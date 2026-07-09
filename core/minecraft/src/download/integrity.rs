@@ -1,10 +1,9 @@
 use super::model::{ActualIntegrity, DownloadError, DownloadIntegrityError, ExpectedIntegrity};
-use super::path_safety::bounded_download_file_label;
+use super::path_safety::{bounded_download_file_label, filesystem_path};
 use sha1::{Digest as _, Sha1};
-use std::io::Read;
-use std::path::Path;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use tokio::fs as async_fs;
-use tokio::io::AsyncReadExt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ExistingArtifactIntegrity {
@@ -30,6 +29,32 @@ pub(super) async fn existing_artifact_integrity(
     path: &Path,
     expected: &ExpectedIntegrity,
 ) -> Result<ExistingArtifactIntegrity, DownloadError> {
+    existing_artifact_integrity_with_policy(path, expected, ExistingArtifactPolicy::FullHash).await
+}
+
+pub(super) async fn existing_content_addressed_asset_integrity(
+    path: &Path,
+    expected: &ExpectedIntegrity,
+) -> Result<ExistingArtifactIntegrity, DownloadError> {
+    existing_artifact_integrity_with_policy(
+        path,
+        expected,
+        ExistingArtifactPolicy::ContentAddressedAsset,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingArtifactPolicy {
+    FullHash,
+    ContentAddressedAsset,
+}
+
+async fn existing_artifact_integrity_with_policy(
+    path: &Path,
+    expected: &ExpectedIntegrity,
+    policy: ExistingArtifactPolicy,
+) -> Result<ExistingArtifactIntegrity, DownloadError> {
     if expected.sha1.is_none() {
         return Ok(ExistingArtifactIntegrity::MetadataMissing);
     }
@@ -38,7 +63,7 @@ pub(super) async fn existing_artifact_integrity(
     {
         return Ok(ExistingArtifactIntegrity::MetadataInvalid);
     }
-    let Ok(metadata) = async_fs::symlink_metadata(path).await else {
+    let Ok(metadata) = async_fs::symlink_metadata(filesystem_path(path).as_ref()).await else {
         return Ok(ExistingArtifactIntegrity::Missing);
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -55,14 +80,25 @@ pub(super) async fn existing_artifact_integrity(
             },
         ));
     }
-    if expected.sha1.is_some() {
-        let actual = hash_file(path).await?;
-        return match verify_download_integrity(path, expected, &actual) {
-            Ok(()) => Ok(ExistingArtifactIntegrity::Verified),
-            Err(error) => Ok(ExistingArtifactIntegrity::Corrupt(error)),
-        };
+
+    if matches!(policy, ExistingArtifactPolicy::ContentAddressedAsset)
+        && expected.size.is_some()
+        && expected
+            .sha1
+            .as_deref()
+            .is_some_and(|sha1| content_addressed_asset_path_matches(path, sha1))
+    {
+        // Asset objects are named by SHA-1 and verified while being downloaded.
+        // Later ensure passes only prove the expected-size file is still present
+        // at that content-addressed path; full readiness/repair checks still hash.
+        return Ok(ExistingArtifactIntegrity::Verified);
     }
-    Ok(ExistingArtifactIntegrity::Verified)
+
+    let actual = hash_file(path).await?;
+    match verify_download_integrity(path, expected, &actual) {
+        Ok(()) => Ok(ExistingArtifactIntegrity::Verified),
+        Err(error) => Ok(ExistingArtifactIntegrity::Corrupt(error)),
+    }
 }
 
 pub fn verify_existing_launcher_managed_artifact(
@@ -77,7 +113,7 @@ pub fn verify_existing_launcher_managed_artifact(
     {
         return LauncherManagedArtifactReadiness::MetadataInvalid;
     }
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+    let Ok(metadata) = std::fs::symlink_metadata(filesystem_path(path).as_ref()) else {
         return LauncherManagedArtifactReadiness::Missing;
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -105,7 +141,7 @@ pub fn verify_existing_launcher_managed_artifact_allowing_missing_checksum(
     if expected.sha1.is_some() {
         return verify_existing_launcher_managed_artifact(path, expected);
     }
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+    let Ok(metadata) = std::fs::symlink_metadata(filesystem_path(path).as_ref()) else {
         return LauncherManagedArtifactReadiness::Missing;
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -131,7 +167,7 @@ pub fn verify_existing_launcher_managed_artifact_allowing_missing_checksum(
 }
 
 pub fn jar_contains_signed_metadata(path: &Path) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(file) = std::fs::File::open(filesystem_path(path).as_ref()) else {
         return false;
     };
     let Ok(mut archive) = zip::ZipArchive::new(file) else {
@@ -156,21 +192,32 @@ pub fn signed_jar_metadata_entry_name(name: &str) -> bool {
 }
 
 fn checksumless_jar_is_readable(path: &Path) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
+    checksumless_jar_readability(path).unwrap_or(false)
+}
+
+pub(super) async fn checksumless_jar_is_readable_async(
+    path: PathBuf,
+) -> Result<bool, DownloadError> {
+    tokio::task::spawn_blocking(move || checksumless_jar_readability(&path))
+        .await
+        .map_err(blocking_join_error)?
+        .map_err(DownloadError::FileOperation)
+}
+
+fn checksumless_jar_readability(path: &Path) -> io::Result<bool> {
+    let file = std::fs::File::open(filesystem_path(path).as_ref())?;
     let Ok(mut archive) = zip::ZipArchive::new(file) else {
-        return false;
+        return Ok(false);
     };
     for index in 0..archive.len() {
         let Ok(entry) = archive.by_index(index) else {
-            return false;
+            return Ok(false);
         };
         if !entry.is_dir() {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -189,32 +236,23 @@ pub(super) async fn existing_asset_object_satisfies(
     path: &Path,
     expected: &ExpectedIntegrity,
 ) -> Result<bool, DownloadError> {
-    existing_file_satisfies(path, expected).await
+    Ok(matches!(
+        existing_content_addressed_asset_integrity(path, expected).await?,
+        ExistingArtifactIntegrity::Verified
+    ))
 }
 
 pub(super) async fn hash_file(path: &Path) -> Result<ActualIntegrity, DownloadError> {
-    let mut file = async_fs::File::open(path).await?;
-    let mut hasher = Sha1::new();
-    let mut size = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024];
-
-    loop {
-        let read = file.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        size += read as u64;
-    }
-
-    Ok(ActualIntegrity {
-        size,
-        sha1: Some(format!("{:x}", hasher.finalize())),
-    })
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || hash_file_sync(&path))
+        .await
+        .map_err(blocking_join_error)?
+        .map_err(DownloadError::FileOperation)
 }
 
 fn hash_file_sync(path: &Path) -> std::io::Result<ActualIntegrity> {
-    let mut file = std::fs::File::open(path)?;
+    observe_hash_file_sync(path);
+    let mut file = std::fs::File::open(filesystem_path(path).as_ref())?;
     let mut hasher = Sha1::new();
     let mut size = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
@@ -278,3 +316,95 @@ pub(super) fn download_size_mismatch(path: &Path, expected: u64, actual: u64) ->
 pub(super) fn is_sha1_hex(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
+
+fn content_addressed_asset_path_matches(path: &Path, expected_sha1: &str) -> bool {
+    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some(prefix) = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|value| value.to_str())
+    else {
+        return false;
+    };
+
+    file_name.eq_ignore_ascii_case(expected_sha1)
+        && prefix.eq_ignore_ascii_case(&expected_sha1[..2])
+}
+
+fn blocking_join_error(error: tokio::task::JoinError) -> DownloadError {
+    DownloadError::FileOperation(io::Error::other(format!(
+        "blocking file task failed: {error}"
+    )))
+}
+
+#[cfg(test)]
+pub(super) struct HashFileCallObserver {
+    path: PathBuf,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl HashFileCallObserver {
+    pub(super) fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Drop for HashFileCallObserver {
+    fn drop(&mut self) {
+        let mut observer = HASH_FILE_CALL_OBSERVER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if observer.as_ref().is_some_and(|active| {
+            active.path == self.path && std::sync::Arc::ptr_eq(&active.calls, &self.calls)
+        }) {
+            *observer = None;
+        }
+    }
+}
+
+#[cfg(test)]
+struct ActiveHashFileCallObserver {
+    path: PathBuf,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+static HASH_FILE_CALL_OBSERVER: std::sync::Mutex<Option<ActiveHashFileCallObserver>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(super) fn observe_hash_file_calls(path: &Path) -> HashFileCallObserver {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut observer = HASH_FILE_CALL_OBSERVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *observer = Some(ActiveHashFileCallObserver {
+        path: path.to_path_buf(),
+        calls: calls.clone(),
+    });
+    HashFileCallObserver {
+        path: path.to_path_buf(),
+        calls,
+    }
+}
+
+#[cfg(test)]
+fn observe_hash_file_sync(path: &Path) {
+    let observer = HASH_FILE_CALL_OBSERVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(active) = observer.as_ref()
+        && active.path == path
+    {
+        active
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(not(test))]
+fn observe_hash_file_sync(_path: &Path) {}

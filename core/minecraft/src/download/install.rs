@@ -457,24 +457,8 @@ impl Downloader {
         }
         .await;
 
-        if let Some(java_version) =
-            finish_runtime_pipeline_after_artifacts(runtime_pipeline, artifact_result, send).await?
-        {
-            send(progress(
-                "java_runtime",
-                1,
-                1,
-                Some(format!(
-                    "Ready {} (Java {})",
-                    if java_version.component.trim().is_empty() {
-                        "managed runtime".to_string()
-                    } else {
-                        java_version.component.clone()
-                    },
-                    java_version.major_version
-                )),
-            ));
-        }
+        let _ = finish_runtime_pipeline_after_artifacts(runtime_pipeline, artifact_result, send)
+            .await?;
 
         Ok(())
     }

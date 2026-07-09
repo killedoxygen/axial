@@ -255,6 +255,7 @@ fn launch_preparation_event_for_runtime_event(event: RuntimeEnsureEvent) -> Laun
         | RuntimeEnsureEvent::InstallingManagedRuntimeFiles { .. } => {
             LaunchPreparationEvent::DownloadingRuntime
         }
+        RuntimeEnsureEvent::ManagedRuntimeReady { .. } => LaunchPreparationEvent::EnsuringRuntime,
     }
 }
 
@@ -817,12 +818,17 @@ mod tests {
                     component: "java-runtime-delta".to_string(),
                     current: 1,
                     total: 2,
-                    file: Some("bin/java".to_string()),
                     bytes_done: 4,
                     bytes_total: 7,
                 },
             ),
             LaunchPreparationEvent::DownloadingRuntime
+        );
+        assert_eq!(
+            launch_preparation_event_for_runtime_event(RuntimeEnsureEvent::ManagedRuntimeReady {
+                component: "java-runtime-delta".to_string(),
+            }),
+            LaunchPreparationEvent::EnsuringRuntime
         );
     }
 

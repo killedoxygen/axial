@@ -253,6 +253,12 @@ mod tests {
                 String::new(),
             )
             .await;
+        let install_started_at_ms = fixture
+            .state
+            .installs()
+            .install_started_at_ms("active-install")
+            .await
+            .expect("active install start time");
         fixture
             .state
             .installs()
@@ -290,6 +296,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(payload["active"]["queue_id"], "queue-active");
         assert_eq!(payload["active"]["install_id"], "active-install");
+        assert_eq!(
+            payload["active"]["install_started_at_ms"].as_u64(),
+            Some(install_started_at_ms)
+        );
         assert_eq!(payload["items"].as_array().expect("queue items").len(), 1);
         assert_eq!(payload["items"][0]["label"], "Minecraft 1.21.6");
         assert!(payload["started_install"].is_null());
@@ -302,6 +312,52 @@ mod tests {
             Some("queue-active")
         );
         assert_eq!(snapshot.pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn install_queue_enqueue_response_contains_started_active_item() {
+        let fixture = RouteInstallFixture::new("install-queue-enqueue-started-active");
+        let library_dir = fixture.root.join("library");
+        fs::create_dir_all(&library_dir).expect("library dir");
+        fixture
+            .state
+            .set_library_dir(library_dir.to_string_lossy().to_string());
+
+        let (status, payload) = fixture
+            .request_json_body(
+                Method::POST,
+                "/api/v1/install/queue",
+                serde_json::json!({
+                    "kind": "vanilla",
+                    "version_id": "1.21.6",
+                    "manifest_url": "http://127.0.0.1:9/version.json"
+                }),
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["items"].as_array().expect("queue items").len(), 0);
+        assert_eq!(payload["active"]["kind"], "vanilla");
+        assert_eq!(payload["active"]["label"], "Minecraft 1.21.6");
+        assert_eq!(payload["active"]["install_item"]["version_id"], "1.21.6");
+        let active_install_id = payload["active"]["install_id"]
+            .as_str()
+            .expect("active install id");
+        assert!(!active_install_id.is_empty());
+        assert_eq!(
+            payload["started_install"]["install_id"].as_str(),
+            Some(active_install_id)
+        );
+        assert!(
+            payload["active"]["install_started_at_ms"]
+                .as_u64()
+                .is_some_and(|started_at| started_at > 0)
+        );
+        fixture
+            .state
+            .installs()
+            .finish_if_active(active_install_id, done_progress())
+            .await;
     }
 
     struct RouteInstallFixture {
@@ -406,6 +462,19 @@ mod tests {
             music_dir: root.join("music"),
             library_dir: root.join("library"),
             config_dir,
+        }
+    }
+
+    fn done_progress() -> DownloadProgress {
+        DownloadProgress {
+            phase: "done".to_string(),
+            current: 1,
+            total: 1,
+            file: None,
+            error: None,
+            done: true,
+            bytes_done: None,
+            bytes_total: None,
         }
     }
 

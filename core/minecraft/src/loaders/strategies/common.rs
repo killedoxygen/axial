@@ -453,13 +453,13 @@ async fn ensure_base_version<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    if is_base_game_installed(library_dir, version_id) {
+    if is_base_game_installed(library_dir, version_id).await {
         return Ok(());
     }
 
     let install_lock = base_version_install_lock(library_dir, version_id);
     let _guard = install_lock.lock().await;
-    if is_base_game_installed(library_dir, version_id) {
+    if is_base_game_installed(library_dir, version_id).await {
         return Ok(());
     }
 
@@ -507,7 +507,7 @@ fn base_version_install_lock_from_map(
         .clone()
 }
 
-fn is_base_game_installed(library_dir: &Path, game_version: &str) -> bool {
+async fn is_base_game_installed(library_dir: &Path, game_version: &str) -> bool {
     let version_dir = versions_dir(library_dir).join(game_version);
     let json_path = version_dir.join(format!("{game_version}.json"));
     let jar_path = version_dir.join(format!("{game_version}.jar"));
@@ -519,16 +519,28 @@ fn is_base_game_installed(library_dir: &Path, game_version: &str) -> bool {
     let Ok(version) = resolve_version(library_dir, game_version) else {
         return false;
     };
-    library_jobs_for(
+    for job in library_jobs_for(
         library_dir,
         &version.libraries,
         &crate::rules::default_environment(),
-    )
-    .into_iter()
-    .all(|job| {
-        verify_existing_launcher_managed_artifact(&job.path, &job.expected)
-            == LauncherManagedArtifactReadiness::Verified
-    })
+    ) {
+        if verify_existing_launcher_managed_artifact_on_blocking_thread(job.path, job.expected)
+            .await
+            != LauncherManagedArtifactReadiness::Verified
+        {
+            return false;
+        }
+    }
+    true
+}
+
+async fn verify_existing_launcher_managed_artifact_on_blocking_thread(
+    path: PathBuf,
+    expected: crate::download::ExpectedIntegrity,
+) -> LauncherManagedArtifactReadiness {
+    tokio::task::spawn_blocking(move || verify_existing_launcher_managed_artifact(&path, &expected))
+        .await
+        .unwrap_or(LauncherManagedArtifactReadiness::Corrupt)
 }
 
 fn mark_loader_libraries_checksumless_allowed(libraries: &mut [crate::launch::Library]) {
@@ -1309,15 +1321,15 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn base_game_installed_requires_selected_libraries() {
+    #[tokio::test]
+    async fn base_game_installed_requires_selected_libraries() {
         let root = temp_dir("base-installed-requires-libraries");
         let version_id = "1.16";
         let library_bytes = b"library jar";
         write_base_version_with_library(&root, version_id, library_bytes);
 
         assert!(
-            !is_base_game_installed(&root, version_id),
+            !is_base_game_installed(&root, version_id).await,
             "base install must not be considered complete while selected libraries are missing"
         );
 
@@ -1328,12 +1340,12 @@ mod tests {
             .expect("create library parent");
         fs::write(&library_path, library_bytes).expect("write library");
 
-        assert!(is_base_game_installed(&root, version_id));
+        assert!(is_base_game_installed(&root, version_id).await);
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn base_game_installed_rejects_corrupt_selected_libraries() {
+    #[tokio::test]
+    async fn base_game_installed_rejects_corrupt_selected_libraries() {
         let root = temp_dir("base-installed-rejects-corrupt-libraries");
         let version_id = "1.16";
         write_base_version_with_library(&root, version_id, b"library jar");
@@ -1345,7 +1357,7 @@ mod tests {
             .expect("create library parent");
         fs::write(&library_path, b"wrong").expect("write corrupt library");
 
-        assert!(!is_base_game_installed(&root, version_id));
+        assert!(!is_base_game_installed(&root, version_id).await);
         let _ = fs::remove_dir_all(root);
     }
 

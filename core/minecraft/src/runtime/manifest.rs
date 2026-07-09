@@ -7,6 +7,8 @@ use std::sync::OnceLock;
 pub(super) const RUNTIME_MANIFEST_URL: &str = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 pub(super) const MAX_RUNTIME_MANIFEST_BYTES: u64 = 16 << 20;
 pub(super) const COMPONENT_MANIFEST_PROOF_FILE: &str = ".croopor-runtime-manifest.json";
+const RUNTIME_MANIFEST_CONNECT_TIMEOUT_SECS: u64 = 10;
+const RUNTIME_MANIFEST_READ_TIMEOUT_SECS: u64 = 30;
 
 pub(super) async fn fetch_runtime_json<T>(url: &str) -> Result<T, JavaRuntimeLookupError>
 where
@@ -50,10 +52,15 @@ pub(super) fn runtime_manifest_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(
+                RUNTIME_MANIFEST_CONNECT_TIMEOUT_SECS,
+            ))
+            .read_timeout(std::time::Duration::from_secs(
+                RUNTIME_MANIFEST_READ_TIMEOUT_SECS,
+            ))
             .user_agent("croopor/0.3")
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .expect("runtime manifest HTTP client configuration should be valid")
     })
 }
 #[derive(Debug, Deserialize)]
@@ -82,12 +89,16 @@ pub(super) struct ComponentManifestFile {
     pub(super) executable: bool,
     #[serde(default)]
     pub(super) downloads: Option<ComponentManifestDownloads>,
+    #[serde(default)]
+    pub(super) target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ComponentManifestDownloads {
     #[serde(default)]
     pub(super) raw: Option<ComponentManifestDownload>,
+    #[serde(default)]
+    pub(super) lzma: Option<ComponentManifestDownload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

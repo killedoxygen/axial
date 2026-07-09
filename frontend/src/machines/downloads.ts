@@ -50,7 +50,7 @@ export type ActiveDownload = {
   label: string;
   phase: string;
   activeStep: InstallProgressStepViewModel | null;
-  startedAt: number;
+  startedAt: number | null;
 };
 
 export type DownloadFailure = {
@@ -129,11 +129,10 @@ function isActiveInstallSource(item: InstallItem, source: CloseableSource | null
 
 function activeDownloadFromQueue(active: InstallQueueActiveViewModel): ActiveDownload {
   const item = installItemFromQueueInstallItem(active.install_item);
-  const current = activeDownload.value;
   const startedAt =
-    current && isSameInstallItem(current.item, item) && current.installId === (active.install_id ?? undefined)
-      ? current.startedAt
-      : Date.now();
+    typeof active.install_started_at_ms === 'number' && Number.isFinite(active.install_started_at_ms)
+      ? active.install_started_at_ms
+      : null;
   return {
     queueId: active.queue_id,
     installId: active.install_id ?? undefined,
@@ -247,18 +246,11 @@ function showInstallQueueNotice(notice: InstallQueueNoticeViewModel | null | und
 }
 
 export async function refreshInstallQueue(
-  options: { connectActive?: boolean; retryPendingStart?: boolean } = {},
+  options: { connectActive?: boolean } = {},
 ): Promise<InstallQueueStateResponse> {
-  let latestResponse: InstallQueueStateResponse | null = null;
-  for (let attempt = 0; attempt < (options.retryPendingStart ? 4 : 1); attempt += 1) {
-    const response = await api<InstallQueueStateResponse>('GET', '/install/queue');
-    latestResponse = response;
-    await applyInstallQueueResponse(response, { connectActive: options.connectActive });
-    if (!options.retryPendingStart || response.active || response.items.length === 0) return response;
-    await delay(120);
-  }
-  if (latestResponse) return latestResponse;
-  throw new Error('Install queue did not return a response.');
+  const response = await api<InstallQueueStateResponse>('GET', '/install/queue');
+  await applyInstallQueueResponse(response, { connectActive: options.connectActive });
+  return response;
 }
 
 export async function applyInstallQueueResponse(
@@ -273,12 +265,12 @@ export async function applyInstallQueueResponse(
   if (terminalActive && response.active) {
     const active = response.active;
     if (!active.install_id) {
-      if (options.connectActive) await refreshInstallQueue({ connectActive: true, retryPendingStart: true });
+      if (options.connectActive) await refreshInstallQueue({ connectActive: true });
       return response;
     }
     const item = installItemFromQueueInstallItem(active.install_item);
     const resolved = await reconcileInstallStatus(active.install_id, item, active.label);
-    if (!resolved) await refreshInstallQueue({ connectActive: options.connectActive, retryPendingStart: true });
+    if (!resolved) await refreshInstallQueue({ connectActive: options.connectActive });
   } else if (options.connectActive) {
     await connectBackendActiveInstall(response.active ?? null);
   }
@@ -377,7 +369,6 @@ async function reconcileInstallStreamIssue(
     try {
       await refreshInstallQueue({
         connectActive: options.reconnect !== false,
-        retryPendingStart: true,
       });
     } catch (err: unknown) {
       const prefix = options.notice || 'Install progress refresh failed.';
@@ -737,7 +728,7 @@ async function onInstallDone(completedItem?: InstallItem): Promise<void> {
   }
 
   try {
-    await refreshInstallQueue({ connectActive: true, retryPendingStart: true });
+    await refreshInstallQueue({ connectActive: true });
   } catch (err: unknown) {
     showError(`Install queue refresh failed: ${errMessage(err)}`);
   }

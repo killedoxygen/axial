@@ -24,7 +24,7 @@ use crate::state::contracts::{
 use crate::state::failure_memory::{
     FailureMemoryActionOutcome, FailureMemoryKey, GuardianFailureMemoryEntry,
 };
-use crate::state::{GuardianFailureMemoryStore, OperationJournalStore};
+use crate::state::{GuardianFailureMemoryStore, InstallProgressRecord, OperationJournalStore};
 use croopor_minecraft::DownloadProgress;
 use croopor_minecraft::download::ExecutionDownloadFact;
 use croopor_minecraft::{LoaderError, LoaderInstallFailureKind};
@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 
 const PROVIDER_FAILURE_SUPPRESSION_COOLDOWN_MINUTES: i64 = 5;
 const PROVIDER_FAILURE_MEMORY_SOURCE: &str = "install_provider";
+const COALESCED_PROGRESS_EVENT_INTERVAL: usize = 25;
 
 const GUARDIAN_OUTCOME_DECISION_PREFIX: &str = "guardian_outcome_decision:";
 const GUARDIAN_OUTCOME_SUMMARY_PREFIX: &str = "guardian_outcome_summary:";
@@ -327,6 +328,100 @@ pub fn public_loader_install_progress_json(progress: &DownloadProgress) -> Value
     public_install_progress_json(progress, InstallProgressKind::Loader)
 }
 
+pub(crate) fn install_progress_record(progress: DownloadProgress) -> InstallProgressRecord {
+    let vanilla_event_json =
+        serde_json::to_string(&public_vanilla_install_progress_json(&progress))
+            .unwrap_or_else(|_| "{}".to_string());
+    let loader_event_json = serde_json::to_string(&public_loader_install_progress_json(&progress))
+        .unwrap_or_else(|_| "{}".to_string());
+    InstallProgressRecord::with_event_json(progress, vanilla_event_json, loader_event_json)
+}
+
+#[derive(Default)]
+pub(crate) struct InstallProgressCoalescer {
+    last_emitted: Option<DownloadProgress>,
+    pending: Option<DownloadProgress>,
+    pending_count: usize,
+}
+
+impl InstallProgressCoalescer {
+    pub(crate) fn push(&mut self, progress: DownloadProgress) -> Vec<DownloadProgress> {
+        if should_passthrough_progress(&progress) || self.is_phase_transition(&progress) {
+            let mut emitted = self.flush_vec();
+            emitted.push(self.mark_emitted(progress));
+            return emitted;
+        }
+
+        if self.should_emit_coalesced_now(&progress) {
+            self.pending = None;
+            self.pending_count = 0;
+            return vec![self.mark_emitted(progress)];
+        }
+
+        self.pending = Some(progress);
+        self.pending_count = self.pending_count.saturating_add(1);
+        if self.pending_count >= COALESCED_PROGRESS_EVENT_INTERVAL {
+            return self.flush_vec();
+        }
+
+        Vec::new()
+    }
+
+    pub(crate) fn flush(&mut self) -> Option<DownloadProgress> {
+        let progress = self.pending.take()?;
+        self.pending_count = 0;
+        Some(self.mark_emitted(progress))
+    }
+
+    fn flush_vec(&mut self) -> Vec<DownloadProgress> {
+        self.flush().into_iter().collect()
+    }
+
+    fn mark_emitted(&mut self, progress: DownloadProgress) -> DownloadProgress {
+        self.last_emitted = Some(progress.clone());
+        progress
+    }
+
+    fn is_phase_transition(&self, progress: &DownloadProgress) -> bool {
+        self.pending
+            .as_ref()
+            .or(self.last_emitted.as_ref())
+            .is_some_and(|previous| previous.phase != progress.phase)
+    }
+
+    fn should_emit_coalesced_now(&self, progress: &DownloadProgress) -> bool {
+        let Some(last) = self.last_emitted.as_ref() else {
+            return true;
+        };
+        progress.bytes_total != last.bytes_total
+            || progress.total != last.total
+            || byte_progress_bucket(progress) != byte_progress_bucket(last)
+            || (progress.total > 0 && progress.current >= progress.total)
+    }
+}
+
+fn should_passthrough_progress(progress: &DownloadProgress) -> bool {
+    progress.done
+        || progress.error.is_some()
+        || matches!(
+            progress.phase.as_str(),
+            "done" | "error" | "java_runtime_ready"
+        )
+        || !is_coalesced_progress_phase(progress.phase.as_str())
+}
+
+fn is_coalesced_progress_phase(phase: &str) -> bool {
+    matches!(phase, "libraries" | "loader_libraries" | "java_runtime")
+}
+
+fn byte_progress_bucket(progress: &DownloadProgress) -> Option<u8> {
+    let (done, total) = (progress.bytes_done?, progress.bytes_total?);
+    if total == 0 {
+        return None;
+    }
+    Some((((u128::from(done.min(total)) * 100) / u128::from(total)).min(100)) as u8)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InstallProgressKind {
     Vanilla,
@@ -386,10 +481,8 @@ fn install_progress_label(progress: &DownloadProgress, kind: InstallProgressKind
         "asset_index" => "Downloading asset index".to_string(),
         "assets" => count_label("Assets", progress),
         "log_config" => "Downloading log config".to_string(),
-        "java_runtime" => progress
-            .file
-            .clone()
-            .unwrap_or_else(|| "Preparing Java runtime".to_string()),
+        "java_runtime" => java_runtime_label(progress),
+        "java_runtime_ready" => "Java runtime ready".to_string(),
         "done" => "Complete".to_string(),
         "error" => progress
             .error
@@ -434,13 +527,6 @@ fn install_progress_pct(progress: &DownloadProgress, kind: InstallProgressKind) 
             21 + (progress_fraction(progress) * 72.0).round() as i32
         }
         (InstallProgressKind::Vanilla, "log_config") => 94,
-        (InstallProgressKind::Vanilla, "java_runtime") => {
-            if is_java_runtime_ready_progress(progress) {
-                95
-            } else {
-                94
-            }
-        }
         (InstallProgressKind::Loader, "loader_meta") => 1,
         (InstallProgressKind::Loader, "loader_json" | "profile") => 3,
         (InstallProgressKind::Loader, "artifacts") => 6,
@@ -460,13 +546,6 @@ fn install_progress_pct(progress: &DownloadProgress, kind: InstallProgressKind) 
             35 + (progress_fraction(progress) * 58.0).round() as i32
         }
         (InstallProgressKind::Loader, "log_config") => 94,
-        (InstallProgressKind::Loader, "java_runtime") => {
-            if is_java_runtime_ready_progress(progress) {
-                95
-            } else {
-                94
-            }
-        }
         _ => 0,
     };
     pct.clamp(0, 100) as u8
@@ -526,21 +605,19 @@ fn count_label(base: &str, progress: &DownloadProgress) -> String {
     }
 }
 
+fn java_runtime_label(progress: &DownloadProgress) -> String {
+    if progress.total > 0 {
+        count_label("Java runtime files", progress)
+    } else {
+        "Preparing Java runtime".to_string()
+    }
+}
+
 fn progress_fraction(progress: &DownloadProgress) -> f32 {
     if progress.total <= 0 {
         return 0.0;
     }
     (progress.current.max(0) as f32 / progress.total as f32).clamp(0.0, 1.0)
-}
-
-fn is_java_runtime_ready_progress(progress: &DownloadProgress) -> bool {
-    progress.phase == "java_runtime"
-        && progress.current == 1
-        && progress.total == 1
-        && progress
-            .file
-            .as_ref()
-            .is_some_and(|file| file.trim().to_ascii_lowercase().starts_with("ready "))
 }
 
 fn install_failure_evidence_from_download_facts(
@@ -1039,9 +1116,8 @@ fn install_operation_phase(progress: &DownloadProgress) -> OperationPhase {
 
     match progress.phase.trim() {
         "version_json" | "client_jar" | "libraries" | "asset_index" | "assets" | "log_config"
-        | "java_runtime" | "loader_meta" | "loader_json" | "artifacts" | "loader_libraries" => {
-            OperationPhase::Downloading
-        }
+        | "java_runtime" | "java_runtime_ready" | "loader_meta" | "loader_json" | "artifacts"
+        | "loader_libraries" => OperationPhase::Downloading,
         "profile" | "loader_processors" | "processors" => OperationPhase::Installing,
         _ => OperationPhase::Running,
     }

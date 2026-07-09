@@ -6,7 +6,9 @@ use super::model::{
     DownloadError, DownloadProgress, ExecutionDownloadFact, ExpectedIntegrity,
     SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
 };
-use super::path_safety::{bounded_download_file_label, bounded_provider_path_label, path_is_file};
+use super::path_safety::{
+    bounded_download_file_label, bounded_provider_path_label, filesystem_path, path_is_file,
+};
 use super::plan::TransferPlan;
 use super::transfer::ensure_selected_artifact_with_client;
 use crate::launch::AssetIndex as VersionAssetIndex;
@@ -244,8 +246,10 @@ pub async fn repair_virtual_assets_from_index(
 }
 
 async fn read_asset_index(asset_index_path: &Path) -> Result<AssetIndex, DownloadError> {
-    serde_json::from_str::<AssetIndex>(&async_fs::read_to_string(asset_index_path).await?)
-        .map_err(DownloadError::ParseVersion)
+    serde_json::from_str::<AssetIndex>(
+        &async_fs::read_to_string(filesystem_path(asset_index_path).as_ref()).await?,
+    )
+    .map_err(DownloadError::ParseVersion)
 }
 
 pub(super) async fn recv_asset_progress(
@@ -361,9 +365,9 @@ pub(super) async fn copy_virtual_asset_if_missing(
         return Ok(());
     }
     if let Some(parent) = dst.parent() {
-        async_fs::create_dir_all(parent).await?;
+        async_fs::create_dir_all(filesystem_path(parent).as_ref()).await?;
     }
-    async_fs::copy(src, dst).await?;
+    async_fs::copy(filesystem_path(src).as_ref(), filesystem_path(dst).as_ref()).await?;
     Ok(())
 }
 

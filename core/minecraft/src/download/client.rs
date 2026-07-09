@@ -8,24 +8,27 @@ const MIN_ASSET_DOWNLOAD_CONCURRENCY: usize = 8;
 const MAX_ASSET_DOWNLOAD_CONCURRENCY: usize = 32;
 const ASSET_DOWNLOADS_PER_CORE: usize = 4;
 const DOWNLOAD_CLIENT_MAX_IDLE_PER_HOST: usize = MAX_ASSET_DOWNLOAD_CONCURRENCY;
+const DOWNLOAD_CLIENT_CONNECT_TIMEOUT_SECS: u64 = 20;
+const DOWNLOAD_CLIENT_READ_TIMEOUT_SECS: u64 = 120;
 const DOWNLOAD_CLIENT_POOL_IDLE_TIMEOUT_SECS: u64 = 120;
 const DOWNLOAD_CLIENT_TCP_KEEPALIVE_SECS: u64 = 60;
 
-pub(super) fn build_http_client(timeout: Duration) -> reqwest::Client {
+pub(super) fn build_http_client(read_timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent("croopor/0.3")
-        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(DOWNLOAD_CLIENT_CONNECT_TIMEOUT_SECS))
+        .read_timeout(read_timeout)
         .pool_max_idle_per_host(DOWNLOAD_CLIENT_MAX_IDLE_PER_HOST)
         .pool_idle_timeout(Duration::from_secs(DOWNLOAD_CLIENT_POOL_IDLE_TIMEOUT_SECS))
         .tcp_keepalive(Duration::from_secs(DOWNLOAD_CLIENT_TCP_KEEPALIVE_SECS))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("download HTTP client configuration should be valid")
 }
 
 pub(super) fn standard_minecraft_download_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
-        .get_or_init(|| build_http_client(Duration::from_secs(300)))
+        .get_or_init(|| build_http_client(Duration::from_secs(DOWNLOAD_CLIENT_READ_TIMEOUT_SECS)))
         .clone()
 }
 

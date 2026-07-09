@@ -7,8 +7,10 @@ mod libraries;
 mod model;
 mod path_safety;
 mod plan;
+mod promotion;
 mod runtime;
 mod transfer;
+mod transfer_failure;
 
 pub use assets::{
     asset_object_hash_prefix, repair_virtual_assets_from_index, virtual_asset_destination,

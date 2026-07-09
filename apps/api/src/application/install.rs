@@ -22,9 +22,11 @@ use crate::observability::{
     },
 };
 use crate::state::AppState;
+use crate::state::contracts::OperationId;
 use crate::state::{
     ActiveQueuedInstallEntry, InstallQueueEnqueueOutcome, InstallQueuePlacement,
-    InstallQueueSnapshot, InstallQueueSpec, InstallStore, QueuedInstallEntry,
+    InstallQueueSnapshot, InstallQueueSpec, InstallStore, OperationJournalStore,
+    QueuedInstallEntry,
 };
 use axum::{Json, http::StatusCode};
 use croopor_minecraft::{
@@ -64,6 +66,11 @@ pub use model::{
     InstallVersionStaging, InstallVersionStartRequest, LoaderBuildsRequest,
     LoaderInstallStartRequest,
 };
+use operation::{
+    InstallProgressCoalescer, install_failure_point_from_journal, install_journal_is_terminal,
+    install_progress_history_from_journal, install_progress_record, interrupted_install_progress,
+    observed_install_failure_progress, public_install_id,
+};
 pub use operation::{
     begin_install_operation_journal, install_guardian_outcome_summary_from_journal,
     install_operation_id, loader_install_progress_view_model, public_loader_install_progress_json,
@@ -74,11 +81,6 @@ pub use operation::{
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome, sanitize_install_progress,
     stage_install_version_command, vanilla_install_progress_view_model,
-};
-use operation::{
-    install_failure_point_from_journal, install_journal_is_terminal,
-    install_progress_history_from_journal, interrupted_install_progress,
-    observed_install_failure_progress, public_install_id,
 };
 pub use repair::{
     install_guardian_repair_summary_from_journal, record_install_operation_guardian_repair_outcome,
@@ -155,16 +157,32 @@ pub(crate) async fn start_install_version(
                 let journals = worker_journals.clone();
                 let operation_id = worker_operation_id.clone();
                 tokio::spawn(async move {
+                    let mut coalescer = InstallProgressCoalescer::default();
                     let mut last_journal_phase = None;
                     while let Some(progress) = progress_rx.recv().await {
                         let progress = sanitize_install_progress(progress);
-                        record_install_operation_progress(
+                        for progress in coalescer.push(progress) {
+                            record_and_emit_install_progress(
+                                store.as_ref(),
+                                journals.as_ref(),
+                                &operation_id,
+                                &install_id,
+                                progress,
+                                &mut last_journal_phase,
+                            )
+                            .await;
+                        }
+                    }
+                    if let Some(progress) = coalescer.flush() {
+                        record_and_emit_install_progress(
+                            store.as_ref(),
                             journals.as_ref(),
                             &operation_id,
-                            &progress,
+                            &install_id,
+                            progress,
                             &mut last_journal_phase,
-                        );
-                        store.emit(&install_id, progress).await;
+                        )
+                        .await;
                     }
                 })
             };
@@ -309,6 +327,20 @@ fn emit_install_failed(telemetry: &TelemetryHub, summary: &str) {
     ));
 }
 
+async fn record_and_emit_install_progress(
+    store: &InstallStore,
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    install_id: &str,
+    progress: DownloadProgress,
+    last_journal_phase: &mut Option<String>,
+) {
+    record_install_operation_progress(journals, operation_id, &progress, last_journal_phase);
+    store
+        .emit_record(install_id, install_progress_record(progress))
+        .await;
+}
+
 fn vanilla_install_done_progress() -> DownloadProgress {
     DownloadProgress {
         phase: "done".to_string(),
@@ -341,16 +373,9 @@ pub async fn install_status(
             .as_ref()
             .is_some_and(|journal| install_journal_is_terminal(journal.status));
     let progress = snapshot
-        .map(|snapshot| {
-            if snapshot.history.is_empty() {
-                journal
-                    .as_ref()
-                    .map(install_progress_history_from_journal)
-                    .unwrap_or_default()
-            } else {
-                snapshot.history
-            }
-        })
+        .as_ref()
+        .and_then(|snapshot| snapshot.latest.as_ref())
+        .map(|record| vec![record.progress.clone()])
         .or_else(|| journal.as_ref().map(install_progress_history_from_journal))
         .unwrap_or_default()
         .into_iter()
@@ -394,7 +419,9 @@ pub async fn install_queue_status(
     state: &AppState,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
     let started_install = maybe_start_next_queued_install(state).await?;
-    Ok(install_queue_state_response(state, None, started_install).await)
+    let response = install_queue_state_response(state, None, started_install.clone()).await;
+    spawn_install_queue_monitor_for_started(state.clone(), started_install.as_ref());
+    Ok(response)
 }
 
 pub async fn enqueue_install(
@@ -450,7 +477,9 @@ async fn enqueue_install_with_placement(
         .await;
     let notice = Some(install_queue_notice_for_outcome(&outcome, &spec, placement));
     let started_install = maybe_start_next_queued_install(state).await?;
-    Ok(install_queue_state_response(state, notice, started_install).await)
+    let response = install_queue_state_response(state, notice, started_install.clone()).await;
+    spawn_install_queue_monitor_for_started(state.clone(), started_install.as_ref());
+    Ok(response)
 }
 
 async fn install_queue_spec_from_request(
@@ -541,7 +570,6 @@ async fn maybe_start_next_queued_install(
         .installs()
         .mark_queued_install_started(&entry.queue_id, started.install_id.clone())
         .await;
-    spawn_install_queue_monitor(state.clone(), started.install_id.clone());
     Ok(Some(started))
 }
 
@@ -588,20 +616,37 @@ fn spawn_install_queue_monitor(state: AppState, install_id: String) {
             .installs()
             .clear_active_queued_install(&install_id)
             .await;
-        let _ = maybe_start_next_queued_install(&state).await;
+        if let Ok(Some(started_install)) = maybe_start_next_queued_install(&state).await {
+            spawn_install_queue_monitor(state.clone(), started_install.install_id);
+        }
     });
 }
 
+fn spawn_install_queue_monitor_for_started(
+    state: AppState,
+    started_install: Option<&InstallStartResponse>,
+) {
+    if let Some(started_install) = started_install {
+        spawn_install_queue_monitor(state, started_install.install_id.clone());
+    }
+}
+
 async fn wait_for_install_terminal(state: &AppState, install_id: &str) {
-    let Some((history, mut receiver, done)) = state.installs().subscribe(install_id).await else {
+    let Some((snapshot, mut receiver)) = state.installs().subscribe_records(install_id).await
+    else {
         return;
     };
-    if done || history.iter().any(|progress| progress.done) {
+    if snapshot.done
+        || snapshot
+            .latest
+            .as_ref()
+            .is_some_and(|record| record.progress.done)
+    {
         return;
     }
     loop {
         match receiver.recv().await {
-            Ok(progress) if progress.done => return,
+            Ok(record) if record.progress.done => return,
             Ok(_) => {}
             Err(RecvError::Lagged(_)) => {}
             Err(RecvError::Closed) => return,
@@ -656,6 +701,7 @@ async fn install_queue_active_view_model(
             .as_ref()
             .map(|install_id| install_operation_id(install_id)),
         install_id,
+        install_started_at_ms: active.install_started_at_ms,
         kind: install_queue_kind(&active.spec).to_string(),
         title: title.to_string(),
         summary,
@@ -671,7 +717,7 @@ async fn install_queue_active_progress_view_model(
     spec: &InstallQueueSpec,
 ) -> InstallProgressViewModel {
     let snapshot = state.installs().snapshot(install_id).await;
-    let progress = snapshot.and_then(|snapshot| snapshot.history.last().cloned());
+    let progress = snapshot.and_then(|snapshot| snapshot.latest.map(|record| record.progress));
     let Some(progress) = progress else {
         return InstallProgressViewModel::starting();
     };

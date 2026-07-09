@@ -1,10 +1,10 @@
 use super::{
     BASE_INSTALL_FAILED_MESSAGE, INSTALL_REPAIR_RESUME_MAX_DEPTH, InstallApplicationError,
-    InstallProgressViewModel, InstallStartResponse, LOADER_INSTALL_INTERRUPTED_MESSAGE,
-    LoaderBuildsRequest, LoaderInstallStartRequest, begin_install_operation_journal,
-    emit_install_failed, generate_install_id, install_operation_id,
+    InstallProgressCoalescer, InstallProgressViewModel, InstallStartResponse,
+    LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
+    begin_install_operation_journal, emit_install_failed, generate_install_id,
+    install_operation_id, record_and_emit_install_progress,
     record_install_failure_outcome_and_repair, record_install_operation_interrupted,
-    record_install_operation_progress,
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome, sanitize_install_progress,
     stage_install_version_command,
@@ -108,16 +108,32 @@ pub async fn start_loader_install(
                 let journals = worker_journals.clone();
                 let operation_id = worker_operation_id.clone();
                 tokio::spawn(async move {
+                    let mut coalescer = InstallProgressCoalescer::default();
                     let mut last_journal_phase = None;
                     while let Some(progress) = progress_rx.recv().await {
                         let progress = sanitize_install_progress(progress);
-                        record_install_operation_progress(
+                        for progress in coalescer.push(progress) {
+                            record_and_emit_install_progress(
+                                store.as_ref(),
+                                journals.as_ref(),
+                                &operation_id,
+                                &install_id,
+                                progress,
+                                &mut last_journal_phase,
+                            )
+                            .await;
+                        }
+                    }
+                    if let Some(progress) = coalescer.flush() {
+                        record_and_emit_install_progress(
+                            store.as_ref(),
                             journals.as_ref(),
                             &operation_id,
-                            &progress,
+                            &install_id,
+                            progress,
                             &mut last_journal_phase,
-                        );
-                        store.emit(&install_id, progress).await;
+                        )
+                        .await;
                     }
                 })
             };
@@ -345,35 +361,35 @@ pub(crate) async fn wait_for_active_vanilla_base_install(
         return Ok(());
     };
 
-    let Some((history, mut receiver, done)) = store.subscribe(&install_id).await else {
+    let Some((snapshot, mut receiver)) = store.subscribe_records(&install_id).await else {
         return Ok(());
     };
 
-    for progress in history {
-        if progress.done {
-            return if progress.error.is_some() {
+    if let Some(record) = snapshot.latest {
+        if record.progress.done {
+            return if record.progress.error.is_some() {
                 Err(base_install_failed_progress())
             } else {
                 Ok(())
             };
         }
-        let _ = progress_tx.send(progress);
+        let _ = progress_tx.send(record.progress);
     }
-    if done {
+    if snapshot.done {
         return Ok(());
     }
 
     loop {
         match receiver.recv().await {
-            Ok(progress) => {
-                if progress.done {
-                    return if progress.error.is_some() {
+            Ok(record) => {
+                if record.progress.done {
+                    return if record.progress.error.is_some() {
                         Err(base_install_failed_progress())
                     } else {
                         Ok(())
                     };
                 }
-                let _ = progress_tx.send(progress);
+                let _ = progress_tx.send(record.progress);
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),

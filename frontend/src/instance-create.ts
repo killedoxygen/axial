@@ -3,7 +3,7 @@ import { toast } from './toast';
 import { errMessage } from './utils';
 import { navigate } from './ui-state';
 import { addInstance } from './actions';
-import { applyInstallQueueResponse, refreshInstallQueue } from './machines/downloads';
+import { applyInstallQueueResponse } from './machines/downloads';
 import type { Instance } from './types-instance';
 import type { InstallQueueStateResponse } from './types-install';
 import type { ToastKind } from './types-ui';
@@ -140,7 +140,6 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
   addInstance(created);
   if (res.install_queue) {
     await applyInstallQueueResponse(res.install_queue, { connectActive: true });
-    void refreshInstallQueue({ connectActive: true, retryPendingStart: true });
   }
   toast(createResultToastMessage(res), createToastKind(res.view_model?.tone ?? res.guardian_notice?.tone));
   navigate({ name: 'instance', id: created.id });

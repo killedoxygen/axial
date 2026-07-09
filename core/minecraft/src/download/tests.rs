@@ -7,21 +7,28 @@ use super::client::{adaptive_download_concurrency, build_http_client};
 use super::facts::{ExecutionDownloadRequest, execution_download_fact};
 use super::install::version_json_download_from_manifest_entry;
 use super::integrity::{
-    download_size_mismatch, existing_file_satisfies, hash_file, verify_download_integrity,
+    download_size_mismatch, existing_asset_object_satisfies, existing_file_satisfies, hash_file,
+    observe_hash_file_calls, verify_download_integrity,
 };
 use super::libraries::{library_jobs_for, resolve_library_download, resolve_native_download};
 use super::model::{ActualIntegrity, DownloadIntegrityError};
-use super::path_safety::{bounded_download_file_label, safe_download_target_label};
-use super::runtime::{RuntimeEnsurePipeline, finish_runtime_pipeline_after_artifacts};
+use super::path_safety::{
+    bounded_download_file_label, safe_download_target_label, windows_verbatim_path_string,
+};
+use super::promotion::sweep_stale_promotion_backups;
+use super::runtime::{
+    RuntimeEnsurePipeline, finish_runtime_pipeline_after_artifacts, runtime_ensure_progress,
+};
 use super::transfer::{
-    download_file_with_client, download_file_with_client_and_fact_sender, execute_download_to_temp,
-    remove_stale_download_temp,
+    download_file_with_client, download_file_with_client_and_fact_sender, download_temp_path,
+    ensure_selected_artifact_with_client, execute_download_to_temp, remove_stale_download_temp,
 };
 use super::*;
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
 use crate::manifest::ManifestEntry;
 use crate::paths::versions_dir;
 use crate::rules::Environment;
+use crate::runtime::RuntimeEnsureEvent;
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -32,7 +39,7 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Duration, timeout};
 
 #[tokio::test]
@@ -218,20 +225,31 @@ async fn selected_missing_artifact_fact_is_emitted_before_download_failure() {
 }
 
 #[tokio::test]
-async fn selected_existing_corrupt_artifact_emits_fact_without_replacement() {
+async fn selected_existing_corrupt_artifact_is_replaced_after_verified_download() {
     let root = temp_dir("selected-corrupt-artifact-fact");
     fs::create_dir_all(&root).expect("create root");
     let destination = root.join("artifact.jar");
     fs::write(&destination, b"wrong").expect("write corrupt artifact");
-    let expected = ExpectedIntegrity::from_mojang(5, &sha1_hex(b"fresh"));
+    let body = b"fresh".to_vec();
+    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+    let url = spawn_download_response_server(
+        "200 OK",
+        vec![(
+            "Content-Type".to_string(),
+            "application/octet-stream".to_string(),
+        )],
+        body.clone(),
+        1,
+    )
+    .await;
     let client = build_http_client(Duration::from_secs(1));
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
 
-    let result = download_file_with_client_and_fact_sender(
+    let result = ensure_selected_artifact_with_client(
         SelectedDownloadArtifactKind::ClientJar,
         &client,
-        "http://127.0.0.1:9/artifact.jar",
+        &url,
         &destination,
         &expected,
         Some(&fact_tx),
@@ -239,11 +257,8 @@ async fn selected_existing_corrupt_artifact_emits_fact_without_replacement() {
     )
     .await;
 
-    assert!(matches!(result, Err(DownloadError::Integrity(_))));
-    assert_eq!(
-        fs::read(&destination).expect("corrupt artifact preserved"),
-        b"wrong"
-    );
+    assert!(result.expect("corrupt artifact should self-heal").is_some());
+    assert_eq!(fs::read(&destination).expect("artifact replaced"), body);
     drop(fact_tx);
     drop(descriptor_tx);
     let mut facts = Vec::new();
@@ -262,13 +277,21 @@ async fn selected_existing_corrupt_artifact_emits_fact_without_replacement() {
                 .iter()
                 .any(|(key, value)| key == "algorithm" && value == "sha1")
     }));
+    assert!(facts.iter().any(|fact| {
+        fact.kind == ExecutionDownloadFactKind::Promoted
+            && fact.target == "minecraft_client_artifact"
+            && fact
+                .fields
+                .iter()
+                .any(|(key, value)| key == "replaced" && value == "corrupt")
+    }));
     assert!(
         !facts
             .iter()
             .any(|fact| fact.kind == ExecutionDownloadFactKind::NetworkFailure)
     );
     assert!(
-        !facts
+        facts
             .iter()
             .any(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
     );
@@ -418,6 +441,24 @@ fn runtime_pipeline(
 }
 
 #[test]
+fn runtime_ready_progress_uses_typed_phase_without_display_sniffing() {
+    let progress = runtime_ensure_progress(
+        &JavaVersion {
+            component: "java-runtime-delta".to_string(),
+            major_version: 21,
+        },
+        RuntimeEnsureEvent::ManagedRuntimeReady {
+            component: "java-runtime-delta".to_string(),
+        },
+    );
+
+    assert_eq!(progress.phase, "java_runtime_ready");
+    assert_eq!(progress.current, 1);
+    assert_eq!(progress.total, 1);
+    assert_eq!(progress.file, None);
+}
+
+#[test]
 fn mixed_windows_native_libraries_only_download_matching_arch() {
     let env = Environment {
         os_name: "windows".to_string(),
@@ -547,7 +588,7 @@ fn unique_asset_object_jobs_rejects_non_hex_hash() {
 }
 
 #[tokio::test]
-async fn missing_asset_object_jobs_uses_bounded_size_prefilter() {
+async fn missing_asset_object_jobs_uses_content_addressed_size_fast_path() {
     let root = temp_dir("asset-filter");
     let objects_dir = root.join("assets").join("objects");
     let existing_hash = sha1_hex(b"asset");
@@ -599,10 +640,33 @@ async fn missing_asset_object_jobs_uses_bounded_size_prefilter() {
 
     let paths = jobs.into_iter().map(|job| job.path).collect::<HashSet<_>>();
 
-    assert_eq!(paths.len(), 3);
+    assert_eq!(paths.len(), 2);
     assert!(paths.contains(&missing_path));
     assert!(paths.contains(&wrong_size_path));
-    assert!(paths.contains(&wrong_hash_same_size_path));
+    assert!(!paths.contains(&wrong_hash_same_size_path));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn content_addressed_asset_object_satisfies_without_hashing() {
+    let root = temp_dir("asset-fast-path");
+    let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let path = root.join("assets").join("objects").join("aa").join(hash);
+    fs::create_dir_all(path.parent().expect("asset parent")).expect("create asset parent");
+    fs::write(&path, b"wrong").expect("write same-size wrong asset");
+    let observer = observe_hash_file_calls(&path);
+
+    assert!(
+        existing_asset_object_satisfies(&path, &ExpectedIntegrity::from_mojang(5, hash))
+            .await
+            .expect("asset object fast path")
+    );
+    assert_eq!(
+        observer.calls(),
+        0,
+        "content-addressed asset ensure should not rehash existing objects"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -641,7 +705,7 @@ async fn existing_file_satisfies_rejects_size_and_sha1_mismatch() {
 async fn download_file_with_client_rejects_oversized_content_length_before_temp_file() {
     let root = temp_dir("oversized-content-length");
     let destination = root.join("nested").join("artifact.jar");
-    let tmp_path = destination.with_extension("tmp");
+    let tmp_path = download_temp_path(&destination);
     let expected = ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let url = spawn_download_response_server(
         "200 OK",
@@ -671,7 +735,7 @@ async fn download_file_with_client_rejects_oversized_content_length_before_temp_
 async fn download_file_with_client_rejects_stream_past_expected_size_and_cleans_temp() {
     let root = temp_dir("oversized-stream");
     let destination = root.join("nested").join("artifact.jar");
-    let tmp_path = destination.with_extension("tmp");
+    let tmp_path = download_temp_path(&destination);
     let expected = ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let url = spawn_download_response_server(
         "200 OK",
@@ -698,7 +762,7 @@ async fn download_file_with_client_rejects_stream_past_expected_size_and_cleans_
 async fn download_file_with_client_rejects_streamed_sha1_mismatch_and_cleans_temp() {
     let root = temp_dir("sha1-stream-mismatch");
     let destination = root.join("nested").join("artifact.jar");
-    let tmp_path = destination.with_extension("tmp");
+    let tmp_path = download_temp_path(&destination);
     let expected = ExpectedIntegrity::from_mojang(8, "0000000000000000000000000000000000000000");
     let url = spawn_download_response_server(
         "200 OK",
@@ -769,7 +833,7 @@ async fn execute_download_to_temp_reports_successful_integrity() {
         fs::read(&destination).expect("read promoted artifact"),
         body
     );
-    assert!(!destination.with_extension("tmp").exists());
+    assert!(!download_temp_path(&destination).exists());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -816,7 +880,7 @@ async fn execute_download_to_temp_reports_missing_metadata_without_promoting() {
             .any(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactVerified)
     );
     assert!(!destination.exists());
-    assert!(!destination.with_extension("tmp").exists());
+    assert!(!download_temp_path(&destination).exists());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -853,7 +917,7 @@ async fn execute_download_to_temp_reports_invalid_metadata_without_promoting() {
             .any(|fact| fact.kind == ExecutionDownloadFactKind::MetadataInvalid)
     );
     assert!(!destination.exists());
-    assert!(!destination.with_extension("tmp").exists());
+    assert!(!download_temp_path(&destination).exists());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -966,7 +1030,7 @@ async fn execute_download_to_temp_reports_interrupted_short_response_without_pro
             .any(|fact| fact.kind == ExecutionDownloadFactKind::TempDiscarded)
     );
     assert!(!destination.exists());
-    assert!(!destination.with_extension("tmp").exists());
+    assert!(!download_temp_path(&destination).exists());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1003,7 +1067,7 @@ async fn execute_download_to_temp_refuses_non_launcher_owned_targets() {
                 .any(|fact| fact.kind == ExecutionDownloadFactKind::OwnershipRefused)
         );
         assert!(!destination.exists());
-        assert!(!destination.with_extension("tmp").exists());
+        assert!(!download_temp_path(&destination).exists());
     }
 }
 
@@ -1035,6 +1099,26 @@ fn execution_download_fact_labels_are_redacted() {
             "sensitive fragment survived: {fragment}"
         );
     }
+}
+
+#[test]
+fn download_windows_verbatim_path_transform_handles_drive_unc_and_relative_paths() {
+    assert_eq!(
+        windows_verbatim_path_string(r"C:/Users/Alice/.minecraft/libraries/example.jar"),
+        r"\\?\C:\Users\Alice\.minecraft\libraries\example.jar"
+    );
+    assert_eq!(
+        windows_verbatim_path_string(r"\\server\share\libraries\example.jar"),
+        r"\\?\UNC\server\share\libraries\example.jar"
+    );
+    assert_eq!(
+        windows_verbatim_path_string(r"\\?\C:\already\verbatim.jar"),
+        r"\\?\C:\already\verbatim.jar"
+    );
+    assert_eq!(
+        windows_verbatim_path_string(r"libraries/example.jar"),
+        r"libraries\example.jar"
+    );
 }
 
 #[test]
@@ -1348,9 +1432,121 @@ async fn execute_download_to_temp_replaces_existing_destination() {
         fs::read(&destination).expect("read promoted artifact"),
         b"fresh"
     );
-    assert!(!destination.with_extension("tmp").exists());
+    assert!(!download_temp_path(&destination).exists());
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn promotion_sweep_removes_stale_other_pid_backups_only() {
+    let root = temp_dir("promote-stale-backup-sweep");
+    fs::create_dir_all(&root).expect("create root");
+    let destination = root.join("artifact.jar");
+    fs::write(&destination, b"destination").expect("write destination");
+    let other_pid = unused_pid_for_test(&[std::process::id()]);
+    let other_pid_backup = root.join(format!("artifact.jar.croopor-backup-{other_pid}"));
+    let current_pid_backup = root.join(format!(
+        "artifact.jar.croopor-backup-{}",
+        std::process::id()
+    ));
+    let unrelated = root.join("other.jar.croopor-backup-7");
+    let backup_directory = root.join("artifact.jar.croopor-backup-8");
+    let invalid_pid_backup = root.join("artifact.jar.croopor-backup-not-a-pid");
+    fs::write(&other_pid_backup, b"stale").expect("write stale backup");
+    fs::write(&current_pid_backup, b"current").expect("write current backup");
+    fs::write(&unrelated, b"unrelated").expect("write unrelated backup");
+    fs::write(&invalid_pid_backup, b"ambiguous").expect("write invalid pid backup");
+    fs::create_dir_all(&backup_directory).expect("create backup-looking directory");
+
+    sweep_stale_promotion_backups(&destination)
+        .await
+        .expect("sweep stale backups");
+
+    assert!(destination.exists());
+    assert!(!other_pid_backup.exists());
+    assert!(current_pid_backup.exists());
+    assert!(unrelated.exists());
+    assert!(backup_directory.exists());
+    assert!(invalid_pid_backup.exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn promotion_sweep_preserves_live_other_pid_backup() {
+    let root = temp_dir("promote-live-backup-sweep");
+    fs::create_dir_all(&root).expect("create root");
+    let destination = root.join("artifact.jar");
+    fs::write(&destination, b"destination").expect("write destination");
+    let mut child = spawn_promotion_sweep_child_process();
+    let live_pid_backup = root.join(format!("artifact.jar.croopor-backup-{}", child.id()));
+    fs::write(&live_pid_backup, b"live").expect("write live backup");
+
+    let sweep_result = sweep_stale_promotion_backups(&destination).await;
+    let destination_exists = destination.exists();
+    let live_pid_backup_exists = live_pid_backup.exists();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    sweep_result.expect("sweep stale backups");
+    assert!(destination_exists);
+    assert!(live_pid_backup_exists);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn promote_sweeps_stale_backups_before_replace() {
+    let root = temp_dir("promote-sweeps-before-replace");
+    fs::create_dir_all(&root).expect("create root");
+    let destination = root.join("artifact.jar");
+    let temp_path = download_temp_path(&destination);
+    let other_pid = unused_pid_for_test(&[std::process::id()]);
+    let stale_backup = root.join(format!("artifact.jar.croopor-backup-{other_pid}"));
+    fs::write(&destination, b"stale").expect("write destination");
+    fs::write(&temp_path, b"fresh").expect("write temp");
+    fs::write(&stale_backup, b"orphan").expect("write stale backup");
+
+    super::transfer::promote_launcher_managed_artifact_temp_once(&temp_path, &destination)
+        .await
+        .expect("promote temp");
+
+    assert_eq!(
+        fs::read(&destination).expect("read promoted artifact"),
+        b"fresh"
+    );
+    assert!(!stale_backup.exists());
+    assert!(!temp_path.exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+fn spawn_promotion_sweep_child_process() -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().expect("current test executable"))
+        .arg("--exact")
+        .arg("download::tests::promotion_sweep_live_pid_child_process")
+        .arg("--ignored")
+        .env("CROOPOR_PROMOTION_SWEEP_CHILD", "1")
+        .spawn()
+        .expect("spawn live pid child")
+}
+
+#[test]
+#[ignore]
+fn promotion_sweep_live_pid_child_process() {
+    if std::env::var_os("CROOPOR_PROMOTION_SWEEP_CHILD").is_some() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+fn unused_pid_for_test(excluded: &[u32]) -> u32 {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    (1..=1_000_000)
+        .find(|pid| {
+            !excluded.contains(pid) && system.process(sysinfo::Pid::from_u32(*pid)).is_none()
+        })
+        .expect("unused pid")
 }
 
 #[tokio::test]
@@ -1426,7 +1622,7 @@ async fn execute_download_to_temp_removes_temp_when_promotion_fails() {
             .iter()
             .any(|fact| fact.kind == ExecutionDownloadFactKind::PromoteFailed)
     );
-    assert!(!destination.with_extension("tmp").exists());
+    assert!(!download_temp_path(&destination).exists());
     assert!(destination.is_dir());
 
     let _ = fs::remove_dir_all(root);
@@ -1684,6 +1880,7 @@ async fn spawn_download_response_server(
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
+            let _ = read_request_path(&mut socket).await;
             let mut response = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
             for (name, value) in &headers {
                 response.push_str(&format!("{name}: {value}\r\n"));
@@ -1732,7 +1929,7 @@ async fn spawn_overlapped_install_server()
     .into_bytes();
 
     tokio::spawn(async move {
-        let mut release_library_rx = Some(release_library_rx);
+        let release_library_rx = Arc::new(Mutex::new(Some(release_library_rx)));
         for _ in 0..4 {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
@@ -1746,13 +1943,13 @@ async fn spawn_overlapped_install_server()
                 "/version.json" => version_body.clone(),
                 "/asset-index.json" => asset_index_body.clone(),
                 "/libraries/lib.jar" => {
-                    let receiver = release_library_rx.take();
-                    let body = library_body.clone();
+                    let release_library_rx = Arc::clone(&release_library_rx);
+                    let library_body = library_body.clone();
                     tokio::spawn(async move {
-                        if let Some(receiver) = receiver {
+                        if let Some(receiver) = release_library_rx.lock().await.take() {
                             let _ = receiver.await;
                         }
-                        write_raw_response(&mut socket, "200 OK", &body).await;
+                        write_raw_response(&mut socket, "200 OK", &library_body).await;
                     });
                     continue;
                 }

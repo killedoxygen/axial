@@ -2,7 +2,7 @@ use super::{
     InstallApplicationError, install_operation_id,
     operation::install_progress_history_from_journal, sanitize_install_progress,
 };
-use crate::state::AppState;
+use crate::state::{AppState, InstallProgressRecord};
 use axum::{
     Json,
     http::StatusCode,
@@ -40,7 +40,7 @@ async fn install_progress_events_stream(
     Sse<impl futures_util::Stream<Item = Result<Event, Infallible>> + use<>>,
     InstallApplicationError,
 > {
-    let subscription = state.installs().subscribe(id).await;
+    let subscription = state.installs().subscribe_records(id).await;
     let operation_id = install_operation_id(id);
     let journal = state.journals().get(&operation_id);
     if subscription.is_none() && journal.is_none() {
@@ -50,14 +50,15 @@ async fn install_progress_events_stream(
         ));
     }
 
-    let (history, mut receiver, done) = if let Some((history, receiver, done)) = subscription {
-        (history, Some(receiver), done)
+    let (replay, mut receiver, done) = if let Some((snapshot, receiver)) = subscription {
+        (snapshot.latest, Some(receiver), snapshot.done)
     } else {
         (
             journal
                 .as_ref()
                 .map(install_progress_history_from_journal)
-                .unwrap_or_default(),
+                .and_then(|mut history| history.pop())
+                .map(InstallProgressRecord::new),
             None,
             true,
         )
@@ -66,10 +67,9 @@ async fn install_progress_events_stream(
     let store = state.installs().clone();
     let install_id = id.to_string();
     let stream = async_stream::stream! {
-        for progress in history {
-            let progress = sanitize_install_progress(progress);
-            let terminal = progress.done;
-            yield Ok(install_progress_event(&progress, loader_install));
+        if let Some(record) = replay {
+            let terminal = record.progress.done;
+            yield Ok(install_progress_event(&record, loader_install));
             if terminal {
                 return;
             }
@@ -84,10 +84,9 @@ async fn install_progress_events_stream(
 
         loop {
             match receiver.recv().await {
-                Ok(progress) => {
-                    let progress = sanitize_install_progress(progress);
-                    let terminal = progress.done;
-                    yield Ok(install_progress_event(&progress, loader_install));
+                Ok(record) => {
+                    let terminal = record.progress.done;
+                    yield Ok(install_progress_event(&record, loader_install));
                     if terminal {
                         return;
                     }
@@ -104,13 +103,21 @@ async fn install_progress_events_stream(
     Ok(Sse::new(stream))
 }
 
-fn install_progress_event(progress: &DownloadProgress, loader_install: bool) -> Event {
+fn install_progress_event(record: &InstallProgressRecord, loader_install: bool) -> Event {
+    if let Some(payload) = record.event_json(loader_install) {
+        return Event::default().event("progress").data(payload);
+    }
+    let progress = sanitize_install_progress(record.progress.clone());
+    Event::default()
+        .event("progress")
+        .data(install_progress_json(&progress, loader_install))
+}
+
+fn install_progress_json(progress: &DownloadProgress, loader_install: bool) -> String {
     let payload = if loader_install {
         super::public_loader_install_progress_json(progress)
     } else {
         super::public_vanilla_install_progress_json(progress)
     };
-    Event::default()
-        .event("progress")
-        .data(serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()))
+    serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
 }

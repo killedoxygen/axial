@@ -31,12 +31,13 @@ pub use probe::probe_java_runtime_info;
 #[cfg(test)]
 use discovery::detect_runtime_state;
 #[cfg(test)]
-use ensure::runtime_install_lock_from_map;
+use ensure::{runtime_install_lock_file_path, runtime_install_lock_from_map};
 #[cfg(test)]
 use file_download::{
     RuntimeDownloadActual, RuntimeDownloadEvidence, RuntimeDownloadIntegrityError,
     component_manifest_destination, fetch_runtime_file, runtime_download_client,
-    runtime_file_download_concurrency_for, verify_runtime_download,
+    runtime_file_download_concurrency_for, runtime_windows_verbatim_path_string,
+    verify_runtime_download,
 };
 #[cfg(test)]
 use install::{

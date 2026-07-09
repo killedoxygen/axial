@@ -2,6 +2,7 @@ use super::discovery::{
     parse_runtime_override, resolve_component_runtime, resolve_managed_runtime,
     resolve_override_runtime, runtime_requirement,
 };
+use super::file_download::runtime_filesystem_path;
 use super::install::install_managed_runtime;
 use super::layout::runtime_cache_dir;
 use super::model::{
@@ -10,7 +11,7 @@ use super::model::{
 };
 use crate::launch::JavaVersion;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
@@ -109,6 +110,9 @@ where
 {
     let preferred = &requirement.preferred_component;
     if let Ok(runtime) = resolve_managed_runtime(library_dir, preferred) {
+        observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+            component: preferred.as_str().to_string(),
+        });
         return Ok(ManagedEnsure {
             effective: runtime,
             install_performed: false,
@@ -118,8 +122,12 @@ where
     let install_root = runtime_cache_dir().join(preferred.as_str());
     let install_lock = runtime_install_lock(preferred.as_str());
     let _guard = install_lock.lock().await;
+    let _file_lock = acquire_runtime_install_file_lock(&install_root).await?;
 
     if let Ok(runtime) = resolve_managed_runtime(library_dir, preferred) {
+        observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+            component: preferred.as_str().to_string(),
+        });
         return Ok(ManagedEnsure {
             effective: runtime,
             install_performed: false,
@@ -159,4 +167,45 @@ pub(super) fn runtime_install_lock_from_map(
         .entry(component.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+struct RuntimeInstallFileLock {
+    file: std::fs::File,
+}
+
+impl Drop for RuntimeInstallFileLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+async fn acquire_runtime_install_file_lock(
+    install_root: &Path,
+) -> Result<RuntimeInstallFileLock, JavaRuntimeLookupError> {
+    let lock_path = runtime_install_lock_file_path(install_root);
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(runtime_filesystem_path(parent).as_ref())?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(runtime_filesystem_path(&lock_path).as_ref())?;
+        file.lock()?;
+        Ok::<_, std::io::Error>(RuntimeInstallFileLock { file })
+    })
+    .await
+    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
+    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
+}
+
+pub(super) fn runtime_install_lock_file_path(install_root: &Path) -> PathBuf {
+    let mut name = install_root
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("runtime"))
+        .to_os_string();
+    name.push(".install.lock");
+    install_root.with_file_name(name)
 }

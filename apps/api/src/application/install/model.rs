@@ -183,6 +183,10 @@ pub struct InstallQueueActiveViewModel {
     pub install_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<OperationId>,
+    /// Unix epoch milliseconds for when the install session began running.
+    /// Omitted while the queue entry is only reserved in the active lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_started_at_ms: Option<u64>,
     pub kind: String,
     pub title: String,
     pub label: String,

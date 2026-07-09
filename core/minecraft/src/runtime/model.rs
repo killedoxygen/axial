@@ -120,9 +120,11 @@ pub enum RuntimeEnsureEvent {
         component: String,
         current: usize,
         total: usize,
-        file: Option<String>,
         bytes_done: u64,
         bytes_total: u64,
+    },
+    ManagedRuntimeReady {
+        component: String,
     },
 }
 

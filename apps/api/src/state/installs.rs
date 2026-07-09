@@ -3,21 +3,61 @@ use std::{
     collections::{HashMap, VecDeque},
     future::Future,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 
 struct InstallEntry {
     key: Option<InstallKey>,
-    history: Vec<DownloadProgress>,
+    started_at_ms: u64,
+    latest: Option<InstallProgressRecord>,
     events: broadcast::Sender<DownloadProgress>,
+    record_events: broadcast::Sender<InstallProgressRecord>,
     done: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallSnapshot {
-    pub history: Vec<DownloadProgress>,
+    pub latest: Option<InstallProgressRecord>,
     pub done: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallProgressRecord {
+    pub progress: DownloadProgress,
+    vanilla_event_json: Option<Arc<str>>,
+    loader_event_json: Option<Arc<str>>,
+}
+
+impl InstallProgressRecord {
+    pub fn new(progress: DownloadProgress) -> Self {
+        Self {
+            progress,
+            vanilla_event_json: None,
+            loader_event_json: None,
+        }
+    }
+
+    pub fn with_event_json(
+        progress: DownloadProgress,
+        vanilla_event_json: String,
+        loader_event_json: String,
+    ) -> Self {
+        Self {
+            progress,
+            vanilla_event_json: Some(Arc::from(vanilla_event_json)),
+            loader_event_json: Some(Arc::from(loader_event_json)),
+        }
+    }
+
+    pub fn event_json(&self, loader_install: bool) -> Option<&str> {
+        if loader_install {
+            self.loader_event_json.as_deref()
+        } else {
+            self.vanilla_event_json.as_deref()
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,6 +123,10 @@ pub struct QueuedInstallEntry {
 pub struct ActiveQueuedInstallEntry {
     pub queue_id: String,
     pub install_id: Option<String>,
+    /// Unix epoch milliseconds copied from the install session when this
+    /// reserved queue entry is marked started. None means the queue entry has
+    /// the active lane but its install session has not begun running yet.
+    pub install_started_at_ms: Option<u64>,
     pub spec: InstallQueueSpec,
 }
 
@@ -188,31 +232,84 @@ impl InstallStore {
     }
 
     pub async fn emit(&self, install_id: &str, progress: DownloadProgress) {
-        let mut installs = self.installs.write().await;
-        if let Some(entry) = installs.get_mut(install_id) {
+        self.emit_record(install_id, InstallProgressRecord::new(progress))
+            .await;
+    }
+
+    pub async fn emit_record(&self, install_id: &str, record: InstallProgressRecord) {
+        let senders = {
+            let mut installs = self.installs.write().await;
+            let Some(entry) = installs.get_mut(install_id) else {
+                return;
+            };
             if entry.done {
                 return;
             }
-            entry.done = progress.done;
-            entry.history.push(progress.clone());
-            let _ = entry.events.send(progress);
-        }
+            entry.done = record.progress.done;
+            entry.latest = Some(record.clone());
+            (entry.events.clone(), entry.record_events.clone())
+        };
+        let _ = senders.0.send(record.progress.clone());
+        let _ = senders.1.send(record);
     }
 
     pub async fn finish_if_active(&self, install_id: &str, mut progress: DownloadProgress) -> bool {
-        let mut installs = self.installs.write().await;
-        let Some(entry) = installs.get_mut(install_id) else {
-            return false;
-        };
-        if entry.done {
-            return false;
-        }
-
         progress.done = true;
-        entry.done = true;
-        entry.history.push(progress.clone());
-        let _ = entry.events.send(progress);
+        let record = InstallProgressRecord::new(progress);
+        let senders = {
+            let mut installs = self.installs.write().await;
+            let Some(entry) = installs.get_mut(install_id) else {
+                return false;
+            };
+            if entry.done {
+                return false;
+            }
+
+            entry.done = true;
+            entry.latest = Some(record.clone());
+            (entry.events.clone(), entry.record_events.clone())
+        };
+        let _ = senders.0.send(record.progress.clone());
+        let _ = senders.1.send(record);
         true
+    }
+
+    pub async fn subscribe(
+        &self,
+        install_id: &str,
+    ) -> Option<(
+        Vec<DownloadProgress>,
+        broadcast::Receiver<DownloadProgress>,
+        bool,
+    )> {
+        let installs = self.installs.read().await;
+        installs.get(install_id).map(|entry| {
+            (
+                entry
+                    .latest
+                    .as_ref()
+                    .map(|record| vec![record.progress.clone()])
+                    .unwrap_or_default(),
+                entry.events.subscribe(),
+                entry.done,
+            )
+        })
+    }
+
+    pub async fn subscribe_records(
+        &self,
+        install_id: &str,
+    ) -> Option<(InstallSnapshot, broadcast::Receiver<InstallProgressRecord>)> {
+        let installs = self.installs.read().await;
+        installs.get(install_id).map(|entry| {
+            (
+                InstallSnapshot {
+                    latest: entry.latest.clone(),
+                    done: entry.done,
+                },
+                entry.record_events.subscribe(),
+            )
+        })
     }
 
     pub fn spawn_tracked_worker<F>(
@@ -255,30 +352,23 @@ impl InstallStore {
         })
     }
 
-    pub async fn subscribe(
-        &self,
-        install_id: &str,
-    ) -> Option<(
-        Vec<DownloadProgress>,
-        broadcast::Receiver<DownloadProgress>,
-        bool,
-    )> {
-        self.installs
-            .read()
-            .await
-            .get(install_id)
-            .map(|entry| (entry.history.clone(), entry.events.subscribe(), entry.done))
-    }
-
     pub async fn snapshot(&self, install_id: &str) -> Option<InstallSnapshot> {
         self.installs
             .read()
             .await
             .get(install_id)
             .map(|entry| InstallSnapshot {
-                history: entry.history.clone(),
+                latest: entry.latest.clone(),
                 done: entry.done,
             })
+    }
+
+    pub async fn install_started_at_ms(&self, install_id: &str) -> Option<u64> {
+        self.installs
+            .read()
+            .await
+            .get(install_id)
+            .map(|entry| entry.started_at_ms)
     }
 
     pub async fn active_install_for_scope_and_version(
@@ -358,18 +448,26 @@ impl InstallStore {
         queue.active = Some(ActiveQueuedInstallEntry {
             queue_id: next.queue_id.clone(),
             install_id: None,
+            install_started_at_ms: None,
             spec: next.spec.clone(),
         });
         Some(next)
     }
 
     pub async fn mark_queued_install_started(&self, queue_id: &str, install_id: String) -> bool {
+        let install_started_at_ms = self
+            .install_started_at_ms(&install_id)
+            .await
+            .unwrap_or_else(now_unix_ms);
         let mut queue = self.queue.write().await;
         let Some(active) = queue.active.as_mut() else {
             return false;
         };
         if active.queue_id != queue_id {
             return false;
+        }
+        if active.install_started_at_ms.is_none() {
+            active.install_started_at_ms = Some(install_started_at_ms);
         }
         active.install_id = Some(install_id);
         true
@@ -444,16 +542,26 @@ impl InstallStore {
 
 fn new_install_entry(key: Option<InstallKey>) -> InstallEntry {
     let (events, _) = broadcast::channel(256);
+    let (record_events, _) = broadcast::channel(256);
     InstallEntry {
         key,
-        history: Vec::new(),
+        started_at_ms: now_unix_ms(),
+        latest: None,
         events,
+        record_events,
         done: false,
     }
 }
 
 fn prune_done_entries(installs: &mut HashMap<String, InstallEntry>) {
     installs.retain(|_, entry| !entry.done);
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
 }
 
 impl Default for InstallStore {
@@ -489,7 +597,7 @@ mod tests {
         assert_eq!(second_id, "first-install");
         assert!(!second_inserted);
         assert_eq!(store.active_install_count().await, 1);
-        assert!(store.subscribe("second-install").await.is_none());
+        assert!(store.subscribe_records("second-install").await.is_none());
     }
 
     #[tokio::test]
@@ -498,19 +606,18 @@ mod tests {
         store.insert("done-install".to_string()).await;
         store.insert("active-install".to_string()).await;
         store.emit("done-install", done_progress()).await;
-        let (history, _, done) = store
-            .subscribe("done-install")
+        let (snapshot, _) = store
+            .subscribe_records("done-install")
             .await
             .expect("terminal install remains subscribable until pruned");
-        assert!(done);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].phase, "done");
+        assert!(snapshot.done);
+        assert_eq!(latest_phase(&snapshot), Some("done"));
 
         store.insert("fresh-install".to_string()).await;
 
-        assert!(store.subscribe("done-install").await.is_none());
-        assert!(store.subscribe("active-install").await.is_some());
-        assert!(store.subscribe("fresh-install").await.is_some());
+        assert!(store.subscribe_records("done-install").await.is_none());
+        assert!(store.subscribe_records("active-install").await.is_some());
+        assert!(store.subscribe_records("fresh-install").await.is_some());
         assert_eq!(store.active_install_count().await, 2);
     }
 
@@ -532,13 +639,12 @@ mod tests {
             )
             .await;
         store.emit("done-install", done_progress()).await;
-        let (history, _, done) = store
-            .subscribe("done-install")
+        let (snapshot, _) = store
+            .subscribe_records("done-install")
             .await
             .expect("terminal install remains subscribable until pruned");
-        assert!(done);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].phase, "done");
+        assert!(snapshot.done);
+        assert_eq!(latest_phase(&snapshot), Some("done"));
 
         let (install_id, inserted) = store
             .insert_or_existing_active(
@@ -550,8 +656,13 @@ mod tests {
 
         assert_eq!(install_id, "active-install");
         assert!(!inserted);
-        assert!(store.subscribe("done-install").await.is_none());
-        assert!(store.subscribe("duplicate-active-install").await.is_none());
+        assert!(store.subscribe_records("done-install").await.is_none());
+        assert!(
+            store
+                .subscribe_records("duplicate-active-install")
+                .await
+                .is_none()
+        );
         assert_eq!(store.active_install_count().await, 1);
     }
 
@@ -589,13 +700,12 @@ mod tests {
             )
             .await;
         store.emit("done-install", done_progress()).await;
-        let (history, _, done) = store
-            .subscribe("done-install")
+        let (snapshot, _) = store
+            .subscribe_records("done-install")
             .await
             .expect("terminal install remains subscribable until pruned");
-        assert!(done);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].phase, "done");
+        assert!(snapshot.done);
+        assert_eq!(latest_phase(&snapshot), Some("done"));
 
         let (install_id, inserted) = store
             .insert_or_existing_active(
@@ -607,8 +717,8 @@ mod tests {
 
         assert_eq!(install_id, "fresh-install");
         assert!(inserted);
-        assert!(store.subscribe("done-install").await.is_none());
-        assert!(store.subscribe("fresh-install").await.is_some());
+        assert!(store.subscribe_records("done-install").await.is_none());
+        assert!(store.subscribe_records("fresh-install").await.is_some());
         assert_eq!(store.active_install_count().await, 1);
     }
 
@@ -665,7 +775,12 @@ mod tests {
 
         assert_eq!(install_id, "fresh-install");
         assert!(inserted);
-        assert!(store.subscribe("interrupted-install").await.is_none());
+        assert!(
+            store
+                .subscribe_records("interrupted-install")
+                .await
+                .is_none()
+        );
         assert_eq!(store.active_install_count().await, 1);
     }
 
@@ -681,13 +796,12 @@ mod tests {
                 .await
         );
 
-        let (history, _, done) = store
-            .subscribe("done-install")
+        let (snapshot, _) = store
+            .subscribe_records("done-install")
             .await
             .expect("done install remains until pruned");
-        assert!(done);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].phase, "done");
+        assert!(snapshot.done);
+        assert_eq!(latest_phase(&snapshot), Some("done"));
     }
 
     #[tokio::test]
@@ -702,14 +816,48 @@ mod tests {
             .emit("done-install", base_progress("assets", true))
             .await;
 
-        let (history, _, done) = store
-            .subscribe("done-install")
+        let (snapshot, _) = store
+            .subscribe_records("done-install")
             .await
             .expect("done install remains until pruned");
 
-        assert!(done);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].phase, "done");
+        assert!(snapshot.done);
+        assert_eq!(latest_phase(&snapshot), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_keeps_only_latest_progress_under_many_events() {
+        let store = InstallStore::new();
+        store.insert("active-install".to_string()).await;
+
+        for current in 1..=5_000 {
+            store
+                .emit(
+                    "active-install",
+                    DownloadProgress {
+                        phase: "java_runtime".to_string(),
+                        current,
+                        total: 5_000,
+                        file: Some(format!("file-{current}")),
+                        error: None,
+                        done: false,
+                        bytes_done: Some(current as u64),
+                        bytes_total: Some(5_000),
+                    },
+                )
+                .await;
+        }
+
+        let (snapshot, _) = store
+            .subscribe_records("active-install")
+            .await
+            .expect("active install remains subscribable");
+        let latest = snapshot.latest.expect("latest progress");
+
+        assert!(!snapshot.done);
+        assert_eq!(latest.progress.phase, "java_runtime");
+        assert_eq!(latest.progress.current, 5_000);
+        assert_eq!(latest.progress.file.as_deref(), Some("file-5000"));
     }
 
     #[tokio::test]
@@ -740,6 +888,46 @@ mod tests {
         assert_eq!(snapshot.pending.len(), 1);
         assert_eq!(snapshot.pending[0].queue_id, "queue-install");
         assert_eq!(snapshot.pending[0].spec, spec);
+    }
+
+    #[tokio::test]
+    async fn mark_queued_install_started_copies_install_session_start_time() {
+        let store = InstallStore::new();
+        let spec = InstallQueueSpec::vanilla("1.21.5".to_string(), String::new());
+        store
+            .insert_or_existing_active(
+                "active-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        let install_started_at_ms = store
+            .install_started_at_ms("active-install")
+            .await
+            .expect("install start time");
+        store
+            .enqueue_queued_install(
+                "queue-install".to_string(),
+                spec,
+                InstallQueuePlacement::Back,
+            )
+            .await;
+
+        let reserved = store
+            .reserve_next_queued_install()
+            .await
+            .expect("queued install");
+
+        assert_eq!(reserved.queue_id, "queue-install");
+        assert!(
+            store
+                .mark_queued_install_started("queue-install", "active-install".to_string())
+                .await
+        );
+        let snapshot = store.queue_snapshot().await;
+        let active = snapshot.active.expect("active queue entry");
+        assert_eq!(active.install_id.as_deref(), Some("active-install"));
+        assert_eq!(active.install_started_at_ms, Some(install_started_at_ms));
     }
 
     #[tokio::test]
@@ -1161,5 +1349,12 @@ mod tests {
             bytes_done: None,
             bytes_total: None,
         }
+    }
+
+    fn latest_phase(snapshot: &InstallSnapshot) -> Option<&str> {
+        snapshot
+            .latest
+            .as_ref()
+            .map(|record| record.progress.phase.as_str())
     }
 }

@@ -1,20 +1,24 @@
 use super::file_download::{
-    RuntimeDownloadEvidence, bounded_manifest_file_label, component_manifest_destination,
-    fetch_runtime_file, runtime_download_client, runtime_download_temp_path,
-    runtime_file_download_concurrency,
+    RuntimeDownloadActual, RuntimeDownloadEvidence, bounded_manifest_file_label,
+    component_manifest_destination, component_manifest_link_target_path, fetch_runtime_file,
+    runtime_download_client, runtime_download_temp_path, runtime_file_download_concurrency,
+    runtime_filesystem_path, verify_runtime_download,
 };
 use super::layout::{java_executable, runtime_executable_ready, runtime_os_arch};
 use super::manifest::{
-    COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, ComponentManifestFile, RUNTIME_MANIFEST_URL,
-    RuntimeManifest, fetch_runtime_json,
+    COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, ComponentManifestDownload,
+    ComponentManifestDownloads, ComponentManifestFile, RUNTIME_MANIFEST_URL, RuntimeManifest,
+    fetch_runtime_json,
 };
 use super::model::{JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeId};
+use futures_util::StreamExt;
+use sha1::{Digest as _, Sha1};
 use std::collections::HashMap;
 #[cfg(test)]
 use std::fs;
+use std::io::{BufReader, Write};
 use std::path::Path;
 use tokio::fs as async_fs;
-use tokio::task::JoinSet;
 
 pub(super) async fn install_managed_runtime(
     component: &RuntimeId,
@@ -25,7 +29,7 @@ pub(super) async fn install_managed_runtime(
     let parent_dir = dest_dir.parent().ok_or_else(|| {
         JavaRuntimeLookupError::Download("invalid runtime destination".to_string())
     })?;
-    async_fs::create_dir_all(parent_dir)
+    async_fs::create_dir_all(runtime_filesystem_path(parent_dir).as_ref())
         .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
 
@@ -36,12 +40,16 @@ pub(super) async fn install_managed_runtime(
     remove_runtime_install_path_async(dest_dir)
         .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-    async_fs::create_dir_all(&temp_dir)
+    async_fs::create_dir_all(runtime_filesystem_path(&temp_dir).as_ref())
         .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-    async_fs::write(temp_dir.join(".croopor-installing"), b"installing")
-        .await
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    let installing_marker = temp_dir.join(".croopor-installing");
+    async_fs::write(
+        runtime_filesystem_path(&installing_marker).as_ref(),
+        b"installing",
+    )
+    .await
+    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
 
     let install_result = async {
         let all_runtimes = fetch_runtime_json::<RuntimeManifest>(RUNTIME_MANIFEST_URL).await?;
@@ -89,19 +97,30 @@ pub(super) async fn install_managed_runtime(
     .await;
 
     if let Err(error) = install_result {
-        let _ = async_fs::remove_dir_all(&temp_dir).await;
+        let _ = async_fs::remove_dir_all(runtime_filesystem_path(&temp_dir).as_ref()).await;
         return Err(error);
     }
 
-    let _ = async_fs::remove_file(temp_dir.join(".croopor-installing")).await;
-    if let Err(error) = async_fs::write(temp_dir.join(".croopor-ready"), b"ready").await {
-        let _ = async_fs::remove_dir_all(&temp_dir).await;
+    let _ = async_fs::remove_file(runtime_filesystem_path(&installing_marker).as_ref()).await;
+    let ready_marker = temp_dir.join(".croopor-ready");
+    if let Err(error) =
+        async_fs::write(runtime_filesystem_path(&ready_marker).as_ref(), b"ready").await
+    {
+        let _ = async_fs::remove_dir_all(runtime_filesystem_path(&temp_dir).as_ref()).await;
         return Err(JavaRuntimeLookupError::Download(error.to_string()));
     }
-    if let Err(error) = async_fs::rename(&temp_dir, dest_dir).await {
-        let _ = async_fs::remove_dir_all(&temp_dir).await;
+    if let Err(error) = async_fs::rename(
+        runtime_filesystem_path(&temp_dir).as_ref(),
+        runtime_filesystem_path(dest_dir).as_ref(),
+    )
+    .await
+    {
+        let _ = async_fs::remove_dir_all(runtime_filesystem_path(&temp_dir).as_ref()).await;
         return Err(JavaRuntimeLookupError::Download(error.to_string()));
     }
+    observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+        component: component.as_str().to_string(),
+    });
 
     Ok(())
 }
@@ -112,37 +131,38 @@ async fn persist_component_manifest_proof(
 ) -> Result<(), JavaRuntimeLookupError> {
     let bytes = serde_json::to_vec_pretty(component_manifest)
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-    async_fs::write(temp_dir.join(COMPONENT_MANIFEST_PROOF_FILE), bytes)
+    let proof_path = temp_dir.join(COMPONENT_MANIFEST_PROOF_FILE);
+    async_fs::write(runtime_filesystem_path(&proof_path).as_ref(), bytes)
         .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
 }
 
 #[cfg(test)]
 pub(super) fn remove_runtime_install_path(path: &Path) -> std::io::Result<()> {
-    let metadata = match fs::symlink_metadata(path) {
+    let metadata = match fs::symlink_metadata(runtime_filesystem_path(path).as_ref()) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
 
     if metadata.is_dir() {
-        fs::remove_dir_all(path)
+        fs::remove_dir_all(runtime_filesystem_path(path).as_ref())
     } else {
-        fs::remove_file(path)
+        fs::remove_file(runtime_filesystem_path(path).as_ref())
     }
 }
 
 pub(super) async fn remove_runtime_install_path_async(path: &Path) -> std::io::Result<()> {
-    let metadata = match async_fs::symlink_metadata(path).await {
+    let metadata = match async_fs::symlink_metadata(runtime_filesystem_path(path).as_ref()).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
 
     if metadata.is_dir() {
-        async_fs::remove_dir_all(path).await
+        async_fs::remove_dir_all(runtime_filesystem_path(path).as_ref()).await
     } else {
-        async_fs::remove_file(path).await
+        async_fs::remove_file(runtime_filesystem_path(path).as_ref()).await
     }
 }
 
@@ -160,7 +180,7 @@ pub(super) async fn install_runtime_manifest_files(
             .await?;
     }
 
-    let total_files = plan.file_entries.len();
+    let total_files = plan.file_entries.len() + plan.link_entries.len();
     let total_bytes = plan
         .file_entries
         .iter()
@@ -171,111 +191,80 @@ pub(super) async fn install_runtime_manifest_files(
             component: component.to_string(),
             current: 0,
             total: total_files,
-            file: Some("Downloading runtime files".to_string()),
             bytes_done: 0,
             bytes_total: total_bytes,
         });
     }
 
-    let mut entries = plan.file_entries.into_iter();
-    let mut tasks = JoinSet::new();
-    for _ in 0..runtime_file_download_concurrency() {
-        let Some(entry) = entries.next() else {
-            break;
-        };
-        spawn_runtime_manifest_file_install(&mut tasks, download_client.clone(), temp_dir, entry);
-    }
+    let mut file_downloads =
+        futures_util::stream::iter(plan.file_entries.into_iter().map(|entry| {
+            let download_client = download_client.clone();
+            let temp_dir = temp_dir.to_path_buf();
+            async move {
+                let (relative_path, file) = entry;
+                let bytes = runtime_manifest_file_bytes(&file);
+                Box::pin(install_runtime_manifest_file(
+                    download_client,
+                    &temp_dir,
+                    &relative_path,
+                    file,
+                ))
+                .await?;
+                Ok::<CompletedRuntimeManifestFile, JavaRuntimeLookupError>(
+                    CompletedRuntimeManifestFile { bytes },
+                )
+            }
+        }))
+        .buffer_unordered(runtime_file_download_concurrency());
 
-    let mut first_error = None;
     let mut completed_files = 0;
     let mut completed_bytes = 0_u64;
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok(Ok(completed)) => {
-                completed_files += 1;
-                completed_bytes += completed.bytes;
-                observer(RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
-                    component: component.to_string(),
-                    current: completed_files,
-                    total: total_files,
-                    file: Some(bounded_manifest_file_label(&completed.relative_path)),
-                    bytes_done: completed_bytes,
-                    bytes_total: total_bytes,
-                });
-            }
-            Ok(Err(error)) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(JavaRuntimeLookupError::Download(error.to_string()));
-                }
-            }
-        }
-
-        if first_error.is_none()
-            && let Some(entry) = entries.next()
-        {
-            spawn_runtime_manifest_file_install(
-                &mut tasks,
-                download_client.clone(),
-                temp_dir,
-                entry,
-            );
-        }
+    while let Some(result) = file_downloads.next().await {
+        let completed = result?;
+        completed_files += 1;
+        completed_bytes += completed.bytes;
+        observer(RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
+            component: component.to_string(),
+            current: completed_files,
+            total: total_files,
+            bytes_done: completed_bytes,
+            bytes_total: total_bytes,
+        });
     }
 
-    if let Some(error) = first_error {
-        return Err(error);
+    for (relative_path, file) in plan.link_entries {
+        install_runtime_manifest_file(download_client.clone(), temp_dir, &relative_path, file)
+            .await?;
+        completed_files += 1;
+        observer(RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
+            component: component.to_string(),
+            current: completed_files,
+            total: total_files,
+            bytes_done: completed_bytes,
+            bytes_total: total_bytes,
+        });
     }
 
     Ok(())
 }
 
 pub(super) struct CompletedRuntimeManifestFile {
-    pub(super) relative_path: String,
     pub(super) bytes: u64,
 }
 
 pub(super) fn runtime_manifest_file_bytes(file: &ComponentManifestFile) -> u64 {
     file.downloads
         .as_ref()
-        .and_then(|downloads| downloads.raw.as_ref())
+        .and_then(|downloads| downloads.lzma.as_ref().or(downloads.raw.as_ref()))
         .and_then(|raw| raw.size)
         .unwrap_or(0)
-}
-
-pub(super) fn spawn_runtime_manifest_file_install(
-    tasks: &mut JoinSet<Result<CompletedRuntimeManifestFile, JavaRuntimeLookupError>>,
-    download_client: reqwest::Client,
-    temp_dir: &Path,
-    entry: (String, ComponentManifestFile),
-) {
-    let temp_dir = temp_dir.to_path_buf();
-    let (relative_path, file) = entry;
-    let bytes = runtime_manifest_file_bytes(&file);
-    tasks.spawn(async move {
-        let completed_path = relative_path.clone();
-        Box::pin(install_runtime_manifest_file(
-            download_client,
-            &temp_dir,
-            &relative_path,
-            file,
-        ))
-        .await?;
-        Ok(CompletedRuntimeManifestFile {
-            relative_path: completed_path,
-            bytes,
-        })
-    });
 }
 
 #[derive(Debug, Default)]
 pub(super) struct RuntimeManifestInstallPlan {
     pub(super) directory_entries: Vec<(String, ComponentManifestFile)>,
     pub(super) file_entries: Vec<(String, ComponentManifestFile)>,
+    pub(super) link_entries: Vec<(String, ComponentManifestFile)>,
     pub(super) other_entries: Vec<(String, ComponentManifestFile)>,
 }
 
@@ -290,6 +279,7 @@ pub(super) fn plan_runtime_manifest_files(
         match file.kind.as_str() {
             "directory" => plan.directory_entries.push((relative_path, file)),
             "file" => plan.file_entries.push((relative_path, file)),
+            "link" => plan.link_entries.push((relative_path, file)),
             _ => plan.other_entries.push((relative_path, file)),
         }
     }
@@ -305,62 +295,287 @@ pub(super) async fn install_runtime_manifest_file(
 ) -> Result<(), JavaRuntimeLookupError> {
     let destination = component_manifest_destination(temp_dir, relative_path)?;
     if file.kind == "directory" {
-        async_fs::create_dir_all(&destination)
+        async_fs::create_dir_all(runtime_filesystem_path(&destination).as_ref())
             .await
             .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
         return Ok(());
     }
+    if file.kind == "link" {
+        return install_runtime_manifest_link(temp_dir, &destination, relative_path, &file).await;
+    }
     if file.kind != "file" {
-        return Ok(());
-    }
-    let Some(raw) = file.downloads.and_then(|downloads| downloads.raw) else {
         return Err(JavaRuntimeLookupError::Download(format!(
-            "runtime manifest file {} is missing download proof",
-            bounded_manifest_file_label(relative_path)
-        )));
-    };
-    if !raw.sha1.as_deref().is_some_and(runtime_sha1_is_valid) {
-        return Err(JavaRuntimeLookupError::Download(format!(
-            "runtime manifest file {} is missing checksum proof",
-            bounded_manifest_file_label(relative_path)
+            "unsupported runtime manifest entry {} ({})",
+            bounded_manifest_file_label(relative_path),
+            file.kind
         )));
     }
+    let RuntimeFileDownloadSelection { raw, lzma } =
+        select_runtime_file_downloads(relative_path, file.downloads)?;
 
     if let Some(parent) = destination.parent() {
-        async_fs::create_dir_all(parent)
+        async_fs::create_dir_all(runtime_filesystem_path(parent).as_ref())
             .await
             .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
     }
 
     let temp_path = runtime_download_temp_path(&destination);
-    let expected = RuntimeDownloadEvidence::from(&raw);
-    Box::pin(fetch_runtime_file(
-        &download_client,
-        &raw.url,
-        &temp_path,
-        expected,
-        relative_path,
-    ))
-    .await?;
-    if let Err(error) = async_fs::rename(&temp_path, &destination).await {
-        let _ = async_fs::remove_file(&temp_path).await;
+    if let Some(lzma) = lzma {
+        Box::pin(fetch_lzma_runtime_file(
+            &download_client,
+            &lzma,
+            &raw,
+            &temp_path,
+            relative_path,
+        ))
+        .await?;
+    } else {
+        let expected = RuntimeDownloadEvidence::from(&raw);
+        Box::pin(fetch_runtime_file(
+            &download_client,
+            &raw.url,
+            &temp_path,
+            expected,
+            relative_path,
+        ))
+        .await?;
+    }
+    if let Err(error) = async_fs::rename(
+        runtime_filesystem_path(&temp_path).as_ref(),
+        runtime_filesystem_path(&destination).as_ref(),
+    )
+    .await
+    {
+        let _ = async_fs::remove_file(runtime_filesystem_path(&temp_path).as_ref()).await;
         return Err(JavaRuntimeLookupError::Download(error.to_string()));
     }
     #[cfg(unix)]
     if file.executable {
         use std::os::unix::fs::PermissionsExt;
 
-        let metadata = async_fs::metadata(&destination)
-            .await
-            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(0o755);
-        async_fs::set_permissions(&destination, permissions)
+        let permissions = std::fs::Permissions::from_mode(0o755);
+        async_fs::set_permissions(runtime_filesystem_path(&destination).as_ref(), permissions)
             .await
             .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
     }
 
     Ok(())
+}
+
+struct RuntimeFileDownloadSelection {
+    raw: ComponentManifestDownload,
+    lzma: Option<ComponentManifestDownload>,
+}
+
+fn select_runtime_file_downloads(
+    relative_path: &str,
+    downloads: Option<ComponentManifestDownloads>,
+) -> Result<RuntimeFileDownloadSelection, JavaRuntimeLookupError> {
+    let Some(downloads) = downloads else {
+        return Err(JavaRuntimeLookupError::Download(format!(
+            "runtime manifest file {} is missing download proof",
+            bounded_manifest_file_label(relative_path)
+        )));
+    };
+    let Some(raw) = downloads.raw else {
+        return Err(JavaRuntimeLookupError::Download(format!(
+            "runtime manifest file {} is missing download proof",
+            bounded_manifest_file_label(relative_path)
+        )));
+    };
+    validate_runtime_download_checksum(relative_path, &raw, "file")?;
+    if let Some(lzma) = downloads.lzma.as_ref() {
+        validate_runtime_download_checksum(relative_path, lzma, "lzma file")?;
+    }
+    Ok(RuntimeFileDownloadSelection {
+        raw,
+        lzma: downloads.lzma,
+    })
+}
+
+fn validate_runtime_download_checksum(
+    relative_path: &str,
+    download: &ComponentManifestDownload,
+    label: &str,
+) -> Result<(), JavaRuntimeLookupError> {
+    if download.sha1.as_deref().is_some_and(runtime_sha1_is_valid) {
+        return Ok(());
+    }
+    Err(JavaRuntimeLookupError::Download(format!(
+        "runtime manifest {label} {} is missing checksum proof",
+        bounded_manifest_file_label(relative_path)
+    )))
+}
+
+async fn fetch_lzma_runtime_file(
+    download_client: &reqwest::Client,
+    lzma: &ComponentManifestDownload,
+    raw: &ComponentManifestDownload,
+    temp_path: &Path,
+    relative_path: &str,
+) -> Result<(), JavaRuntimeLookupError> {
+    let lzma_temp_path = runtime_lzma_download_temp_path(temp_path);
+    let compressed_expected = RuntimeDownloadEvidence::from(lzma);
+    let raw_expected = RuntimeDownloadEvidence::from(raw);
+    let result = async {
+        Box::pin(fetch_runtime_file(
+            download_client,
+            &lzma.url,
+            &lzma_temp_path,
+            compressed_expected,
+            relative_path,
+        ))
+        .await?;
+        decompress_lzma_runtime_file_to_temp(
+            &lzma_temp_path,
+            temp_path,
+            raw_expected,
+            relative_path.to_string(),
+        )
+        .await
+    }
+    .await;
+
+    let _ = async_fs::remove_file(runtime_filesystem_path(&lzma_temp_path).as_ref()).await;
+    if result.is_err() {
+        let _ = async_fs::remove_file(runtime_filesystem_path(temp_path).as_ref()).await;
+    }
+    result
+}
+
+fn runtime_lzma_download_temp_path(temp_path: &Path) -> std::path::PathBuf {
+    let mut name = temp_path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("runtime-download"))
+        .to_os_string();
+    name.push(".lzma");
+    temp_path.with_file_name(name)
+}
+
+async fn decompress_lzma_runtime_file_to_temp(
+    compressed_path: &Path,
+    output_path: &Path,
+    expected: RuntimeDownloadEvidence,
+    relative_path: String,
+) -> Result<(), JavaRuntimeLookupError> {
+    let compressed_path = compressed_path.to_path_buf();
+    let output_path = output_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let input = std::fs::File::open(runtime_filesystem_path(&compressed_path).as_ref())
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        let output = std::fs::File::create(runtime_filesystem_path(&output_path).as_ref())
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        let mut input = BufReader::new(input);
+        let mut output = RuntimeIntegrityWriter::new(output, expected.clone(), &relative_path);
+        lzma_rs::lzma_decompress(&mut input, &mut output)
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        output
+            .flush()
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        let actual = output.actual();
+        verify_runtime_download(&relative_path, &expected, &actual)
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
+    })
+    .await
+    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
+}
+
+struct RuntimeIntegrityWriter {
+    output: std::fs::File,
+    expected: RuntimeDownloadEvidence,
+    relative_path: String,
+    hasher: Sha1,
+    size: u64,
+}
+
+impl RuntimeIntegrityWriter {
+    fn new(output: std::fs::File, expected: RuntimeDownloadEvidence, relative_path: &str) -> Self {
+        Self {
+            output,
+            expected,
+            relative_path: relative_path.to_string(),
+            hasher: Sha1::new(),
+            size: 0,
+        }
+    }
+
+    fn actual(self) -> RuntimeDownloadActual {
+        RuntimeDownloadActual {
+            size: self.size,
+            sha1: format!("{:x}", self.hasher.finalize()),
+        }
+    }
+}
+
+impl Write for RuntimeIntegrityWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let next_size = self.size.saturating_add(buffer.len() as u64);
+        if let Some(expected_size) = self.expected.size
+            && next_size > expected_size
+        {
+            return Err(std::io::Error::other(
+                super::file_download::RuntimeDownloadIntegrityError::SizeMismatch {
+                    file: bounded_manifest_file_label(&self.relative_path),
+                    expected: expected_size,
+                    actual: next_size,
+                }
+                .to_string(),
+            ));
+        }
+        let written = self.output.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
+        self.size += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+}
+
+async fn install_runtime_manifest_link(
+    temp_dir: &Path,
+    destination: &Path,
+    relative_path: &str,
+    file: &ComponentManifestFile,
+) -> Result<(), JavaRuntimeLookupError> {
+    let Some(target) = file.target.as_deref() else {
+        return Err(JavaRuntimeLookupError::Download(format!(
+            "runtime manifest link {} is missing target",
+            bounded_manifest_file_label(relative_path)
+        )));
+    };
+    component_manifest_link_target_path(temp_dir, destination, relative_path, target)?;
+    if let Some(parent) = destination.parent() {
+        async_fs::create_dir_all(runtime_filesystem_path(parent).as_ref())
+            .await
+            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    }
+
+    install_runtime_manifest_symlink(target.to_string(), destination.to_path_buf()).await
+}
+
+#[cfg(unix)]
+async fn install_runtime_manifest_symlink(
+    target: String,
+    destination: std::path::PathBuf,
+) -> Result<(), JavaRuntimeLookupError> {
+    tokio::task::spawn_blocking(move || {
+        std::os::unix::fs::symlink(target, runtime_filesystem_path(&destination).as_ref())
+    })
+    .await
+    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
+    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
+}
+
+#[cfg(not(unix))]
+async fn install_runtime_manifest_symlink(
+    _target: String,
+    _destination: std::path::PathBuf,
+) -> Result<(), JavaRuntimeLookupError> {
+    Err(JavaRuntimeLookupError::Download(
+        "runtime manifest link entries are unsupported on this platform".to_string(),
+    ))
 }
 
 fn runtime_sha1_is_valid(value: &str) -> bool {

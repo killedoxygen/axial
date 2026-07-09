@@ -1,6 +1,7 @@
 use super::file_download::{
     RuntimeDownloadActual, RuntimeDownloadEvidence, available_runtime_parallelism,
-    component_manifest_destination, verify_runtime_download,
+    component_manifest_destination, component_manifest_link_target_path, runtime_filesystem_path,
+    verify_runtime_download,
 };
 use super::layout::{
     java_executable, runtime_cache_dir, runtime_executable_ready, runtime_os_arch,
@@ -169,7 +170,7 @@ pub(super) fn resolve_component_runtime(
 }
 
 pub(super) fn component_runtime_ready_without_probe(base_dir: &Path, component: &str) -> bool {
-    if !base_dir.exists() {
+    if !runtime_filesystem_path(base_dir).as_ref().exists() {
         return false;
     }
 
@@ -186,7 +187,7 @@ pub(super) fn component_runtime_ready_without_probe(base_dir: &Path, component: 
 }
 
 fn component_runtime_executable_present(base_dir: &Path, component: &str) -> bool {
-    if !base_dir.exists() {
+    if !runtime_filesystem_path(base_dir).as_ref().exists() {
         return false;
     }
 
@@ -196,7 +197,10 @@ fn component_runtime_executable_present(base_dir: &Path, component: &str) -> boo
         base_dir.join(component),
     ]
     .into_iter()
-    .any(|candidate| java_executable(&candidate).is_file())
+    .any(|candidate| {
+        let java = java_executable(&candidate);
+        runtime_filesystem_path(&java).as_ref().is_file()
+    })
 }
 
 pub(super) fn resolve_managed_runtime(
@@ -210,7 +214,7 @@ pub(super) fn resolve_override_runtime(
     path: &Path,
     preferred_component: &RuntimeId,
 ) -> Result<RuntimeRecord, JavaRuntimeLookupError> {
-    if !path.is_file() {
+    if !runtime_filesystem_path(path).as_ref().is_file() {
         return Err(JavaRuntimeLookupError::NotFound {
             component: path.to_string_lossy().to_string(),
             major: 0,
@@ -233,7 +237,7 @@ pub(super) fn resolve_override_runtime(
     })
 }
 pub(super) fn inspect_component_runtime(base_dir: &Path, component: &str) -> Option<RuntimeRecord> {
-    if !base_dir.exists() {
+    if !runtime_filesystem_path(base_dir).as_ref().exists() {
         return None;
     }
 
@@ -304,13 +308,20 @@ pub(super) fn detect_runtime_state(
     let java_exe = java_executable(runtime_root);
 
     if require_ready_marker {
-        if installing_marker.exists() {
+        if runtime_filesystem_path(&installing_marker)
+            .as_ref()
+            .exists()
+        {
             return RuntimeInstallState::Installing;
         }
-        if ready_marker.is_file() && managed_runtime_contents_verified_without_probe(runtime_root) {
+        if runtime_filesystem_path(&ready_marker).as_ref().is_file()
+            && managed_runtime_contents_verified_without_probe(runtime_root)
+        {
             return RuntimeInstallState::Ready;
         }
-        if ready_marker.exists() || runtime_root.exists() {
+        if runtime_filesystem_path(&ready_marker).as_ref().exists()
+            || runtime_filesystem_path(runtime_root).as_ref().exists()
+        {
             return RuntimeInstallState::Broken;
         }
         return RuntimeInstallState::Missing;
@@ -319,10 +330,15 @@ pub(super) fn detect_runtime_state(
     if runtime_executable_ready(&java_exe) {
         return RuntimeInstallState::Ready;
     }
-    if installing_marker.exists() {
+    if runtime_filesystem_path(&installing_marker)
+        .as_ref()
+        .exists()
+    {
         return RuntimeInstallState::Installing;
     }
-    if ready_marker.exists() || runtime_root.exists() {
+    if runtime_filesystem_path(&ready_marker).as_ref().exists()
+        || runtime_filesystem_path(runtime_root).as_ref().exists()
+    {
         return RuntimeInstallState::Broken;
     }
     RuntimeInstallState::Missing
@@ -330,41 +346,69 @@ pub(super) fn detect_runtime_state(
 
 fn persisted_runtime_manifest_verified(runtime_root: &Path) -> bool {
     let manifest_path = runtime_root.join(COMPONENT_MANIFEST_PROOF_FILE);
-    let Ok(data) = std::fs::read(&manifest_path) else {
+    let Ok(data) = std::fs::read(runtime_filesystem_path(&manifest_path).as_ref()) else {
         return false;
     };
     let Ok(manifest) = serde_json::from_slice::<ComponentManifest>(&data) else {
         return false;
     };
 
-    let mut jobs = Vec::new();
+    let mut file_jobs = Vec::new();
+    let mut link_jobs = Vec::new();
+    let mut saw_file = false;
     for (relative_path, file) in manifest.files {
-        if file.kind != "file" {
-            continue;
-        }
-        let Some(raw) = file.downloads.and_then(|downloads| downloads.raw) else {
-            return false;
-        };
-        let Some(expected_sha1) = raw.sha1.as_deref() else {
-            return false;
-        };
-        if !runtime_sha1_hex(expected_sha1) {
-            return false;
-        }
         let Ok(path) = component_manifest_destination(runtime_root, &relative_path) else {
             return false;
         };
-        jobs.push(RuntimeVerificationJob {
-            relative_path,
-            path,
-            expected: RuntimeDownloadEvidence {
-                size: raw.size,
-                sha1: raw.sha1,
-            },
-        });
+        match file.kind.as_str() {
+            "directory" => {
+                if !runtime_filesystem_path(&path).as_ref().is_dir() {
+                    return false;
+                }
+            }
+            "file" => {
+                let Some(raw) = file.downloads.and_then(|downloads| downloads.raw) else {
+                    return false;
+                };
+                let Some(expected_sha1) = raw.sha1.as_deref() else {
+                    return false;
+                };
+                if !runtime_sha1_hex(expected_sha1) {
+                    return false;
+                }
+                saw_file = true;
+                file_jobs.push(RuntimeVerificationJob {
+                    relative_path,
+                    path,
+                    expected: RuntimeDownloadEvidence {
+                        size: raw.size,
+                        sha1: raw.sha1,
+                    },
+                });
+            }
+            "link" => {
+                let Some(target) = file.target else {
+                    return false;
+                };
+                let Ok(target_path) = component_manifest_link_target_path(
+                    runtime_root,
+                    &path,
+                    &relative_path,
+                    &target,
+                ) else {
+                    return false;
+                };
+                link_jobs.push(RuntimeLinkVerificationJob {
+                    path,
+                    target,
+                    target_path,
+                });
+            }
+            _ => return false,
+        }
     }
 
-    !jobs.is_empty() && verify_runtime_jobs(jobs)
+    saw_file && verify_runtime_jobs(file_jobs) && link_jobs.into_iter().all(verify_runtime_link_job)
 }
 
 #[derive(Clone)]
@@ -404,12 +448,39 @@ fn verify_runtime_job(job: RuntimeVerificationJob) -> bool {
     verify_runtime_download(&job.relative_path, &job.expected, &actual).is_ok()
 }
 
+struct RuntimeLinkVerificationJob {
+    path: PathBuf,
+    target: String,
+    target_path: PathBuf,
+}
+
+#[cfg(unix)]
+fn verify_runtime_link_job(job: RuntimeLinkVerificationJob) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(runtime_filesystem_path(&job.path).as_ref())
+    else {
+        return false;
+    };
+    if !metadata.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(actual_target) = std::fs::read_link(runtime_filesystem_path(&job.path).as_ref()) else {
+        return false;
+    };
+    actual_target == Path::new(&job.target)
+        && runtime_filesystem_path(&job.target_path).as_ref().exists()
+}
+
+#[cfg(not(unix))]
+fn verify_runtime_link_job(_job: RuntimeLinkVerificationJob) -> bool {
+    false
+}
+
 fn runtime_sha1_hex(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn runtime_file_actual(path: &Path) -> std::io::Result<RuntimeDownloadActual> {
-    let mut file = std::fs::File::open(path)?;
+    let mut file = std::fs::File::open(runtime_filesystem_path(path).as_ref())?;
     let mut hasher = Sha1::new();
     let mut size = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];

@@ -180,7 +180,7 @@ fn client() -> &'static reqwest::Client {
             ))
             .tcp_keepalive(Duration::from_secs(LOADER_HTTP_CLIENT_TCP_KEEPALIVE_SECS))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .expect("loader HTTP client configuration should be valid")
     })
 }
 

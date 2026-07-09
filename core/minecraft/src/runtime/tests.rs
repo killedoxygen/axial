@@ -6,8 +6,9 @@ use super::{
     fetch_runtime_file, fetch_runtime_json, install_runtime_manifest_file,
     install_runtime_manifest_files, java_executable, java_executable_for_os,
     plan_runtime_manifest_files, remove_runtime_install_path, remove_runtime_install_path_async,
-    runtime_download_client, runtime_file_download_concurrency_for, runtime_install_lock_from_map,
-    runtime_os_arch_for, verify_runtime_download,
+    runtime_download_client, runtime_file_download_concurrency_for, runtime_install_lock_file_path,
+    runtime_install_lock_from_map, runtime_os_arch_for, runtime_windows_verbatim_path_string,
+    verify_runtime_download,
 };
 use crate::JavaVersion;
 use serde::Deserialize;
@@ -15,7 +16,10 @@ use sha1::{Digest as _, Sha1};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -34,11 +38,18 @@ fn actual(size: u64, sha1: &str) -> RuntimeDownloadActual {
     }
 }
 
+fn sha1_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 fn manifest_file(kind: &str) -> ComponentManifestFile {
     ComponentManifestFile {
         kind: kind.to_string(),
         executable: false,
         downloads: None,
+        target: None,
     }
 }
 
@@ -52,7 +63,45 @@ fn downloadable_manifest_file(url: &str, size: u64, sha1: &str) -> ComponentMani
                 sha1: Some(sha1.to_string()),
                 size: Some(size),
             }),
+            lzma: None,
         }),
+        target: None,
+    }
+}
+
+fn downloadable_lzma_manifest_file(
+    raw_url: &str,
+    raw_size: u64,
+    raw_sha1: &str,
+    lzma_url: &str,
+    lzma_size: u64,
+    lzma_sha1: &str,
+) -> ComponentManifestFile {
+    ComponentManifestFile {
+        kind: "file".to_string(),
+        executable: false,
+        downloads: Some(ComponentManifestDownloads {
+            raw: Some(ComponentManifestDownload {
+                url: raw_url.to_string(),
+                sha1: Some(raw_sha1.to_string()),
+                size: Some(raw_size),
+            }),
+            lzma: Some(ComponentManifestDownload {
+                url: lzma_url.to_string(),
+                sha1: Some(lzma_sha1.to_string()),
+                size: Some(lzma_size),
+            }),
+        }),
+        target: None,
+    }
+}
+
+fn manifest_link(target: &str) -> ComponentManifestFile {
+    ComponentManifestFile {
+        kind: "link".to_string(),
+        executable: false,
+        downloads: None,
+        target: Some(target.to_string()),
     }
 }
 
@@ -210,13 +259,33 @@ fn component_manifest_destination_rejects_drive_like_path_with_backslashes() {
 }
 
 #[test]
+fn runtime_windows_verbatim_path_transform_handles_deep_runtime_paths() {
+    assert_eq!(
+        runtime_windows_verbatim_path_string(
+            r"C:/Users/Alice/AppData/Roaming/croopor/runtimes/java-runtime-delta/bin/javaw.exe"
+        ),
+        r"\\?\C:\Users\Alice\AppData\Roaming\croopor\runtimes\java-runtime-delta\bin\javaw.exe"
+    );
+    assert_eq!(
+        runtime_windows_verbatim_path_string(
+            r"\\server\share\croopor\runtimes\java-runtime-delta\lib\jvm.cfg"
+        ),
+        r"\\?\UNC\server\share\croopor\runtimes\java-runtime-delta\lib\jvm.cfg"
+    );
+    assert_eq!(
+        runtime_windows_verbatim_path_string(r"\\?\C:\already\verbatim\javaw.exe"),
+        r"\\?\C:\already\verbatim\javaw.exe"
+    );
+}
+
+#[test]
 fn runtime_file_download_concurrency_is_adaptive_and_bounded() {
-    assert_eq!(runtime_file_download_concurrency_for(0), 2);
-    assert_eq!(runtime_file_download_concurrency_for(1), 2);
-    assert_eq!(runtime_file_download_concurrency_for(2), 4);
-    assert_eq!(runtime_file_download_concurrency_for(3), 6);
-    assert_eq!(runtime_file_download_concurrency_for(4), 8);
-    assert_eq!(runtime_file_download_concurrency_for(64), 8);
+    assert_eq!(runtime_file_download_concurrency_for(0), 8);
+    assert_eq!(runtime_file_download_concurrency_for(1), 8);
+    assert_eq!(runtime_file_download_concurrency_for(2), 8);
+    assert_eq!(runtime_file_download_concurrency_for(3), 12);
+    assert_eq!(runtime_file_download_concurrency_for(8), 32);
+    assert_eq!(runtime_file_download_concurrency_for(64), 32);
 }
 
 #[test]
@@ -226,7 +295,11 @@ fn runtime_manifest_install_plan_sorts_directories_before_files() {
     files.insert("bin/java".to_string(), manifest_file("file"));
     files.insert("lib/server".to_string(), manifest_file("directory"));
     files.insert("bin".to_string(), manifest_file("directory"));
-    files.insert("ignored-entry".to_string(), manifest_file("link"));
+    files.insert(
+        "legal/module/LICENSE".to_string(),
+        manifest_link("../base/LICENSE"),
+    );
+    files.insert("ignored-entry".to_string(), manifest_file("unknown"));
 
     let plan = plan_runtime_manifest_files(files);
 
@@ -238,6 +311,10 @@ fn runtime_manifest_install_plan_sorts_directories_before_files() {
         planned_paths(&plan.file_entries),
         vec!["bin/java", "lib/server/libjvm.so"]
     );
+    assert_eq!(
+        planned_paths(&plan.link_entries),
+        vec!["legal/module/LICENSE"]
+    );
     assert_eq!(planned_paths(&plan.other_entries), vec!["ignored-entry"]);
 }
 
@@ -246,16 +323,8 @@ async fn runtime_manifest_install_reports_file_progress() {
     let root = unique_temp_root("croopor-runtime-progress-test");
     let java_bytes = b"java".to_vec();
     let cfg_bytes = b"cfg".to_vec();
-    let java_sha1 = {
-        let mut hasher = Sha1::new();
-        hasher.update(&java_bytes);
-        format!("{:x}", hasher.finalize())
-    };
-    let cfg_sha1 = {
-        let mut hasher = Sha1::new();
-        hasher.update(&cfg_bytes);
-        format!("{:x}", hasher.finalize())
-    };
+    let java_sha1 = sha1_hex(&java_bytes);
+    let cfg_sha1 = sha1_hex(&cfg_bytes);
     let java_url = serve_runtime_download(java_bytes.clone()).await;
     let cfg_url = serve_runtime_response(
         200,
@@ -288,7 +357,6 @@ async fn runtime_manifest_install_reports_file_progress() {
             component: "java-runtime-delta".to_string(),
             current: 0,
             total: 2,
-            file: Some("Downloading runtime files".to_string()),
             bytes_done: 0,
             bytes_total: (b"java".len() + b"cfg".len()) as u64,
         })
@@ -306,21 +374,102 @@ async fn runtime_manifest_install_reports_file_progress() {
             .collect::<Vec<_>>(),
         vec![(0, 2), (1, 2), (2, 2)]
     );
-    let completed_files = events
-        .iter()
-        .filter_map(|event| match event {
-            RuntimeEnsureEvent::InstallingManagedRuntimeFiles { file, current, .. }
-                if *current > 0 =>
-            {
-                file.as_deref()
-            }
-            _ => None,
-        })
-        .collect::<std::collections::HashSet<_>>();
-    assert_eq!(
-        completed_files,
-        std::collections::HashSet::from(["bin/java", "lib/jvm.cfg"])
+    assert!(events.iter().all(|event| matches!(
+        event,
+        RuntimeEnsureEvent::InstallingManagedRuntimeFiles { .. }
+    )));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_manifest_install_creates_link_entries_and_counts_them() {
+    let root = unique_temp_root("croopor-runtime-link-install-test");
+    let license_bytes = b"license".to_vec();
+    let license_sha1 = sha1_hex(&license_bytes);
+    let license_url = serve_runtime_download(license_bytes.clone()).await;
+    let mut files = HashMap::new();
+    files.insert(
+        "legal/java.base/LICENSE".to_string(),
+        downloadable_manifest_file(&license_url, license_bytes.len() as u64, &license_sha1),
     );
+    files.insert(
+        "legal/java.compiler/LICENSE".to_string(),
+        manifest_link("../java.base/LICENSE"),
+    );
+    let mut events = Vec::new();
+
+    install_runtime_manifest_files("java-runtime-delta", &root, files, &mut |event| {
+        events.push(event);
+    })
+    .await
+    .expect("runtime manifest with link");
+
+    assert_eq!(
+        fs::read_link(root.join("legal/java.compiler/LICENSE")).expect("runtime link"),
+        PathBuf::from("../java.base/LICENSE")
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
+                    current,
+                    total,
+                    bytes_done,
+                    bytes_total,
+                    ..
+                } => Some((*current, *total, *bytes_done, *bytes_total)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (0, 2, 0, license_bytes.len() as u64),
+            (1, 2, license_bytes.len() as u64, license_bytes.len() as u64),
+            (2, 2, license_bytes.len() as u64, license_bytes.len() as u64)
+        ]
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_manifest_link_rejects_target_escape() {
+    let root = unique_temp_root("croopor-runtime-link-escape-test");
+    let result = install_runtime_manifest_file(
+        runtime_download_client().clone(),
+        &root,
+        "bin/java-link",
+        manifest_link("../../outside"),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(JavaRuntimeLookupError::Download(message))
+            if message.contains("unsafe runtime manifest link target")
+    ));
+    assert!(!root.join("bin").join("java-link").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(not(unix))]
+#[tokio::test]
+async fn runtime_manifest_link_fails_explicitly_on_non_unix() {
+    let root = unique_temp_root("croopor-runtime-link-non-unix-test");
+    let result = install_runtime_manifest_file(
+        runtime_download_client().clone(),
+        &root,
+        "bin/java-link",
+        manifest_link("java"),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(JavaRuntimeLookupError::Download(message))
+            if message.contains("unsupported on this platform")
+    ));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -388,6 +537,16 @@ fn runtime_install_lock_recovers_from_poisoned_map_lock() {
     let recovered_lock = runtime_install_lock_from_map(&locks, "java-runtime-delta");
 
     assert!(Arc::ptr_eq(&recovered_lock, &seeded_install_lock));
+}
+
+#[test]
+fn runtime_install_file_lock_path_is_component_sibling() {
+    let install_root = Path::new("/runtime-cache").join("java-runtime-delta");
+
+    assert_eq!(
+        runtime_install_lock_file_path(&install_root),
+        Path::new("/runtime-cache").join("java-runtime-delta.install.lock")
+    );
 }
 
 #[test]
@@ -473,6 +632,30 @@ fn managed_runtime_manifest_drift_is_broken() {
     fs::write(java_executable(&root), b"changed java").expect("modify java");
     make_executable(&java_executable(&root));
 
+    assert_eq!(
+        detect_runtime_state(&root, true),
+        RuntimeInstallState::Broken
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_runtime_verifies_manifest_links() {
+    let root = unique_temp_root("croopor-managed-runtime-link-proof-test");
+    write_runtime_executable_fixture(&root);
+    let link = java_executable(&root).with_file_name("java-link");
+    std::os::unix::fs::symlink("java", &link).expect("runtime symlink");
+    write_runtime_manifest_proof_for_java_and_link(&root);
+    fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
+
+    assert_eq!(
+        detect_runtime_state(&root, true),
+        RuntimeInstallState::Ready
+    );
+
+    fs::remove_file(link).expect("remove runtime symlink");
     assert_eq!(
         detect_runtime_state(&root, true),
         RuntimeInstallState::Broken
@@ -692,6 +875,37 @@ async fn runtime_file_download_streams_and_verifies_to_temp() {
 }
 
 #[tokio::test]
+async fn runtime_file_download_retries_transient_status_errors() {
+    let root = unique_temp_root("croopor-runtime-download-retry-test");
+    fs::create_dir_all(&root).expect("download root");
+    let temp_path = root.join("java.croopor-tmp");
+    let (url, attempts) = serve_runtime_retry_responses(vec![
+        (503, b"try again".to_vec()),
+        (503, b"try again".to_vec()),
+        (200, b"hello".to_vec()),
+    ])
+    .await;
+    let client = runtime_download_client();
+
+    fetch_runtime_file(
+        &client,
+        &url,
+        &temp_path,
+        expected(Some(5), Some("aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d")),
+        "bin/java",
+    )
+    .await
+    .expect("runtime download should retry transient failures");
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        fs::read(&temp_path).expect("retried runtime file"),
+        b"hello"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn runtime_file_download_removes_temp_on_verification_error() {
     let root = unique_temp_root("croopor-runtime-download-cleanup-test");
     fs::create_dir_all(&root).expect("download root");
@@ -753,7 +967,9 @@ async fn runtime_manifest_file_requires_checksum_proof() {
                 sha1: None,
                 size: Some(4),
             }),
+            lzma: None,
         }),
+        target: None,
     };
 
     let result =
@@ -770,6 +986,32 @@ async fn runtime_manifest_file_requires_checksum_proof() {
 }
 
 #[tokio::test]
+async fn runtime_manifest_file_prefers_lzma_and_verifies_decompressed_output() {
+    let root = unique_temp_root("croopor-runtime-lzma-test");
+    let raw_bytes = b"decompressed runtime file".to_vec();
+    let compressed_bytes = lzma_compress_bytes(&raw_bytes);
+    let lzma_url = serve_runtime_download(compressed_bytes.clone()).await;
+    let file = downloadable_lzma_manifest_file(
+        "http://127.0.0.1:9/raw-runtime-file",
+        raw_bytes.len() as u64,
+        &sha1_hex(&raw_bytes),
+        &lzma_url,
+        compressed_bytes.len() as u64,
+        &sha1_hex(&compressed_bytes),
+    );
+
+    install_runtime_manifest_file(runtime_download_client().clone(), &root, "bin/java", file)
+        .await
+        .expect("runtime lzma file install");
+
+    assert_eq!(
+        fs::read(root.join("bin").join("java")).expect("decompressed runtime file"),
+        raw_bytes
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn runtime_manifest_file_rejects_invalid_checksum_proof() {
     let root = unique_temp_root("croopor-runtime-invalid-checksum-test");
     let file = ComponentManifestFile {
@@ -781,7 +1023,9 @@ async fn runtime_manifest_file_rejects_invalid_checksum_proof() {
                 sha1: Some("not-a-sha1".to_string()),
                 size: Some(4),
             }),
+            lzma: None,
         }),
+        target: None,
     };
 
     let result =
@@ -940,6 +1184,53 @@ fn write_runtime_manifest_proof_for_java(root: &Path) {
 }
 
 #[cfg(unix)]
+fn write_runtime_manifest_proof_for_java_and_link(root: &Path) {
+    let java = java_executable(root);
+    let link = java.with_file_name("java-link");
+    let bytes = fs::read(&java).expect("read java fixture");
+    let relative_path = java
+        .strip_prefix(root)
+        .expect("java under root")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let link_relative_path = link
+        .strip_prefix(root)
+        .expect("link under root")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let manifest = serde_json::json!({
+        "files": {
+            relative_path: {
+                "type": "file",
+                "downloads": {
+                    "raw": {
+                        "url": "https://example.invalid/java",
+                        "sha1": sha1_hex(&bytes),
+                        "size": bytes.len()
+                    }
+                }
+            },
+            link_relative_path: {
+                "type": "link",
+                "target": "java"
+            }
+        }
+    });
+    fs::write(
+        root.join(".croopor-runtime-manifest.json"),
+        serde_json::to_vec(&manifest).expect("manifest json"),
+    )
+    .expect("write runtime manifest proof with link");
+}
+
+fn lzma_compress_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut input = std::io::Cursor::new(bytes);
+    let mut output = Vec::new();
+    lzma_rs::lzma_compress(&mut input, &mut output).expect("compress lzma fixture");
+    output
+}
+
+#[cfg(unix)]
 fn make_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -995,4 +1286,42 @@ async fn serve_runtime_response(
             .expect("runtime test response body");
     });
     format!("http://{address}{path}")
+}
+
+async fn serve_runtime_retry_responses(
+    responses: Vec<(u16, Vec<u8>)>,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("runtime retry test listener");
+    let address = listener
+        .local_addr()
+        .expect("runtime retry test listener address");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_in_task = Arc::clone(&attempts);
+    tokio::spawn(async move {
+        for (status, body) in responses {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("runtime retry test connection");
+            attempts_in_task.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let headers = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("runtime retry response headers");
+            socket
+                .write_all(&body)
+                .await
+                .expect("runtime retry response body");
+        }
+    });
+    (format!("http://{address}/runtime.bin"), attempts)
 }

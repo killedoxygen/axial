@@ -74,7 +74,9 @@ export function DownloadsView(): JSX.Element {
                 {pct}
                 <em>%</em>
               </span>
-              <span class="cp-dl-live-elapsed">{formatElapsedTime(active.startedAt, now)}</span>
+              {active.startedAt !== null && (
+                <span class="cp-dl-live-elapsed">{formatElapsedTime(active.startedAt, now)}</span>
+              )}
             </div>
           </div>
           <Meter value={pct} height={6} ariaLabel={`Install progress for ${title}`} />

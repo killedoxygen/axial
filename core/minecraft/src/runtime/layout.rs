@@ -1,3 +1,4 @@
+use super::file_download::runtime_filesystem_path;
 use std::path::{Path, PathBuf};
 
 pub(super) fn runtime_cache_dir() -> PathBuf {
@@ -58,7 +59,7 @@ pub(super) fn java_executable_for_os(runtime_root: &Path, target_os: &str) -> Pa
 }
 
 pub(super) fn runtime_executable_ready(java_exe: &Path) -> bool {
-    if !java_exe.is_file() {
+    if !runtime_filesystem_path(java_exe).as_ref().is_file() {
         return false;
     }
 
@@ -66,7 +67,8 @@ pub(super) fn runtime_executable_ready(java_exe: &Path) -> bool {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        java_exe
+        runtime_filesystem_path(java_exe)
+            .as_ref()
             .metadata()
             .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
@@ -81,7 +83,7 @@ pub(super) fn runtime_executable_ready(java_exe: &Path) -> bool {
             .unwrap_or_default();
         return runtime_config_candidates(&runtime_root)
             .into_iter()
-            .any(|candidate| candidate.is_file());
+            .any(|candidate| runtime_filesystem_path(&candidate).as_ref().is_file());
     }
 
     #[cfg(not(any(unix, windows)))]

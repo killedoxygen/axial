@@ -28,20 +28,28 @@ pub(super) fn spawn_runtime_ensure_pipeline(
         let mut plan_done_seen = 0_u64;
         let ensure_result =
             ensure_runtime_with_events(&mc_dir, &java_version, "", false, |event| {
-                if let RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
-                    bytes_done,
-                    bytes_total,
-                    ..
-                } = &event
-                {
-                    if !plan_contribution_resolved && *bytes_total > 0 {
-                        plan.resolve_contribution(*bytes_total);
-                        plan_contribution_resolved = true;
+                match &event {
+                    RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
+                        bytes_done,
+                        bytes_total,
+                        ..
+                    } => {
+                        if !plan_contribution_resolved && *bytes_total > 0 {
+                            plan.resolve_contribution(*bytes_total);
+                            plan_contribution_resolved = true;
+                        }
+                        if *bytes_done > plan_done_seen {
+                            plan.add_done(*bytes_done - plan_done_seen);
+                            plan_done_seen = *bytes_done;
+                        }
                     }
-                    if *bytes_done > plan_done_seen {
-                        plan.add_done(*bytes_done - plan_done_seen);
-                        plan_done_seen = *bytes_done;
+                    RuntimeEnsureEvent::ManagedRuntimeReady { .. } => {
+                        if !plan_contribution_resolved {
+                            plan.resolve_contribution(0);
+                            plan_contribution_resolved = true;
+                        }
                     }
+                    RuntimeEnsureEvent::DownloadingManagedRuntime { .. } => {}
                 }
                 let _ = progress_tx.send(runtime_ensure_progress(&event_java_version, event));
             })
@@ -71,31 +79,14 @@ pub(super) fn runtime_ensure_progress(
                 java_version.major_version
             )),
         ),
-        RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
-            component,
-            current,
-            total,
-            file,
-            ..
-        } => {
-            let detail = match file {
-                Some(file) if current > 0 && total > 0 => {
-                    format!("Runtime files ({current}/{total}): {file}")
-                }
-                Some(file) => file,
-                None if total > 0 => format!("Runtime files ({current}/{total})"),
-                None => format!(
-                    "Installing {} (Java {})",
-                    runtime_component_label(&component),
-                    java_version.major_version
-                ),
-            };
-            progress(
-                "java_runtime",
-                bounded_progress_count(current),
-                bounded_progress_count(total),
-                Some(detail),
-            )
+        RuntimeEnsureEvent::InstallingManagedRuntimeFiles { current, total, .. } => progress(
+            "java_runtime",
+            bounded_progress_count(current),
+            bounded_progress_count(total),
+            None,
+        ),
+        RuntimeEnsureEvent::ManagedRuntimeReady { .. } => {
+            progress("java_runtime_ready", 1, 1, None)
         }
     }
 }

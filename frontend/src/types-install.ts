@@ -119,6 +119,7 @@ export interface InstallQueueActiveViewModel {
   queue_id: string;
   install_id?: string | null;
   operation_id?: string | null;
+  install_started_at_ms?: number | null;
   kind: 'vanilla' | 'loader';
   title: string;
   label: string;

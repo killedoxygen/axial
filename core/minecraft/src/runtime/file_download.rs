@@ -2,14 +2,19 @@ use super::manifest::ComponentManifestDownload;
 use super::model::JavaRuntimeLookupError;
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
+use std::borrow::Cow;
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use tokio::fs as async_fs;
 use tokio::io::AsyncWriteExt;
 
-const MIN_RUNTIME_FILE_DOWNLOAD_CONCURRENCY: usize = 2;
-const MAX_RUNTIME_FILE_DOWNLOAD_CONCURRENCY: usize = 8;
-const RUNTIME_FILE_DOWNLOADS_PER_CORE: usize = 2;
+const MIN_RUNTIME_FILE_DOWNLOAD_CONCURRENCY: usize = 8;
+const MAX_RUNTIME_FILE_DOWNLOAD_CONCURRENCY: usize = 32;
+const RUNTIME_FILE_DOWNLOADS_PER_CORE: usize = 4;
+const RUNTIME_DOWNLOAD_ATTEMPTS: u64 = 3;
+const RUNTIME_DOWNLOAD_CLIENT_CONNECT_TIMEOUT_SECS: u64 = 20;
+const RUNTIME_DOWNLOAD_CLIENT_READ_TIMEOUT_SECS: u64 = 120;
 const RUNTIME_DOWNLOAD_CLIENT_POOL_IDLE_TIMEOUT_SECS: u64 = 120;
 const RUNTIME_DOWNLOAD_CLIENT_TCP_KEEPALIVE_SECS: u64 = 60;
 
@@ -58,6 +63,61 @@ pub(super) fn component_manifest_destination(
     Ok(destination)
 }
 
+pub(super) fn component_manifest_link_target_path(
+    component_root: &Path,
+    link_destination: &Path,
+    link_relative_path: &str,
+    target: &str,
+) -> Result<PathBuf, JavaRuntimeLookupError> {
+    if target.trim().is_empty() || Path::new(target).is_absolute() {
+        return Err(JavaRuntimeLookupError::Download(format!(
+            "unsafe runtime manifest link target for {}",
+            bounded_manifest_file_label(link_relative_path)
+        )));
+    }
+    for segment in target.split(['/', '\\']) {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment.contains(':') {
+            return Err(JavaRuntimeLookupError::Download(format!(
+                "unsafe runtime manifest link target for {}",
+                bounded_manifest_file_label(link_relative_path)
+            )));
+        }
+    }
+
+    let root = normalize_path_lexically(component_root);
+    let parent = link_destination.parent().unwrap_or(component_root);
+    let target_path = normalize_path_lexically(&parent.join(target));
+    if !target_path.starts_with(&root) {
+        return Err(JavaRuntimeLookupError::Download(format!(
+            "unsafe runtime manifest link target for {}",
+            bounded_manifest_file_label(link_relative_path)
+        )));
+    }
+
+    Ok(target_path)
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(value) => normalized.push(value),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+        }
+    }
+    normalized
+}
+
 pub(super) fn has_unsafe_path_component(path: &Path) -> bool {
     path.components()
         .any(|component| !matches!(component, std::path::Component::Normal(_)))
@@ -79,35 +139,57 @@ pub(super) async fn fetch_runtime_file(
     expected: RuntimeDownloadEvidence,
     relative_path: &str,
 ) -> Result<(), JavaRuntimeLookupError> {
-    let result =
-        stream_runtime_file_to_temp(download_client, url, temp_path, &expected, relative_path)
-            .await;
-
-    if result.is_err() {
-        let _ = async_fs::remove_file(temp_path).await;
+    let mut attempt = 1_u64;
+    loop {
+        let result = stream_runtime_file_to_temp_attempt(
+            download_client,
+            url,
+            temp_path,
+            &expected,
+            relative_path,
+        )
+        .await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if error.retryable && attempt < RUNTIME_DOWNLOAD_ATTEMPTS => {
+                let _ = async_fs::remove_file(runtime_filesystem_path(temp_path).as_ref()).await;
+                tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
+                attempt += 1;
+            }
+            Err(error) => {
+                let _ = async_fs::remove_file(runtime_filesystem_path(temp_path).as_ref()).await;
+                return Err(error.error);
+            }
+        }
     }
-
-    result
 }
 
-pub(super) async fn stream_runtime_file_to_temp(
+async fn stream_runtime_file_to_temp_attempt(
     download_client: &reqwest::Client,
     url: &str,
     temp_path: &Path,
     expected: &RuntimeDownloadEvidence,
     relative_path: &str,
-) -> Result<(), JavaRuntimeLookupError> {
+) -> Result<(), RuntimeFileDownloadAttemptError> {
     let response = download_client
         .get(url)
         .send()
         .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        .map_err(RuntimeFileDownloadAttemptError::retryable)?;
+    let status = response.status();
+    if !status.is_success() {
+        let retryable =
+            status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        return Err(RuntimeFileDownloadAttemptError::from_parts(
+            JavaRuntimeLookupError::Download(format!("HTTP {status}")),
+            retryable,
+        ));
+    }
     if let Some(expected_size) = expected.size
         && let Some(content_length) = response.content_length()
         && content_length > expected_size
     {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(RuntimeFileDownloadAttemptError::fatal(
             RuntimeDownloadIntegrityError::SizeMismatch {
                 file: bounded_manifest_file_label(relative_path),
                 expected: expected_size,
@@ -116,20 +198,20 @@ pub(super) async fn stream_runtime_file_to_temp(
             .to_string(),
         ));
     }
-    let mut output = async_fs::File::create(temp_path)
+    let mut output = async_fs::File::create(runtime_filesystem_path(temp_path).as_ref())
         .await
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        .map_err(RuntimeFileDownloadAttemptError::fatal)?;
     let mut stream = response.bytes_stream();
     let mut hasher = Sha1::new();
     let mut actual_size = 0_u64;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        let chunk = chunk.map_err(RuntimeFileDownloadAttemptError::retryable)?;
         let next_size = actual_size.saturating_add(chunk.len() as u64);
         if let Some(expected_size) = expected.size
             && next_size > expected_size
         {
-            return Err(JavaRuntimeLookupError::Download(
+            return Err(RuntimeFileDownloadAttemptError::fatal(
                 RuntimeDownloadIntegrityError::SizeMismatch {
                     file: bounded_manifest_file_label(relative_path),
                     expected: expected_size,
@@ -141,40 +223,66 @@ pub(super) async fn stream_runtime_file_to_temp(
         output
             .write_all(&chunk)
             .await
-            .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+            .map_err(RuntimeFileDownloadAttemptError::fatal)?;
         hasher.update(&chunk);
         actual_size = next_size;
     }
     output
         .flush()
         .await
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-    output
-        .sync_all()
-        .await
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        .map_err(RuntimeFileDownloadAttemptError::fatal)?;
 
     let actual = RuntimeDownloadActual {
         size: actual_size,
         sha1: format!("{:x}", hasher.finalize()),
     };
     verify_runtime_download(relative_path, expected, &actual)
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
+        .map_err(|error| RuntimeFileDownloadAttemptError::fatal(error.to_string()))
+}
+
+#[derive(Debug)]
+struct RuntimeFileDownloadAttemptError {
+    error: JavaRuntimeLookupError,
+    retryable: bool,
+}
+
+impl RuntimeFileDownloadAttemptError {
+    fn from_parts(error: JavaRuntimeLookupError, retryable: bool) -> Self {
+        Self { error, retryable }
+    }
+
+    fn retryable(error: impl ToString) -> Self {
+        Self::from_parts(JavaRuntimeLookupError::Download(error.to_string()), true)
+    }
+
+    fn fatal(error: impl ToString) -> Self {
+        Self::from_parts(JavaRuntimeLookupError::Download(error.to_string()), false)
+    }
 }
 
 pub(super) fn runtime_download_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .user_agent("croopor/0.3")
-        .pool_max_idle_per_host(MAX_RUNTIME_FILE_DOWNLOAD_CONCURRENCY)
-        .pool_idle_timeout(std::time::Duration::from_secs(
-            RUNTIME_DOWNLOAD_CLIENT_POOL_IDLE_TIMEOUT_SECS,
-        ))
-        .tcp_keepalive(std::time::Duration::from_secs(
-            RUNTIME_DOWNLOAD_CLIENT_TCP_KEEPALIVE_SECS,
-        ))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(
+                    RUNTIME_DOWNLOAD_CLIENT_CONNECT_TIMEOUT_SECS,
+                ))
+                .read_timeout(std::time::Duration::from_secs(
+                    RUNTIME_DOWNLOAD_CLIENT_READ_TIMEOUT_SECS,
+                ))
+                .user_agent("croopor/0.3")
+                .pool_max_idle_per_host(MAX_RUNTIME_FILE_DOWNLOAD_CONCURRENCY)
+                .pool_idle_timeout(std::time::Duration::from_secs(
+                    RUNTIME_DOWNLOAD_CLIENT_POOL_IDLE_TIMEOUT_SECS,
+                ))
+                .tcp_keepalive(std::time::Duration::from_secs(
+                    RUNTIME_DOWNLOAD_CLIENT_TCP_KEEPALIVE_SECS,
+                ))
+                .build()
+                .expect("runtime download HTTP client configuration should be valid")
+        })
+        .clone()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,4 +383,46 @@ pub(super) fn bounded_manifest_file_label(relative_path: &str) -> String {
     } else {
         label
     }
+}
+
+pub(super) fn runtime_filesystem_path(path: &Path) -> Cow<'_, Path> {
+    #[cfg(windows)]
+    {
+        return windows_runtime_filesystem_path(path);
+    }
+    #[cfg(not(windows))]
+    {
+        Cow::Borrowed(path)
+    }
+}
+
+#[cfg(windows)]
+fn windows_runtime_filesystem_path(path: &Path) -> Cow<'_, Path> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    };
+    Cow::Owned(PathBuf::from(runtime_windows_verbatim_path_string(
+        absolute.to_string_lossy().as_ref(),
+    )))
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn runtime_windows_verbatim_path_string(path: &str) -> String {
+    let normalized = path.replace('/', "\\");
+    if normalized.starts_with(r"\\?\")
+        || normalized.starts_with(r"\??\")
+        || normalized.starts_with(r"\\.\")
+    {
+        return normalized;
+    }
+    if let Some(rest) = normalized.strip_prefix(r"\\") {
+        return format!(r"\\?\UNC\{}", rest.trim_start_matches('\\'));
+    }
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 3 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() && bytes[2] == b'\\' {
+        return format!(r"\\?\{normalized}");
+    }
+    normalized
 }

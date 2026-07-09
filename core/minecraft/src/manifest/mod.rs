@@ -276,7 +276,7 @@ fn manifest_client() -> &'static reqwest::Client {
             .pool_idle_timeout(Duration::from_secs(MANIFEST_CLIENT_POOL_IDLE_TIMEOUT_SECS))
             .tcp_keepalive(Duration::from_secs(MANIFEST_CLIENT_TCP_KEEPALIVE_SECS))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .expect("version manifest HTTP client configuration should be valid")
     })
 }
 

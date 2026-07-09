@@ -261,6 +261,68 @@ fn install_progress_pct_ignores_bytes_on_terminal_events() {
 }
 
 #[test]
+fn install_progress_coalescer_compacts_high_volume_events_and_keeps_terminal() {
+    let mut coalescer = InstallProgressCoalescer::default();
+    let mut emitted = Vec::new();
+
+    for current in 1..=100 {
+        let mut progress = base_progress("java_runtime");
+        progress.current = current;
+        progress.total = 100;
+        emitted.extend(coalescer.push(progress));
+    }
+    emitted.extend(coalescer.push(done_progress()));
+
+    assert!(emitted.len() < 100);
+    assert_eq!(emitted.first().map(|progress| progress.current), Some(1));
+    assert!(emitted.iter().any(|progress| progress.current == 100));
+    assert_eq!(
+        emitted.last().map(|progress| progress.phase.as_str()),
+        Some("done")
+    );
+    assert!(emitted.last().is_some_and(|progress| progress.done));
+}
+
+#[test]
+fn install_progress_coalescer_emits_byte_total_changes() {
+    let mut coalescer = InstallProgressCoalescer::default();
+    let mut first = base_progress("libraries");
+    first.bytes_done = Some(10);
+    first.bytes_total = Some(100);
+    let mut second = base_progress("libraries");
+    second.current = 2;
+    second.bytes_done = Some(10);
+    second.bytes_total = Some(200);
+
+    let first_emitted = coalescer.push(first);
+    let second_emitted = coalescer.push(second);
+
+    assert_eq!(first_emitted.len(), 1);
+    assert_eq!(second_emitted.len(), 1);
+    assert_eq!(second_emitted[0].bytes_total, Some(200));
+}
+
+#[test]
+fn install_progress_coalescer_preserves_runtime_ready_transition() {
+    let mut coalescer = InstallProgressCoalescer::default();
+    let mut emitted = Vec::new();
+    emitted.extend(coalescer.push(base_progress("java_runtime")));
+
+    let mut pending = base_progress("java_runtime");
+    pending.current = 2;
+    emitted.extend(coalescer.push(pending));
+    emitted.extend(coalescer.push(base_progress("java_runtime_ready")));
+
+    assert_eq!(
+        emitted
+            .iter()
+            .map(|progress| progress.phase.as_str())
+            .collect::<Vec<_>>(),
+        vec!["java_runtime", "java_runtime", "java_runtime_ready"]
+    );
+}
+
+#[test]
 fn install_progress_pct_falls_back_to_phase_table_without_bytes() {
     let mut progress = base_progress("java_runtime");
     progress.current = 1;
@@ -270,7 +332,33 @@ fn install_progress_pct_falls_back_to_phase_table_without_bytes() {
 
     let view_model = vanilla_install_progress_view_model(&progress);
 
-    assert_eq!(view_model.progress_pct, 94);
+    assert_eq!(view_model.progress_pct, 0);
+}
+
+#[test]
+fn install_progress_view_model_authors_runtime_copy_from_typed_counts() {
+    let mut progress = base_progress("java_runtime");
+    progress.current = 2;
+    progress.total = 5;
+    progress.file = Some("jre.bundle/Contents/Home/bin/java".to_string());
+
+    let view_model = vanilla_install_progress_view_model(&progress);
+
+    assert_eq!(view_model.label, "Java runtime files (2/5)");
+    assert_eq!(
+        view_model.active_step.expect("runtime active step").label,
+        "Java runtime files (2/5)"
+    );
+}
+
+#[test]
+fn install_progress_view_model_authors_runtime_ready_copy_from_phase() {
+    let progress = base_progress("java_runtime_ready");
+
+    let view_model = vanilla_install_progress_view_model(&progress);
+
+    assert_eq!(view_model.phase_id, "java_runtime_ready");
+    assert_eq!(view_model.label, "Java runtime ready");
 }
 
 #[test]
@@ -334,13 +422,61 @@ async fn install_events_keep_terminal_installs_subscribable_after_stream_ends() 
 
     assert!(body.contains("event: progress"));
     assert!(body.contains("\"phase\":\"done\""));
-    let (history, _, done) = state
+    let (snapshot, _) = state
         .installs()
-        .subscribe("done-install")
+        .subscribe_records("done-install")
         .await
         .expect("terminal install remains subscribable after stream completion");
-    assert!(done);
-    assert_eq!(history.len(), 1);
+    assert!(snapshot.done);
+    assert_eq!(
+        snapshot
+            .latest
+            .as_ref()
+            .map(|record| record.progress.phase.as_str()),
+        Some("done")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn install_events_replay_latest_snapshot_not_prior_progress_log() {
+    let root = temp_root("install-events-compact-replay");
+    let state = build_test_state(&root);
+    state.installs().insert("active-install".to_string()).await;
+    state
+        .installs()
+        .emit("active-install", base_progress("client_jar"))
+        .await;
+    state
+        .installs()
+        .emit("active-install", base_progress("libraries"))
+        .await;
+
+    let response = install_events_stream(&state, "active-install")
+        .await
+        .expect("active install events should be served")
+        .into_response();
+    let body_task = tokio::spawn(async move {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("sse body should complete");
+        String::from_utf8(body.to_vec()).expect("sse body is utf8")
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    state
+        .installs()
+        .emit("active-install", done_progress())
+        .await;
+    let body = timeout(Duration::from_secs(1), body_task)
+        .await
+        .expect("stream should finish after terminal progress")
+        .expect("body task should not panic");
+
+    assert!(body.contains("\"phase\":\"libraries\""));
+    assert!(body.contains("\"phase\":\"done\""));
+    assert!(!body.contains("\"phase\":\"client_jar\""));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -735,7 +871,7 @@ async fn restart_interrupted_install_retry_discards_stale_temp_without_promoting
         .join("versions")
         .join("1.21.5")
         .join("1.21.5.jar");
-    let temp_path = destination.with_extension("tmp");
+    let temp_path = launcher_managed_download_temp_path(&destination);
     fs::create_dir_all(destination.parent().expect("destination parent"))
         .expect("create destination parent");
     fs::write(&temp_path, b"partial bytes from interrupted worker")
@@ -1549,19 +1685,25 @@ async fn loader_install_events_keep_terminal_installs_subscribable_after_stream_
 
     assert!(body.contains("event: progress"));
     assert!(body.contains("\"phase\":\"done\""));
-    let (history, _, done) = state
+    let (snapshot, _) = state
         .installs()
-        .subscribe("done-install")
+        .subscribe_records("done-install")
         .await
         .expect("terminal loader install remains subscribable after stream completion");
-    assert!(done);
-    assert_eq!(history.len(), 1);
+    assert!(snapshot.done);
+    assert_eq!(
+        snapshot
+            .latest
+            .as_ref()
+            .map(|record| record.progress.phase.as_str()),
+        Some("done")
+    );
 
     let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn loader_install_events_redact_raw_progress_history() {
+async fn loader_install_events_redact_raw_terminal_progress_snapshot() {
     let root = temp_root("loader-install-events-redaction");
     let state = build_test_state(&root);
     state
@@ -1581,15 +1723,11 @@ async fn loader_install_events_redact_raw_progress_history() {
                         "provider_payload={\"token\":\"secret\"} account_id=account-secret username=SecretPlayer -Xmx8192M"
                             .to_string(),
                     ),
-                    done: false,
-                                    bytes_done: None,
+                    done: true,
+                    bytes_done: None,
                     bytes_total: None,
-},
+                },
             )
-            .await;
-    state
-        .installs()
-        .emit("raw-loader-install", done_progress())
         .await;
 
     let response = loader_install_events_stream(&state, "raw-loader-install")
@@ -2353,15 +2491,15 @@ async fn install_guardian_repair_repairs_matching_checksum_failure() {
 }
 
 #[tokio::test]
-async fn install_worker_reruns_once_after_guardian_repairs_artifact() {
-    let root = temp_root("guardian-install-repair-rerun");
+async fn install_worker_self_heals_corrupt_launcher_artifact_without_guardian_repair() {
+    let root = temp_root("execution-install-self-heal");
     let state = build_test_state(&root);
     let library_dir = root.join("library");
     configure_library_dir(&state, &library_dir);
     write_bundled_runtime_fixture(&library_dir, "java-runtime-delta");
 
     let version_id = "repair-rerun";
-    let replacement = b"fresh client from repair".to_vec();
+    let replacement = b"fresh client from execution self-heal".to_vec();
     let client_server = TestByteServer::start(replacement.clone());
     let version_body = serde_json::json!({
         "id": version_id,
@@ -2401,23 +2539,23 @@ async fn install_worker_reruns_once_after_guardian_repairs_artifact() {
     assert!(status.view_model.terminal);
     assert!(!status.view_model.failed);
     assert_eq!(status.view_model.phase_id, "done");
-    let repair = status
-        .guardian_repair
-        .as_ref()
-        .expect("guardian repair summary");
-    assert_eq!(repair.status, "repaired");
+    assert!(
+        status.guardian_repair.is_none(),
+        "Execution self-heal should not produce a Guardian repair summary"
+    );
     assert_eq!(
-        fs::read(&client_jar).expect("repaired client jar"),
+        fs::read(&client_jar).expect("self-healed client jar"),
         replacement
     );
     assert_eq!(
         client_server.request_count(),
         1,
-        "client artifact should be downloaded by Guardian repair, then reused by the resumed install"
+        "client artifact should be downloaded once by the first install attempt"
     );
-    assert!(
-        version_server.request_count() >= 2,
-        "explicit version json should be fetched for the failed attempt and the resumed attempt"
+    assert_eq!(
+        version_server.request_count(),
+        1,
+        "explicit version json should be fetched once because the install does not rerun"
     );
 
     client_server.stop();
@@ -2939,6 +3077,15 @@ fn temp_root(name: &str) -> PathBuf {
 
 fn sha1_hex(bytes: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha1::digest(bytes.as_ref()))
+}
+
+fn launcher_managed_download_temp_path(destination: &Path) -> PathBuf {
+    let mut name = destination
+        .file_name()
+        .expect("launcher managed artifact filename")
+        .to_os_string();
+    name.push(".croopor-tmp");
+    destination.with_file_name(name)
 }
 
 struct TestByteServer {
