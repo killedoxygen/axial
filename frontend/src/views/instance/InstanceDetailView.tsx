@@ -5,7 +5,7 @@ import { Button, IconButton, Pill } from '../../ui/Atoms';
 import { InstanceTile, guardedInstanceHue } from '../../ui/InstanceVisual';
 import { openContextMenu } from '../../ui/ContextMenu';
 import { instances, launchNotices, launchState, runningSessions, versionById } from '../../store';
-import { navigate } from '../../ui-state';
+import { navigate, resetViewScroll } from '../../ui-state';
 import { selectInstance } from '../../actions';
 import { launchGame, killGame } from '../../launch';
 import { handleInstallClick, retryFailedInstall } from '../../machines/downloads';
@@ -64,6 +64,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const preparing = inst && launch.status === 'preparing' && launch.instanceId === inst.id ? launch : null;
   const selectTab = (next: Tab): void => {
     setSelectedTab({ instanceId: id, tab: next });
+    resetViewScroll();
   };
 
   const reloadResources = (): void => {

@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
 import { Icon } from '../../ui/Icons';
+import { resetViewScroll } from '../../ui-state';
 import { AppearanceSection } from './AppearanceSection';
 import { AudioSection } from './AudioSection';
 import { LaunchingSection } from './LaunchingSection';
@@ -34,7 +35,10 @@ export function SettingsView(): JSX.Element {
               key={s.id}
               class="cp-settings-rail-btn"
               data-active={section === s.id}
-              onClick={() => setSection(s.id)}
+              onClick={() => {
+                setSection(s.id);
+                resetViewScroll();
+              }}
             >
               <Icon name={s.icon} size={16} stroke={1.8} />
               {s.label}

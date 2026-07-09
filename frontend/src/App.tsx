@@ -8,7 +8,14 @@ import { Button, Card } from './ui/Atoms';
 import { DialogHost } from './ui/Dialog';
 import { ContextMenuHost } from './ui/ContextMenu';
 import { ToastHost } from './ui/ToastHost';
-import { accountSwitcherOpen, commandPaletteOpen, createOpen, route, showOnboardingOverlay } from './ui-state';
+import {
+  accountSwitcherOpen,
+  commandPaletteOpen,
+  createOpen,
+  resetViewScroll,
+  route,
+  showOnboardingOverlay,
+} from './ui-state';
 import { devMode } from './store';
 import { useShortcuts } from './hooks/use-shortcuts';
 import { reportRenderError } from './error-reporting';
@@ -135,6 +142,10 @@ function LazyAccountSwitcherHost(): JSX.Element | null {
 
 function CurrentView(): JSX.Element {
   const r = route.value;
+  const routeKey = r.name === 'instance' ? `instance:${r.id}` : r.name;
+  useEffect(() => {
+    resetViewScroll();
+  }, [routeKey]);
   switch (r.name) {
     case 'home':
       return <HomeView />;

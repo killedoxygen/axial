@@ -20,6 +20,10 @@ function sameRoute(a: Route, b: Route): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+export function resetViewScroll(): void {
+  document.querySelector('.cp-view')?.scrollTo({ top: 0 });
+}
+
 function setRoute(r: Route): void {
   route.value = r;
   try {
