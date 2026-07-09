@@ -13,6 +13,7 @@ import { local, saveLocalState } from '../state';
 import { Sound } from '../sound';
 import { openInstanceContextMenu } from '../views/instance/instance-menu';
 import type { Instance } from '../types-instance';
+import { shortcutHint } from '../shortcuts';
 
 type RailTip = {
   label: string;
@@ -294,7 +295,7 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
           navigate({ name: 'settings' });
           onClose();
         }}
-        hint="Ctrl ,"
+        hint={shortcutHint('open-settings')}
       />
     </div>
   );

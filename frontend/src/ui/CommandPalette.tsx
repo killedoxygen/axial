@@ -10,6 +10,7 @@ import { Sound } from '../sound';
 import { applyTheme } from '../theme';
 import type { EnrichedInstance } from '../types-instance';
 import { useDraggableOverlay } from '../hooks/use-draggable-overlay';
+import { shortcutHint } from '../shortcuts';
 
 type Group = 'jump' | 'instance' | 'action';
 
@@ -49,7 +50,7 @@ function buildCommands(): Command[] {
       group: 'jump',
       icon: 'plus',
       label: 'New instance',
-      hint: 'Ctrl N',
+      hint: shortcutHint('new-instance'),
       perform: () => {
         openCreate();
         close();
@@ -68,7 +69,7 @@ function buildCommands(): Command[] {
       group: 'jump',
       icon: 'settings',
       label: 'Settings',
-      hint: 'Ctrl ,',
+      hint: shortcutHint('open-settings'),
       perform: goto({ name: 'settings' }),
     },
   );
