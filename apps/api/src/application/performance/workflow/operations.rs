@@ -300,6 +300,8 @@ async fn emit_performance_progress(
                 file: file.map(ToOwned::to_owned),
                 error,
                 done,
+                bytes_done: None,
+                bytes_total: None,
             },
         )
         .await;

@@ -109,6 +109,8 @@ fn sanitize_install_progress_preserves_safe_non_error_progress() {
         file: Some("1.20.1.json".to_string()),
         error: None,
         done: false,
+        bytes_done: None,
+        bytes_total: None,
     };
 
     assert_eq!(sanitize_install_progress(progress.clone()), progress);
@@ -129,6 +131,8 @@ fn sanitize_install_progress_hides_raw_terminal_error_fragments() {
                 .to_string(),
         ),
         done: true,
+        bytes_done: None,
+        bytes_total: None,
     };
 
     let sanitized = sanitize_install_progress(progress);
@@ -149,6 +153,8 @@ fn sanitize_install_progress_preserves_shape_and_only_changes_error_text() {
             "request failed for https://example.invalid/manifest.json in /tmp/croopor".to_string(),
         ),
         done: true,
+        bytes_done: None,
+        bytes_total: None,
     };
 
     let sanitized = sanitize_install_progress(progress.clone());
@@ -173,7 +179,9 @@ fn sanitize_install_progress_redacts_raw_non_terminal_progress() {
                     .to_string(),
             ),
             done: false,
-        };
+                    bytes_done: None,
+            bytes_total: None,
+};
 
     let sanitized = sanitize_install_progress(progress);
 
@@ -203,6 +211,8 @@ fn install_progress_view_model_authors_vanilla_progress_copy() {
         file: None,
         error: None,
         done: false,
+        bytes_done: None,
+        bytes_total: None,
     };
 
     let view_model = vanilla_install_progress_view_model(&progress);
@@ -215,6 +225,55 @@ fn install_progress_view_model_authors_vanilla_progress_copy() {
 }
 
 #[test]
+fn install_progress_pct_prefers_transfer_plan_bytes() {
+    let mut progress = base_progress("assets");
+    progress.bytes_done = Some(50);
+    progress.bytes_total = Some(100);
+
+    let vanilla = vanilla_install_progress_view_model(&progress);
+    let loader = loader_install_progress_view_model(&progress);
+
+    assert_eq!(vanilla.progress_pct, 50);
+    assert_eq!(loader.progress_pct, 60);
+}
+
+#[test]
+fn install_progress_pct_caps_byte_weighted_progress_below_done() {
+    let mut progress = base_progress("java_runtime");
+    progress.bytes_done = Some(100);
+    progress.bytes_total = Some(100);
+
+    let view_model = vanilla_install_progress_view_model(&progress);
+
+    assert_eq!(view_model.progress_pct, 99);
+}
+
+#[test]
+fn install_progress_pct_ignores_bytes_on_terminal_events() {
+    let mut progress = done_progress();
+    progress.bytes_done = Some(10);
+    progress.bytes_total = Some(100);
+
+    let view_model = vanilla_install_progress_view_model(&progress);
+
+    assert_eq!(view_model.progress_pct, 100);
+    assert!(view_model.terminal);
+}
+
+#[test]
+fn install_progress_pct_falls_back_to_phase_table_without_bytes() {
+    let mut progress = base_progress("java_runtime");
+    progress.current = 1;
+    progress.total = 1;
+    progress.bytes_done = Some(0);
+    progress.bytes_total = Some(0);
+
+    let view_model = vanilla_install_progress_view_model(&progress);
+
+    assert_eq!(view_model.progress_pct, 94);
+}
+
+#[test]
 fn install_progress_view_model_authors_loader_active_step() {
     let progress = DownloadProgress {
         phase: "loader_processors".to_string(),
@@ -223,6 +282,8 @@ fn install_progress_view_model_authors_loader_active_step() {
         file: None,
         error: None,
         done: false,
+        bytes_done: None,
+        bytes_total: None,
     };
 
     let view_model = loader_install_progress_view_model(&progress);
@@ -245,6 +306,8 @@ fn public_install_progress_json_includes_backend_view_model() {
         file: None,
         error: None,
         done: false,
+        bytes_done: None,
+        bytes_total: None,
     });
 
     assert_eq!(payload["phase"], "libraries");
@@ -625,7 +688,9 @@ async fn install_status_exposes_interrupted_install_as_redacted_terminal_state()
                         .to_string(),
                 ),
                 done: true,
-            },
+                            bytes_done: None,
+                bytes_total: None,
+},
         );
 
     let response = install_status(&state, install_id)
@@ -699,7 +764,9 @@ async fn restart_interrupted_install_retry_discards_stale_temp_without_promoting
                         .to_string(),
                 ),
                 done: true,
-            },
+                            bytes_done: None,
+                bytes_total: None,
+},
         );
     }
 
@@ -801,7 +868,9 @@ async fn install_status_reconstructs_journal_progress_when_snapshot_is_missing()
                     .to_string(),
             ),
             done: true,
-        },
+                    bytes_done: None,
+            bytes_total: None,
+},
     );
 
     let response = install_status(&state, install_id)
@@ -1254,7 +1323,9 @@ async fn install_status_redacts_raw_progress_history_and_install_id() {
                             .to_string(),
                     ),
                     done: false,
-                },
+                                    bytes_done: None,
+                    bytes_total: None,
+},
             )
             .await;
 
@@ -1511,7 +1582,9 @@ async fn loader_install_events_redact_raw_progress_history() {
                             .to_string(),
                     ),
                     done: false,
-                },
+                                    bytes_done: None,
+                    bytes_total: None,
+},
             )
             .await;
     state
@@ -2683,6 +2756,8 @@ fn base_progress(phase: &str) -> DownloadProgress {
         file: Some("base game".to_string()),
         error: None,
         done: false,
+        bytes_done: None,
+        bytes_total: None,
     }
 }
 
@@ -2694,6 +2769,8 @@ fn done_progress() -> DownloadProgress {
         file: None,
         error: None,
         done: true,
+        bytes_done: None,
+        bytes_total: None,
     }
 }
 
@@ -2705,6 +2782,8 @@ fn failed_progress() -> DownloadProgress {
         file: None,
         error: Some("failed".to_string()),
         done: true,
+        bytes_done: None,
+        bytes_total: None,
     }
 }
 
@@ -2737,6 +2816,8 @@ fn progress(phase: &str, done: bool, error: Option<&str>) -> DownloadProgress {
         file: Some("/Users/alice/.croopor/libraries/secret.jar".to_string()),
         error: error.map(str::to_string),
         done,
+        bytes_done: None,
+        bytes_total: None,
     }
 }
 

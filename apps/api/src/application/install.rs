@@ -317,6 +317,8 @@ fn vanilla_install_done_progress() -> DownloadProgress {
         file: None,
         error: None,
         done: true,
+        bytes_done: None,
+        bytes_total: None,
     }
 }
 

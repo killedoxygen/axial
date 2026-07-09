@@ -6,6 +6,7 @@ mod integrity;
 mod libraries;
 mod model;
 mod path_safety;
+mod plan;
 mod runtime;
 mod transfer;
 

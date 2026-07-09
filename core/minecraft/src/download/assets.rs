@@ -7,6 +7,7 @@ use super::model::{
     SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
 };
 use super::path_safety::{bounded_download_file_label, bounded_provider_path_label, path_is_file};
+use super::plan::TransferPlan;
 use super::transfer::ensure_selected_artifact_with_client;
 use crate::launch::AssetIndex as VersionAssetIndex;
 use crate::paths::assets_dir;
@@ -14,6 +15,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs as async_fs;
 use tokio::sync::mpsc;
 
@@ -44,10 +46,14 @@ pub(super) fn spawn_asset_download_pipeline(
     asset_index: VersionAssetIndex,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
     descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+    plan: Arc<TransferPlan>,
 ) -> Option<AssetDownloadPipeline> {
     if asset_index.url.is_empty() {
         return None;
     }
+    // Asset-object bytes are unknown until the index is parsed; reserve the
+    // contribution so partial totals are not stamped as near-complete.
+    plan.expect_contribution();
 
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
@@ -61,6 +67,8 @@ pub(super) fn spawn_asset_download_pipeline(
             Some(format!("{}.json", asset_index.id)),
         ));
         let expected = ExpectedIntegrity::from_mojang(asset_index.size, &asset_index.sha1);
+        let index_bytes = expected.size.unwrap_or(0);
+        plan.contribute_total(index_bytes);
         ensure_selected_artifact_with_client(
             SelectedDownloadArtifactKind::AssetIndex,
             &client,
@@ -71,12 +79,14 @@ pub(super) fn spawn_asset_download_pipeline(
             descriptor_tx.as_ref(),
         )
         .await?;
+        plan.add_done(index_bytes);
         download_asset_objects_with_client(
             &mc_dir,
             client,
             &asset_index_path,
             fact_tx,
             descriptor_tx,
+            &plan,
             |progress| {
                 let _ = progress_tx.send(progress);
             },
@@ -134,6 +144,7 @@ async fn download_asset_objects_with_client<F>(
     asset_index_path: &Path,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
     descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+    plan: &TransferPlan,
     mut send: F,
 ) -> Result<(), DownloadError>
 where
@@ -149,6 +160,11 @@ where
             .map(|object| (object.hash.as_str(), object.size)),
     )?;
 
+    plan.resolve_contribution(
+        jobs.iter()
+            .map(|job| job.expected.size.unwrap_or(0))
+            .sum::<u64>(),
+    );
     send(progress("assets", 0, jobs.len() as i32, None));
     let total_jobs = jobs.len() as i32;
     let mut completed_jobs = 0;
@@ -160,6 +176,7 @@ where
             let hash = job.hash;
             let path = job.path;
             let expected = job.expected;
+            let bytes = expected.size.unwrap_or(0);
             let url = format!(
                 "https://resources.download.minecraft.net/{}/{}",
                 &hash[..2],
@@ -174,12 +191,14 @@ where
                 fact_tx.as_ref(),
                 descriptor_tx.as_ref(),
             )
-            .await
+            .await?;
+            Ok::<u64, DownloadError>(bytes)
         }
     }))
     .buffer_unordered(asset_download_concurrency());
     while let Some(result) = asset_downloads.next().await {
-        result?;
+        let bytes = result?;
+        plan.add_done(bytes);
         completed_jobs += 1;
         if completed_jobs == total_jobs || completed_jobs % 50 == 0 {
             send(progress("assets", completed_jobs, total_jobs, None));

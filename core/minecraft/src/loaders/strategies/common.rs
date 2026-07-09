@@ -287,6 +287,8 @@ where
                     file: Some(detail),
                     error: None,
                     done: false,
+                    bytes_done: None,
+                    bytes_total: None,
                 });
             },
         ))
@@ -1069,6 +1071,8 @@ fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> Down
         file,
         error: None,
         done: false,
+        bytes_done: None,
+        bytes_total: None,
     }
 }
 
@@ -1080,6 +1084,8 @@ fn done() -> DownloadProgress {
         file: None,
         error: None,
         done: true,
+        bytes_done: None,
+        bytes_total: None,
     }
 }
 

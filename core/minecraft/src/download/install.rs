@@ -9,6 +9,7 @@ use super::model::{
     ExpectedIntegrity, SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
 };
 use super::path_safety::path_is_file;
+use super::plan::TransferPlan;
 use super::runtime::{
     finish_runtime_pipeline_after_artifacts, recv_runtime_progress, spawn_runtime_ensure_pipeline,
 };
@@ -24,6 +25,7 @@ use crate::rules::default_environment;
 use futures_util::StreamExt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs as async_fs;
 use tokio::sync::mpsc;
 
@@ -127,6 +129,11 @@ impl Downloader {
     {
         let version_dir = versions_dir(&self.mc_dir).join(version_id);
         let marker_path = version_dir.join(".incomplete");
+        let plan = TransferPlan::shared();
+        let mut send = |mut progress: DownloadProgress| {
+            plan.stamp(&mut progress);
+            send(progress)
+        };
 
         let install_result = async {
             async_fs::create_dir_all(&version_dir).await?;
@@ -134,7 +141,8 @@ impl Downloader {
             self.install_version_inner(
                 version_id,
                 manifest_url,
-                send,
+                &mut send,
+                &plan,
                 fact_tx.as_ref(),
                 descriptor_tx.as_ref(),
             )
@@ -152,6 +160,8 @@ impl Downloader {
                     file: None,
                     error: None,
                     done: true,
+                    bytes_done: None,
+                    bytes_total: None,
                 });
                 Ok(())
             }
@@ -163,6 +173,8 @@ impl Downloader {
                     file: None,
                     error: Some(error.to_string()),
                     done: true,
+                    bytes_done: None,
+                    bytes_total: None,
                 });
                 Err(error)
             }
@@ -174,6 +186,7 @@ impl Downloader {
         version_id: &str,
         manifest_url: Option<&str>,
         send: &mut F,
+        plan: &Arc<TransferPlan>,
         fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
         descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
     ) -> Result<(), DownloadError>
@@ -246,6 +259,23 @@ impl Downloader {
 
         let version = resolve_version(&self.mc_dir, version_id)
             .map_err(|error| DownloadError::ResolveManifest(error.to_string()))?;
+        let client_jar_bytes = version
+            .downloads
+            .client
+            .as_ref()
+            .and_then(|client| ExpectedIntegrity::from_mojang(client.size, &client.sha1).size)
+            .unwrap_or(0);
+        plan.contribute_total(client_jar_bytes);
+        let log_config_bytes = version
+            .logging
+            .as_ref()
+            .and_then(|logging| logging.client.as_ref())
+            .filter(|client| !client.file.url.is_empty())
+            .and_then(|client| {
+                ExpectedIntegrity::from_mojang(client.file.size, &client.file.sha1).size
+            })
+            .unwrap_or(0);
+        plan.contribute_total(log_config_bytes);
         let mut runtime_pipeline = if version.java_version.major_version > 0 {
             send(progress(
                 "java_runtime",
@@ -264,7 +294,11 @@ impl Downloader {
 
             let mc_dir = self.mc_dir.clone();
             let java_version = version.java_version.clone();
-            Some(spawn_runtime_ensure_pipeline(mc_dir, java_version))
+            Some(spawn_runtime_ensure_pipeline(
+                mc_dir,
+                java_version,
+                plan.clone(),
+            ))
         } else {
             None
         };
@@ -305,9 +339,16 @@ impl Downloader {
                 version.asset_index.clone(),
                 fact_tx.cloned(),
                 descriptor_tx.cloned(),
+                plan.clone(),
             );
 
             let library_jobs = self.library_jobs(&version);
+            plan.contribute_total(
+                library_jobs
+                    .iter()
+                    .map(|job| job.expected.size.unwrap_or(0))
+                    .sum::<u64>(),
+            );
             send(progress("libraries", 0, library_jobs.len() as i32, None));
             let client = self.client.clone();
             let total_library_jobs = library_jobs.len() as i32;
@@ -319,6 +360,7 @@ impl Downloader {
                         let fact_tx = fact_tx.cloned();
                         let descriptor_tx = descriptor_tx.cloned();
                         async move {
+                            let bytes = job.expected.size.unwrap_or(0);
                             ensure_selected_artifact_with_client(
                                 SelectedDownloadArtifactKind::Library,
                                 &client,
@@ -329,7 +371,7 @@ impl Downloader {
                                 descriptor_tx.as_ref(),
                             )
                             .await?;
-                            Ok::<String, DownloadError>(job.name)
+                            Ok::<(String, u64), DownloadError>((job.name, bytes))
                         }
                     }))
                     .buffer_unordered(library_download_concurrency());
@@ -355,7 +397,8 @@ impl Downloader {
                             let Some(result) = result else {
                                 break;
                             };
-                            let name = result?;
+                            let (name, bytes) = result?;
+                            plan.add_done(bytes);
                             completed_library_jobs += 1;
                             send(progress(
                                 "libraries",
@@ -371,6 +414,7 @@ impl Downloader {
             .await;
             let client_jar_result = await_client_jar_download(client_jar_task).await;
             if client_jar_result.is_ok() && version.downloads.client.is_some() {
+                plan.add_done(client_jar_bytes);
                 send(progress(
                     "client_jar",
                     1,
@@ -407,6 +451,7 @@ impl Downloader {
                     descriptor_tx,
                 )
                 .await?;
+                plan.add_done(log_config_bytes);
             }
             Ok::<(), DownloadError>(())
         }

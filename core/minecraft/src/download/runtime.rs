@@ -1,7 +1,9 @@
 use super::model::{DownloadError, DownloadProgress, progress};
+use super::plan::TransferPlan;
 use crate::launch::JavaVersion;
 use crate::runtime::{RuntimeEnsureEvent, ensure_runtime_with_events};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub(super) struct RuntimeEnsurePipeline {
@@ -12,16 +14,42 @@ pub(super) struct RuntimeEnsurePipeline {
 pub(super) fn spawn_runtime_ensure_pipeline(
     mc_dir: PathBuf,
     java_version: JavaVersion,
+    plan: Arc<TransferPlan>,
 ) -> RuntimeEnsurePipeline {
+    // Runtime bytes are unknown until the component manifest is fetched (and
+    // zero when a cached runtime resolves); reserve the contribution so
+    // partial totals are not stamped as near-complete in the meantime.
+    plan.expect_contribution();
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
         let event_java_version = java_version.clone();
         let progress_tx = progress_tx.clone();
-        ensure_runtime_with_events(&mc_dir, &java_version, "", false, |event| {
-            let _ = progress_tx.send(runtime_ensure_progress(&event_java_version, event));
-        })
-        .await
-        .map_err(|error| error.to_string())?;
+        let mut plan_contribution_resolved = false;
+        let mut plan_done_seen = 0_u64;
+        let ensure_result =
+            ensure_runtime_with_events(&mc_dir, &java_version, "", false, |event| {
+                if let RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
+                    bytes_done,
+                    bytes_total,
+                    ..
+                } = &event
+                {
+                    if !plan_contribution_resolved && *bytes_total > 0 {
+                        plan.resolve_contribution(*bytes_total);
+                        plan_contribution_resolved = true;
+                    }
+                    if *bytes_done > plan_done_seen {
+                        plan.add_done(*bytes_done - plan_done_seen);
+                        plan_done_seen = *bytes_done;
+                    }
+                }
+                let _ = progress_tx.send(runtime_ensure_progress(&event_java_version, event));
+            })
+            .await;
+        if !plan_contribution_resolved {
+            plan.resolve_contribution(0);
+        }
+        ensure_result.map_err(|error| error.to_string())?;
         Ok::<_, String>(java_version)
     });
 
@@ -48,6 +76,7 @@ pub(super) fn runtime_ensure_progress(
             current,
             total,
             file,
+            ..
         } => {
             let detail = match file {
                 Some(file) if current > 0 && total > 0 => {

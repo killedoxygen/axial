@@ -161,12 +161,19 @@ pub(super) async fn install_runtime_manifest_files(
     }
 
     let total_files = plan.file_entries.len();
+    let total_bytes = plan
+        .file_entries
+        .iter()
+        .map(|(_, file)| runtime_manifest_file_bytes(file))
+        .sum::<u64>();
     if total_files > 0 {
         observer(RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
             component: component.to_string(),
             current: 0,
             total: total_files,
             file: Some("Downloading runtime files".to_string()),
+            bytes_done: 0,
+            bytes_total: total_bytes,
         });
     }
 
@@ -181,15 +188,19 @@ pub(super) async fn install_runtime_manifest_files(
 
     let mut first_error = None;
     let mut completed_files = 0;
+    let mut completed_bytes = 0_u64;
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok(Ok(relative_path)) => {
+            Ok(Ok(completed)) => {
                 completed_files += 1;
+                completed_bytes += completed.bytes;
                 observer(RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
                     component: component.to_string(),
                     current: completed_files,
                     total: total_files,
-                    file: Some(bounded_manifest_file_label(&relative_path)),
+                    file: Some(bounded_manifest_file_label(&completed.relative_path)),
+                    bytes_done: completed_bytes,
+                    bytes_total: total_bytes,
                 });
             }
             Ok(Err(error)) => {
@@ -223,14 +234,28 @@ pub(super) async fn install_runtime_manifest_files(
     Ok(())
 }
 
+pub(super) struct CompletedRuntimeManifestFile {
+    pub(super) relative_path: String,
+    pub(super) bytes: u64,
+}
+
+pub(super) fn runtime_manifest_file_bytes(file: &ComponentManifestFile) -> u64 {
+    file.downloads
+        .as_ref()
+        .and_then(|downloads| downloads.raw.as_ref())
+        .and_then(|raw| raw.size)
+        .unwrap_or(0)
+}
+
 pub(super) fn spawn_runtime_manifest_file_install(
-    tasks: &mut JoinSet<Result<String, JavaRuntimeLookupError>>,
+    tasks: &mut JoinSet<Result<CompletedRuntimeManifestFile, JavaRuntimeLookupError>>,
     download_client: reqwest::Client,
     temp_dir: &Path,
     entry: (String, ComponentManifestFile),
 ) {
     let temp_dir = temp_dir.to_path_buf();
     let (relative_path, file) = entry;
+    let bytes = runtime_manifest_file_bytes(&file);
     tasks.spawn(async move {
         let completed_path = relative_path.clone();
         Box::pin(install_runtime_manifest_file(
@@ -240,7 +265,10 @@ pub(super) fn spawn_runtime_manifest_file_install(
             file,
         ))
         .await?;
-        Ok(completed_path)
+        Ok(CompletedRuntimeManifestFile {
+            relative_path: completed_path,
+            bytes,
+        })
     });
 }
 

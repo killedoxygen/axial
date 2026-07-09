@@ -138,6 +138,8 @@ mod tests {
                     .to_string(),
             ),
             done: true,
+            bytes_done: None,
+            bytes_total: None,
         };
 
         fixture

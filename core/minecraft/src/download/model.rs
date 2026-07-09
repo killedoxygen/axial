@@ -14,6 +14,13 @@ pub struct DownloadProgress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub done: bool,
+    /// Cumulative transfer-plan facts for the whole install: bytes of planned
+    /// work completed vs. planned so far. Stamped by the installer entry
+    /// points; absent on events emitted before the plan has any entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_done: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_total: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -263,5 +270,7 @@ pub(super) fn progress(
         file,
         error: None,
         done: false,
+        bytes_done: None,
+        bytes_total: None,
     }
 }

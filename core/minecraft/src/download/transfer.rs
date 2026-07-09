@@ -506,8 +506,9 @@ pub async fn download_file_with_client_report(
     destination: &Path,
     expected: &ExpectedIntegrity,
 ) -> Result<ExecutionDownloadReport, ExecutionDownloadError> {
-    let mut last_error: Option<DownloadError> = None;
-    for attempt in 0..3 {
+    const DOWNLOAD_ATTEMPTS: u64 = 3;
+    let mut attempt = 1;
+    loop {
         match execute_download_to_temp(
             client,
             ExecutionDownloadRequest::launcher_managed(url, destination, expected),
@@ -515,20 +516,13 @@ pub async fn download_file_with_client_report(
         .await
         {
             Ok(report) => return Ok(report),
-            Err(error) => {
-                if attempt == 2 {
-                    return Err(error);
-                }
-                last_error = Some(error.into_download_error());
-                tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
+            Err(_) if attempt < DOWNLOAD_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
+                attempt += 1;
             }
+            Err(error) => return Err(error),
         }
     }
-    Err(execution_download_error(
-        ExecutionDownloadFactKind::NetworkFailure,
-        Vec::new(),
-        last_error.unwrap_or_else(|| DownloadError::ResolveManifest("download failed".to_string())),
-    ))
 }
 
 pub(crate) async fn write_launcher_managed_artifact_bytes_to_temp(

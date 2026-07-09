@@ -26,6 +26,8 @@ where
         )),
         error: None,
         done: false,
+        bytes_done: None,
+        bytes_total: None,
     });
 
     ensure_java_runtime(library_dir, &version.java_version, "")
@@ -42,6 +44,8 @@ where
         )),
         error: None,
         done: false,
+        bytes_done: None,
+        bytes_total: None,
     });
 
     Ok(())

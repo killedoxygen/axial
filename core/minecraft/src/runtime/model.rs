@@ -121,6 +121,8 @@ pub enum RuntimeEnsureEvent {
         current: usize,
         total: usize,
         file: Option<String>,
+        bytes_done: u64,
+        bytes_total: u64,
     },
 }
 

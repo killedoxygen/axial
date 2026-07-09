@@ -426,6 +426,8 @@ pub(crate) fn loader_error_progress(error: &LoaderError) -> DownloadProgress {
         file: None,
         error: Some(public_loader_error_message(error).to_string()),
         done: true,
+        bytes_done: None,
+        bytes_total: None,
     }
 }
 
@@ -437,6 +439,8 @@ pub(crate) fn base_install_failed_progress() -> DownloadProgress {
         file: None,
         error: Some(BASE_INSTALL_FAILED_MESSAGE.to_string()),
         done: true,
+        bytes_done: None,
+        bytes_total: None,
     }
 }
 
@@ -448,6 +452,8 @@ pub(crate) fn loader_install_done_progress() -> DownloadProgress {
         file: None,
         error: None,
         done: true,
+        bytes_done: None,
+        bytes_total: None,
     }
 }
 
@@ -459,6 +465,8 @@ pub(crate) fn interrupted_loader_install_progress() -> DownloadProgress {
         file: None,
         error: Some(LOADER_INSTALL_INTERRUPTED_MESSAGE.to_string()),
         done: true,
+        bytes_done: None,
+        bytes_total: None,
     }
 }
 

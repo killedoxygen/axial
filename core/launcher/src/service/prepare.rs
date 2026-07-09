@@ -818,6 +818,8 @@ mod tests {
                     current: 1,
                     total: 2,
                     file: Some("bin/java".to_string()),
+                    bytes_done: 4,
+                    bytes_total: 7,
                 },
             ),
             LaunchPreparationEvent::DownloadingRuntime

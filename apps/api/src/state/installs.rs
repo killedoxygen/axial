@@ -1115,6 +1115,8 @@ mod tests {
                     file: None,
                     error: None,
                     done: true,
+                    bytes_done: None,
+                    bytes_total: None,
                 },
             )
             .await;
@@ -1130,6 +1132,8 @@ mod tests {
             file: None,
             error: None,
             done: true,
+            bytes_done: None,
+            bytes_total: None,
         }
     }
 
@@ -1141,6 +1145,8 @@ mod tests {
             file: None,
             error: Some("failed".to_string()),
             done: true,
+            bytes_done: None,
+            bytes_total: None,
         }
     }
 
@@ -1152,6 +1158,8 @@ mod tests {
             file: None,
             error: None,
             done,
+            bytes_done: None,
+            bytes_total: None,
         }
     }
 }

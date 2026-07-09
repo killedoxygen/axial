@@ -289,6 +289,8 @@ async fn runtime_manifest_install_reports_file_progress() {
             current: 0,
             total: 2,
             file: Some("Downloading runtime files".to_string()),
+            bytes_done: 0,
+            bytes_total: (b"java".len() + b"cfg".len()) as u64,
         })
     );
     assert_eq!(events.len(), 3);

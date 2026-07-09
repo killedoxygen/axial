@@ -415,6 +415,12 @@ fn install_progress_label(progress: &DownloadProgress, kind: InstallProgressKind
 }
 
 fn install_progress_pct(progress: &DownloadProgress, kind: InstallProgressKind) -> u8 {
+    if let Some(pct) = byte_weighted_install_pct(progress, kind) {
+        return pct;
+    }
+    // Fallback for events without transfer-plan facts: pre-plan phases
+    // (version_json), loader-specific head phases (loader metadata, installer
+    // artifacts, processors), and journal-replayed history.
     let pct = match (kind, progress.phase.as_str()) {
         (_, "done") => 100,
         (_, "error") => 100,
@@ -464,6 +470,27 @@ fn install_progress_pct(progress: &DownloadProgress, kind: InstallProgressKind) 
         _ => 0,
     };
     pct.clamp(0, 100) as u8
+}
+
+/// Overall progress from the installer's transfer-plan facts: bytes of
+/// planned work completed across every concurrent phase (client jar,
+/// libraries, assets, managed Java runtime). Capped below 100 so only the
+/// terminal `done` event completes the bar. Loader installs reserve a head
+/// span for the loader-specific phases, which carry no byte facts.
+fn byte_weighted_install_pct(progress: &DownloadProgress, kind: InstallProgressKind) -> Option<u8> {
+    if matches!(progress.phase.as_str(), "done" | "error") {
+        return None;
+    }
+    let (done, total) = (progress.bytes_done?, progress.bytes_total?);
+    if total == 0 {
+        return None;
+    }
+    let fraction = (done.min(total) as f64) / (total as f64);
+    let (base, span) = match kind {
+        InstallProgressKind::Vanilla => (0.0, 99.0),
+        InstallProgressKind::Loader => (20.0, 79.0),
+    };
+    Some((base + fraction * span).round().clamp(0.0, 99.0) as u8)
 }
 
 fn install_active_step_view_model(
@@ -881,6 +908,8 @@ pub(crate) fn observed_install_failure_progress() -> DownloadProgress {
         file: None,
         error: Some(INSTALL_FAILURE_MESSAGE.to_string()),
         done: true,
+        bytes_done: None,
+        bytes_total: None,
     }
 }
 
@@ -935,6 +964,8 @@ fn progress_from_install_journal_step(step: &OperationJournalStep) -> Option<Dow
         file: None,
         error: (done && failed).then(|| INSTALL_FAILURE_MESSAGE.to_string()),
         done,
+        bytes_done: None,
+        bytes_total: None,
     })
 }
 
@@ -954,6 +985,8 @@ fn terminal_progress_for_journal_status(status: OperationStatus) -> DownloadProg
             file: None,
             error: None,
             done: true,
+            bytes_done: None,
+            bytes_total: None,
         };
     }
 

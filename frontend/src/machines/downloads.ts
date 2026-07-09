@@ -171,6 +171,9 @@ function updateActiveDownloadProgress(viewModel: InstallProgressViewModel): void
   const nextPct = Number.isFinite(viewModel.progress_pct)
     ? Math.max(0, Math.min(100, viewModel.progress_pct))
     : current.pct;
+  // A lower pct means a stale event: the SSE stream replays install history
+  // on (re)connect after the queue snapshot already seeded current progress.
+  // Keep the newer copy until replay catches up.
   const regressed = nextPct < current.pct;
   activeDownload.value = {
     ...current,
