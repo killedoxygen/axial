@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { createPortal } from 'preact/compat';
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Icon } from './Icons';
 
 export interface SelectFieldOption<T extends string = string> {
@@ -14,22 +14,6 @@ interface PopoverPlacement {
   top: number;
   minWidth: number;
   maxHeight: number;
-}
-
-function placePopover(trigger: HTMLElement): PopoverPlacement {
-  const rect = trigger.getBoundingClientRect();
-  const gap = 6;
-  const margin = 10;
-  const below = window.innerHeight - rect.bottom - gap - margin;
-  const above = rect.top - gap - margin;
-  const openUp = below < 160 && above > below;
-  const maxHeight = Math.min(320, Math.max(120, openUp ? above : below));
-  return {
-    left: Math.max(margin, Math.min(rect.left, window.innerWidth - rect.width - margin)),
-    top: openUp ? Math.max(margin, rect.top - gap - maxHeight) : rect.bottom + gap,
-    minWidth: rect.width,
-    maxHeight,
-  };
 }
 
 export function SelectField<T extends string>({
@@ -51,6 +35,7 @@ export function SelectField<T extends string>({
 }): JSX.Element {
   const [open, setOpen] = useState(false);
   const [highlighted, setHighlighted] = useState(-1);
+  const [placement, setPlacement] = useState<PopoverPlacement | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const typeahead = useRef<{ buffer: string; timer: number }>({ buffer: '', timer: 0 });
@@ -157,6 +142,31 @@ export function SelectField<T extends string>({
     handleTypeahead(e.key);
   };
 
+  useLayoutEffect(() => {
+    if (!open) {
+      setPlacement(null);
+      return;
+    }
+    const trigger = triggerRef.current;
+    const list = listRef.current;
+    if (!trigger || !list) return;
+    const rect = trigger.getBoundingClientRect();
+    const gap = 6;
+    const margin = 10;
+    const spaceBelow = window.innerHeight - rect.bottom - gap - margin;
+    const spaceAbove = rect.top - gap - margin;
+    const contentHeight = list.scrollHeight;
+    const openUp = contentHeight > spaceBelow && spaceAbove > spaceBelow;
+    const maxHeight = Math.min(320, Math.max(96, openUp ? spaceAbove : spaceBelow));
+    const height = Math.min(contentHeight, maxHeight);
+    setPlacement({
+      left: Math.max(margin, Math.min(rect.left, window.innerWidth - rect.width - margin)),
+      top: openUp ? Math.max(margin, rect.top - gap - height) : rect.bottom + gap,
+      minWidth: rect.width,
+      maxHeight,
+    });
+  }, [open, options.length]);
+
   useEffect(() => {
     if (!open) return;
     listRef.current?.focus();
@@ -165,12 +175,18 @@ export function SelectField<T extends string>({
       if (listRef.current?.contains(target) || triggerRef.current?.contains(target)) return;
       closeList(false);
     };
+    const onOutsideScroll = (e: Event): void => {
+      if (listRef.current?.contains(e.target as Node)) return;
+      closeList(false);
+    };
     const onWindowChange = (): void => closeList(false);
     document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('scroll', onOutsideScroll, true);
     window.addEventListener('resize', onWindowChange);
     window.addEventListener('blur', onWindowChange);
     return () => {
       document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('scroll', onOutsideScroll, true);
       window.removeEventListener('resize', onWindowChange);
       window.removeEventListener('blur', onWindowChange);
     };
@@ -181,8 +197,6 @@ export function SelectField<T extends string>({
     if (!open || highlighted < 0) return;
     listRef.current?.querySelector<HTMLElement>(`[data-index="${highlighted}"]`)?.scrollIntoView({ block: 'nearest' });
   }, [open, highlighted]);
-
-  const placement = open && triggerRef.current ? placePopover(triggerRef.current) : null;
 
   return (
     <>
@@ -208,7 +222,6 @@ export function SelectField<T extends string>({
         </span>
       </button>
       {open &&
-        placement &&
         createPortal(
           <div
             ref={listRef}
@@ -216,13 +229,17 @@ export function SelectField<T extends string>({
             role="listbox"
             tabIndex={-1}
             aria-label={ariaLabel}
-            style={{
-              position: 'fixed',
-              left: placement.left,
-              top: placement.top,
-              minWidth: placement.minWidth,
-              maxHeight: placement.maxHeight,
-            }}
+            style={
+              placement
+                ? {
+                    position: 'fixed',
+                    left: placement.left,
+                    top: placement.top,
+                    minWidth: placement.minWidth,
+                    maxHeight: placement.maxHeight,
+                  }
+                : { position: 'fixed', left: 0, top: 0, visibility: 'hidden' }
+            }
             onKeyDown={onListKeyDown}
           >
             <div class="cp-select-viewport">
@@ -242,11 +259,6 @@ export function SelectField<T extends string>({
                   onClick={() => commit(index)}
                 >
                   <span class="cp-select-item-label">{option.label}</span>
-                  {option.value === value && (
-                    <span class="cp-select-check" aria-hidden="true">
-                      <Icon name="check" size={13} stroke={2.4} />
-                    </span>
-                  )}
                 </div>
               ))}
             </div>

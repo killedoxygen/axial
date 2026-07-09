@@ -120,11 +120,6 @@
   opacity: 0.45;
   cursor: not-allowed;
 }
-.cp-select-check {
-  display: inline-flex;
-  flex-shrink: 0;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .cp-select-content {
     animation: none !important;
