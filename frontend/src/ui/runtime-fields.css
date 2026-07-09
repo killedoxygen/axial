@@ -1,0 +1,183 @@
+.cp-ovr-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.cp-ovr-field > span {
+  color: var(--text-mute);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+.cp-ovr-field .cp-field {
+  height: 34px;
+  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.cp-ovr-field .cp-field.cp-field--focused {
+  box-shadow:
+    inset 0 0 0 1px var(--line-strong),
+    0 0 0 3px color-mix(in oklab, var(--text) 8%, transparent);
+}
+.cp-ovr-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: var(--r-sm);
+  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
+  box-shadow: inset 0 0 0 1px var(--line);
+  transition: box-shadow 120ms ease;
+}
+.cp-ovr-input:focus-within {
+  box-shadow:
+    inset 0 0 0 1px var(--line-strong),
+    0 0 0 3px color-mix(in oklab, var(--text) 8%, transparent);
+}
+.cp-ovr-input input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  outline: none;
+}
+.cp-ovr-args {
+  min-width: 0;
+}
+.cp-argbox {
+  position: relative;
+  min-height: 84px;
+  border-radius: var(--r-sm);
+  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
+  box-shadow: inset 0 0 0 1px var(--line);
+  padding: 7px 8px;
+  transition: box-shadow 120ms ease;
+}
+.cp-argbox--focus {
+  box-shadow:
+    inset 0 0 0 1px var(--line-strong),
+    0 0 0 3px color-mix(in oklab, var(--text) 8%, transparent);
+}
+.cp-argbox[data-disabled='true'] {
+  opacity: 0.55;
+  pointer-events: none;
+}
+.cp-argbox-tokens {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  align-items: center;
+  gap: 5px;
+  cursor: text;
+}
+.cp-argchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  height: 24px;
+  max-width: 100%;
+  padding: 0 2px 0 8px;
+  border-radius: var(--r-xs);
+  background: var(--surface-3);
+}
+.cp-argchip-text {
+  max-width: min(280px, 46vw);
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.cp-argchip-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-mute);
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
+}
+.cp-argchip-x:hover {
+  color: var(--text);
+  background: color-mix(in oklab, var(--text) 12%, transparent);
+}
+.cp-argchip[data-kind='unknown'] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--line) 85%, transparent);
+}
+.cp-argchip[data-kind='unknown'] .cp-argchip-text {
+  color: var(--text-dim);
+}
+.cp-argbox-input {
+  flex: 1;
+  min-width: 90px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  outline: none;
+}
+.cp-argbox-suggest {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  box-shadow:
+    0 8px 28px rgba(0, 0, 0, 0.4),
+    inset 0 0 0 1px var(--line);
+}
+.cp-argbox-suggest-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 8px;
+  border: none;
+  border-radius: var(--r-xs);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.cp-argbox-suggest-row:hover {
+  background: var(--surface-3);
+}
+.cp-argbox-suggest-row code {
+  flex-shrink: 0;
+  color: var(--text);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+.cp-argbox-suggest-row span {
+  min-width: 0;
+  color: var(--text-mute);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

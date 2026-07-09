@@ -40,7 +40,7 @@ import {
   nextWindowPreset,
   type ScreenSize,
   type WindowPresetSpec,
-} from './screen-presets';
+} from '../../ui/screen-presets';
 
 type CreateStep = 'version' | 'details';
 

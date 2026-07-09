@@ -1,8 +1,8 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { SelectField } from '../../../ui/Select';
-import { Icon } from '../../../ui/Icons';
-import { api } from '../../../api';
+import { SelectField } from './Select';
+import { Icon } from './Icons';
+import { api } from '../api';
 
 type JavaRuntime = { path: string; component: string; source: string };
 
@@ -19,11 +19,13 @@ function runtimeLabel(runtime: JavaRuntime): string {
 export function JavaPathField({
   value,
   onChange,
+  onCommit,
   disabled,
   className,
 }: {
   value: string;
   onChange: (value: string) => void;
+  onCommit?: (value: string) => void;
   disabled?: boolean;
   className?: string;
 }): JSX.Element {
@@ -66,6 +68,7 @@ export function JavaPathField({
     }
     setCustomOpen(false);
     onChange(next);
+    onCommit?.(next);
   };
 
   return (
@@ -90,6 +93,10 @@ export function JavaPathField({
             disabled={disabled}
             aria-label="Custom Java path"
             onInput={(event) => onChange((event.currentTarget as HTMLInputElement).value)}
+            onBlur={() => onCommit?.(value.trim())}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') (event.currentTarget as HTMLInputElement).blur();
+            }}
           />
         </div>
       )}

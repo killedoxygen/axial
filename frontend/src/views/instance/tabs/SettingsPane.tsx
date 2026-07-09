@@ -21,7 +21,7 @@ import {
   performanceModeLabel,
 } from '../performance-mode';
 import type { PerformanceMode } from '../../../types-performance';
-import { JavaPathField, JvmArgsInput } from './AdvancedOverrides';
+import { JavaPathField, JvmArgsInput } from '../../../ui/RuntimeFields';
 import { WindowSizeField, type WindowPreset } from './WindowSizeField';
 
 const WINDOW_PRESETS: WindowPreset[] = [

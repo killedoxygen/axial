@@ -1,0 +1,26 @@
+.cp-memfield {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.cp-memfield-readout {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.cp-memfield-readout strong {
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.cp-memfield-band {
+  color: var(--text-mute);
+  font-size: 11.5px;
+  font-weight: 600;
+}

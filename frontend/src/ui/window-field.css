@@ -1,0 +1,92 @@
+.cp-winfield {
+  min-width: 0;
+  display: flex;
+  gap: 20px;
+  align-items: stretch;
+}
+.cp-winfield-stage {
+  flex-shrink: 0;
+  width: 148px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 7px;
+}
+.cp-winfield-screen {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--r-xs);
+  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--line) 70%, transparent);
+  overflow: hidden;
+}
+.cp-winfield-window {
+  max-height: 100%;
+  border-radius: 3px;
+  background: var(--surface-2);
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.24),
+    inset 0 1px 0 color-mix(in oklab, var(--text) 7%, transparent);
+  transition:
+    width 180ms ease,
+    aspect-ratio 180ms ease,
+    opacity 160ms;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cp-winfield-window {
+    transition: none;
+  }
+}
+.cp-winfield[data-inherit='true'] .cp-winfield-window {
+  opacity: 0.45;
+}
+.cp-winfield-caption {
+  color: var(--text-mute);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  line-height: 1.3;
+}
+.cp-winfield-controls {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  justify-content: center;
+}
+.cp-winfield-controls .cp-seg {
+  flex-wrap: wrap;
+  align-self: flex-start;
+  max-width: 100%;
+}
+.cp-winfield-dims {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  width: 260px;
+  max-width: 100%;
+}
+.cp-winfield-dims label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.cp-winfield-dims label > span {
+  color: var(--text-mute);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+@media (max-width: 640px) {
+  .cp-winfield {
+    flex-direction: column;
+  }
+  .cp-winfield-stage {
+    width: 180px;
+  }
+}
