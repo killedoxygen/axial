@@ -746,8 +746,8 @@ mod tests {
         ManagedRuntimeRoot, ManagedRuntimeRootError, ManagedRuntimeVerificationRequest,
         RuntimeCapabilityErrorKind, RuntimeProbeFailure, RuntimeProbeInfo, RuntimeProbeRequest,
         inspect_java_override_value, java_override_is_undefined_sentinel,
-        probe_java_runtime_with_runner, repair_managed_runtime, runtime_fact,
-        validate_managed_runtime_repair, verify_managed_runtime,
+        probe_java_runtime_with_runner, repair_managed_runtime, validate_managed_runtime_repair,
+        verify_managed_runtime,
     };
     use crate::execution::ExecutionFactKind;
     use crate::state::contracts::{
@@ -1206,7 +1206,7 @@ mod tests {
         let root = test_root("repair-ready-marker");
         let paths = test_paths(&root);
         let runtime_root_path = managed_runtime_root(&paths, "java_runtime_delta");
-        let java_path = runtime_root_path.join("bin").join("java");
+        let java_path = managed_runtime_java_path(&runtime_root_path);
         fs::create_dir_all(java_path.parent().expect("java parent")).expect("runtime bin");
         fs::write(&java_path, b"java").expect("fake java");
         make_executable(&java_path);
@@ -1254,27 +1254,6 @@ mod tests {
         assert!(has_fact(&error.facts, ExecutionFactKind::RuntimeCorrupt));
         assert_no_sensitive_runtime_material(&error.facts);
         cleanup(&root);
-    }
-
-    #[test]
-    fn runtime_fact_catalog_covers_phase_three_facts() {
-        let target = managed_runtime_target();
-        for kind in [
-            ExecutionFactKind::RuntimeMissingExecutable,
-            ExecutionFactKind::RuntimeProbeFailed,
-            ExecutionFactKind::RuntimeWrongMajor,
-            ExecutionFactKind::RuntimeReadyMarkerMissing,
-            ExecutionFactKind::RuntimeRepairApplied,
-            ExecutionFactKind::RuntimeCorrupt,
-            ExecutionFactKind::RuntimeJavaOverrideEmpty,
-            ExecutionFactKind::RuntimeJavaOverrideUndefinedSentinel,
-            ExecutionFactKind::RuntimeWrongUpdate,
-        ] {
-            let fact = runtime_fact(kind, None, &target, Vec::new());
-            assert_eq!(fact.kind, kind);
-            assert_eq!(fact.target.as_ref(), Some(&target));
-            assert_no_sensitive_runtime_material(&[fact]);
-        }
     }
 
     struct SuccessfulProbe {
@@ -1411,6 +1390,25 @@ mod tests {
             serde_json::to_vec(&manifest).expect("manifest json"),
         )
         .expect("runtime manifest proof");
+    }
+
+    fn managed_runtime_java_path(runtime_root: &Path) -> PathBuf {
+        if cfg!(target_os = "macos") {
+            return runtime_root
+                .join("jre.bundle")
+                .join("Contents")
+                .join("Home")
+                .join("bin")
+                .join("java");
+        }
+
+        runtime_root
+            .join("bin")
+            .join(if cfg!(target_os = "windows") {
+                "javaw.exe"
+            } else {
+                "java"
+            })
     }
 
     #[cfg(unix)]

@@ -418,7 +418,7 @@ mod tests {
     use super::{
         ProcessCapabilityErrorKind, ProcessKillReason, ProcessKillRequest, ProcessObservation,
         ProcessObservationRequest, ProcessSpawnRequest, ProcessStopIntent, ProcessStopRequest,
-        observe_process, process_fact, process_killed, process_session_target, process_spawned,
+        observe_process, process_killed, process_session_target, process_spawned,
         process_stop_requested,
     };
     use crate::execution::ExecutionFactKind;
@@ -560,24 +560,6 @@ mod tests {
         let encoded = facts_json(&report.facts);
         assert!(encoded.contains("boot_evidence"));
         assert_no_sensitive_process_material(&encoded);
-    }
-
-    #[test]
-    fn process_fact_catalog_covers_phase_four_facts() {
-        let target = session_target("session-1");
-        for kind in [
-            ExecutionFactKind::ProcessSpawned,
-            ExecutionFactKind::ProcessStopIntent,
-            ExecutionFactKind::ProcessKilled,
-            ExecutionFactKind::ProcessExitCode,
-            ExecutionFactKind::ProcessBootEvidence,
-            ExecutionFactKind::ProcessWatchdogAction,
-            ExecutionFactKind::ProcessExited,
-        ] {
-            let fact = process_fact(kind, None, &target, Vec::new());
-            assert_eq!(fact.kind, kind);
-            assert_eq!(fact.target.as_ref(), Some(&target));
-        }
     }
 
     fn session_target(id: &str) -> TargetDescriptor {

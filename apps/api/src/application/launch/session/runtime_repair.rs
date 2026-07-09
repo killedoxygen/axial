@@ -166,6 +166,15 @@ fn managed_runtime_ready_marker_repair_candidate(
 }
 
 fn managed_runtime_java_executable(runtime_root: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return runtime_root
+            .join("jre.bundle")
+            .join("Contents")
+            .join("Home")
+            .join("bin")
+            .join("java");
+    }
+
     runtime_root
         .join("bin")
         .join(if cfg!(target_os = "windows") {

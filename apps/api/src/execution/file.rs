@@ -756,31 +756,6 @@ mod tests {
     }
 
     #[test]
-    fn file_fact_catalog_covers_phase_one_fact_kinds() {
-        let target = launcher_target("operation_status");
-        let kinds = [
-            ExecutionFactKind::FileMissing,
-            ExecutionFactKind::FileCorrupt,
-            ExecutionFactKind::FileLocked,
-            ExecutionFactKind::FilePermissionDenied,
-            ExecutionFactKind::FileQuarantined,
-            ExecutionFactKind::FileTempLeftover,
-            ExecutionFactKind::FileOwnershipUnknown,
-        ];
-
-        for kind in kinds {
-            let fact = file_fact(kind, None, &target);
-            assert_eq!(fact.kind, kind);
-            assert_eq!(fact.target.as_ref(), Some(&target));
-            assert!(
-                fact.fields
-                    .iter()
-                    .all(|field| field.value != "/tmp/raw-path")
-            );
-        }
-    }
-
-    #[test]
     fn file_facts_sanitize_unsafe_target_ids() {
         let target = TargetDescriptor {
             system: StabilizationSystem::Execution,

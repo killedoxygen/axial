@@ -1171,7 +1171,7 @@ mod tests {
     }
 
     fn write_fake_java(runtime_root: &Path) -> PathBuf {
-        let java_path = runtime_root.join("bin").join("java");
+        let java_path = managed_runtime_java_path(runtime_root);
         fs::create_dir_all(java_path.parent().expect("java parent")).expect("runtime bin");
         fs::write(&java_path, b"java").expect("fake java");
         make_executable(&java_path);
@@ -1207,6 +1207,25 @@ mod tests {
             serde_json::to_vec(&manifest).expect("manifest json"),
         )
         .expect("runtime manifest proof");
+    }
+
+    fn managed_runtime_java_path(runtime_root: &Path) -> PathBuf {
+        if cfg!(target_os = "macos") {
+            return runtime_root
+                .join("jre.bundle")
+                .join("Contents")
+                .join("Home")
+                .join("bin")
+                .join("java");
+        }
+
+        runtime_root
+            .join("bin")
+            .join(if cfg!(target_os = "windows") {
+                "javaw.exe"
+            } else {
+                "java"
+            })
     }
 
     #[cfg(unix)]

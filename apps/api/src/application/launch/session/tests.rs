@@ -131,14 +131,9 @@ impl TestFixture {
 
     fn write_global_runtime_without_ready_marker(&self, component: &str) -> PathBuf {
         let runtime_root = self.paths.config_dir.join("runtimes").join(component);
-        let runtime_bin = runtime_root.join("bin");
-        fs::create_dir_all(&runtime_bin).expect("global runtime bin");
-        let java_name = if cfg!(target_os = "windows") {
-            "javaw.exe"
-        } else {
-            "java"
-        };
-        let java_path = runtime_bin.join(java_name);
+        let java_path = managed_runtime_java_path(&runtime_root);
+        fs::create_dir_all(java_path.parent().expect("global runtime java parent"))
+            .expect("global runtime java parent");
         fs::write(&java_path, b"java").expect("global runtime java");
         make_executable(&java_path);
         write_runtime_manifest_proof(&runtime_root, &java_path);
@@ -352,6 +347,25 @@ fn write_runtime_manifest_proof(runtime_root: &Path, java_path: &Path) {
         serde_json::to_vec(&manifest).expect("manifest json"),
     )
     .expect("runtime manifest proof");
+}
+
+fn managed_runtime_java_path(runtime_root: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        return runtime_root
+            .join("jre.bundle")
+            .join("Contents")
+            .join("Home")
+            .join("bin")
+            .join("java");
+    }
+
+    runtime_root
+        .join("bin")
+        .join(if cfg!(target_os = "windows") {
+            "javaw.exe"
+        } else {
+            "java"
+        })
 }
 
 fn test_root(name: &str) -> PathBuf {

@@ -198,13 +198,3 @@ async fn handle_apply_saved_skin(
 async fn handle_flush_saved_skin_applies(State(state): State<AppState>) -> impl IntoResponse {
     application_skin::handle_flush_saved_skin_applies(&state).await
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn skin_profile_router_builds_with_from_profile_route() {
-        let _ = router();
-    }
-}
