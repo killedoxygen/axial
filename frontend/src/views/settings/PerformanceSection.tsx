@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
-import { OptionList, type OptionListItem } from '../../ui/OptionList';
+import { ChoicePills, type ChoicePillOption } from '../../ui/ChoicePills';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
 import { useAutoSave } from '../../hooks/use-autosave';
 import { api } from '../../api';
@@ -10,38 +10,17 @@ import type { GuardianMode } from '../../types-guardian';
 import type { PerformanceMode } from '../../types-performance';
 import { PerformanceRulesStatusBlock, usePerformanceRulesStatus } from './PerformanceRulesStatus';
 
-const PERFORMANCE_OPTIONS: Array<OptionListItem<PerformanceMode>> = [
-  {
-    value: 'managed',
-    label: 'Managed',
-    icon: 'sparkles',
-    note: 'Croopor applies recommended tuning and optimizations for you.',
-  },
-  {
-    value: 'vanilla',
-    label: 'Vanilla',
-    icon: 'cube',
-    note: 'Pure Minecraft. No tweaks or add-ons applied at launch.',
-  },
-  {
-    value: 'custom',
-    label: 'Custom',
-    icon: 'sliders',
-    note: 'You set the tuning. Your manual choices are kept as-is.',
-  },
+const PERFORMANCE_OPTIONS: Array<ChoicePillOption<PerformanceMode>> = [
+  { value: 'managed', label: 'Managed', note: 'Croopor applies recommended tuning and optimizations for you.' },
+  { value: 'vanilla', label: 'Vanilla', note: 'Pure Minecraft. No tweaks or add-ons applied at launch.' },
+  { value: 'custom', label: 'Custom', note: 'You set the tuning. Your manual choices are kept as-is.' },
 ];
 
-const GUARDIAN_OPTIONS: Array<OptionListItem<GuardianMode>> = [
-  {
-    value: 'managed',
-    label: 'Managed',
-    icon: 'shield-check',
-    note: 'Catches risky launch settings and fixes them automatically.',
-  },
+const GUARDIAN_OPTIONS: Array<ChoicePillOption<GuardianMode>> = [
+  { value: 'managed', label: 'Managed', note: 'Catches risky launch settings and fixes them automatically.' },
   {
     value: 'custom',
     label: 'Custom',
-    icon: 'shield-person',
     note: 'Keeps your choices, warns instead of changing, blocks only fatal setups.',
   },
 ];
@@ -76,41 +55,49 @@ export function PerformanceSection(): JSX.Element {
     errorLabel: 'performance settings',
   });
 
+  const performanceNote = PERFORMANCE_OPTIONS.find((option) => option.value === performanceMode)?.note;
+  const guardianNote = GUARDIAN_OPTIONS.find((option) => option.value === guardianMode)?.note;
+
   return (
     <SettingsSection>
       <SettingRow
         title="Performance mode"
-        description="How launches are tuned by default. Instances can override this per profile."
-      >
-        <OptionList<PerformanceMode>
-          value={performanceMode}
-          options={PERFORMANCE_OPTIONS}
-          disabled={saving}
-          ariaLabel="Performance mode"
-          onChange={(next) => {
-            setPerformanceMode(next);
-            commit(
-              { performance_mode: next },
-              { label: 'performance settings', revert: () => setPerformanceMode(savedPerformance) },
-            );
-          }}
-        />
-      </SettingRow>
-      <SettingRow title="Guardian" description="The safety net around risky launch configurations.">
-        <OptionList<GuardianMode>
-          value={guardianMode}
-          options={GUARDIAN_OPTIONS}
-          disabled={saving}
-          ariaLabel="Guardian mode"
-          onChange={(next) => {
-            setGuardianMode(next);
-            commit(
-              { guardian_mode: next },
-              { label: 'Guardian settings', revert: () => setGuardianMode(savedGuardian) },
-            );
-          }}
-        />
-      </SettingRow>
+        description={performanceNote}
+        control={
+          <ChoicePills<PerformanceMode>
+            value={performanceMode}
+            options={PERFORMANCE_OPTIONS}
+            disabled={saving}
+            ariaLabel="Performance mode"
+            onChange={(next) => {
+              setPerformanceMode(next);
+              commit(
+                { performance_mode: next },
+                { label: 'performance settings', revert: () => setPerformanceMode(savedPerformance) },
+              );
+            }}
+          />
+        }
+      />
+      <SettingRow
+        title="Guardian"
+        description={guardianNote}
+        control={
+          <ChoicePills<GuardianMode>
+            value={guardianMode}
+            options={GUARDIAN_OPTIONS}
+            disabled={saving}
+            ariaLabel="Guardian mode"
+            onChange={(next) => {
+              setGuardianMode(next);
+              commit(
+                { guardian_mode: next },
+                { label: 'Guardian settings', revert: () => setGuardianMode(savedGuardian) },
+              );
+            }}
+          />
+        }
+      />
       <SettingRow title="Managed rules" description="The rule set powering managed tuning and its readiness.">
         <PerformanceRulesStatusBlock state={rulesStatus} />
       </SettingRow>

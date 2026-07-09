@@ -2,7 +2,7 @@ import './base.css';
 import './ui/atoms.css';
 import './ui/segmented.css';
 import './ui/settings-sheet.css';
-import './ui/option-list.css';
+import './ui/choice-pills.css';
 import './ui/runtime-fields.css';
 import './ui/memory-field.css';
 import './ui/window-field.css';

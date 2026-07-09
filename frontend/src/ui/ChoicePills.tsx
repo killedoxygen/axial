@@ -1,16 +1,14 @@
 import type { JSX } from 'preact';
 import { useRef } from 'preact/hooks';
-import { Icon } from './Icons';
 
-export type OptionListItem<T extends string> = {
+export type ChoicePillOption<T extends string> = {
   value: T;
   label: string;
-  icon?: string;
   note?: string;
   disabled?: boolean;
 };
 
-export function OptionList<T extends string>({
+export function ChoicePills<T extends string>({
   value,
   options,
   onChange,
@@ -18,19 +16,19 @@ export function OptionList<T extends string>({
   disabled,
 }: {
   value: T;
-  options: Array<OptionListItem<T>>;
+  options: Array<ChoicePillOption<T>>;
   onChange: (v: T) => void;
   ariaLabel: string;
   disabled?: boolean;
 }): JSX.Element {
-  const listRef = useRef<HTMLDivElement>(null);
+  const groupRef = useRef<HTMLDivElement>(null);
 
   const blocked = (index: number): boolean => disabled || Boolean(options[index]?.disabled);
 
   const focusAndSelect = (index: number): void => {
     const option = options[index];
     if (!option || blocked(index)) return;
-    listRef.current?.querySelectorAll('button')[index]?.focus();
+    groupRef.current?.querySelectorAll('button')[index]?.focus();
     if (option.value !== value) onChange(option.value);
   };
 
@@ -57,7 +55,7 @@ export function OptionList<T extends string>({
   const tabStop = activeIndex >= 0 && !blocked(activeIndex) ? activeIndex : options.findIndex((_, i) => !blocked(i));
 
   return (
-    <div ref={listRef} class="cp-optlist" role="radiogroup" aria-label={ariaLabel}>
+    <div ref={groupRef} class="cp-pills" role="radiogroup" aria-label={ariaLabel}>
       {options.map((opt, index) => {
         const active = opt.value === value;
         return (
@@ -68,21 +66,14 @@ export function OptionList<T extends string>({
             aria-checked={active}
             data-active={active}
             disabled={blocked(index)}
+            title={opt.note}
             tabIndex={index === tabStop ? 0 : -1}
             onClick={() => {
               if (!blocked(index) && !active) onChange(opt.value);
             }}
             onKeyDown={(e) => onKeyDown(e as unknown as KeyboardEvent, index)}
           >
-            {opt.icon && (
-              <span class="cp-optlist-icon" aria-hidden="true">
-                <Icon name={opt.icon} size={15} stroke={1.8} />
-              </span>
-            )}
-            <span class="cp-optlist-copy">
-              <strong>{opt.label}</strong>
-              {opt.note && <span>{opt.note}</span>}
-            </span>
+            {opt.label}
           </button>
         );
       })}

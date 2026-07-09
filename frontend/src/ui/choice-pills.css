@@ -1,0 +1,40 @@
+.cp-pills {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cp-pills > button {
+  height: 28px;
+  padding: 0 14px;
+  border: none;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 120ms,
+    color 120ms,
+    scale 70ms ease;
+}
+.cp-pills > button:hover:not(:disabled):not([data-active='true']) {
+  background: var(--surface-3);
+  color: var(--text);
+}
+.cp-pills > button:active:not(:disabled) {
+  scale: 0.96;
+}
+.cp-pills > button:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+.cp-pills > button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.cp-pills > button[data-active='true'] {
+  background: var(--accent-fill);
+  color: var(--accent-on);
+}

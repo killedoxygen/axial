@@ -49,6 +49,29 @@
 .cp-ovr-args {
   min-width: 0;
 }
+.cp-runtime-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(160px, 0.7fr) minmax(200px, 0.9fr) minmax(240px, 1.4fr);
+  gap: 12px;
+  align-items: start;
+}
+.cp-runtime-grid .cp-argbox {
+  min-height: 34px;
+}
+@media (max-width: 1150px) {
+  .cp-runtime-grid {
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1fr);
+  }
+  .cp-runtime-grid > .cp-ovr-args {
+    grid-column: 1 / -1;
+  }
+}
+@media (max-width: 720px) {
+  .cp-runtime-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 .cp-argbox {
   position: relative;
   min-height: 84px;

@@ -280,7 +280,7 @@ export function inferButtonSound(btn: HTMLElement): SoundKind | null {
   if (btn.classList.contains('cp-winctrl')) return 'soft';
   if (btn.classList.contains('cp-sidebar-item')) return 'soft';
   if (btn.classList.contains('cp-seg') || btn.closest('.cp-seg')) return 'soft';
-  if (btn.closest('.cp-optlist')) return 'soft';
+  if (btn.closest('.cp-pills')) return 'soft';
   if (btn.classList.contains('cp-ob-choice')) return 'soft';
 
   if (btn.classList.contains('cp-btn--primary')) {

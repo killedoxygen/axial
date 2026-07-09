@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
 import { SelectField } from '../../../ui/Select';
-import { OptionList, type OptionListItem } from '../../../ui/OptionList';
+import { ChoicePills, type ChoicePillOption } from '../../../ui/ChoicePills';
 import { OverrideChip, SettingRow, SettingsSection } from '../../../ui/SettingsSheet';
 import { MemoryField, recommendedHeapRange } from '../../../ui/MemoryField';
 import { WindowField } from '../../../ui/WindowField';
@@ -75,6 +75,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
 
   const savedJavaPath = inst.java_path ?? '';
   const [javaPath, setJavaPath] = useState(savedJavaPath);
+  const runtimeOverridden = savedPreset !== '' || savedJavaPath.trim() !== '';
 
   const savedArgs = inst.extra_jvm_args ?? '';
   const [jvmArgs, setJvmArgs] = useState(savedArgs);
@@ -155,31 +156,19 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     };
   }, [inst.id]);
 
-  const modeOptions: Array<OptionListItem<InstancePerformanceMode>> = [
+  const modeOptions: Array<ChoicePillOption<InstancePerformanceMode>> = [
     {
       value: '',
       label: 'Inherit',
-      icon: 'globe',
       note: `Follows the global Performance setting, currently ${performanceModeLabel(globalMode)}.`,
     },
     {
       value: 'managed',
       label: 'Managed',
-      icon: 'sparkles',
       note: 'Croopor applies recommended tuning and optimizations for this instance.',
     },
-    {
-      value: 'vanilla',
-      label: 'Vanilla',
-      icon: 'cube',
-      note: 'Pure Minecraft. No tweaks or add-ons applied at launch.',
-    },
-    {
-      value: 'custom',
-      label: 'Custom',
-      icon: 'sliders',
-      note: 'You set the tuning. Your manual choices are kept as-is.',
-    },
+    { value: 'vanilla', label: 'Vanilla', note: 'Pure Minecraft. No tweaks or add-ons applied at launch.' },
+    { value: 'custom', label: 'Custom', note: 'You set the tuning. Your manual choices are kept as-is.' },
   ];
 
   const changeMode = (next: InstancePerformanceMode): void => {
@@ -216,60 +205,50 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
       <SettingsSection>
         <SettingRow
           title="Launch profile"
-          description="How this instance is tuned at launch."
+          description={modeOptions.find((option) => option.value === mode)?.note}
           aside={mode !== '' && <OverrideChip onReset={() => changeMode('')} />}
-        >
-          <OptionList<InstancePerformanceMode>
-            value={mode}
-            options={modeOptions}
-            ariaLabel="Instance performance mode"
-            onChange={changeMode}
-          />
-        </SettingRow>
-
-        <SettingRow
-          title="JVM preset"
-          description={selectedPreset?.disabled_reason ?? selectedPreset?.detail}
-          aside={
-            savedPreset !== '' && (
-              <OverrideChip
-                onReset={() => commit({ jvm_preset: '' }, { label: 'JVM preset', onSuccess: bumpHealth })}
-              />
-            )
-          }
           control={
-            <SelectField<string>
-              value={savedPreset}
-              ariaLabel="JVM preset"
-              onChange={(next) => commit({ jvm_preset: next }, { label: 'JVM preset', onSuccess: bumpHealth })}
-              disabled={selectablePresets.length === 0}
-              placeholder="Loading"
-              options={presetOptions.map((preset) => ({
-                value: preset.id,
-                label: jvmPresetSelectLabel(preset),
-                disabled: Boolean(preset.disabled_reason),
-              }))}
+            <ChoicePills<InstancePerformanceMode>
+              value={mode}
+              options={modeOptions}
+              ariaLabel="Instance performance mode"
+              onChange={changeMode}
             />
           }
         />
 
         <SettingRow
-          title="Java runtime"
-          description="Which Java executable launches this instance."
+          title="Runtime"
+          description={selectedPreset?.disabled_reason ?? selectedPreset?.detail}
           aside={
-            savedJavaPath.trim() !== '' && (
+            runtimeOverridden && (
               <OverrideChip
                 onReset={() => {
                   setJavaPath('');
-                  commit({ java_path: '' }, { label: 'Java runtime', onSuccess: bumpHealth });
+                  commit({ jvm_preset: '', java_path: '' }, { label: 'runtime', onSuccess: bumpHealth });
                 }}
               />
             )
           }
-          control={
+        >
+          <div class="cp-runtime-grid">
+            <label class="cp-ovr-field">
+              <span>JVM preset</span>
+              <SelectField<string>
+                value={savedPreset}
+                ariaLabel="JVM preset"
+                onChange={(next) => commit({ jvm_preset: next }, { label: 'JVM preset', onSuccess: bumpHealth })}
+                disabled={selectablePresets.length === 0}
+                placeholder="Loading"
+                options={presetOptions.map((preset) => ({
+                  value: preset.id,
+                  label: jvmPresetSelectLabel(preset),
+                  disabled: Boolean(preset.disabled_reason),
+                }))}
+              />
+            </label>
             <JavaPathField
               value={javaPath}
-              label=""
               onChange={setJavaPath}
               onCommit={(next) => {
                 if (next === savedJavaPath.trim()) return;
@@ -279,11 +258,8 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
                 );
               }}
             />
-          }
-        />
-
-        <SettingRow title="JVM arguments" description="Extra flags appended to the launch command.">
-          <JvmArgsInput value={jvmArgs} onChange={onArgsChange} label="" />
+            <JvmArgsInput value={jvmArgs} onChange={onArgsChange} />
+          </div>
         </SettingRow>
 
         <SettingRow
