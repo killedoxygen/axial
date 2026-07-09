@@ -15,7 +15,7 @@ import {
   openUpdateNotes,
   restartDesktopApp,
 } from '../../updater';
-import { SettingsCard } from './settings-shared';
+import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
 
 function displayReleaseVersion(version: string): string {
   return version.startsWith('v') || version.startsWith('V') ? version : `v${version}`;
@@ -52,48 +52,50 @@ export function AboutSettingsSection(): JSX.Element {
   };
 
   return (
-    <SettingsCard title="Croopor" desc={`Version ${appVersion.value}. A focused Minecraft launcher.`} stack>
-      <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <Button variant="secondary" icon="globe" onClick={() => void openHomepage()}>
-          Homepage
-        </Button>
-        <Button
-          variant="secondary"
-          icon="refresh"
-          disabled={checking}
-          onClick={() => void checkForUpdates({ force: true })}
-        >
-          {checking ? 'Checking...' : 'Check'}
-        </Button>
-        {hasNativeDesktopRuntime() && (
-          <Button variant="secondary" icon="refresh" onClick={() => void restartDesktopApp()}>
-            Restart
-          </Button>
-        )}
-      </div>
-      <div style={{ marginTop: 12, color: 'var(--text)', fontSize: 13, fontWeight: 700 }}>{status}</div>
-      <div style={{ marginTop: 4, color: 'var(--text-mute)', fontSize: 12 }}>Last checked: {checkedAt}</div>
-      {checkState === 'error' && (
-        <div style={{ marginTop: 8, color: 'var(--err)', fontSize: 12 }}>Could not check for updates.</div>
-      )}
-      {visibleUpdate && (
+    <SettingsSection>
+      <SettingRow title="Croopor" description={`Version ${appVersion.value}. A focused Minecraft launcher.`}>
         <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          <Button variant="primary" icon="globe" onClick={() => void openUpdateAction()}>
-            {info?.action_label || 'Open release'}
+          <Button variant="secondary" icon="globe" onClick={() => void openHomepage()}>
+            Homepage
           </Button>
-          <Button variant="secondary" icon="tag" onClick={() => void openUpdateNotes()}>
-            Notes
+          <Button
+            variant="secondary"
+            icon="refresh"
+            disabled={checking}
+            onClick={() => void checkForUpdates({ force: true })}
+          >
+            {checking ? 'Checking...' : 'Check'}
           </Button>
-          {info?.checksum_url && (
-            <Button variant="secondary" icon="shield-check" onClick={() => void openUpdateChecksum()}>
-              Checksum
+          {hasNativeDesktopRuntime() && (
+            <Button variant="secondary" icon="refresh" onClick={() => void restartDesktopApp()}>
+              Restart
             </Button>
           )}
-          <Button variant="secondary" icon="x" onClick={dismiss}>
-            Dismiss
-          </Button>
         </div>
-      )}
-    </SettingsCard>
+        <div style={{ marginTop: 12, color: 'var(--text)', fontSize: 13, fontWeight: 700 }}>{status}</div>
+        <div style={{ marginTop: 4, color: 'var(--text-mute)', fontSize: 12 }}>Last checked: {checkedAt}</div>
+        {checkState === 'error' && (
+          <div style={{ marginTop: 8, color: 'var(--err)', fontSize: 12 }}>Could not check for updates.</div>
+        )}
+        {visibleUpdate && (
+          <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <Button variant="primary" icon="globe" onClick={() => void openUpdateAction()}>
+              {info?.action_label || 'Open release'}
+            </Button>
+            <Button variant="secondary" icon="tag" onClick={() => void openUpdateNotes()}>
+              Notes
+            </Button>
+            {info?.checksum_url && (
+              <Button variant="secondary" icon="shield-check" onClick={() => void openUpdateChecksum()}>
+                Checksum
+              </Button>
+            )}
+            <Button variant="secondary" icon="x" onClick={dismiss}>
+              Dismiss
+            </Button>
+          </div>
+        )}
+      </SettingRow>
+    </SettingsSection>
   );
 }

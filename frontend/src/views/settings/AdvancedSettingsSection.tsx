@@ -3,12 +3,12 @@ import { useEffect, useState } from 'preact/hooks';
 import { api } from '../../api';
 import { ensureFlags, refreshFlags, setFlagOverride } from '../../flags';
 import { Button, Toggle } from '../../ui/Atoms';
+import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
 import { navigate, ROUTE_STORAGE_KEY } from '../../ui-state';
 import { STORAGE_KEY } from '../../state';
 import { config, devMode, featureFlags, featureFlagsLoadState } from '../../store';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
-import { SettingsCard } from './settings-shared';
 
 type PerformanceLabCardComponent = (typeof import('./PerformanceLabCard'))['PerformanceLabCard'];
 
@@ -40,7 +40,7 @@ const FLAG_STAGE_NOTES = {
   beta: 'Beta — may still change.',
 } as const;
 
-export function ExperimentalFlagsCards(): JSX.Element | null {
+export function ExperimentalFlagRows(): JSX.Element | null {
   const allFlags = featureFlags.value;
   const loadState = featureFlagsLoadState.value;
 
@@ -51,9 +51,9 @@ export function ExperimentalFlagsCards(): JSX.Element | null {
   if (!allFlags) {
     const failed = loadState.status === 'error';
     return (
-      <SettingsCard
+      <SettingRow
         title="Experimental flags"
-        desc={
+        description={
           failed ? `Could not load feature flags: ${loadState.error || 'Unknown error'}` : 'Feature flags are loading.'
         }
         control={
@@ -73,10 +73,10 @@ export function ExperimentalFlagsCards(): JSX.Element | null {
   return (
     <>
       {flags.map((flag) => (
-        <SettingsCard
+        <SettingRow
           key={flag.key}
           title={flag.title}
-          desc={`${flag.description} ${FLAG_STAGE_NOTES[flag.stage]}`}
+          description={`${flag.description} ${FLAG_STAGE_NOTES[flag.stage]}`}
           control={<Toggle on={flag.enabled} onChange={() => void setFlagOverride(flag.key, !flag.enabled)} />}
         />
       ))}
@@ -136,26 +136,26 @@ export function AdvancedSettingsSection(): JSX.Element {
   };
 
   return (
-    <>
-      <SettingsCard
+    <SettingsSection>
+      <SettingRow
         title="Anonymous usage stats"
-        desc="Shares anonymous feature-usage and launch-outcome events to improve Croopor. No names, files, or personal data — see docs/TELEMETRY.md. Builds without a telemetry key never upload."
+        description="Shares anonymous feature-usage and launch-outcome events to improve Croopor. No names, files, or personal data — see docs/TELEMETRY.md. Builds without a telemetry key never upload."
         control={<Toggle on={telemetryEnabled} onChange={() => void toggleTelemetry()} />}
       />
-      <SettingsCard
+      <SettingRow
         title="Reload launcher"
-        desc="Useful if the launcher gets out of sync with the backend."
+        description="Useful if the launcher gets out of sync with the backend."
         control={
           <Button variant="secondary" icon="refresh" onClick={() => location.reload()}>
             Reload
           </Button>
         }
       />
-      <ExperimentalFlagsCards />
+      <ExperimentalFlagRows />
       {__CROOPOR_ENABLE_DEV_LAB__ && isDev && (
-        <SettingsCard
+        <SettingRow
           title="Dev lab"
-          desc="Developer workbench: feature flags, live state inspector, and UI playgrounds."
+          description="Developer workbench: feature flags, live state inspector, and UI playgrounds."
           control={
             <Button variant="secondary" icon="palette" onClick={() => navigate({ name: 'dev-lab' })}>
               Open lab
@@ -165,9 +165,9 @@ export function AdvancedSettingsSection(): JSX.Element {
       )}
       {isDev && <PerformanceLabSlot />}
       {isDev && (
-        <SettingsCard
+        <SettingRow
           title="Flush all data"
-          desc="Deletes every Croopor-managed file and restarts from first run. Existing libraries selected through 'Use existing' are preserved."
+          description="Deletes every Croopor-managed file and restarts from first run. Existing libraries selected through 'Use existing' are preserved."
           control={
             <Button variant="danger" icon="trash" disabled={busy} onClick={flush}>
               {busy ? 'Flushing…' : 'Flush'}
@@ -175,6 +175,6 @@ export function AdvancedSettingsSection(): JSX.Element {
           }
         />
       )}
-    </>
+    </SettingsSection>
   );
 }

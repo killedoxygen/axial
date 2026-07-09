@@ -1,10 +1,11 @@
-import type { ComponentChildren, JSX } from 'preact';
+import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { api } from '../../api';
 import { devMode } from '../../store';
 import type { LaunchReportsResponse } from '../../types-launch';
 import type { BenchmarkMatrixResponse, BenchmarkQualificationPreviewResponse } from '../../types-performance';
-import { Button, Card } from '../../ui/Atoms';
+import { Button } from '../../ui/Atoms';
+import { SettingRow } from '../../ui/SettingsSheet';
 import { errMessage } from '../../utils';
 import { BenchmarkMatrixBlock } from './PerformanceLabBenchmarkMatrix';
 import { LaunchProofHistoryBlock } from './PerformanceLabProofHistory';
@@ -18,31 +19,6 @@ import type {
   BenchmarkQualificationPreviewState,
   LaunchReportsState,
 } from './PerformanceLabTypes';
-
-function SettingsCard({
-  title,
-  desc,
-  control,
-  stack,
-  children,
-}: {
-  title: string;
-  desc?: string;
-  control?: ComponentChildren;
-  stack?: boolean;
-  children?: ComponentChildren;
-}): JSX.Element {
-  return (
-    <Card class={`cp-settings-card${stack ? ' cp-settings-card--stack' : ''}`}>
-      <div>
-        <div class="cp-settings-card-title">{title}</div>
-        {desc && <div class="cp-settings-card-desc">{desc}</div>}
-        {stack && children}
-      </div>
-      {(control || (!stack && children)) && <div class="cp-settings-card-control">{control || children}</div>}
-    </Card>
-  );
-}
 
 export function PerformanceLabCard(): JSX.Element | null {
   const isDev = devMode.value;
@@ -123,9 +99,9 @@ export function PerformanceLabCard(): JSX.Element | null {
 
   if (!labOpen) {
     return (
-      <SettingsCard
+      <SettingRow
         title="Performance lab"
-        desc="Developer-only launch proof and benchmark tools."
+        description="Developer-only launch proof and benchmark tools."
         control={
           <Button variant="secondary" size="sm" icon="chevron-down" onClick={() => setLabOpen(true)}>
             Open
@@ -136,7 +112,7 @@ export function PerformanceLabCard(): JSX.Element | null {
   }
 
   return (
-    <SettingsCard title="Performance lab" desc="Developer-only launch proof and benchmark tools." stack>
+    <SettingRow title="Performance lab" description="Developer-only launch proof and benchmark tools.">
       <div class="cp-settings-lab-action">
         <Button variant="secondary" size="sm" icon="chevron-up" onClick={() => setLabOpen(false)}>
           Close
@@ -146,6 +122,6 @@ export function PerformanceLabCard(): JSX.Element | null {
       <BenchmarkMatrixBlock state={benchmarkMatrix} />
       <BenchmarkQualificationPreviewBlock state={qualificationPreview} />
       <BenchmarkSuiteDriversBlock matrixState={benchmarkMatrix} />
-    </SettingsCard>
+    </SettingRow>
   );
 }
