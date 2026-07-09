@@ -1,5 +1,6 @@
 import type { JSX } from 'preact';
-import { Button, Input, Segmented } from '../../ui/Atoms';
+import { Button, Input } from '../../ui/Atoms';
+import { Segmented } from '../../ui/Segmented';
 import { Modal, ModalContent, ModalHeader, ModalTitle } from '../../ui/Modal';
 import { CapePicker } from './CapePicker';
 import { savedSkinFileUrl, stagedSkinPreviewSrc } from './api';

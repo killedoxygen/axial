@@ -1,5 +1,6 @@
 import type { JSX } from 'preact';
-import { Input, Segmented } from '../../../ui/Atoms';
+import { Input } from '../../../ui/Atoms';
+import { Segmented } from '../../../ui/Segmented';
 
 export type WindowPreset = { id: string; label: string; w: number; h: number };
 

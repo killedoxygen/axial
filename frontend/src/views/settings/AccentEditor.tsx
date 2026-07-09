@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { Button, Segmented } from '../../ui/Atoms';
+import { Button } from '../../ui/Atoms';
+import { Segmented } from '../../ui/Segmented';
 import { ColorField } from './ColorField';
 import { applyTheme, resetThemeToDefault } from '../../theme';
 import { defaults, local, PRESET_HUES } from '../../state';
@@ -23,6 +24,7 @@ export function AccentModeToggle({ onChange }: { onChange?: (mode: 'dark' | 'lig
     <Segmented<'dark' | 'light'>
       value={mode}
       onChange={applyMode}
+      ariaLabel="Theme mode"
       options={[
         { value: 'dark', label: 'Dark' },
         { value: 'light', label: 'Light' },

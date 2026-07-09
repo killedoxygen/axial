@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Button, IconButton, Input, Pill, Toggle } from '../../ui/Atoms';
+import { Segmented } from '../../ui/Segmented';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
 import { SelectField } from '../../ui/Select';
@@ -728,28 +729,23 @@ function CreateCard(): JSX.Element {
                 inputRef={searchInputRef}
                 style={{ flex: 1 }}
               />
-              <div class="cp-seg cp-seg--sm cp-cr-channels" role="tablist" aria-label="Release channel">
-                {channelTabs.map((value) => {
+              <Segmented<Channel>
+                role="tablist"
+                size="sm"
+                class="cp-cr-channels"
+                ariaLabel="Release channel"
+                value={channel}
+                onChange={setChannel}
+                options={channelTabs.map((value) => {
                   const available = availableChannelSet.has(value);
-                  return (
-                    <button
-                      key={value}
-                      type="button"
-                      class="cp-cr-chan"
-                      data-active={channel === value}
-                      role="tab"
-                      aria-selected={channel === value}
-                      disabled={!available}
-                      title={available ? undefined : `No ${CHANNEL_LABEL[value].toLowerCase()} versions here`}
-                      onClick={() => {
-                        if (available) setChannel(value);
-                      }}
-                    >
-                      {CHANNEL_LABEL[value]}
-                    </button>
-                  );
+                  return {
+                    value,
+                    label: CHANNEL_LABEL[value],
+                    disabled: !available,
+                    ...(available ? {} : { title: `No ${CHANNEL_LABEL[value].toLowerCase()} versions here` }),
+                  };
                 })}
-              </div>
+              />
             </div>
 
             <div class="cp-cr-vwell" ref={versionWellRef}>

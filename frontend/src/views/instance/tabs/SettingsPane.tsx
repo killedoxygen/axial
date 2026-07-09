@@ -1,7 +1,8 @@
 import type { ComponentChildren, JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
-import { Button, Segmented } from '../../../ui/Atoms';
+import { Button } from '../../../ui/Atoms';
+import { Segmented } from '../../../ui/Segmented';
 import { SelectField } from '../../../ui/Select';
 import { type SliderZone } from '../../../ui/Slider';
 import { RangeSlider } from '../../../ui/RangeSlider';

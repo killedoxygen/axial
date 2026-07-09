@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { Button, Input, Pill, Segmented, Toggle } from '../../ui/Atoms';
+import { Button, Input, Pill, Toggle } from '../../ui/Atoms';
+import { Segmented } from '../../ui/Segmented';
 import { Icon } from '../../ui/Icons';
 import { Slider } from '../../ui/Slider';
 import { AccentField, AccentModeToggle } from './AccentEditor';

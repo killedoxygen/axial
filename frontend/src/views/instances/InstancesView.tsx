@@ -1,7 +1,8 @@
 import type { JSX } from 'preact';
 import { useCallback, useState } from 'preact/hooks';
 import { InstanceTile } from '../../ui/InstanceVisual';
-import { Button, IconButton, Input, Segmented, Pill } from '../../ui/Atoms';
+import { Button, IconButton, Input, Pill } from '../../ui/Atoms';
+import { Segmented } from '../../ui/Segmented';
 import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
 import { openContextMenu } from '../../ui/ContextMenu';
@@ -142,6 +143,7 @@ export function InstancesView(): JSX.Element {
         <Segmented<'grid' | 'list'>
           value={view}
           onChange={setView}
+          ariaLabel="Library view"
           options={[
             { value: 'grid', label: 'Grid' },
             { value: 'list', label: 'List' },

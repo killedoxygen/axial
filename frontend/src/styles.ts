@@ -1,5 +1,6 @@
 import './base.css';
 import './ui/atoms.css';
+import './ui/segmented.css';
 import './shell/shell.css';
 import './shell/rail-icons.css';
 import './ui/instance-visual.css';

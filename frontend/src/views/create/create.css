@@ -157,10 +157,6 @@ html[data-color-mode='light'] .cp-cr-card {
 .cp-cr-channels {
   flex-shrink: 0;
 }
-.cp-cr-chan:disabled {
-  opacity: 0.38;
-  cursor: not-allowed;
-}
 
 .cp-cr-vwell {
   flex: 1;
