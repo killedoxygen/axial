@@ -1,10 +1,10 @@
 # Discord RPC Setup
 
-Croopor desktop builds can publish Discord Rich Presence through Discord's local IPC socket or named pipe. This is compile-time configured; a binary built without `CROOPOR_DISCORD_APPLICATION_ID` does not start the Discord RPC worker.
+Axial desktop builds can publish Discord Rich Presence through Discord's local IPC socket or named pipe. This is compile-time configured; a binary built without `CROOPOR_DISCORD_APPLICATION_ID` does not start the Discord RPC worker.
 
 ## Developer Portal
 1. Open `https://discord.com/developers/applications`.
-2. Create or select the Croopor application.
+2. Create or select the Axial application.
 3. Copy the application id and set it as `CROOPOR_DISCORD_APPLICATION_ID`.
 4. Open Rich Presence art assets for that application.
 5. Upload these asset keys:

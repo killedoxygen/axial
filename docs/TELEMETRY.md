@@ -1,5 +1,5 @@
 # Telemetry
-Croopor has an anonymous, consent-gated telemetry path for broad product health signals and remote feature flags. Local source builds and packaged builds without a valid PostHog key do not upload anything.
+Axial has an anonymous, consent-gated telemetry path for broad product health signals and remote feature flags. Local source builds and packaged builds without a valid PostHog key do not upload anything.
 
 ## What is collected
 Telemetry events are defined only in `apps/api/src/observability/telemetry.rs`. The current event vocabulary is:
@@ -23,14 +23,14 @@ Telemetry events are defined only in `apps/api/src/observability/telemetry.rs`. 
 
 Every queued event also includes the anonymous install id as PostHog `distinct_id`, `$process_person_profile: false`, `environment`, and a UTC timestamp. `environment` is a deployment label, not a user property. The queue is local memory only, bounded, and flushed in batches when telemetry is configured and consent remains enabled.
 
-`$exception` is used for privacy-safe backend error tracking in PostHog Error Tracking. Error kinds are a closed vocabulary in code, and summaries are short backend-authored labels or sanitized public copy. Croopor deliberately never sends stack traces; Rust backtraces can include absolute user paths.
+`$exception` is used for privacy-safe backend error tracking in PostHog Error Tracking. Error kinds are a closed vocabulary in code, and summaries are short backend-authored labels or sanitized public copy. Axial deliberately never sends stack traces; Rust backtraces can include absolute user paths.
 
 Frontend error reports use the same backend telemetry boundary at `/api/v1/telemetry/frontend-error`; the browser never talks to telemetry vendors directly. The frontend sends only the error kind (`error`, `unhandledrejection`, or `render`), the error constructor name, and a short truncated message. It does not send stacks, URLs, filenames, line numbers, or column numbers. The backend converts the report to the closed `frontend_error` `$exception` kind and sanitizes it through the same telemetry export redaction path as every other event.
 
 ## What is never collected
 Telemetry must not include usernames, file paths, server addresses, instance names, tokens, hardware identifiers, command lines, account ids, or raw provider payloads.
 
-Every property value is sanitized through the `TelemetryExport` redaction audience before it is queued. Values that look sensitive are dropped instead of uploaded. Events are sent to PostHog with `$process_person_profile: false`, so PostHog person profiles are not created for Croopor telemetry events.
+Every property value is sanitized through the `TelemetryExport` redaction audience before it is queued. Values that look sensitive are dropped instead of uploaded. Events are sent to PostHog with `$process_person_profile: false`, so PostHog person profiles are not created for Axial telemetry events.
 
 For `$exception`, the fingerprint and area are the durable signal. The summary is capped and sanitized; if it looks sensitive, the event is still sent with a redacted summary value.
 

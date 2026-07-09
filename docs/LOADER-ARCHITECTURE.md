@@ -1,6 +1,6 @@
 # Loader Architecture
 
-This is the current modloader model used by Croopor.
+This is the current modloader model used by Axial.
 
 The important rule is:
 
@@ -11,7 +11,7 @@ The important rule is:
 
 ## Core model
 
-Croopor treats loaders as components.
+Axial treats loaders as components.
 
 Current component ids:
 
@@ -57,7 +57,7 @@ Important fields:
 - `artifact_kind`
 - `install_source`
 
-`build_id` is Croopor-owned. It is the stable selection key for install work.
+`build_id` is Axial-owned. It is the stable selection key for install work.
 
 `version_id` is the installed local version id written into `versions/`.
 
@@ -178,7 +178,7 @@ Responsibility:
 - choose behavior from `LoaderInstallStrategy`
 - keep loader-family and era-specific work local to the selected strategy
 
-Profile-based loaders, currently Fabric and Quilt, download libraries declared by trusted upstream profile JSON. Those profile libraries may omit SHA-1 metadata. Croopor permits a best-effort first download or size-matching reuse for those profile libraries only, while descriptor-backed vanilla artifacts and installer-sourced selected artifacts still require valid checksum metadata. Missing-checksum `.jar` profile libraries are not trusted solely because a file exists; existing and freshly downloaded jars must be structurally readable so stale bad cache entries are replaced. Composed profile-loader version JSON marks those trusted profile libraries with `crooporChecksumlessAllowed`; launch readiness uses that marker to accept only present, structurally readable checksumless jars, while unmarked checksumless libraries still fail strict readiness. Loader strategies also validate base Minecraft dependencies before treating a base version as already installed: the base JSON, client jar, incomplete marker, and selected base libraries must be ready so a partially-installed vanilla base cannot produce a finalized loader profile with missing inherited libraries.
+Profile-based loaders, currently Fabric and Quilt, download libraries declared by trusted upstream profile JSON. Those profile libraries may omit SHA-1 metadata. Axial permits a best-effort first download or size-matching reuse for those profile libraries only, while descriptor-backed vanilla artifacts and installer-sourced selected artifacts still require valid checksum metadata. Missing-checksum `.jar` profile libraries are not trusted solely because a file exists; existing and freshly downloaded jars must be structurally readable so stale bad cache entries are replaced. Composed profile-loader version JSON marks those trusted profile libraries with `crooporChecksumlessAllowed`; launch readiness uses that marker to accept only present, structurally readable checksumless jars, while unmarked checksumless libraries still fail strict readiness. Loader strategies also validate base Minecraft dependencies before treating a base version as already installed: the base JSON, client jar, incomplete marker, and selected base libraries must be ready so a partially-installed vanilla base cannot produce a finalized loader profile with missing inherited libraries.
 
 ### 4. Helper layers
 
@@ -225,7 +225,7 @@ The frontend should not parse composite ids as its main loader data model.
 
 Forge is not one installer path.
 
-Croopor still treats it as three eras:
+Axial still treats it as three eras:
 
 1. earliest pre-installer Forge
 2. legacy installer/FML Forge

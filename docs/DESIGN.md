@@ -8,7 +8,7 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 - Prefer dense but readable operational surfaces over decorative layouts.
 
 ## Visual Direction
-- Use existing Croopor primitives before inventing new ones:
+- Use existing Axial primitives before inventing new ones:
   - `Button`, `IconButton`, `Input`, `Pill`, `Segmented`, `Card`, `SectionHeading`, dialogs, context menus, resource/log layouts.
 - Use the Modrinth App as a product reference where a launcher workflow needs precedent, but do not copy its code, Vue components, or exact layout.
 - Depth model: elevation does hierarchy, accent does action. A deep chassis (`--bg-deep`) holds the content panel (`--bg`); cards are solid raised surfaces (`--surface`, `--shadow-raised`, no border); controls on cards sit at `--surface-2`; hover is `--surface-3`. Recessed wells (search fields, segmented tracks) use `color-mix(in oklab, var(--bg) 55%, var(--surface))`.

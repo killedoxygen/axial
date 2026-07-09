@@ -1,12 +1,12 @@
-# Croopor
+# Axial
 
-Croopor is a protective Minecraft launcher that creates, tunes, repairs, and safely launches vanilla and modded instances.
+Axial is a modern Minecraft launcher and management environment that creates, tunes, repairs, and safely launches vanilla and modded instances.
 
-It is built around a simple promise: launching Minecraft should feel fast, understandable, and resilient. Croopor manages the routine technical work, explains meaningful adjustments, and gives advanced players control without making every player debug Java, loaders, or damaged game files.
+It is built around a simple promise: launching Minecraft should feel fast, understandable, and resilient. Axial absorbs the routine technical work, explains meaningful adjustments, and gives advanced players control without making every player debug Java, loaders, or damaged game files.
 
-> Croopor is pre-release software under active development.
+> Axial Launcher is pre-release software under active development. The source tree and internal identifiers still use the project's former `croopor` name while the rebrand is phased in.
 
-## What Croopor does
+## What Axial does
 
 - Creates and manages multiple Minecraft instances
 - Installs vanilla, Fabric, Quilt, Forge, and NeoForge
@@ -19,7 +19,7 @@ It is built around a simple promise: launching Minecraft should feel fast, under
 
 ## Guardian
 
-Guardian is Croopor's safety and recovery layer. It turns runtime, install, launch, and performance facts into bounded decisions before a small configuration problem becomes a broken instance.
+Guardian is Axial's safety and recovery layer. It turns runtime, install, launch, and performance facts into bounded decisions before a small configuration problem becomes a broken instance. It stays quiet until it is needed; Guardian supports the product rather than defining it.
 
 Depending on the selected mode and who owns the affected state, Guardian can warn, choose a safer runtime, repair launcher-managed files, retry a failed startup once, fall back to a safe performance plan, or block an unsafe operation. Its actions are journaled, verified, redacted for user-facing output, and constrained to avoid destructive repair loops or silent changes to user-owned files.
 
