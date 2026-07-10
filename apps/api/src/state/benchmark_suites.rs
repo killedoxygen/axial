@@ -1,3 +1,4 @@
+use crate::execution::file::{DeleteFileRequest, delete_launcher_managed_file};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
@@ -23,6 +24,7 @@ const BENCHMARK_SUITE_SCHEMA_VERSION: u32 = 2;
 const OPAQUE_ID_HEX_CHARS: usize = 16;
 const BENCHMARK_ID_PREFIX: &str = "benchmark-";
 const SUITE_ID_PREFIX: &str = "suite-";
+const MAX_ORDINARY_TERMINAL_SUITES: usize = 32;
 const MAX_MANIFEST_FIELD_CHARS: usize = 96;
 const MAX_MANIFEST_RUNS: usize = 64;
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
@@ -141,6 +143,8 @@ pub enum BenchmarkSuiteStoreError {
     GenerationOverflow,
     #[error("benchmark suite obligation counter overflowed")]
     ObligationOverflow,
+    #[error("benchmark suite cleanup failed")]
+    Cleanup(#[source] io::Error),
     #[error("benchmark suite persistence failed: {0}")]
     Persistence(#[source] io::Error),
 }
@@ -162,9 +166,33 @@ impl BenchmarkSuiteStoreError {
             Self::Closed => "closed",
             Self::GenerationOverflow => "generation_overflow",
             Self::ObligationOverflow => "obligation_overflow",
+            Self::Cleanup(_) => "cleanup",
             Self::Persistence(_) => "persistence",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BenchmarkSuiteCleanupPhase {
+    SettleWriter,
+    DeleteManifest,
+    BlockingTask,
+}
+
+impl std::fmt::Display for BenchmarkSuiteCleanupPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::SettleWriter => "writer settlement",
+            Self::DeleteManifest => "manifest deletion",
+            Self::BlockingTask => "blocking deletion task",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BenchmarkSuiteCleanupIssue {
+    pub suite_id: String,
+    pub phase: BenchmarkSuiteCleanupPhase,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -228,6 +256,7 @@ struct BenchmarkSuiteInner {
 struct BenchmarkSuiteLoadState {
     inner: BenchmarkSuiteInner,
     issues: Vec<BenchmarkSuiteLoadIssue>,
+    cleanup_obligations: HashMap<String, SuiteCleanupObligation>,
     mutation_latched: bool,
 }
 
@@ -244,6 +273,146 @@ struct SuiteWriteObligation {
     candidate: BenchmarkSuiteManifest,
     state: ObligationState,
     live_session_update: Option<(String, bool)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SuiteCleanupObligation {
+    generation: u64,
+    phase: BenchmarkSuiteCleanupPhase,
+}
+
+#[derive(Debug, Clone)]
+struct SuiteCleanupTarget {
+    suite_id: String,
+    generation: u64,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct BenchmarkSuiteRetentionClaims {
+    inner: Arc<SyncMutex<BenchmarkSuiteRetentionClaimState>>,
+}
+
+#[derive(Default)]
+struct BenchmarkSuiteRetentionClaimState {
+    owner_suites: HashMap<String, String>,
+    pruning_suite_ids: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum BenchmarkSuiteRetentionClaimError {
+    #[error("benchmark suite is reserved for retention cleanup")]
+    Pruning,
+    #[error("benchmark suite retention owner already claims another suite")]
+    OwnerConflict,
+}
+
+impl BenchmarkSuiteRetentionClaims {
+    pub(crate) fn claim(
+        &self,
+        owner_id: &str,
+        suite_id: &str,
+    ) -> Result<(), BenchmarkSuiteRetentionClaimError> {
+        debug_assert!(!owner_id.is_empty());
+        debug_assert!(is_canonical_suite_id(suite_id));
+        let mut state = self.inner.lock().expect(SUITE_STORE_LOCK_INVARIANT);
+        if state.pruning_suite_ids.contains(suite_id) {
+            return Err(BenchmarkSuiteRetentionClaimError::Pruning);
+        }
+        match state.owner_suites.get(owner_id) {
+            Some(existing) if existing == suite_id => Ok(()),
+            Some(_) => Err(BenchmarkSuiteRetentionClaimError::OwnerConflict),
+            None => {
+                state
+                    .owner_suites
+                    .insert(owner_id.to_string(), suite_id.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn release(&self, owner_id: &str, suite_id: &str) -> bool {
+        let mut state = self.inner.lock().expect(SUITE_STORE_LOCK_INVARIANT);
+        if state
+            .owner_suites
+            .get(owner_id)
+            .is_some_and(|claimed_suite_id| claimed_suite_id == suite_id)
+        {
+            state.owner_suites.remove(owner_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn try_begin_prune(&self, suite_id: &str) -> Option<BenchmarkSuitePruneGuard> {
+        debug_assert!(is_canonical_suite_id(suite_id));
+        let mut state = self.inner.lock().expect(SUITE_STORE_LOCK_INVARIANT);
+        if state.pruning_suite_ids.contains(suite_id)
+            || state
+                .owner_suites
+                .values()
+                .any(|claimed_suite_id| claimed_suite_id == suite_id)
+        {
+            return None;
+        }
+        state.pruning_suite_ids.insert(suite_id.to_string());
+        Some(BenchmarkSuitePruneGuard {
+            claims: self.clone(),
+            suite_id: suite_id.to_string(),
+            active: true,
+        })
+    }
+
+    pub(crate) fn claimed_suite_ids(&self) -> HashSet<String> {
+        self.inner
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .owner_suites
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_claim(&self, owner_id: &str, suite_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .owner_suites
+            .get(owner_id)
+            .is_some_and(|claimed_suite_id| claimed_suite_id == suite_id)
+    }
+}
+
+pub(crate) struct BenchmarkSuitePruneGuard {
+    claims: BenchmarkSuiteRetentionClaims,
+    suite_id: String,
+    active: bool,
+}
+
+impl BenchmarkSuitePruneGuard {
+    pub(crate) fn finish(mut self) {
+        self.clear();
+    }
+
+    fn clear(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.claims
+            .inner
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .pruning_suite_ids
+            .remove(&self.suite_id);
+        self.active = false;
+    }
+}
+
+impl Drop for BenchmarkSuitePruneGuard {
+    fn drop(&mut self) {
+        self.clear();
+    }
 }
 
 struct PendingReservationCommit {
@@ -300,6 +469,35 @@ impl BenchmarkSuitePersistence {
         Ok(writer)
     }
 
+    fn take_writer(
+        &self,
+        suite_id: &str,
+    ) -> Result<AtomicSnapshotWriter, BenchmarkSuiteStoreError> {
+        if let Some(writer) = self
+            .writers
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .remove(suite_id)
+        {
+            return Ok(writer);
+        }
+        self.owner
+            .writer(
+                suite_path_in_dir(&self.storage_dir, suite_id),
+                benchmark_suite_target(suite_id),
+            )
+            .map_err(suite_persistence_error)
+    }
+
+    fn restore_writer(&self, suite_id: String, writer: AtomicSnapshotWriter) {
+        let previous = self
+            .writers
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .insert(suite_id, writer);
+        debug_assert!(previous.is_none());
+    }
+
     async fn settle_writers(&self) -> Result<(), BenchmarkSuiteStoreError> {
         let mut writers = self
             .writers
@@ -326,20 +524,370 @@ pub struct BenchmarkSuiteStore {
     mutation_gate: Arc<AsyncMutex<()>>,
     persistence: Option<Arc<BenchmarkSuitePersistence>>,
     obligations: Arc<SyncMutex<HashMap<String, SuiteWriteObligation>>>,
+    cleanup_obligations: Arc<SyncMutex<HashMap<String, SuiteCleanupObligation>>>,
+    retention_claims: BenchmarkSuiteRetentionClaims,
     next_obligation_id: SyncMutex<u64>,
     load_issues: Vec<BenchmarkSuiteLoadIssue>,
     mutation_latched: bool,
     lifecycle: Arc<SyncMutex<BenchmarkSuiteStoreLifecycle>>,
 }
 
+#[derive(Clone)]
+struct BenchmarkSuiteRetention {
+    inner: Arc<RwLock<BenchmarkSuiteInner>>,
+    obligations: Arc<SyncMutex<HashMap<String, SuiteWriteObligation>>>,
+    cleanup_obligations: Arc<SyncMutex<HashMap<String, SuiteCleanupObligation>>>,
+    retention_claims: BenchmarkSuiteRetentionClaims,
+    persistence: Option<Arc<BenchmarkSuitePersistence>>,
+    mutation_latched: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct BenchmarkSuiteRetentionHandle {
+    mutation_gate: Arc<AsyncMutex<()>>,
+    retention: BenchmarkSuiteRetention,
+}
+
+impl BenchmarkSuiteRetentionHandle {
+    pub(crate) async fn retry_detached(&self) {
+        let handle = self.clone();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        drop(tokio::spawn(async move {
+            let mutation = handle.mutation_gate.lock_owned().await;
+            let mutation = handle.retention.enforce_best_effort(mutation).await;
+            drop(mutation);
+            let _ = completed_tx.send(());
+        }));
+        let _ = completed_rx.await;
+    }
+}
+
+impl BenchmarkSuiteRetention {
+    async fn enforce_best_effort_detached(
+        &self,
+        mutation: OwnedMutexGuard<()>,
+    ) -> OwnedMutexGuard<()> {
+        let retention = self.clone();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        drop(tokio::spawn(async move {
+            let _ = completed_tx.send(retention.enforce_best_effort(mutation).await);
+        }));
+        completed_rx
+            .await
+            .expect("benchmark suite best-effort retention owner stopped")
+    }
+
+    async fn enforce_strict_detached(
+        &self,
+        mutation: OwnedMutexGuard<()>,
+    ) -> Result<OwnedMutexGuard<()>, BenchmarkSuiteStoreError> {
+        let retention = self.clone();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        drop(tokio::spawn(async move {
+            let _ = completed_tx.send(retention.enforce_strict(mutation).await);
+        }));
+        completed_rx.await.map_err(|_| {
+            BenchmarkSuiteStoreError::Persistence(io::Error::other(
+                "benchmark suite retention owner stopped",
+            ))
+        })?
+    }
+
+    async fn reconcile_cleanup_detached(
+        &self,
+        suite_id: &str,
+        mutation: OwnedMutexGuard<()>,
+    ) -> Result<OwnedMutexGuard<()>, BenchmarkSuiteStoreError> {
+        let retention = self.clone();
+        let suite_id = suite_id.to_string();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        drop(tokio::spawn(async move {
+            let _ = completed_tx.send(retention.reconcile_cleanup(&suite_id, mutation).await);
+        }));
+        completed_rx.await.map_err(|_| {
+            BenchmarkSuiteStoreError::Persistence(io::Error::other(
+                "benchmark suite cleanup owner stopped",
+            ))
+        })?
+    }
+
+    async fn enforce_best_effort(&self, mutation: OwnedMutexGuard<()>) -> OwnedMutexGuard<()> {
+        if self.mutation_latched {
+            return mutation;
+        }
+        for target in self.pending_cleanup_targets() {
+            if let Err(error) = self.cleanup_target(target).await {
+                warn!(
+                    error_class = error.class(),
+                    "benchmark suite cleanup retry failed"
+                );
+            }
+        }
+        for target in self.new_cleanup_targets() {
+            self.register_cleanup(&target);
+            if let Err(error) = self.cleanup_target(target).await {
+                warn!(
+                    error_class = error.class(),
+                    "benchmark suite retention cleanup failed"
+                );
+            }
+        }
+        mutation
+    }
+
+    async fn enforce_strict(
+        &self,
+        mutation: OwnedMutexGuard<()>,
+    ) -> Result<OwnedMutexGuard<()>, BenchmarkSuiteStoreError> {
+        if self.mutation_latched {
+            return Ok(mutation);
+        }
+        for target in self.pending_cleanup_targets() {
+            self.cleanup_target(target).await?;
+        }
+        for target in self.new_cleanup_targets() {
+            self.register_cleanup(&target);
+            self.cleanup_target(target).await?;
+        }
+        Ok(mutation)
+    }
+
+    async fn reconcile_cleanup(
+        &self,
+        suite_id: &str,
+        mutation: OwnedMutexGuard<()>,
+    ) -> Result<OwnedMutexGuard<()>, BenchmarkSuiteStoreError> {
+        let target = self
+            .cleanup_obligations
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .get(suite_id)
+            .map(|obligation| SuiteCleanupTarget {
+                suite_id: suite_id.to_string(),
+                generation: obligation.generation,
+            });
+        if let Some(target) = target {
+            self.cleanup_target(target).await?;
+        }
+        Ok(mutation)
+    }
+
+    fn pending_cleanup_targets(&self) -> Vec<SuiteCleanupTarget> {
+        let mut targets = self
+            .cleanup_obligations
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .iter()
+            .map(|(suite_id, obligation)| SuiteCleanupTarget {
+                suite_id: suite_id.clone(),
+                generation: obligation.generation,
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| left.suite_id.cmp(&right.suite_id));
+        targets
+    }
+
+    fn new_cleanup_targets(&self) -> Vec<SuiteCleanupTarget> {
+        let write_obligations = self
+            .obligations
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .clone();
+        let cleanup_obligations = self
+            .cleanup_obligations
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .clone();
+        let protected_suite_ids = self.retention_claims.claimed_suite_ids();
+        ordinary_terminal_cleanup_targets(
+            &self.inner.read().expect(SUITE_STORE_LOCK_INVARIANT),
+            &write_obligations,
+            &cleanup_obligations,
+            &protected_suite_ids,
+            self.mutation_latched,
+        )
+    }
+
+    fn register_cleanup(&self, target: &SuiteCleanupTarget) {
+        self.cleanup_obligations
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .entry(target.suite_id.clone())
+            .or_insert(SuiteCleanupObligation {
+                generation: target.generation,
+                phase: BenchmarkSuiteCleanupPhase::SettleWriter,
+            });
+    }
+
+    async fn cleanup_target(
+        &self,
+        target: SuiteCleanupTarget,
+    ) -> Result<(), BenchmarkSuiteStoreError> {
+        let Some(prune_guard) = self.retention_claims.try_begin_prune(&target.suite_id) else {
+            self.remove_cleanup_if_generation(&target);
+            return Ok(());
+        };
+        if !self.cleanup_is_still_allowed(&target) {
+            self.remove_cleanup_if_generation(&target);
+            return Ok(());
+        }
+        let Some(persistence) = &self.persistence else {
+            self.remove_committed_cleanup(&target);
+            prune_guard.finish();
+            return Ok(());
+        };
+
+        let writer = persistence.take_writer(&target.suite_id).map_err(|error| {
+            self.cleanup_error(
+                &target,
+                BenchmarkSuiteCleanupPhase::SettleWriter,
+                io::Error::other(error.to_string()),
+            )
+        })?;
+        if let Err(error) = writer.settle().await {
+            persistence.restore_writer(target.suite_id.clone(), writer);
+            return Err(self.cleanup_error(
+                &target,
+                BenchmarkSuiteCleanupPhase::SettleWriter,
+                io::Error::from(error),
+            ));
+        }
+
+        let path = suite_path_in_dir(&persistence.storage_dir, &target.suite_id);
+        let suite_id = target.suite_id.clone();
+        let delete_target = benchmark_suite_target(&suite_id);
+        let deletion = match tokio::task::spawn_blocking(move || {
+            debug_assert_eq!(
+                path.file_name().and_then(|value| value.to_str()),
+                Some(format!("{suite_id}.json").as_str())
+            );
+            delete_launcher_managed_file(DeleteFileRequest::new(delete_target, &path))
+        })
+        .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(self.cleanup_error(
+                &target,
+                BenchmarkSuiteCleanupPhase::DeleteManifest,
+                io::Error::new(error.io_kind(), error),
+            )),
+            Err(error) => Err(self.cleanup_error(
+                &target,
+                BenchmarkSuiteCleanupPhase::BlockingTask,
+                io::Error::other(format!("benchmark suite cleanup task failed: {error}")),
+            )),
+        };
+        if let Err(error) = deletion {
+            persistence.restore_writer(target.suite_id.clone(), writer);
+            return Err(error);
+        }
+
+        drop(writer);
+        self.remove_committed_cleanup(&target);
+        prune_guard.finish();
+        Ok(())
+    }
+
+    fn cleanup_is_still_allowed(&self, target: &SuiteCleanupTarget) -> bool {
+        let obligation_matches = self
+            .cleanup_obligations
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .get(&target.suite_id)
+            .is_some_and(|obligation| obligation.generation == target.generation);
+        if !obligation_matches
+            || self
+                .obligations
+                .lock()
+                .expect(SUITE_STORE_LOCK_INVARIANT)
+                .contains_key(&target.suite_id)
+        {
+            return false;
+        }
+        let inner = self.inner.read().expect(SUITE_STORE_LOCK_INVARIANT);
+        inner.suites.get(&target.suite_id).is_some_and(|entry| {
+            entry.generation == target.generation
+                && !inner.rejected_ids.contains(&target.suite_id)
+                && manifest_is_fully_terminal(&entry.manifest)
+                && !entry.manifest.runs.iter().any(|run| {
+                    run.session_id
+                        .as_ref()
+                        .is_some_and(|session_id| inner.live_reservations.contains(session_id))
+                })
+        })
+    }
+
+    fn cleanup_error(
+        &self,
+        target: &SuiteCleanupTarget,
+        phase: BenchmarkSuiteCleanupPhase,
+        source: io::Error,
+    ) -> BenchmarkSuiteStoreError {
+        if let Some(obligation) = self
+            .cleanup_obligations
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .get_mut(&target.suite_id)
+            .filter(|obligation| obligation.generation == target.generation)
+        {
+            obligation.phase = phase;
+        }
+        BenchmarkSuiteStoreError::Cleanup(io::Error::new(
+            source.kind(),
+            format!("{phase}: {source}"),
+        ))
+    }
+
+    fn remove_cleanup_if_generation(&self, target: &SuiteCleanupTarget) {
+        let mut cleanups = self
+            .cleanup_obligations
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT);
+        if cleanups
+            .get(&target.suite_id)
+            .is_some_and(|obligation| obligation.generation == target.generation)
+        {
+            cleanups.remove(&target.suite_id);
+        }
+    }
+
+    fn remove_committed_cleanup(&self, target: &SuiteCleanupTarget) {
+        let mut cleanups = self
+            .cleanup_obligations
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT);
+        if cleanups
+            .get(&target.suite_id)
+            .is_none_or(|obligation| obligation.generation != target.generation)
+        {
+            return;
+        }
+        remove_manifest_if_generation(
+            &mut self.inner.write().expect(SUITE_STORE_LOCK_INVARIANT),
+            &target.suite_id,
+            target.generation,
+        );
+        cleanups.remove(&target.suite_id);
+    }
+}
+
 impl BenchmarkSuiteStore {
     #[cfg(test)]
     pub fn new() -> Self {
+        Self::new_with_retention_claims(BenchmarkSuiteRetentionClaims::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_retention_claims(
+        retention_claims: BenchmarkSuiteRetentionClaims,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(BenchmarkSuiteInner::default())),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             persistence: None,
             obligations: Arc::new(SyncMutex::new(HashMap::new())),
+            cleanup_obligations: Arc::new(SyncMutex::new(HashMap::new())),
+            retention_claims,
             next_obligation_id: SyncMutex::new(0),
             load_issues: Vec::new(),
             mutation_latched: false,
@@ -347,16 +895,34 @@ impl BenchmarkSuiteStore {
         }
     }
 
-    pub fn load_from_paths(paths: &AppPaths) -> Self {
-        Self::try_load_from_paths_with_coordinator(paths, PersistenceCoordinator::global())
-            .unwrap_or_else(|error| {
-                panic!("failed to initialize benchmark suite persistence: {error}")
-            })
+    pub(crate) fn load_from_paths(
+        paths: &AppPaths,
+        retention_claims: BenchmarkSuiteRetentionClaims,
+    ) -> Self {
+        Self::try_load_from_paths_with_coordinator_and_claims(
+            paths,
+            PersistenceCoordinator::global(),
+            retention_claims,
+        )
+        .unwrap_or_else(|error| panic!("failed to initialize benchmark suite persistence: {error}"))
     }
 
+    #[cfg(test)]
     pub(crate) fn try_load_from_paths_with_coordinator(
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
+    ) -> Result<Self, BenchmarkSuiteStoreError> {
+        Self::try_load_from_paths_with_coordinator_and_claims(
+            paths,
+            coordinator,
+            BenchmarkSuiteRetentionClaims::default(),
+        )
+    }
+
+    pub(crate) fn try_load_from_paths_with_coordinator_and_claims(
+        paths: &AppPaths,
+        coordinator: PersistenceCoordinator,
+        retention_claims: BenchmarkSuiteRetentionClaims,
     ) -> Result<Self, BenchmarkSuiteStoreError> {
         let storage_dir = suite_dir(paths);
         let load_state = load_persisted_suites(&storage_dir);
@@ -368,11 +934,31 @@ impl BenchmarkSuiteStore {
                 coordinator,
             )?)),
             obligations: Arc::new(SyncMutex::new(HashMap::new())),
+            cleanup_obligations: Arc::new(SyncMutex::new(load_state.cleanup_obligations)),
+            retention_claims,
             next_obligation_id: SyncMutex::new(0),
             load_issues: load_state.issues,
             mutation_latched: load_state.mutation_latched,
             lifecycle: Arc::new(SyncMutex::new(BenchmarkSuiteStoreLifecycle::Open)),
         })
+    }
+
+    fn retention(&self) -> BenchmarkSuiteRetention {
+        BenchmarkSuiteRetention {
+            inner: self.inner.clone(),
+            obligations: self.obligations.clone(),
+            cleanup_obligations: self.cleanup_obligations.clone(),
+            retention_claims: self.retention_claims.clone(),
+            persistence: self.persistence.clone(),
+            mutation_latched: self.mutation_latched,
+        }
+    }
+
+    pub(crate) fn retention_handle(&self) -> BenchmarkSuiteRetentionHandle {
+        BenchmarkSuiteRetentionHandle {
+            mutation_gate: self.mutation_gate.clone(),
+            retention: self.retention(),
+        }
     }
 
     pub fn get(
@@ -399,6 +985,27 @@ impl BenchmarkSuiteStore {
         self.load_issues.iter().map(|issue| issue.count).sum()
     }
 
+    pub(crate) fn cleanup_issues(&self) -> Vec<BenchmarkSuiteCleanupIssue> {
+        let mut issues = self
+            .cleanup_obligations
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .iter()
+            .map(|(suite_id, obligation)| BenchmarkSuiteCleanupIssue {
+                suite_id: suite_id.clone(),
+                phase: obligation.phase,
+            })
+            .collect::<Vec<_>>();
+        issues.sort_by(|left, right| left.suite_id.cmp(&right.suite_id));
+        issues
+    }
+
+    pub(crate) async fn retry_terminal_retention(&self) -> Vec<BenchmarkSuiteCleanupIssue> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let _ = self.retention().enforce_strict_detached(mutation).await;
+        self.cleanup_issues()
+    }
+
     pub async fn select_reservation(
         &self,
         suite_id: &str,
@@ -415,6 +1022,10 @@ impl BenchmarkSuiteStore {
         let mutation = self.mutation_gate.clone().lock_owned().await;
         self.ensure_open()?;
         let mutation = self.reconcile_suite_once(&suite_id, mutation).await?;
+        let mutation = self
+            .retention()
+            .reconcile_cleanup_detached(&suite_id, mutation)
+            .await?;
         self.ensure_mutation_allowed(&suite_id)?;
 
         let inner = self.inner.read().expect(SUITE_STORE_LOCK_INVARIANT);
@@ -491,6 +1102,10 @@ impl BenchmarkSuiteStore {
         self.ensure_open()?;
         let mutation = self
             .reconcile_suite_once(&selection.suite_id, mutation)
+            .await?;
+        let mutation = self
+            .retention()
+            .reconcile_cleanup_detached(&selection.suite_id, mutation)
             .await?;
         self.ensure_mutation_allowed(&selection.suite_id)?;
 
@@ -677,6 +1292,10 @@ impl BenchmarkSuiteStore {
         let mutation = self
             .reconcile_suite_once(&mapping.suite_id, mutation)
             .await?;
+        let mutation = self
+            .retention()
+            .reconcile_cleanup_detached(&mapping.suite_id, mutation)
+            .await?;
         self.ensure_mutation_allowed(&mapping.suite_id)?;
         let (generation, mut candidate) = {
             let inner = self.inner.read().expect(SUITE_STORE_LOCK_INVARIANT);
@@ -739,6 +1358,7 @@ impl BenchmarkSuiteStore {
         for suite_id in suite_ids {
             mutation = self.reconcile_suite_once(&suite_id, mutation).await?;
         }
+        mutation = self.retention().enforce_strict_detached(mutation).await?;
         if let Some(persistence) = &self.persistence {
             persistence.settle_writers().await?;
             persistence
@@ -767,6 +1387,7 @@ impl BenchmarkSuiteStore {
         for suite_id in suite_ids {
             mutation = self.reconcile_suite_once(&suite_id, mutation).await?;
         }
+        mutation = self.retention().enforce_strict_detached(mutation).await?;
         if let Some(persistence) = &self.persistence {
             persistence.settle_writers().await?;
             persistence
@@ -821,6 +1442,14 @@ impl BenchmarkSuiteStore {
         }
         if self
             .obligations
+            .lock()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .contains_key(suite_id)
+        {
+            return Err(BenchmarkSuiteStoreError::RetryRequired);
+        }
+        if self
+            .cleanup_obligations
             .lock()
             .expect(SUITE_STORE_LOCK_INVARIANT)
             .contains_key(suite_id)
@@ -1007,6 +1636,7 @@ impl BenchmarkSuiteStore {
         mutation: OwnedMutexGuard<()>,
     ) -> Result<(), BenchmarkSuiteStoreError> {
         let Some(persistence) = &self.persistence else {
+            let is_terminal = manifest_is_fully_terminal(&candidate);
             publish_manifest(
                 &mut self.inner.write().expect(SUITE_STORE_LOCK_INVARIANT),
                 candidate,
@@ -1020,6 +1650,13 @@ impl BenchmarkSuiteStore {
                     inner.live_reservations.remove(&session_id);
                 }
             }
+            let mutation = if is_terminal {
+                self.retention()
+                    .enforce_best_effort_detached(mutation)
+                    .await
+            } else {
+                mutation
+            };
             drop(mutation);
             return Ok(());
         };
@@ -1067,9 +1704,11 @@ impl BenchmarkSuiteStore {
     ) -> Result<(), BenchmarkSuiteStoreError> {
         let inner = self.inner.clone();
         let obligations = self.obligations.clone();
+        let retention = self.retention();
+        let is_terminal = manifest_is_fully_terminal(&candidate);
         let suite_id = candidate.suite_id.clone();
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        ticket.observe(move |result| {
+        ticket.observe_async(move |result| async move {
             let result = match result {
                 Ok(_) => {
                     let mut retained = obligations.lock().expect(SUITE_STORE_LOCK_INVARIANT);
@@ -1093,15 +1732,19 @@ impl BenchmarkSuiteStore {
                 }
                 Err(error) => Err(suite_persistence_error(error)),
             };
-            let _ = completed_tx.send((result, mutation));
+            let mutation = if result.is_ok() && is_terminal {
+                retention.enforce_best_effort(mutation).await
+            } else {
+                mutation
+            };
+            drop(mutation);
+            let _ = completed_tx.send(result);
         });
-        let (result, mutation) = completed_rx.await.map_err(|_| {
+        completed_rx.await.map_err(|_| {
             BenchmarkSuiteStoreError::Persistence(io::Error::other(
                 "benchmark suite commit observer stopped",
             ))
-        })?;
-        drop(mutation);
-        result
+        })?
     }
 
     async fn reconcile_suite_once(
@@ -1120,24 +1763,33 @@ impl BenchmarkSuiteStore {
         };
         let obligation_id = obligation.obligation_id;
         let Some(persistence) = &self.persistence else {
-            let mut retained = self.obligations.lock().expect(SUITE_STORE_LOCK_INVARIANT);
-            if retained
-                .get(suite_id)
-                .is_some_and(|current| current.obligation_id == obligation_id)
+            let is_terminal = manifest_is_fully_terminal(&obligation.candidate);
             {
-                let mut inner = self.inner.write().expect(SUITE_STORE_LOCK_INVARIANT);
-                publish_manifest(&mut inner, obligation.candidate, obligation.generation);
-                if let Some((session_id, live)) = obligation.live_session_update {
-                    if live {
-                        inner.live_reservations.insert(session_id);
-                    } else {
-                        inner.live_reservations.remove(&session_id);
+                let mut retained = self.obligations.lock().expect(SUITE_STORE_LOCK_INVARIANT);
+                if retained
+                    .get(suite_id)
+                    .is_some_and(|current| current.obligation_id == obligation_id)
+                {
+                    let mut inner = self.inner.write().expect(SUITE_STORE_LOCK_INVARIANT);
+                    publish_manifest(&mut inner, obligation.candidate, obligation.generation);
+                    if let Some((session_id, live)) = obligation.live_session_update {
+                        if live {
+                            inner.live_reservations.insert(session_id);
+                        } else {
+                            inner.live_reservations.remove(&session_id);
+                        }
                     }
+                    drop(inner);
+                    retained.remove(suite_id);
                 }
-                drop(inner);
-                retained.remove(suite_id);
             }
-            return Ok(mutation);
+            return Ok(if is_terminal {
+                self.retention()
+                    .enforce_best_effort_detached(mutation)
+                    .await
+            } else {
+                mutation
+            });
         };
         let writer = persistence.writer(suite_id)?;
         let ticket_result = match obligation.state {
@@ -1180,9 +1832,11 @@ impl BenchmarkSuiteStore {
         }
         let inner = self.inner.clone();
         let obligations = self.obligations.clone();
+        let retention = self.retention();
+        let is_terminal = manifest_is_fully_terminal(&obligation.candidate);
         let suite_id = suite_id.to_string();
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        ticket.observe(move |result| {
+        ticket.observe_async(move |result| async move {
             let result = match result {
                 Ok(_) => {
                     let mut retained = obligations.lock().expect(SUITE_STORE_LOCK_INVARIANT);
@@ -1205,6 +1859,11 @@ impl BenchmarkSuiteStore {
                     Ok(())
                 }
                 Err(error) => Err(suite_persistence_error(error)),
+            };
+            let mutation = if result.is_ok() && is_terminal {
+                retention.enforce_best_effort(mutation).await
+            } else {
+                mutation
             };
             let _ = completed_tx.send((result, mutation));
         });
@@ -1594,6 +2253,132 @@ fn publish_manifest(
             manifest,
         },
     );
+}
+
+fn ordinary_terminal_cleanup_targets(
+    inner: &BenchmarkSuiteInner,
+    write_obligations: &HashMap<String, SuiteWriteObligation>,
+    cleanup_obligations: &HashMap<String, SuiteCleanupObligation>,
+    protected_suite_ids: &HashSet<String>,
+    mutation_latched: bool,
+) -> Vec<SuiteCleanupTarget> {
+    if mutation_latched {
+        return Vec::new();
+    }
+    let mut candidates = inner
+        .suites
+        .iter()
+        .filter(|(suite_id, entry)| {
+            !inner.rejected_ids.contains(*suite_id)
+                && !write_obligations.contains_key(*suite_id)
+                && !cleanup_obligations.contains_key(*suite_id)
+                && !protected_suite_ids.contains(*suite_id)
+                && !entry.manifest.runs.iter().any(|run| {
+                    run.session_id
+                        .as_ref()
+                        .is_some_and(|session_id| inner.live_reservations.contains(session_id))
+                })
+                && manifest_is_fully_terminal(&entry.manifest)
+        })
+        .map(|(suite_id, entry)| {
+            (
+                SuiteCleanupTarget {
+                    suite_id: suite_id.clone(),
+                    generation: entry.generation,
+                },
+                entry.manifest.instance_id.clone(),
+                entry.manifest.mode.clone(),
+                parsed_timestamp(&entry.manifest.updated_at)
+                    .expect("committed benchmark suite timestamp is normalized"),
+                parsed_timestamp(&entry.manifest.created_at)
+                    .expect("committed benchmark suite timestamp is normalized"),
+            )
+        })
+        .collect::<Vec<_>>();
+    // Recency is newest-first by update, creation, then canonical id. The final id
+    // tie-break matches the other State retention stores and makes exact ties stable.
+    candidates.sort_by(|left, right| {
+        right
+            .3
+            .cmp(&left.3)
+            .then_with(|| right.4.cmp(&left.4))
+            .then_with(|| right.0.suite_id.cmp(&left.0.suite_id))
+    });
+
+    let mut retained = HashSet::new();
+    let mut represented = HashSet::new();
+    for (target, instance_id, mode, _, _) in &candidates {
+        if retained.len() == MAX_ORDINARY_TERMINAL_SUITES {
+            break;
+        }
+        if represented.insert((instance_id.clone(), mode.clone())) {
+            retained.insert(target.suite_id.clone());
+        }
+    }
+    if retained.len() < MAX_ORDINARY_TERMINAL_SUITES {
+        for (target, _, _, _, _) in &candidates {
+            if retained.len() == MAX_ORDINARY_TERMINAL_SUITES {
+                break;
+            }
+            retained.insert(target.suite_id.clone());
+        }
+    }
+
+    candidates
+        .into_iter()
+        .rev()
+        .filter_map(|(target, _, _, _, _)| (!retained.contains(&target.suite_id)).then_some(target))
+        .collect()
+}
+
+fn manifest_is_fully_terminal(manifest: &BenchmarkSuiteManifest) -> bool {
+    !manifest.runs.is_empty()
+        && manifest.runs.iter().all(|run| {
+            run.session_id
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+                && run
+                    .launched_at
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                && matches!(
+                    run.state.as_str(),
+                    "failed" | "stopped" | "exited" | "completed"
+                )
+        })
+}
+
+fn remove_manifest_if_generation(
+    inner: &mut BenchmarkSuiteInner,
+    suite_id: &str,
+    generation: u64,
+) -> bool {
+    if inner
+        .suites
+        .get(suite_id)
+        .is_none_or(|entry| entry.generation != generation)
+    {
+        return false;
+    }
+    let Some(removed) = inner.suites.remove(suite_id) else {
+        return false;
+    };
+    for session_id in removed
+        .manifest
+        .runs
+        .iter()
+        .filter_map(|run| run.session_id.as_ref())
+    {
+        if inner
+            .session_index
+            .get(session_id)
+            .is_some_and(|mapping| mapping.suite_id == suite_id)
+        {
+            inner.session_index.remove(session_id);
+        }
+        inner.live_reservations.remove(session_id);
+    }
+    true
 }
 
 fn run_mapping(run: &BenchmarkSuiteManifestRun) -> Option<SuiteSessionMapping> {
@@ -2182,6 +2967,167 @@ mod tests {
         ] {
             assert!(!is_canonical_benchmark_id(benchmark_id));
         }
+    }
+
+    #[test]
+    fn retention_claims_are_exact_and_prune_reservations_are_atomic() {
+        let claims = BenchmarkSuiteRetentionClaims::default();
+        let suite_id = test_suite_id("claimed-suite");
+        let other_suite_id = test_suite_id("other-suite");
+
+        claims
+            .claim("driver-1", &suite_id)
+            .expect("claim suite retention");
+        claims
+            .claim("driver-2", &suite_id)
+            .expect("multiple exact owners may claim one suite");
+        assert!(claims.has_claim("driver-1", &suite_id));
+        assert_eq!(
+            claims.claim("driver-1", &other_suite_id),
+            Err(BenchmarkSuiteRetentionClaimError::OwnerConflict)
+        );
+        assert!(claims.try_begin_prune(&suite_id).is_none());
+        assert!(claims.release("driver-1", &suite_id));
+        assert!(claims.release("driver-2", &suite_id));
+
+        let prune = claims
+            .try_begin_prune(&suite_id)
+            .expect("unclaimed suite reserves pruning");
+        assert_eq!(
+            claims.claim("driver-3", &suite_id),
+            Err(BenchmarkSuiteRetentionClaimError::Pruning)
+        );
+        drop(prune);
+        claims
+            .claim("driver-3", &suite_id)
+            .expect("dropped prune reservation permits claim");
+        assert!(claims.release("driver-3", &suite_id));
+
+        claims
+            .try_begin_prune(&suite_id)
+            .expect("reserve prune before finish")
+            .finish();
+        claims
+            .claim("driver-4", &suite_id)
+            .expect("finished prune reservation permits claim");
+    }
+
+    #[test]
+    fn terminal_retention_preserves_recent_identity_diversity_before_global_fill() {
+        let mut inner = BenchmarkSuiteInner::default();
+        for second in 2..=32 {
+            publish_manifest(
+                &mut inner,
+                terminal_manifest(
+                    &format!("recent-a-{second}"),
+                    "instance-a",
+                    "development",
+                    &format!("2026-07-10T00:00:{second:02}.000Z"),
+                ),
+                1,
+            );
+        }
+        let oldest_a = terminal_manifest(
+            "oldest-a",
+            "instance-a",
+            "development",
+            "2026-07-10T00:00:01.000Z",
+        );
+        let oldest_a_id = oldest_a.suite_id.clone();
+        publish_manifest(&mut inner, oldest_a, 1);
+        let diverse_b = terminal_manifest(
+            "diverse-b",
+            "instance-b",
+            "development",
+            "2026-07-10T00:00:00.000Z",
+        );
+        let diverse_b_id = diverse_b.suite_id.clone();
+        publish_manifest(&mut inner, diverse_b, 1);
+
+        let targets = ordinary_terminal_cleanup_targets(
+            &inner,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            false,
+        );
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].suite_id, oldest_a_id);
+        assert!(inner.suites.contains_key(&diverse_b_id));
+    }
+
+    #[test]
+    fn terminal_retention_excludes_claimed_live_retry_and_cleanup_suites() {
+        let mut inner = BenchmarkSuiteInner::default();
+        for index in 0..=MAX_ORDINARY_TERMINAL_SUITES + 4 {
+            publish_manifest(
+                &mut inner,
+                terminal_manifest(
+                    &format!("protected-{index}"),
+                    "instance",
+                    "development",
+                    &format!("2026-07-10T00:00:{index:02}.000Z"),
+                ),
+                1,
+            );
+        }
+        let mut suite_ids = inner.suites.keys().cloned().collect::<Vec<_>>();
+        suite_ids.sort();
+        let claimed = suite_ids[0].clone();
+        let retry = suite_ids[1].clone();
+        let cleanup = suite_ids[2].clone();
+        let live = suite_ids[3].clone();
+        let rejected = suite_ids[4].clone();
+        inner.rejected_ids.insert(rejected.clone());
+        let live_session = inner.suites[&live].manifest.runs[0]
+            .session_id
+            .clone()
+            .expect("terminal session");
+        inner.live_reservations.insert(live_session);
+        let write_obligations = HashMap::from([(
+            retry.clone(),
+            SuiteWriteObligation {
+                obligation_id: 1,
+                generation: 1,
+                candidate: inner.suites[&retry].manifest.clone(),
+                state: ObligationState::Unarmed,
+                live_session_update: None,
+            },
+        )]);
+        let cleanup_obligations = HashMap::from([(
+            cleanup.clone(),
+            SuiteCleanupObligation {
+                generation: 1,
+                phase: BenchmarkSuiteCleanupPhase::DeleteManifest,
+            },
+        )]);
+
+        let targets = ordinary_terminal_cleanup_targets(
+            &inner,
+            &write_obligations,
+            &cleanup_obligations,
+            &HashSet::from([claimed.clone()]),
+            false,
+        );
+        let target_ids = targets
+            .into_iter()
+            .map(|target| target.suite_id)
+            .collect::<HashSet<_>>();
+
+        for protected in [claimed, retry, cleanup, live, rejected] {
+            assert!(!target_ids.contains(&protected));
+        }
+        assert!(
+            ordinary_terminal_cleanup_targets(
+                &inner,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashSet::new(),
+                true,
+            )
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3041,6 +3987,370 @@ mod tests {
         cleanup(&root);
     }
 
+    #[tokio::test]
+    async fn persisted_terminal_retention_bounds_disk_memory_sessions_and_writers() {
+        let root = test_root("terminal-retention-bounds");
+        let paths = test_paths(&root);
+        let manifests =
+            write_terminal_manifest_fixtures(&paths, MAX_ORDINARY_TERMINAL_SUITES + 3, "bounded");
+        let backend = Arc::new(RecordingFileBackend::new());
+        let coordinator = PersistenceCoordinator::for_test(
+            backend,
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        );
+        let store = BenchmarkSuiteStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+            .expect("load over-cap suites");
+
+        store.flush().await.expect("reconcile terminal retention");
+
+        {
+            let inner = store.inner.read().expect(SUITE_STORE_LOCK_INVARIANT);
+            assert_eq!(inner.suites.len(), MAX_ORDINARY_TERMINAL_SUITES);
+            assert_eq!(inner.session_index.len(), MAX_ORDINARY_TERMINAL_SUITES);
+        }
+        for manifest in &manifests[..3] {
+            assert!(
+                store
+                    .get(&manifest.suite_id)
+                    .expect("read pruned suite")
+                    .is_none()
+            );
+            assert!(!suite_path(&paths, &manifest.suite_id).exists());
+        }
+        for manifest in &manifests[3..] {
+            assert!(
+                store
+                    .get(&manifest.suite_id)
+                    .expect("read retained suite")
+                    .is_some()
+            );
+            assert!(suite_path(&paths, &manifest.suite_id).is_file());
+        }
+        assert_eq!(
+            store
+                .persistence
+                .as_ref()
+                .expect("persistence")
+                .writer_count(),
+            0
+        );
+        assert!(store.cleanup_issues().is_empty());
+        store.close().await.expect("close bounded store");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn startup_retention_is_deterministic_idempotent_and_preserves_claimed_and_hostile() {
+        let root = test_root("startup-terminal-retention");
+        let paths = test_paths(&root);
+        let manifests =
+            write_terminal_manifest_fixtures(&paths, MAX_ORDINARY_TERMINAL_SUITES + 2, "startup");
+        let claimed = manifests[0].suite_id.clone();
+        let expected_pruned = manifests[1].suite_id.clone();
+        let hostile_id = test_suite_id("startup-hostile");
+        let hostile_path = suite_path(&paths, &hostile_id);
+        let hostile_bytes = b"{not-json".to_vec();
+        fs::write(&hostile_path, &hostile_bytes).expect("write hostile manifest");
+        let claims = BenchmarkSuiteRetentionClaims::default();
+        claims
+            .claim("driver-startup", &claimed)
+            .expect("protect claimed suite");
+        let backend = Arc::new(RecordingFileBackend::new());
+        let coordinator = PersistenceCoordinator::for_test(
+            backend,
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        );
+        let store = BenchmarkSuiteStore::try_load_from_paths_with_coordinator_and_claims(
+            &paths,
+            coordinator.clone(),
+            claims.clone(),
+        )
+        .expect("load startup suites");
+
+        store.flush().await.expect("reconcile startup retention");
+
+        assert!(store.get(&claimed).expect("read claimed suite").is_some());
+        assert!(
+            store
+                .get(&expected_pruned)
+                .expect("read pruned suite")
+                .is_none()
+        );
+        assert!(suite_path(&paths, &claimed).is_file());
+        assert!(!suite_path(&paths, &expected_pruned).exists());
+        assert_eq!(
+            fs::read(&hostile_path).expect("hostile bytes"),
+            hostile_bytes
+        );
+        assert!(matches!(
+            store.get(&hostile_id),
+            Err(BenchmarkSuiteStoreError::RejectedManifest)
+        ));
+        assert_eq!(
+            store
+                .inner
+                .read()
+                .expect(SUITE_STORE_LOCK_INVARIANT)
+                .suites
+                .len(),
+            MAX_ORDINARY_TERMINAL_SUITES + 1
+        );
+        store.close().await.expect("close startup store");
+        drop(store);
+
+        let reloaded = BenchmarkSuiteStore::try_load_from_paths_with_coordinator_and_claims(
+            &paths,
+            coordinator,
+            claims.clone(),
+        )
+        .expect("reload reconciled suites");
+        reloaded
+            .flush()
+            .await
+            .expect("idempotent startup retention");
+
+        assert!(
+            reloaded
+                .get(&claimed)
+                .expect("read reloaded claim")
+                .is_some()
+        );
+        assert!(
+            reloaded
+                .get(&expected_pruned)
+                .expect("read pruned suite")
+                .is_none()
+        );
+        assert_eq!(
+            reloaded
+                .inner
+                .read()
+                .expect(SUITE_STORE_LOCK_INVARIANT)
+                .suites
+                .len(),
+            MAX_ORDINARY_TERMINAL_SUITES + 1
+        );
+        assert_eq!(
+            fs::read(&hostile_path).expect("hostile bytes"),
+            hostile_bytes
+        );
+        assert!(reloaded.cleanup_issues().is_empty());
+        reloaded.close().await.expect("close reloaded store");
+        assert!(claims.release("driver-startup", &claimed));
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_delete_retains_exact_state_until_retry_and_blocks_lifecycle() {
+        let root = test_root("terminal-retention-delete-retry");
+        let paths = test_paths(&root);
+        let manifests = write_terminal_manifest_fixtures(
+            &paths,
+            MAX_ORDINARY_TERMINAL_SUITES + 1,
+            "delete-retry",
+        );
+        let oldest = &manifests[0];
+        let oldest_path = suite_path(&paths, &oldest.suite_id);
+        let oldest_session = oldest.runs[0]
+            .session_id
+            .as_deref()
+            .expect("oldest session")
+            .to_string();
+        let backend = Arc::new(RecordingFileBackend::new());
+        let coordinator = PersistenceCoordinator::for_test(
+            backend,
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        );
+        let store =
+            BenchmarkSuiteStore::try_load_from_paths_with_coordinator(&paths, coordinator.clone())
+                .expect("load over-cap suites");
+        fs::remove_file(&oldest_path).expect("remove oldest manifest");
+        fs::create_dir(&oldest_path).expect("block oldest manifest deletion");
+
+        assert!(matches!(
+            store.flush().await,
+            Err(BenchmarkSuiteStoreError::Cleanup(_))
+        ));
+
+        assert!(
+            store
+                .get(&oldest.suite_id)
+                .expect("read retained oldest")
+                .is_some()
+        );
+        assert!(
+            store
+                .inner
+                .read()
+                .expect(SUITE_STORE_LOCK_INVARIANT)
+                .session_index
+                .contains_key(&oldest_session)
+        );
+        assert!(oldest_path.is_dir());
+        assert_eq!(
+            store.cleanup_issues(),
+            vec![BenchmarkSuiteCleanupIssue {
+                suite_id: oldest.suite_id.clone(),
+                phase: BenchmarkSuiteCleanupPhase::DeleteManifest,
+            }]
+        );
+        assert_eq!(
+            store
+                .persistence
+                .as_ref()
+                .expect("persistence")
+                .writer_count(),
+            1
+        );
+        assert!(matches!(
+            store.close().await,
+            Err(BenchmarkSuiteStoreError::Cleanup(_))
+        ));
+        assert!(matches!(
+            BenchmarkSuiteStore::try_load_from_paths_with_coordinator(
+                &paths,
+                coordinator.clone(),
+            ),
+            Err(BenchmarkSuiteStoreError::Persistence(ref error))
+                if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+
+        fs::remove_dir(&oldest_path).expect("unblock oldest manifest deletion");
+        assert!(store.retry_terminal_retention().await.is_empty());
+        assert!(
+            store
+                .get(&oldest.suite_id)
+                .expect("read pruned oldest")
+                .is_none()
+        );
+        assert!(
+            !store
+                .inner
+                .read()
+                .expect(SUITE_STORE_LOCK_INVARIANT)
+                .session_index
+                .contains_key(&oldest_session)
+        );
+        assert!(!oldest_path.exists());
+        assert_eq!(
+            store
+                .inner
+                .read()
+                .expect(SUITE_STORE_LOCK_INVARIANT)
+                .suites
+                .len(),
+            MAX_ORDINARY_TERMINAL_SUITES
+        );
+        assert_eq!(
+            store
+                .persistence
+                .as_ref()
+                .expect("persistence")
+                .writer_count(),
+            0
+        );
+        store
+            .flush()
+            .await
+            .expect("flush after exact cleanup retry");
+        store
+            .close()
+            .await
+            .expect("close after exact cleanup retry");
+        drop(store);
+        let reloaded =
+            BenchmarkSuiteStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("owner released after successful close");
+        assert!(
+            reloaded
+                .get(&oldest.suite_id)
+                .expect("read reloaded oldest")
+                .is_none()
+        );
+        reloaded.close().await.expect("close reloaded store");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn terminal_retention_finishes_after_waiting_caller_is_aborted() {
+        let root = test_root("terminal-retention-abort");
+        let paths = test_paths(&root);
+        let manifests =
+            write_terminal_manifest_fixtures(&paths, MAX_ORDINARY_TERMINAL_SUITES, "abort");
+        let oldest_id = manifests[0].suite_id.clone();
+        let backend = Arc::new(RecordingFileBackend::new());
+        let coordinator = PersistenceCoordinator::for_test(
+            backend.clone(),
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        );
+        let store = Arc::new(
+            BenchmarkSuiteStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("load retained suites"),
+        );
+        let newest_id = test_suite_id("abort-newest");
+        let one_run_plan = vec![run_input(0, "managed_default", "repeat")];
+        let selected = store
+            .select_reservation(
+                &newest_id,
+                "instance-newest",
+                "development",
+                &one_run_plan,
+                None,
+            )
+            .await
+            .expect("select newest suite");
+        store
+            .reserve(selected, "session-newest", test_timestamp(), false)
+            .await
+            .expect("reserve newest run");
+        let gate = backend.gate_next();
+        let task_store = store.clone();
+        let task = tokio::spawn(async move {
+            task_store
+                .update_run_state_for_session("session-newest", "completed")
+                .await
+        });
+        backend.wait_for_attempt(2).await;
+        task.abort();
+        assert!(task.await.expect_err("caller aborted").is_cancelled());
+        gate.release();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let newest_is_terminal = store
+                    .get(&newest_id)
+                    .expect("read newest suite")
+                    .is_some_and(|manifest| manifest.runs[0].state == "completed");
+                if newest_is_terminal && store.get(&oldest_id).expect("read oldest suite").is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached terminal commit completes retention");
+
+        assert!(!suite_path(&paths, &oldest_id).exists());
+        assert!(suite_path(&paths, &newest_id).is_file());
+        assert_eq!(
+            store
+                .inner
+                .read()
+                .expect(SUITE_STORE_LOCK_INVARIANT)
+                .suites
+                .len(),
+            MAX_ORDINARY_TERMINAL_SUITES
+        );
+        assert!(store.cleanup_issues().is_empty());
+        store.close().await.expect("close retained store");
+        cleanup(&root);
+    }
+
     #[test]
     fn strict_loader_rejects_hostile_inputs_without_touching_bytes() {
         let root = test_root("hostile-loader");
@@ -3535,6 +4845,47 @@ mod tests {
             target_id: None,
             benchmark_id: test_benchmark_id(&format!("run-{run_index}")),
         }
+    }
+
+    fn terminal_manifest(
+        suite_label: &str,
+        instance_id: &str,
+        mode: &str,
+        timestamp: &str,
+    ) -> BenchmarkSuiteManifest {
+        let mut manifest = valid_manifest(suite_label, &format!("session-{suite_label}"));
+        manifest.instance_id = instance_id.to_string();
+        manifest.mode = mode.to_string();
+        manifest.created_at = timestamp.to_string();
+        manifest.updated_at = timestamp.to_string();
+        manifest.runs[0].launched_at = Some(timestamp.to_string());
+        manifest.runs[0].state = "completed".to_string();
+        manifest
+    }
+
+    fn write_terminal_manifest_fixtures(
+        paths: &AppPaths,
+        count: usize,
+        label: &str,
+    ) -> Vec<BenchmarkSuiteManifest> {
+        let dir = suite_dir(paths);
+        fs::create_dir_all(&dir).expect("create suite fixture directory");
+        (0..count)
+            .map(|index| {
+                let manifest = terminal_manifest(
+                    &format!("{label}-{index}"),
+                    "instance",
+                    "development",
+                    &format!("2025-01-01T00:{index:02}:00Z"),
+                );
+                fs::write(
+                    suite_path(paths, &manifest.suite_id),
+                    serde_json::to_vec_pretty(&manifest).expect("encode terminal manifest"),
+                )
+                .expect("write terminal manifest");
+                manifest
+            })
+            .collect()
     }
 
     fn valid_manifest(suite_id: &str, session_id: &str) -> BenchmarkSuiteManifest {

@@ -104,6 +104,13 @@ pub(crate) struct BenchmarkSuiteDriverResumeSummary {
 pub(crate) fn spawn_restart_interrupted_benchmark_suite_drivers(state: &AppState) -> bool {
     let state = state.clone();
     tokio::spawn(async move {
+        let cleanup_issues = state.benchmark_suites().retry_terminal_retention().await;
+        if !cleanup_issues.is_empty() {
+            tracing::warn!(
+                pending = cleanup_issues.len(),
+                "benchmark suite startup retention cleanup is pending"
+            );
+        }
         match resume_restart_interrupted_benchmark_suite_drivers(state).await {
             Ok(summary) if summary.pending > 0 => tracing::info!(
                 pending = summary.pending,
@@ -576,6 +583,17 @@ async fn start_owned_benchmark_suite_driver(
                 return;
             }
         };
+        if let Some(previous_id) = resumed_from.as_deref()
+            && let Err(error) = state
+                .benchmark_suite_drivers()
+                .consume_restart_handoff_started(previous_id)
+                .await
+        {
+            tracing::warn!(
+                error_class = error.class(),
+                "benchmark suite driver restart handoff checkpoint failed"
+            );
+        }
         let mut response = benchmark_suite_driver_response_payload("scheduled", &started.status);
         if let Some(resumed_from) = resumed_from {
             response["resumed_from"] = json!(resumed_from);
@@ -1039,6 +1057,7 @@ impl BenchmarkSuiteReservationFailure {
             | BenchmarkSuiteStoreError::Closed
             | BenchmarkSuiteStoreError::GenerationOverflow
             | BenchmarkSuiteStoreError::ObligationOverflow
+            | BenchmarkSuiteStoreError::Cleanup(_)
             | BenchmarkSuiteStoreError::Persistence(_) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 message: BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE,
@@ -1411,6 +1430,7 @@ fn benchmark_suite_driver_store_error_response(
         BenchmarkSuiteDriverStoreError::TerminalDriver => benchmark_suite_driver_terminal_error(),
         BenchmarkSuiteDriverStoreError::RetryRequired
         | BenchmarkSuiteDriverStoreError::RetryUnavailable
+        | BenchmarkSuiteDriverStoreError::RetentionConflict
         | BenchmarkSuiteDriverStoreError::Persistence(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -2042,8 +2062,10 @@ mod tests {
             .close()
             .await
             .expect("close compensated suite store");
-        let reloaded =
-            crate::state::benchmark_suites::BenchmarkSuiteStore::load_from_paths(&fixture.paths);
+        let reloaded = crate::state::benchmark_suites::BenchmarkSuiteStore::load_from_paths(
+            &fixture.paths,
+            crate::state::benchmark_suites::BenchmarkSuiteRetentionClaims::default(),
+        );
         let manifest = reloaded
             .get(&suite_id)
             .expect("read reloaded suite")

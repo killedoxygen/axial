@@ -8,6 +8,9 @@ use crate::logging::timestamp_utc;
 use crate::observability::{
     RedactionAudience, sanitize_evidence_token, sanitize_public_diagnostic_text,
 };
+use crate::state::benchmark_suites::{
+    BenchmarkSuiteRetentionClaims, BenchmarkSuiteRetentionHandle,
+};
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
 use axial_config::AppPaths;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -22,7 +25,6 @@ use tracing::warn;
 
 const MAX_DRIVER_ERROR_CHARS: usize = 160;
 const DRIVER_ID_PREFIX: &str = "benchmark-suite-driver-";
-const INTERRUPTED_BY_RESTART_ERROR: &str = "driver interrupted by restart";
 const AUTOMATIC_RESUME_QUEUED_ERROR: &str = "driver automatic resume queued after restart";
 const AUTOMATIC_RESUME_STARTED_ERROR: &str = "driver automatic resume started after restart";
 const AUTOMATIC_RESUME_LIMIT_ERROR: &str = "driver ignored after restart resume limit";
@@ -47,6 +49,8 @@ pub enum BenchmarkSuiteDriverStoreError {
     RetryRequired,
     #[error("benchmark suite driver has no failed critical transition to retry")]
     RetryUnavailable,
+    #[error("benchmark suite retention is changing")]
+    RetentionConflict,
     #[error("benchmark suite driver persistence failed: {0}")]
     Persistence(#[source] io::Error),
 }
@@ -58,6 +62,7 @@ impl BenchmarkSuiteDriverStoreError {
             Self::TerminalDriver => "terminal_driver",
             Self::RetryRequired => "retry_required",
             Self::RetryUnavailable => "retry_unavailable",
+            Self::RetentionConflict => "retention_conflict",
             Self::Persistence(_) => "persistence",
         }
     }
@@ -194,6 +199,7 @@ struct BenchmarkSuiteDriverLoadState {
     inner: BenchmarkSuiteDriverInner,
     issues: Vec<BenchmarkSuiteDriverLoadIssue>,
     retention_excluded_ids: HashSet<String>,
+    suite_retention_claims: Vec<(String, String)>,
 }
 
 struct BenchmarkSuiteDriverPersistence {
@@ -296,11 +302,54 @@ pub struct BenchmarkSuiteDriverStore {
     handoff_obligation_ids: Arc<SyncMutex<HashSet<String>>>,
     effect_owners: Arc<SyncMutex<HashMap<String, String>>>,
     retention_excluded_ids: Arc<HashSet<String>>,
+    suite_retention_claims: BenchmarkSuiteRetentionClaims,
+    suite_retention: BenchmarkSuiteRetentionHandle,
     load_issues: Vec<BenchmarkSuiteDriverLoadIssue>,
 }
 
+pub(crate) struct PreparedBenchmarkSuiteDriverStore {
+    storage_dir: PathBuf,
+    load_state: BenchmarkSuiteDriverLoadState,
+    suite_retention_claims: BenchmarkSuiteRetentionClaims,
+}
+
+impl PreparedBenchmarkSuiteDriverStore {
+    pub(crate) fn bind(
+        self,
+        suite_retention: BenchmarkSuiteRetentionHandle,
+    ) -> BenchmarkSuiteDriverStore {
+        BenchmarkSuiteDriverStore::finish_load(
+            self,
+            PersistenceCoordinator::global(),
+            suite_retention,
+        )
+        .unwrap_or_else(|error| {
+            panic!("failed to initialize benchmark suite driver persistence: {error}")
+        })
+    }
+}
+
 impl BenchmarkSuiteDriverStore {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::new_with_retention_claims(BenchmarkSuiteRetentionClaims::default())
+    }
+
+    #[cfg(test)]
+    fn new_with_retention_claims(suite_retention_claims: BenchmarkSuiteRetentionClaims) -> Self {
+        let suite_retention =
+            crate::state::benchmark_suites::BenchmarkSuiteStore::new_with_retention_claims(
+                suite_retention_claims.clone(),
+            )
+            .retention_handle();
+        Self::new_with_retention(suite_retention_claims, suite_retention)
+    }
+
+    #[cfg(test)]
+    fn new_with_retention(
+        suite_retention_claims: BenchmarkSuiteRetentionClaims,
+        suite_retention: BenchmarkSuiteRetentionHandle,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(BenchmarkSuiteDriverInner::default())),
             mutation_gate: Arc::new(AsyncMutex::new(())),
@@ -310,26 +359,101 @@ impl BenchmarkSuiteDriverStore {
             handoff_obligation_ids: Arc::new(SyncMutex::new(HashSet::new())),
             effect_owners: Arc::new(SyncMutex::new(HashMap::new())),
             retention_excluded_ids: Arc::new(HashSet::new()),
+            suite_retention_claims,
+            suite_retention,
             load_issues: Vec::new(),
         }
     }
 
+    #[cfg(test)]
     pub fn load_from_paths(paths: &AppPaths) -> Self {
-        Self::try_load_from_paths(paths).unwrap_or_else(|error| {
-            panic!("failed to initialize benchmark suite driver persistence: {error}")
+        Self::load_from_paths_with_retention_claims(paths, BenchmarkSuiteRetentionClaims::default())
+    }
+
+    pub(crate) fn prepare_load_from_paths(
+        paths: &AppPaths,
+        suite_retention_claims: BenchmarkSuiteRetentionClaims,
+    ) -> PreparedBenchmarkSuiteDriverStore {
+        Self::prepare_load(paths, suite_retention_claims).unwrap_or_else(|error| {
+            panic!("failed to prepare benchmark suite driver persistence: {error}")
         })
     }
 
-    pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, BenchmarkSuiteDriverStoreError> {
-        Self::try_load_from_paths_with_coordinator(paths, PersistenceCoordinator::global())
+    fn prepare_load(
+        paths: &AppPaths,
+        suite_retention_claims: BenchmarkSuiteRetentionClaims,
+    ) -> Result<PreparedBenchmarkSuiteDriverStore, BenchmarkSuiteDriverStoreError> {
+        let storage_dir = driver_dir(paths);
+        let load_state = load_persisted_driver_inner(&storage_dir);
+        for (driver_id, suite_id) in &load_state.suite_retention_claims {
+            suite_retention_claims
+                .claim(driver_id, suite_id)
+                .map_err(|_| BenchmarkSuiteDriverStoreError::RetentionConflict)?;
+        }
+        Ok(PreparedBenchmarkSuiteDriverStore {
+            storage_dir,
+            load_state,
+            suite_retention_claims,
+        })
     }
 
+    #[cfg(test)]
+    pub(crate) fn load_from_paths_with_retention_claims(
+        paths: &AppPaths,
+        suite_retention_claims: BenchmarkSuiteRetentionClaims,
+    ) -> Self {
+        let prepared =
+            Self::prepare_load(paths, suite_retention_claims.clone()).unwrap_or_else(|error| {
+                panic!("failed to prepare benchmark suite driver persistence: {error}")
+            });
+        let suite_retention =
+            crate::state::benchmark_suites::BenchmarkSuiteStore::new_with_retention_claims(
+                suite_retention_claims,
+            )
+            .retention_handle();
+        Self::finish_load(prepared, PersistenceCoordinator::global(), suite_retention)
+            .unwrap_or_else(|error| {
+                panic!("failed to initialize benchmark suite driver persistence: {error}")
+            })
+    }
+
+    #[cfg(test)]
     fn try_load_from_paths_with_coordinator(
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, BenchmarkSuiteDriverStoreError> {
-        let storage_dir = driver_dir(paths);
-        let load_state = load_persisted_driver_inner(&storage_dir);
+        Self::try_load_from_paths_with_coordinator_and_retention_claims(
+            paths,
+            coordinator,
+            BenchmarkSuiteRetentionClaims::default(),
+        )
+    }
+
+    #[cfg(test)]
+    fn try_load_from_paths_with_coordinator_and_retention_claims(
+        paths: &AppPaths,
+        coordinator: PersistenceCoordinator,
+        suite_retention_claims: BenchmarkSuiteRetentionClaims,
+    ) -> Result<Self, BenchmarkSuiteDriverStoreError> {
+        let prepared = Self::prepare_load(paths, suite_retention_claims.clone())?;
+        let suite_retention =
+            crate::state::benchmark_suites::BenchmarkSuiteStore::new_with_retention_claims(
+                suite_retention_claims,
+            )
+            .retention_handle();
+        Self::finish_load(prepared, coordinator, suite_retention)
+    }
+
+    fn finish_load(
+        prepared: PreparedBenchmarkSuiteDriverStore,
+        coordinator: PersistenceCoordinator,
+        suite_retention: BenchmarkSuiteRetentionHandle,
+    ) -> Result<Self, BenchmarkSuiteDriverStoreError> {
+        let PreparedBenchmarkSuiteDriverStore {
+            storage_dir,
+            load_state,
+            suite_retention_claims,
+        } = prepared;
         Ok(Self {
             inner: Arc::new(RwLock::new(load_state.inner)),
             mutation_gate: Arc::new(AsyncMutex::new(())),
@@ -342,6 +466,8 @@ impl BenchmarkSuiteDriverStore {
             handoff_obligation_ids: Arc::new(SyncMutex::new(HashSet::new())),
             effect_owners: Arc::new(SyncMutex::new(HashMap::new())),
             retention_excluded_ids: Arc::new(load_state.retention_excluded_ids),
+            suite_retention_claims,
+            suite_retention,
             load_issues: load_state.issues,
         })
     }
@@ -417,10 +543,24 @@ impl BenchmarkSuiteDriverStore {
             (BenchmarkSuiteDriverEntry { status, stop_tx }, effect_owner)
         };
         let driver_id = candidate.status.id.clone();
+        let suite_id = candidate.status.suite_id.clone();
         let status = candidate.status.clone();
-        self.commit_transition(candidate, mutation)
-            .await
-            .map_err(|source| BenchmarkSuiteDriverStartError::Store { driver_id, source })?;
+        if self
+            .suite_retention_claims
+            .claim(&driver_id, &suite_id)
+            .is_err()
+        {
+            return Err(BenchmarkSuiteDriverStartError::Conflict);
+        }
+        if let Err(source) = self.commit_transition(candidate, mutation).await {
+            if !self.has_retry_candidate(&driver_id)
+                && !self.transition_matches(&status)
+                && self.suite_retention_claims.release(&driver_id, &suite_id)
+            {
+                self.suite_retention.retry_detached().await;
+            }
+            return Err(BenchmarkSuiteDriverStartError::Store { driver_id, source });
+        }
         Ok(BenchmarkSuiteDriverStart {
             status,
             effect_owner,
@@ -479,6 +619,22 @@ impl BenchmarkSuiteDriverStore {
     ) -> Result<(), BenchmarkSuiteDriverStoreError> {
         self.update_restart_resume_consumed_error(id, AUTOMATIC_RESUME_STARTED_ERROR.to_string())
             .await
+    }
+
+    pub(crate) async fn consume_restart_handoff_started(
+        &self,
+        id: &str,
+    ) -> Result<bool, BenchmarkSuiteDriverStoreError> {
+        if !self
+            .handoff_obligation_ids
+            .lock()
+            .expect(DRIVER_STORE_LOCK_INVARIANT)
+            .contains(id)
+        {
+            return Ok(false);
+        }
+        self.record_restart_resume_started(id).await?;
+        Ok(true)
     }
 
     pub async fn record_restart_resume_failed(
@@ -678,11 +834,13 @@ impl BenchmarkSuiteDriverStore {
                 )
                 .map_err(driver_persistence_error)?;
         }
-        apply_driver_transition(
+        let released_suite_claim = apply_driver_transition(
             &mut self.inner.write().expect(DRIVER_STORE_LOCK_INVARIANT),
             candidate,
             &self.handoff_obligation_ids,
+            &self.suite_retention_claims,
         );
+        debug_assert!(!released_suite_claim);
         Ok(())
     }
 
@@ -718,11 +876,15 @@ impl BenchmarkSuiteDriverStore {
         }
         let Some(persistence) = &self.persistence else {
             let terminal = !is_non_terminal(&candidate.status.state);
-            apply_driver_transition(
+            let released_suite_claim = apply_driver_transition(
                 &mut self.inner.write().expect(DRIVER_STORE_LOCK_INVARIANT),
                 candidate,
                 &self.handoff_obligation_ids,
+                &self.suite_retention_claims,
             );
+            if released_suite_claim {
+                self.suite_retention.retry_detached().await;
+            }
             if terminal {
                 self.prune_terminal_drivers().await;
             }
@@ -812,6 +974,8 @@ impl BenchmarkSuiteDriverStore {
         let persistence = self.persistence.clone();
         let retention_issues = self.retention_issues.clone();
         let handoff_obligation_ids = self.handoff_obligation_ids.clone();
+        let suite_retention_claims = self.suite_retention_claims.clone();
+        let suite_retention = self.suite_retention.clone();
         let retention_excluded_ids = self.retention_excluded_ids.clone();
         let driver_id = candidate.status.id.clone();
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
@@ -819,11 +983,15 @@ impl BenchmarkSuiteDriverStore {
             let result = match result {
                 Ok(_) => {
                     let terminal = !is_non_terminal(&candidate.status.state);
-                    apply_driver_transition(
+                    let released_suite_claim = apply_driver_transition(
                         &mut inner.write().expect(DRIVER_STORE_LOCK_INVARIANT),
                         candidate,
                         &handoff_obligation_ids,
+                        &suite_retention_claims,
                     );
+                    if released_suite_claim {
+                        suite_retention.retry_detached().await;
+                    }
                     retry_candidates
                         .lock()
                         .expect(DRIVER_STORE_LOCK_INVARIANT)
@@ -1005,6 +1173,7 @@ impl BenchmarkSuiteDriverStore {
     }
 }
 
+#[cfg(test)]
 impl Default for BenchmarkSuiteDriverStore {
     fn default() -> Self {
         Self::new()
@@ -1029,7 +1198,7 @@ fn is_restart_queued_marker(status: &BenchmarkSuiteDriverStatus) -> bool {
 }
 
 fn is_restart_recoverable_marker(status: &BenchmarkSuiteDriverStatus) -> bool {
-    is_restart_queued_marker(status) || is_restart_interrupted_driver(status)
+    is_restart_queued_marker(status)
 }
 
 fn is_known_driver_state(state: &str) -> bool {
@@ -1043,10 +1212,6 @@ fn is_known_driver_state(state: &str) -> bool {
             | "stopped"
             | "interrupted"
     )
-}
-
-fn is_restart_interrupted_driver(status: &BenchmarkSuiteDriverStatus) -> bool {
-    status.state == "interrupted" && status.error.as_deref() == Some(INTERRUPTED_BY_RESTART_ERROR)
 }
 
 fn normalize_and_validate_loaded_status(
@@ -1205,6 +1370,14 @@ fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadSt
         records.sort_by(|left, right| left.0.cmp(&right.0));
         if records.len() > 1 {
             warn!("skipping duplicate persisted benchmark suite driver id");
+            load_state
+                .suite_retention_claims
+                .extend(records.iter().enumerate().map(|(index, (_, status))| {
+                    (
+                        duplicate_retention_claim_owner(&status.id, index),
+                        status.suite_id.clone(),
+                    )
+                }));
             for _ in 1..records.len() {
                 record_load_issue(
                     &mut load_state.issues,
@@ -1290,6 +1463,11 @@ fn admit_conflicting_loaded_suite(
     load_state
         .retention_excluded_ids
         .extend(statuses.iter().map(|status| status.id.clone()));
+    load_state.suite_retention_claims.extend(
+        statuses
+            .iter()
+            .map(|status| (status.id.clone(), status.suite_id.clone())),
+    );
     for (index, status) in statuses.into_iter().enumerate() {
         if conflicting_indices.contains(&index) {
             record_load_issue(
@@ -1314,6 +1492,9 @@ fn admit_loaded_driver(
         status.state = "interrupted".to_string();
         status.active_session_id = None;
         let resumable = load_state.inner.restart_candidates.len() < MAX_RESUMABLE_DRIVERS;
+        load_state
+            .suite_retention_claims
+            .push((status.id.clone(), status.suite_id.clone()));
         status.error = Some(
             if resumable {
                 AUTOMATIC_RESUME_QUEUED_ERROR
@@ -1348,6 +1529,10 @@ fn record_load_issue(
     }
 }
 
+fn duplicate_retention_claim_owner(driver_id: &str, index: usize) -> String {
+    format!("{driver_id}:duplicate:{index}")
+}
+
 fn driver_status_load_issue_kind(error: &io::Error) -> BenchmarkSuiteDriverLoadIssueKind {
     if error.kind() == io::ErrorKind::InvalidData {
         BenchmarkSuiteDriverLoadIssueKind::StatusInvalid
@@ -1377,7 +1562,8 @@ fn apply_driver_transition(
     inner: &mut BenchmarkSuiteDriverInner,
     candidate: BenchmarkSuiteDriverEntry,
     handoff_obligation_ids: &SyncMutex<HashSet<String>>,
-) {
+    suite_retention_claims: &BenchmarkSuiteRetentionClaims,
+) -> bool {
     let driver_id = candidate.status.id.clone();
     let suite_id = candidate.status.suite_id.clone();
     let restart_candidate = inner
@@ -1401,6 +1587,20 @@ fn apply_driver_transition(
             .remove(&driver_id);
     }
 
+    let retains_suite = is_non_terminal(&candidate.status.state)
+        || handoff_obligation_ids
+            .lock()
+            .expect(DRIVER_STORE_LOCK_INVARIANT)
+            .contains(&driver_id);
+    let released_suite_claim = if retains_suite {
+        if suite_retention_claims.claim(&driver_id, &suite_id).is_err() {
+            panic!("benchmark suite retention claim disappeared during a driver transition");
+        }
+        false
+    } else {
+        suite_retention_claims.release(&driver_id, &suite_id)
+    };
+
     if is_non_terminal(&candidate.status.state) {
         inner
             .active_by_suite
@@ -1416,6 +1616,7 @@ fn apply_driver_transition(
         let _ = candidate.stop_tx.send(true);
     }
     inner.drivers.insert(driver_id, candidate);
+    released_suite_claim
 }
 
 async fn prune_terminal_drivers(
@@ -1865,6 +2066,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_claim_and_suite_prune_reservation_have_one_winner() {
+        let retention_claims = BenchmarkSuiteRetentionClaims::default();
+        let suite_id = test_suite_id("claim-prune-race", "development");
+        let prune = retention_claims
+            .try_begin_prune(&suite_id)
+            .expect("unclaimed suite can reserve pruning");
+        let store = BenchmarkSuiteDriverStore::new_with_retention_claims(retention_claims.clone());
+
+        assert!(matches!(
+            store
+                .start(
+                    suite_id.clone(),
+                    "development".to_string(),
+                    30_000,
+                    test_summary(),
+                )
+                .await,
+            Err(BenchmarkSuiteDriverStartError::Conflict)
+        ));
+        assert!(retention_claims.claimed_suite_ids().is_empty());
+
+        drop(prune);
+        let started = store
+            .start(
+                suite_id.clone(),
+                "development".to_string(),
+                30_000,
+                test_summary(),
+            )
+            .await
+            .expect("driver claims after pruning reservation ends");
+        assert!(retention_claims.has_claim(&started.status.id, &suite_id));
+        store
+            .record_stopped(&started.status.id)
+            .await
+            .expect("terminal commit releases claim");
+        assert!(!retention_claims.has_claim(&started.status.id, &suite_id));
+        drop(started.effect_owner);
+    }
+
+    #[tokio::test]
+    async fn preaccept_start_failure_releases_suite_claim() {
+        let root = test_root("preaccept-claim-release");
+        let paths = test_paths(&root);
+        let retention_claims = BenchmarkSuiteRetentionClaims::default();
+        let suite_id = test_suite_id("preaccept-claim-release", "development");
+        let store = BenchmarkSuiteDriverStore::load_from_paths_with_retention_claims(
+            &paths,
+            retention_claims.clone(),
+        );
+        store.close().await.expect("close persistence owner");
+
+        assert!(matches!(
+            store
+                .start(
+                    suite_id.clone(),
+                    "development".to_string(),
+                    30_000,
+                    test_summary(),
+                )
+                .await,
+            Err(BenchmarkSuiteDriverStartError::Store {
+                source: BenchmarkSuiteDriverStoreError::Persistence(_),
+                ..
+            })
+        ));
+        assert!(retention_claims.claimed_suite_ids().is_empty());
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn terminal_driver_release_promptly_retries_suite_retention() {
+        use crate::state::benchmark_suites::{BenchmarkSuiteRunInput, BenchmarkSuiteStore};
+
+        let claims = BenchmarkSuiteRetentionClaims::default();
+        let suites = BenchmarkSuiteStore::new_with_retention_claims(claims.clone());
+        let drivers = BenchmarkSuiteDriverStore::new_with_retention(
+            claims.clone(),
+            suites.retention_handle(),
+        );
+        let mut suite_ids = Vec::new();
+        for index in 0..33 {
+            let suite_id = test_suite_id(&format!("release-retention-{index}"), "development");
+            let session_id = format!("session-{index}");
+            claims
+                .claim(&format!("fixture-{index}"), &suite_id)
+                .expect("protect fixture during setup");
+            let selected = suites
+                .select_reservation(
+                    &suite_id,
+                    &format!("instance-{index}"),
+                    "development",
+                    &[BenchmarkSuiteRunInput {
+                        run_index: 0,
+                        profile: "managed_default".to_string(),
+                        run_type: "repeat".to_string(),
+                        target_id: Some("target-current".to_string()),
+                        benchmark_id: format!("benchmark-{index:016x}"),
+                    }],
+                    None,
+                )
+                .await
+                .expect("select fixture");
+            suites
+                .reserve(selected, &session_id, "2026-01-01T00:00:00Z", false)
+                .await
+                .expect("reserve fixture");
+            suites
+                .update_run_state_for_session(&session_id, "completed")
+                .await
+                .expect("complete fixture");
+            suite_ids.push(suite_id);
+        }
+
+        let protected_suite = suite_ids[0].clone();
+        let started = drivers
+            .start(
+                protected_suite.clone(),
+                "development".to_string(),
+                30_000,
+                test_summary(),
+            )
+            .await
+            .expect("driver protects oldest suite");
+        for (index, suite_id) in suite_ids.iter().enumerate() {
+            assert!(claims.release(&format!("fixture-{index}"), suite_id));
+        }
+        assert!(suites.retry_terminal_retention().await.is_empty());
+        assert!(
+            suites
+                .get(&protected_suite)
+                .expect("read protected")
+                .is_some()
+        );
+        assert_eq!(
+            suite_ids
+                .iter()
+                .filter(|suite_id| suites.get(suite_id).expect("read suite").is_some())
+                .count(),
+            33
+        );
+
+        drivers
+            .record_stopped(&started.status.id)
+            .await
+            .expect("terminal commit releases suite");
+
+        assert!(!claims.has_claim(&started.status.id, &protected_suite));
+        assert_eq!(
+            suite_ids
+                .iter()
+                .filter(|suite_id| suites.get(suite_id).expect("read suite").is_some())
+                .count(),
+            32
+        );
+        drop(started.effect_owner);
+    }
+
+    #[tokio::test]
     async fn stopped_driver_blocks_successor_until_effect_owner_exits() {
         let store = BenchmarkSuiteDriverStore::new();
         let suite_id = test_suite_id("stopped-owner", "development");
@@ -2004,19 +2364,23 @@ mod tests {
         let root = test_root("critical-abort-observer");
         let paths = test_paths(&root);
         let backend = Arc::new(ControlledBackend::default());
+        let retention_claims = BenchmarkSuiteRetentionClaims::default();
+        let suite_id = test_suite_id("suite-a", "development");
         backend.gate();
         let store = Arc::new(
-            BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(
+            BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator_and_retention_claims(
                 &paths,
                 backend.coordinator(),
+                retention_claims.clone(),
             )
             .expect("store"),
         );
         let task_store = store.clone();
+        let task_suite_id = suite_id.clone();
         let task = tokio::spawn(async move {
             task_store
                 .start(
-                    test_suite_id("suite-a", "development"),
+                    task_suite_id,
                     "development".to_string(),
                     30_000,
                     test_summary(),
@@ -2032,6 +2396,7 @@ mod tests {
         .await
         .expect("writer entered");
         let driver_id = "benchmark-suite-driver-0000000000000001";
+        assert!(retention_claims.has_claim(driver_id, &suite_id));
         assert!(store.get(driver_id).await.is_none());
         assert!(store.list_recent(10).await.is_empty());
 
@@ -2049,10 +2414,12 @@ mod tests {
             store.get(driver_id).await.expect("visible driver").state,
             "scheduled"
         );
+        assert!(retention_claims.has_claim(driver_id, &suite_id));
         store
             .record_stopped(driver_id)
             .await
             .expect("observer releases the mutation gate");
+        assert!(!retention_claims.has_claim(driver_id, &suite_id));
         store.close().await.expect("store closes");
         cleanup(&root);
     }
@@ -2605,69 +2972,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_interrupted_handoff_alone_remains_recoverable() {
-        let root = test_root("legacy-handoff-alone");
-        let paths = test_paths(&root);
-        let dir = driver_dir(&paths);
-        fs::create_dir_all(&dir).expect("create driver dir");
-        let legacy = status_fixture(1, "interrupted", Some(INTERRUPTED_BY_RESTART_ERROR));
-        write_status_fixture(&dir, &legacy);
-
-        let load_state = load_persisted_driver_inner(&dir);
-
-        assert_eq!(load_state.inner.restart_candidates.len(), 1);
-        assert_eq!(load_state.inner.restart_candidates[0].status.id, legacy.id);
-        assert!(load_state.issues.is_empty());
-        cleanup(&root);
-    }
-
-    #[test]
-    fn legacy_interrupted_handoff_defers_to_exactly_one_newer_successor() {
-        let root = test_root("legacy-handoff-successor");
-        let paths = test_paths(&root);
-        let dir = driver_dir(&paths);
-        fs::create_dir_all(&dir).expect("create driver dir");
-        let mut legacy = status_fixture(1, "interrupted", Some(INTERRUPTED_BY_RESTART_ERROR));
-        legacy.suite_id = test_suite_id("same-suite", "development");
-        let mut successor = status_fixture(2, "scheduled", None);
-        successor.suite_id = test_suite_id("same-suite", "development");
-        write_status_fixture(&dir, &legacy);
-        write_status_fixture(&dir, &successor);
-
-        let load_state = load_persisted_driver_inner(&dir);
-
-        assert_eq!(load_state.inner.restart_candidates.len(), 1);
-        assert_eq!(
-            load_state.inner.restart_candidates[0].status.id,
-            successor.id
-        );
-        assert!(load_state.inner.drivers.contains_key(&legacy.id));
-        assert!(load_state.issues.is_empty());
-        cleanup(&root);
-    }
-
-    #[test]
-    fn newer_terminal_driver_consumes_legacy_interrupted_handoff() {
-        let root = test_root("legacy-handoff-terminal");
-        let paths = test_paths(&root);
-        let dir = driver_dir(&paths);
-        fs::create_dir_all(&dir).expect("create driver dir");
-        let mut legacy = status_fixture(1, "interrupted", Some(INTERRUPTED_BY_RESTART_ERROR));
-        legacy.suite_id = test_suite_id("same-suite", "development");
-        let mut terminal = status_fixture(2, "failed", Some("bounded failure"));
-        terminal.suite_id = test_suite_id("same-suite", "development");
-        write_status_fixture(&dir, &legacy);
-        write_status_fixture(&dir, &terminal);
-
-        let load_state = load_persisted_driver_inner(&dir);
-
-        assert!(load_state.inner.restart_candidates.is_empty());
-        assert_eq!(load_state.inner.drivers.len(), 2);
-        assert!(load_state.issues.is_empty());
-        cleanup(&root);
-    }
-
-    #[test]
     fn queued_or_started_handoff_with_one_successor_replays_only_successor() {
         for (name, marker) in [
             ("queued", AUTOMATIC_RESUME_QUEUED_ERROR),
@@ -2765,7 +3069,7 @@ mod tests {
         let dir = driver_dir(&paths);
         fs::create_dir_all(&dir).expect("create driver dir");
         for (index, state, error) in [
-            (1, "interrupted", Some(INTERRUPTED_BY_RESTART_ERROR)),
+            (1, "interrupted", Some(AUTOMATIC_RESUME_QUEUED_ERROR)),
             (2, "scheduled", None),
             (3, "active", None),
         ] {
@@ -2792,7 +3096,6 @@ mod tests {
     fn newer_recoverable_marker_supersedes_one_stale_nonterminal() {
         for (name, marker) in [
             ("queued", AUTOMATIC_RESUME_QUEUED_ERROR),
-            ("legacy", INTERRUPTED_BY_RESTART_ERROR),
             ("started", AUTOMATIC_RESUME_STARTED_ERROR),
         ] {
             let root = test_root(&format!("inverse-handoff-{name}"));
@@ -2874,19 +3177,23 @@ mod tests {
         let paths = test_paths(&root);
         let backend = Arc::new(ControlledBackend::default());
         let coordinator = backend.coordinator();
+        let retention_claims = BenchmarkSuiteRetentionClaims::default();
+        let suite_id = test_suite_id("suite-a", "development");
         backend.set_fail_writes(true);
         let store = Arc::new(
-            BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(
+            BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator_and_retention_claims(
                 &paths,
                 coordinator.clone(),
+                retention_claims.clone(),
             )
             .expect("store"),
         );
         let task_store = store.clone();
+        let task_suite_id = suite_id.clone();
         let start_task = tokio::spawn(async move {
             task_store
                 .start(
-                    test_suite_id("suite-a", "development"),
+                    task_suite_id,
                     "development".to_string(),
                     30_000,
                     test_summary(),
@@ -2898,6 +3205,7 @@ mod tests {
         start_task.abort();
         let _ = start_task.await;
         wait_for_retry_candidate(&store, driver_id).await;
+        assert!(retention_claims.has_claim(driver_id, &suite_id));
 
         assert!(matches!(
             store.flush().await,
@@ -2916,10 +3224,11 @@ mod tests {
         .await
         .expect("lifecycle retry entered writer");
         let competing_store = store.clone();
+        let competing_suite_id = suite_id.clone();
         let competing_start = tokio::spawn(async move {
             competing_store
                 .start(
-                    test_suite_id("suite-a", "development"),
+                    competing_suite_id,
                     "development".to_string(),
                     30_000,
                     test_summary(),
@@ -2955,6 +3264,7 @@ mod tests {
             Err(BenchmarkSuiteDriverStoreError::Persistence(_))
         ));
         assert!(store.has_retry_candidate(driver_id));
+        assert!(retention_claims.has_claim(driver_id, &suite_id));
         assert!(matches!(
             BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(
                 &paths,
@@ -2969,6 +3279,7 @@ mod tests {
             .await
             .expect("close retries terminal state and releases owner");
         assert!(store.retry_candidate_ids().is_empty());
+        assert!(!retention_claims.has_claim(driver_id, &suite_id));
 
         let reloaded =
             BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(&paths, coordinator)
@@ -3033,7 +3344,15 @@ mod tests {
             .expect("write driver");
         }
 
-        let store = BenchmarkSuiteDriverStore::load_from_paths(&paths);
+        let retention_claims = BenchmarkSuiteRetentionClaims::default();
+        let store = BenchmarkSuiteDriverStore::load_from_paths_with_retention_claims(
+            &paths,
+            retention_claims.clone(),
+        );
+        for index in 1..=total {
+            let status = status_fixture(index as u64, "active", None);
+            assert!(retention_claims.has_claim(&status.id, &status.suite_id));
+        }
         let pending = store
             .take_restart_interrupted_resumable_drivers()
             .await
@@ -3047,6 +3366,17 @@ mod tests {
 
         assert_eq!(pending.len(), MAX_RESUMABLE_DRIVERS);
         assert_eq!(limited, total - MAX_RESUMABLE_DRIVERS);
+        let pending_ids = pending
+            .iter()
+            .map(|status| status.id.as_str())
+            .collect::<HashSet<_>>();
+        for index in 1..=total {
+            let status = status_fixture(index as u64, "active", None);
+            assert_eq!(
+                retention_claims.has_claim(&status.id, &status.suite_id),
+                pending_ids.contains(status.id.as_str())
+            );
+        }
         cleanup(&root);
     }
 
@@ -3315,11 +3645,13 @@ mod tests {
         let mut inner = BenchmarkSuiteDriverInner::default();
         inner.restart_candidates.push(test_entry(queued.clone()));
         let handoff_obligation_ids = SyncMutex::new(HashSet::new());
+        let suite_retention_claims = BenchmarkSuiteRetentionClaims::default();
 
         apply_driver_transition(
             &mut inner,
             test_entry(queued.clone()),
             &handoff_obligation_ids,
+            &suite_retention_claims,
         );
         assert_eq!(inner.ready_resume_ids, vec![queued.id.clone()]);
         assert!(
@@ -3328,27 +3660,52 @@ mod tests {
                 .expect("handoff lock")
                 .contains(&queued.id)
         );
+        assert!(suite_retention_claims.has_claim(&queued.id, &queued.suite_id));
 
         inner.ready_resume_ids.clear();
         let mut successor = status_fixture(2, "scheduled", None);
         successor.suite_id = queued.suite_id.clone();
-        apply_driver_transition(&mut inner, test_entry(successor), &handoff_obligation_ids);
+        let successor_id = successor.id.clone();
+        apply_driver_transition(
+            &mut inner,
+            test_entry(successor.clone()),
+            &handoff_obligation_ids,
+            &suite_retention_claims,
+        );
         assert!(
             handoff_obligation_ids
                 .lock()
                 .expect("handoff lock")
                 .contains(&queued.id)
         );
+        assert!(suite_retention_claims.has_claim(&queued.id, &queued.suite_id));
+        assert!(suite_retention_claims.has_claim(&successor_id, &queued.suite_id));
 
         let mut consumed = queued.clone();
         consumed.error = Some(AUTOMATIC_RESUME_STARTED_ERROR.to_string());
-        apply_driver_transition(&mut inner, test_entry(consumed), &handoff_obligation_ids);
+        apply_driver_transition(
+            &mut inner,
+            test_entry(consumed),
+            &handoff_obligation_ids,
+            &suite_retention_claims,
+        );
         assert!(
             handoff_obligation_ids
                 .lock()
                 .expect("handoff lock")
                 .is_empty()
         );
+        assert!(!suite_retention_claims.has_claim(&queued.id, &queued.suite_id));
+        assert!(suite_retention_claims.has_claim(&successor_id, &queued.suite_id));
+
+        successor.state = "complete".to_string();
+        apply_driver_transition(
+            &mut inner,
+            test_entry(successor),
+            &handoff_obligation_ids,
+            &suite_retention_claims,
+        );
+        assert!(!suite_retention_claims.has_claim(&successor_id, &queued.suite_id));
     }
 
     #[tokio::test]
@@ -3534,7 +3891,11 @@ mod tests {
             write_status_fixture(&dir, &active);
         }
 
-        let store = BenchmarkSuiteDriverStore::load_from_paths(&paths);
+        let retention_claims = BenchmarkSuiteRetentionClaims::default();
+        let store = BenchmarkSuiteDriverStore::load_from_paths_with_retention_claims(
+            &paths,
+            retention_claims.clone(),
+        );
         let pending = store
             .take_restart_interrupted_resumable_drivers()
             .await
@@ -3551,19 +3912,26 @@ mod tests {
         }
         assert!(store.get(&ambiguous_terminal.id).await.is_some());
         assert!(driver_path(&dir, &ambiguous_terminal.id).is_file());
+        assert!(retention_claims.has_claim(&ambiguous_terminal.id, &ambiguous_terminal.suite_id));
         assert!(malformed_path.is_file());
         assert!(noncanonical_path.is_file());
         assert!(unsafe_path.is_file());
         for index in [201, 202] {
-            assert!(driver_path(&dir, &status_fixture(index, "active", None).id).is_file());
+            let status = status_fixture(index, "active", None);
+            assert!(driver_path(&dir, &status.id).is_file());
+            assert!(retention_claims.has_claim(&status.id, &ambiguous_terminal.suite_id));
         }
         assert_eq!(
             store.list_recent(100).await.len(),
             MAX_RETAINED_TERMINAL_DRIVERS + 1
         );
         store.close().await.expect("store closes");
+        assert!(retention_claims.has_claim(&ambiguous_terminal.id, &ambiguous_terminal.suite_id));
 
-        let reloaded = BenchmarkSuiteDriverStore::load_from_paths(&paths);
+        let reloaded = BenchmarkSuiteDriverStore::load_from_paths_with_retention_claims(
+            &paths,
+            retention_claims,
+        );
         assert!(
             reloaded
                 .take_restart_interrupted_resumable_drivers()
@@ -3748,29 +4116,62 @@ mod tests {
         cleanup(&root);
     }
 
-    #[test]
-    fn duplicate_driver_id_is_rejected_deterministically_without_resume() {
+    #[tokio::test]
+    async fn duplicate_driver_id_protects_every_valid_suite_without_resume() {
         let root = test_root("duplicate-id");
         let paths = test_paths(&root);
         let dir = driver_dir(&paths);
         fs::create_dir_all(&dir).expect("create driver dir");
         let status = status_fixture(1, "active", None);
+        let mut duplicate = status.clone();
+        duplicate.suite_id = test_suite_id("duplicate-other-suite", "development");
         let encoded = serde_json::to_vec_pretty(&status).expect("serialize driver");
         fs::write(driver_path(&dir, &status.id), &encoded).expect("write canonical driver");
-        fs::write(dir.join("aaa-duplicate.json"), encoded).expect("write duplicate driver");
+        fs::write(
+            dir.join("aaa-duplicate.json"),
+            serde_json::to_vec_pretty(&duplicate).expect("serialize duplicate driver"),
+        )
+        .expect("write duplicate driver");
 
-        let load_state = load_persisted_driver_inner(&dir);
+        let retention_claims = BenchmarkSuiteRetentionClaims::default();
+        let store = BenchmarkSuiteDriverStore::load_from_paths_with_retention_claims(
+            &paths,
+            retention_claims.clone(),
+        );
 
-        assert!(load_state.inner.drivers.is_empty());
-        assert!(load_state.inner.restart_candidates.is_empty());
-        assert_eq!(load_state.inner.next_id, 1);
+        assert!(
+            store
+                .inner
+                .read()
+                .expect(DRIVER_STORE_LOCK_INVARIANT)
+                .drivers
+                .is_empty()
+        );
         assert_eq!(
-            load_state.issues,
+            store
+                .inner
+                .read()
+                .expect(DRIVER_STORE_LOCK_INVARIANT)
+                .next_id,
+            1
+        );
+        assert_eq!(
+            store.load_issues(),
             vec![BenchmarkSuiteDriverLoadIssue {
                 kind: BenchmarkSuiteDriverLoadIssueKind::DuplicateDriverId,
                 count: 1,
             }]
         );
+        assert!(retention_claims.has_claim(
+            &duplicate_retention_claim_owner(&status.id, 0),
+            &duplicate.suite_id
+        ));
+        assert!(retention_claims.has_claim(
+            &duplicate_retention_claim_owner(&status.id, 1),
+            &status.suite_id
+        ));
+        store.close().await.expect("store closes");
+        assert_eq!(retention_claims.claimed_suite_ids().len(), 2);
         cleanup(&root);
     }
 
@@ -3817,7 +4218,6 @@ mod tests {
             (6, "stopped", None),
             (7, "interrupted", Some(AUTOMATIC_RESUME_QUEUED_ERROR)),
             (8, "interrupted", Some(AUTOMATIC_RESUME_STARTED_ERROR)),
-            (9, "interrupted", Some(INTERRUPTED_BY_RESTART_ERROR)),
         ];
         for (index, state, error) in shapes {
             let mut status = status_fixture(index, state, error);
@@ -3841,7 +4241,7 @@ mod tests {
         let load_state = load_persisted_driver_inner(&dir);
 
         assert!(load_state.issues.is_empty());
-        assert_eq!(load_state.inner.restart_candidates.len(), 5);
+        assert_eq!(load_state.inner.restart_candidates.len(), 4);
         assert_eq!(load_state.inner.drivers.len(), 4);
         cleanup(&root);
     }

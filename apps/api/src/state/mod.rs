@@ -133,14 +133,19 @@ impl AppState {
 
     fn new_with_telemetry_inner(init: AppStateInit, telemetry: Arc<TelemetryHub>) -> Self {
         let library_dir = init.config.current().library_dir;
+        let benchmark_suite_retention_claims =
+            benchmark_suites::BenchmarkSuiteRetentionClaims::default();
+        let benchmark_suite_drivers =
+            benchmark_suite_drivers::BenchmarkSuiteDriverStore::prepare_load_from_paths(
+                init.config.paths(),
+                benchmark_suite_retention_claims.clone(),
+            );
         let benchmark_suites = Arc::new(benchmark_suites::BenchmarkSuiteStore::load_from_paths(
             init.config.paths(),
+            benchmark_suite_retention_claims,
         ));
-        let benchmark_suite_drivers = Arc::new(
-            benchmark_suite_drivers::BenchmarkSuiteDriverStore::load_from_paths(
-                init.config.paths(),
-            ),
-        );
+        let benchmark_suite_drivers =
+            Arc::new(benchmark_suite_drivers.bind(benchmark_suites.retention_handle()));
         let performance_operations = Arc::new(
             performance_operations::PerformanceOperationStore::load_from_paths(init.config.paths()),
         );
