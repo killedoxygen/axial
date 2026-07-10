@@ -67,6 +67,7 @@ pub enum CurrentArtifact {
     ManagedRuntimeCache,
     MusicCacheFile,
     InternalLaunchProof,
+    BenchmarkSuiteDriverStatus,
     GuardianFailureMemorySnapshot,
     OperationJournalSnapshot,
     PerformanceRulesCache,
@@ -107,6 +108,7 @@ impl CurrentArtifact {
             | Self::PerformanceRulesCache
             | Self::GuardianFailureMemorySnapshot
             | Self::OperationJournalSnapshot
+            | Self::BenchmarkSuiteDriverStatus
             | Self::PerformanceOperationStatus
             | Self::PerformanceCompositionLock => TargetKind::Config,
             Self::ManagedLibraryRoot
@@ -135,6 +137,7 @@ impl CurrentArtifact {
             | Self::ManagedRuntimeCache
             | Self::MusicCacheFile
             | Self::InternalLaunchProof
+            | Self::BenchmarkSuiteDriverStatus
             | Self::GuardianFailureMemorySnapshot
             | Self::OperationJournalSnapshot
             | Self::PerformanceRulesCache
@@ -164,6 +167,7 @@ impl CurrentArtifact {
             Self::ManagedRuntimeCache => "managed_runtime_cache",
             Self::MusicCacheFile => "music_cache_file",
             Self::InternalLaunchProof => "internal_launch_proof",
+            Self::BenchmarkSuiteDriverStatus => "benchmark_suite_driver_status",
             Self::GuardianFailureMemorySnapshot => "guardian_failure_memory",
             Self::OperationJournalSnapshot => "operation_journal",
             Self::PerformanceRulesCache => "performance_rules_cache",
@@ -220,6 +224,9 @@ pub fn classify_app_path(paths: &AppPaths, path: &Path) -> OwnershipClassificati
     }
     if path.starts_with(paths.config_dir.join("benchmarks").join("launch")) {
         return classify_current_artifact(CurrentArtifact::InternalLaunchProof, "");
+    }
+    if path.starts_with(paths.config_dir.join("benchmarks").join("suite-drivers")) {
+        return classify_current_artifact(CurrentArtifact::BenchmarkSuiteDriverStatus, "");
     }
     if path.starts_with(paths.config_dir.join("performance")) {
         return classify_current_artifact(CurrentArtifact::PerformanceCompositionLock, "");
@@ -402,6 +409,22 @@ mod tests {
         assert_eq!(music.target.ownership, OwnershipClass::LauncherManaged);
         assert_eq!(music.target.id, "music_cache_file");
         assert!(music.allows_automatic_managed_mutation());
+
+        let driver_status = classify_app_path(
+            &paths,
+            &paths
+                .config_dir
+                .join("benchmarks")
+                .join("suite-drivers")
+                .join("benchmark-suite-driver-0000000000000001.json"),
+        );
+        assert_eq!(driver_status.target.system, StabilizationSystem::State);
+        assert_eq!(driver_status.target.kind, TargetKind::Config);
+        assert_eq!(
+            driver_status.target.ownership,
+            OwnershipClass::LauncherManaged
+        );
+        assert_eq!(driver_status.target.id, "benchmark_suite_driver_status");
 
         let instance_path = classify_app_path(
             &paths,

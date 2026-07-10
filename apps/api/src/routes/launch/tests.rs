@@ -2229,7 +2229,11 @@ async fn benchmark_suite_driver_duplicate_start_conflicts_until_terminal() {
         .await;
 
     assert!(conflict.is_err());
-    store.record_stopped(&first.status.id).await;
+    store
+        .record_stopped(&first.status.id)
+        .await
+        .expect("first driver stops");
+    drop(first.effect_owner);
     store
         .start(
             "suite-driver".to_string(),
@@ -2289,7 +2293,10 @@ async fn benchmark_suite_driver_list_payload_is_bounded_and_recent_first() {
             )
             .await
             .expect("driver starts");
-        store.record_stopped(&started.status.id).await;
+        store
+            .record_stopped(&started.status.id)
+            .await
+            .expect("driver stops");
     }
 
     let drivers = store.list_recent(MAX_BENCHMARK_SUITE_DRIVER_LIST).await;
@@ -2485,7 +2492,9 @@ async fn benchmark_suite_driver_startup_resume_starts_fresh_driver_from_restart_
         .insert(test_record("session-0"))
         .await;
 
-    let summary = resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone()).await;
+    let summary = resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone())
+        .await
+        .expect("restart driver reconciliation");
 
     assert_eq!(
         summary,
@@ -2539,7 +2548,9 @@ async fn benchmark_suite_driver_startup_resume_missing_manifest_fails_boundedly(
         .await;
     let reloaded = fixture.reload().await;
 
-    let summary = resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone()).await;
+    let summary = resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone())
+        .await
+        .expect("restart driver reconciliation");
 
     assert_eq!(
         summary,
@@ -2572,7 +2583,9 @@ async fn benchmark_suite_driver_startup_resume_complete_manifest_fails_boundedly
     let interrupted = fixture.active_driver(suite_id, "development", 30_000).await;
     let reloaded = fixture.reload().await;
 
-    let summary = resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone()).await;
+    let summary = resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone())
+        .await
+        .expect("restart driver reconciliation");
 
     assert_eq!(
         summary,
@@ -2619,7 +2632,8 @@ async fn benchmark_suite_driver_error_status_payload_is_bounded_and_sanitized() 
             &started.status.id,
             "failed command java_path /home/Secret/.minecraft --jvm-args username Secret",
         )
-        .await;
+        .await
+        .expect("failed driver status persists");
     let status = store.get(&started.status.id).await.expect("driver status");
     let payload = benchmark_suite_driver_response_payload(&status.state, &status);
     let data = serde_json::to_string(&payload).expect("serialize driver payload");
@@ -2635,6 +2649,71 @@ async fn benchmark_suite_driver_error_status_payload_is_bounded_and_sanitized() 
     assert!(!lower_data.contains("username"));
     assert!(!lower_data.contains("filesystem"));
     assert!(!lower_data.contains("args"));
+}
+
+#[tokio::test]
+async fn benchmark_suite_driver_response_defensively_redacts_tampered_fields() {
+    let store = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverStore::new();
+    let started = store
+        .start(
+            "safe-suite".to_string(),
+            "development".to_string(),
+            30_000,
+            crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary {
+                run_count: 2,
+                launched_run_count: 0,
+                pending_run_index: Some(0),
+            },
+        )
+        .await
+        .expect("driver starts");
+    let mut status = started.status.clone();
+    drop(started.effect_owner);
+    status.id = "/home/Secret/driver".to_string();
+    status.state = "../../raw-state".to_string();
+    status.suite_id = "C:\\Users\\Secret\\suite".to_string();
+    status.mode = "secret-mode".to_string();
+    status.active_session_id = Some("/home/Secret/access-token".to_string());
+    status.last_session_id = Some("C:\\Users\\Secret\\session".to_string());
+    status.error = Some("failed /home/Secret --access-token raw-secret".to_string());
+    status.created_at = "raw-created-/home/Secret".to_string();
+    status.updated_at = "raw-updated-C:\\Users\\Secret".to_string();
+    status.run_count = usize::MAX;
+    status.launched_run_count = usize::MAX;
+    status.pending_run_index = Some(usize::MAX);
+
+    let payload = benchmark_suite_driver_response_payload("../../raw-status", &status);
+    let serialized = serde_json::to_string(&payload).expect("serialize public response");
+
+    assert_eq!(payload["status"], serde_json::json!("unknown"));
+    assert_eq!(payload["driver"]["state"], serde_json::json!("unknown"));
+    assert_eq!(payload["driver"]["suite_id"], serde_json::json!("suite"));
+    assert_eq!(payload["driver"]["mode"], serde_json::json!("unknown"));
+    assert_eq!(
+        payload["view_model"]["state_label"],
+        serde_json::json!("Unknown")
+    );
+    assert_eq!(
+        payload["driver"]["created_at"],
+        serde_json::json!("unknown")
+    );
+    assert_eq!(
+        payload["driver"]["updated_at"],
+        serde_json::json!("unknown")
+    );
+    assert_eq!(
+        payload["driver"]["error"],
+        serde_json::json!("driver error")
+    );
+    assert_eq!(payload["suite"]["run_count"], serde_json::json!(64));
+    assert_eq!(
+        payload["suite"]["pending_run_index"],
+        serde_json::Value::Null
+    );
+    assert!(!serialized.contains("Secret"));
+    assert!(!serialized.contains("raw-state"));
+    assert!(!serialized.contains("raw-status"));
+    assert!(!serialized.contains("access-token"));
 }
 
 #[test]
@@ -3207,6 +3286,16 @@ impl RouteTestFixture {
 
     async fn reload(&self) -> Self {
         self.state
+            .accounts()
+            .close()
+            .await
+            .expect("close account store before reload");
+        self.state
+            .benchmark_suite_drivers()
+            .close()
+            .await
+            .expect("close benchmark suite driver store before reload");
+        self.state
             .performance_operations()
             .close()
             .await
@@ -3361,7 +3450,8 @@ impl RouteTestFixture {
                 summary,
                 Some("session-before-restart".to_string()),
             )
-            .await;
+            .await
+            .expect("active driver status persists");
         self.state
             .benchmark_suite_drivers()
             .get(&started.status.id)
@@ -3389,7 +3479,8 @@ impl RouteTestFixture {
         self.state
             .benchmark_suite_drivers()
             .record_stopped(&started.status.id)
-            .await;
+            .await
+            .expect("stopped driver status persists");
         self.state
             .benchmark_suite_drivers()
             .get(&started.status.id)
