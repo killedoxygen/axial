@@ -1,6 +1,6 @@
 //! Application commands for Performance-owned workflows.
 //!
-//! Application orchestrates command handling here while `croopor-performance`
+//! Application orchestrates command handling here while `axial-performance`
 //! keeps ownership of rules refresh mechanics and validation.
 
 mod benchmark_matrix;
@@ -26,11 +26,11 @@ use crate::state::{
     failure_memory::GuardianFailureMemoryEntry,
     ownership::{CurrentArtifact, classify_current_artifact},
 };
-use axum::{Json, http::StatusCode};
-use croopor_performance::{
+use axial_performance::{
     BundleHealth, CompositionPlan, CompositionTier, PerformanceMode, PerformanceRulesStatus,
     RuleChannel, RuleSource, RulesRefreshError, RulesValidation,
 };
+use axum::{Json, http::StatusCode};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -175,7 +175,7 @@ pub fn performance_plan_summary_view_model(
             },
             detail: warning.unwrap_or_else(|| {
                 format!(
-                    "Croopor chose {} because the preferred bundle could not be applied.",
+                    "Axial chose {} because the preferred bundle could not be applied.",
                     fallback_tier.to_ascii_lowercase()
                 )
             }),
@@ -195,7 +195,7 @@ pub fn performance_plan_summary_view_model(
             state_id: "performance_summary_launcher_tuning".to_string(),
             title: "Launcher tuning".to_string(),
             detail: warning.unwrap_or_else(|| {
-                "Croopor will tune Java and memory for this version; no performance mod bundle is available."
+                "Axial will tune Java and memory for this version; no performance mod bundle is available."
                     .to_string()
             }),
             tone: health_view_tone(health),
@@ -342,13 +342,13 @@ fn public_performance_notice(raw: &str, fallback: bool) -> Option<String> {
         raw.to_string()
     } else if raw.contains("skipped by emergency disable") {
         if fallback {
-            "A performance bundle is temporarily unavailable, so Croopor chose the safest available option."
+            "A performance bundle is temporarily unavailable, so Axial chose the safest available option."
                 .to_string()
         } else {
-            "One performance mod is temporarily unavailable, so Croopor left it out.".to_string()
+            "One performance mod is temporarily unavailable, so Axial left it out.".to_string()
         }
     } else if raw.contains("not enough compatible performance mods") {
-        "A faster performance bundle is not compatible with this instance, so Croopor chose a safer option."
+        "A faster performance bundle is not compatible with this instance, so Axial chose a safer option."
             .to_string()
     } else if raw.contains("no NVIDIA Turing+ GPU detected") {
         "Nvidium was left out because this device does not have a supported NVIDIA GPU.".to_string()
@@ -577,7 +577,7 @@ fn public_performance_timestamp(value: &str, fallback: &str) -> String {
 }
 
 fn performance_rules_cache_label(status: &PerformanceRulesStatus) -> &'static str {
-    if status.rules_cache.state == croopor_performance::RulesCacheState::Invalid {
+    if status.rules_cache.state == axial_performance::RulesCacheState::Invalid {
         "Invalid local cache"
     } else if !status.rules_cache.recorded {
         "Unavailable"
@@ -625,12 +625,10 @@ fn performance_rules_health_label(health: BundleHealth) -> &'static str {
     }
 }
 
-fn performance_rules_ownership_label(
-    ownership: croopor_performance::OwnershipClass,
-) -> &'static str {
+fn performance_rules_ownership_label(ownership: axial_performance::OwnershipClass) -> &'static str {
     match ownership {
-        croopor_performance::OwnershipClass::CompositionManaged => "Croopor-managed",
-        croopor_performance::OwnershipClass::UserManaged => "User-managed",
+        axial_performance::OwnershipClass::CompositionManaged => "Axial-managed",
+        axial_performance::OwnershipClass::UserManaged => "User-managed",
     }
 }
 
@@ -731,7 +729,7 @@ mod tests {
         },
         failure_memory::GuardianFailureMemoryEntry,
     };
-    use croopor_performance::{
+    use axial_performance::{
         BundleHealth, CompositionPlan, CompositionTier, ModCondition, PerformanceMode, RuleChannel,
         RuleSource, RulesCacheState, RulesCacheStatus, RulesValidation, builtin_manifest,
         rules_status, rules_status_for,
@@ -802,7 +800,7 @@ mod tests {
         assert_eq!(summary.title, "Using launcher tuning");
         assert_eq!(
             summary.detail,
-            "A faster performance bundle is not compatible with this instance, so Croopor chose a safer option."
+            "A faster performance bundle is not compatible with this instance, so Axial chose a safer option."
         );
         assert_eq!(summary.tone, ViewModelTone::Warn);
         assert!(

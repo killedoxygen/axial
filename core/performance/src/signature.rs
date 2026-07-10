@@ -4,9 +4,9 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-pub const PERFORMANCE_RULES_PUBLIC_KEY_ENV: &str = "CROOPOR_PERFORMANCE_RULES_ED25519_PUBLIC_KEY";
-pub const RULES_SIGNATURE_HEADER: &str = "x-croopor-rules-signature-ed25519";
-pub const RULES_KEY_ID_HEADER: &str = "x-croopor-rules-key-id";
+pub const PERFORMANCE_RULES_PUBLIC_KEY_ENV: &str = "AXIAL_PERFORMANCE_RULES_ED25519_PUBLIC_KEY";
+pub const RULES_SIGNATURE_HEADER: &str = "x-axial-rules-signature-ed25519";
+pub const RULES_KEY_ID_HEADER: &str = "x-axial-rules-key-id";
 
 const PUBLIC_KEY_BYTES: usize = 32;
 const SIGNATURE_BYTES: usize = 64;

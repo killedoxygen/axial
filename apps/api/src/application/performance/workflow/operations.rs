@@ -149,7 +149,7 @@ pub(super) async fn queue_performance_operation(
         active: true,
         status: "queued".to_string(),
         install_id: Some(install_id),
-        health: croopor_performance::BundleHealth::Disabled,
+        health: axial_performance::BundleHealth::Disabled,
         composition_id: String::new(),
         tier: String::new(),
         installed_count: 0,

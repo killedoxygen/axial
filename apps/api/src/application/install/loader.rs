@@ -17,11 +17,11 @@ use crate::dto::loaders::{
 use crate::guardian::GuardianArtifactRepairStatus;
 use crate::install_runtime::prewarm_version_runtime;
 use crate::state::{AppState, InstallStore};
-use axum::{Json, http::StatusCode};
-use croopor_minecraft::{
+use axial_minecraft::{
     DownloadProgress, LoaderComponentId, LoaderError, LoaderProviderFailureKind, fetch_builds,
     fetch_components, fetch_supported_versions, install_build, resolve_build_record,
 };
+use axum::{Json, http::StatusCode};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -44,7 +44,7 @@ pub async fn start_loader_install(
     let library_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
+            Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
     let library_dir_path = PathBuf::from(&library_dir);
@@ -311,7 +311,7 @@ pub async fn loader_builds(
     let library_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
+            Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
 
@@ -334,7 +334,7 @@ pub async fn loader_game_versions(
     let library_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
+            Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
 
@@ -504,7 +504,7 @@ fn public_loader_error_message(error: &LoaderError) -> &'static str {
         LoaderError::InvalidMinecraftVersion => "Invalid Minecraft version.",
         LoaderError::InvalidBuildId => "Invalid loader build.",
         LoaderError::InvalidComponentId => "Invalid loader component.",
-        LoaderError::MissingLibraryDir => "Croopor library is not configured",
+        LoaderError::MissingLibraryDir => "Axial library is not configured",
         LoaderError::CatalogUnavailable { .. } => {
             "Loader catalog is unavailable. Check your connection and try again."
         }
@@ -519,7 +519,7 @@ fn public_loader_error_message(error: &LoaderError) -> &'static str {
             "Loader provider is unavailable. Check your connection and try again."
         }
         LoaderError::ProviderDataInvalid { .. } => {
-            "Loader provider returned data Croopor could not trust. Try again later."
+            "Loader provider returned data Axial could not trust. Try again later."
         }
         LoaderError::InvalidProfile(_) => "Loader profile is invalid. Try another build.",
         LoaderError::Verify(_) => {

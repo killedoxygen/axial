@@ -1,5 +1,5 @@
 [package]
-name = "croopor-performance"
+name = "axial-performance"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -15,13 +15,13 @@ impl AppPaths {
         let config_dir = if cfg!(target_os = "windows") {
             std::env::var_os("APPDATA")
                 .map(PathBuf::from)
-                .map(|path| path.join("croopor"))
+                .map(|path| path.join("axial"))
         } else {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
-                .map(|path| path.join(".croopor"))
+                .map(|path| path.join(".axial"))
         }
-        .unwrap_or_else(|| PathBuf::from(".croopor"));
+        .unwrap_or_else(|| PathBuf::from(".axial"));
 
         Self {
             config_file: config_dir.join("config.json"),

@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use croopor_config::{AppConfig, Instance};
+use axial_config::{AppConfig, Instance};
 
 pub(super) fn persist_launch_metadata(
     state: &AppState,
@@ -29,8 +29,8 @@ pub(super) fn persist_launch_metadata(
 mod tests {
     use super::*;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
-    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-    use croopor_performance::PerformanceManager;
+    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_performance::PerformanceManager;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -129,7 +129,7 @@ mod tests {
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         AppState::new(AppStateInit {
-            app_name: "Croopor".to_string(),
+            app_name: "Axial".to_string(),
             version: "test".to_string(),
             config,
             instances,

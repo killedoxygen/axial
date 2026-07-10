@@ -3,11 +3,11 @@ use crate::state::{
     AppState, AuthLoginAccountState, AuthLoginMinecraftAccount, LauncherAccountKind,
     LauncherAccountRecord,
 };
-use axum::{Json, http::StatusCode};
-use croopor_config::{
+use axial_config::{
     ConfigStoreError, LAUNCH_AUTH_MODE_OFFLINE, LAUNCH_AUTH_MODE_ONLINE, validate_username,
 };
-use croopor_minecraft::offline_uuid;
+use axial_minecraft::offline_uuid;
+use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -544,7 +544,7 @@ fn account_selection_failed_error() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({
-            "error": "Could not select account. Restart Croopor and try again.",
+            "error": "Could not select account. Restart Axial and try again.",
             "status": "account_selection_failed",
         })),
     )
@@ -554,7 +554,7 @@ fn account_remove_failed_error() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({
-            "error": "Could not remove account credentials. Restart Croopor and try again.",
+            "error": "Could not remove account credentials. Restart Axial and try again.",
             "status": "auth_persistence_failed",
         })),
     )
@@ -596,8 +596,8 @@ mod tests {
         AppStateInit, AuthLoginMinecraftProfile, AuthLoginMinecraftSkin, InstallStore,
         NewAuthLoginMinecraftAccount, NewAuthLoginMsaToken, SessionStore,
     };
-    use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
-    use croopor_performance::PerformanceManager;
+    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+    use axial_performance::PerformanceManager;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -738,7 +738,7 @@ mod tests {
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let state = AppState::new(AppStateInit {
-                app_name: "Croopor".to_string(),
+                app_name: "Axial".to_string(),
                 version: "test".to_string(),
                 config,
                 instances,
@@ -810,7 +810,7 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "croopor-account-routes-{name}-{}-{nonce}",
+            "axial-account-routes-{name}-{}-{nonce}",
             std::process::id()
         ))
     }

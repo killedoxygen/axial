@@ -176,12 +176,12 @@ mod tests {
         AppStateInit, InstallStore, SessionStore,
         performance_operations::PerformanceOperationPayload,
     };
+    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_performance::PerformanceManager;
     use axum::{
         body::{Body, to_bytes},
         http::{Method, Request},
     };
-    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-    use croopor_performance::PerformanceManager;
     use serde_json::Value;
     use std::{fs, path::PathBuf, sync::Arc};
     use tower::ServiceExt;
@@ -274,7 +274,7 @@ mod tests {
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let state = AppState::new(AppStateInit {
-                app_name: "Croopor".to_string(),
+                app_name: "Axial".to_string(),
                 version: "test".to_string(),
                 config,
                 instances,
@@ -331,7 +331,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "croopor-api-performance-route-{name}-{}-{}",
+            "axial-api-performance-route-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

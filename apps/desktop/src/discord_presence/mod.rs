@@ -4,9 +4,9 @@ mod client_id;
 mod transport;
 mod worker;
 
+use axial_api::state::AppState;
+use axial_api::state::presence::{PresenceSnapshot, build_presence_snapshot};
 use client_id::configured_client_id;
-use croopor_api::state::AppState;
-use croopor_api::state::presence::{PresenceSnapshot, build_presence_snapshot};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -72,7 +72,7 @@ impl DiscordPresenceHandle {
 pub fn spawn(state: AppState) -> DiscordPresenceHandle {
     let Some(client_id) = configured_client_id() else {
         info!(
-            "Discord RPC is inactive; CROOPOR_DISCORD_APPLICATION_ID was not provided at build time"
+            "Discord RPC is inactive; AXIAL_DISCORD_APPLICATION_ID was not provided at build time"
         );
         return DiscordPresenceHandle::disabled();
     };
@@ -82,7 +82,7 @@ pub fn spawn(state: AppState) -> DiscordPresenceHandle {
     spawn_snapshot_monitor(state, tx.clone());
 
     match thread::Builder::new()
-        .name("croopor-discord-rpc".to_string())
+        .name("axial-discord-rpc".to_string())
         .spawn(move || {
             DiscordPresenceWorker::new(client_id, rx).run();
             let _ = done_tx.send(());

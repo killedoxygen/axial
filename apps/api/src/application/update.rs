@@ -9,10 +9,9 @@ use std::{
 };
 
 const GITHUB_LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/mateoltd/croopor/releases/latest";
-const GITHUB_RELEASE_PAGE_TAG_PREFIX: &str = "https://github.com/mateoltd/croopor/releases/tag/";
-const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
-    "https://github.com/mateoltd/croopor/releases/download/";
+    "https://api.github.com/repos/mateoltd/axial/releases/latest";
+const GITHUB_RELEASE_PAGE_TAG_PREFIX: &str = "https://github.com/mateoltd/axial/releases/tag/";
+const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/mateoltd/axial/releases/download/";
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const UPDATE_CHECK_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const UPDATE_CHECK_UNAVAILABLE_MESSAGE: &str = "update check unavailable";
@@ -72,7 +71,7 @@ async fn fetch_latest_release_from_url(
 ) -> Result<GithubLatestRelease, UpdateFetchError> {
     let response = update_http_client()
         .get(url)
-        .header(USER_AGENT, format!("Croopor/{current_version}"))
+        .header(USER_AGENT, format!("Axial/{current_version}"))
         .header(ACCEPT, "application/vnd.github+json")
         .send()
         .await
@@ -296,7 +295,7 @@ fn release_asset_name(latest_version: &str, os: &str, arch: &str) -> Option<Stri
     };
 
     Some(format!(
-        "croopor-{platform}-{package_arch}-{latest_version}.{archive_ext}"
+        "axial-{platform}-{package_arch}-{latest_version}.{archive_ext}"
     ))
 }
 
@@ -408,7 +407,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
             GithubLatestRelease {
                 tag_name: "v1.2.4".to_string(),
-                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: Vec::new(),
             },
         );
@@ -427,7 +426,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
             GithubLatestRelease {
                 tag_name: "v1.2.3".to_string(),
-                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.3".to_string(),
+                html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.3".to_string(),
                 assets: Vec::new(),
             },
         );
@@ -440,8 +439,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
             GithubLatestRelease {
                 tag_name: "v1.2.4-beta".to_string(),
-                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4-beta"
-                    .to_string(),
+                html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4-beta".to_string(),
                 assets: Vec::new(),
             },
         );
@@ -454,7 +452,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
             GithubLatestRelease {
                 tag_name: "v1.2.4".to_string(),
-                html_url: "https://example.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                html_url: "https://example.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: Vec::new(),
             },
         );
@@ -467,7 +465,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
             GithubLatestRelease {
                 tag_name: "v1.2.4".to_string(),
-                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.5".to_string(),
+                html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.5".to_string(),
                 assets: Vec::new(),
             },
         );
@@ -501,7 +499,7 @@ mod tests {
         assert_eq!(release.tag_name, "v1.2.4");
         assert_eq!(
             release.html_url,
-            "https://github.com/mateoltd/croopor/releases/tag/v1.2.4"
+            "https://github.com/mateoltd/axial/releases/tag/v1.2.4"
         );
     }
 
@@ -539,12 +537,12 @@ mod tests {
         let asset_url = matching_release_asset_url(
             &[
                 release_asset(
-                    "croopor-windows-amd64-1.2.4.zip",
-                    "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-windows-amd64-1.2.4.zip",
+                    "axial-windows-amd64-1.2.4.zip",
+                    "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-windows-amd64-1.2.4.zip",
                 ),
                 release_asset(
-                    "croopor-linux-amd64-1.2.4.tar.gz",
-                    "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                    "axial-linux-amd64-1.2.4.tar.gz",
+                    "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-linux-amd64-1.2.4.tar.gz",
                 ),
             ],
             "1.2.4",
@@ -555,7 +553,7 @@ mod tests {
 
         assert_eq!(
             asset_url,
-            "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz"
+            "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-linux-amd64-1.2.4.tar.gz"
         );
     }
 
@@ -564,12 +562,12 @@ mod tests {
         let asset_url = matching_release_asset_url(
             &[
                 release_asset(
-                    "croopor-linux-amd64-1.2.4.tar.gz",
-                    "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                    "axial-linux-amd64-1.2.4.tar.gz",
+                    "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-linux-amd64-1.2.4.tar.gz",
                 ),
                 release_asset(
-                    "croopor-windows-amd64-1.2.4.zip",
-                    "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-windows-amd64-1.2.4.zip",
+                    "axial-windows-amd64-1.2.4.zip",
+                    "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-windows-amd64-1.2.4.zip",
                 ),
             ],
             "1.2.4",
@@ -580,7 +578,7 @@ mod tests {
 
         assert_eq!(
             asset_url,
-            "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-windows-amd64-1.2.4.zip"
+            "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-windows-amd64-1.2.4.zip"
         );
     }
 
@@ -588,8 +586,8 @@ mod tests {
     fn asset_selection_rejects_missing_or_unsafe_assets() {
         let missing = matching_release_asset_url(
             &[release_asset(
-                "croopor-linux-amd64-1.2.3.tar.gz",
-                "https://github.com/mateoltd/croopor/releases/download/v1.2.3/croopor-linux-amd64-1.2.3.tar.gz",
+                "axial-linux-amd64-1.2.3.tar.gz",
+                "https://github.com/mateoltd/axial/releases/download/v1.2.3/axial-linux-amd64-1.2.3.tar.gz",
             )],
             "1.2.4",
             "linux",
@@ -599,8 +597,8 @@ mod tests {
 
         let unsafe_url = matching_release_asset_url(
             &[release_asset(
-                "croopor-linux-amd64-1.2.4.tar.gz",
-                "https://example.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                "axial-linux-amd64-1.2.4.tar.gz",
+                "https://example.com/mateoltd/axial/releases/download/v1.2.4/axial-linux-amd64-1.2.4.tar.gz",
             )],
             "1.2.4",
             "linux",
@@ -610,8 +608,8 @@ mod tests {
 
         let mismatched_filename = matching_release_asset_url(
             &[release_asset(
-                "croopor-linux-amd64-1.2.4.tar.gz",
-                "https://github.com/mateoltd/croopor/releases/download/v1.2.4/other.tar.gz",
+                "axial-linux-amd64-1.2.4.tar.gz",
+                "https://github.com/mateoltd/axial/releases/download/v1.2.4/other.tar.gz",
             )],
             "1.2.4",
             "linux",
@@ -621,8 +619,8 @@ mod tests {
 
         let mismatched_release_tag = matching_release_asset_url(
             &[release_asset(
-                "croopor-linux-amd64-1.2.4.tar.gz",
-                "https://github.com/mateoltd/croopor/releases/download/v1.2.5/croopor-linux-amd64-1.2.4.tar.gz",
+                "axial-linux-amd64-1.2.4.tar.gz",
+                "https://github.com/mateoltd/axial/releases/download/v1.2.5/axial-linux-amd64-1.2.4.tar.gz",
             )],
             "1.2.4",
             "linux",
@@ -632,8 +630,8 @@ mod tests {
 
         let unsupported_arch = matching_release_asset_url(
             &[release_asset(
-                "croopor-linux-amd64-1.2.4.tar.gz",
-                "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                "axial-linux-amd64-1.2.4.tar.gz",
+                "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-linux-amd64-1.2.4.tar.gz",
             )],
             "1.2.4",
             "linux",
@@ -649,10 +647,10 @@ mod tests {
             "2026-01-01T00:00:00Z",
             GithubLatestRelease {
                 tag_name: "v1.2.4".to_string(),
-                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: vec![release_asset(
-                    "croopor-linux-amd64-1.2.4.tar.gz",
-                    "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                    "axial-linux-amd64-1.2.4.tar.gz",
+                    "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-linux-amd64-1.2.4.tar.gz",
                 )],
             },
             "linux",
@@ -664,11 +662,11 @@ mod tests {
         assert_eq!(response.checksum_url, None);
         assert_eq!(
             response.notes_url,
-            "https://github.com/mateoltd/croopor/releases/tag/v1.2.4"
+            "https://github.com/mateoltd/axial/releases/tag/v1.2.4"
         );
         assert_eq!(
             response.action_url,
-            "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz"
+            "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-linux-amd64-1.2.4.tar.gz"
         );
     }
 
@@ -679,15 +677,15 @@ mod tests {
             "2026-01-01T00:00:00Z",
             GithubLatestRelease {
                 tag_name: "v1.2.4".to_string(),
-                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: vec![
                     release_asset(
-                        "croopor-windows-amd64-1.2.4.zip",
-                        "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-windows-amd64-1.2.4.zip",
+                        "axial-windows-amd64-1.2.4.zip",
+                        "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-windows-amd64-1.2.4.zip",
                     ),
                     release_asset(
-                        "croopor-windows-amd64-1.2.4.zip.sha256",
-                        "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-windows-amd64-1.2.4.zip.sha256",
+                        "axial-windows-amd64-1.2.4.zip.sha256",
+                        "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-windows-amd64-1.2.4.zip.sha256",
                     ),
                 ],
             },
@@ -699,7 +697,7 @@ mod tests {
         assert_eq!(
             response.checksum_url.as_deref(),
             Some(
-                "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-windows-amd64-1.2.4.zip.sha256"
+                "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-windows-amd64-1.2.4.zip.sha256"
             )
         );
     }
@@ -711,15 +709,15 @@ mod tests {
             "2026-01-01T00:00:00Z",
             GithubLatestRelease {
                 tag_name: "v1.2.4".to_string(),
-                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: vec![
                     release_asset(
-                        "croopor-linux-amd64-1.2.4.tar.gz",
-                        "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                        "axial-linux-amd64-1.2.4.tar.gz",
+                        "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-linux-amd64-1.2.4.tar.gz",
                     ),
                     release_asset(
-                        "croopor-linux-amd64-1.2.4.tar.gz.sha256",
-                        "https://example.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz.sha256",
+                        "axial-linux-amd64-1.2.4.tar.gz.sha256",
+                        "https://example.com/mateoltd/axial/releases/download/v1.2.4/axial-linux-amd64-1.2.4.tar.gz.sha256",
                     ),
                 ],
             },
@@ -734,15 +732,15 @@ mod tests {
             "2026-01-01T00:00:00Z",
             GithubLatestRelease {
                 tag_name: "v1.2.4".to_string(),
-                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: vec![
                     release_asset(
-                        "croopor-linux-amd64-1.2.4.tar.gz",
-                        "https://github.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                        "axial-linux-amd64-1.2.4.tar.gz",
+                        "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-linux-amd64-1.2.4.tar.gz",
                     ),
                     release_asset(
-                        "croopor-linux-amd64-1.2.4.tar.gz.sha256",
-                        "https://github.com/mateoltd/croopor/releases/download/v1.2.5/croopor-linux-amd64-1.2.4.tar.gz.sha256",
+                        "axial-linux-amd64-1.2.4.tar.gz.sha256",
+                        "https://github.com/mateoltd/axial/releases/download/v1.2.5/axial-linux-amd64-1.2.4.tar.gz.sha256",
                     ),
                 ],
             },
@@ -760,7 +758,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
             GithubLatestRelease {
                 tag_name: "v1.2.4".to_string(),
-                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: Vec::new(),
             },
             "linux",
@@ -775,10 +773,10 @@ mod tests {
             "2026-01-01T00:00:00Z",
             GithubLatestRelease {
                 tag_name: "v1.2.4".to_string(),
-                html_url: "https://github.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: vec![release_asset(
-                    "croopor-linux-amd64-1.2.4.tar.gz",
-                    "https://example.com/mateoltd/croopor/releases/download/v1.2.4/croopor-linux-amd64-1.2.4.tar.gz",
+                    "axial-linux-amd64-1.2.4.tar.gz",
+                    "https://example.com/mateoltd/axial/releases/download/v1.2.4/axial-linux-amd64-1.2.4.tar.gz",
                 )],
             },
             "linux",
@@ -796,7 +794,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
             Ok(GithubLatestRelease {
                 tag_name: "v1.2.4".to_string(),
-                html_url: "https://example.com/mateoltd/croopor/releases/tag/v1.2.4".to_string(),
+                html_url: "https://example.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: Vec::new(),
             }),
         )
@@ -841,7 +839,7 @@ mod tests {
         format!(
             r#"{{
                 "tag_name": "{tag}",
-                "html_url": "https://github.com/mateoltd/croopor/releases/tag/{tag}",
+                "html_url": "https://github.com/mateoltd/axial/releases/tag/{tag}",
                 "assets": []
             }}"#
         )

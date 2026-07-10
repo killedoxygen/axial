@@ -60,7 +60,7 @@ pub(super) fn promotion_backup_path(destination: &Path) -> PathBuf {
         .file_name()
         .unwrap_or_else(|| OsStr::new("artifact"))
         .to_os_string();
-    name.push(".croopor-backup-");
+    name.push(".axial-backup-");
     name.push(std::process::id().to_string());
     destination.with_file_name(name)
 }
@@ -84,5 +84,5 @@ fn promotion_backup_owner_is_live(system: &mut System, pid: u32) -> bool {
 
 fn promotion_backup_file_name_prefix(destination: &Path) -> Option<String> {
     let file_name = destination.file_name()?.to_string_lossy();
-    Some(format!("{file_name}.croopor-backup-"))
+    Some(format!("{file_name}.axial-backup-"))
 }

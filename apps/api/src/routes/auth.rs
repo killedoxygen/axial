@@ -51,16 +51,14 @@ mod tests {
             NewAuthLoginMsaToken, SessionStore,
         },
     };
+    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore, LAUNCH_AUTH_MODE_ONLINE};
+    use axial_performance::PerformanceManager;
     use axum::{
         body::{Body, Bytes, to_bytes},
         extract::State,
         http::{HeaderMap, Method, Request},
         routing::get,
     };
-    use croopor_config::{
-        AppConfig, AppPaths, ConfigStore, InstanceStore, LAUNCH_AUTH_MODE_ONLINE,
-    };
-    use croopor_performance::PerformanceManager;
     use serde_json::Value;
     use std::{fs, path::PathBuf, sync::Arc};
     use tokio::sync::mpsc;
@@ -179,7 +177,7 @@ mod tests {
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let state = AppState::new(AppStateInit {
-                app_name: "Croopor".to_string(),
+                app_name: "Axial".to_string(),
                 version: "test".to_string(),
                 config,
                 instances,
@@ -357,7 +355,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "croopor-api-auth-route-{name}-{}-{}",
+            "axial-api-auth-route-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

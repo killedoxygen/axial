@@ -10,7 +10,7 @@ const AUTH_SNAPSHOT_SCHEMA_VERSION: u8 = 2;
 const AUTH_SNAPSHOT_CHUNK_BYTES: usize = 900;
 const AUTH_SNAPSHOT_MAX_CHUNKS: usize = 128;
 #[cfg(not(test))]
-const AUTH_SNAPSHOT_SERVICE: &str = "croopor-auth";
+const AUTH_SNAPSHOT_SERVICE: &str = "axial-auth";
 #[cfg(not(test))]
 const AUTH_SNAPSHOT_PREVIOUS_USER: &str = "minecraft-auth";
 #[cfg(not(test))]
@@ -18,7 +18,7 @@ const AUTH_SNAPSHOT_CHUNK_INDEX_USER: &str = "minecraft-auth-v2-index";
 #[cfg(not(test))]
 const AUTH_SNAPSHOT_CHUNK_USER_PREFIX: &str = "minecraft-auth-v2";
 #[cfg(not(test))]
-const AUTH_SNAPSHOT_CHUNK_INDEX_SCHEMA: &str = "croopor.auth.snapshot.chunks";
+const AUTH_SNAPSHOT_CHUNK_INDEX_SCHEMA: &str = "axial.auth.snapshot.chunks";
 #[cfg(not(test))]
 const AUTH_SNAPSHOT_CHUNK_INDEX_VERSION: u8 = 1;
 #[cfg(not(test))]

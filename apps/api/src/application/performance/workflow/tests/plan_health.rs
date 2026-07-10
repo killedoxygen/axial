@@ -213,7 +213,7 @@ async fn plan_without_instance_id_stays_request_only() {
         .expect("remote manifest should refresh");
     assert_eq!(
         status.status.rule_source,
-        croopor_performance::RuleSource::Remote
+        axial_performance::RuleSource::Remote
     );
     assert!(status.guardian_facts.is_empty());
     let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
@@ -266,7 +266,7 @@ async fn plan_with_instance_id_uses_user_installed_iris_file_for_nvidium_exclusi
         .expect("remote manifest should refresh");
     assert_eq!(
         status.status.rule_source,
-        croopor_performance::RuleSource::Remote
+        axial_performance::RuleSource::Remote
     );
     assert!(status.guardian_facts.is_empty());
     let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
@@ -326,7 +326,7 @@ async fn health_custom_mode_ignores_corrupt_state_and_has_one_warnings_field() {
         .instances()
         .game_dir(&instance_id)
         .join("mods");
-    fs::write(mods_dir.join(".croopor-lock.json"), "{not json").expect("write corrupt state");
+    fs::write(mods_dir.join(".axial-lock.json"), "{not json").expect("write corrupt state");
 
     let Json(response) = handle_health(
         State(fixture.state.clone()),
@@ -363,7 +363,7 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
         .join("mods");
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed file");
-    croopor_performance::state::save_state(
+    axial_performance::state::save_state(
         &mods_dir,
         &test_composition_state(
             "core",
@@ -371,9 +371,9 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
                 project_id: "sodium".to_string(),
                 version_id: "version-a".to_string(),
                 filename: "managed.jar".to_string(),
-                ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
+                ownership_class: axial_performance::OwnershipClass::CompositionManaged,
                 source: test_modrinth_source(),
-                integrity: croopor_performance::ManagedArtifactIntegrity {
+                integrity: axial_performance::ManagedArtifactIntegrity {
                     sha512: valid_sha512(),
                     sha512_verified: true,
                 },
@@ -399,8 +399,8 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
             project_id: "sodium".to_string(),
             version_id: "version-a".to_string(),
             filename: "managed.jar".to_string(),
-            ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
-            source_provider: croopor_performance::ManagedArtifactProvider::Modrinth,
+            ownership_class: axial_performance::OwnershipClass::CompositionManaged,
+            source_provider: axial_performance::ManagedArtifactProvider::Modrinth,
             sha512_present: true,
             sha512_verified: true,
         }]
@@ -469,7 +469,7 @@ async fn health_response_bounds_public_composition_identifiers() {
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed file");
     let raw_composition_id = r"C:\Users\Alice\.minecraft\mods\secret.jar";
-    croopor_performance::state::save_state(
+    axial_performance::state::save_state(
         &mods_dir,
         &test_composition_state(
             raw_composition_id,
@@ -477,9 +477,9 @@ async fn health_response_bounds_public_composition_identifiers() {
                 project_id: "sodium".to_string(),
                 version_id: "version-a".to_string(),
                 filename: "managed.jar".to_string(),
-                ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
+                ownership_class: axial_performance::OwnershipClass::CompositionManaged,
                 source: test_modrinth_source(),
-                integrity: croopor_performance::ManagedArtifactIntegrity {
+                integrity: axial_performance::ManagedArtifactIntegrity {
                     sha512: valid_sha512(),
                     sha512_verified: true,
                 },
@@ -542,9 +542,9 @@ async fn health_response_exposes_degraded_and_fallback_guardian_view_models_and_
             project_id: "sodium".to_string(),
             version_id: "version-a".to_string(),
             filename: "managed.jar".to_string(),
-            ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
+            ownership_class: axial_performance::OwnershipClass::CompositionManaged,
             source: test_modrinth_source(),
-            integrity: croopor_performance::ManagedArtifactIntegrity {
+            integrity: axial_performance::ManagedArtifactIntegrity {
                 sha512: valid_sha512(),
                 sha512_verified: true,
             },
@@ -552,9 +552,9 @@ async fn health_response_exposes_degraded_and_fallback_guardian_view_models_and_
     );
     degraded_state.failure_count = 1;
     degraded_state.last_failure = "managed artifact install failed".to_string();
-    croopor_performance::state::save_state(&degraded_mods_dir, &degraded_state)
+    axial_performance::state::save_state(&degraded_mods_dir, &degraded_state)
         .expect("save degraded state");
-    croopor_performance::state::save_rollback_snapshot(&degraded_mods_dir, &degraded_state)
+    axial_performance::state::save_rollback_snapshot(&degraded_mods_dir, &degraded_state)
         .expect("save degraded rollback snapshot");
 
     let Json(degraded_response) = handle_health(
@@ -620,9 +620,9 @@ async fn health_response_exposes_degraded_and_fallback_guardian_view_models_and_
         failure_count: 0,
         last_failure: String::new(),
     };
-    croopor_performance::state::save_state(&fallback_mods_dir, &fallback_state)
+    axial_performance::state::save_state(&fallback_mods_dir, &fallback_state)
         .expect("save fallback state");
-    croopor_performance::state::save_rollback_snapshot(&fallback_mods_dir, &fallback_state)
+    axial_performance::state::save_rollback_snapshot(&fallback_mods_dir, &fallback_state)
         .expect("save fallback rollback snapshot");
 
     let Json(fallback_response) = handle_health(
@@ -674,12 +674,12 @@ async fn health_response_exposes_degraded_and_fallback_guardian_view_models_and_
 
 #[tokio::test]
 async fn health_plan_uses_user_installed_iris_file_for_nvidium_exclusion() {
-    let mut manifest = croopor_performance::builtin_manifest().expect("builtin manifest");
+    let mut manifest = axial_performance::builtin_manifest().expect("builtin manifest");
     manifest.generated_at = "2026-05-30T14:00:00Z".to_string();
     for composition in &mut manifest.compositions {
         for managed_mod in &mut composition.mods {
             if managed_mod.slug == "nvidium" {
-                managed_mod.condition = croopor_performance::types::ModCondition::Always;
+                managed_mod.condition = axial_performance::types::ModCondition::Always;
                 managed_mod.hardware_req = None;
             }
         }
@@ -700,7 +700,7 @@ async fn health_plan_uses_user_installed_iris_file_for_nvidium_exclusion() {
         .expect("remote manifest should refresh");
     assert_eq!(
         status.status.rule_source,
-        croopor_performance::RuleSource::Remote
+        axial_performance::RuleSource::Remote
     );
     assert!(status.guardian_facts.is_empty());
     let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
@@ -759,7 +759,7 @@ async fn health_invalidates_user_managed_artifact_in_tracked_state() {
         .join("mods");
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(
-        mods_dir.join(".croopor-lock.json"),
+        mods_dir.join(".axial-lock.json"),
         serde_json::to_vec(&serde_json::json!({
             "composition_id": "core",
             "tier": "core",

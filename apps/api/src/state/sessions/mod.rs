@@ -7,7 +7,7 @@ use crate::execution::process::{
     ProcessStopIntent, ProcessStopRequest, observe_process, process_killed, process_session_target,
     process_stage_evidence, process_stop_requested,
 };
-use croopor_launcher::{
+use axial_launcher::{
     LaunchEvent, LaunchFailure, LaunchFailureClass, LaunchLogEvent, LaunchNotice,
     LaunchPriorityEvidence, LaunchSessionOutcomeKind, LaunchSessionRecord, LaunchStageEvidence,
     LaunchStageRecord, LaunchState, LaunchStatusEvent, classify_startup_failure_text,
@@ -1004,7 +1004,7 @@ impl Default for SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use croopor_launcher::{LaunchSessionExitReason, LaunchStageEvidence, SessionId};
+    use axial_launcher::{LaunchSessionExitReason, LaunchStageEvidence, SessionId};
     use serde_json::json;
     use std::sync::Arc;
     use tokio::process::Command;
@@ -1523,7 +1523,7 @@ mod tests {
 
         let mut command = Command::new("sh");
         command.arg("-c").arg(
-            "printf '%s\\n' \"Unrecognized VM option '-XX:+UseZGC' /home/alice/.croopor/secret\" >&2; sleep 0.2; exit 1",
+            "printf '%s\\n' \"Unrecognized VM option '-XX:+UseZGC' /home/alice/.axial/secret\" >&2; sleep 0.2; exit 1",
         );
 
         store
@@ -1906,7 +1906,7 @@ mod tests {
         );
         assert_eq!(
             preboot_status.notice.as_ref().map(|notice| notice.tone),
-            Some(croopor_launcher::LaunchNoticeTone::Error)
+            Some(axial_launcher::LaunchNoticeTone::Error)
         );
         assert_eq!(
             preboot_status
@@ -2037,7 +2037,7 @@ mod tests {
         );
         assert_eq!(
             unknown_status.notice.as_ref().map(|notice| notice.tone),
-            Some(croopor_launcher::LaunchNoticeTone::Error)
+            Some(axial_launcher::LaunchNoticeTone::Error)
         );
     }
 

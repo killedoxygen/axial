@@ -11,11 +11,11 @@ use crate::{
         AuthLoginMinecraftCape, AuthLoginMinecraftProfile, AuthLoginMinecraftSkin, AuthLoginStore,
     },
 };
-use axum::{Json, http::StatusCode};
-use croopor_config::{
+use axial_config::{
     AppConfig, LAUNCH_AUTH_MODE_OFFLINE, LAUNCH_AUTH_MODE_ONLINE, validate_username,
 };
-use croopor_minecraft::offline_uuid;
+use axial_minecraft::offline_uuid;
+use axum::{Json, http::StatusCode};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -696,7 +696,7 @@ fn auth_refresh_error_response(error: AuthRefreshFailure) -> (StatusCode, Json<s
         AuthRefreshFailureKind::MicrosoftClientBuild => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
-                "error": "Could not start Microsoft sign-in. Restart Croopor and try again.",
+                "error": "Could not start Microsoft sign-in. Restart Axial and try again.",
             })),
         ),
         AuthRefreshFailureKind::MicrosoftRequest => (
@@ -759,7 +759,7 @@ fn auth_clear_failed_response() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({
-            "error": "Could not clear Microsoft sign-in. Restart Croopor and try again.",
+            "error": "Could not clear Microsoft sign-in. Restart Axial and try again.",
             "status": "auth_clear_failed",
         })),
     )
@@ -769,7 +769,7 @@ fn auth_logout_cleanup_failed_response() -> (StatusCode, Json<serde_json::Value>
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({
-            "error": "Could not finish logout. Restart Croopor and try again.",
+            "error": "Could not finish logout. Restart Axial and try again.",
             "status": "logout_cleanup_failed",
         })),
     )
@@ -956,9 +956,9 @@ mod tests {
         AppStateInit, AuthLoginMsaToken, InstallStore, NewAuthLoginMinecraftAccount,
         NewAuthLoginMsaToken, SessionStore,
     };
+    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+    use axial_performance::PerformanceManager;
     use axum::{body::Bytes, extract::State, http::HeaderMap, routing::get};
-    use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
-    use croopor_performance::PerformanceManager;
     use std::{fs, path::PathBuf, sync::Arc};
     use tokio::sync::mpsc;
 
@@ -1052,7 +1052,7 @@ mod tests {
             (
                 AuthRefreshFailureKind::MicrosoftClientBuild,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not start Microsoft sign-in. Restart Croopor and try again.",
+                "Could not start Microsoft sign-in. Restart Axial and try again.",
             ),
             (
                 AuthRefreshFailureKind::MicrosoftRequest,
@@ -1568,7 +1568,7 @@ mod tests {
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let state = AppState::new(AppStateInit {
-                app_name: "Croopor".to_string(),
+                app_name: "Axial".to_string(),
                 version: "test".to_string(),
                 config,
                 instances,
@@ -1603,7 +1603,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "croopor-api-auth-{name}-{}-{}",
+            "axial-api-auth-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -1185,7 +1185,7 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         std::env::temp_dir().join(format!(
-            "croopor-download-{prefix}-{}-{nanos:x}",
+            "axial-download-{prefix}-{}-{nanos:x}",
             std::process::id()
         ))
     }

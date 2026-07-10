@@ -7,7 +7,7 @@ use crate::guardian::{GuardianMode, LaunchGuardianContext};
 use crate::jvm::{boot_throttle_args, gc_preset_args, recommended_preset};
 use crate::runtime::RuntimeSelection;
 use crate::types::LaunchFailureClass;
-use croopor_minecraft::{
+use axial_minecraft::{
     JavaRuntimeInfo, JavaVersion, RuntimeEnsureEvent, ensure_runtime_with_events, resolve_version,
 };
 use std::time::Instant;
@@ -261,7 +261,7 @@ fn launch_preparation_event_for_runtime_event(event: RuntimeEnsureEvent) -> Laun
 
 fn launch_target_version_id<'a>(
     intent: &'a LaunchIntent,
-    version: &'a croopor_minecraft::VersionJson,
+    version: &'a axial_minecraft::VersionJson,
 ) -> &'a str {
     let explicit = intent.target_version_id.trim();
     if !explicit.is_empty() {
@@ -288,7 +288,7 @@ fn launch_auth_mode_for_context(intent: &LaunchIntent) -> &'static str {
 
 fn runtime_selection_from_ensure(
     requested_java: &str,
-    ensured: croopor_minecraft::RuntimeEnsureResult,
+    ensured: axial_minecraft::RuntimeEnsureResult,
 ) -> RuntimeSelection {
     let selected = ensured
         .requested
@@ -347,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_representative_fabric_launch_plans_without_spawning_java() {
-        let root = unique_temp_root("croopor-prepare-fabric-gate");
+        let root = unique_temp_root("axial-prepare-fabric-gate");
         let library_dir = root.join("library");
         let instance_root = root.join("instances");
         let fake_java = write_fake_java(&root);
@@ -394,7 +394,7 @@ mod tests {
                 max_memory_mb: 6144,
                 min_memory_mb: 1024,
                 resolution: None,
-                launcher_name: "croopor".to_string(),
+                launcher_name: "axial".to_string(),
                 launcher_version: "test".to_string(),
                 game_dir: Some(game_dir.clone()),
                 guardian: LaunchGuardianContext {
@@ -474,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_launch_attempt_uses_offline_auth_context_from_intent_username() {
-        let root = unique_temp_root("croopor-prepare-auth-test");
+        let root = unique_temp_root("axial-prepare-auth-test");
         let library_dir = root.join("library");
         let game_dir = root.join("instances").join("auth-test");
         let fake_java = write_fake_java(&root);
@@ -528,7 +528,7 @@ mod tests {
             max_memory_mb: 2048,
             min_memory_mb: 512,
             resolution: None,
-            launcher_name: "croopor".to_string(),
+            launcher_name: "axial".to_string(),
             launcher_version: "test".to_string(),
             game_dir: Some(game_dir),
             guardian: LaunchGuardianContext {
@@ -546,7 +546,7 @@ mod tests {
         assert_arg_value(
             &prepared.plan.game_args,
             "--uuid",
-            &croopor_minecraft::offline_uuid("Player"),
+            &axial_minecraft::offline_uuid("Player"),
         );
         assert_arg_value(&prepared.plan.game_args, "--accessToken", "0");
         assert_arg_value(&prepared.plan.game_args, "--userType", "msa");
@@ -556,7 +556,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_explicit_unsupported_named_preset_is_preserved_for_guardian_startup_handling() {
-        let root = unique_temp_root("croopor-prepare-custom-preset-block-test");
+        let root = unique_temp_root("axial-prepare-custom-preset-block-test");
         let library_dir = root.join("library");
         let game_dir = root.join("instances").join("custom-preset-block-test");
         let fake_java = write_fake_openj9_java(&root);
@@ -601,7 +601,7 @@ mod tests {
             max_memory_mb: 2048,
             min_memory_mb: 512,
             resolution: None,
-            launcher_name: "croopor".to_string(),
+            launcher_name: "axial".to_string(),
             launcher_version: "test".to_string(),
             game_dir: Some(game_dir),
             guardian: LaunchGuardianContext {
@@ -632,7 +632,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_launch_attempt_uses_explicit_online_auth_context() {
-        let root = unique_temp_root("croopor-prepare-online-auth-test");
+        let root = unique_temp_root("axial-prepare-online-auth-test");
         let library_dir = root.join("library");
         let game_dir = root.join("instances").join("online-auth-test");
         let fake_java = write_fake_java(&root);
@@ -693,7 +693,7 @@ mod tests {
             max_memory_mb: 2048,
             min_memory_mb: 512,
             resolution: None,
-            launcher_name: "croopor".to_string(),
+            launcher_name: "axial".to_string(),
             launcher_version: "test".to_string(),
             game_dir: Some(game_dir),
             guardian: LaunchGuardianContext {
@@ -725,7 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_launch_attempt_with_events_observes_staged_preparation() {
-        let root = unique_temp_root("croopor-prepare-runtime-event-test");
+        let root = unique_temp_root("axial-prepare-runtime-event-test");
         let library_dir = root.join("library");
         let game_dir = root.join("instances").join("runtime-event-test");
         let fake_java = write_fake_java(&root);
@@ -770,7 +770,7 @@ mod tests {
             max_memory_mb: 2048,
             min_memory_mb: 512,
             resolution: None,
-            launcher_name: "croopor".to_string(),
+            launcher_name: "axial".to_string(),
             launcher_version: "test".to_string(),
             game_dir: Some(game_dir),
             guardian: LaunchGuardianContext {

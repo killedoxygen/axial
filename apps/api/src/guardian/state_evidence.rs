@@ -71,7 +71,7 @@ mod tests {
         assert_eq!(outcome.user_outcome.phase, OperationPhase::Startup);
         assert_eq!(
             outcome.user_outcome.summary,
-            "Guardian kept Croopor running after persisted operation state could not be trusted."
+            "Guardian kept Axial running after persisted operation state could not be trusted."
         );
     }
 }

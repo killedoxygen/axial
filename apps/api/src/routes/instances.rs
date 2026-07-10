@@ -8,6 +8,7 @@ use crate::{
     },
     state::AppState,
 };
+use axial_config::EnrichedInstance;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -15,7 +16,6 @@ use axum::{
     response::Response,
     routing::{get, post, put},
 };
-use croopor_config::EnrichedInstance;
 use std::collections::HashMap;
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -301,12 +301,12 @@ async fn handle_delete_instance(
 mod tests {
     use super::*;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
+    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_performance::PerformanceManager;
     use axum::{
         body::{Body, to_bytes},
         http::{Method, Request, header},
     };
-    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-    use croopor_performance::PerformanceManager;
     use serde_json::{Value, json};
     use std::{
         fs,
@@ -444,7 +444,7 @@ mod tests {
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let state = AppState::new(AppStateInit {
-                app_name: "Croopor".to_string(),
+                app_name: "Axial".to_string(),
                 version: "test".to_string(),
                 config,
                 instances,
@@ -493,7 +493,7 @@ mod tests {
     }
 
     fn write_route_version_manifest_cache(library_dir: &FsPath, version_ids: &[&str]) {
-        let cache_path = croopor_minecraft::version_manifest_cache_path(library_dir);
+        let cache_path = axial_minecraft::version_manifest_cache_path(library_dir);
         fs::create_dir_all(cache_path.parent().expect("version manifest cache parent"))
             .expect("create version manifest cache dir");
         let versions = version_ids
@@ -533,7 +533,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "croopor-api-instance-route-{name}-{}-{}",
+            "axial-api-instance-route-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

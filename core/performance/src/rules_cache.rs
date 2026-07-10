@@ -710,7 +710,7 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "croopor-performance-rules-cache-{name}-{}-{nonce}",
+            "axial-performance-rules-cache-{name}-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("create test root");

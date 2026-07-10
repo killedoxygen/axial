@@ -145,7 +145,7 @@ export function LogsPane({
           <div class="cp-logview-body">
             {selectedIsCompressedArchive && (
               <div class="cp-logview-note">
-                This is a compressed log archive. Croopor cannot preview .log.gz files here; use Open folder to extract
+                This is a compressed log archive. Axial cannot preview .log.gz files here; use Open folder to extract
                 it, or select an uncompressed .log file.
               </div>
             )}

@@ -467,7 +467,7 @@ fn detail_for_diagnosis(
             Some("Managed Java runtime is missing and can be prepared before launch.")
         }
         "launch_memory_min_clamped" => Some(
-            "Minimum memory was higher than maximum memory, so Croopor clamped the launch minimum to match the maximum allocation.",
+            "Minimum memory was higher than maximum memory, so Axial clamped the launch minimum to match the maximum allocation.",
         ),
         "launch_memory_allocation_low" => {
             Some("Launch memory allocation is very low for Minecraft.")
@@ -573,7 +573,7 @@ fn guidance_for_diagnosis(
             Some("Install or repair the affected version before launching again.")
         }
         "managed_runtime_missing" => {
-            Some("Let Croopor prepare the managed Java runtime before launching.")
+            Some("Let Axial prepare the managed Java runtime before launching.")
         }
         "launch_memory_min_clamped" => Some(
             "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.",
@@ -596,7 +596,7 @@ fn guidance_for_diagnosis(
         "custom_java_override_present"
         | "custom_jvm_preset_present"
         | "custom_jvm_args_present" => {
-            Some("Switch Guardian back to Managed if you want Croopor to adjust unsafe choices.")
+            Some("Switch Guardian back to Managed if you want Axial to adjust unsafe choices.")
         }
         _ => None,
     }

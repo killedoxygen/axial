@@ -1,5 +1,5 @@
-use croopor_config::{AppPaths, validate_username};
-use croopor_minecraft::offline_uuid;
+use axial_config::{AppPaths, validate_username};
+use axial_minecraft::offline_uuid;
 use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
@@ -7,7 +7,7 @@ use std::{
     sync::Mutex,
 };
 
-const ACCOUNT_STORE_SCHEMA: &str = "croopor.accounts";
+const ACCOUNT_STORE_SCHEMA: &str = "axial.accounts";
 const ACCOUNT_STORE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -651,7 +651,7 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "croopor-account-store-{name}-{}-{nonce}",
+            "axial-account-store-{name}-{}-{nonce}",
             std::process::id()
         ))
     }

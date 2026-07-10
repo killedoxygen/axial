@@ -1,5 +1,5 @@
 [package]
-name = "croopor-api"
+name = "axial-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -31,10 +31,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
-croopor-config = { path = "../../core/config" }
-croopor-launcher = { path = "../../core/launcher" }
-croopor-minecraft = { path = "../../core/minecraft" }
-croopor-performance = { path = "../../core/performance" }
+axial-config = { path = "../../core/config" }
+axial-launcher = { path = "../../core/launcher" }
+axial-minecraft = { path = "../../core/minecraft" }
+axial-performance = { path = "../../core/performance" }
 
 [dev-dependencies]
 ed25519-dalek.workspace = true

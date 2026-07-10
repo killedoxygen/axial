@@ -6,16 +6,16 @@ use crate::application::performance::{
     benchmark_suite_run_id, family_c_qualification_payload, family_c_qualification_preview_payload,
 };
 use crate::state::{AppStateInit, InstallStore, SessionStore};
+use axial_config::{AppConfig, AppPaths, ConfigStore, Instance, InstanceStore};
+use axial_launcher::{
+    GuardianDecision, GuardianMode, GuardianSummary, LaunchAuthContext, LaunchGuardianContext,
+    LaunchIntent, LaunchSessionRecord, LaunchStageRecord, LaunchState, SessionId,
+};
+use axial_performance::PerformanceManager;
 use axum::{
     body::{Body, to_bytes},
     http::Request,
 };
-use croopor_config::{AppConfig, AppPaths, ConfigStore, Instance, InstanceStore};
-use croopor_launcher::{
-    GuardianDecision, GuardianMode, GuardianSummary, LaunchAuthContext, LaunchGuardianContext,
-    LaunchIntent, LaunchSessionRecord, LaunchStageRecord, LaunchState, SessionId,
-};
-use croopor_performance::PerformanceManager;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -126,7 +126,7 @@ fn launch_request_error_status_keeps_non_guardian_blocked_errors_internal() {
 #[test]
 fn launch_request_error_response_sanitizes_public_error_payload() {
     let response = launch_request_error_response(launch_app::LaunchRequestError {
-            message: "prepare failed for /home/alice/.croopor --accessToken raw-secret-token -Xmx8192M -Dtoken=raw provider_payload=provider-secret account_id=account-secret username=SecretPlayer\njava.exe C:\\Users\\Alice\\AppData"
+            message: "prepare failed for /home/alice/.axial --accessToken raw-secret-token -Xmx8192M -Dtoken=raw provider_payload=provider-secret account_id=account-secret username=SecretPlayer\njava.exe C:\\Users\\Alice\\AppData"
                 .to_string(),
             healing: None,
             guardian: None,
@@ -161,7 +161,7 @@ fn launch_request_error_response_sanitizes_public_error_payload() {
 fn launch_kill_not_found_error_response_uses_session_not_found() {
     let response = launch_kill_error_response(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "failed to kill process 4242 at /home/alice/.croopor/secret",
+        "failed to kill process 4242 at /home/alice/.axial/secret",
     ));
 
     assert_eq!(response.0, StatusCode::NOT_FOUND);
@@ -205,7 +205,7 @@ fn benchmark_suite_storage_error_response_hides_raw_io_details() {
     let data = serde_json::to_string(&response.1.0).expect("serialize public error");
     for fragment in [
         "/home/alice",
-        ".croopor",
+        ".axial",
         "C:\\Users\\Alice",
         "AppData",
         "Permission denied",
@@ -2969,7 +2969,7 @@ fn benchmark_status_payload_uses_sanitized_active_status_shape() {
 
 fn sensitive_launch_proof_record() -> crate::state::launch_reports::LaunchProofRecord {
     crate::state::launch_reports::LaunchProofRecord {
-            schema: "croopor.launch.proof".to_string(),
+            schema: "axial.launch.proof".to_string(),
             schema_version: 1,
             session_id: "sensitive-proof".to_string(),
             instance_id: "instance-safe".to_string(),
@@ -3020,7 +3020,7 @@ fn sensitive_launch_proof_record() -> crate::state::launch_reports::LaunchProofR
                     "Suspicious eyJheader123456789.eyJpayload123456789.signature123456789"
                 ],
                 "guidance": [
-                    "Switch Guardian back to Managed if you want Croopor to adjust unsafe choices.",
+                    "Switch Guardian back to Managed if you want Axial to adjust unsafe choices.",
                     "provider_payload={\"token\":\"provider-secret\"}"
                 ],
                 "interventions": [
@@ -3213,7 +3213,7 @@ impl RouteTestFixture {
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         let state = AppState::new(AppStateInit {
-            app_name: "Croopor".to_string(),
+            app_name: "Axial".to_string(),
             version: "test".to_string(),
             config,
             instances,
@@ -3308,7 +3308,7 @@ impl RouteTestFixture {
             .id
     }
 
-    fn update_instance(&self, id: &str, update: impl FnOnce(&mut croopor_config::Instance)) {
+    fn update_instance(&self, id: &str, update: impl FnOnce(&mut axial_config::Instance)) {
         let mut instance = self.state.instances().get(id).expect("instance");
         update(&mut instance);
         self.state
@@ -3406,7 +3406,7 @@ fn test_root(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("time should be after epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("croopor-launch-{name}-{nanos}"))
+    std::env::temp_dir().join(format!("axial-launch-{name}-{nanos}"))
 }
 
 fn test_paths(root: &Path) -> AppPaths {
@@ -3502,7 +3502,7 @@ fn write_family_c_proof_record(
 
 fn write_family_c_managed_state(fixture: &RouteTestFixture, instance_id: &str) {
     let mods_dir = fixture.state.instances().game_dir(instance_id).join("mods");
-    croopor_performance::save_state(&mods_dir, &family_c_managed_state())
+    axial_performance::save_state(&mods_dir, &family_c_managed_state())
         .expect("write family c managed state");
 }
 
@@ -3510,16 +3510,16 @@ fn write_invalid_family_c_managed_state(fixture: &RouteTestFixture, instance_id:
     let mods_dir = fixture.state.instances().game_dir(instance_id).join("mods");
     std::fs::create_dir_all(&mods_dir).expect("create mods dir");
     std::fs::write(
-        croopor_performance::state::lock_file_path(&mods_dir),
+        axial_performance::state::lock_file_path(&mods_dir),
         "{ invalid",
     )
     .expect("write invalid managed state");
 }
 
-fn family_c_managed_state() -> croopor_performance::CompositionState {
-    croopor_performance::CompositionState {
+fn family_c_managed_state() -> axial_performance::CompositionState {
+    axial_performance::CompositionState {
         composition_id: FAMILY_C_MANAGED_COMPOSITION_ID.to_string(),
-        tier: croopor_performance::CompositionTier::Core,
+        tier: axial_performance::CompositionTier::Core,
         installed_mods: vec![
             family_c_installed_mod("jupr7Bf5", "foamfix.jar"),
             family_c_installed_mod("DSVgwcji", "ai-improvements.jar"),
@@ -3531,16 +3531,16 @@ fn family_c_managed_state() -> croopor_performance::CompositionState {
     }
 }
 
-fn family_c_installed_mod(project_id: &str, filename: &str) -> croopor_performance::InstalledMod {
-    croopor_performance::InstalledMod {
+fn family_c_installed_mod(project_id: &str, filename: &str) -> axial_performance::InstalledMod {
+    axial_performance::InstalledMod {
         project_id: project_id.to_string(),
         version_id: format!("{project_id}-version"),
         filename: filename.to_string(),
-        ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
-        source: croopor_performance::ManagedArtifactSource {
-            provider: croopor_performance::ManagedArtifactProvider::Modrinth,
+        ownership_class: axial_performance::OwnershipClass::CompositionManaged,
+        source: axial_performance::ManagedArtifactSource {
+            provider: axial_performance::ManagedArtifactProvider::Modrinth,
         },
-        integrity: croopor_performance::ManagedArtifactIntegrity {
+        integrity: axial_performance::ManagedArtifactIntegrity {
             sha512: "a".repeat(128),
             sha512_verified: true,
         },
@@ -3574,7 +3574,7 @@ fn family_c_proof_record(
     };
 
     crate::state::launch_reports::LaunchProofRecord {
-        schema: "croopor.launch.proof".to_string(),
+        schema: "axial.launch.proof".to_string(),
         schema_version: 1,
         session_id,
         instance_id: instance_id.to_string(),
@@ -3654,7 +3654,7 @@ fn test_manifest(
     runs: Vec<crate::state::benchmark_suites::BenchmarkSuiteManifestRun>,
 ) -> crate::state::benchmark_suites::BenchmarkSuiteManifest {
     crate::state::benchmark_suites::BenchmarkSuiteManifest {
-        schema: "croopor.launch.benchmark.suite".to_string(),
+        schema: "axial.launch.benchmark.suite".to_string(),
         schema_version: 2,
         suite_id: "suite-test".to_string(),
         instance_id: "instance".to_string(),
@@ -3689,8 +3689,8 @@ fn launch_request_error(decision: Option<GuardianDecision>) -> launch_app::Launc
     launch_app::LaunchRequestError {
         message: "launch rejected".to_string(),
         healing: None,
-        guardian: decision.map(|decision| croopor_launcher::GuardianSummary {
-            mode: croopor_launcher::GuardianMode::Managed,
+        guardian: decision.map(|decision| axial_launcher::GuardianSummary {
+            mode: axial_launcher::GuardianMode::Managed,
             decision,
             message: None,
             details: Vec::new(),
@@ -3703,14 +3703,14 @@ fn launch_request_error(decision: Option<GuardianDecision>) -> launch_app::Launc
 fn raw_launch_control_io_error() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
-        "failed to kill process 4242 while reading /home/alice/.croopor/launch-reports/sensitive-proof.json from C:\\Users\\Alice\\AppData\\Roaming\\Croopor\\launch-reports\\secret-report.json: Permission denied (os error 13)",
+        "failed to kill process 4242 while reading /home/alice/.axial/launch-reports/sensitive-proof.json from C:\\Users\\Alice\\AppData\\Roaming\\Axial\\launch-reports\\secret-report.json: Permission denied (os error 13)",
     )
 }
 
 fn raw_benchmark_suite_storage_io_error() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
-        "failed to load benchmark suite manifest family-c-1-12-2 from /home/alice/.croopor/benchmark-suites/family-c-1-12-2.json and C:\\Users\\Alice\\AppData\\Roaming\\Croopor\\benchmark-suites\\suite-release_validation-00-family_c_forge.json: Permission denied (os error 13)",
+        "failed to load benchmark suite manifest family-c-1-12-2 from /home/alice/.axial/benchmark-suites/family-c-1-12-2.json and C:\\Users\\Alice\\AppData\\Roaming\\Axial\\benchmark-suites\\suite-release_validation-00-family_c_forge.json: Permission denied (os error 13)",
     )
 }
 
@@ -3727,7 +3727,7 @@ fn assert_public_error_excludes_raw_launch_control_fragments(
     let data = serde_json::to_string(&response.1.0).expect("serialize public error");
     for fragment in [
         "/home/alice",
-        ".croopor",
+        ".axial",
         "C:\\Users\\Alice",
         "AppData",
         "failed to kill",
@@ -3812,7 +3812,7 @@ fn test_launch_session_task() -> launch_app::LaunchSessionTask {
         config: AppConfig::default(),
         intent: LaunchIntent {
             session_id: "session-queued".to_string(),
-            library_dir: PathBuf::from("/tmp/croopor-test-library"),
+            library_dir: PathBuf::from("/tmp/axial-test-library"),
             instance_id: "instance-queued".to_string(),
             version_id: "1.21.1".to_string(),
             target_version_id: "1.21.1".to_string(),
@@ -3826,7 +3826,7 @@ fn test_launch_session_task() -> launch_app::LaunchSessionTask {
             max_memory_mb: 6144,
             min_memory_mb: 1024,
             resolution: None,
-            launcher_name: "croopor".to_string(),
+            launcher_name: "axial".to_string(),
             launcher_version: "test".to_string(),
             game_dir: None,
             guardian: LaunchGuardianContext::default(),

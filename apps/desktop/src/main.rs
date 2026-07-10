@@ -3,16 +3,16 @@ mod discord_presence;
 mod events;
 mod state;
 
-use croopor_api::app::{
+use axial_api::app::{
     spawn_background, spawn_benchmark_suite_drivers_resume, spawn_performance_operations_resume,
     spawn_performance_rules_refresh, spawn_remote_flags_refresh, spawn_telemetry_export,
 };
-use croopor_api::observability::telemetry::{
+use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
 };
-use croopor_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
-use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-use croopor_performance::PerformanceManager;
+use axial_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
+use axial_config::{AppPaths, ConfigStore, InstanceStore};
+use axial_performance::PerformanceManager;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, WindowEvent};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
@@ -42,7 +42,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let sessions = Arc::new(SessionStore::new());
     let performance = Arc::new(PerformanceManager::new_with_config_dir(&paths.config_dir)?);
     let state = AppState::new(AppStateInit {
-        app_name: "Croopor".to_string(),
+        app_name: "Axial".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         config,
         instances,
@@ -50,7 +50,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         sessions,
         performance,
         startup_warnings,
-        frontend_dir: croopor_api::app::default_frontend_dir(),
+        frontend_dir: axial_api::app::default_frontend_dir(),
     });
     let telemetry = state.telemetry().clone();
     let discord_presence = discord_presence::spawn(state.clone());

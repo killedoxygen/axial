@@ -30,18 +30,18 @@ use crate::guardian::{
 use crate::observability::telemetry::TelemetryEvent;
 use crate::state::AppState;
 use crate::state::contracts::{CommandKind, OperationId, OperationStatus};
-use axum::{Json, http::StatusCode};
-use croopor_config::{EnrichedInstance, Instance};
-use croopor_launcher::{
+use axial_config::{EnrichedInstance, Instance};
+use axial_launcher::{
     GuardianMode, LaunchReadinessReasonId, LaunchReadinessRequest, LaunchReadinessSeverity,
     inspect_launch_readiness,
 };
-use croopor_minecraft::{
+use axial_minecraft::{
     LifecycleChannel, LifecycleMeta, LoaderAvailability, LoaderBuildRecord, LoaderCatalogState,
     LoaderComponentId, LoaderInstallability, MinecraftVersionMeta, VersionEntry,
     analyze_minecraft_version, fetch_builds, fetch_components, fetch_supported_versions,
     fetch_version_manifest_cached, manifest_release_references, parse_build_id,
 };
+use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -338,7 +338,7 @@ fn create_optimize_option() -> CreateOptimizeOptionViewModel {
     CreateOptimizeOptionViewModel {
         id: "auto_optimize".to_string(),
         label: "Auto-optimize".to_string(),
-        detail: "Croopor tunes this instance's performance while you play.".to_string(),
+        detail: "Axial tunes this instance's performance while you play.".to_string(),
         default_enabled: true,
     }
 }
@@ -416,7 +416,7 @@ pub(crate) async fn handle_create_loader_builds_view(
             ),
             label: "Automatic".to_string(),
             detail: format!(
-                "Croopor picks the newest stable {} build.",
+                "Axial picks the newest stable {} build.",
                 component_id.display_name()
             ),
         },
@@ -1466,7 +1466,7 @@ fn bad_create_request(message: &'static str) -> (StatusCode, Json<serde_json::Va
 fn library_not_configured_response() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::PRECONDITION_FAILED,
-        Json(serde_json::json!({ "error": "Croopor library is not configured" })),
+        Json(serde_json::json!({ "error": "Axial library is not configured" })),
     )
 }
 
@@ -1531,7 +1531,7 @@ mod tests {
         super::super::create_cache::reset_create_view_cache_for_tests();
         let component_id = LoaderComponentId::Fabric;
         let library_dir = std::env::temp_dir().join(format!(
-            "croopor-create-source-cache-stale-{}",
+            "axial-create-source-cache-stale-{}",
             std::process::id()
         ));
         let source_id = component_id.as_str();

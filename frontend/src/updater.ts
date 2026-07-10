@@ -116,7 +116,7 @@ export async function restartDesktopApp(): Promise<void> {
   try {
     const requested = await requestNativeAppRestart();
     if (!requested) throw new Error('desktop runtime unavailable');
-    toast('Restarting Croopor');
+    toast('Restarting Axial');
   } catch (err: unknown) {
     toast(`Failed to restart: ${errMessage(err)}`, 'error');
   }

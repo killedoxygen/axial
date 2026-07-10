@@ -4,11 +4,11 @@ use crate::application::{
 use crate::state::{
     ActiveMinecraftAccountState, AppState, LauncherAccountKind, LauncherAccountRecord,
 };
-use axum::{Json, http::StatusCode};
-use croopor_config::{AppConfig, LAUNCH_AUTH_MODE_ONLINE, validate_username};
-use croopor_launcher::{
+use axial_config::{AppConfig, LAUNCH_AUTH_MODE_ONLINE, validate_username};
+use axial_launcher::{
     LaunchAuthContext, LaunchFailureClass, LaunchNotice, LaunchNoticeTone, failure_class_name,
 };
+use axum::{Json, http::StatusCode};
 use serde_json::json;
 
 #[derive(Clone, Copy)]
@@ -240,20 +240,20 @@ fn online_auth_launch_notice(refresh: Option<(&'static str, &'static str)>) -> L
     let first_detail = if sign_in_required {
         match reason {
             "refresh_token_missing" => {
-                "Croopor could not refresh the Microsoft session because the saved sign-in is missing or expired."
+                "Axial could not refresh the Microsoft session because the saved sign-in is missing or expired."
             }
             "refresh_token_rejected" => "Microsoft rejected the saved sign-in session.",
-            "refresh_state_unavailable" => "Croopor could not read the saved sign-in session.",
-            _ => "Croopor could not use the saved Microsoft session for Online launch.",
+            "refresh_state_unavailable" => "Axial could not read the saved sign-in session.",
+            _ => "Axial could not use the saved Microsoft session for Online launch.",
         }
     } else {
         match reason {
             "auth_chain_failed" => {
-                "Croopor refreshed Microsoft sign-in, but Minecraft account verification did not complete."
+                "Axial refreshed Microsoft sign-in, but Minecraft account verification did not complete."
             }
             "client_id_missing" => "Microsoft sign-in is not configured for this build.",
             "client_build" | "token_client_unavailable" => {
-                "Croopor could not start Microsoft sign-in refresh."
+                "Axial could not start Microsoft sign-in refresh."
             }
             "oauth_refresh_failed"
             | "token_endpoint_unreachable"
@@ -265,7 +265,7 @@ fn online_auth_launch_notice(refresh: Option<(&'static str, &'static str)>) -> L
             "refreshed_account_unusable" => {
                 "The refreshed account could not be used for a verified Minecraft Java launch."
             }
-            _ => "Croopor could not verify the Microsoft account for Online launch.",
+            _ => "Axial could not verify the Microsoft account for Online launch.",
         }
     };
     let second_detail = if sign_in_required {

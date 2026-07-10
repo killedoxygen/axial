@@ -66,7 +66,7 @@ pub(super) async fn install_managed_runtime_from_manifest_url(
     async_fs::create_dir_all(runtime_filesystem_path(&temp_dir).as_ref())
         .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
-    let installing_marker = temp_dir.join(".croopor-installing");
+    let installing_marker = temp_dir.join(".axial-installing");
     async_fs::write(
         runtime_filesystem_path(&installing_marker).as_ref(),
         b"installing",
@@ -106,7 +106,7 @@ pub(super) async fn install_managed_runtime_from_manifest_url(
     }
 
     let _ = async_fs::remove_file(runtime_filesystem_path(&installing_marker).as_ref()).await;
-    let ready_marker = temp_dir.join(".croopor-ready");
+    let ready_marker = temp_dir.join(".axial-ready");
     if let Err(error) =
         async_fs::write(runtime_filesystem_path(&ready_marker).as_ref(), b"ready").await
     {

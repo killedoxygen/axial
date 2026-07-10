@@ -1,12 +1,12 @@
 use crate::GuardianMode;
 use crate::build::find_client_jar;
-use croopor_minecraft::download::{
+use axial_minecraft::download::{
     ExpectedIntegrity, LauncherManagedArtifactReadiness, asset_object_hash_prefix,
     jar_contains_signed_metadata, library_jobs_for, verify_existing_launcher_managed_artifact,
     verify_existing_launcher_managed_artifact_allowing_missing_checksum,
 };
-use croopor_minecraft::paths::assets_dir;
-use croopor_minecraft::{
+use axial_minecraft::paths::assets_dir;
+use axial_minecraft::{
     LaunchModelError, RuntimeOverride, VersionJson, default_environment, load_version_json,
     parse_runtime_override, preferred_runtime_component, resolve_version,
     runtime_component_executable_present_without_probe, runtime_component_ready_without_probe,
@@ -526,7 +526,7 @@ fn read_loader_metadata(library_dir: &Path, version_id: &str) -> Option<Readines
     let path = library_dir
         .join("versions")
         .join(version_id)
-        .join(".croopor-loader.json");
+        .join(".axial-loader.json");
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
@@ -779,7 +779,7 @@ mod tests {
                 "mainClass": "net.minecraft.client.main.Main",
                 "assetIndex": {},
                 "javaVersion": {
-                    "component": "croopor-test-runtime-missing",
+                    "component": "axial-test-runtime-missing",
                     "majorVersion": 21
                 },
                 "libraries": []
@@ -841,7 +841,7 @@ mod tests {
         let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
             library_dir: library_dir.clone(),
             version_id: "1.21.1".to_string(),
-            requested_java: "croopor-test-runtime-missing".to_string(),
+            requested_java: "axial-test-runtime-missing".to_string(),
             guardian_mode: GuardianMode::Custom,
         });
 
@@ -1051,7 +1051,7 @@ mod tests {
                     "libraries": [{{
                         "name": "org.quiltmc:quilt-loader:0.29.2",
                         "url": "https://maven.example.invalid/",
-                        "crooporChecksumlessAllowed": true
+                        "axialChecksumlessAllowed": true
                     }}]
                 }}"#,
                 sha1_hex(client),
@@ -1113,7 +1113,7 @@ mod tests {
                     "libraries": [{{
                         "name": "org.quiltmc:quilt-loader:0.29.2",
                         "url": "https://maven.example.invalid/",
-                        "crooporChecksumlessAllowed": true
+                        "axialChecksumlessAllowed": true
                     }}]
                 }}"#,
                 sha1_hex(client),
@@ -1621,7 +1621,7 @@ mod tests {
             .expect("system time")
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "croopor-launcher-readiness-{name}-{}-{unique}",
+            "axial-launcher-readiness-{name}-{}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&root).expect("create temp library");

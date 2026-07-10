@@ -10,8 +10,8 @@ use crate::state::failure_memory::{
     FailureMemoryActionOutcome, FailureMemoryKey, GuardianFailureMemoryEntry,
     GuardianFailureMemoryStore,
 };
+use axial_launcher::LaunchFailureClass;
 use chrono::{DateTime, Duration, FixedOffset};
-use croopor_launcher::LaunchFailureClass;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_LAUNCH_RECOVERY_SUPPRESSION_MINUTES: i64 = 30;
@@ -499,8 +499,8 @@ mod tests {
     use crate::state::OperationJournalStore;
     use crate::state::contracts::{CommandKind, OperationOutcome, OperationStatus};
     use crate::state::failure_memory::{FailureMemoryActionOutcome, GuardianFailureMemoryStore};
-    use croopor_config::AppPaths;
-    use croopor_launcher::LaunchFailureClass;
+    use axial_config::AppPaths;
+    use axial_launcher::LaunchFailureClass;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -801,7 +801,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "croopor-launch-recovery-{name}-{}",
+            "axial-launch-recovery-{name}-{}",
             uuid::Uuid::new_v4()
         ));
         let _ = fs::remove_dir_all(&root);

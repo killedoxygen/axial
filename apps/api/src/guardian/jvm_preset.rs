@@ -1,4 +1,4 @@
-use croopor_launcher::{
+use axial_launcher::{
     PRESET_GRAALVM, PRESET_LEGACY, PRESET_LEGACY_HEAVY, PRESET_LEGACY_PVP, PRESET_PERFORMANCE,
     PRESET_SMOOTH, PRESET_ULTRA_LOW_LATENCY,
 };
@@ -92,7 +92,7 @@ fn preset_catalog() -> &'static [PresetCatalogEntry] {
         PresetCatalogEntry {
             id: AUTO_PRESET_ID,
             label: "Auto",
-            detail: "Croopor picks safe JVM flags automatically.",
+            detail: "Axial picks safe JVM flags automatically.",
         },
         PresetCatalogEntry {
             id: PRESET_SMOOTH,

@@ -1,8 +1,8 @@
 use super::AppState;
 use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
-use croopor_config::{AppConfig, Instance};
-use croopor_launcher::{LaunchSessionRecord, LaunchState};
-use croopor_minecraft::{VersionEntry, scan_versions};
+use axial_config::{AppConfig, Instance};
+use axial_launcher::{LaunchSessionRecord, LaunchState};
+use axial_minecraft::{VersionEntry, scan_versions};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -292,9 +292,9 @@ fn sanitize_presence_text(raw: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use croopor_config::{AppConfig, Instance};
-    use croopor_launcher::{LaunchSessionRecord, SessionId};
-    use croopor_minecraft::{
+    use axial_config::{AppConfig, Instance};
+    use axial_launcher::{LaunchSessionRecord, SessionId};
+    use axial_minecraft::{
         MinecraftVersionMeta, VersionEntry, VersionLoaderAttachment, VersionSubjectKind,
     };
 
@@ -380,7 +380,7 @@ mod tests {
             java_major: 21,
             manifest_url: String::new(),
             loader: loader_name.map(|name| VersionLoaderAttachment {
-                component_id: croopor_minecraft::LoaderComponentId::Fabric,
+                component_id: axial_minecraft::LoaderComponentId::Fabric,
                 component_name: name.to_string(),
                 build_id: "fabric:1.21.1:0.16.10".to_string(),
                 loader_version: "0.16.10".to_string(),

@@ -143,7 +143,7 @@ export async function launchGame(): Promise<void> {
       });
       if (saved.error) {
         setLaunchNotice(inst.id, {
-          message: 'Croopor could not save the pending launch overrides.',
+          message: 'Axial could not save the pending launch overrides.',
           detail: saved.error,
           tone: 'error',
         });

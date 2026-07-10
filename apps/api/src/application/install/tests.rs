@@ -10,17 +10,17 @@ use crate::state::{
     AppState, AppStateInit, GuardianFailureMemoryStore, InstallStore, OperationJournalStore,
     SessionStore,
 };
-use axum::{body::to_bytes, response::IntoResponse};
-use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-use croopor_minecraft::download::{
+use axial_config::{AppPaths, ConfigStore, InstanceStore};
+use axial_minecraft::download::{
     ExecutionDownloadFact, ExecutionDownloadFactKind, ExpectedIntegrity,
     SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind,
     download_file_with_client_report,
 };
-use croopor_minecraft::{
+use axial_minecraft::{
     DownloadError, DownloadProgress, LoaderComponentId, LoaderError, LoaderProviderFailureKind,
 };
-use croopor_performance::PerformanceManager;
+use axial_performance::PerformanceManager;
+use axum::{body::to_bytes, response::IntoResponse};
 use serde_json::json;
 use sha1::{Digest, Sha1};
 use std::io::{Read, Write};
@@ -126,8 +126,8 @@ fn sanitize_install_progress_hides_raw_terminal_error_fragments() {
         error: Some(
             "request failed: GET https://piston-meta.mojang.com/mc/game/version_manifest_v2.json \
                  parse version json: expected value at line 1 column 1 \
-                 prepare java runtime: failed in /home/zero/.croopor/runtime/java \
-                 and C:\\Users\\zero\\AppData\\Roaming\\Croopor\\runtime\\java"
+                 prepare java runtime: failed in /home/zero/.axial/runtime/java \
+                 and C:\\Users\\zero\\AppData\\Roaming\\Axial\\runtime\\java"
                 .to_string(),
         ),
         done: true,
@@ -192,7 +192,7 @@ fn sanitize_install_progress_preserves_shape_and_only_changes_error_text() {
         total: 21,
         file: Some("1.20.1.json".to_string()),
         error: Some(
-            "request failed for https://example.invalid/manifest.json in /tmp/croopor".to_string(),
+            "request failed for https://example.invalid/manifest.json in /tmp/axial".to_string(),
         ),
         done: true,
         bytes_done: None,
@@ -215,7 +215,7 @@ fn sanitize_install_progress_redacts_raw_non_terminal_progress() {
             phase: r"C:\Users\Alice\.minecraft --accessToken raw-secret".to_string(),
             current: 7,
             total: 42,
-            file: Some("/Users/alice/.croopor/libraries/secret.jar".to_string()),
+            file: Some("/Users/alice/.axial/libraries/secret.jar".to_string()),
             error: Some(
                 "provider_payload={\"token\":\"secret\"} account_id=account-secret username=SecretPlayer"
                     .to_string(),
@@ -860,9 +860,9 @@ async fn install_status_exposes_interrupted_install_as_redacted_terminal_state()
                 phase: r"C:\Users\Alice\.minecraft --accessToken provider_payload".to_string(),
                 current: 0,
                 total: 0,
-                file: Some("/Users/alice/.croopor/libraries/secret.jar".to_string()),
+                file: Some("/Users/alice/.axial/libraries/secret.jar".to_string()),
                 error: Some(
-                    "worker interrupted in /Users/alice/.croopor with token secret provider_payload={\"token\":\"secret\"}"
+                    "worker interrupted in /Users/alice/.axial with token secret provider_payload={\"token\":\"secret\"}"
                         .to_string(),
                 ),
                 done: true,
@@ -936,9 +936,9 @@ async fn restart_interrupted_install_retry_discards_stale_temp_without_promoting
                 phase: r"C:\Users\Alice\.minecraft --accessToken provider_payload".to_string(),
                 current: 0,
                 total: 0,
-                file: Some("/Users/alice/.croopor/versions/1.21.5/1.21.5.jar".to_string()),
+                file: Some("/Users/alice/.axial/versions/1.21.5/1.21.5.jar".to_string()),
                 error: Some(
-                    "worker interrupted in /Users/alice/.croopor with token secret provider_payload={\"token\":\"secret\"}"
+                    "worker interrupted in /Users/alice/.axial with token secret provider_payload={\"token\":\"secret\"}"
                         .to_string(),
                 ),
                 done: true,
@@ -1040,9 +1040,9 @@ async fn install_status_reconstructs_journal_progress_when_snapshot_is_missing()
             phase: r"C:\Users\Alice\.minecraft --accessToken provider_payload".to_string(),
             current: 0,
             total: 0,
-            file: Some("/Users/alice/.croopor/libraries/secret.jar".to_string()),
+            file: Some("/Users/alice/.axial/libraries/secret.jar".to_string()),
             error: Some(
-                "worker interrupted in /Users/alice/.croopor with token secret provider_payload={\"token\":\"secret\"}"
+                "worker interrupted in /Users/alice/.axial with token secret provider_payload={\"token\":\"secret\"}"
                     .to_string(),
             ),
             done: true,
@@ -1521,7 +1521,7 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
         .timeout(Duration::from_millis(100))
         .build()
         .expect("client")
-        .get("http://127.0.0.1:1/croopor-network-failure")
+        .get("http://127.0.0.1:1/axial-network-failure")
         .send()
         .await
         .expect_err("closed localhost port should fail");
@@ -1594,7 +1594,7 @@ async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory
         .timeout(Duration::from_millis(100))
         .build()
         .expect("client")
-        .get("http://127.0.0.1:1/croopor-network-failure")
+        .get("http://127.0.0.1:1/axial-network-failure")
         .send()
         .await
         .expect_err("closed localhost port should fail");
@@ -1766,7 +1766,7 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
             fields: vec![
                 (
                     "path".to_string(),
-                    "/Users/alice/.croopor/libraries/secret.jar".to_string(),
+                    "/Users/alice/.axial/libraries/secret.jar".to_string(),
                 ),
                 (
                     "url".to_string(),
@@ -1859,7 +1859,7 @@ async fn install_status_redacts_raw_progress_history_and_install_id() {
                     phase: r"C:\Users\Alice\.minecraft --accessToken raw-secret".to_string(),
                     current: 3,
                     total: 9,
-                    file: Some("/Users/alice/.croopor/libraries/secret.jar".to_string()),
+                    file: Some("/Users/alice/.axial/libraries/secret.jar".to_string()),
                     error: Some(
                         "provider_payload={\"token\":\"secret\"} account_id=account-secret username=SecretPlayer"
                             .to_string(),
@@ -1966,13 +1966,13 @@ fn loader_error_response_keeps_status_and_failure_kind_without_raw_details() {
     assert_eq!(body["failure_kind"], json!("provider_response_too_large"));
     assert_eq!(
         body["error"],
-        json!("Loader provider returned data Croopor could not trust. Try again later.")
+        json!("Loader provider returned data Axial could not trust. Try again later.")
     );
     assert_no_public_raw_fragments(body["error"].as_str().expect("error is a string"));
 
     let (status, Json(body)) = loader_error_response(LoaderError::Io(std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
-        "permission denied: /home/zero/.croopor/libraries/example.jar",
+        "permission denied: /home/zero/.axial/libraries/example.jar",
     )));
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1996,7 +1996,7 @@ fn loader_error_response_keeps_status_and_failure_kind_without_raw_details() {
     assert_no_public_raw_fragments(body["error"].as_str().expect("error is a string"));
 
     let (status, Json(body)) = loader_error_response(LoaderError::ArtifactMissing(
-        "missing https://cdn.example.invalid/path/mod-loader.jar in /tmp/croopor".to_string(),
+        "missing https://cdn.example.invalid/path/mod-loader.jar in /tmp/axial".to_string(),
     ));
 
     assert_eq!(status, StatusCode::BAD_GATEWAY);
@@ -2043,13 +2043,13 @@ fn loader_error_response_preserves_safe_explicit_messages() {
 
     assert_eq!(status, StatusCode::PRECONDITION_FAILED);
     assert_eq!(body["failure_kind"], json!("other"));
-    assert_eq!(body["error"], json!("Croopor library is not configured"));
+    assert_eq!(body["error"], json!("Axial library is not configured"));
 }
 
 #[test]
 fn loader_error_progress_hides_raw_details_and_keeps_terminal_shape() {
     let progress = loader_error_progress(&LoaderError::ArtifactMissing(
-        "missing https://cdn.example.invalid/path/mod-loader.jar in /tmp/croopor".to_string(),
+        "missing https://cdn.example.invalid/path/mod-loader.jar in /tmp/axial".to_string(),
     ));
 
     assert_eq!(progress.phase, "error");
@@ -2161,7 +2161,7 @@ async fn loader_install_events_redact_raw_terminal_progress_snapshot() {
                     phase: r"C:\Users\Alice\.minecraft --accessToken raw-secret".to_string(),
                     current: 2,
                     total: 5,
-                    file: Some("/Users/alice/.croopor/libraries/secret.jar".to_string()),
+                    file: Some("/Users/alice/.axial/libraries/secret.jar".to_string()),
                     error: Some(
                         "provider_payload={\"token\":\"secret\"} account_id=account-secret username=SecretPlayer -Xmx8192M"
                             .to_string(),
@@ -2437,7 +2437,7 @@ fn install_journal_records_failure_and_interruption() {
             r"C:\Users\Alice\.minecraft -Xmx8192M --accessToken provider_payload",
             true,
             Some(
-                "failed in /Users/alice/.croopor with token secret provider_payload={\"token\":\"secret\"}",
+                "failed in /Users/alice/.axial with token secret provider_payload={\"token\":\"secret\"}",
             ),
         ),
         &mut last_phase,
@@ -2566,7 +2566,7 @@ fn install_journal_treats_temp_discard_as_non_terminal_evidence_only() {
         target: "minecraft_client_1.21.5".to_string(),
         fields: vec![(
             "path".to_string(),
-            "/Users/alice/.croopor/libraries/secret.jar".to_string(),
+            "/Users/alice/.axial/libraries/secret.jar".to_string(),
         )],
     }];
     record_install_operation_guardian_evidence(&journals, &operation_id, &facts);
@@ -3257,7 +3257,7 @@ async fn install_guardian_repair_ignores_unrepairable_or_unmatched_facts() {
 fn assert_no_public_raw_fragments(message: &str) {
     for fragment in [
         "/home/zero",
-        "/tmp/croopor",
+        "/tmp/axial",
         "C:\\Users\\zero",
         "AppData\\Roaming",
         "https://",
@@ -3294,7 +3294,7 @@ fn build_test_state(root: &Path) -> AppState {
     let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
     let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
     AppState::new(AppStateInit {
-        app_name: "Croopor".to_string(),
+        app_name: "Axial".to_string(),
         version: "test".to_string(),
         config,
         instances,
@@ -3394,7 +3394,7 @@ fn progress(phase: &str, done: bool, error: Option<&str>) -> DownloadProgress {
         phase: phase.to_string(),
         current: 1,
         total: 2,
-        file: Some("/Users/alice/.croopor/libraries/secret.jar".to_string()),
+        file: Some("/Users/alice/.axial/libraries/secret.jar".to_string()),
         error: error.map(str::to_string),
         done,
         bytes_done: None,
@@ -3507,7 +3507,7 @@ fn make_runtime_fixture_executable(_path: &Path) {}
 
 fn temp_root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "croopor-api-install-application-{name}-{}-{}",
+        "axial-api-install-application-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3527,7 +3527,7 @@ fn launcher_managed_download_temp_path(destination: &Path) -> PathBuf {
         .file_name()
         .expect("launcher managed artifact filename")
         .to_os_string();
-    name.push(".croopor-tmp");
+    name.push(".axial-tmp");
     destination.with_file_name(name)
 }
 

@@ -274,12 +274,12 @@ function generateMacIcon({ glyph, outputDir, fill }) {
 }
 
 generateRasterIcons({
-  svg: path.join(sourceDir, "croopor-flat.svg"),
+  svg: path.join(sourceDir, "axial-flat.svg"),
   png: path.join(iconsDir, "icon.png"),
   ico: path.join(iconsDir, "icon.ico"),
 });
 
-copyFileSync(path.join(sourceDir, "croopor-dev-flat.svg"), path.join(iconsDir, "dev", "icon.svg"));
+copyFileSync(path.join(sourceDir, "axial-dev-flat.svg"), path.join(iconsDir, "dev", "icon.svg"));
 generateRasterIcons({
   svg: path.join(iconsDir, "dev", "icon.svg"),
   png: path.join(iconsDir, "dev", "icon.png"),
@@ -287,13 +287,13 @@ generateRasterIcons({
 });
 
 generateMacIcon({
-  glyph: path.join(sourceDir, "croopor-glyph.svg"),
+  glyph: path.join(sourceDir, "axial-glyph.svg"),
   outputDir: macosDir,
   fill: solidFill("#151515"),
 });
 
 generateMacIcon({
-  glyph: path.join(sourceDir, "croopor-dev-glyph.svg"),
+  glyph: path.join(sourceDir, "axial-dev-glyph.svg"),
   outputDir: devMacosDir,
   fill: solidFill("#151515"),
 });

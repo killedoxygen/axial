@@ -7,7 +7,7 @@ use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::observability::{
     RedactionAudience, evidence_text_looks_sensitive, sanitize_evidence_text,
 };
-use croopor_config::AppPaths;
+use axial_config::AppPaths;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use tracing::warn;
 
-pub const OPERATION_JOURNAL_SCHEMA: &str = "croopor.state.operation_journals.v1";
+pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v1";
 pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = 128;
 const OPERATION_JOURNAL_FILE: &str = "operation-journals.json";
 
@@ -536,7 +536,7 @@ mod tests {
         OperationOutcome, OperationPhase, OperationStatus, OwnershipClass, RollbackState,
         StabilizationSystem, TargetDescriptor, TargetKind,
     };
-    use croopor_config::AppPaths;
+    use axial_config::AppPaths;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -698,7 +698,7 @@ mod tests {
         unsafe_target.targets.push(TargetDescriptor {
             system: StabilizationSystem::State,
             kind: TargetKind::FilesystemPath,
-            id: "/home/alice/.croopor/libraries/secret.jar".to_string(),
+            id: "/home/alice/.axial/libraries/secret.jar".to_string(),
             ownership: OwnershipClass::LauncherManaged,
         });
         assert!(OperationJournalSnapshot::new(vec![unsafe_target]).is_err());
@@ -847,7 +847,7 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         std::env::temp_dir().join(format!(
-            "croopor-operation-journal-{prefix}-{}-{nanos:x}",
+            "axial-operation-journal-{prefix}-{}-{nanos:x}",
             std::process::id()
         ))
     }

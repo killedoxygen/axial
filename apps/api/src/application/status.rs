@@ -44,8 +44,8 @@ mod tests {
     use super::launcher_status;
     use crate::state::performance_operations::{operation_dir, operation_path};
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
-    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-    use croopor_performance::PerformanceManager;
+    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_performance::PerformanceManager;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -57,7 +57,7 @@ mod tests {
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         let state = AppState::new(AppStateInit {
-            app_name: "Croopor".to_string(),
+            app_name: "Axial".to_string(),
             version: "test".to_string(),
             config,
             instances,
@@ -106,7 +106,7 @@ mod tests {
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         let state = AppState::new(AppStateInit {
-            app_name: "Croopor".to_string(),
+            app_name: "Axial".to_string(),
             version: "test".to_string(),
             config,
             instances,
@@ -123,7 +123,7 @@ mod tests {
         assert_eq!(response.warnings.len(), 1);
         assert_eq!(
             response.warnings[0],
-            "Guardian kept Croopor running after persisted operation state could not be trusted."
+            "Guardian kept Axial running after persisted operation state could not be trusted."
         );
         assert!(!response.warnings[0].contains(&root.to_string_lossy().to_string()));
         assert!(!response.warnings[0].contains("unexpected_mode"));
@@ -145,7 +145,7 @@ mod tests {
         let mut startup_warnings = config_startup.warnings;
         startup_warnings.extend(instance_startup.warnings);
         let state = AppState::new(AppStateInit {
-            app_name: "Croopor".to_string(),
+            app_name: "Axial".to_string(),
             version: "test".to_string(),
             config: Arc::new(config_startup.store),
             instances: Arc::new(instance_startup.store),
@@ -162,7 +162,7 @@ mod tests {
         assert_eq!(response.warnings.len(), 1);
         assert_eq!(
             response.warnings[0],
-            "Croopor could not load the instance list, so it started with an empty list. Check app data permissions or restore the instance registry."
+            "Axial could not load the instance list, so it started with an empty list. Check app data permissions or restore the instance registry."
         );
         assert!(!response.warnings[0].contains(&root.to_string_lossy().to_string()));
         assert!(!response.warnings[0].contains("expected"));
@@ -173,7 +173,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "croopor-api-status-{name}-{}-{}",
+            "axial-api-status-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

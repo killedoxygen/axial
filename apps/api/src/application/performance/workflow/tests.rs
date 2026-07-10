@@ -1,14 +1,14 @@
 use super::*;
 use crate::state::performance_operations::PerformanceOperationPayload;
 use crate::state::{AppStateInit, DownloadProgress, InstallStore, SessionStore};
+use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+use axial_performance::modrinth::ModrinthError;
+use axial_performance::{CompositionState, InstalledMod, PerformanceManager};
 use axum::{
     body::{Body, to_bytes},
     extract::{Path, Query, State},
     http::Request,
 };
-use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
-use croopor_performance::modrinth::ModrinthError;
-use croopor_performance::{CompositionState, InstalledMod, PerformanceManager};
 use ed25519_dalek::{Signer, SigningKey};
 use std::{
     fs,
@@ -229,7 +229,7 @@ impl TestFixture {
         )
         .expect("write version json");
         fs::write(
-            version_dir.join(".croopor-loader.json"),
+            version_dir.join(".axial-loader.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "schema_version": 1,
                 "component_id": "net.fabricmc.fabric-loader",
@@ -261,9 +261,9 @@ async fn spawn_rules_server(body: Vec<u8>, signature: Option<String>) -> String 
             .map(|signature| {
                 format!(
                     "{}: {}\r\n{}: test-key\r\n",
-                    croopor_performance::RULES_SIGNATURE_HEADER,
+                    axial_performance::RULES_SIGNATURE_HEADER,
                     signature,
-                    croopor_performance::RULES_KEY_ID_HEADER
+                    axial_performance::RULES_KEY_ID_HEADER
                 )
             })
             .unwrap_or_default();
@@ -292,7 +292,7 @@ impl Drop for TestFixture {
 
 fn test_root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "croopor-api-performance-{name}-{}-{}",
+        "axial-api-performance-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -330,7 +330,7 @@ fn build_test_state(
         .expect("configure library dir");
     let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
     AppState::new(AppStateInit {
-        app_name: "Croopor".to_string(),
+        app_name: "Axial".to_string(),
         version: "test".to_string(),
         config,
         instances,
@@ -405,13 +405,13 @@ struct SignedRulesResponse {
     signature: String,
 }
 
-fn nvidium_always_manifest(generated_at: &str) -> croopor_performance::Manifest {
-    let mut manifest = croopor_performance::builtin_manifest().expect("builtin manifest");
+fn nvidium_always_manifest(generated_at: &str) -> axial_performance::Manifest {
+    let mut manifest = axial_performance::builtin_manifest().expect("builtin manifest");
     manifest.generated_at = generated_at.to_string();
     for composition in &mut manifest.compositions {
         for managed_mod in &mut composition.mods {
             if managed_mod.slug == "nvidium" {
-                managed_mod.condition = croopor_performance::types::ModCondition::Always;
+                managed_mod.condition = axial_performance::types::ModCondition::Always;
                 managed_mod.hardware_req = None;
             }
         }
@@ -419,9 +419,9 @@ fn nvidium_always_manifest(generated_at: &str) -> croopor_performance::Manifest 
     manifest
 }
 
-fn signed_rules_response(manifest: &croopor_performance::Manifest) -> SignedRulesResponse {
+fn signed_rules_response(manifest: &axial_performance::Manifest) -> SignedRulesResponse {
     let signing_key = SigningKey::from_bytes(&[13_u8; 32]);
-    let payload = croopor_performance::canonical_manifest_payload(manifest).expect("payload");
+    let payload = axial_performance::canonical_manifest_payload(manifest).expect("payload");
     let signature = signing_key.sign(&payload);
     SignedRulesResponse {
         public_key: hex::encode(signing_key.verifying_key().to_bytes()),
@@ -448,18 +448,18 @@ fn test_installed_mod(project_id: &str, filename: &str) -> InstalledMod {
         project_id: project_id.to_string(),
         version_id: "version".to_string(),
         filename: filename.to_string(),
-        ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
+        ownership_class: axial_performance::OwnershipClass::CompositionManaged,
         source: test_modrinth_source(),
-        integrity: croopor_performance::ManagedArtifactIntegrity {
+        integrity: axial_performance::ManagedArtifactIntegrity {
             sha512: String::new(),
             sha512_verified: false,
         },
     }
 }
 
-fn test_modrinth_source() -> croopor_performance::ManagedArtifactSource {
-    croopor_performance::ManagedArtifactSource {
-        provider: croopor_performance::ManagedArtifactProvider::Modrinth,
+fn test_modrinth_source() -> axial_performance::ManagedArtifactSource {
+    axial_performance::ManagedArtifactSource {
+        provider: axial_performance::ManagedArtifactProvider::Modrinth,
     }
 }
 

@@ -1,10 +1,10 @@
 use super::*;
 use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
+use axial_config::{AppPaths, ConfigStore, InstanceStore};
+use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
+use axial_minecraft::VersionEntry;
+use axial_performance::PerformanceManager;
 use axum::http::{HeaderValue, header};
-use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-use croopor_launcher::{LaunchSessionRecord, LaunchState, SessionId};
-use croopor_minecraft::VersionEntry;
-use croopor_performance::PerformanceManager;
 use sha1::{Digest as _, Sha1};
 use std::{collections::HashMap, fs, io, path::Path as FsPath, sync::Arc};
 
@@ -47,17 +47,17 @@ fn instance_write_error_mapper_bounds_internal_operation_errors() {
     let cases = [
         (
             InstanceWriteOperation::Create,
-            "failed to initialize instance files: /home/zero/.config/Croopor/instances/new/logs",
+            "failed to initialize instance files: /home/zero/.config/Axial/instances/new/logs",
             "Could not create the instance. Check app data permissions and try again.",
         ),
         (
             InstanceWriteOperation::Update,
-            "failed to persist /home/zero/.config/Croopor/instances.json",
+            "failed to persist /home/zero/.config/Axial/instances.json",
             "Could not save the instance. Check app data permissions and try again.",
         ),
         (
             InstanceWriteOperation::Delete,
-            "failed to delete C:\\Users\\Zero\\AppData\\Roaming\\Croopor\\instances\\old",
+            "failed to delete C:\\Users\\Zero\\AppData\\Roaming\\Axial\\instances\\old",
             "Could not delete the instance. Check app data permissions and try again.",
         ),
     ];
@@ -81,9 +81,9 @@ fn instance_write_error_mapper_bounds_internal_operation_errors() {
 fn duplicate_instance_write_error_hides_layout_and_persist_paths() {
     let store_message = concat!(
         "failed to duplicate instance files: ",
-        "/home/zero/.config/Croopor/instances/source/mods/example.jar; ",
+        "/home/zero/.config/Axial/instances/source/mods/example.jar; ",
         "failed to roll back persisted instance: ",
-        "C:\\Users\\Zero\\AppData\\Roaming\\Croopor\\config\\instances.json"
+        "C:\\Users\\Zero\\AppData\\Roaming\\Axial\\config\\instances.json"
     );
 
     let (status, Json(body)) = instance_write_error_response(
@@ -132,8 +132,8 @@ fn instance_folder_open_error_response_bounds_public_message() {
 #[test]
 fn instance_log_read_error_response_bounds_public_metadata_open_and_read_messages() {
     let cases = [
-        "metadata failed for /home/zero/.config/Croopor/instances/test/logs/latest.log",
-        "open failed for C:\\Users\\Zero\\AppData\\Roaming\\Croopor\\instances\\test\\logs\\debug.log",
+        "metadata failed for /home/zero/.config/Axial/instances/test/logs/latest.log",
+        "open failed for C:\\Users\\Zero\\AppData\\Roaming\\Axial\\instances\\test\\logs\\debug.log",
         "Permission denied (os error 13) while reading logs/latest.log",
     ];
 
@@ -166,7 +166,7 @@ fn instance_log_read_error_response_bounds_public_metadata_open_and_read_message
 
 #[test]
 fn instance_folder_resolver_returns_root_when_subfolder_is_omitted() {
-    let game_dir = FsPath::new("/tmp/croopor-instance");
+    let game_dir = FsPath::new("/tmp/axial-instance");
 
     assert_eq!(
         resolve_instance_folder(game_dir, None).expect("resolve root"),
@@ -176,7 +176,7 @@ fn instance_folder_resolver_returns_root_when_subfolder_is_omitted() {
 
 #[test]
 fn instance_folder_resolver_accepts_allowed_subfolder() {
-    let game_dir = FsPath::new("/tmp/croopor-instance");
+    let game_dir = FsPath::new("/tmp/axial-instance");
 
     assert_eq!(
         resolve_instance_folder(game_dir, Some("mods")).expect("resolve mods"),
@@ -186,7 +186,7 @@ fn instance_folder_resolver_accepts_allowed_subfolder() {
 
 #[test]
 fn instance_folder_resolver_rejects_unknown_subfolder() {
-    let game_dir = FsPath::new("/tmp/croopor-instance");
+    let game_dir = FsPath::new("/tmp/axial-instance");
 
     assert_eq!(
         resolve_instance_folder(game_dir, Some("versions")),
@@ -196,7 +196,7 @@ fn instance_folder_resolver_rejects_unknown_subfolder() {
 
 #[test]
 fn instance_folder_resolver_rejects_traversal_like_subfolders() {
-    let game_dir = FsPath::new("/tmp/croopor-instance");
+    let game_dir = FsPath::new("/tmp/axial-instance");
 
     for subfolder in ["..", "../mods", "mods/..", "mods/../logs", "mods\\..\\logs"] {
         assert_eq!(
@@ -233,7 +233,7 @@ fn resource_names_reject_path_traversal_hidden_and_control_names() {
 #[test]
 fn log_scanner_returns_only_safe_instance_local_file_names() {
     let root = std::env::temp_dir().join(format!(
-        "croopor-api-instance-logs-{}-{}",
+        "axial-api-instance-logs-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -634,7 +634,7 @@ fn instance_screenshot_error_responses_do_not_leak_paths() {
         screenshot_file_write_error_response,
     ] {
         let (status, Json(body)) = mapper(io::Error::other(
-            "failed for /home/zero/.config/Croopor/instances/test/screenshots/shot.png",
+            "failed for /home/zero/.config/Axial/instances/test/screenshots/shot.png",
         ));
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1300,7 +1300,7 @@ async fn instance_crud_handlers_create_list_get_update_and_delete() {
     assert_eq!(listed.instances[0].launch_action.label, "Install");
     assert_eq!(
         listed.instances[0].launch_action.primary_action,
-        croopor_config::LaunchPrimaryAction::Install
+        axial_config::LaunchPrimaryAction::Install
     );
 
     let fetched = handle_get_instance(&fixture.state, &created.id)
@@ -1353,7 +1353,7 @@ async fn list_instances_summary_reports_missing_libraries() {
     assert_eq!(listed.launch_action.state_id, "install_required");
     assert_eq!(
         listed.launch_action.primary_action,
-        croopor_config::LaunchPrimaryAction::Install
+        axial_config::LaunchPrimaryAction::Install
     );
     assert_eq!(
         listed.status_detail,
@@ -1377,7 +1377,7 @@ async fn list_instances_summary_does_not_walk_asset_objects() {
     assert_eq!(listed.launch_action.state_id, "launch_ready");
     assert_eq!(
         listed.launch_action.primary_action,
-        croopor_config::LaunchPrimaryAction::Launch
+        axial_config::LaunchPrimaryAction::Launch
     );
 }
 
@@ -1397,7 +1397,7 @@ async fn list_instances_summary_does_not_hash_client_jar() {
     assert_eq!(listed.launch_action.state_id, "launch_ready");
     assert_eq!(
         listed.launch_action.primary_action,
-        croopor_config::LaunchPrimaryAction::Launch
+        axial_config::LaunchPrimaryAction::Launch
     );
 }
 
@@ -1424,7 +1424,7 @@ async fn list_instances_incomplete_parent_marker_does_not_show_launch_action() {
     assert_not_launch_action(&listed);
     assert_eq!(
         listed.launch_action.primary_action,
-        croopor_config::LaunchPrimaryAction::Install
+        axial_config::LaunchPrimaryAction::Install
     );
     assert!(listed.status_detail.contains("incomplete"));
 }
@@ -1445,7 +1445,7 @@ async fn list_instances_installed_ready_version_transitions_to_launch_action() {
     assert_eq!(listed.launch_action.state_id, "launch_ready");
     assert_eq!(
         listed.launch_action.primary_action,
-        croopor_config::LaunchPrimaryAction::Launch
+        axial_config::LaunchPrimaryAction::Launch
     );
 }
 
@@ -1470,7 +1470,7 @@ async fn degraded_version_scan_blocks_instances_and_create_queue_checks() {
     assert_eq!(listed.instances.len(), 1);
     assert_eq!(
         listed.instances[0].launch_action.primary_action,
-        croopor_config::LaunchPrimaryAction::Blocked
+        axial_config::LaunchPrimaryAction::Blocked
     );
     assert_eq!(
         listed.instances[0].status_detail,
@@ -1823,7 +1823,7 @@ async fn create_instance_rejects_unknown_exact_loader_selection() {
 
 #[test]
 fn loader_create_selection_rejects_stale_uninstalled_exact_build() {
-    let component_id = croopor_minecraft::LoaderComponentId::Fabric;
+    let component_id = axial_minecraft::LoaderComponentId::Fabric;
     let build = fabric_build_record(component_id, "1.21.1", "0.16.14", 900);
     let build_id = build.build_id.clone();
 
@@ -1845,7 +1845,7 @@ fn loader_create_selection_rejects_stale_uninstalled_exact_build() {
 
 #[test]
 fn loader_create_selection_allows_stale_exact_build_when_already_installed() {
-    let component_id = croopor_minecraft::LoaderComponentId::Fabric;
+    let component_id = axial_minecraft::LoaderComponentId::Fabric;
     let build = fabric_build_record(component_id, "1.21.1", "0.16.14", 900);
     let installed_version = installed_loader_entry(&build);
 
@@ -1872,11 +1872,10 @@ fn loader_create_selection_allows_stale_exact_build_when_already_installed() {
 async fn create_instance_loader_version_uses_beta_build_when_only_beta_builds_exist() {
     let fixture = TestFixture::new("create-loader-version-beta-only");
     let library_dir = fixture.configure_create_manifest(&["26.2"]);
-    let component_id = croopor_minecraft::LoaderComponentId::NeoForge;
+    let component_id = axial_minecraft::LoaderComponentId::NeoForge;
     let mut beta = fabric_build_record(component_id, "26.2", "26.2.0.3-beta", 600);
-    beta.build_meta.selection.reason = croopor_minecraft::LoaderSelectionReason::Unstable;
-    beta.build_meta.selection.source =
-        croopor_minecraft::LoaderSelectionSource::ExplicitVersionLabel;
+    beta.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unstable;
+    beta.build_meta.selection.source = axial_minecraft::LoaderSelectionSource::ExplicitVersionLabel;
     let beta_version_id = beta.version_id.clone();
     write_loader_build_cache_records(&library_dir, component_id, "26.2", vec![beta]);
     fixture
@@ -1917,14 +1916,14 @@ async fn create_instance_loader_version_uses_beta_build_when_only_beta_builds_ex
 async fn create_instance_quilt_java25_default_uses_compatible_beta_fallback() {
     let fixture = TestFixture::new("create-quilt-java25-beta-fallback");
     let library_dir = fixture.configure_create_manifest(&["26.1.2"]);
-    let component_id = croopor_minecraft::LoaderComponentId::Quilt;
+    let component_id = axial_minecraft::LoaderComponentId::Quilt;
     let mut stable_build = fabric_build_record(component_id, "26.1.2", "0.29.2", 700);
-    stable_build.build_meta.selection.reason = croopor_minecraft::LoaderSelectionReason::Unlabeled;
-    stable_build.build_meta.selection.source = croopor_minecraft::LoaderSelectionSource::None;
+    stable_build.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unlabeled;
+    stable_build.build_meta.selection.source = axial_minecraft::LoaderSelectionSource::None;
     let mut beta_build = fabric_build_record(component_id, "26.1.2", "0.30.0-beta.8", 600);
-    beta_build.build_meta.selection.reason = croopor_minecraft::LoaderSelectionReason::Unstable;
+    beta_build.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unstable;
     beta_build.build_meta.selection.source =
-        croopor_minecraft::LoaderSelectionSource::ExplicitVersionLabel;
+        axial_minecraft::LoaderSelectionSource::ExplicitVersionLabel;
     write_loader_build_cache_records(
         &library_dir,
         component_id,
@@ -1973,8 +1972,8 @@ async fn create_instance_view_returns_backend_authored_version_rows() {
         .set_library_dir(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["1.21.1", "1.21.2"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
-    for component in croopor_minecraft::fetch_components() {
-        let versions = if component.id == croopor_minecraft::LoaderComponentId::Fabric {
+    for component in axial_minecraft::fetch_components() {
+        let versions = if component.id == axial_minecraft::LoaderComponentId::Fabric {
             vec!["1.21.1"]
         } else {
             Vec::new()
@@ -2000,14 +1999,14 @@ async fn create_instance_view_returns_backend_authored_version_rows() {
 
     let view = handle_create_instance_view(
         &fixture.state,
-        Some(croopor_minecraft::LoaderComponentId::Fabric.as_str()),
+        Some(axial_minecraft::LoaderComponentId::Fabric.as_str()),
     )
     .await;
     let fabric = view
         .versions
         .iter()
         .find(|row| {
-            row.source_id == croopor_minecraft::LoaderComponentId::Fabric.as_str()
+            row.source_id == axial_minecraft::LoaderComponentId::Fabric.as_str()
                 && row.minecraft_version_id == "1.21.1"
         })
         .expect("fabric row");
@@ -2033,8 +2032,8 @@ async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is
         .set_library_dir(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["1.21.1"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
-    for component in croopor_minecraft::fetch_components() {
-        let versions = if component.id == croopor_minecraft::LoaderComponentId::Fabric {
+    for component in axial_minecraft::fetch_components() {
+        let versions = if component.id == axial_minecraft::LoaderComponentId::Fabric {
             vec!["1.21.1"]
         } else {
             Vec::new()
@@ -2049,14 +2048,14 @@ async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is
     );
     write_installed_loader_version(
         &library_dir,
-        croopor_minecraft::LoaderComponentId::Fabric,
+        axial_minecraft::LoaderComponentId::Fabric,
         "1.21.1",
         "0.16.14",
     );
 
     let view = handle_create_instance_view(
         &fixture.state,
-        Some(croopor_minecraft::LoaderComponentId::Fabric.as_str()),
+        Some(axial_minecraft::LoaderComponentId::Fabric.as_str()),
     )
     .await;
 
@@ -2064,7 +2063,7 @@ async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is
         .versions
         .iter()
         .find(|row| {
-            row.source_id == croopor_minecraft::LoaderComponentId::Fabric.as_str()
+            row.source_id == axial_minecraft::LoaderComponentId::Fabric.as_str()
                 && row.minecraft_version_id == "1.21.1"
         })
         .expect("fabric row");
@@ -2120,12 +2119,12 @@ async fn create_instance_view_tags_beta_only_loader_version_rows_without_blockin
         .state
         .set_library_dir(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["26.2", "1.7.10_pre4"]);
-    for component in croopor_minecraft::fetch_components() {
+    for component in axial_minecraft::fetch_components() {
         let versions = match component.id {
-            croopor_minecraft::LoaderComponentId::Forge => {
+            axial_minecraft::LoaderComponentId::Forge => {
                 vec![("1.7.10_pre4", Some(false))]
             }
-            croopor_minecraft::LoaderComponentId::NeoForge => vec![("26.2", Some(false))],
+            axial_minecraft::LoaderComponentId::NeoForge => vec![("26.2", Some(false))],
             _ => Vec::new(),
         };
         write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
@@ -2133,14 +2132,14 @@ async fn create_instance_view_tags_beta_only_loader_version_rows_without_blockin
     write_installed_vanilla_version(&library_dir, "26.2");
     write_installed_loader_version(
         &library_dir,
-        croopor_minecraft::LoaderComponentId::NeoForge,
+        axial_minecraft::LoaderComponentId::NeoForge,
         "26.2",
         "26.2.0.6-beta",
     );
 
     for (component_id, minecraft_version) in [
-        (croopor_minecraft::LoaderComponentId::Forge, "1.7.10_pre4"),
-        (croopor_minecraft::LoaderComponentId::NeoForge, "26.2"),
+        (axial_minecraft::LoaderComponentId::Forge, "1.7.10_pre4"),
+        (axial_minecraft::LoaderComponentId::NeoForge, "26.2"),
     ] {
         let view = handle_create_instance_view(&fixture.state, Some(component_id.as_str())).await;
 
@@ -2153,7 +2152,7 @@ async fn create_instance_view_tags_beta_only_loader_version_rows_without_blockin
             })
             .expect("beta-only loader row");
         assert_eq!(row.channel, "snapshot");
-        if component_id == croopor_minecraft::LoaderComponentId::NeoForge {
+        if component_id == axial_minecraft::LoaderComponentId::NeoForge {
             assert_eq!(row.download_state, "full");
         }
         assert!(row.create_enabled);
@@ -2174,11 +2173,10 @@ async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
         .state
         .set_library_dir(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["26.2"]);
-    for component in croopor_minecraft::fetch_components() {
+    for component in axial_minecraft::fetch_components() {
         let versions = if matches!(
             component.id,
-            croopor_minecraft::LoaderComponentId::Fabric
-                | croopor_minecraft::LoaderComponentId::Quilt
+            axial_minecraft::LoaderComponentId::Fabric | axial_minecraft::LoaderComponentId::Quilt
         ) {
             vec![("26.2", Some(false))]
         } else {
@@ -2188,10 +2186,10 @@ async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
     }
     write_loader_build_cache_records(
         &library_dir,
-        croopor_minecraft::LoaderComponentId::Quilt,
+        axial_minecraft::LoaderComponentId::Quilt,
         "26.2",
         vec![fabric_build_record(
-            croopor_minecraft::LoaderComponentId::Quilt,
+            axial_minecraft::LoaderComponentId::Quilt,
             "26.2",
             "0.30.0",
             700,
@@ -2199,8 +2197,8 @@ async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
     );
 
     for component_id in [
-        croopor_minecraft::LoaderComponentId::Fabric,
-        croopor_minecraft::LoaderComponentId::Quilt,
+        axial_minecraft::LoaderComponentId::Fabric,
+        axial_minecraft::LoaderComponentId::Quilt,
     ] {
         let view = handle_create_instance_view(&fixture.state, Some(component_id.as_str())).await;
         let row = view
@@ -2225,8 +2223,8 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
         .state
         .set_library_dir(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["26.1.3", "26.1.2", "1.21.10"]);
-    for component in croopor_minecraft::fetch_components() {
-        let versions = if component.id == croopor_minecraft::LoaderComponentId::Quilt {
+    for component in axial_minecraft::fetch_components() {
+        let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
             vec![
                 ("26.1.3", Some(true)),
                 ("26.1.2", Some(true)),
@@ -2237,7 +2235,7 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
         };
         write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
     }
-    let component_id = croopor_minecraft::LoaderComponentId::Quilt;
+    let component_id = axial_minecraft::LoaderComponentId::Quilt;
     write_loader_build_cache_records(
         &library_dir,
         component_id,
@@ -2253,7 +2251,7 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
 
     let view = handle_create_instance_view(
         &fixture.state,
-        Some(croopor_minecraft::LoaderComponentId::Quilt.as_str()),
+        Some(axial_minecraft::LoaderComponentId::Quilt.as_str()),
     )
     .await;
 
@@ -2261,7 +2259,7 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
         .versions
         .iter()
         .find(|row| {
-            row.source_id == croopor_minecraft::LoaderComponentId::Quilt.as_str()
+            row.source_id == axial_minecraft::LoaderComponentId::Quilt.as_str()
                 && row.minecraft_version_id == "26.1.2"
         })
         .expect("quilt 26 row");
@@ -2274,7 +2272,7 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
         .versions
         .iter()
         .find(|row| {
-            row.source_id == croopor_minecraft::LoaderComponentId::Quilt.as_str()
+            row.source_id == axial_minecraft::LoaderComponentId::Quilt.as_str()
                 && row.minecraft_version_id == "26.1.3"
         })
         .expect("quilt compatible 26 row");
@@ -2284,7 +2282,7 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
         .versions
         .iter()
         .find(|row| {
-            row.source_id == croopor_minecraft::LoaderComponentId::Quilt.as_str()
+            row.source_id == axial_minecraft::LoaderComponentId::Quilt.as_str()
                 && row.minecraft_version_id == "1.21.10"
         })
         .expect("quilt 1.21 row");
@@ -2299,8 +2297,8 @@ async fn create_instance_view_tags_quilt_java25_without_cached_builds() {
         .state
         .set_library_dir(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["26.1.2"]);
-    for component in croopor_minecraft::fetch_components() {
-        let versions = if component.id == croopor_minecraft::LoaderComponentId::Quilt {
+    for component in axial_minecraft::fetch_components() {
+        let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
             vec![("26.1.2", Some(true))]
         } else {
             Vec::new()
@@ -2310,7 +2308,7 @@ async fn create_instance_view_tags_quilt_java25_without_cached_builds() {
 
     let view = handle_create_instance_view(
         &fixture.state,
-        Some(croopor_minecraft::LoaderComponentId::Quilt.as_str()),
+        Some(axial_minecraft::LoaderComponentId::Quilt.as_str()),
     )
     .await;
 
@@ -2318,7 +2316,7 @@ async fn create_instance_view_tags_quilt_java25_without_cached_builds() {
         .versions
         .iter()
         .find(|row| {
-            row.source_id == croopor_minecraft::LoaderComponentId::Quilt.as_str()
+            row.source_id == axial_minecraft::LoaderComponentId::Quilt.as_str()
                 && row.minecraft_version_id == "26.1.2"
         })
         .expect("quilt 26 row");
@@ -2335,19 +2333,19 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
         .state
         .set_library_dir(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["26.1.2"]);
-    for component in croopor_minecraft::fetch_components() {
-        let versions = if component.id == croopor_minecraft::LoaderComponentId::Quilt {
+    for component in axial_minecraft::fetch_components() {
+        let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
             vec![("26.1.2", Some(true))]
         } else {
             Vec::new()
         };
         write_supported_versions_cache_with_stable_hints(&library_dir, component.id, &versions);
     }
-    let component_id = croopor_minecraft::LoaderComponentId::Quilt;
+    let component_id = axial_minecraft::LoaderComponentId::Quilt;
     let mut stable_build = fabric_build_record(component_id, "26.1.2", "0.29.2", 700);
-    stable_build.build_meta.selection.reason = croopor_minecraft::LoaderSelectionReason::Unlabeled;
+    stable_build.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unlabeled;
     let mut beta_build = fabric_build_record(component_id, "26.1.2", "0.30.0-beta.8", 600);
-    beta_build.build_meta.selection.reason = croopor_minecraft::LoaderSelectionReason::Unstable;
+    beta_build.build_meta.selection.reason = axial_minecraft::LoaderSelectionReason::Unstable;
     write_loader_build_cache_records(
         &library_dir,
         component_id,
@@ -2357,7 +2355,7 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
 
     let view = handle_create_instance_view(
         &fixture.state,
-        Some(croopor_minecraft::LoaderComponentId::Quilt.as_str()),
+        Some(axial_minecraft::LoaderComponentId::Quilt.as_str()),
     )
     .await;
 
@@ -2365,7 +2363,7 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
         .versions
         .iter()
         .find(|row| {
-            row.source_id == croopor_minecraft::LoaderComponentId::Quilt.as_str()
+            row.source_id == axial_minecraft::LoaderComponentId::Quilt.as_str()
                 && row.minecraft_version_id == "26.1.2"
         })
         .expect("quilt 26 row");
@@ -2703,8 +2701,8 @@ fn assert_instance_folder_error_response_is_bounded(
     expected_message: &str,
 ) {
     for internal_message in [
-        "failed for /home/zero/.config/Croopor/instances/test/mods",
-        "failed for C:\\Users\\Zero\\AppData\\Roaming\\Croopor\\instances\\test\\logs",
+        "failed for /home/zero/.config/Axial/instances/test/mods",
+        "failed for C:\\Users\\Zero\\AppData\\Roaming\\Axial\\instances\\test\\logs",
         "Permission denied (os error 13)",
     ] {
         let (status, Json(body)) = mapper(io::Error::other(internal_message));
@@ -2745,8 +2743,8 @@ fn write_fabric_loader_build_cache(
     minecraft_version: &str,
     loader_version: &str,
 ) -> String {
-    let component_id = croopor_minecraft::LoaderComponentId::Fabric;
-    let build_id = croopor_minecraft::build_id_for(component_id, minecraft_version, loader_version);
+    let component_id = axial_minecraft::LoaderComponentId::Fabric;
+    let build_id = axial_minecraft::build_id_for(component_id, minecraft_version, loader_version);
     write_fabric_loader_build_cache_with_builds(
         library_dir,
         minecraft_version,
@@ -2762,8 +2760,8 @@ fn write_fabric_loader_build_cache_with_builds(
     loader_versions: &[(&str, i32)],
     fetched_at_ms: i64,
 ) {
-    let component_id = croopor_minecraft::LoaderComponentId::Fabric;
-    let index = croopor_minecraft::LoaderVersionIndex {
+    let component_id = axial_minecraft::LoaderComponentId::Fabric;
+    let index = axial_minecraft::LoaderVersionIndex {
         component_id,
         builds: loader_versions
             .iter()
@@ -2777,14 +2775,14 @@ fn write_fabric_loader_build_cache_with_builds(
 
 fn write_loader_build_cache_records(
     library_dir: &FsPath,
-    component_id: croopor_minecraft::LoaderComponentId,
+    component_id: axial_minecraft::LoaderComponentId,
     minecraft_version: &str,
-    builds: Vec<croopor_minecraft::LoaderBuildRecord>,
+    builds: Vec<axial_minecraft::LoaderBuildRecord>,
 ) {
     write_loader_build_cache_index(
         library_dir,
         minecraft_version,
-        croopor_minecraft::LoaderVersionIndex {
+        axial_minecraft::LoaderVersionIndex {
             component_id,
             builds,
         },
@@ -2795,16 +2793,16 @@ fn write_loader_build_cache_records(
 fn write_loader_build_cache_index(
     library_dir: &FsPath,
     minecraft_version: &str,
-    index: croopor_minecraft::LoaderVersionIndex,
+    index: axial_minecraft::LoaderVersionIndex,
     fetched_at_ms: i64,
 ) {
     let component_id = index.component_id;
     let cache = TestCachedCatalog {
-        schema_version: croopor_minecraft::LOADER_CATALOG_SCHEMA_VERSION,
+        schema_version: axial_minecraft::LOADER_CATALOG_SCHEMA_VERSION,
         fetched_at_ms,
         value: index,
     };
-    let cache_dir = croopor_minecraft::loader_catalog_dir(library_dir);
+    let cache_dir = axial_minecraft::loader_catalog_dir(library_dir);
     fs::create_dir_all(&cache_dir).expect("create loader cache dir");
     fs::write(
         cache_dir.join(format!(
@@ -2818,45 +2816,42 @@ fn write_loader_build_cache_index(
 }
 
 fn fabric_build_record(
-    component_id: croopor_minecraft::LoaderComponentId,
+    component_id: axial_minecraft::LoaderComponentId,
     minecraft_version: &str,
     loader_version: &str,
     default_rank: i32,
-) -> croopor_minecraft::LoaderBuildRecord {
-    let build_id = croopor_minecraft::build_id_for(component_id, minecraft_version, loader_version);
-    let version_id = croopor_minecraft::installed_version_id_for(
-        component_id,
-        minecraft_version,
-        loader_version,
-    );
-    croopor_minecraft::LoaderBuildRecord {
-        subject_kind: croopor_minecraft::loaders::types::LoaderBuildSubjectKind::LoaderBuild,
+) -> axial_minecraft::LoaderBuildRecord {
+    let build_id = axial_minecraft::build_id_for(component_id, minecraft_version, loader_version);
+    let version_id =
+        axial_minecraft::installed_version_id_for(component_id, minecraft_version, loader_version);
+    axial_minecraft::LoaderBuildRecord {
+        subject_kind: axial_minecraft::loaders::types::LoaderBuildSubjectKind::LoaderBuild,
         component_id,
         component_name: component_id.display_name().to_string(),
         build_id,
         minecraft_version: minecraft_version.to_string(),
         loader_version: loader_version.to_string(),
         version_id,
-        build_meta: croopor_minecraft::LoaderBuildMetadata {
-            selection: croopor_minecraft::LoaderSelectionMeta {
+        build_meta: axial_minecraft::LoaderBuildMetadata {
+            selection: axial_minecraft::LoaderSelectionMeta {
                 default_rank,
-                reason: croopor_minecraft::LoaderSelectionReason::Recommended,
-                source: croopor_minecraft::LoaderSelectionSource::ExplicitApiFlag,
+                reason: axial_minecraft::LoaderSelectionReason::Recommended,
+                source: axial_minecraft::LoaderSelectionSource::ExplicitApiFlag,
             },
-            ..croopor_minecraft::LoaderBuildMetadata::default()
+            ..axial_minecraft::LoaderBuildMetadata::default()
         },
-        strategy: croopor_minecraft::LoaderInstallStrategy::FabricProfile,
-        artifact_kind: croopor_minecraft::LoaderArtifactKind::ProfileJson,
-        installability: croopor_minecraft::LoaderInstallability::Installable,
-        install_source: croopor_minecraft::loaders::LoaderInstallSource::ProfileJson {
+        strategy: axial_minecraft::LoaderInstallStrategy::FabricProfile,
+        artifact_kind: axial_minecraft::LoaderArtifactKind::ProfileJson,
+        installability: axial_minecraft::LoaderInstallability::Installable,
+        install_source: axial_minecraft::loaders::LoaderInstallSource::ProfileJson {
             url: "https://example.invalid/fabric-profile.json".to_string(),
         },
     }
 }
 
-fn loader_catalog_state(fresh: bool, stale: bool) -> croopor_minecraft::LoaderCatalogState {
-    croopor_minecraft::LoaderCatalogState {
-        availability: croopor_minecraft::LoaderAvailability {
+fn loader_catalog_state(fresh: bool, stale: bool) -> axial_minecraft::LoaderCatalogState {
+    axial_minecraft::LoaderCatalogState {
+        availability: axial_minecraft::LoaderAvailability {
             fresh,
             stale,
             cache_hit: stale,
@@ -2868,14 +2863,14 @@ fn loader_catalog_state(fresh: bool, stale: bool) -> croopor_minecraft::LoaderCa
     }
 }
 
-fn installed_loader_entry(build: &croopor_minecraft::LoaderBuildRecord) -> VersionEntry {
+fn installed_loader_entry(build: &axial_minecraft::LoaderBuildRecord) -> VersionEntry {
     VersionEntry {
-        subject_kind: croopor_minecraft::VersionSubjectKind::InstalledVersion,
+        subject_kind: axial_minecraft::VersionSubjectKind::InstalledVersion,
         id: build.version_id.clone(),
         raw_kind: "release".to_string(),
         release_time: String::new(),
-        minecraft_meta: croopor_minecraft::MinecraftVersionMeta::default(),
-        lifecycle: croopor_minecraft::LifecycleMeta::default(),
+        minecraft_meta: axial_minecraft::MinecraftVersionMeta::default(),
+        lifecycle: axial_minecraft::LifecycleMeta::default(),
         inherits_from: build.minecraft_version.clone(),
         launchable: true,
         installed: true,
@@ -2885,7 +2880,7 @@ fn installed_loader_entry(build: &croopor_minecraft::LoaderBuildRecord) -> Versi
         java_component: String::new(),
         java_major: 0,
         manifest_url: String::new(),
-        loader: Some(croopor_minecraft::VersionLoaderAttachment {
+        loader: Some(axial_minecraft::VersionLoaderAttachment {
             component_id: build.component_id,
             component_name: build.component_name.clone(),
             build_id: build.build_id.clone(),
@@ -2896,7 +2891,7 @@ fn installed_loader_entry(build: &croopor_minecraft::LoaderBuildRecord) -> Versi
 }
 
 fn write_version_manifest_cache(library_dir: &FsPath, version_ids: &[&str]) {
-    let cache_path = croopor_minecraft::version_manifest_cache_path(library_dir);
+    let cache_path = axial_minecraft::version_manifest_cache_path(library_dir);
     fs::create_dir_all(cache_path.parent().expect("version manifest cache parent"))
         .expect("create version manifest cache dir");
     let versions = version_ids
@@ -2930,7 +2925,7 @@ fn write_version_manifest_cache(library_dir: &FsPath, version_ids: &[&str]) {
 
 fn write_supported_versions_cache(
     library_dir: &FsPath,
-    component_id: croopor_minecraft::LoaderComponentId,
+    component_id: axial_minecraft::LoaderComponentId,
     version_ids: &[&str],
 ) {
     let versions = version_ids
@@ -2942,24 +2937,24 @@ fn write_supported_versions_cache(
 
 fn write_supported_versions_cache_with_stable_hints(
     library_dir: &FsPath,
-    component_id: croopor_minecraft::LoaderComponentId,
+    component_id: axial_minecraft::LoaderComponentId,
     version_ids: &[(&str, Option<bool>)],
 ) {
     let cache = TestCachedCatalog {
-        schema_version: croopor_minecraft::LOADER_CATALOG_SCHEMA_VERSION,
+        schema_version: axial_minecraft::LOADER_CATALOG_SCHEMA_VERSION,
         fetched_at_ms: chrono::Utc::now().timestamp_millis(),
         value: version_ids
             .iter()
             .map(|(version_id, stable_hint)| {
-                let analysis = croopor_minecraft::analyze_minecraft_version(
+                let analysis = axial_minecraft::analyze_minecraft_version(
                     version_id,
                     "release",
                     "",
                     *stable_hint,
                     &[],
                 );
-                croopor_minecraft::LoaderGameVersion {
-                    subject_kind: croopor_minecraft::VersionSubjectKind::MinecraftVersion,
+                axial_minecraft::LoaderGameVersion {
+                    subject_kind: axial_minecraft::VersionSubjectKind::MinecraftVersion,
                     id: (*version_id).to_string(),
                     release_time: String::new(),
                     minecraft_meta: analysis.minecraft_meta,
@@ -2969,7 +2964,7 @@ fn write_supported_versions_cache_with_stable_hints(
             })
             .collect::<Vec<_>>(),
     };
-    let cache_dir = croopor_minecraft::loader_catalog_dir(library_dir);
+    let cache_dir = axial_minecraft::loader_catalog_dir(library_dir);
     fs::create_dir_all(&cache_dir).expect("create loader cache dir");
     fs::write(
         cache_dir.join(format!(
@@ -3176,7 +3171,7 @@ fn add_test_instance(
     fixture: &TestFixture,
     name: &str,
     version_id: &str,
-) -> croopor_config::Instance {
+) -> axial_config::Instance {
     fixture
         .state
         .instances()
@@ -3204,22 +3199,19 @@ fn assert_not_launch_action(instance: &EnrichedInstance) {
     assert_ne!(instance.launch_action.label, "Launch");
     assert_ne!(
         instance.launch_action.primary_action,
-        croopor_config::LaunchPrimaryAction::Launch
+        axial_config::LaunchPrimaryAction::Launch
     );
 }
 
 fn write_installed_loader_version(
     library_dir: &FsPath,
-    component_id: croopor_minecraft::LoaderComponentId,
+    component_id: axial_minecraft::LoaderComponentId,
     minecraft_version: &str,
     loader_version: &str,
 ) {
-    let build_id = croopor_minecraft::build_id_for(component_id, minecraft_version, loader_version);
-    let version_id = croopor_minecraft::installed_version_id_for(
-        component_id,
-        minecraft_version,
-        loader_version,
-    );
+    let build_id = axial_minecraft::build_id_for(component_id, minecraft_version, loader_version);
+    let version_id =
+        axial_minecraft::installed_version_id_for(component_id, minecraft_version, loader_version);
     let version_dir = library_dir.join("versions").join(&version_id);
     fs::create_dir_all(&version_dir).expect("create loader version dir");
     fs::write(
@@ -3236,7 +3228,7 @@ fn write_installed_loader_version(
     )
     .expect("write loader version json");
     fs::write(
-        version_dir.join(".croopor-loader.json"),
+        version_dir.join(".axial-loader.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "schema_version": 1,
             "component_id": component_id,
@@ -3244,7 +3236,7 @@ fn write_installed_loader_version(
             "build_id": build_id,
             "minecraft_version": minecraft_version,
             "loader_version": loader_version,
-            "build_meta": croopor_minecraft::LoaderBuildMetadata::default()
+            "build_meta": axial_minecraft::LoaderBuildMetadata::default()
         }))
         .expect("serialize loader metadata"),
     )
@@ -3258,7 +3250,7 @@ impl TestFixture {
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         let state = AppState::new(AppStateInit {
-            app_name: "Croopor".to_string(),
+            app_name: "Axial".to_string(),
             version: "test".to_string(),
             config,
             instances,
@@ -3289,7 +3281,7 @@ impl Drop for TestFixture {
 
 fn test_root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "croopor-api-instances-{name}-{}-{}",
+        "axial-api-instances-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

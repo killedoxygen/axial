@@ -9,7 +9,7 @@ export type Route =
   | { name: 'accounts' }
   | { name: 'settings' };
 
-export const ROUTE_STORAGE_KEY = 'croopor:route';
+export const ROUTE_STORAGE_KEY = 'axial:route';
 
 export const route = signal<Route>({ name: 'home' });
 

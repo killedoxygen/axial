@@ -104,7 +104,7 @@ pub(super) struct LaunchPrewarmRunSummary {
 }
 
 pub(super) async fn prewarm_launch_plan(
-    plan: &croopor_launcher::VanillaLaunchPlan,
+    plan: &axial_launcher::VanillaLaunchPlan,
     resource_budget: Option<&LaunchProofResourceBudget>,
 ) -> LaunchPrewarmRunSummary {
     // Prewarm is bounded and best-effort. Resource pressure reduces or skips it.
@@ -173,7 +173,7 @@ pub(super) fn format_prewarm_run_summary(prewarm: &LaunchPrewarmRunSummary) -> S
     )
 }
 
-fn prewarm_candidate_paths(plan: &croopor_launcher::VanillaLaunchPlan) -> Vec<PathBuf> {
+fn prewarm_candidate_paths(plan: &axial_launcher::VanillaLaunchPlan) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
 

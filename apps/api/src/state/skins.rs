@@ -1,4 +1,4 @@
-use croopor_config::AppPaths;
+use axial_config::AppPaths;
 use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
@@ -6,7 +6,7 @@ use std::{
     sync::Mutex,
 };
 
-const SKIN_STORE_SCHEMA: &str = "croopor.skins.saved";
+const SKIN_STORE_SCHEMA: &str = "axial.skins.saved";
 const SKIN_STORE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -702,10 +702,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "croopor-skins-{name}-{}-{nanos}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("axial-skins-{name}-{}-{nanos}", std::process::id()))
     }
 
     fn cleanup(root: &Path) {

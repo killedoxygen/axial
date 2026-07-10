@@ -6,13 +6,13 @@ use crate::state::{
     AppStateInit, AuthLoginMinecraftProfile, InstallStore, NewAuthLoginMinecraftAccount,
     NewAuthLoginMsaToken, SessionStore,
 };
-use axum::Json;
-use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
-use croopor_launcher::{
+use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+use axial_launcher::{
     GuardianDecision, LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB, LaunchReadinessReason,
     LaunchReadinessReasonId, LaunchReadinessSeverity, OverrideOrigin, SessionId,
 };
-use croopor_performance::PerformanceManager;
+use axial_performance::PerformanceManager;
+use axum::Json;
 use sha1::{Digest, Sha1};
 use std::{
     fs,
@@ -47,7 +47,7 @@ impl TestFixture {
             .expect("set library dir");
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         let state = AppState::new(AppStateInit {
-            app_name: "Croopor".to_string(),
+            app_name: "Axial".to_string(),
             version: "test".to_string(),
             config,
             instances,
@@ -112,19 +112,9 @@ impl TestFixture {
     }
 
     fn write_ready_runtime(&self, component: &str) {
-        let runtime_bin = self
-            .paths
-            .library_dir
-            .join("runtime")
-            .join(component)
-            .join("bin");
-        fs::create_dir_all(&runtime_bin).expect("runtime bin");
-        let java_name = if cfg!(target_os = "windows") {
-            "javaw.exe"
-        } else {
-            "java"
-        };
-        let java_path = runtime_bin.join(java_name);
+        let runtime_root = self.paths.library_dir.join("runtime").join(component);
+        let java_path = managed_runtime_java_path(&runtime_root);
+        fs::create_dir_all(java_path.parent().expect("runtime bin")).expect("runtime bin");
         fs::write(&java_path, b"java").expect("runtime java");
         make_executable(&java_path);
     }
@@ -146,7 +136,7 @@ impl TestFixture {
         let java_path = bin_dir.join("java");
         fs::write(
             &java_path,
-            "#!/bin/sh\ncat >&2 <<'CROOPOR_JAVA_PROBE'\nopenjdk version \"21.0.2\" 2024-01-16\njava.vendor = Eclipse Adoptium\njava.runtime.name = OpenJDK Runtime Environment\nCROOPOR_JAVA_PROBE\n",
+            "#!/bin/sh\ncat >&2 <<'AXIAL_JAVA_PROBE'\nopenjdk version \"21.0.2\" 2024-01-16\njava.vendor = Eclipse Adoptium\njava.runtime.name = OpenJDK Runtime Environment\nAXIAL_JAVA_PROBE\n",
         )
         .expect("manual java");
         make_executable(&java_path);
@@ -343,7 +333,7 @@ fn write_runtime_manifest_proof(runtime_root: &Path, java_path: &Path) {
         }
     });
     fs::write(
-        runtime_root.join(".croopor-runtime-manifest.json"),
+        runtime_root.join(".axial-runtime-manifest.json"),
         serde_json::to_vec(&manifest).expect("manifest json"),
     )
     .expect("runtime manifest proof");
@@ -370,7 +360,7 @@ fn managed_runtime_java_path(runtime_root: &Path) -> PathBuf {
 
 fn test_root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "croopor-api-launch-{name}-{}-{}",
+        "axial-api-launch-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -524,7 +514,7 @@ fn test_budget_with_memory_and_disk(
 
 fn assert_has_memory_clamp_warning(guardian: &GuardianSummary) {
     for expected in [
-        "Minimum memory was higher than maximum memory, so Croopor clamped the launch minimum to match the maximum allocation.",
+        "Minimum memory was higher than maximum memory, so Axial clamped the launch minimum to match the maximum allocation.",
         "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.",
     ] {
         assert!(
@@ -540,7 +530,7 @@ fn assert_has_memory_clamp_warning(guardian: &GuardianSummary) {
 
 fn assert_no_memory_clamp_warning(guardian: &GuardianSummary) {
     for unexpected in [
-        "Minimum memory was higher than maximum memory, so Croopor clamped the launch minimum to match the maximum allocation.",
+        "Minimum memory was higher than maximum memory, so Axial clamped the launch minimum to match the maximum allocation.",
         "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.",
     ] {
         assert!(

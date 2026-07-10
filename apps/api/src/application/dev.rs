@@ -1,16 +1,16 @@
 //! Application-owned developer maintenance workflows.
 
 use crate::{application::skin::clear_all_pending_saved_skin_applies, state::AppState};
+use axial_config::AppConfig;
+use axial_minecraft::versions_dir;
 use axum::{Json, http::StatusCode};
-use croopor_config::AppConfig;
-use croopor_minecraft::versions_dir;
 use serde::Serialize;
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
-const DEV_LIBRARY_NOT_CONFIGURED_COPY: &str = "Croopor library is not configured";
+const DEV_LIBRARY_NOT_CONFIGURED_COPY: &str = "Axial library is not configured";
 const DEV_OPERATION_FAILED_COPY: &str =
     "Developer maintenance failed. Check local app data permissions and try again.";
 const DEV_BACKUP_LOCATION_COPY: &str = "local_app_data_backup";
@@ -44,7 +44,7 @@ pub async fn dev_cleanup_versions(state: &AppState) -> Result<DevCleanupResponse
 
     let config_paths = state.config().paths().clone();
     let backup_dir = config_paths.config_dir.join("backups").join(format!(
-        "croopor-backup-{}",
+        "axial-backup-{}",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     ));
     fs::create_dir_all(&backup_dir).map_err(internal_error)?;
@@ -195,7 +195,7 @@ fn internal_error(_error: impl std::fmt::Display) -> ApiError {
 }
 
 fn managed_library_dir_to_remove(
-    paths: &croopor_config::AppPaths,
+    paths: &axial_config::AppPaths,
     config: &AppConfig,
 ) -> Option<PathBuf> {
     let library_dir = config.library_dir.trim();
@@ -235,8 +235,8 @@ fn normalize_for_prefix(path: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::state::{AppState, AppStateInit, InstallStore, NewAuthLoginMsaToken, SessionStore};
-    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-    use croopor_performance::PerformanceManager;
+    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_performance::PerformanceManager;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -294,7 +294,7 @@ mod tests {
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         AppState::new(AppStateInit {
-            app_name: "Croopor".to_string(),
+            app_name: "Axial".to_string(),
             version: "test".to_string(),
             config,
             instances,
@@ -327,7 +327,7 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "croopor-api-dev-{name}-{}-{nonce}",
+            "axial-api-dev-{name}-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&root).expect("create test root");

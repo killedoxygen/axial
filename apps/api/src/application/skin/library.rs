@@ -1,12 +1,12 @@
 use crate::state::AppState;
 use crate::state::skins::{SavedSkinDeleteResult, SavedSkinRecord};
+use axial_config::validate_username;
 use axum::{
     Json,
     body::{Body, to_bytes},
     http::{Response, StatusCode, header},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use croopor_config::validate_username;
 use serde::{Deserialize, Serialize};
 
 use super::SKIN_UPLOAD_MAX_BYTES;

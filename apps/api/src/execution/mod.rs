@@ -14,7 +14,7 @@ use crate::observability::{
     EvidenceField, RedactionAudience, sanitize_evidence_text, sanitize_evidence_token,
 };
 use crate::state::contracts::{OperationId, OwnershipClass, TargetDescriptor};
-use croopor_launcher::LaunchStageEvidence;
+use axial_launcher::LaunchStageEvidence;
 use serde::{Deserialize, Serialize};
 
 const MAX_STAGE_EVIDENCE_DETAILS: usize = 8;

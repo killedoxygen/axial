@@ -197,7 +197,7 @@ pub struct GuardianCommandCarrier {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PerformanceCommandCarrier {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective_plan: Option<croopor_performance::EffectivePerformancePlan>,
+    pub effective_plan: Option<axial_performance::EffectivePerformancePlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<PerformanceProofRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

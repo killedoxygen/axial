@@ -1,12 +1,12 @@
 use crate::application::launch as launch_app;
 use crate::observability::{RedactionAudience, sanitize_evidence_token, sanitize_public_log_line};
 use crate::state::{AppState, LaunchEvent, LaunchLogEvent, LaunchStatusEvent};
+use axial_launcher::{is_terminal_state, is_terminal_status, snapshot_status};
 use axum::{
     Json,
     http::StatusCode,
     response::sse::{Event, Sse},
 };
-use croopor_launcher::{is_terminal_state, is_terminal_status, snapshot_status};
 use std::convert::Infallible;
 
 pub(super) async fn launch_events_sse(

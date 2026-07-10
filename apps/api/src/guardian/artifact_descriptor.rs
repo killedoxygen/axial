@@ -11,11 +11,9 @@ use crate::execution::download::{
 use crate::state::contracts::{
     OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind, sanitize_target_id,
 };
-use croopor_minecraft::download::{
-    SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind,
-};
-use croopor_minecraft::launch::{AssetIndex, DownloadEntry, LibraryArtifact};
-use croopor_minecraft::manifest::ManifestEntry;
+use axial_minecraft::download::{SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind};
+use axial_minecraft::launch::{AssetIndex, DownloadEntry, LibraryArtifact};
+use axial_minecraft::manifest::ManifestEntry;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use url::Url;
@@ -340,10 +338,10 @@ mod tests {
         MAX_MINECRAFT_REPAIR_ARTIFACT_BYTES,
     };
     use crate::state::contracts::OwnershipClass;
-    use croopor_minecraft::download::{
+    use axial_minecraft::download::{
         SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind,
     };
-    use croopor_minecraft::launch::{AssetIndex, DownloadEntry, LibraryArtifact};
+    use axial_minecraft::launch::{AssetIndex, DownloadEntry, LibraryArtifact};
     use sha1::{Digest, Sha1};
     use std::path::{Path, PathBuf};
 
@@ -351,7 +349,7 @@ mod tests {
 
     #[test]
     fn client_download_descriptor_maps_to_repair_source_inputs() {
-        let destination = Path::new("/tmp/croopor/versions/1.21.5/1.21.5.jar");
+        let destination = Path::new("/tmp/axial/versions/1.21.5/1.21.5.jar");
         let body = b"client jar";
         let descriptor = GuardianMinecraftArtifactRepairDescriptor::from_client_download(
             "1.21.5",
@@ -386,7 +384,7 @@ mod tests {
 
     #[test]
     fn library_artifact_descriptor_maps_non_client_metadata() {
-        let destination = Path::new("/tmp/croopor/libraries/org/example/lib/1.0.0/lib-1.0.0.jar");
+        let destination = Path::new("/tmp/axial/libraries/org/example/lib/1.0.0/lib-1.0.0.jar");
         let descriptor = GuardianMinecraftArtifactRepairDescriptor::from_library_artifact(
             "org.example.lib.1.0.0",
             destination,
@@ -414,7 +412,7 @@ mod tests {
 
     #[test]
     fn asset_index_descriptor_maps_asset_metadata() {
-        let destination = Path::new("/tmp/croopor/assets/indexes/17.json");
+        let destination = Path::new("/tmp/axial/assets/indexes/17.json");
         let descriptor = GuardianMinecraftArtifactRepairDescriptor::from_asset_index(
             &AssetIndex {
                 id: "17".to_string(),
@@ -435,7 +433,7 @@ mod tests {
 
     #[test]
     fn descriptor_rejects_unsafe_or_incomplete_metadata_before_effects() {
-        let destination = Path::new("/tmp/croopor/artifact.jar");
+        let destination = Path::new("/tmp/axial/artifact.jar");
         assert_eq!(
             selected_metadata("target", destination)
                 .with_provider_url("")
@@ -501,7 +499,7 @@ mod tests {
 
     #[test]
     fn descriptor_debug_output_is_redacted() {
-        let root = PathBuf::from("/tmp/croopor/redaction");
+        let root = PathBuf::from("/tmp/axial/redaction");
         let destination = root.join("artifact.jar");
         let checksum = sha1_hex(b"artifact");
         let descriptor = selected_metadata("artifact_target", &destination)
@@ -522,7 +520,7 @@ mod tests {
 
     #[test]
     fn core_selected_descriptor_maps_to_guardian_repair_descriptor() {
-        let root = PathBuf::from("/tmp/croopor/selected");
+        let root = PathBuf::from("/tmp/axial/selected");
         let destination = root.join("logs/log4j2.xml");
         let checksum = sha1_hex(b"log config");
         let core_descriptor = SelectedDownloadArtifactDescriptor::new(

@@ -59,7 +59,7 @@ export function classifyLogLine(text: string): LogLineKind {
   const lower = text.toLowerCase();
   if (/\b(errors?|fatal|exceptions?|crashes?|crashed)\b/.test(lower)) return 'error';
   if (/\bwarn(?:ing|ings|ed)?\b/.test(lower)) return 'warning';
-  if (/\b(launcher|system|guardian|healing|croopor)\b/.test(lower)) return 'system';
+  if (/\b(launcher|system|guardian|healing|axial)\b/.test(lower)) return 'system';
   return 'info';
 }
 

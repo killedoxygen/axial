@@ -845,7 +845,7 @@ async fn skin_profile_save_from_profile_downloads_normalizes_and_saves_active_sk
 
     assert_eq!(request.path, "/texture/activeTexture123");
     assert_eq!(request.accept.as_deref(), Some("image/png"));
-    assert_eq!(request.user_agent.as_deref(), Some(CROOPOR_USER_AGENT));
+    assert_eq!(request.user_agent.as_deref(), Some(AXIAL_USER_AGENT));
     assert_eq!(saved.name, "MinecraftName profile skin");
     assert_eq!(normalized.variant_suggestion, "classic");
     assert_eq!(saved.variant, normalized.variant_suggestion);
@@ -1073,11 +1073,11 @@ async fn skin_username_save_downloads_normalizes_and_saves_session_skin() {
     assert_eq!(session_request.accept.as_deref(), Some("application/json"));
     assert_eq!(
         profile_request.user_agent.as_deref(),
-        Some(CROOPOR_USER_AGENT)
+        Some(AXIAL_USER_AGENT)
     );
     assert_eq!(
         session_request.user_agent.as_deref(),
-        Some(CROOPOR_USER_AGENT)
+        Some(AXIAL_USER_AGENT)
     );
     assert_eq!(texture_request.path, "/texture/usernameTexture123");
     assert_eq!(texture_request.accept.as_deref(), Some("image/png"));

@@ -1,11 +1,11 @@
 use crate::logging::timestamp_utc;
-use croopor_config::AppPaths;
+use axial_config::AppPaths;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-const BENCHMARK_SUITE_SCHEMA: &str = "croopor.launch.benchmark.suite";
+const BENCHMARK_SUITE_SCHEMA: &str = "axial.launch.benchmark.suite";
 const BENCHMARK_SUITE_SCHEMA_VERSION: u32 = 2;
 const MAX_SUITE_ID_STEM_CHARS: usize = 96;
 const MAX_DERIVED_INSTANCE_ID_CHARS: usize = 40;
@@ -388,7 +388,7 @@ fn stable_hash(parts: &[&str]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use croopor_config::AppPaths;
+    use axial_config::AppPaths;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -725,7 +725,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("croopor-{name}-{nanos}"))
+        std::env::temp_dir().join(format!("axial-{name}-{nanos}"))
     }
 
     fn test_paths(root: &Path) -> AppPaths {

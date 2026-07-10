@@ -66,7 +66,7 @@ async fn prepare_launch_session_ensures_instance_layout_before_building_intent()
     assert_eq!(prepared.task.intent.auth.player_name, "Player");
     assert_eq!(
         prepared.task.intent.auth.uuid,
-        croopor_minecraft::offline_uuid("Player")
+        axial_minecraft::offline_uuid("Player")
     );
     assert_eq!(prepared.task.intent.auth.access_token, "0");
     assert_eq!(prepared.task.intent.auth.user_type, "msa");

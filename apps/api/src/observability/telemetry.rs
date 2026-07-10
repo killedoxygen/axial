@@ -1,5 +1,5 @@
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_public_json_value};
-use croopor_config::{AppConfig, ConfigStore, FEATURE_FLAGS};
+use axial_config::{AppConfig, ConfigStore, FEATURE_FLAGS};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -12,9 +12,9 @@ use std::thread;
 use std::time::Duration;
 use url::Url;
 
-pub const POSTHOG_API_KEY_ENV: &str = "CROOPOR_POSTHOG_API_KEY";
-pub const POSTHOG_HOST_ENV: &str = "CROOPOR_POSTHOG_HOST";
-pub const POSTHOG_ENVIRONMENT_ENV: &str = "CROOPOR_POSTHOG_ENVIRONMENT";
+pub const POSTHOG_API_KEY_ENV: &str = "AXIAL_POSTHOG_API_KEY";
+pub const POSTHOG_HOST_ENV: &str = "AXIAL_POSTHOG_HOST";
+pub const POSTHOG_ENVIRONMENT_ENV: &str = "AXIAL_POSTHOG_ENVIRONMENT";
 pub const DEFAULT_POSTHOG_HOST: &str = "https://eu.i.posthog.com";
 pub const TELEMETRY_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -23,7 +23,7 @@ const TELEMETRY_BATCH_CAP: usize = 20;
 const TELEMETRY_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const TELEMETRY_SYNC_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 const TELEMETRY_SYNC_JOIN_TIMEOUT: Duration = Duration::from_millis(3_500);
-const TELEMETRY_USER_AGENT: &str = concat!("croopor/", env!("CARGO_PKG_VERSION"), " telemetry");
+const TELEMETRY_USER_AGENT: &str = concat!("axial/", env!("CARGO_PKG_VERSION"), " telemetry");
 const MAX_PROPERTY_TEXT_CHARS: usize = 128;
 const MAX_PROPERTY_TOKEN_CHARS: usize = 64;
 pub(crate) const MAX_EXCEPTION_SUMMARY_CHARS: usize = 200;
@@ -63,14 +63,14 @@ fn default_posthog_environment() -> &'static str {
 pub fn configured_posthog_key() -> Option<String> {
     let raw = std::env::var(POSTHOG_API_KEY_ENV)
         .ok()
-        .or_else(|| option_env!("CROOPOR_POSTHOG_API_KEY").map(str::to_string))?;
+        .or_else(|| option_env!("AXIAL_POSTHOG_API_KEY").map(str::to_string))?;
     sanitize_posthog_key(&raw).ok()
 }
 
 pub fn configured_posthog_host() -> String {
     let raw = std::env::var(POSTHOG_HOST_ENV)
         .ok()
-        .or_else(|| option_env!("CROOPOR_POSTHOG_HOST").map(str::to_string));
+        .or_else(|| option_env!("AXIAL_POSTHOG_HOST").map(str::to_string));
     raw.as_deref()
         .and_then(sanitize_posthog_host)
         .unwrap_or_else(|| DEFAULT_POSTHOG_HOST.to_string())
@@ -79,7 +79,7 @@ pub fn configured_posthog_host() -> String {
 pub fn configured_posthog_environment() -> String {
     let raw = std::env::var(POSTHOG_ENVIRONMENT_ENV)
         .ok()
-        .or_else(|| option_env!("CROOPOR_POSTHOG_ENVIRONMENT").map(str::to_string));
+        .or_else(|| option_env!("AXIAL_POSTHOG_ENVIRONMENT").map(str::to_string));
     raw.as_deref()
         .and_then(sanitize_posthog_environment)
         .unwrap_or_else(|| default_posthog_environment().to_string())
@@ -897,9 +897,9 @@ mod tests {
     use super::*;
     use crate::app::default_frontend_dir;
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
+    use axial_config::{AppPaths, InstanceStore};
+    use axial_performance::PerformanceManager;
     use axum::{Json, Router, extract::State, http::StatusCode, http::Uri, routing::post};
-    use croopor_config::{AppPaths, InstanceStore};
-    use croopor_performance::PerformanceManager;
     use std::fs;
     use std::path::PathBuf;
     use tokio::sync::mpsc;
@@ -916,7 +916,7 @@ mod tests {
     impl TestConfig {
         fn new(name: &str, config: AppConfig) -> Self {
             let root = std::env::temp_dir().join(format!(
-                "croopor-api-telemetry-{name}-{}-{}",
+                "axial-api-telemetry-{name}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1120,7 +1120,7 @@ mod tests {
             TelemetryErrorKind::ConfigSaveFailed,
             TelemetryErrorArea::Config,
             TelemetryErrorLevel::Error,
-            "failed writing /Users/alice/.croopor/config.json",
+            "failed writing /Users/alice/.axial/config.json",
         ));
 
         let queued = hub.queued_batch_for_test();
@@ -1420,7 +1420,7 @@ mod tests {
             Arc::new(InstanceStore::load_from(fixture.paths.clone()).expect("load instances"));
         AppState::new_with_telemetry(
             AppStateInit {
-                app_name: "Croopor".to_string(),
+                app_name: "Axial".to_string(),
                 version: "test".to_string(),
                 config: fixture.store.clone(),
                 instances,

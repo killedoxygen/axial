@@ -165,7 +165,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     {
       value: 'managed',
       label: 'Managed',
-      note: 'Croopor applies recommended tuning and optimizations for this instance.',
+      note: 'Axial applies recommended tuning and optimizations for this instance.',
     },
     { value: 'vanilla', label: 'Vanilla', note: 'Pure Minecraft. No tweaks or add-ons applied at launch.' },
     { value: 'custom', label: 'Custom', note: 'You set the tuning. Your manual choices are kept as-is.' },

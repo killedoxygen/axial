@@ -3,13 +3,13 @@ use crate::application::{
     loader_builds, loader_components, loader_game_versions, loader_install_events_stream,
 };
 use crate::state::AppState;
+use axial_minecraft::LoaderComponentId;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
-use croopor_minecraft::LoaderComponentId;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]

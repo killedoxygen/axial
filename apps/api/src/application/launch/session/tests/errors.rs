@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn launch_layout_error_response_keeps_500_and_hides_unix_path_material() {
     let (status, Json(body)) = launch_layout_error_response(
-        "/Users/alice/Library/Application Support/Croopor/instances/survival: Permission denied (os error 13)",
+        "/Users/alice/Library/Application Support/Axial/instances/survival: Permission denied (os error 13)",
     );
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -31,7 +31,7 @@ fn launch_layout_error_response_keeps_500_and_hides_unix_path_material() {
 #[test]
 fn launch_layout_error_response_hides_windows_path_material_and_raw_io_text() {
     let (status, Json(body)) = launch_layout_error_response(
-        r"C:\Users\Alice\AppData\Roaming\Croopor\instances\creative: Access is denied. Read-only file system (os error 5)",
+        r"C:\Users\Alice\AppData\Roaming\Axial\instances\creative: Access is denied. Read-only file system (os error 5)",
     );
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);

@@ -23,12 +23,12 @@ use crate::observability::telemetry::{
 };
 use crate::state::launch_reports::LaunchProofContext;
 use crate::state::{AppState, StartupOutcome};
-use croopor_launcher::{
+use axial_launcher::{
     GuardianSummary, LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome,
     LaunchState, PreparedLaunchAttempt, build_healing_summary, prepare_launch_attempt_with_events,
 };
-use croopor_minecraft::download::repair_virtual_assets_from_index;
-use croopor_minecraft::paths::assets_dir;
+use axial_minecraft::download::repair_virtual_assets_from_index;
+use axial_minecraft::paths::assets_dir;
 use failure::{fail_launch, fail_launch_with_outcome};
 use metadata::persist_launch_metadata;
 use prewarm::{format_prewarm_run_summary, prewarm_launch_plan};
@@ -58,13 +58,13 @@ pub struct LaunchSuccess {
     pub launched_at: String,
     pub max_memory_mb: i32,
     pub min_memory_mb: i32,
-    pub healing: Option<croopor_launcher::LaunchHealingSummary>,
+    pub healing: Option<axial_launcher::LaunchHealingSummary>,
     pub guardian: Option<GuardianSummary>,
 }
 
 pub struct LaunchRequestError {
     pub message: String,
-    pub healing: Option<croopor_launcher::LaunchHealingSummary>,
+    pub healing: Option<axial_launcher::LaunchHealingSummary>,
     pub guardian: Option<GuardianSummary>,
 }
 
@@ -113,7 +113,7 @@ pub async fn launch_session(
     let proof_context = LaunchProofContext::from_intent(&intent)
         .with_benchmark(benchmark)
         .with_resource_budget(resource_budget);
-    let mut attempt = croopor_launcher::service::AttemptOverrides::default();
+    let mut attempt = axial_launcher::service::AttemptOverrides::default();
     let mut last_recovery_plan: Option<GuardianLaunchRecoveryPlan> = None;
     let mut launch_completion_pending = false;
     emit_launch_started(
@@ -426,7 +426,7 @@ pub async fn launch_session(
         command.current_dir(launch_command.game_dir);
 
         let record = crate::state::LaunchSessionRecord {
-            session_id: croopor_launcher::SessionId(session_id.clone()),
+            session_id: axial_launcher::SessionId(session_id.clone()),
             instance_id: intent.instance_id.clone(),
             version_id: intent.version_id.clone(),
             launched_at: Some(launched_at.clone()),
@@ -750,9 +750,9 @@ fn emit_pending_launch_failure(state: &AppState, launch_completion_pending: &mut
 }
 
 async fn repair_legacy_virtual_assets_before_launch(
-    intent: &croopor_launcher::LaunchIntent,
-    plan: &croopor_launcher::VanillaLaunchPlan,
-) -> Result<(), croopor_minecraft::download::DownloadError> {
+    intent: &axial_launcher::LaunchIntent,
+    plan: &axial_launcher::VanillaLaunchPlan,
+) -> Result<(), axial_minecraft::download::DownloadError> {
     let asset_index_id = plan.version.asset_index.id.trim();
     if asset_index_id.is_empty() {
         return Ok(());
@@ -765,21 +765,21 @@ async fn repair_legacy_virtual_assets_before_launch(
 }
 
 fn launch_policy_guardian_mode(
-    mode: croopor_launcher::GuardianMode,
+    mode: axial_launcher::GuardianMode,
 ) -> crate::guardian::GuardianMode {
     match mode {
-        croopor_launcher::GuardianMode::Managed => crate::guardian::GuardianMode::Managed,
-        croopor_launcher::GuardianMode::Custom => crate::guardian::GuardianMode::Custom,
+        axial_launcher::GuardianMode::Managed => crate::guardian::GuardianMode::Managed,
+        axial_launcher::GuardianMode::Custom => crate::guardian::GuardianMode::Custom,
     }
 }
 
 fn startup_failure_healing(
-    intent: &croopor_launcher::LaunchIntent,
+    intent: &axial_launcher::LaunchIntent,
     prepared: &PreparedLaunchAttempt,
-    attempt: &croopor_launcher::service::AttemptOverrides,
+    attempt: &axial_launcher::service::AttemptOverrides,
     failure_class: LaunchFailureClass,
-) -> Option<croopor_launcher::LaunchHealingSummary> {
-    build_healing_summary(croopor_launcher::service::HealingSummaryInput {
+) -> Option<axial_launcher::LaunchHealingSummary> {
+    build_healing_summary(axial_launcher::service::HealingSummaryInput {
         auth_mode: if intent.auth.is_offline() {
             "offline"
         } else {
@@ -804,9 +804,9 @@ mod tests {
     use super::*;
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
     use crate::state::{AppStateInit, InstallStore, LaunchEvent, SessionStore};
-    use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
-    use croopor_launcher::{LaunchSessionRecord, SessionId};
-    use croopor_performance::PerformanceManager;
+    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+    use axial_launcher::{LaunchSessionRecord, SessionId};
+    use axial_performance::PerformanceManager;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -948,7 +948,7 @@ mod tests {
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         AppState::new(AppStateInit {
-            app_name: "Croopor".to_string(),
+            app_name: "Axial".to_string(),
             version: "test".to_string(),
             config,
             instances,
@@ -980,7 +980,7 @@ mod tests {
 
         AppState::new_with_telemetry(
             AppStateInit {
-                app_name: "Croopor".to_string(),
+                app_name: "Axial".to_string(),
                 version: "test".to_string(),
                 config,
                 instances,

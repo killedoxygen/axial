@@ -1,6 +1,6 @@
 use crate::logging::timestamp_utc;
 use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
-use croopor_config::AppPaths;
+use axial_config::AppPaths;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -1028,7 +1028,7 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "croopor-suite-driver-{name}-{}-{nanos}",
+            "axial-suite-driver-{name}-{}-{nanos}",
             std::process::id()
         ))
     }

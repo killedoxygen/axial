@@ -3,12 +3,12 @@ use super::{
     operation::install_progress_history_from_journal, sanitize_install_progress,
 };
 use crate::state::{AppState, InstallProgressRecord};
+use axial_minecraft::DownloadProgress;
 use axum::{
     Json,
     http::StatusCode,
     response::sse::{Event, Sse},
 };
-use croopor_minecraft::DownloadProgress;
 use std::convert::Infallible;
 
 pub async fn install_events_stream(

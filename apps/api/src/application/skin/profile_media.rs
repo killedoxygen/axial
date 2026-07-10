@@ -1,11 +1,11 @@
 use crate::state::{AppState, AuthLoginMinecraftAccount};
+use axial_config::validate_username;
+use axial_minecraft::offline_uuid;
 use axum::{
     Json,
     body::Body,
     http::{Response, StatusCode, header},
 };
-use croopor_config::validate_username;
-use croopor_minecraft::offline_uuid;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 

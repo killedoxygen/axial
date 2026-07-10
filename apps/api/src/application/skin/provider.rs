@@ -27,7 +27,7 @@ const MINECRAFT_SKIN_RESET_ENDPOINT: &str =
     "https://api.minecraftservices.com/minecraft/profile/skins/active";
 const MINECRAFT_CAPE_ENDPOINT: &str =
     "https://api.minecraftservices.com/minecraft/profile/capes/active";
-pub(super) const CROOPOR_USER_AGENT: &str = concat!("croopor/", env!("CARGO_PKG_VERSION"));
+pub(super) const AXIAL_USER_AGENT: &str = concat!("axial/", env!("CARGO_PKG_VERSION"));
 
 static MINECRAFT_USERNAME_SKIN_CACHE: LazyLock<
     tokio::sync::Mutex<HashMap<String, MinecraftUsernameSkinCacheEntry>>,
@@ -248,7 +248,7 @@ impl MinecraftSkinUsernameClient {
             .http
             .get(format!("{}/{username}", self.profile_endpoint))
             .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::USER_AGENT, CROOPOR_USER_AGENT)
+            .header(reqwest::header::USER_AGENT, AXIAL_USER_AGENT)
             .send()
             .await
             .map_err(|_| MinecraftUsernameSkinError::Unavailable)?;
@@ -267,7 +267,7 @@ impl MinecraftSkinUsernameClient {
             .http
             .get(format!("{}/{uuid}", self.session_profile_endpoint))
             .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::USER_AGENT, CROOPOR_USER_AGENT)
+            .header(reqwest::header::USER_AGENT, AXIAL_USER_AGENT)
             .send()
             .await
             .map_err(|_| MinecraftUsernameSkinError::Unavailable)?;
@@ -470,7 +470,7 @@ impl MinecraftSkinTextureClient {
             .http
             .get(url)
             .header(reqwest::header::ACCEPT, "image/png")
-            .header(reqwest::header::USER_AGENT, CROOPOR_USER_AGENT)
+            .header(reqwest::header::USER_AGENT, AXIAL_USER_AGENT)
             .send()
             .await
             .map_err(|_| SkinTextureDownloadError::Unavailable)?;
@@ -553,7 +553,7 @@ impl MinecraftSkinUploadClient {
             .post(&self.endpoint)
             .bearer_auth(access_token)
             .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::USER_AGENT, CROOPOR_USER_AGENT)
+            .header(reqwest::header::USER_AGENT, AXIAL_USER_AGENT)
             .multipart(form)
             .send()
             .await
@@ -615,7 +615,7 @@ impl MinecraftSkinResetClient {
             .delete(&self.endpoint)
             .bearer_auth(access_token)
             .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::USER_AGENT, CROOPOR_USER_AGENT)
+            .header(reqwest::header::USER_AGENT, AXIAL_USER_AGENT)
             .send()
             .await
             .map_err(|_| SkinUploadError::Unavailable)?;
@@ -692,7 +692,7 @@ impl MinecraftCapeSyncClient {
         let response = request
             .bearer_auth(access_token)
             .header(reqwest::header::ACCEPT, "application/json")
-            .header(reqwest::header::USER_AGENT, CROOPOR_USER_AGENT)
+            .header(reqwest::header::USER_AGENT, AXIAL_USER_AGENT)
             .send()
             .await
             .map_err(|_| SkinCapeError::Unavailable)?;
@@ -769,7 +769,7 @@ fn minecraft_skin_http_client() -> reqwest::Client {
             reqwest::Client::builder()
                 .connect_timeout(MINECRAFT_SKIN_HTTP_CONNECT_TIMEOUT)
                 .timeout(MINECRAFT_SKIN_HTTP_TIMEOUT)
-                .user_agent(CROOPOR_USER_AGENT)
+                .user_agent(AXIAL_USER_AGENT)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         })

@@ -1,4 +1,4 @@
-use croopor_launcher::{
+use axial_launcher::{
     LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome, LaunchState,
 };
 
@@ -101,7 +101,7 @@ fn render_thread_atlas_created(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{SessionOutcomeInput, boot_marker_detected, classify_session_outcome};
-    use croopor_launcher::{LaunchFailureClass, LaunchSessionExitReason, LaunchState};
+    use axial_launcher::{LaunchFailureClass, LaunchSessionExitReason, LaunchState};
 
     #[test]
     fn boot_marker_detected_accepts_explicit_boot_evidence() {

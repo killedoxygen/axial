@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Croopor",
+  "productName": "Axial",
   "version": "0.4.0-alpha",
-  "identifier": "dev.mateoltd.croopor",
+  "identifier": "dev.mateoltd.axial",
   "build": {
     "beforeBuildCommand": "cd ../../frontend && pnpm run build",
     "frontendDist": "../../frontend/static"
@@ -12,7 +12,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Croopor",
+        "title": "Axial",
         "width": 1100,
         "height": 720,
         "minWidth": 960,

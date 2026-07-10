@@ -476,7 +476,7 @@ fn mixed_windows_native_libraries_only_download_matching_arch() {
         os_version: String::new(),
         features: HashMap::new(),
     };
-    let mc_dir = Path::new("/tmp/croopor-test");
+    let mc_dir = Path::new("/tmp/axial-test");
     let libraries = vec![
         native_library("org.lwjgl:lwjgl:3.3.3:natives-windows-arm64"),
         native_library("org.lwjgl:lwjgl:3.3.3:natives-windows-x86"),
@@ -524,7 +524,7 @@ fn legacy_native_classifier_prefers_windows_generic_classifier() {
         ..Library::default()
     };
 
-    let job = resolve_native_download(&lib, Path::new("/tmp/croopor-test"), "windows")
+    let job = resolve_native_download(&lib, Path::new("/tmp/axial-test"), "windows")
         .expect("native download");
 
     assert!(job.name.contains("natives-windows.jar"));
@@ -548,7 +548,7 @@ fn library_jobs_deduplicate_same_destination() {
         os_version: String::new(),
         features: HashMap::new(),
     };
-    let mc_dir = Path::new("/tmp/croopor-test");
+    let mc_dir = Path::new("/tmp/axial-test");
     let libraries = vec![
         normal_library("org.example:duplicate:1.0.0"),
         normal_library("org.example:duplicate:1.0.0"),
@@ -562,7 +562,7 @@ fn library_jobs_deduplicate_same_destination() {
 
 #[test]
 fn unique_asset_object_jobs_deduplicate_same_hash() {
-    let objects_dir = Path::new("/tmp/croopor-test/assets/objects");
+    let objects_dir = Path::new("/tmp/axial-test/assets/objects");
     let hash_a = "abcdef1234567890abcdef1234567890abcdef12";
     let hash_b = "1234567890abcdef1234567890abcdef12345678";
 
@@ -580,7 +580,7 @@ fn unique_asset_object_jobs_deduplicate_same_hash() {
 
 #[test]
 fn unique_asset_object_jobs_rejects_one_character_hash() {
-    let objects_dir = Path::new("/tmp/croopor-test/assets/objects");
+    let objects_dir = Path::new("/tmp/axial-test/assets/objects");
     let result = unique_asset_object_jobs(objects_dir, [("a", 4)]);
 
     assert!(matches!(result, Err(DownloadError::Integrity(_))));
@@ -588,7 +588,7 @@ fn unique_asset_object_jobs_rejects_one_character_hash() {
 
 #[test]
 fn unique_asset_object_jobs_rejects_non_hex_hash() {
-    let objects_dir = Path::new("/tmp/croopor-test/assets/objects");
+    let objects_dir = Path::new("/tmp/axial-test/assets/objects");
     let result = unique_asset_object_jobs(
         objects_dir,
         [("abcdef1234567890abcdef1234567890abcdef1z", 4)],
@@ -1133,7 +1133,7 @@ fn download_windows_verbatim_path_transform_handles_drive_unc_and_relative_paths
 
 #[test]
 fn download_integrity_futures_stay_small_enough_for_tokio_workers() {
-    let path = Path::new("/tmp/croopor-test/artifact.jar");
+    let path = Path::new("/tmp/axial-test/artifact.jar");
     let expected = ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
     assert!(
@@ -1385,7 +1385,7 @@ async fn virtual_asset_index_repair_refreshes_stale_legacy_copy() {
 
 #[test]
 fn virtual_asset_destination_rejects_unsafe_provider_paths() {
-    let root = Path::new("/tmp/croopor-test/assets/virtual/legacy");
+    let root = Path::new("/tmp/axial-test/assets/virtual/legacy");
 
     assert_eq!(
         virtual_asset_destination(root, "sounds/step.ogg").expect("safe path"),
@@ -1454,14 +1454,11 @@ async fn promotion_sweep_removes_stale_other_pid_backups_only() {
     let destination = root.join("artifact.jar");
     fs::write(&destination, b"destination").expect("write destination");
     let other_pid = unused_pid_for_test(&[std::process::id()]);
-    let other_pid_backup = root.join(format!("artifact.jar.croopor-backup-{other_pid}"));
-    let current_pid_backup = root.join(format!(
-        "artifact.jar.croopor-backup-{}",
-        std::process::id()
-    ));
-    let unrelated = root.join("other.jar.croopor-backup-7");
-    let backup_directory = root.join("artifact.jar.croopor-backup-8");
-    let invalid_pid_backup = root.join("artifact.jar.croopor-backup-not-a-pid");
+    let other_pid_backup = root.join(format!("artifact.jar.axial-backup-{other_pid}"));
+    let current_pid_backup = root.join(format!("artifact.jar.axial-backup-{}", std::process::id()));
+    let unrelated = root.join("other.jar.axial-backup-7");
+    let backup_directory = root.join("artifact.jar.axial-backup-8");
+    let invalid_pid_backup = root.join("artifact.jar.axial-backup-not-a-pid");
     fs::write(&other_pid_backup, b"stale").expect("write stale backup");
     fs::write(&current_pid_backup, b"current").expect("write current backup");
     fs::write(&unrelated, b"unrelated").expect("write unrelated backup");
@@ -1489,7 +1486,7 @@ async fn promotion_sweep_preserves_live_other_pid_backup() {
     let destination = root.join("artifact.jar");
     fs::write(&destination, b"destination").expect("write destination");
     let mut child = spawn_promotion_sweep_child_process();
-    let live_pid_backup = root.join(format!("artifact.jar.croopor-backup-{}", child.id()));
+    let live_pid_backup = root.join(format!("artifact.jar.axial-backup-{}", child.id()));
     fs::write(&live_pid_backup, b"live").expect("write live backup");
 
     let sweep_result = sweep_stale_promotion_backups(&destination).await;
@@ -1512,7 +1509,7 @@ async fn promote_sweeps_stale_backups_before_replace() {
     let destination = root.join("artifact.jar");
     let temp_path = download_temp_path(&destination);
     let other_pid = unused_pid_for_test(&[std::process::id()]);
-    let stale_backup = root.join(format!("artifact.jar.croopor-backup-{other_pid}"));
+    let stale_backup = root.join(format!("artifact.jar.axial-backup-{other_pid}"));
     fs::write(&destination, b"stale").expect("write destination");
     fs::write(&temp_path, b"fresh").expect("write temp");
     fs::write(&stale_backup, b"orphan").expect("write stale backup");
@@ -1536,7 +1533,7 @@ fn spawn_promotion_sweep_child_process() -> std::process::Child {
         .arg("--exact")
         .arg("download::tests::promotion_sweep_live_pid_child_process")
         .arg("--ignored")
-        .env("CROOPOR_PROMOTION_SWEEP_CHILD", "1")
+        .env("AXIAL_PROMOTION_SWEEP_CHILD", "1")
         .spawn()
         .expect("spawn live pid child")
 }
@@ -1544,7 +1541,7 @@ fn spawn_promotion_sweep_child_process() -> std::process::Child {
 #[test]
 #[ignore]
 fn promotion_sweep_live_pid_child_process() {
-    if std::env::var_os("CROOPOR_PROMOTION_SWEEP_CHILD").is_some() {
+    if std::env::var_os("AXIAL_PROMOTION_SWEEP_CHILD").is_some() {
         std::thread::sleep(Duration::from_secs(30));
     }
 }
@@ -1659,7 +1656,7 @@ async fn promote_launcher_managed_artifact_temp_once_preserves_destination_when_
 
 #[test]
 fn verify_download_integrity_rejects_mismatches() {
-    let path = Path::new("/tmp/croopor-test/artifact.jar");
+    let path = Path::new("/tmp/axial-test/artifact.jar");
     let expected = ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let wrong_size = ActualIntegrity {
         size: 7,
@@ -1724,7 +1721,7 @@ fn library_artifact_job_carries_expected_integrity() {
         ..Library::default()
     };
 
-    let job = resolve_library_download(&lib, Path::new("/tmp/croopor-test")).expect("library job");
+    let job = resolve_library_download(&lib, Path::new("/tmp/axial-test")).expect("library job");
 
     assert_eq!(job.expected, ExpectedIntegrity::from_mojang(1234, sha1));
 }
@@ -1748,7 +1745,7 @@ fn library_job_uses_legacy_checksums_when_mojang_sha1_is_missing() {
         ..Library::default()
     };
 
-    let job = resolve_library_download(&lib, Path::new("/tmp/croopor-test")).expect("library job");
+    let job = resolve_library_download(&lib, Path::new("/tmp/axial-test")).expect("library job");
 
     assert_eq!(job.expected, ExpectedIntegrity::from_sha1(sha1));
 }
@@ -1779,8 +1776,8 @@ fn native_classifier_job_carries_expected_integrity() {
         ..Library::default()
     };
 
-    let job = resolve_native_download(&lib, Path::new("/tmp/croopor-test"), "windows")
-        .expect("native job");
+    let job =
+        resolve_native_download(&lib, Path::new("/tmp/axial-test"), "windows").expect("native job");
 
     assert_eq!(job.expected, ExpectedIntegrity::from_mojang(4321, sha1));
 }
@@ -1793,7 +1790,7 @@ fn library_maven_fallback_job_reuses_when_metadata_missing() {
         ..Library::default()
     };
 
-    let job = resolve_library_download(&lib, Path::new("/tmp/croopor-test")).expect("library job");
+    let job = resolve_library_download(&lib, Path::new("/tmp/axial-test")).expect("library job");
 
     assert_eq!(job.expected, ExpectedIntegrity::default());
     assert!(!job.expected.has_evidence());
@@ -1869,7 +1866,7 @@ fn temp_dir(prefix: &str) -> PathBuf {
         .map(|value| value.as_nanos())
         .unwrap_or_default();
     std::env::temp_dir().join(format!(
-        "croopor-download-{prefix}-{}-{nanos:x}",
+        "axial-download-{prefix}-{}-{nanos:x}",
         std::process::id()
     ))
 }

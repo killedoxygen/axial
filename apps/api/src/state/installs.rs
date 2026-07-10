@@ -1,4 +1,4 @@
-use croopor_minecraft::{LoaderComponentId, download::DownloadProgress};
+use axial_minecraft::{LoaderComponentId, download::DownloadProgress};
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,

@@ -12,7 +12,7 @@ use crate::state::contracts::{
 };
 use crate::state::failure_memory::GuardianFailureMemoryEntry;
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
-use croopor_performance::{
+use axial_performance::{
     BundleHealth, CompositionPlan, PerformanceRulesStatus, RuleSource, RulesCacheState,
     RulesValidation, StateError,
 };
@@ -383,8 +383,8 @@ mod tests {
         TargetKind,
     };
     use crate::state::failure_memory::GuardianFailureMemoryEntry;
-    use croopor_performance::types::VersionFamily;
-    use croopor_performance::{
+    use axial_performance::types::VersionFamily;
+    use axial_performance::{
         BundleHealth, CompositionPlan, CompositionTier, PerformanceMode, RuleChannel, RuleSource,
         RulesCacheStatus, RulesValidation, StateError, builtin_manifest, rules_status_for,
     };

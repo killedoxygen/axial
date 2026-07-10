@@ -5,7 +5,7 @@ use crate::state::StateError;
 use crate::status::{RuleChannel, RuleSource, RulesValidation};
 use thiserror::Error;
 
-pub const PERFORMANCE_RULES_URL_ENV: &str = "CROOPOR_PERFORMANCE_RULES_URL";
+pub const PERFORMANCE_RULES_URL_ENV: &str = "AXIAL_PERFORMANCE_RULES_URL";
 
 #[derive(Debug, Error)]
 pub enum InstallError {

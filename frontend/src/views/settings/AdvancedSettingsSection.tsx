@@ -116,7 +116,7 @@ export function AdvancedSettingsSection(): JSX.Element {
 
   const flush = async (): Promise<void> => {
     const { showConfirm } = await import('../../ui/Dialog');
-    const ok = await showConfirm('Delete all Croopor-owned data and reset the launcher to first run?', {
+    const ok = await showConfirm('Delete all Axial-owned data and reset the launcher to first run?', {
       destructive: true,
       confirmText: 'Reset',
     });
@@ -139,7 +139,7 @@ export function AdvancedSettingsSection(): JSX.Element {
     <SettingsSection>
       <SettingRow
         title="Anonymous usage stats"
-        description="Shares anonymous usage and launch stats to improve Croopor. Never includes names, files, or personal data."
+        description="Shares anonymous usage and launch stats to improve Axial. Never includes names, files, or personal data."
         control={<Toggle on={telemetryEnabled} onChange={() => void toggleTelemetry()} />}
       />
       <SettingRow
@@ -152,7 +152,7 @@ export function AdvancedSettingsSection(): JSX.Element {
         }
       />
       <ExperimentalFlagRows />
-      {__CROOPOR_ENABLE_DEV_LAB__ && isDev && (
+      {__AXIAL_ENABLE_DEV_LAB__ && isDev && (
         <SettingRow
           title="Dev lab"
           description="Developer workbench: feature flags, live state inspector, and UI playgrounds."
@@ -167,7 +167,7 @@ export function AdvancedSettingsSection(): JSX.Element {
       {isDev && (
         <SettingRow
           title="Flush all data"
-          description="Deletes every Croopor-managed file and restarts from first run. Existing libraries selected through 'Use existing' are preserved."
+          description="Deletes every Axial-managed file and restarts from first run. Existing libraries selected through 'Use existing' are preserved."
           control={
             <Button variant="danger" icon="trash" disabled={busy} onClick={flush}>
               {busy ? 'Flushing…' : 'Flush'}

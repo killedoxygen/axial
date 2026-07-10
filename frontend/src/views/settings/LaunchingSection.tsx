@@ -130,7 +130,7 @@ export function LaunchingSection(): JSX.Element {
       <SettingsSection title="Integrations">
         <SettingRow
           title="Discord activity"
-          description="Shows Croopor and broad Minecraft status on your Discord profile."
+          description="Shows Axial and broad Minecraft status on your Discord profile."
           control={
             <Toggle
               on={discordOn}

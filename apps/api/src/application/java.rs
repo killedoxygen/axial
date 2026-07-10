@@ -5,7 +5,7 @@
 //! adapters.
 
 use crate::state::AppState;
-use croopor_minecraft::{JavaRuntimeResult, list_java_runtimes};
+use axial_minecraft::{JavaRuntimeResult, list_java_runtimes};
 use serde::Serialize;
 use std::path::PathBuf;
 

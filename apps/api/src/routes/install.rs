@@ -112,13 +112,13 @@ mod tests {
         },
         state::{AppStateInit, InstallStore, SessionStore},
     };
+    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_minecraft::DownloadProgress;
+    use axial_performance::PerformanceManager;
     use axum::{
         body::{Body, to_bytes},
         http::{Method, Request},
     };
-    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-    use croopor_minecraft::DownloadProgress;
-    use croopor_performance::PerformanceManager;
     use serde_json::Value;
     use std::{fs, path::PathBuf, sync::Arc};
     use tower::ServiceExt;
@@ -132,9 +132,9 @@ mod tests {
             phase: "error".to_string(),
             current: 0,
             total: 0,
-            file: Some("/Users/alice/.croopor/libraries/secret-client.jar".to_string()),
+            file: Some("/Users/alice/.axial/libraries/secret-client.jar".to_string()),
             error: Some(
-                "checksum failed in /Users/alice/.croopor with token secret provider_payload"
+                "checksum failed in /Users/alice/.axial with token secret provider_payload"
                     .to_string(),
             ),
             done: true,
@@ -172,7 +172,7 @@ mod tests {
                 status: GuardianArtifactRepairStatus::Repaired,
                 facts: vec![
                     "https://example.invalid/client.jar?token=secret".to_string(),
-                    "/Users/alice/.croopor/libraries/secret-client.jar".to_string(),
+                    "/Users/alice/.axial/libraries/secret-client.jar".to_string(),
                 ],
                 summary: "guardian_artifact_repaired".to_string(),
             },
@@ -373,7 +373,7 @@ mod tests {
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let state = AppState::new(AppStateInit {
-                app_name: "Croopor".to_string(),
+                app_name: "Axial".to_string(),
                 version: "test".to_string(),
                 config,
                 instances,
@@ -442,7 +442,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "croopor-api-install-route-{name}-{}-{}",
+            "axial-api-install-route-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -482,7 +482,7 @@ mod tests {
         let text = value.to_string();
         for material in [
             "/Users/alice",
-            ".croopor",
+            ".axial",
             ".minecraft",
             "secret-client.jar",
             "provider_payload",

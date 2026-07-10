@@ -268,6 +268,127 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "axial-api"
+version = "0.4.0-alpha"
+dependencies = [
+ "async-stream",
+ "axial-config",
+ "axial-launcher",
+ "axial-minecraft",
+ "axial-performance",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "futures-util",
+ "hex",
+ "include_dir",
+ "keyring",
+ "p256",
+ "png",
+ "rand 0.8.5",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "shlex",
+ "sysinfo",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "axial-config"
+version = "0.4.0-alpha"
+dependencies = [
+ "axial-minecraft",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "axial-desktop"
+version = "0.4.0-alpha"
+dependencies = [
+ "axial-api",
+ "axial-config",
+ "axial-launcher",
+ "axial-performance",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "axial-launcher"
+version = "0.4.0-alpha"
+dependencies = [
+ "axial-minecraft",
+ "md5",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sysinfo",
+ "thiserror 2.0.18",
+ "tokio",
+ "zip",
+]
+
+[[package]]
+name = "axial-minecraft"
+version = "0.4.0-alpha"
+dependencies = [
+ "chrono",
+ "futures-util",
+ "lzma-rs",
+ "md5",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sysinfo",
+ "thiserror 2.0.18",
+ "tokio",
+ "zip",
+]
+
+[[package]]
+name = "axial-performance"
+version = "0.4.0-alpha"
+dependencies = [
+ "chrono",
+ "ed25519-dalek",
+ "futures-util",
+ "hex",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sysinfo",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "axum"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -762,127 +883,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "croopor-api"
-version = "0.4.0-alpha"
-dependencies = [
- "async-stream",
- "axum",
- "base64 0.22.1",
- "chrono",
- "croopor-config",
- "croopor-launcher",
- "croopor-minecraft",
- "croopor-performance",
- "ed25519-dalek",
- "futures-util",
- "hex",
- "include_dir",
- "keyring",
- "p256",
- "png",
- "rand 0.8.5",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "shlex",
- "sysinfo",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "croopor-config"
-version = "0.4.0-alpha"
-dependencies = [
- "chrono",
- "croopor-minecraft",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "croopor-desktop"
-version = "0.4.0-alpha"
-dependencies = [
- "croopor-api",
- "croopor-config",
- "croopor-launcher",
- "croopor-performance",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "croopor-launcher"
-version = "0.4.0-alpha"
-dependencies = [
- "croopor-minecraft",
- "md5",
- "serde",
- "serde_json",
- "sha1",
- "sysinfo",
- "thiserror 2.0.18",
- "tokio",
- "zip",
-]
-
-[[package]]
-name = "croopor-minecraft"
-version = "0.4.0-alpha"
-dependencies = [
- "chrono",
- "futures-util",
- "lzma-rs",
- "md5",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha1",
- "sysinfo",
- "thiserror 2.0.18",
- "tokio",
- "zip",
-]
-
-[[package]]
-name = "croopor-performance"
-version = "0.4.0-alpha"
-dependencies = [
- "chrono",
- "ed25519-dalek",
- "futures-util",
- "hex",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "sysinfo",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]

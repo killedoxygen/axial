@@ -86,7 +86,7 @@ export function BootSplash(): JSX.Element | null {
             <div class="cp-boot-bar">
               <div class="cp-boot-bar-fill" style={{ width: `${progress}%` }} />
             </div>
-            <div class="cp-boot-label">Starting Croopor…</div>
+            <div class="cp-boot-label">Starting Axial…</div>
           </>
         )}
       </div>

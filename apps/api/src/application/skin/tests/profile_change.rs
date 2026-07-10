@@ -140,7 +140,7 @@ async fn skin_profile_reset_preserves_current_skin_and_clears_local_apply_state(
     assert_eq!(texture_request.accept.as_deref(), Some("image/png"));
     assert_eq!(
         texture_request.user_agent.as_deref(),
-        Some(CROOPOR_USER_AGENT)
+        Some(AXIAL_USER_AGENT)
     );
     assert_eq!(reset_request.method, "DELETE");
     assert_eq!(reset_request.path, "/minecraft/profile/skins/active");
@@ -149,10 +149,7 @@ async fn skin_profile_reset_preserves_current_skin_and_clears_local_apply_state(
         Some("Bearer minecraft-access-token")
     );
     assert_eq!(reset_request.accept.as_deref(), Some("application/json"));
-    assert_eq!(
-        reset_request.user_agent.as_deref(),
-        Some(CROOPOR_USER_AGENT)
-    );
+    assert_eq!(reset_request.user_agent.as_deref(), Some(AXIAL_USER_AGENT));
     assert_eq!(listed.pending_apply_texture_key, None);
     assert!(listed.skins.iter().all(|skin| skin.applied_at.is_none()));
     assert_eq!(preserved.name, "MinecraftName profile skin");
@@ -308,7 +305,7 @@ async fn skin_cape_reset_preserves_current_skin_and_clears_local_apply_state() {
     assert_eq!(texture_request.accept.as_deref(), Some("image/png"));
     assert_eq!(
         texture_request.user_agent.as_deref(),
-        Some(CROOPOR_USER_AGENT)
+        Some(AXIAL_USER_AGENT)
     );
     assert_eq!(cape_request.method, "DELETE");
     assert_eq!(cape_request.path, "/minecraft/profile/capes/active");
@@ -317,7 +314,7 @@ async fn skin_cape_reset_preserves_current_skin_and_clears_local_apply_state() {
         Some("Bearer minecraft-access-token")
     );
     assert_eq!(cape_request.accept.as_deref(), Some("application/json"));
-    assert_eq!(cape_request.user_agent.as_deref(), Some(CROOPOR_USER_AGENT));
+    assert_eq!(cape_request.user_agent.as_deref(), Some(AXIAL_USER_AGENT));
     assert_eq!(listed.pending_apply_texture_key, None);
     assert!(listed.skins.iter().all(|skin| skin.applied_at.is_none()));
     assert_eq!(preserved.name, "MinecraftName profile skin");
@@ -444,7 +441,7 @@ async fn skin_apply_upstream_success_uploads_saved_skin_and_updates_profile() {
         Some("Bearer minecraft-access-token")
     );
     assert_eq!(request.accept.as_deref(), Some("application/json"));
-    assert_eq!(request.user_agent.as_deref(), Some(CROOPOR_USER_AGENT));
+    assert_eq!(request.user_agent.as_deref(), Some(AXIAL_USER_AGENT));
     assert!(
         request
             .content_type
@@ -941,7 +938,7 @@ async fn skin_apply_success_syncs_selected_cape() {
         Some("Bearer minecraft-access-token")
     );
     assert_eq!(cape_request.accept.as_deref(), Some("application/json"));
-    assert_eq!(cape_request.user_agent.as_deref(), Some(CROOPOR_USER_AGENT));
+    assert_eq!(cape_request.user_agent.as_deref(), Some(AXIAL_USER_AGENT));
     assert_eq!(
         cape_request.content_type.as_deref(),
         Some("application/json")
@@ -1010,7 +1007,7 @@ async fn skin_apply_preserves_external_profile_skin_before_upload() {
     assert_eq!(texture_request.accept.as_deref(), Some("image/png"));
     assert_eq!(
         texture_request.user_agent.as_deref(),
-        Some(CROOPOR_USER_AGENT)
+        Some(AXIAL_USER_AGENT)
     );
     assert_eq!(cape_request.method, "DELETE");
     assert_eq!(preserved.name, "MinecraftName profile skin");

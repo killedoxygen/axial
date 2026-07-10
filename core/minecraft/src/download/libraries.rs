@@ -177,7 +177,7 @@ pub fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<Download
                 path,
                 url: artifact.url.clone(),
                 expected: library_expected_integrity(lib, artifact.size, &artifact.sha1),
-                allow_missing_checksum: lib.croopor_checksumless_allowed,
+                allow_missing_checksum: lib.axial_checksumless_allowed,
             });
         }
         return None;
@@ -207,7 +207,7 @@ pub fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<Download
             maven_path.to_string_lossy().replace('\\', "/")
         ),
         expected: library_expected_integrity(lib, lib.size, &lib.sha1),
-        allow_missing_checksum: lib.croopor_checksumless_allowed,
+        allow_missing_checksum: lib.axial_checksumless_allowed,
     })
 }
 
@@ -229,7 +229,7 @@ pub fn resolve_native_download(lib: &Library, mc_dir: &Path, os_name: &str) -> O
                 path,
                 url: artifact.url.clone(),
                 expected: library_expected_integrity(lib, artifact.size, &artifact.sha1),
-                allow_missing_checksum: lib.croopor_checksumless_allowed,
+                allow_missing_checksum: lib.axial_checksumless_allowed,
             });
         }
     }
@@ -261,7 +261,7 @@ pub fn resolve_native_download(lib: &Library, mc_dir: &Path, os_name: &str) -> O
             maven_path.to_string_lossy().replace('\\', "/")
         ),
         expected: library_expected_integrity(lib, lib.size, &lib.sha1),
-        allow_missing_checksum: lib.croopor_checksumless_allowed,
+        allow_missing_checksum: lib.axial_checksumless_allowed,
     })
 }
 

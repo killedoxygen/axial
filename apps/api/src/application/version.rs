@@ -1,10 +1,10 @@
 use crate::{application::instances::invalidate_create_view_installed_scan, state::AppState};
-use axum::{Json, http::StatusCode};
-use croopor_minecraft::{
+use axial_minecraft::{
     LifecycleMeta, MinecraftVersionMeta, VersionEntry, VersionScanReport, VersionScanState,
     VersionSubjectKind, analyze_minecraft_version, enrich_version_entries,
     fetch_version_manifest_cached, manifest_release_references, scan_versions_report, versions_dir,
 };
+use axum::{Json, http::StatusCode};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -59,7 +59,7 @@ pub struct CatalogEntry {
 
 #[derive(Debug, Serialize)]
 pub struct CatalogResponse {
-    pub latest: croopor_minecraft::manifest::LatestVersions,
+    pub latest: axial_minecraft::manifest::LatestVersions,
     pub versions: Vec<CatalogEntry>,
 }
 
@@ -307,7 +307,7 @@ fn version_library_dir(state: &AppState) -> Result<PathBuf, (StatusCode, Json<se
     let Some(mc_dir) = state.library_dir() else {
         return Err((
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
+            Json(serde_json::json!({ "error": "Axial library is not configured" })),
         ));
     };
     Ok(PathBuf::from(mc_dir))
@@ -616,7 +616,7 @@ mod tests {
     fn scan_versions_error_response_hides_unix_path_fragments() {
         let (status, Json(body)) = scan_versions_error_response(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "permission denied reading /home/alice/Croopor Library/versions",
+            "permission denied reading /home/alice/Axial Library/versions",
         ));
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -626,14 +626,14 @@ mod tests {
         );
         let body = body.to_string();
         assert!(!body.contains("/home/alice"));
-        assert!(!body.contains("Croopor Library"));
+        assert!(!body.contains("Axial Library"));
     }
 
     #[test]
     fn scan_versions_error_response_hides_windows_path_fragments() {
         let (status, Json(body)) = scan_versions_error_response(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            r"permission denied reading C:\Users\Alice\AppData\Roaming\Croopor\versions",
+            r"permission denied reading C:\Users\Alice\AppData\Roaming\Axial\versions",
         ));
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -649,7 +649,7 @@ mod tests {
     #[test]
     fn installed_version_scan_view_model_marks_malformed_library_as_degraded() {
         let root = std::env::temp_dir().join(format!(
-            "croopor-api-version-scan-degraded-{}-{}",
+            "axial-api-version-scan-degraded-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

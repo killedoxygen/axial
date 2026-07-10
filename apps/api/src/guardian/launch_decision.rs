@@ -8,7 +8,7 @@ use crate::observability::{RedactionAudience, sanitize_evidence_text};
 use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
-use croopor_launcher::LaunchFailureClass;
+use axial_launcher::LaunchFailureClass;
 use serde::{Deserialize, Serialize};
 
 const MAX_LAUNCH_DECISION_SUMMARY_CHARS: usize = 180;
@@ -862,7 +862,7 @@ fn prepare_failure_guidance(
             if explicit_java_override_present {
                 vec!["Remove the Java override or switch Guardian Mode back to Managed."]
             } else {
-                vec!["Use a compatible Java runtime or let Croopor use the managed runtime."]
+                vec!["Use a compatible Java runtime or let Axial use the managed runtime."]
             }
         }
         LaunchFailureClass::JvmUnsupportedOption
@@ -873,7 +873,7 @@ fn prepare_failure_guidance(
             } else if explicit_jvm_preset_present {
                 vec!["Choose a safer JVM preset or switch Guardian Mode back to Managed."]
             } else {
-                vec!["Use safer launch settings or let Croopor manage compatibility."]
+                vec!["Use safer launch settings or let Axial manage compatibility."]
             }
         }
         LaunchFailureClass::StartupStalled => {
@@ -881,7 +881,7 @@ fn prepare_failure_guidance(
         }
         LaunchFailureClass::LauncherManagedArtifactSignature => {
             vec![
-                "Repair the installed version so Croopor can replace the affected launcher-managed jars.",
+                "Repair the installed version so Axial can replace the affected launcher-managed jars.",
             ]
         }
         _ => Vec::new(),
@@ -993,7 +993,7 @@ mod tests {
         GuardianDecisionKind, GuardianLaunchRecoveryKind, GuardianMode,
         conservative_launch_recovery_preset,
     };
-    use croopor_launcher::LaunchFailureClass;
+    use axial_launcher::LaunchFailureClass;
 
     #[test]
     fn managed_prepare_java_mismatch_returns_managed_runtime_fallback_directive() {
@@ -1220,7 +1220,7 @@ mod tests {
             &"Minecraft exited before startup completed with detected launcher-managed jar signature corruption.".to_string()
         ));
         assert!(outcome.user_outcome.guidance.contains(
-            &"Repair the installed version so Croopor can replace the affected launcher-managed jars.".to_string()
+            &"Repair the installed version so Axial can replace the affected launcher-managed jars.".to_string()
         ));
     }
 

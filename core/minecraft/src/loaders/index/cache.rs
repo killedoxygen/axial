@@ -488,7 +488,7 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         std::env::temp_dir().join(format!(
-            "croopor-loader-cache-{prefix}-{}-{nanos:x}",
+            "axial-loader-cache-{prefix}-{}-{nanos:x}",
             std::process::id()
         ))
     }

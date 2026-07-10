@@ -52,7 +52,7 @@ export function useMicrosoftSignIn(options: MicrosoftSignInOptions = {}): {
           tone: 'err',
           text: boundedMessage(
             errorText(err),
-            'Microsoft sign-in completed, but Croopor could not switch to that account.',
+            'Microsoft sign-in completed, but Axial could not switch to that account.',
           ),
         });
         return;

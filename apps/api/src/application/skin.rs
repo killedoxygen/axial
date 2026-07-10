@@ -19,6 +19,8 @@ use crate::state::skins::SavedSkinRecord;
 #[cfg(test)]
 use crate::state::{AppState, AuthLoginMinecraftAccount};
 #[cfg(test)]
+use axial_minecraft::offline_uuid;
+#[cfg(test)]
 use axum::{
     Json,
     body::Body,
@@ -31,8 +33,6 @@ use cache::{
     PROFILE_CAPE_FILE_CACHE_CONTROL, PROFILE_SKIN_FILE_CACHE_CONTROL, profile_cape_file_cache_path,
     profile_skin_file_cache_path,
 };
-#[cfg(test)]
-use croopor_minecraft::offline_uuid;
 #[cfg(test)]
 use image::{
     LEGACY_SKIN_HEIGHT, PNG_SIGNATURE, SKIN_HEIGHT, SKIN_WIDTH, decode_skin_png,
@@ -58,7 +58,7 @@ use profile_media::{
 };
 #[cfg(test)]
 use provider::{
-    CROOPOR_USER_AGENT, MINECRAFT_SKIN_UPLOAD_RESPONSE_MAX_BYTES, MinecraftCapeSyncClient,
+    AXIAL_USER_AGENT, MINECRAFT_SKIN_UPLOAD_RESPONSE_MAX_BYTES, MinecraftCapeSyncClient,
     MinecraftSkinResetClient, MinecraftSkinTextureClient, MinecraftSkinUploadClient,
     MinecraftSkinUsernameClient, sane_minecraft_texture_url,
 };
@@ -110,14 +110,14 @@ mod tests {
         AuthLoginMinecraftCape, AuthLoginMinecraftProfile, AuthLoginMinecraftSkin,
         NewAuthLoginMinecraftAccount, NewAuthLoginMsaToken,
     };
+    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+    use axial_performance::PerformanceManager;
     use axum::{
         body::{Bytes, to_bytes},
         extract::{Path, State as AxumState},
         http::HeaderMap,
         routing::{delete, get, post},
     };
-    use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
-    use croopor_performance::PerformanceManager;
     use std::{fs, io::Cursor, path::PathBuf, sync::Arc};
     use tokio::sync::mpsc;
 
@@ -144,7 +144,7 @@ mod tests {
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let state = AppState::new(AppStateInit {
-                app_name: "Croopor".to_string(),
+                app_name: "Axial".to_string(),
                 version: "test".to_string(),
                 config,
                 instances,
@@ -617,7 +617,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "croopor-api-skin-{name}-{}-{}",
+            "axial-api-skin-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

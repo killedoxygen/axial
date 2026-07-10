@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 pub(crate) const FAMILY_C_QUALIFICATION_PROOF_SCAN_LIMIT: usize = 100;
 pub(crate) const FAMILY_C_QUALIFICATION_SCHEMA: &str =
-    "croopor.launch.benchmark.qualification.family_c_1_12_2";
+    "axial.launch.benchmark.qualification.family_c_1_12_2";
 pub(crate) const FAMILY_C_QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 pub(crate) const FAMILY_C_QUALIFICATION_MODE: &str = "release_validation";
 pub(crate) const FAMILY_C_QUALIFICATION_VERSION: &str = "1.12.2";
@@ -37,7 +37,7 @@ pub(crate) async fn family_c_qualification_payload(
         crate::state::benchmark_suites::load(state.config().paths(), &normalized_suite_id)
             .map_err(benchmark_suite_storage_error_response)?
             .ok_or_else(benchmark_suite_not_found_error)?;
-    if manifest.schema != "croopor.launch.benchmark.suite" || manifest.schema_version != 2 {
+    if manifest.schema != "axial.launch.benchmark.suite" || manifest.schema_version != 2 {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "benchmark suite manifest is not current schema" })),
@@ -96,7 +96,7 @@ fn family_c_qualification_preview_manifest()
         .collect();
 
     Ok(crate::state::benchmark_suites::BenchmarkSuiteManifest {
-        schema: "croopor.launch.benchmark.suite".to_string(),
+        schema: "axial.launch.benchmark.suite".to_string(),
         schema_version: 2,
         suite_id: "family-c-1-12-2-preview".to_string(),
         instance_id: "preview".to_string(),
@@ -440,7 +440,7 @@ fn family_c_qualification_targets() -> [FamilyCQualificationTarget; 2] {
 }
 
 fn family_c_qualification_proofs(
-    paths: &croopor_config::AppPaths,
+    paths: &axial_config::AppPaths,
     manifest: &crate::state::benchmark_suites::BenchmarkSuiteManifest,
 ) -> Result<Vec<crate::state::launch_reports::LaunchProofRecord>, (StatusCode, Json<Value>)> {
     let mut proofs =
@@ -692,17 +692,17 @@ fn family_c_qualification_managed_install_evidence(
     }
 
     let mods_dir = state.instances().game_dir(&instance_id).join("mods");
-    let composition_state = match croopor_performance::load_state(&mods_dir) {
+    let composition_state = match axial_performance::load_state(&mods_dir) {
         Ok(Some(state)) => state,
         Ok(None) => {
             evidence.missing.push("managed_install_state_missing");
             return evidence;
         }
-        Err(croopor_performance::StateError::InvalidOwnership { .. }) => {
+        Err(axial_performance::StateError::InvalidOwnership { .. }) => {
             evidence.missing.push("managed_install_ownership_missing");
             return evidence;
         }
-        Err(croopor_performance::StateError::InvalidIntegrity { .. }) => {
+        Err(axial_performance::StateError::InvalidIntegrity { .. }) => {
             evidence.missing.push("managed_install_integrity_missing");
             return evidence;
         }
@@ -719,11 +719,11 @@ fn family_c_qualification_managed_install_evidence(
         has_installed && family_c_managed_expected_artifacts_present(&composition_state);
     let ownership = has_installed
         && composition_state.installed_mods.iter().all(|installed| {
-            installed.ownership_class == croopor_performance::OwnershipClass::CompositionManaged
+            installed.ownership_class == axial_performance::OwnershipClass::CompositionManaged
         });
     let source = has_installed
         && composition_state.installed_mods.iter().all(|installed| {
-            installed.source.provider == croopor_performance::ManagedArtifactProvider::Modrinth
+            installed.source.provider == axial_performance::ManagedArtifactProvider::Modrinth
         });
     let integrity = has_installed
         && composition_state.installed_mods.iter().all(|installed| {
@@ -762,7 +762,7 @@ fn family_c_qualification_managed_install_evidence(
 }
 
 fn family_c_managed_expected_artifacts_present(
-    composition_state: &croopor_performance::CompositionState,
+    composition_state: &axial_performance::CompositionState,
 ) -> bool {
     FAMILY_C_MANAGED_EXPECTED_ARTIFACTS
         .iter()

@@ -699,7 +699,7 @@ pub(super) fn download_temp_path(destination: &Path) -> PathBuf {
         .file_name()
         .unwrap_or_else(|| OsStr::new("download"))
         .to_os_string();
-    name.push(".croopor-tmp");
+    name.push(".axial-tmp");
     destination.with_file_name(name)
 }
 

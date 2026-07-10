@@ -1508,7 +1508,7 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         std::env::temp_dir().join(format!(
-            "croopor-artifact-repair-{prefix}-{}-{nanos:x}",
+            "axial-artifact-repair-{prefix}-{}-{nanos:x}",
             std::process::id()
         ))
     }

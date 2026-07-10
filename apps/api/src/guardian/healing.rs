@@ -568,7 +568,7 @@ mod tests {
         FailureMemoryActionOutcome, FailureMemoryKey, GuardianFailureMemoryEntry,
         GuardianFailureMemoryStore,
     };
-    use croopor_config::AppPaths;
+    use axial_config::AppPaths;
     use sha1::{Digest, Sha1};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -594,7 +594,7 @@ mod tests {
         );
 
         assert_eq!(outcome.status, GuardianRepairStatus::Repaired);
-        assert!(runtime_root.join(".croopor-ready").is_file());
+        assert!(runtime_root.join(".axial-ready").is_file());
         assert!(
             outcome
                 .facts
@@ -669,7 +669,7 @@ mod tests {
         );
 
         assert_eq!(outcome.status, GuardianRepairStatus::Suppressed);
-        assert!(!runtime_root.join(".croopor-ready").exists());
+        assert!(!runtime_root.join(".axial-ready").exists());
         let journal = stores
             .journals
             .get(&outcome.operation_id)
@@ -713,7 +713,7 @@ mod tests {
             .expect_err("unsafe ownership rejects before execution");
 
             assert_eq!(error, GuardianRepairPlanRejection::UnsafeOwnership);
-            assert!(!runtime_root.join(".croopor-ready").exists());
+            assert!(!runtime_root.join(".axial-ready").exists());
             cleanup(&root);
         }
     }
@@ -737,7 +737,7 @@ mod tests {
         .expect_err("unsupported target rejects before execution");
 
         assert_eq!(error, GuardianRepairPlanRejection::UnsupportedDiagnosis);
-        assert!(!runtime_root.join(".croopor-ready").exists());
+        assert!(!runtime_root.join(".axial-ready").exists());
         cleanup(&root);
     }
 
@@ -761,7 +761,7 @@ mod tests {
         );
 
         assert_eq!(outcome.status, GuardianRepairStatus::Blocked);
-        assert!(!runtime_root.join(".croopor-ready").exists());
+        assert!(!runtime_root.join(".axial-ready").exists());
 
         cleanup(&root);
     }
@@ -815,7 +815,7 @@ mod tests {
                 decision
             },
         ] {
-            let _ = fs::remove_file(runtime_root.join(".croopor-ready"));
+            let _ = fs::remove_file(runtime_root.join(".axial-ready"));
             let error = plan_managed_runtime_ready_marker_repair(
                 &decision,
                 GuardianRepairPlanningContext::current_operation(),
@@ -827,7 +827,7 @@ mod tests {
                 GuardianRepairPlanRejection::NonRepairDecision
                     | GuardianRepairPlanRejection::UnsupportedDiagnosis
             ));
-            assert!(!runtime_root.join(".croopor-ready").exists());
+            assert!(!runtime_root.join(".axial-ready").exists());
         }
 
         cleanup(&root);
@@ -862,7 +862,7 @@ mod tests {
             )
             .expect("memory record");
 
-        let _ = fs::remove_file(runtime_root.join(".croopor-ready"));
+        let _ = fs::remove_file(runtime_root.join(".axial-ready"));
         let outcome = execute_repair(
             &decision,
             &paths,
@@ -874,7 +874,7 @@ mod tests {
         );
 
         assert_eq!(outcome.status, GuardianRepairStatus::Suppressed);
-        assert!(!runtime_root.join(".croopor-ready").exists());
+        assert!(!runtime_root.join(".axial-ready").exists());
         let memory = stores.failure_memory.list();
         assert_eq!(memory[0].repair_attempt_count, 1);
         assert_eq!(
@@ -915,7 +915,7 @@ mod tests {
             )
             .expect("memory record");
 
-        let _ = fs::remove_file(runtime_root.join(".croopor-ready"));
+        let _ = fs::remove_file(runtime_root.join(".axial-ready"));
         let outcome = execute_repair(
             &decision,
             &paths,
@@ -927,7 +927,7 @@ mod tests {
         );
 
         assert_eq!(outcome.status, GuardianRepairStatus::Repaired);
-        assert!(runtime_root.join(".croopor-ready").exists());
+        assert!(runtime_root.join(".axial-ready").exists());
         let memory = stores.failure_memory.list();
         assert_eq!(
             memory[0].last_action_outcome,
@@ -957,7 +957,7 @@ mod tests {
         );
 
         assert_eq!(outcome.status, GuardianRepairStatus::Failed);
-        assert!(!runtime_root.join(".croopor-ready").exists());
+        assert!(!runtime_root.join(".axial-ready").exists());
         assert!(
             !outcome
                 .facts
@@ -1203,7 +1203,7 @@ mod tests {
             }
         });
         fs::write(
-            runtime_root.join(".croopor-runtime-manifest.json"),
+            runtime_root.join(".axial-runtime-manifest.json"),
             serde_json::to_vec(&manifest).expect("manifest json"),
         )
         .expect("runtime manifest proof");
@@ -1270,7 +1270,7 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         std::env::temp_dir().join(format!(
-            "croopor-guardian-repair-{prefix}-{}-{nanos:x}",
+            "axial-guardian-repair-{prefix}-{}-{nanos:x}",
             std::process::id()
         ))
     }

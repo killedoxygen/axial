@@ -15,7 +15,7 @@ const DOWNLOAD_CLIENT_TCP_KEEPALIVE_SECS: u64 = 60;
 
 pub(super) fn build_http_client(read_timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
-        .user_agent("croopor/0.3")
+        .user_agent("axial/0.3")
         .connect_timeout(Duration::from_secs(DOWNLOAD_CLIENT_CONNECT_TIMEOUT_SECS))
         .read_timeout(read_timeout)
         .pool_max_idle_per_host(DOWNLOAD_CLIENT_MAX_IDLE_PER_HOST)

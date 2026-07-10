@@ -9,15 +9,12 @@ async fn status_reports_bundled_rules_without_remote_refresh() {
         .expect("status should serialize");
     let status = &response.status;
 
-    assert_eq!(status.rule_source, croopor_performance::RuleSource::BuiltIn);
-    assert_eq!(
-        status.rule_channel,
-        croopor_performance::RuleChannel::Bundled
-    );
+    assert_eq!(status.rule_source, axial_performance::RuleSource::BuiltIn);
+    assert_eq!(status.rule_channel, axial_performance::RuleChannel::Bundled);
     assert!(status.rules_cache.recorded);
     assert_eq!(
         status.rules_cache.state,
-        croopor_performance::RulesCacheState::Recorded
+        axial_performance::RulesCacheState::Recorded
     );
     assert!(status.rules_cache.updated_at.is_some());
     assert!(status.rules_cache.loaded_at.is_some());
@@ -28,10 +25,7 @@ async fn status_reports_bundled_rules_without_remote_refresh() {
     assert!(!status.remote_refresh);
     assert_eq!(status.last_refresh_at, None);
     assert!(response.guardian_facts.is_empty());
-    assert_eq!(
-        status.validation,
-        croopor_performance::RulesValidation::Valid
-    );
+    assert_eq!(status.validation, axial_performance::RulesValidation::Valid);
     assert_eq!(
         status.health_states,
         vec![
@@ -45,8 +39,8 @@ async fn status_reports_bundled_rules_without_remote_refresh() {
     assert_eq!(
         status.ownership_classes,
         vec![
-            croopor_performance::OwnershipClass::CompositionManaged,
-            croopor_performance::OwnershipClass::UserManaged,
+            axial_performance::OwnershipClass::CompositionManaged,
+            axial_performance::OwnershipClass::UserManaged,
         ]
     );
     assert!(status.warnings.is_empty());
@@ -63,7 +57,7 @@ async fn status_exposes_repeated_performance_failure_memory_fact() {
 
     assert_eq!(
         response.status.rule_source,
-        croopor_performance::RuleSource::BuiltIn
+        axial_performance::RuleSource::BuiltIn
     );
     let fact = response
         .guardian_facts
@@ -90,23 +84,23 @@ async fn status_exposes_repeated_performance_failure_memory_fact() {
 async fn status_reports_invalid_remote_rules_with_guardian_fact_and_safe_copy() {
     let root = test_root("status-invalid-remote-rules");
     let paths = test_paths(&root);
-    let mut remote = croopor_performance::builtin_manifest().expect("builtin manifest");
+    let mut remote = axial_performance::builtin_manifest().expect("builtin manifest");
     remote.schema_version = 99;
     let signed = signed_rules_response(&remote);
-    let cache_path = croopor_performance::rules_cache_path(&paths.config_dir);
+    let cache_path = axial_performance::rules_cache_path(&paths.config_dir);
     fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("create cache dir");
     fs::write(
         &cache_path,
-        serde_json::to_vec(&croopor_performance::RulesCacheSnapshot {
-            rule_source: croopor_performance::RuleSource::Remote,
-            rule_channel: croopor_performance::RuleChannel::Remote,
+        serde_json::to_vec(&axial_performance::RulesCacheSnapshot {
+            rule_source: axial_performance::RuleSource::Remote,
+            rule_channel: axial_performance::RuleChannel::Remote,
             schema_version: remote.schema_version,
             generated_at: remote.generated_at.clone(),
-            validation: croopor_performance::RulesValidation::Valid,
+            validation: axial_performance::RulesValidation::Valid,
             updated_at: "2026-06-15T12:00:00Z".to_string(),
             loaded_at: "2026-06-15T12:00:00Z".to_string(),
             manifest: Some(remote),
-            signature: Some(croopor_performance::RulesSignatureMetadata {
+            signature: Some(axial_performance::RulesSignatureMetadata {
                 signature: signed.signature,
                 key_id: Some("test-key".to_string()),
             }),
@@ -226,7 +220,7 @@ async fn rules_refresh_route_requires_configured_remote_url() {
 
 #[tokio::test]
 async fn rules_refresh_route_accepts_configured_remote_manifest() {
-    let mut manifest = croopor_performance::builtin_manifest().expect("builtin manifest");
+    let mut manifest = axial_performance::builtin_manifest().expect("builtin manifest");
     manifest.generated_at = "2026-05-30T13:00:00Z".to_string();
     let signed = signed_rules_response(&manifest);
     let remote_url = spawn_rules_server(
@@ -256,19 +250,13 @@ async fn rules_refresh_route_accepts_configured_remote_manifest() {
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read body");
-    let status: croopor_performance::PerformanceRulesStatus =
+    let status: axial_performance::PerformanceRulesStatus =
         serde_json::from_slice(&body).expect("rules status json");
-    assert_eq!(status.rule_source, croopor_performance::RuleSource::Remote);
-    assert_eq!(
-        status.rule_channel,
-        croopor_performance::RuleChannel::Remote
-    );
+    assert_eq!(status.rule_source, axial_performance::RuleSource::Remote);
+    assert_eq!(status.rule_channel, axial_performance::RuleChannel::Remote);
     assert!(status.remote_refresh);
     assert_eq!(status.generated_at, manifest.generated_at);
-    assert_eq!(
-        status.validation,
-        croopor_performance::RulesValidation::Valid
-    );
+    assert_eq!(status.validation, axial_performance::RulesValidation::Valid);
     assert!(status.warnings.is_empty());
     let journal = fixture
         .state
@@ -305,7 +293,7 @@ async fn rules_refresh_route_accepts_configured_remote_manifest() {
 
 #[tokio::test]
 async fn rules_refresh_route_provider_failure_keeps_previous_rules_and_redacts_provider_details() {
-    let builtin = croopor_performance::builtin_manifest().expect("builtin manifest");
+    let builtin = axial_performance::builtin_manifest().expect("builtin manifest");
     let signed = signed_rules_response(&builtin);
     let remote_base_url = spawn_closing_rules_server().await;
     let remote_url =
@@ -334,16 +322,13 @@ async fn rules_refresh_route_provider_failure_keeps_previous_rules_and_redacts_p
         .await
         .expect("read body");
     let body = String::from_utf8(body.to_vec()).expect("utf8 body");
-    let status: croopor_performance::PerformanceRulesStatus =
+    let status: axial_performance::PerformanceRulesStatus =
         serde_json::from_str(&body).expect("rules status json");
 
     assert_eq!(status.rule_source, before.rule_source);
     assert_eq!(status.rule_channel, before.rule_channel);
     assert_eq!(status.generated_at, before.generated_at);
-    assert_eq!(
-        status.validation,
-        croopor_performance::RulesValidation::Valid
-    );
+    assert_eq!(status.validation, axial_performance::RulesValidation::Valid);
     assert!(
         status
             .warnings
@@ -389,7 +374,7 @@ async fn rules_refresh_route_provider_failure_keeps_previous_rules_and_redacts_p
 
 #[tokio::test]
 async fn rules_refresh_route_provider_rate_limit_and_invalid_body_are_bounded_and_redacted() {
-    let builtin = croopor_performance::builtin_manifest().expect("builtin manifest");
+    let builtin = axial_performance::builtin_manifest().expect("builtin manifest");
     let signed = signed_rules_response(&builtin);
     let cases = [
         (
@@ -438,17 +423,14 @@ async fn rules_refresh_route_provider_rate_limit_and_invalid_body_are_bounded_an
             .await
             .expect("read body");
         let body = String::from_utf8(body.to_vec()).expect("utf8 body");
-        let status: croopor_performance::PerformanceRulesStatus =
+        let status: axial_performance::PerformanceRulesStatus =
             serde_json::from_str(&body).expect("rules status json");
         let value: serde_json::Value = serde_json::from_str(&body).expect("status json");
 
         assert_eq!(status.rule_source, before.rule_source);
         assert_eq!(status.rule_channel, before.rule_channel);
         assert_eq!(status.generated_at, before.generated_at);
-        assert_eq!(
-            status.validation,
-            croopor_performance::RulesValidation::Valid
-        );
+        assert_eq!(status.validation, axial_performance::RulesValidation::Valid);
         assert!(
             status
                 .warnings
@@ -479,7 +461,7 @@ async fn rules_refresh_route_provider_rate_limit_and_invalid_body_are_bounded_an
 
 #[tokio::test]
 async fn rules_refresh_route_rejects_missing_signature_and_keeps_builtin_rules() {
-    let mut manifest = croopor_performance::builtin_manifest().expect("builtin manifest");
+    let mut manifest = axial_performance::builtin_manifest().expect("builtin manifest");
     manifest.generated_at = "2026-05-30T13:30:00Z".to_string();
     let signed = signed_rules_response(&manifest);
     let remote_url = spawn_rules_server(
@@ -509,9 +491,9 @@ async fn rules_refresh_route_rejects_missing_signature_and_keeps_builtin_rules()
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read body");
-    let status: croopor_performance::PerformanceRulesStatus =
+    let status: axial_performance::PerformanceRulesStatus =
         serde_json::from_slice(&body).expect("rules status json");
-    assert_eq!(status.rule_source, croopor_performance::RuleSource::BuiltIn);
+    assert_eq!(status.rule_source, axial_performance::RuleSource::BuiltIn);
     assert!(status.remote_refresh);
     assert!(
         status
@@ -553,9 +535,9 @@ async fn spawn_rules_provider_response(
             .map(|signature| {
                 format!(
                     "{}: {}\r\n{}: test-key\r\n",
-                    croopor_performance::RULES_SIGNATURE_HEADER,
+                    axial_performance::RULES_SIGNATURE_HEADER,
                     signature,
-                    croopor_performance::RULES_KEY_ID_HEADER
+                    axial_performance::RULES_KEY_ID_HEADER
                 )
             })
             .unwrap_or_default();
@@ -604,7 +586,7 @@ fn bounded_performance_data_error_omits_raw_internal_details() {
         .expect_err("invalid json")
         .to_string();
     let raw_error = format!(
-        "failed to read /home/zero/.config/croopor/performance.json and C:\\Users\\Zero\\AppData\\Roaming\\Croopor\\performance.json: {raw_parser}: Permission denied (os error 13)"
+        "failed to read /home/zero/.config/axial/performance.json and C:\\Users\\Zero\\AppData\\Roaming\\Axial\\performance.json: {raw_parser}: Permission denied (os error 13)"
     );
 
     let error = internal_error(&raw_error);
@@ -615,8 +597,8 @@ fn bounded_performance_data_error_omits_raw_internal_details() {
     assert_omits_raw_fragments(
         &body,
         &[
-            "/home/zero/.config/croopor/performance.json",
-            "C:\\Users\\Zero\\AppData\\Roaming\\Croopor\\performance.json",
+            "/home/zero/.config/axial/performance.json",
+            "C:\\Users\\Zero\\AppData\\Roaming\\Axial\\performance.json",
             raw_parser.as_str(),
             "Permission denied",
             "os error 13",

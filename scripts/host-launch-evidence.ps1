@@ -1,4 +1,4 @@
-# Reports Windows host Java and Minecraft/Croopor folder evidence as
+# Reports Windows host Java and Minecraft/Axial folder evidence as
 # redacted key/value pairs. Never prints filesystem paths.
 # Invoked by `task host:launch-evidence` on Windows and from WSL.
 
@@ -69,10 +69,10 @@ $minecraftLibraries = Child $minecraft 'libraries'
 $minecraftAssets = Child $minecraft 'assets'
 $storeRuntime = Child $env:LOCALAPPDATA 'Packages\Microsoft.4297127D64EC6_8wekyb3d8bbwe\LocalCache\Local\runtime'
 
-$croopor = Child $env:APPDATA 'croopor'
-$crooporInstances = Child $croopor 'instances'
-$crooporLibrary = Child $croopor 'library'
-$crooporRuntime = Child $crooporLibrary 'runtime'
+$axial = Child $env:APPDATA 'axial'
+$axialInstances = Child $axial 'instances'
+$axialLibrary = Child $axial 'library'
+$axialRuntime = Child $axialLibrary 'runtime'
 
 Emit 'windows_appdata_minecraft' (LocationState $minecraft)
 Emit 'windows_minecraft_versions' (LocationState $minecraftVersions)
@@ -82,10 +82,10 @@ Emit 'windows_minecraft_assets' (LocationState $minecraftAssets)
 Emit 'windows_minecraft_runtime' (LocationState $minecraftRuntime)
 Emit 'windows_store_runtime' (LocationState $storeRuntime)
 
-Emit 'windows_appdata_croopor' (LocationState $croopor)
-Emit 'windows_croopor_instances' (LocationState $crooporInstances)
-Emit 'windows_croopor_instances_count' (DirectoryCount $crooporInstances)
-Emit 'windows_croopor_library' (LocationState $crooporLibrary)
-Emit 'windows_croopor_runtime' (LocationState $crooporRuntime)
-Emit 'windows_croopor_runtime_count' (DirectoryCount $crooporRuntime)
+Emit 'windows_appdata_axial' (LocationState $axial)
+Emit 'windows_axial_instances' (LocationState $axialInstances)
+Emit 'windows_axial_instances_count' (DirectoryCount $axialInstances)
+Emit 'windows_axial_library' (LocationState $axialLibrary)
+Emit 'windows_axial_runtime' (LocationState $axialRuntime)
+Emit 'windows_axial_runtime_count' (DirectoryCount $axialRuntime)
 Emit 'windows_paths_redacted' 'yes'

@@ -1,7 +1,7 @@
 use crate::logging::timestamp_utc;
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
-use croopor_config::AppPaths;
-use croopor_launcher::{
+use axial_config::AppPaths;
+use axial_launcher::{
     GuardianSummary, LaunchHealingSummary, LaunchIntent, LaunchPriorityEvidence,
     LaunchSessionOutcome, LaunchSessionRecord, LaunchStageEvidence, LaunchStageRecord,
     launch_state_name,
@@ -13,7 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use sysinfo::System;
 
-const LAUNCH_PROOF_SCHEMA: &str = "croopor.launch.proof";
+const LAUNCH_PROOF_SCHEMA: &str = "axial.launch.proof";
 const LAUNCH_PROOF_SCHEMA_VERSION: u32 = 1;
 const LAUNCH_STAGE_COMPARISON_METRIC_NAME: &str = "total_completed_stage_duration_ms";
 const LAUNCH_BOOT_COMPARISON_METRIC_NAME: &str = "boot_duration_ms";
@@ -1100,9 +1100,9 @@ fn safe_report_filename(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use croopor_config::AppPaths;
-    use croopor_launcher::service::HealingSummaryInput;
-    use croopor_launcher::{
+    use axial_config::AppPaths;
+    use axial_launcher::service::HealingSummaryInput;
+    use axial_launcher::{
         LaunchFailure, LaunchFailureClass, LaunchState, SessionId, build_healing_summary,
         launch_stage_label,
     };
@@ -2010,17 +2010,17 @@ mod tests {
             loader: "vanilla".to_string(),
             is_modded: false,
             username: "Player".to_string(),
-            auth: croopor_launcher::LaunchAuthContext::offline("Player"),
+            auth: axial_launcher::LaunchAuthContext::offline("Player"),
             requested_java: String::new(),
             requested_preset: String::new(),
             extra_jvm_args: Vec::new(),
             max_memory_mb: 4096,
             min_memory_mb: 1024,
             resolution: None,
-            launcher_name: "croopor".to_string(),
+            launcher_name: "axial".to_string(),
             launcher_version: "test".to_string(),
             game_dir: None,
-            guardian: croopor_launcher::LaunchGuardianContext::default(),
+            guardian: axial_launcher::LaunchGuardianContext::default(),
             performance_mode: "managed".to_string(),
         };
         let context = LaunchProofContext::from_intent(&intent);
@@ -2181,7 +2181,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "croopor-launch-reports-{name}-{}-{}",
+            "axial-launch-reports-{name}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

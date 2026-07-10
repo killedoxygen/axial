@@ -1,12 +1,12 @@
 use crate::events;
 use crate::state::{ApiRuntimeState, DesktopState};
-use croopor_api::application::launch::public_launch_status_json;
-use croopor_api::application::{
+use axial_api::application::launch::public_launch_status_json;
+use axial_api::application::{
     public_loader_install_progress_json, public_vanilla_install_progress_json,
 };
-use croopor_api::routes::flush_pending_saved_skin_applies_for_shutdown;
-use croopor_api::state::{AppState, LaunchEvent, LaunchSessionRecord, LaunchStatusEvent};
-use croopor_launcher::{LaunchState, launch_notice_from_values};
+use axial_api::routes::flush_pending_saved_skin_applies_for_shutdown;
+use axial_api::state::{AppState, LaunchEvent, LaunchSessionRecord, LaunchStatusEvent};
+use axial_launcher::{LaunchState, launch_notice_from_values};
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -81,7 +81,7 @@ pub async fn microsoft_sign_in(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<NativeMicrosoftSignIn, String> {
-    let flow = croopor_api::microsoft_auth::begin_login()
+    let flow = axial_api::microsoft_auth::begin_login()
         .await
         .map_err(|error| error.user_message())?;
     let url = flow
@@ -116,12 +116,12 @@ pub async fn microsoft_sign_in(
         if let Ok(url) = window.url()
             && url
                 .as_str()
-                .starts_with(croopor_api::microsoft_auth::MICROSOFT_AUTH_REDIRECT_URL)
+                .starts_with(axial_api::microsoft_auth::MICROSOFT_AUTH_REDIRECT_URL)
         {
-            if let Some(code) = croopor_api::microsoft_auth::redirect_code_from_url(&url) {
+            if let Some(code) = axial_api::microsoft_auth::redirect_code_from_url(&url) {
                 let _ = window.close();
                 let outcome =
-                    croopor_api::microsoft_auth::finish_login(flow, &code, state.auth_logins())
+                    axial_api::microsoft_auth::finish_login(flow, &code, state.auth_logins())
                         .await
                         .map_err(|error| error.user_message())?;
                 return Ok(NativeMicrosoftSignIn {
@@ -525,7 +525,7 @@ mod tests {
             .expect("test clock should be after unix epoch")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "croopor-desktop-{name}-{}-{nonce}",
+            "axial-desktop-{name}-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("test dir");

@@ -1,7 +1,7 @@
 use super::LaunchPreflightResourceBudget;
 use crate::guardian::GuardianPreflightResourceSignals;
 use crate::state::launch_reports::LaunchProofResourceBudget;
-use croopor_launcher::{
+use axial_launcher::{
     LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB, LaunchCpuLoadWarningFacts,
     LaunchResourceWarningFacts,
 };
@@ -43,7 +43,7 @@ pub(super) fn preflight_resource_signals(
     GuardianPreflightResourceSignals {
         memory_clamped: raw_min_memory_mb > max_memory_mb,
         low_memory_allocation: max_memory_mb > 0
-            && max_memory_mb < croopor_launcher::LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB,
+            && max_memory_mb < axial_launcher::LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB,
         memory_pressure: resource_budget.memory_pressure,
         cpu_pressure: resource_budget.cpu_pressure,
         install_pressure: resource_budget.install_pressure,

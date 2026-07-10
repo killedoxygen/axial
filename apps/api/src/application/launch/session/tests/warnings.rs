@@ -69,7 +69,7 @@ async fn custom_mode_with_java_override_warns_before_queue() {
     assert!(prepared.task.guardian.guidance.iter().any(|detail| detail
         == "Guardian Custom mode will keep the selected Java override for this launch."));
     assert!(prepared.task.guardian.guidance.iter().any(|detail| detail
-        == "Switch Guardian back to Managed if you want Croopor to adjust unsafe choices."));
+        == "Switch Guardian back to Managed if you want Axial to adjust unsafe choices."));
 }
 
 #[tokio::test]
@@ -379,7 +379,7 @@ async fn memory_warning_and_custom_override_warning_merge_before_queue() {
     for expected in [
         "Launch memory budget is tight for the current active sessions.",
         "Guardian Custom mode will keep the selected Java override for this launch.",
-        "Switch Guardian back to Managed if you want Croopor to adjust unsafe choices.",
+        "Switch Guardian back to Managed if you want Axial to adjust unsafe choices.",
     ] {
         assert!(
             prepared

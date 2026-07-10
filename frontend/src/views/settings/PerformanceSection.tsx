@@ -10,7 +10,7 @@ import type { GuardianMode } from '../../types-guardian';
 import type { PerformanceMode } from '../../types-performance';
 
 const PERFORMANCE_OPTIONS: Array<ChoicePillOption<PerformanceMode>> = [
-  { value: 'managed', label: 'Managed', note: 'Croopor applies recommended tuning and optimizations for you.' },
+  { value: 'managed', label: 'Managed', note: 'Axial applies recommended tuning and optimizations for you.' },
   { value: 'vanilla', label: 'Vanilla', note: 'Pure Minecraft. No tweaks or add-ons applied at launch.' },
   { value: 'custom', label: 'Custom', note: 'You set the tuning. Your manual choices are kept as-is.' },
 ];

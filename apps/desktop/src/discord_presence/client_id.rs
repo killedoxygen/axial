@@ -1,7 +1,7 @@
 use tracing::warn;
 
 pub(super) fn configured_client_id() -> Option<String> {
-    match option_env!("CROOPOR_DISCORD_APPLICATION_ID") {
+    match option_env!("AXIAL_DISCORD_APPLICATION_ID") {
         Some(raw) => match sanitize_client_id(raw) {
             Ok(value) => Some(value),
             Err(error) => {

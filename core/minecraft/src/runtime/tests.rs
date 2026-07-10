@@ -265,15 +265,15 @@ fn component_manifest_destination_rejects_drive_like_path_with_backslashes() {
 fn runtime_windows_verbatim_path_transform_handles_deep_runtime_paths() {
     assert_eq!(
         runtime_windows_verbatim_path_string(
-            r"C:/Users/Alice/AppData/Roaming/croopor/runtimes/java-runtime-delta/bin/javaw.exe"
+            r"C:/Users/Alice/AppData/Roaming/axial/runtimes/java-runtime-delta/bin/javaw.exe"
         ),
-        r"\\?\C:\Users\Alice\AppData\Roaming\croopor\runtimes\java-runtime-delta\bin\javaw.exe"
+        r"\\?\C:\Users\Alice\AppData\Roaming\axial\runtimes\java-runtime-delta\bin\javaw.exe"
     );
     assert_eq!(
         runtime_windows_verbatim_path_string(
-            r"\\server\share\croopor\runtimes\java-runtime-delta\lib\jvm.cfg"
+            r"\\server\share\axial\runtimes\java-runtime-delta\lib\jvm.cfg"
         ),
-        r"\\?\UNC\server\share\croopor\runtimes\java-runtime-delta\lib\jvm.cfg"
+        r"\\?\UNC\server\share\axial\runtimes\java-runtime-delta\lib\jvm.cfg"
     );
     assert_eq!(
         runtime_windows_verbatim_path_string(r"\\?\C:\already\verbatim\javaw.exe"),
@@ -323,7 +323,7 @@ fn runtime_manifest_install_plan_sorts_directories_before_files() {
 
 #[tokio::test]
 async fn runtime_manifest_install_reports_file_progress() {
-    let root = unique_temp_root("croopor-runtime-progress-test");
+    let root = unique_temp_root("axial-runtime-progress-test");
     let java_bytes = b"java".to_vec();
     let cfg_bytes = b"cfg".to_vec();
     let java_sha1 = sha1_hex(&java_bytes);
@@ -387,7 +387,7 @@ async fn runtime_manifest_install_reports_file_progress() {
 #[cfg(unix)]
 #[tokio::test]
 async fn runtime_manifest_install_creates_link_entries_and_counts_them() {
-    let root = unique_temp_root("croopor-runtime-link-install-test");
+    let root = unique_temp_root("axial-runtime-link-install-test");
     let license_bytes = b"license".to_vec();
     let license_sha1 = sha1_hex(&license_bytes);
     let license_url = serve_runtime_download(license_bytes.clone()).await;
@@ -438,7 +438,7 @@ async fn runtime_manifest_install_creates_link_entries_and_counts_them() {
 #[cfg(unix)]
 #[tokio::test]
 async fn runtime_manifest_link_rejects_target_escape() {
-    let root = unique_temp_root("croopor-runtime-link-escape-test");
+    let root = unique_temp_root("axial-runtime-link-escape-test");
     let result = install_runtime_manifest_file(
         runtime_download_client().clone(),
         &root,
@@ -459,7 +459,7 @@ async fn runtime_manifest_link_rejects_target_escape() {
 #[cfg(not(unix))]
 #[tokio::test]
 async fn runtime_manifest_link_fails_explicitly_on_non_unix() {
-    let root = unique_temp_root("croopor-runtime-link-non-unix-test");
+    let root = unique_temp_root("axial-runtime-link-non-unix-test");
     let result = install_runtime_manifest_file(
         runtime_download_client().clone(),
         &root,
@@ -554,7 +554,7 @@ fn runtime_install_file_lock_path_is_component_sibling() {
 
 #[test]
 fn managed_runtime_requires_ready_marker_even_when_java_exists() {
-    let root = unique_temp_root("croopor-managed-runtime-ready-marker-test");
+    let root = unique_temp_root("axial-managed-runtime-ready-marker-test");
     write_runtime_executable_fixture(&root);
 
     assert_eq!(
@@ -562,14 +562,14 @@ fn managed_runtime_requires_ready_marker_even_when_java_exists() {
         RuntimeInstallState::Broken
     );
 
-    fs::write(root.join(".croopor-installing"), b"installing").expect("installing marker");
+    fs::write(root.join(".axial-installing"), b"installing").expect("installing marker");
     assert_eq!(
         detect_runtime_state(&root, true),
         RuntimeInstallState::Installing
     );
 
-    fs::remove_file(root.join(".croopor-installing")).expect("remove installing marker");
-    fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
+    fs::remove_file(root.join(".axial-installing")).expect("remove installing marker");
+    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
     assert_eq!(
         detect_runtime_state(&root, true),
         RuntimeInstallState::Broken
@@ -585,11 +585,11 @@ fn managed_runtime_requires_ready_marker_even_when_java_exists() {
 
 #[test]
 fn managed_runtime_rejects_empty_manifest_proof() {
-    let root = unique_temp_root("croopor-managed-runtime-empty-proof-test");
+    let root = unique_temp_root("axial-managed-runtime-empty-proof-test");
     write_runtime_executable_fixture(&root);
-    fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
+    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
     fs::write(
-        root.join(".croopor-runtime-manifest.json"),
+        root.join(".axial-runtime-manifest.json"),
         br#"{"files":{}}"#,
     )
     .expect("empty runtime manifest proof");
@@ -604,11 +604,11 @@ fn managed_runtime_rejects_empty_manifest_proof() {
 
 #[test]
 fn managed_runtime_rejects_manifest_file_without_raw_download_proof() {
-    let root = unique_temp_root("croopor-managed-runtime-missing-raw-proof-test");
+    let root = unique_temp_root("axial-managed-runtime-missing-raw-proof-test");
     write_runtime_executable_fixture(&root);
-    fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
+    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
     fs::write(
-        root.join(".croopor-runtime-manifest.json"),
+        root.join(".axial-runtime-manifest.json"),
         br#"{"files":{"bin/java":{"type":"file","downloads":{}}}}"#,
     )
     .expect("runtime manifest proof without raw download");
@@ -623,10 +623,10 @@ fn managed_runtime_rejects_manifest_file_without_raw_download_proof() {
 
 #[test]
 fn managed_runtime_manifest_drift_is_broken() {
-    let root = unique_temp_root("croopor-managed-runtime-manifest-drift-test");
+    let root = unique_temp_root("axial-managed-runtime-manifest-drift-test");
     write_runtime_executable_fixture(&root);
     write_runtime_manifest_proof_for_java(&root);
-    fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
+    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
     assert_eq!(
         detect_runtime_state(&root, true),
         RuntimeInstallState::Ready
@@ -646,12 +646,12 @@ fn managed_runtime_manifest_drift_is_broken() {
 #[cfg(unix)]
 #[test]
 fn managed_runtime_verifies_manifest_links() {
-    let root = unique_temp_root("croopor-managed-runtime-link-proof-test");
+    let root = unique_temp_root("axial-managed-runtime-link-proof-test");
     write_runtime_executable_fixture(&root);
     let link = java_executable(&root).with_file_name("java-link");
     std::os::unix::fs::symlink("java", &link).expect("runtime symlink");
     write_runtime_manifest_proof_for_java_and_link(&root);
-    fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
+    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
 
     assert_eq!(
         detect_runtime_state(&root, true),
@@ -669,7 +669,7 @@ fn managed_runtime_verifies_manifest_links() {
 
 #[test]
 fn runtime_install_cleanup_removes_stale_directory_destination() {
-    let root = unique_temp_root("croopor-runtime-cleanup-dir-test");
+    let root = unique_temp_root("axial-runtime-cleanup-dir-test");
     fs::create_dir_all(root.join("bin")).expect("create stale runtime dir");
     fs::write(root.join("bin").join("java"), b"stale").expect("write stale java");
 
@@ -680,7 +680,7 @@ fn runtime_install_cleanup_removes_stale_directory_destination() {
 
 #[test]
 fn runtime_install_cleanup_removes_stale_file_destination() {
-    let root = unique_temp_root("croopor-runtime-cleanup-file-test");
+    let root = unique_temp_root("axial-runtime-cleanup-file-test");
     fs::write(&root, b"blocking file").expect("write stale runtime file");
 
     remove_runtime_install_path(&root).expect("remove stale runtime file");
@@ -690,7 +690,7 @@ fn runtime_install_cleanup_removes_stale_file_destination() {
 
 #[test]
 fn runtime_install_cleanup_accepts_missing_destination() {
-    let root = unique_temp_root("croopor-runtime-cleanup-missing-test");
+    let root = unique_temp_root("axial-runtime-cleanup-missing-test");
 
     remove_runtime_install_path(&root).expect("missing runtime path is clean");
 
@@ -699,7 +699,7 @@ fn runtime_install_cleanup_accepts_missing_destination() {
 
 #[tokio::test]
 async fn async_runtime_install_cleanup_removes_stale_directory_destination() {
-    let root = unique_temp_root("croopor-runtime-async-cleanup-dir-test");
+    let root = unique_temp_root("axial-runtime-async-cleanup-dir-test");
     fs::create_dir_all(root.join("bin")).expect("create stale runtime dir");
     fs::write(root.join("bin").join("java"), b"stale").expect("write stale java");
 
@@ -712,7 +712,7 @@ async fn async_runtime_install_cleanup_removes_stale_directory_destination() {
 
 #[tokio::test]
 async fn async_runtime_install_cleanup_removes_stale_file_destination() {
-    let root = unique_temp_root("croopor-runtime-async-cleanup-file-test");
+    let root = unique_temp_root("axial-runtime-async-cleanup-file-test");
     fs::write(&root, b"blocking file").expect("write stale runtime file");
 
     remove_runtime_install_path_async(&root)
@@ -724,7 +724,7 @@ async fn async_runtime_install_cleanup_removes_stale_file_destination() {
 
 #[tokio::test]
 async fn async_runtime_install_cleanup_accepts_missing_destination() {
-    let root = unique_temp_root("croopor-runtime-async-cleanup-missing-test");
+    let root = unique_temp_root("axial-runtime-async-cleanup-missing-test");
 
     remove_runtime_install_path_async(&root)
         .await
@@ -735,7 +735,7 @@ async fn async_runtime_install_cleanup_accepts_missing_destination() {
 
 #[test]
 fn bundled_runtime_keeps_executable_readiness_without_marker() {
-    let root = unique_temp_root("croopor-bundled-runtime-ready-test");
+    let root = unique_temp_root("axial-bundled-runtime-ready-test");
     write_runtime_executable_fixture(&root);
 
     assert_eq!(
@@ -1049,7 +1049,7 @@ fn fat_arch64_be(cputype: u32) -> [u8; 32] {
 
 #[tokio::test]
 async fn fallback_selected_runtime_install_is_ready_with_manifest_proof() {
-    let root = unique_temp_root("croopor-runtime-fallback-install-test");
+    let root = unique_temp_root("axial-runtime-fallback-install-test");
     let component = RuntimeId::from("jre-legacy");
     let java_bytes = b"fallback java".to_vec();
     let cfg_bytes = b"fallback cfg".to_vec();
@@ -1103,7 +1103,7 @@ async fn fallback_selected_runtime_install_is_ready_with_manifest_proof() {
         detect_runtime_state(&root, true),
         RuntimeInstallState::Ready
     );
-    assert!(root.join(".croopor-runtime-manifest.json").is_file());
+    assert!(root.join(".axial-runtime-manifest.json").is_file());
     assert_eq!(
         events.last(),
         Some(&RuntimeEnsureEvent::ManagedRuntimeReady {
@@ -1138,11 +1138,11 @@ fn java_executable_uses_platform_runtime_layouts() {
 #[cfg(unix)]
 #[test]
 fn runtime_with_non_executable_java_is_broken() {
-    let root = unique_temp_root("croopor-runtime-non-executable-test");
+    let root = unique_temp_root("axial-runtime-non-executable-test");
     let java = java_executable(&root);
     fs::create_dir_all(java.parent().expect("java parent")).expect("java parent dir");
     fs::write(&java, b"java").expect("java file");
-    fs::write(root.join(".croopor-ready"), b"ready").expect("ready marker");
+    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
 
     assert_eq!(
         detect_runtime_state(&root, true),
@@ -1212,9 +1212,9 @@ fn runtime_download_verification_accepts_missing_metadata() {
 
 #[tokio::test]
 async fn runtime_file_download_streams_and_verifies_to_temp() {
-    let root = unique_temp_root("croopor-runtime-download-stream-test");
+    let root = unique_temp_root("axial-runtime-download-stream-test");
     fs::create_dir_all(&root).expect("download root");
-    let temp_path = root.join("java.croopor-tmp");
+    let temp_path = root.join("java.axial-tmp");
     let url = serve_runtime_download(b"hello".to_vec()).await;
     let client = runtime_download_client();
 
@@ -1234,9 +1234,9 @@ async fn runtime_file_download_streams_and_verifies_to_temp() {
 
 #[tokio::test]
 async fn runtime_file_download_retries_transient_status_errors() {
-    let root = unique_temp_root("croopor-runtime-download-retry-test");
+    let root = unique_temp_root("axial-runtime-download-retry-test");
     fs::create_dir_all(&root).expect("download root");
-    let temp_path = root.join("java.croopor-tmp");
+    let temp_path = root.join("java.axial-tmp");
     let (url, attempts) = serve_runtime_retry_responses(vec![
         (503, b"try again".to_vec()),
         (503, b"try again".to_vec()),
@@ -1265,9 +1265,9 @@ async fn runtime_file_download_retries_transient_status_errors() {
 
 #[tokio::test]
 async fn runtime_file_download_removes_temp_on_verification_error() {
-    let root = unique_temp_root("croopor-runtime-download-cleanup-test");
+    let root = unique_temp_root("axial-runtime-download-cleanup-test");
     fs::create_dir_all(&root).expect("download root");
-    let temp_path = root.join("java.croopor-tmp");
+    let temp_path = root.join("java.axial-tmp");
     let url = serve_runtime_download(b"hello".to_vec()).await;
     let client = runtime_download_client();
 
@@ -1287,9 +1287,9 @@ async fn runtime_file_download_removes_temp_on_verification_error() {
 
 #[tokio::test]
 async fn runtime_file_download_rejects_oversized_content_length() {
-    let root = unique_temp_root("croopor-runtime-download-content-length-test");
+    let root = unique_temp_root("axial-runtime-download-content-length-test");
     fs::create_dir_all(&root).expect("download root");
-    let temp_path = root.join("java.croopor-tmp");
+    let temp_path = root.join("java.axial-tmp");
     let url = serve_runtime_response(200, b"hello".to_vec(), Some(6), "/runtime.bin").await;
     let client = runtime_download_client();
 
@@ -1315,7 +1315,7 @@ async fn runtime_file_download_rejects_oversized_content_length() {
 
 #[tokio::test]
 async fn runtime_manifest_file_requires_checksum_proof() {
-    let root = unique_temp_root("croopor-runtime-missing-checksum-test");
+    let root = unique_temp_root("axial-runtime-missing-checksum-test");
     let file = ComponentManifestFile {
         kind: "file".to_string(),
         executable: false,
@@ -1345,7 +1345,7 @@ async fn runtime_manifest_file_requires_checksum_proof() {
 
 #[tokio::test]
 async fn runtime_manifest_file_prefers_lzma_and_verifies_decompressed_output() {
-    let root = unique_temp_root("croopor-runtime-lzma-test");
+    let root = unique_temp_root("axial-runtime-lzma-test");
     let raw_bytes = b"decompressed runtime file".to_vec();
     let compressed_bytes = lzma_compress_bytes(&raw_bytes);
     let lzma_url = serve_runtime_download(compressed_bytes.clone()).await;
@@ -1371,7 +1371,7 @@ async fn runtime_manifest_file_prefers_lzma_and_verifies_decompressed_output() {
 
 #[tokio::test]
 async fn runtime_manifest_file_rejects_invalid_checksum_proof() {
-    let root = unique_temp_root("croopor-runtime-invalid-checksum-test");
+    let root = unique_temp_root("axial-runtime-invalid-checksum-test");
     let file = ComponentManifestFile {
         kind: "file".to_string(),
         executable: false,
@@ -1401,9 +1401,9 @@ async fn runtime_manifest_file_rejects_invalid_checksum_proof() {
 
 #[tokio::test]
 async fn runtime_file_download_rejects_stream_past_expected_size_and_removes_temp() {
-    let root = unique_temp_root("croopor-runtime-download-stream-bound-test");
+    let root = unique_temp_root("axial-runtime-download-stream-bound-test");
     fs::create_dir_all(&root).expect("download root");
-    let temp_path = root.join("java.croopor-tmp");
+    let temp_path = root.join("java.axial-tmp");
     let url = serve_runtime_response(200, b"hello!".to_vec(), None, "/runtime.bin").await;
     let client = runtime_download_client();
 
@@ -1429,7 +1429,7 @@ async fn runtime_file_download_rejects_stream_past_expected_size_and_removes_tem
 
 #[test]
 fn runtime_install_futures_stay_small_enough_for_tokio_workers() {
-    let root = Path::new("/tmp/croopor-runtime-future-size");
+    let root = Path::new("/tmp/axial-runtime-future-size");
     let client = runtime_download_client();
     let expected = expected(Some(8), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     let file = downloadable_manifest_file(
@@ -1454,7 +1454,7 @@ fn runtime_install_futures_stay_small_enough_for_tokio_workers() {
         std::mem::size_of_val(&fetch_runtime_file(
             &client,
             "https://example.test/runtime.bin",
-            &root.join("java.croopor-tmp"),
+            &root.join("java.axial-tmp"),
             expected,
             "bin/java",
         )) < 4096,
@@ -1539,7 +1539,7 @@ fn write_runtime_manifest_proof_for_java(root: &Path) {
         }
     });
     fs::write(
-        root.join(".croopor-runtime-manifest.json"),
+        root.join(".axial-runtime-manifest.json"),
         serde_json::to_vec(&manifest).expect("manifest json"),
     )
     .expect("write runtime manifest proof");
@@ -1579,7 +1579,7 @@ fn write_runtime_manifest_proof_for_java_and_link(root: &Path) {
         }
     });
     fs::write(
-        root.join(".croopor-runtime-manifest.json"),
+        root.join(".axial-runtime-manifest.json"),
         serde_json::to_vec(&manifest).expect("manifest json"),
     )
     .expect("write runtime manifest proof with link");

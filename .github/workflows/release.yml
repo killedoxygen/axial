@@ -13,13 +13,13 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CROOPOR_MSA_CLIENT_ID: ${{ vars.CROOPOR_MSA_CLIENT_ID }}
+  AXIAL_MSA_CLIENT_ID: ${{ vars.AXIAL_MSA_CLIENT_ID }}
 
 jobs:
   verify:
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/mateoltd/croopor-linux-ci:latest
+      image: ghcr.io/mateoltd/axial-linux-ci:latest
     steps:
       - uses: actions/checkout@v4
 
@@ -60,8 +60,8 @@ jobs:
 
       - name: Verify Microsoft auth client id provisioning
         run: |
-          if [ -z "${CROOPOR_MSA_CLIENT_ID//[[:space:]]/}" ]; then
-            echo "::error::Release builds require repository variable CROOPOR_MSA_CLIENT_ID with the public Microsoft application client id."
+          if [ -z "${AXIAL_MSA_CLIENT_ID//[[:space:]]/}" ]; then
+            echo "::error::Release builds require repository variable AXIAL_MSA_CLIENT_ID with the public Microsoft application client id."
             exit 1
           fi
 
@@ -98,14 +98,14 @@ jobs:
       - name: Release desktop build
         env:
           # Telemetry key is a public write-only PostHog project token; keyless builds never upload (docs/TELEMETRY.md).
-          CROOPOR_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
-        run: cargo build --locked -p croopor-desktop --release
+          AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+        run: cargo build --locked -p axial-desktop --release
 
   linux-desktop:
     needs: verify
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/mateoltd/croopor-linux-ci:latest
+      image: ghcr.io/mateoltd/axial-linux-ci:latest
     steps:
       - uses: actions/checkout@v4
 
@@ -135,24 +135,24 @@ jobs:
 
       - name: Build release desktop binary
         env:
-          CROOPOR_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
-        run: cargo build --locked -p croopor-desktop --release
+          AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+        run: cargo build --locked -p axial-desktop --release
 
       - name: Package linux desktop binary
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist/linux
-          cp target/release/croopor-desktop dist/linux/croopor
-          chmod +x dist/linux/croopor
-          tar -C dist/linux -czf "dist/croopor-linux-amd64-${VERSION}.tar.gz" croopor
-          sha256sum "dist/croopor-linux-amd64-${VERSION}.tar.gz" > "dist/croopor-linux-amd64-${VERSION}.tar.gz.sha256"
+          cp target/release/axial-desktop dist/linux/axial
+          chmod +x dist/linux/axial
+          tar -C dist/linux -czf "dist/axial-linux-amd64-${VERSION}.tar.gz" axial
+          sha256sum "dist/axial-linux-amd64-${VERSION}.tar.gz" > "dist/axial-linux-amd64-${VERSION}.tar.gz.sha256"
 
       - name: Upload linux release asset
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/croopor-linux-amd64-*.tar.gz
-            dist/croopor-linux-amd64-*.tar.gz.sha256
+            dist/axial-linux-amd64-*.tar.gz
+            dist/axial-linux-amd64-*.tar.gz.sha256
 
   windows-desktop:
     needs: verify
@@ -183,17 +183,17 @@ jobs:
 
       - name: Build release desktop binary
         env:
-          CROOPOR_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
-        run: cargo build --locked -p croopor-desktop --release
+          AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+        run: cargo build --locked -p axial-desktop --release
 
       - name: Package windows desktop binary
         shell: pwsh
         run: |
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
           New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
-          Copy-Item target/release/croopor-desktop.exe dist/windows/croopor.exe
-          $archive = "dist/croopor-windows-amd64-$version.zip"
-          Compress-Archive -Path dist/windows/croopor.exe -DestinationPath $archive -Force
+          Copy-Item target/release/axial-desktop.exe dist/windows/axial.exe
+          $archive = "dist/axial-windows-amd64-$version.zip"
+          Compress-Archive -Path dist/windows/axial.exe -DestinationPath $archive -Force
           $hash = Get-FileHash -Algorithm SHA256 -Path $archive
           "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $archive)" | Set-Content -Path "$archive.sha256" -NoNewline -Encoding ascii
 
@@ -201,5 +201,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/croopor-windows-amd64-*.zip
-            dist/croopor-windows-amd64-*.zip.sha256
+            dist/axial-windows-amd64-*.zip
+            dist/axial-windows-amd64-*.zip.sha256

@@ -15,10 +15,10 @@ pub mod remote_flags;
 mod sessions;
 pub mod skins;
 
-use croopor_config::{AppConfig, ConfigStore, ConfigStoreError, InstanceStore, find_flag};
-pub use croopor_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
-pub use croopor_minecraft::download::DownloadProgress;
-use croopor_performance::PerformanceManager;
+use axial_config::{AppConfig, ConfigStore, ConfigStoreError, InstanceStore, find_flag};
+pub use axial_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
+pub use axial_minecraft::download::DownloadProgress;
+use axial_performance::PerformanceManager;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;

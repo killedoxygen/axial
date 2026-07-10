@@ -1,6 +1,6 @@
 use crate::runtime::RuntimeSelection;
 use crate::types::LaunchFailureClass;
-use croopor_minecraft::JavaRuntimeInfo;
+use axial_minecraft::JavaRuntimeInfo;
 
 pub(crate) fn validate_requested_java_override(
     requested_java: &str,

@@ -6,8 +6,8 @@ use crate::{
     },
     state::{AppState, ResolvedFlagSource, resolve_flag},
 };
+use axial_config::{ConfigStoreError, FEATURE_FLAGS, FlagStage, find_flag};
 use axum::{Json, http::StatusCode};
-use croopor_config::{ConfigStoreError, FEATURE_FLAGS, FlagStage, find_flag};
 use serde::{Deserialize, Serialize};
 
 const CONFIG_SAVE_ERROR_MESSAGE: &str =
@@ -113,7 +113,7 @@ pub async fn update_flag(
     Ok(list_flags(state))
 }
 
-fn find_visible_flag(key: &str) -> Option<&'static croopor_config::FeatureFlagDef> {
+fn find_visible_flag(key: &str) -> Option<&'static axial_config::FeatureFlagDef> {
     find_flag(key).filter(|flag| cfg!(debug_assertions) || !flag.dev_only)
 }
 
@@ -153,9 +153,9 @@ fn config_update_error_response(error: ConfigStoreError) -> ApiError {
 mod tests {
     use super::{FlagOverridePatch, FlagSource};
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
+    use axial_config::{AppConfig, AppPaths, ConfigStore, FEATURE_FLAGS, InstanceStore};
+    use axial_performance::PerformanceManager;
     use axum::Json;
-    use croopor_config::{AppConfig, AppPaths, ConfigStore, FEATURE_FLAGS, InstanceStore};
-    use croopor_performance::PerformanceManager;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -301,7 +301,7 @@ mod tests {
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let state = AppState::new(AppStateInit {
-                app_name: "Croopor".to_string(),
+                app_name: "Axial".to_string(),
                 version: "test".to_string(),
                 config,
                 instances,
@@ -340,7 +340,7 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "croopor-flags-application-{name}-{}-{nonce}",
+            "axial-flags-application-{name}-{}-{nonce}",
             std::process::id()
         ))
     }

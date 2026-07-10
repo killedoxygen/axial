@@ -25,9 +25,9 @@ use crate::state::failure_memory::{
     FailureMemoryActionOutcome, FailureMemoryKey, GuardianFailureMemoryEntry,
 };
 use crate::state::{GuardianFailureMemoryStore, InstallProgressRecord, OperationJournalStore};
-use croopor_minecraft::download::{ExecutionDownloadFact, ExecutionDownloadFactKind};
-use croopor_minecraft::{DownloadError, DownloadProgress};
-use croopor_minecraft::{LoaderError, LoaderInstallFailureKind};
+use axial_minecraft::download::{ExecutionDownloadFact, ExecutionDownloadFactKind};
+use axial_minecraft::{DownloadError, DownloadProgress};
+use axial_minecraft::{LoaderError, LoaderInstallFailureKind};
 use serde_json::{Value, json};
 
 const PROVIDER_FAILURE_SUPPRESSION_COOLDOWN_MINUTES: i64 = 5;

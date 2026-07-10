@@ -6,7 +6,7 @@
 use super::contracts::{
     OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind, sanitize_target_id,
 };
-use croopor_config::AppPaths;
+use axial_config::AppPaths;
 use std::path::{Component, Path};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -266,7 +266,7 @@ mod tests {
         protection_for,
     };
     use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetKind};
-    use croopor_config::AppPaths;
+    use axial_config::AppPaths;
     use std::path::PathBuf;
 
     #[test]
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn app_path_classifier_uses_safe_ids_and_protects_unknown_instance_paths() {
-        let root = PathBuf::from("/tmp/croopor-test");
+        let root = PathBuf::from("/tmp/axial-test");
         let paths = AppPaths {
             config_file: root.join("config").join("config.json"),
             instances_file: root.join("config").join("instances.json"),

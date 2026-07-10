@@ -8,13 +8,13 @@ use crate::guardian::{
 };
 use crate::logging::timestamp_utc;
 use crate::state::AppState;
-use croopor_launcher::{
+use axial_launcher::{
     GuardianDecision, GuardianInterventionKind, GuardianSummary, LaunchFailureClass,
 };
 
 pub(super) fn plan_guardian_launch_recovery_directive(
     session_id: &str,
-    intent: &croopor_launcher::LaunchIntent,
+    intent: &axial_launcher::LaunchIntent,
     directive: GuardianLaunchRecoveryDirective,
     mode: crate::guardian::GuardianMode,
 ) -> Result<GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection> {
@@ -92,7 +92,7 @@ pub(super) async fn record_failed_self_healing_if_any(
 }
 
 fn launch_recovery_user_intent_hash(
-    intent: &croopor_launcher::LaunchIntent,
+    intent: &axial_launcher::LaunchIntent,
     kind: GuardianLaunchRecoveryKind,
 ) -> String {
     let override_marker = match kind {
@@ -191,7 +191,7 @@ fn block_guardian_with_reason_and_guidance(
 
 pub(super) fn apply_prepare_recovery_directive(
     guardian: &mut GuardianSummary,
-    attempt: &mut croopor_launcher::service::AttemptOverrides,
+    attempt: &mut axial_launcher::service::AttemptOverrides,
     plan: &GuardianLaunchRecoveryPlan,
 ) {
     let directive = &plan.directive;
@@ -222,7 +222,7 @@ pub(super) fn apply_prepare_recovery_directive(
 
 pub(super) fn apply_startup_recovery_directive(
     guardian: &mut GuardianSummary,
-    attempt: &mut croopor_launcher::service::AttemptOverrides,
+    attempt: &mut axial_launcher::service::AttemptOverrides,
     plan: &GuardianLaunchRecoveryPlan,
 ) {
     let directive = &plan.directive;
@@ -321,11 +321,11 @@ mod tests {
     };
     use crate::state::failure_memory::FailureMemoryActionOutcome;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
-    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-    use croopor_launcher::{
+    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_launcher::{
         GuardianDecision, GuardianMode, LaunchSessionRecord, LaunchState, SessionId,
     };
-    use croopor_performance::PerformanceManager;
+    use axial_performance::PerformanceManager;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn prelaunch_preset_adjustment_records_backend_authored_guardian_intervention() {
-        let intent = test_launch_intent(Path::new("/tmp/croopor-test"), "session");
+        let intent = test_launch_intent(Path::new("/tmp/axial-test"), "session");
         let directive = GuardianLaunchRecoveryDirective {
             kind: GuardianLaunchRecoveryKind::DowngradePreset,
             effect: GuardianLaunchRecoveryEffect::DowngradePreset {
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn suppressed_launch_recovery_block_uses_existing_guardian_block_copy() {
-        let intent = test_launch_intent(Path::new("/tmp/croopor-test"), "session");
+        let intent = test_launch_intent(Path::new("/tmp/axial-test"), "session");
         let plan = test_recovery_plan(
             "session",
             &intent,
@@ -757,7 +757,7 @@ mod tests {
 
     fn test_recovery_plan(
         session_id: &str,
-        intent: &croopor_launcher::LaunchIntent,
+        intent: &axial_launcher::LaunchIntent,
         kind: GuardianLaunchRecoveryKind,
     ) -> GuardianLaunchRecoveryPlan {
         let directive = match kind {
@@ -801,7 +801,7 @@ mod tests {
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         AppState::new(AppStateInit {
-            app_name: "Croopor".to_string(),
+            app_name: "Axial".to_string(),
             version: "test".to_string(),
             config,
             instances,
@@ -850,8 +850,8 @@ mod tests {
         }
     }
 
-    fn test_launch_intent(root: &Path, session_id: &str) -> croopor_launcher::LaunchIntent {
-        croopor_launcher::LaunchIntent {
+    fn test_launch_intent(root: &Path, session_id: &str) -> axial_launcher::LaunchIntent {
+        axial_launcher::LaunchIntent {
             session_id: session_id.to_string(),
             library_dir: root.join("library"),
             instance_id: "instance".to_string(),
@@ -860,7 +860,7 @@ mod tests {
             loader: "vanilla".to_string(),
             is_modded: false,
             username: "Player".to_string(),
-            auth: croopor_launcher::LaunchAuthContext::offline("Player"),
+            auth: axial_launcher::LaunchAuthContext::offline("Player"),
             requested_java: "/home/alice/.jdks/bad-java/bin/java".to_string(),
             requested_preset: "graalvm".to_string(),
             extra_jvm_args: vec![
@@ -870,14 +870,14 @@ mod tests {
             max_memory_mb: 4096,
             min_memory_mb: 1024,
             resolution: None,
-            launcher_name: "croopor".to_string(),
+            launcher_name: "axial".to_string(),
             launcher_version: "test".to_string(),
             game_dir: None,
-            guardian: croopor_launcher::LaunchGuardianContext {
+            guardian: axial_launcher::LaunchGuardianContext {
                 mode: GuardianMode::Managed,
-                java_override_origin: Some(croopor_launcher::OverrideOrigin::Instance),
-                preset_override_origin: Some(croopor_launcher::OverrideOrigin::Instance),
-                raw_jvm_args_origin: Some(croopor_launcher::OverrideOrigin::Instance),
+                java_override_origin: Some(axial_launcher::OverrideOrigin::Instance),
+                preset_override_origin: Some(axial_launcher::OverrideOrigin::Instance),
+                raw_jvm_args_origin: Some(axial_launcher::OverrideOrigin::Instance),
             },
             performance_mode: "managed".to_string(),
         }

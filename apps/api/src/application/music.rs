@@ -20,11 +20,11 @@ use tokio::sync::Mutex;
 const MUSIC_TRACKS: [(&str, &str); 2] = [
     (
         "vapor-halo.mp3",
-        "https://github.com/mateoltd/croopor/releases/download/music-v2/vapor-halo.mp3",
+        "https://github.com/mateoltd/axial/releases/download/music-v2/vapor-halo.mp3",
     ),
     (
         "sublunar-hum.mp3",
-        "https://github.com/mateoltd/croopor/releases/download/music-v2/sublunar-hum.mp3",
+        "https://github.com/mateoltd/axial/releases/download/music-v2/sublunar-hum.mp3",
     ),
 ];
 
@@ -203,7 +203,7 @@ mod tests {
     fn music_download_failure_does_not_expose_url_or_request_fragments() {
         let internal_error = concat!(
             "error sending request for url ",
-            "https://github.com/mateoltd/croopor/releases/download/music-v2/vapor-halo.mp3"
+            "https://github.com/mateoltd/axial/releases/download/music-v2/vapor-halo.mp3"
         );
         let public_json = public_error_json_for(internal_error);
 
@@ -215,18 +215,18 @@ mod tests {
     #[test]
     fn music_download_failure_does_not_expose_unix_paths() {
         let public_json = public_error_json_for(
-            "failed to rename /home/zero/.local/share/croopor/music/vapor-halo.tmp",
+            "failed to rename /home/zero/.local/share/axial/music/vapor-halo.tmp",
         );
 
         assert!(!public_json.contains("/home/zero"));
-        assert!(!public_json.contains(".local/share/croopor"));
+        assert!(!public_json.contains(".local/share/axial"));
         assert!(!public_json.contains("vapor-halo.tmp"));
     }
 
     #[test]
     fn music_download_failure_does_not_expose_windows_paths() {
         let public_json = public_error_json_for(
-            r"failed to write C:\Users\Zero\AppData\Roaming\Croopor\music\vapor-halo.tmp",
+            r"failed to write C:\Users\Zero\AppData\Roaming\Axial\music\vapor-halo.tmp",
         );
 
         assert!(!public_json.contains(r"C:\Users"));
@@ -248,7 +248,7 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         std::env::temp_dir().join(format!(
-            "croopor-music-{prefix}-{}-{nanos:x}",
+            "axial-music-{prefix}-{}-{nanos:x}",
             std::process::id()
         ))
     }

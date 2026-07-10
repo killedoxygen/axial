@@ -4,7 +4,7 @@ use serde::de::DeserializeOwned;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-const USER_AGENT: &str = "croopor/0.3";
+const USER_AGENT: &str = "axial/0.3";
 const MAX_LOADER_JSON_BYTES: usize = 8 * 1024 * 1024;
 const LOADER_HTTP_CLIENT_MAX_IDLE_PER_HOST: usize = 8;
 const LOADER_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECS: u64 = 120;

@@ -704,7 +704,7 @@ async fn ensure_installed_rejects_existing_final_file_with_wrong_size() {
 fn managed_artifact_reuse_future_stays_small_enough_for_tokio_workers() {
     assert!(
         std::mem::size_of_val(&file_matches_sha512(
-            Path::new("/tmp/croopor-test/sodium.jar"),
+            Path::new("/tmp/axial-test/sodium.jar"),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             Some(8),
         )) < 4096,
@@ -1238,7 +1238,7 @@ fn remove_rejects_non_composition_owned_tracked_state_without_deleting_files() {
     fs::create_dir_all(&root).expect("create mods dir");
     fs::write(root.join("user.jar"), b"user").expect("write user file");
     fs::write(
-        root.join(".croopor-lock.json"),
+        root.join(".axial-lock.json"),
         serde_json::to_vec(&serde_json::json!({
             "composition_id": "core",
             "tier": "core",
@@ -1267,7 +1267,7 @@ fn remove_rejects_non_composition_owned_tracked_state_without_deleting_files() {
         InstallError::State(StateError::InvalidOwnership { .. })
     ));
     assert_eq!(fs::read(root.join("user.jar")).expect("read user"), b"user");
-    assert!(root.join(".croopor-lock.json").is_file());
+    assert!(root.join(".axial-lock.json").is_file());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -1275,7 +1275,7 @@ fn remove_rejects_non_composition_owned_tracked_state_without_deleting_files() {
 fn rollback_rejects_path_traversal_metadata() {
     let root = test_root("rollback-path-traversal");
     let manager = PerformanceManager::new().expect("performance manager");
-    let rollback_dir = root.join(".croopor-performance").join("rollback");
+    let rollback_dir = root.join(".axial-performance").join("rollback");
     fs::create_dir_all(&rollback_dir).expect("create rollback dir");
     fs::write(
         rollback_dir.join("latest.json"),
@@ -2232,7 +2232,7 @@ async fn spawn_modrinth_server_with_sha512_size_and_requests(
 
 fn test_root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "croopor-performance-install-{name}-{}-{}",
+        "axial-performance-install-{name}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

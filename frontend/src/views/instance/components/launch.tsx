@@ -204,7 +204,7 @@ export function InstallBarrierPane({
     ? `${installProgress.label} for ${targetLabel}.`
     : installQueued
       ? installQueuedView?.summary || `${targetLabel} is waiting in the download queue.`
-      : `Croopor is preparing the required version files for ${targetLabel}.`;
+      : `Axial is preparing the required version files for ${targetLabel}.`;
   const detail = installProgress ? `${pct}% complete` : installQueued ? installQueuedView?.detail || '' : '';
 
   return (

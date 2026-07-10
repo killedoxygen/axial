@@ -94,7 +94,7 @@ keep this short and real. if the codebase changes, update this file.
 - frontend entry is `frontend/src/main.tsx`
 - frontend CSS is imported through `frontend/src/styles.ts`; `frontend/static/app.css` is generated
 - frontend JS entry output is `frontend/static/app.js`; additional generated chunks may be emitted under `frontend/static/chunks/`
-- frontend mock mode is build-time gated via `__CROOPOR_MOCK_API__` and lives at the `api()` seam in `frontend/src/mock/`; run it with `task dev:web:mock`
+- frontend mock mode is build-time gated via `__AXIAL_MOCK_API__` and lives at the `api()` seam in `frontend/src/mock/`; run it with `task dev:web:mock`
 - frontend package manager is `pnpm`, pinned through `frontend/package.json`
 - frontend formatting uses Prettier from `frontend/`; run `pnpm run format:check` to check and `pnpm run format` to write
 - the Rust workspace root is `Cargo.toml`

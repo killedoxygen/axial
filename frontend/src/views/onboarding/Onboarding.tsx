@@ -491,10 +491,10 @@ export function Onboarding(): JSX.Element | null {
       </div>
     );
   } else if (stage === 'telemetry') {
-    headline = 'Mind if Croopor keeps count?';
+    headline = 'Mind if Axial keeps count?';
     subline = (
       <p class="cp-ob-subline">
-        Croopor counts which features get used and whether launches succeed — always anonymous. Never your name, your
+        Axial counts which features get used and whether launches succeed — always anonymous. Never your name, your
         files, or the servers you join. Off means nothing is ever sent.
       </p>
     );
@@ -530,9 +530,7 @@ export function Onboarding(): JSX.Element | null {
     );
   } else {
     headline = 'Share launcher activity on Discord?';
-    subline = (
-      <p class="cp-ob-subline">Croopor shares broad Minecraft activity, not instance names or server details.</p>
-    );
+    subline = <p class="cp-ob-subline">Axial shares broad Minecraft activity, not instance names or server details.</p>;
     widget = (
       <div class="cp-ob-widget">
         <div class="cp-ob-pills">

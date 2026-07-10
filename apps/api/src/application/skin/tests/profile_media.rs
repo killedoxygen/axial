@@ -325,7 +325,7 @@ async fn skin_profile_file_downloads_normalizes_active_skin() {
 
     assert_eq!(request.path, "/texture/activeTexture123");
     assert_eq!(request.accept.as_deref(), Some("image/png"));
-    assert_eq!(request.user_agent.as_deref(), Some(CROOPOR_USER_AGENT));
+    assert_eq!(request.user_agent.as_deref(), Some(AXIAL_USER_AGENT));
     assert_eq!(content_type.as_deref(), Some("image/png"));
     assert_eq!(
         cache_control.as_deref(),
@@ -492,7 +492,7 @@ async fn skin_cape_file_downloads_available_account_cape() {
 
     assert_eq!(request.path, "/texture/capeTexture123");
     assert_eq!(request.accept.as_deref(), Some("image/png"));
-    assert_eq!(request.user_agent.as_deref(), Some(CROOPOR_USER_AGENT));
+    assert_eq!(request.user_agent.as_deref(), Some(AXIAL_USER_AGENT));
     assert_eq!(content_type.as_deref(), Some("image/png"));
     assert_eq!(
         cache_control.as_deref(),
@@ -1000,7 +1000,7 @@ async fn skin_lookup_file_downloads_normalizes_and_caches_username_skin() {
     assert_eq!(texture_request.accept.as_deref(), Some("image/png"));
     assert_eq!(
         texture_request.user_agent.as_deref(),
-        Some(CROOPOR_USER_AGENT)
+        Some(AXIAL_USER_AGENT)
     );
     assert_eq!(content_type.as_deref(), Some("image/png"));
     assert_eq!(
@@ -1153,7 +1153,7 @@ async fn skin_lookup_cape_downloads_session_cape_texture() {
     assert_eq!(texture_request.accept.as_deref(), Some("image/png"));
     assert_eq!(
         texture_request.user_agent.as_deref(),
-        Some(CROOPOR_USER_AGENT)
+        Some(AXIAL_USER_AGENT)
     );
     assert_eq!(content_type.as_deref(), Some("image/png"));
     assert_eq!(

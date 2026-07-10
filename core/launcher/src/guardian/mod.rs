@@ -1,6 +1,6 @@
 use crate::types::LaunchFailureClass;
 #[cfg(test)]
-use croopor_minecraft::JavaRuntimeInfo;
+use axial_minecraft::JavaRuntimeInfo;
 use serde::{Deserialize, Serialize};
 
 pub const LAUNCH_MEMORY_HEADROOM_MB: u64 = 2048;
@@ -8,7 +8,7 @@ pub const LAUNCH_DISK_HEADROOM_MB: u64 = 2048;
 pub const LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB: i32 = 2048;
 
 #[cfg(test)]
-const MEMORY_CLAMP_WARNING: &str = "Minimum memory was higher than maximum memory, so Croopor clamped the launch minimum to match the maximum allocation.";
+const MEMORY_CLAMP_WARNING: &str = "Minimum memory was higher than maximum memory, so Axial clamped the launch minimum to match the maximum allocation.";
 #[cfg(test)]
 const MEMORY_CLAMP_GUIDANCE: &str = "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.";
 
@@ -619,7 +619,7 @@ fn custom_risky_override_warning_guidance(context: &LaunchGuardianContext) -> Op
         );
     }
     guidance.push(
-        "Switch Guardian back to Managed if you want Croopor to adjust unsafe choices.".to_string(),
+        "Switch Guardian back to Managed if you want Axial to adjust unsafe choices.".to_string(),
     );
     Some(guidance)
 }
@@ -716,7 +716,7 @@ fn guidance_for_failure(class: LaunchFailureClass, context: &LaunchGuardianConte
                 ]
             } else {
                 vec![
-                    "Use a compatible Java runtime or let Croopor use the managed runtime."
+                    "Use a compatible Java runtime or let Axial use the managed runtime."
                         .to_string(),
                 ]
             }
@@ -735,14 +735,14 @@ fn guidance_for_failure(class: LaunchFailureClass, context: &LaunchGuardianConte
                         .to_string(),
                 ]
             } else {
-                vec!["Use safer launch settings or let Croopor manage compatibility.".to_string()]
+                vec!["Use safer launch settings or let Axial manage compatibility.".to_string()]
             }
         }
         LaunchFailureClass::StartupStalled => {
             vec!["Launch stalled before startup. Review recent override changes first.".to_string()]
         }
         LaunchFailureClass::LauncherManagedArtifactSignature => {
-            vec!["Repair the installed version so Croopor can replace the affected launcher-managed jars.".to_string()]
+            vec!["Repair the installed version so Axial can replace the affected launcher-managed jars.".to_string()]
         }
         _ => Vec::new(),
     }
@@ -1094,7 +1094,7 @@ mod tests {
         summarize_launch_warnings,
     };
     use crate::types::LaunchFailureClass;
-    use croopor_minecraft::JavaRuntimeInfo;
+    use axial_minecraft::JavaRuntimeInfo;
     use serde_json::json;
 
     #[test]
@@ -1330,7 +1330,7 @@ mod tests {
     fn blocked_summary_prefers_guardian_message_and_guidance_details() {
         let mut summary = GuardianSummary::new(GuardianMode::Managed);
         summary.block_with_guidance(vec![
-            "Use a compatible Java runtime or let Croopor use the managed runtime.".to_string(),
+            "Use a compatible Java runtime or let Axial use the managed runtime.".to_string(),
         ]);
 
         assert_eq!(summary.decision, super::GuardianDecision::Blocked);
@@ -1340,7 +1340,7 @@ mod tests {
         );
         assert_eq!(
             summary.details,
-            vec!["Use a compatible Java runtime or let Croopor use the managed runtime."]
+            vec!["Use a compatible Java runtime or let Axial use the managed runtime."]
         );
     }
 
@@ -1445,7 +1445,7 @@ mod tests {
     fn startup_failure_text_classification_is_bounded_to_failure_class() {
         assert_eq!(
             classify_startup_failure_text(
-                "Unrecognized VM option '-XX:+UseZGC' in /home/alice/.croopor/instances/secret"
+                "Unrecognized VM option '-XX:+UseZGC' in /home/alice/.axial/instances/secret"
             ),
             LaunchFailureClass::JvmUnsupportedOption
         );
@@ -1561,7 +1561,7 @@ mod tests {
         assert_eq!(summary.decision, super::GuardianDecision::Warned);
         assert_has_guidance(
             &summary,
-            "Minimum memory was higher than maximum memory, so Croopor clamped the launch minimum to match the maximum allocation.",
+            "Minimum memory was higher than maximum memory, so Axial clamped the launch minimum to match the maximum allocation.",
         );
         assert_has_guidance(
             &summary,
@@ -1743,7 +1743,7 @@ mod tests {
         assert_eq!(summary.decision, super::GuardianDecision::Warned);
         assert_has_guidance(
             &summary,
-            "Minimum memory was higher than maximum memory, so Croopor clamped the launch minimum to match the maximum allocation.",
+            "Minimum memory was higher than maximum memory, so Axial clamped the launch minimum to match the maximum allocation.",
         );
         assert_has_guidance(
             &summary,
@@ -1759,7 +1759,7 @@ mod tests {
         );
         assert_has_guidance(
             &summary,
-            "Switch Guardian back to Managed if you want Croopor to adjust unsafe choices.",
+            "Switch Guardian back to Managed if you want Axial to adjust unsafe choices.",
         );
         assert_eq!(summary.details, summary.guidance);
     }

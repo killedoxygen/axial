@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-const MATRIX_SCHEMA: &str = "croopor.launch.benchmark.matrix";
+const MATRIX_SCHEMA: &str = "axial.launch.benchmark.matrix";
 const MATRIX_SCHEMA_VERSION: u32 = 1;
 const MAX_MATRIX_JSON_BYTES: usize = 12 * 1024;
 

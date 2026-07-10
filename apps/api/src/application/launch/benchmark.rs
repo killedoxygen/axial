@@ -4,9 +4,9 @@ use crate::application::performance::{
     benchmark_suite_run_descriptor, benchmark_suite_run_id,
 };
 use crate::state::AppState;
+use axial_launcher::LaunchState;
 use axum::Json;
 use axum::http::StatusCode;
-use croopor_launcher::LaunchState;
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
@@ -179,7 +179,7 @@ impl BenchmarkLaunchRequest {
 
     pub(crate) fn into_suite_launch_input_with_manifest(
         self,
-        paths: Option<&croopor_config::AppPaths>,
+        paths: Option<&axial_config::AppPaths>,
     ) -> Result<BenchmarkSuiteLaunchInput, (StatusCode, Json<serde_json::Value>)> {
         let requested_run_index = self.run_index;
         let manifest_paths = if requested_run_index.is_none() {
@@ -211,7 +211,7 @@ impl BenchmarkLaunchRequest {
 
     pub(crate) fn into_suite_plan_input_with_manifest(
         self,
-        paths: Option<&croopor_config::AppPaths>,
+        paths: Option<&axial_config::AppPaths>,
     ) -> Result<BenchmarkSuitePlanInput, (StatusCode, Json<serde_json::Value>)> {
         if self
             .benchmark_mode
@@ -577,7 +577,7 @@ pub(crate) async fn launch_benchmark_suite_run(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_benchmark_suite_run_reservation(
-    paths: &croopor_config::AppPaths,
+    paths: &axial_config::AppPaths,
     suite_id: &str,
     mode: &str,
     plan: &[BenchmarkSuiteRunSpec],

@@ -35,7 +35,7 @@ use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
 
 const MAX_INSTALLER_DOWNLOAD_SIZE: u64 = 50 << 20;
-const LOADER_METADATA_FILE: &str = ".croopor-loader.json";
+const LOADER_METADATA_FILE: &str = ".axial-loader.json";
 
 #[derive(Debug)]
 struct CachedProfile {
@@ -549,7 +549,7 @@ async fn verify_existing_launcher_managed_artifact_on_blocking_thread(
 
 fn mark_loader_libraries_checksumless_allowed(libraries: &mut [crate::launch::Library]) {
     for library in libraries {
-        library.croopor_checksumless_allowed = true;
+        library.axial_checksumless_allowed = true;
     }
 }
 
@@ -1162,7 +1162,7 @@ mod tests {
 
     #[test]
     fn loader_install_futures_stay_small_enough_for_tokio_workers() {
-        let root = PathBuf::from("/tmp/croopor-loader-future-size");
+        let root = PathBuf::from("/tmp/axial-loader-future-size");
         let profile_plan = LoaderInstallPlan {
             record: profile_record(),
             stage_dir: root.join("profile-stage"),
@@ -1234,7 +1234,7 @@ mod tests {
     #[tokio::test]
     async fn base_version_install_lock_serializes_same_library_version() {
         let locks = std::sync::Mutex::new(HashMap::new());
-        let root = PathBuf::from("/tmp/croopor-loader-base-lock");
+        let root = PathBuf::from("/tmp/axial-loader-base-lock");
         let first = base_version_install_lock_from_map(&locks, &root, "1.21.5");
         let second = base_version_install_lock_from_map(&locks, &root, "1.21.5");
         let other_version = base_version_install_lock_from_map(&locks, &root, "1.21.4");
@@ -1262,7 +1262,7 @@ mod tests {
     #[test]
     fn base_version_install_lock_recovers_from_poisoned_map_lock() {
         let locks = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let root = PathBuf::from("/tmp/croopor-loader-poisoned-base-lock");
+        let root = PathBuf::from("/tmp/axial-loader-poisoned-base-lock");
         let seeded_install_lock = Arc::new(tokio::sync::Mutex::new(()));
         let poison_target = Arc::clone(&locks);
         let poison_seed = Arc::clone(&seeded_install_lock);
@@ -1938,7 +1938,7 @@ mod tests {
         let libraries = version["libraries"].as_array().expect("libraries");
         assert!(libraries.iter().any(|library| {
             library["name"] == "org.quiltmc:quilt-loader:0.29.2"
-                && library["crooporChecksumlessAllowed"] == true
+                && library["axialChecksumlessAllowed"] == true
         }));
 
         server.stop();
@@ -2044,7 +2044,7 @@ mod tests {
         let libraries = version["libraries"].as_array().expect("libraries");
         assert!(libraries.iter().any(|library| {
             library["name"] == "net.minecraftforge:forge:1.7.10-10.13.4.1614-1.7.10"
-                && library["crooporChecksumlessAllowed"] == true
+                && library["axialChecksumlessAllowed"] == true
         }));
 
         server.stop();
@@ -2366,7 +2366,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|value| value.as_nanos())
             .unwrap_or_default();
-        std::env::temp_dir().join(format!("croopor-{prefix}-{nanos:x}"))
+        std::env::temp_dir().join(format!("axial-{prefix}-{nanos:x}"))
     }
 
     fn write_oversized_cached_file(path: &std::path::Path) {

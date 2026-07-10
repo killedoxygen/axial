@@ -7,8 +7,8 @@ use crate::{
     },
     state::AppState,
 };
+use axial_config::{AppConfig, ConfigStoreError};
 use axum::{Json, http::StatusCode};
-use croopor_config::{AppConfig, ConfigStoreError};
 use serde::Deserialize;
 
 const CONFIG_SAVE_ERROR_MESSAGE: &str =
@@ -189,11 +189,11 @@ mod tests {
         observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub},
         state::{AppState, AppStateInit, InstallStore, SessionStore},
     };
-    use axum::Json;
-    use croopor_config::{
+    use axial_config::{
         AppConfig, AppConfigValidationError, AppPaths, ConfigStore, ConfigStoreError, InstanceStore,
     };
-    use croopor_performance::PerformanceManager;
+    use axial_performance::PerformanceManager;
+    use axum::Json;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -244,8 +244,8 @@ mod tests {
     #[test]
     fn config_update_non_validation_error_hides_local_paths() {
         let paths = [
-            "/Users/alice/Library/Application Support/Croopor/config.json",
-            r"C:\Users\Alice\AppData\Roaming\Croopor\config.json",
+            "/Users/alice/Library/Application Support/Axial/config.json",
+            r"C:\Users\Alice\AppData\Roaming\Axial\config.json",
         ];
 
         for path in paths {
@@ -382,7 +382,7 @@ mod tests {
             ));
             let state = AppState::new_with_telemetry(
                 AppStateInit {
-                    app_name: "Croopor".to_string(),
+                    app_name: "Axial".to_string(),
                     version: "test".to_string(),
                     config,
                     instances,
@@ -436,7 +436,7 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "croopor-config-route-{name}-{}-{nonce}",
+            "axial-config-route-{name}-{}-{nonce}",
             std::process::id()
         ))
     }

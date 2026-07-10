@@ -11,7 +11,7 @@ use crate::observability::{
 use crate::state::contracts::{
     OperationId, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
-use croopor_launcher::LaunchStageEvidence;
+use axial_launcher::LaunchStageEvidence;
 use std::fmt;
 
 #[derive(Clone, Debug)]

@@ -1,5 +1,5 @@
 use super::create::CreateVersionTagViewModel;
-use croopor_minecraft::{
+use axial_minecraft::{
     LoaderBuildRecord, LoaderCatalogState, LoaderComponentId, LoaderGameVersion,
     LoaderSelectionReason, compare_version_like, fetch_cached_builds,
 };
@@ -240,7 +240,7 @@ fn quilt_loader_version_is_before_java25_support(loader_version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use croopor_minecraft::{
+    use axial_minecraft::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderInstallStrategy, LoaderInstallability,
         LoaderSelectionMeta, LoaderSelectionSource, build_id_for, installed_version_id_for,
         loaders::{LoaderInstallSource, types::LoaderBuildSubjectKind},

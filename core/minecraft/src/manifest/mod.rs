@@ -271,7 +271,7 @@ fn manifest_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(15))
-            .user_agent("croopor/0.3")
+            .user_agent("axial/0.3")
             .pool_max_idle_per_host(MANIFEST_CLIENT_MAX_IDLE_PER_HOST)
             .pool_idle_timeout(Duration::from_secs(MANIFEST_CLIENT_POOL_IDLE_TIMEOUT_SECS))
             .tcp_keepalive(Duration::from_secs(MANIFEST_CLIENT_TCP_KEEPALIVE_SECS))
@@ -548,7 +548,7 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         std::env::temp_dir().join(format!(
-            "croopor-manifest-cache-{prefix}-{}-{nanos:x}",
+            "axial-manifest-cache-{prefix}-{}-{nanos:x}",
             std::process::id()
         ))
     }

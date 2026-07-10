@@ -178,7 +178,7 @@ Responsibility:
 - choose behavior from `LoaderInstallStrategy`
 - keep loader-family and era-specific work local to the selected strategy
 
-Profile-based loaders, currently Fabric and Quilt, download libraries declared by trusted upstream profile JSON. Those profile libraries may omit SHA-1 metadata. Axial permits a best-effort first download or size-matching reuse for those profile libraries only, while descriptor-backed vanilla artifacts and installer-sourced selected artifacts still require valid checksum metadata. Missing-checksum `.jar` profile libraries are not trusted solely because a file exists; existing and freshly downloaded jars must be structurally readable so stale bad cache entries are replaced. Composed profile-loader version JSON marks those trusted profile libraries with `crooporChecksumlessAllowed`; launch readiness uses that marker to accept only present, structurally readable checksumless jars, while unmarked checksumless libraries still fail strict readiness. Loader strategies also validate base Minecraft dependencies before treating a base version as already installed: the base JSON, client jar, incomplete marker, and selected base libraries must be ready so a partially-installed vanilla base cannot produce a finalized loader profile with missing inherited libraries.
+Profile-based loaders, currently Fabric and Quilt, download libraries declared by trusted upstream profile JSON. Those profile libraries may omit SHA-1 metadata. Axial permits a best-effort first download or size-matching reuse for those profile libraries only, while descriptor-backed vanilla artifacts and installer-sourced selected artifacts still require valid checksum metadata. Missing-checksum `.jar` profile libraries are not trusted solely because a file exists; existing and freshly downloaded jars must be structurally readable so stale bad cache entries are replaced. Composed profile-loader version JSON marks those trusted profile libraries with `axialChecksumlessAllowed`; launch readiness uses that marker to accept only present, structurally readable checksumless jars, while unmarked checksumless libraries still fail strict readiness. Loader strategies also validate base Minecraft dependencies before treating a base version as already installed: the base JSON, client jar, incomplete marker, and selected base libraries must be ready so a partially-installed vanilla base cannot produce a finalized loader profile with missing inherited libraries.
 
 ### 4. Helper layers
 
@@ -270,9 +270,9 @@ The loader attachment carries:
 
 That keeps Minecraft-version lifecycle and loader-build terms separate in the UI.
 
-Install strategies also write `versions/<id>/.croopor-loader.json` beside the composed version JSON. Version scanning reads that file as the authoritative installed-loader attachment source, so routes do not infer loader identity, Minecraft version, or loader version from composite local version ids.
+Install strategies also write `versions/<id>/.axial-loader.json` beside the composed version JSON. Version scanning reads that file as the authoritative installed-loader attachment source, so routes do not infer loader identity, Minecraft version, or loader version from composite local version ids.
 
-The installed-version scanner also anchors Minecraft metadata for loader versions to the inherited/base Minecraft id from the version JSON or `.croopor-loader.json`. Composite loader ids remain install identities, not Minecraft-version labels or lifecycle inputs.
+The installed-version scanner also anchors Minecraft metadata for loader versions to the inherited/base Minecraft id from the version JSON or `.axial-loader.json`. Composite loader ids remain install identities, not Minecraft-version labels or lifecycle inputs.
 
 ## Maintenance rules
 

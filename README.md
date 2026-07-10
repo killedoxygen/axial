@@ -4,7 +4,7 @@ Axial is a modern Minecraft launcher and management environment that creates, tu
 
 It is built around a simple promise: launching Minecraft should feel fast, understandable, and resilient. Axial absorbs the routine technical work, explains meaningful adjustments, and gives advanced players control without making every player debug Java, loaders, or damaged game files.
 
-> Axial Launcher is pre-release software under active development. The source tree and internal identifiers still use the project's former `croopor` name while the rebrand is phased in.
+> Axial Launcher is pre-release software under active development.
 
 ## What Axial does
 

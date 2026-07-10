@@ -7,8 +7,8 @@ use super::contracts::{OwnershipClass, TargetDescriptor, sanitize_target_id};
 use super::ownership::{CurrentArtifact, classify_current_artifact};
 use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
+use axial_config::AppPaths;
 use chrono::{DateTime, FixedOffset};
-use croopor_config::AppPaths;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use tracing::warn;
 
-pub const FAILURE_MEMORY_SCHEMA: &str = "croopor.guardian.failure_memory.v1";
+pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v1";
 pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = 64;
 const FAILURE_MEMORY_FILE: &str = "failure-memory.json";
 
@@ -626,7 +626,7 @@ mod tests {
         OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
-    use croopor_config::AppPaths;
+    use axial_config::AppPaths;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -949,7 +949,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "croopor-failure-memory-{name}-{}",
+            "axial-failure-memory-{name}-{}",
             uuid::Uuid::new_v4()
         ));
         let _ = fs::remove_dir_all(&root);

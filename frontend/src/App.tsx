@@ -43,7 +43,7 @@ const DownloadsRoute = createRouteLoader(async () => (await import('./views/down
 
 const OnboardingOverlay = createRouteLoader(async () => (await import('./views/onboarding/Onboarding')).Onboarding);
 
-const loadDevLabView = __CROOPOR_ENABLE_DEV_LAB__
+const loadDevLabView = __AXIAL_ENABLE_DEV_LAB__
   ? async (): Promise<DevLabViewComponent> => (await import('./views/dev-lab/DevLabView')).DevLabView
   : null;
 
@@ -189,7 +189,7 @@ function AppErrorBoundary({ children }: { children: ComponentChildren }): JSX.El
           }}
         >
           <div>
-            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Croopor hit a render error</div>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Axial hit a render error</div>
             <div style={{ color: 'var(--text-dim)', fontSize: 13, lineHeight: 1.45 }}>
               Reloading usually gets the launcher back in sync with the backend.
             </div>

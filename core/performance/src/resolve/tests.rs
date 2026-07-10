@@ -130,7 +130,7 @@ fn family_c_forge_core_emergency_disable_falls_back_to_vanilla_enhanced() {
     assert!(plan.mods.is_empty());
     assert_eq!(
         plan.fallback_reason,
-        "A faster performance bundle is temporarily unavailable, so Croopor chose the safest available option."
+        "A faster performance bundle is temporarily unavailable, so Axial chose the safest available option."
     );
     assert!(plan.warnings.iter().any(|warning| {
         warning.contains("family-c-forge-core skipped by emergency disable")
@@ -254,7 +254,7 @@ fn forge_family_e_and_f_resolve_extended_then_core_when_extended_disabled() {
             assert_eq!(count_mods_with_slug(&fallback_plan.mods, "ferrite-core"), 1);
             assert_eq!(
                 fallback_plan.fallback_reason,
-                "A faster performance bundle is temporarily unavailable, so Croopor chose the safest available option."
+                "A faster performance bundle is temporarily unavailable, so Axial chose the safest available option."
             );
             let expected_warning =
                 format!("{extended_composition_id} skipped by emergency disable");
@@ -1097,7 +1097,7 @@ fn disabled_composition_falls_back_to_next_eligible_tier() {
     }
     assert_eq!(
         plan.fallback_reason,
-        "A faster performance bundle is temporarily unavailable, so Croopor chose the safest available option."
+        "A faster performance bundle is temporarily unavailable, so Axial chose the safest available option."
     );
     assert!(plan.warnings.iter().any(|warning| {
         warning.contains("family-f-fabric-extended skipped by emergency disable")
@@ -1156,7 +1156,7 @@ fn depleted_higher_bundle_falls_back_with_compatibility_reason() {
     assert_eq!(plan.tier, CompositionTier::Core);
     assert_eq!(
         plan.fallback_reason,
-        "A faster performance bundle is not compatible with this instance, so Croopor chose a safer option."
+        "A faster performance bundle is not compatible with this instance, so Axial chose a safer option."
     );
     assert!(plan.warnings.iter().any(|warning| {
         warning

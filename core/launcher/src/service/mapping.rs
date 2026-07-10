@@ -277,7 +277,7 @@ fn healing_event_detail(event: &crate::healing::HealingEvent) -> &str {
         HealingEventKind::FallbackApplied => event
             .detail
             .as_deref()
-            .unwrap_or("Croopor retried startup with safer settings."),
+            .unwrap_or("Axial retried startup with safer settings."),
     }
 }
 

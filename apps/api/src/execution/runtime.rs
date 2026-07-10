@@ -9,8 +9,8 @@ use crate::observability::{
 };
 use crate::state::contracts::{OperationId, StabilizationSystem, TargetDescriptor, TargetKind};
 use crate::state::ownership::{classify_managed_runtime_root, protection_for};
-use croopor_config::AppPaths;
-use croopor_minecraft::{
+use axial_config::AppPaths;
+use axial_minecraft::{
     JavaRuntimeLookupError, RuntimeOverride, managed_runtime_contents_verified_without_probe,
     parse_runtime_override, runtime_executable_ready_without_probe,
 };
@@ -292,7 +292,7 @@ impl JavaProbeRunner for CoreJavaProbeRunner {
         java_path: &Path,
         id_hint: Option<&str>,
     ) -> Result<RuntimeProbeInfo, RuntimeProbeFailure> {
-        croopor_minecraft::probe_java_runtime_info(java_path, id_hint)
+        axial_minecraft::probe_java_runtime_info(java_path, id_hint)
             .map(|info| RuntimeProbeInfo::new(info.id, info.major, info.update, info.distribution))
             .map_err(|error| match error {
                 JavaRuntimeLookupError::ProbeTimedOut => RuntimeProbeFailure::TimedOut,
@@ -480,7 +480,7 @@ pub fn verify_managed_runtime(
     let mut facts = Vec::new();
     validate_managed_runtime_target(&request.target, request.operation_id.as_ref(), &mut facts)?;
 
-    let ready_marker = request.runtime_root.join(".croopor-ready");
+    let ready_marker = request.runtime_root.join(".axial-ready");
     if request.require_ready_marker && !ready_marker.is_file() {
         let kind = if ready_marker.exists() {
             RuntimeCapabilityErrorKind::RuntimeCorrupt
@@ -716,7 +716,7 @@ fn validate_managed_runtime_root_target(
 
 fn recreate_ready_marker(runtime_root: &Path) -> std::io::Result<()> {
     fs::create_dir_all(runtime_root)?;
-    let ready_marker = runtime_root.join(".croopor-ready");
+    let ready_marker = runtime_root.join(".axial-ready");
     if ready_marker.is_dir() {
         fs::remove_dir_all(&ready_marker)?;
     } else if ready_marker.exists() {
@@ -754,7 +754,7 @@ mod tests {
         OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
-    use croopor_config::AppPaths;
+    use axial_config::AppPaths;
     use sha1::{Digest, Sha1};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1034,7 +1034,7 @@ mod tests {
         let java_path = runtime_root.join("bin").join("java");
         fs::create_dir_all(java_path.parent().expect("java parent")).expect("runtime bin");
         fs::write(&java_path, b"java").expect("fake java");
-        fs::create_dir(runtime_root.join(".croopor-ready")).expect("bad ready marker");
+        fs::create_dir(runtime_root.join(".axial-ready")).expect("bad ready marker");
 
         let error = verify_managed_runtime(ManagedRuntimeVerificationRequest::new(
             managed_runtime_target(),
@@ -1055,7 +1055,7 @@ mod tests {
         let runtime_root = root.join("java-runtime-delta");
         let java_path = runtime_root.join("bin").join("java");
         fs::create_dir_all(&runtime_root).expect("runtime root");
-        fs::write(runtime_root.join(".croopor-ready"), b"ready").expect("ready marker");
+        fs::write(runtime_root.join(".axial-ready"), b"ready").expect("ready marker");
 
         let error = verify_managed_runtime(ManagedRuntimeVerificationRequest::new(
             managed_runtime_target(),
@@ -1137,7 +1137,7 @@ mod tests {
             assert!(has_fact(&error.facts, ExecutionFactKind::PrimitiveRefused));
             assert_no_sensitive_runtime_material(&error.facts);
         }
-        assert!(!runtime_root.join(".croopor-ready").exists());
+        assert!(!runtime_root.join(".axial-ready").exists());
         cleanup(&root);
     }
 
@@ -1161,7 +1161,7 @@ mod tests {
         assert!(has_fact(&error.facts, ExecutionFactKind::PrimitiveRefused));
         assert!(
             !managed_runtime_root(&paths, "different_runtime")
-                .join(".croopor-ready")
+                .join(".axial-ready")
                 .exists()
         );
         assert_no_sensitive_runtime_material(&error.facts);
@@ -1211,7 +1211,7 @@ mod tests {
         fs::write(&java_path, b"java").expect("fake java");
         make_executable(&java_path);
         write_runtime_manifest_proof(&runtime_root_path, &java_path);
-        fs::create_dir_all(runtime_root_path.join(".croopor-ready")).expect("bad marker dir");
+        fs::create_dir_all(runtime_root_path.join(".axial-ready")).expect("bad marker dir");
         let runtime_root = runtime_root_binding(&paths, &runtime_root_path, &java_path);
 
         let report = repair_managed_runtime(ManagedRuntimeRepairRequest::new(
@@ -1221,7 +1221,7 @@ mod tests {
         ))
         .expect("repair ready marker");
 
-        assert!(runtime_root_path.join(".croopor-ready").is_file());
+        assert!(runtime_root_path.join(".axial-ready").is_file());
         assert!(has_fact(
             &report.facts,
             ExecutionFactKind::RuntimeRepairApplied
@@ -1245,7 +1245,7 @@ mod tests {
         ))
         .expect_err("missing executable should fail post-repair verification");
 
-        assert!(!runtime_root.join(".croopor-ready").exists());
+        assert!(!runtime_root.join(".axial-ready").exists());
         assert_eq!(error.kind, RuntimeCapabilityErrorKind::RuntimeCorrupt);
         assert!(!has_fact(
             &error.facts,
@@ -1386,7 +1386,7 @@ mod tests {
             }
         });
         fs::write(
-            runtime_root.join(".croopor-runtime-manifest.json"),
+            runtime_root.join(".axial-runtime-manifest.json"),
             serde_json::to_vec(&manifest).expect("manifest json"),
         )
         .expect("runtime manifest proof");
@@ -1453,7 +1453,7 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         std::env::temp_dir().join(format!(
-            "croopor-runtime-{prefix}-{}-{nanos:x}",
+            "axial-runtime-{prefix}-{}-{nanos:x}",
             std::process::id()
         ))
     }

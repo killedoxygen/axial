@@ -23,7 +23,7 @@ use tower_http::services::{ServeDir, ServeFile};
 
 pub const DEFAULT_API_PORT: u16 = 43_430;
 pub const PERFORMANCE_RULES_REFRESH_INTERVAL_ENV: &str =
-    "CROOPOR_PERFORMANCE_RULES_REFRESH_INTERVAL_SECONDS";
+    "AXIAL_PERFORMANCE_RULES_REFRESH_INTERVAL_SECONDS";
 pub const MIN_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 pub const DEFAULT_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 pub const MAX_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -31,7 +31,7 @@ pub const REMOTE_FLAGS_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 *
 static EMBEDDED_FRONTEND: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../frontend/static");
 
 pub fn default_frontend_dir() -> PathBuf {
-    std::env::var("CROOPOR_FRONTEND_STATIC_DIR")
+    std::env::var("AXIAL_FRONTEND_STATIC_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("frontend/static"))
 }
@@ -134,7 +134,7 @@ where
     }
 }
 
-async fn refresh_performance_rules_once(performance: &croopor_performance::PerformanceManager) {
+async fn refresh_performance_rules_once(performance: &axial_performance::PerformanceManager) {
     match performance.refresh_rules().await {
         Ok(status) => {
             if status.warnings.is_empty() {
@@ -278,7 +278,7 @@ fn content_type_for_path(path: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::croopor_api_test_support::build_test_state;
+    use super::axial_api_test_support::build_test_state;
     use super::*;
     use std::fs;
     use tokio::sync::mpsc;
@@ -313,12 +313,12 @@ mod tests {
 
     #[tokio::test]
     async fn performance_rules_refresh_spawns_only_when_remote_url_is_configured() {
-        let unset_root = croopor_api_test_support::test_root("app-refresh-unset");
+        let unset_root = axial_api_test_support::test_root("app-refresh-unset");
         let unset_state = build_test_state(&unset_root, None);
         assert!(!spawn_performance_rules_refresh(&unset_state));
         let _ = fs::remove_dir_all(&unset_root);
 
-        let configured_root = croopor_api_test_support::test_root("app-refresh-configured");
+        let configured_root = axial_api_test_support::test_root("app-refresh-configured");
         let configured_state = build_test_state(
             &configured_root,
             Some("http://127.0.0.1:9/rules.json".to_string()),
@@ -354,10 +354,10 @@ mod tests {
 }
 
 #[cfg(test)]
-mod croopor_api_test_support {
+mod axial_api_test_support {
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
-    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-    use croopor_performance::PerformanceManager;
+    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_performance::PerformanceManager;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -367,7 +367,7 @@ mod croopor_api_test_support {
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         AppState::new(AppStateInit {
-            app_name: "Croopor".to_string(),
+            app_name: "Axial".to_string(),
             version: "test".to_string(),
             config,
             instances,
@@ -387,7 +387,7 @@ mod croopor_api_test_support {
 
     pub fn test_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "croopor-api-app-{name}-{}-{}",
+            "axial-api-app-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

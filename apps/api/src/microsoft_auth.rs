@@ -31,7 +31,7 @@ const MINECRAFT_LAUNCHER_LOGIN_ENDPOINT: &str = "https://api.minecraftservices.c
 const MINECRAFT_PROFILE_ENDPOINT: &str = "https://api.minecraftservices.com/minecraft/profile";
 const MINECRAFT_ENTITLEMENTS_ENDPOINT: &str =
     "https://api.minecraftservices.com/entitlements/license";
-const MINECRAFT_SERVICES_USER_AGENT: &str = "Croopor (https://github.com/mateoltd/croopor)";
+const MINECRAFT_SERVICES_USER_AGENT: &str = "Axial (https://github.com/mateoltd/axial)";
 const MICROSOFT_AUTH_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_MICROSOFT_AUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MINECRAFT_ACCESS_TOKEN_EXPIRES_IN: u64 = 86_400;

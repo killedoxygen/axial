@@ -49,11 +49,11 @@ Error tracking uses the same consent and key gates as every other telemetry even
 ## Where it goes
 Telemetry uses PostHog. The default host is the PostHog EU ingest endpoint, `https://eu.i.posthog.com`.
 
-Uploads only happen when a valid `CROOPOR_POSTHOG_API_KEY` is available at runtime or compiled into the build. The key must be a public PostHog project key with the `phc_` prefix. Keyless runs never upload.
+Uploads only happen when a valid `AXIAL_POSTHOG_API_KEY` is available at runtime or compiled into the build. The key must be a public PostHog project key with the `phc_` prefix. Keyless runs never upload.
 
-`CROOPOR_POSTHOG_HOST` can redirect the endpoint, including to a local or self-auditing PostHog-compatible endpoint. The host must be an `http` or `https` URL without credentials, query parameters, or fragments.
+`AXIAL_POSTHOG_HOST` can redirect the endpoint, including to a local or self-auditing PostHog-compatible endpoint. The host must be an `http` or `https` URL without credentials, query parameters, or fragments.
 
-`CROOPOR_POSTHOG_ENVIRONMENT` can override the deployment label attached to events and flag evaluation. Values are lowercased and must contain only ASCII letters, numbers, hyphens, or underscores, up to 32 characters. Invalid values fall back to `dev` for debug builds and `production` otherwise.
+`AXIAL_POSTHOG_ENVIRONMENT` can override the deployment label attached to events and flag evaluation. Values are lowercased and must contain only ASCII letters, numbers, hyphens, or underscores, up to 32 characters. Invalid values fall back to `dev` for debug builds and `production` otherwise.
 
 ## Error storm control
 Backend error events are capped per process before they enter the telemetry queue. At most 30 `$exception` events are exported per process, and at most 5 events are exported for the same `$exception_fingerprint`. The counters reset only when the process restarts. Non-error telemetry events are unaffected.

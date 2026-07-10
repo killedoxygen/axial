@@ -1,7 +1,7 @@
 use super::activity::discord_activity;
 use super::client::DiscordRpcClient;
 use super::transport::DiscordRpcError;
-use croopor_api::state::presence::PresenceSnapshot;
+use axial_api::state::presence::PresenceSnapshot;
 use serde_json::Value;
 use std::marker::PhantomData;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -239,7 +239,7 @@ fn schedule_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use croopor_api::state::presence::{PresenceActivity, PresenceActivityKind};
+    use axial_api::state::presence::{PresenceActivity, PresenceActivityKind};
     use std::sync::Mutex;
     use std::thread;
 

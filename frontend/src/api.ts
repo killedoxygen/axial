@@ -1,9 +1,9 @@
 import { getNativeApiBaseUrl } from './native';
 
-declare const __CROOPOR_WEB_API_BASE__: string;
+declare const __AXIAL_WEB_API_BASE__: string;
 
 const API_PATH = '/api/v1';
-const WEB_API_BASE = normalizeApiBaseUrl(__CROOPOR_WEB_API_BASE__ ?? '');
+const WEB_API_BASE = normalizeApiBaseUrl(__AXIAL_WEB_API_BASE__ ?? '');
 
 let apiBaseUrl = WEB_API_BASE;
 let apiBaseInitialized = false;
@@ -31,7 +31,7 @@ async function resolveApiBase(): Promise<void> {
   } catch {
     nativeBaseUrl = undefined;
   }
-  setApiBaseUrl(nativeBaseUrl ?? __CROOPOR_WEB_API_BASE__ ?? '');
+  setApiBaseUrl(nativeBaseUrl ?? __AXIAL_WEB_API_BASE__ ?? '');
   apiBaseInitialized = true;
 }
 
@@ -68,7 +68,7 @@ export function isApiError(error: unknown): error is ApiError {
 }
 
 export async function api<T = any>(method: string, path: string, body?: unknown): Promise<T> {
-  if (__CROOPOR_MOCK_API__) {
+  if (__AXIAL_MOCK_API__) {
     const { mockApi } = await import('./mock/api');
     return mockApi<T>(method, path, body);
   }

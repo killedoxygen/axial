@@ -1,4 +1,4 @@
-# croopor dev cli — the single entrypoint on macOS, Linux, WSL, and Windows.
+# axial dev cli — the single entrypoint on macOS, Linux, WSL, and Windows.
 #
 # Task runs every recipe through its built-in cross-platform shell, so the
 # commands below behave identically on all three OSes. Desktop dev and
@@ -113,7 +113,7 @@ tasks:
   api:
     desc: run the local API server
     cmds:
-      - cargo run --locked -p croopor-api
+      - cargo run --locked -p axial-api
 
   check:
     desc: run all static checks (matches CI)
@@ -146,45 +146,45 @@ tasks:
     desc: build the release desktop binary
     deps: [frontend:build]
     cmds:
-      - cargo build --locked -p croopor-desktop --release
-      - cmd: echo "artifact → target/release/croopor-desktop{{exeExt}}"
+      - cargo build --locked -p axial-desktop --release
+      - cmd: echo "artifact → target/release/axial-desktop{{exeExt}}"
         silent: true
 
   build:dev:
     desc: build the debug desktop binary (bundled static assets, no dev server)
     deps: [frontend:build]
     cmds:
-      - cargo build --locked -p croopor-desktop
-      - cmd: echo "artifact → target/debug/croopor-desktop{{exeExt}}"
+      - cargo build --locked -p axial-desktop
+      - cmd: echo "artifact → target/debug/axial-desktop{{exeExt}}"
         silent: true
 
   build:windows:
     desc: cross-build the release Windows desktop binary from Linux/WSL
     deps: [ensure:windows-cross, frontend:build]
     cmds:
-      - cargo build --locked -p croopor-desktop --release --target {{.WINDOWS_TARGET}}
-      - cmd: echo "artifact → target/{{.WINDOWS_TARGET}}/release/croopor-desktop.exe"
+      - cargo build --locked -p axial-desktop --release --target {{.WINDOWS_TARGET}}
+      - cmd: echo "artifact → target/{{.WINDOWS_TARGET}}/release/axial-desktop.exe"
         silent: true
 
   build:windows:dev:
     desc: cross-build the debug Windows desktop binary from Linux/WSL
     deps: [ensure:windows-cross, frontend:build]
     cmds:
-      - cargo build --locked -p croopor-desktop --target {{.WINDOWS_TARGET}}
-      - cmd: echo "artifact → target/{{.WINDOWS_TARGET}}/debug/croopor-desktop.exe"
+      - cargo build --locked -p axial-desktop --target {{.WINDOWS_TARGET}}
+      - cmd: echo "artifact → target/{{.WINDOWS_TARGET}}/debug/axial-desktop.exe"
         silent: true
 
   build:api:
     desc: build the debug API binary
     deps: [frontend:build]
     cmds:
-      - cargo build --locked -p croopor-api
+      - cargo build --locked -p axial-api
 
   build:api:release:
     desc: build the release API binary
     deps: [frontend:build]
     cmds:
-      - cargo build --locked -p croopor-api --release
+      - cargo build --locked -p axial-api --release
 
   bundle:
     desc: build native installers/bundles via tauri (.app/.dmg, .msi/.exe, .deb/.rpm)
@@ -225,7 +225,7 @@ tasks:
         platforms: [linux]
 
   host:launch-evidence:
-    desc: report Windows host Java and Minecraft/Croopor folder evidence (redacted, no paths)
+    desc: report Windows host Java and Minecraft/Axial folder evidence (redacted, no paths)
     silent: true
     cmds:
       - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/host-launch-evidence.ps1

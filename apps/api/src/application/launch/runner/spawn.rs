@@ -11,7 +11,7 @@ pub(super) fn launch_command_target(session_id: &str) -> TargetDescriptor {
 pub(super) fn launch_spawn_stage_evidence(
     session_id: &str,
     record: &crate::state::LaunchSessionRecord,
-) -> Vec<croopor_launcher::LaunchStageEvidence> {
+) -> Vec<axial_launcher::LaunchStageEvidence> {
     let Some(pid) = record.pid else {
         return launch_spawn_failed_stage_evidence();
     };
@@ -25,7 +25,7 @@ pub(super) fn launch_spawn_stage_evidence(
     }
 }
 
-pub(super) fn launch_spawn_failed_stage_evidence() -> Vec<croopor_launcher::LaunchStageEvidence> {
+pub(super) fn launch_spawn_failed_stage_evidence() -> Vec<axial_launcher::LaunchStageEvidence> {
     vec![process_spawn_failed_stage_evidence()]
 }
 
@@ -33,7 +33,7 @@ pub(super) fn launch_spawn_failed_stage_evidence() -> Vec<croopor_launcher::Laun
 mod tests {
     use super::*;
     use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetKind};
-    use croopor_launcher::{LaunchSessionRecord, LaunchState, SessionId};
+    use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
 
     #[test]
     fn launch_command_target_uses_execution_session_target() {

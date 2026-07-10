@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 pub(super) const RUNTIME_MANIFEST_URL: &str = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 pub(super) const MAX_RUNTIME_MANIFEST_BYTES: u64 = 16 << 20;
-pub(super) const COMPONENT_MANIFEST_PROOF_FILE: &str = ".croopor-runtime-manifest.json";
+pub(super) const COMPONENT_MANIFEST_PROOF_FILE: &str = ".axial-runtime-manifest.json";
 const RUNTIME_MANIFEST_CONNECT_TIMEOUT_SECS: u64 = 10;
 const RUNTIME_MANIFEST_READ_TIMEOUT_SECS: u64 = 30;
 
@@ -58,7 +58,7 @@ pub(super) fn runtime_manifest_client() -> &'static reqwest::Client {
             .read_timeout(std::time::Duration::from_secs(
                 RUNTIME_MANIFEST_READ_TIMEOUT_SECS,
             ))
-            .user_agent("croopor/0.3")
+            .user_agent("axial/0.3")
             .build()
             .expect("runtime manifest HTTP client configuration should be valid")
     })

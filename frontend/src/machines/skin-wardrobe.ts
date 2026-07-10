@@ -420,7 +420,7 @@ export async function resetProfileSkin(): Promise<void> {
   const { skinActionsEnabled, profile } = wardrobeContext.value;
   if (!skinActionsEnabled || !activeMinecraftSkin(profile ?? undefined)) return;
   const ok = await showConfirm(
-    'Reset the active Minecraft profile skin to the default skin? Croopor will save the current profile skin locally first.',
+    'Reset the active Minecraft profile skin to the default skin? Axial will save the current profile skin locally first.',
     { title: 'Reset profile skin', destructive: true, confirmText: 'Reset' },
   );
   if (!ok) return;
@@ -436,7 +436,7 @@ export async function resetProfileSkin(): Promise<void> {
 export async function resetProfileCape(): Promise<void> {
   if (!wardrobeContext.value.skinActionsEnabled) return;
   const ok = await showConfirm(
-    'Remove the active Minecraft profile cape? Croopor will save the current skin and cape pairing locally first.',
+    'Remove the active Minecraft profile cape? Axial will save the current skin and cape pairing locally first.',
     { title: 'Reset profile cape', destructive: true, confirmText: 'Reset cape' },
   );
   if (!ok) return;

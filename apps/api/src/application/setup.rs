@@ -1,11 +1,11 @@
 //! Application-owned setup and onboarding workflows.
 
 use crate::{application::instances::invalidate_create_view_cache, state::AppState};
-use axum::{Json, http::StatusCode};
-use croopor_config::AppPaths;
-use croopor_minecraft::{
+use axial_config::AppPaths;
+use axial_minecraft::{
     create_minecraft_dir, default_minecraft_dir, ensure_launcher_profiles, validate_installation,
 };
+use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -122,9 +122,7 @@ pub fn setup_init(
     if path.as_os_str().is_empty() {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                serde_json::json!({ "error": "could not determine default Croopor library path" }),
-            ),
+            Json(serde_json::json!({ "error": "could not determine default Axial library path" })),
         ));
     }
 
@@ -191,7 +189,7 @@ mod tests {
         assert_eq!(body["error"], expected_message);
 
         let rendered = body.to_string();
-        assert!(!rendered.contains("/Users/alice/.croopor"));
+        assert!(!rendered.contains("/Users/alice/.axial"));
         assert!(!rendered.contains("permission denied"));
         assert!(!rendered.contains("config.toml"));
     }
@@ -199,9 +197,7 @@ mod tests {
     #[test]
     fn setup_managed_create_error_does_not_expose_raw_error_fragments() {
         assert_bounded_setup_error(
-            setup_managed_create_error(
-                "permission denied creating /Users/alice/.croopor/libraries",
-            ),
+            setup_managed_create_error("permission denied creating /Users/alice/.axial/libraries"),
             "Could not create the managed library folder. Check folder permissions and try again.",
         );
     }
@@ -209,7 +205,7 @@ mod tests {
     #[test]
     fn setup_config_error_does_not_expose_raw_error_fragments() {
         assert_bounded_setup_error(
-            setup_config_error("failed to write /Users/alice/.croopor/config.toml"),
+            setup_config_error("failed to write /Users/alice/.axial/config.toml"),
             "Could not save the selected library folder. Check app data permissions and try again.",
         );
     }
@@ -217,7 +213,7 @@ mod tests {
     #[test]
     fn setup_onboarding_save_error_does_not_expose_raw_error_fragments() {
         assert_bounded_setup_error(
-            onboarding_save_error("permission denied writing /Users/alice/.croopor/config.toml"),
+            onboarding_save_error("permission denied writing /Users/alice/.axial/config.toml"),
             "Could not save onboarding progress. Check app data permissions and try again.",
         );
     }

@@ -207,13 +207,13 @@ pub fn action_safety_score(
 }
 
 pub fn launch_summary_decision_kind(
-    summary: &croopor_launcher::GuardianSummary,
+    summary: &axial_launcher::GuardianSummary,
 ) -> GuardianDecisionKind {
     match summary.decision {
-        croopor_launcher::GuardianDecision::Allowed => GuardianDecisionKind::Allow,
-        croopor_launcher::GuardianDecision::Warned => GuardianDecisionKind::Warn,
-        croopor_launcher::GuardianDecision::Blocked => GuardianDecisionKind::Block,
-        croopor_launcher::GuardianDecision::Intervened => summary
+        axial_launcher::GuardianDecision::Allowed => GuardianDecisionKind::Allow,
+        axial_launcher::GuardianDecision::Warned => GuardianDecisionKind::Warn,
+        axial_launcher::GuardianDecision::Blocked => GuardianDecisionKind::Block,
+        axial_launcher::GuardianDecision::Intervened => summary
             .interventions
             .first()
             .map(|intervention| launch_intervention_decision_kind(intervention.kind))
@@ -221,7 +221,7 @@ pub fn launch_summary_decision_kind(
     }
 }
 
-pub fn launch_summary_safety_outcome(summary: &croopor_launcher::GuardianSummary) -> SafetyOutcome {
+pub fn launch_summary_safety_outcome(summary: &axial_launcher::GuardianSummary) -> SafetyOutcome {
     let decision = launch_summary_decision_kind(summary);
     SafetyOutcome {
         decision,
@@ -782,17 +782,17 @@ fn is_managed_mutation_action(action: GuardianActionKind) -> bool {
 }
 
 fn launch_intervention_decision_kind(
-    intervention: croopor_launcher::GuardianInterventionKind,
+    intervention: axial_launcher::GuardianInterventionKind,
 ) -> GuardianDecisionKind {
     match intervention {
-        croopor_launcher::GuardianInterventionKind::SwitchManagedRuntime => {
+        axial_launcher::GuardianInterventionKind::SwitchManagedRuntime => {
             GuardianDecisionKind::Fallback
         }
-        croopor_launcher::GuardianInterventionKind::StripJvmArgs => GuardianDecisionKind::Strip,
-        croopor_launcher::GuardianInterventionKind::DowngradePreset => {
+        axial_launcher::GuardianInterventionKind::StripJvmArgs => GuardianDecisionKind::Strip,
+        axial_launcher::GuardianInterventionKind::DowngradePreset => {
             GuardianDecisionKind::Downgrade
         }
-        croopor_launcher::GuardianInterventionKind::DisableCustomGc => GuardianDecisionKind::Strip,
+        axial_launcher::GuardianInterventionKind::DisableCustomGc => GuardianDecisionKind::Strip,
     }
 }
 
@@ -1426,8 +1426,7 @@ mod tests {
 
     #[test]
     fn launch_summary_warning_and_block_map_to_policy_outcomes() {
-        let mut warned =
-            croopor_launcher::GuardianSummary::new(croopor_launcher::GuardianMode::Custom);
+        let mut warned = axial_launcher::GuardianSummary::new(axial_launcher::GuardianMode::Custom);
         warned.warn_with_guidance(vec![
             "Guardian Custom mode will keep explicit JVM args; remove them first if startup becomes unstable.".to_string(),
         ]);
@@ -1441,7 +1440,7 @@ mod tests {
         );
 
         let mut blocked =
-            croopor_launcher::GuardianSummary::new(croopor_launcher::GuardianMode::Managed);
+            axial_launcher::GuardianSummary::new(axial_launcher::GuardianMode::Managed);
         blocked.block_with_reason_and_guidance(
             "explicit Java override targets Java 8 but this version requires Java 17",
             vec!["Remove the Java override or switch Guardian Mode back to Managed.".to_string()],
@@ -1459,9 +1458,9 @@ mod tests {
     #[test]
     fn launch_summary_interventions_map_to_specific_policy_actions() {
         let mut summary =
-            croopor_launcher::GuardianSummary::new(croopor_launcher::GuardianMode::Managed);
+            axial_launcher::GuardianSummary::new(axial_launcher::GuardianMode::Managed);
         summary.record_intervention(
-            croopor_launcher::GuardianInterventionKind::SwitchManagedRuntime,
+            axial_launcher::GuardianInterventionKind::SwitchManagedRuntime,
             "Guardian switched to managed Java before launch",
             false,
         );
@@ -1475,8 +1474,8 @@ mod tests {
     #[test]
     fn launch_summary_unknown_intervention_does_not_overstate_repair() {
         let mut summary =
-            croopor_launcher::GuardianSummary::new(croopor_launcher::GuardianMode::Managed);
-        summary.decision = croopor_launcher::GuardianDecision::Intervened;
+            axial_launcher::GuardianSummary::new(axial_launcher::GuardianMode::Managed);
+        summary.decision = axial_launcher::GuardianDecision::Intervened;
 
         assert_eq!(
             launch_summary_decision_kind(&summary),
@@ -1487,7 +1486,7 @@ mod tests {
     #[test]
     fn launch_summary_outcome_redacts_unsafe_details() {
         let mut summary =
-            croopor_launcher::GuardianSummary::new(croopor_launcher::GuardianMode::Managed);
+            axial_launcher::GuardianSummary::new(axial_launcher::GuardianMode::Managed);
         summary.block_with_reason_and_guidance(
             "/home/alice/java.exe --accessToken secret -Xmx8192M",
             vec!["Review the latest game log before retrying.".to_string()],

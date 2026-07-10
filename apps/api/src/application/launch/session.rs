@@ -26,13 +26,13 @@ use crate::state::contracts::OperationPhase;
 use crate::state::launch_reports::{LaunchBenchmarkMetadata, LaunchProofResourceBudget};
 use crate::state::{AppState, LaunchSessionRecord};
 use auth::{LaunchAuthRefreshOptions, resolve_launch_auth_context};
-use axum::{Json, http::StatusCode};
-use croopor_config::{AppConfig, Instance};
-use croopor_launcher::{
+use axial_config::{AppConfig, Instance};
+use axial_launcher::{
     GuardianDecision, GuardianMode, GuardianSummary, LaunchGuardianContext, LaunchIntent,
     LaunchReadiness, LaunchReadinessReason, LaunchReadinessReasonId, LaunchReadinessRequest,
     LaunchReadinessSeverity, LaunchState, inspect_launch_readiness, launch_notice,
 };
+use axum::{Json, http::StatusCode};
 use overrides::{
     inspect_explicit_java_override, inspect_explicit_jvm_args, preflight_override_signals,
 };
@@ -130,7 +130,7 @@ pub struct LaunchPreflightOverrides {
 pub struct LaunchPreflightOverride {
     pub present: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin: Option<croopor_launcher::OverrideOrigin>,
+    pub origin: Option<axial_launcher::OverrideOrigin>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -162,7 +162,7 @@ async fn prepare_launch_session_with_auth_refresh(
     let library_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
-            Json(json!({ "error": "Croopor library is not configured" })),
+            Json(json!({ "error": "Axial library is not configured" })),
         )
     })?;
     let library_dir = PathBuf::from(library_dir);
@@ -275,7 +275,7 @@ async fn prepare_launch_session_with_auth_refresh(
         max_memory_mb: preflight.max_memory_mb,
         min_memory_mb: preflight.min_memory_mb,
         resolution: policy::selected_resolution(&instance, &config),
-        launcher_name: "croopor".to_string(),
+        launcher_name: "axial".to_string(),
         launcher_version: state.version().to_string(),
         game_dir: Some(game_dir),
         guardian: preflight.guardian.clone(),
@@ -390,7 +390,7 @@ pub async fn prepare_launch_preflight(
     let library_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
-            Json(json!({ "error": "Croopor library is not configured" })),
+            Json(json!({ "error": "Axial library is not configured" })),
         )
     })?;
     let library_dir = PathBuf::from(library_dir);
@@ -700,7 +700,7 @@ impl LaunchPreflightFacts {
 }
 
 impl LaunchPreflightOverride {
-    fn from_origin(origin: Option<croopor_launcher::OverrideOrigin>) -> Self {
+    fn from_origin(origin: Option<axial_launcher::OverrideOrigin>) -> Self {
         Self {
             present: origin.is_some(),
             origin,

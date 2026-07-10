@@ -34,7 +34,7 @@ pub(super) fn rosetta_required_error_for_current_host(
     }
 
     // installed with Rosetta, checked uncached so installing Rosetta then
-    // retrying works without restarting Croopor
+    // retrying works without restarting Axial
     if rosetta_present_for_current_host() {
         return None;
     }

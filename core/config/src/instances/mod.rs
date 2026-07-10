@@ -1,5 +1,5 @@
 use crate::paths::AppPaths;
-use croopor_minecraft::VersionEntry;
+use axial_minecraft::VersionEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -338,7 +338,7 @@ pub struct InstanceStoreStartup {
     pub warnings: Vec<String>,
 }
 
-const INSTANCE_REGISTRY_STARTUP_WARNING: &str = "Croopor could not load the instance list, so it started with an empty list. Check app data permissions or restore the instance registry.";
+const INSTANCE_REGISTRY_STARTUP_WARNING: &str = "Axial could not load the instance list, so it started with an empty list. Check app data permissions or restore the instance registry.";
 
 #[derive(Debug, Error)]
 pub enum InstanceStoreError {
@@ -900,7 +900,7 @@ fn derive_art_seed(id: &str, name: &str, version_id: &str) -> u32 {
 mod tests {
     use super::{EnrichedInstance, Instance, InstanceStore, StoredInstances};
     use crate::paths::AppPaths;
-    use croopor_minecraft::{
+    use axial_minecraft::{
         LifecycleMeta, LoaderBuildMetadata, LoaderComponentId, MinecraftVersionMeta, VersionEntry,
         VersionLoaderAttachment, VersionSubjectKind,
     };
@@ -910,7 +910,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "croopor-config-{name}-{}",
+            "axial-config-{name}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|value| value.as_nanos())

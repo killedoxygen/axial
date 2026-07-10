@@ -1,6 +1,6 @@
 use crate::observability::telemetry::{TelemetryHub, configured_posthog_environment};
+use axial_config::{FEATURE_FLAGS, FeatureFlagDef};
 use chrono::{DateTime, Utc};
-use croopor_config::{FEATURE_FLAGS, FeatureFlagDef};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -12,8 +12,7 @@ use thiserror::Error;
 const REMOTE_FLAGS_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const REMOTE_FLAGS_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_FLAGS_MAX_BYTES: usize = 1024 * 1024;
-const REMOTE_FLAGS_USER_AGENT: &str =
-    concat!("croopor/", env!("CARGO_PKG_VERSION"), " remote-flags");
+const REMOTE_FLAGS_USER_AGENT: &str = concat!("axial/", env!("CARGO_PKG_VERSION"), " remote-flags");
 const REMOTE_FLAGS_CACHE_FILE: &str = "remote-cache.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,8 +336,8 @@ fn remote_flags_client() -> reqwest::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axial_config::{AppConfig, FlagStage};
     use axum::{Json, Router, extract::State, http::StatusCode, http::Uri, routing::post};
-    use croopor_config::{AppConfig, FlagStage};
     use serde_json::Value;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -615,7 +614,7 @@ mod tests {
         let root = test_root("empty-install-id");
         let paths = test_paths(&root);
         let config = Arc::new(
-            croopor_config::ConfigStore::load_from(paths.clone()).expect("load config store"),
+            axial_config::ConfigStore::load_from(paths.clone()).expect("load config store"),
         );
         config
             .replace_in_memory(AppConfig {
@@ -681,16 +680,16 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "croopor-api-remote-flags-{name}-{}-{nonce}",
+            "axial-api-remote-flags-{name}-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("create test root");
         path
     }
 
-    fn test_paths(root: &Path) -> croopor_config::AppPaths {
+    fn test_paths(root: &Path) -> axial_config::AppPaths {
         let config_dir = root.join("config");
-        croopor_config::AppPaths {
+        axial_config::AppPaths {
             config_file: config_dir.join("config.json"),
             instances_file: config_dir.join("instances.json"),
             instances_dir: root.join("instances"),

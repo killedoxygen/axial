@@ -208,7 +208,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root =
-            std::env::temp_dir().join(format!("croopor-java-probe-timeout-{}", std::process::id()));
+            std::env::temp_dir().join(format!("axial-java-probe-timeout-{}", std::process::id()));
         fs::create_dir_all(&root).expect("probe timeout test dir");
         let java_path = root.join("java");
         fs::write(&java_path, "#!/bin/sh\nsleep 60\n").expect("probe timeout script");

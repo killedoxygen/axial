@@ -1,7 +1,7 @@
 use super::super::{ApplicationCommand, CommandResult, InstallVersionPayload};
 use crate::observability::OperationProofRecord;
 use crate::state::contracts::OperationId;
-use croopor_minecraft::{DownloadProgress, LoaderComponentId};
+use axial_minecraft::{DownloadProgress, LoaderComponentId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

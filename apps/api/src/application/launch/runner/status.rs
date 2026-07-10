@@ -1,5 +1,5 @@
 use crate::state::{AppState, LaunchStatusEvent};
-use croopor_launcher::{
+use axial_launcher::{
     GuardianSummary, LaunchFailureClass, LaunchPreparationEvent, LaunchState, failure_class_name,
     launch_state_name,
 };
@@ -21,7 +21,7 @@ pub(super) async fn emit_status(
     launch_state: LaunchState,
     pid: Option<u32>,
     failure_class: Option<LaunchFailureClass>,
-    healing: Option<croopor_launcher::LaunchHealingSummary>,
+    healing: Option<axial_launcher::LaunchHealingSummary>,
     guardian: Option<GuardianSummary>,
 ) {
     state
@@ -47,7 +47,7 @@ pub(super) async fn emit_status(
 }
 
 pub(super) fn serialize_healing(
-    healing: Option<croopor_launcher::LaunchHealingSummary>,
+    healing: Option<axial_launcher::LaunchHealingSummary>,
 ) -> Option<Value> {
     healing.and_then(|value| serde_json::to_value(value).ok())
 }

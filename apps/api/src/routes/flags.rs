@@ -32,12 +32,12 @@ async fn handle_update_flag(
 #[cfg(test)]
 mod tests {
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
+    use axial_config::{AppConfig, AppPaths, ConfigStore, FEATURE_FLAGS, InstanceStore};
+    use axial_performance::PerformanceManager;
     use axum::{
         body::{Body, to_bytes},
         http::{Method, Request, StatusCode, header},
     };
-    use croopor_config::{AppConfig, AppPaths, ConfigStore, FEATURE_FLAGS, InstanceStore};
-    use croopor_performance::PerformanceManager;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -123,7 +123,7 @@ mod tests {
                 .expect("set config");
             let instances = Arc::new(InstanceStore::load_from(paths).expect("load instances"));
             let state = AppState::new(AppStateInit {
-                app_name: "Croopor".to_string(),
+                app_name: "Axial".to_string(),
                 version: "test".to_string(),
                 config,
                 instances,
@@ -162,7 +162,7 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "croopor-flags-routes-{name}-{}-{nonce}",
+            "axial-flags-routes-{name}-{}-{nonce}",
             std::process::id()
         ))
     }

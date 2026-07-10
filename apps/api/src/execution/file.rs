@@ -802,7 +802,7 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         let path = std::env::temp_dir().join(format!(
-            "croopor-file-capability-{name}-{}-{nanos}",
+            "axial-file-capability-{name}-{}-{nanos}",
             std::process::id()
         ));
         if path.exists() {

@@ -361,7 +361,7 @@ pub enum LoaderError {
     InvalidBuildId,
     #[error("invalid loader component id")]
     InvalidComponentId,
-    #[error("Croopor library is not configured")]
+    #[error("Axial library is not configured")]
     MissingLibraryDir,
     #[error("loader catalog is unavailable: {message}")]
     CatalogUnavailable {

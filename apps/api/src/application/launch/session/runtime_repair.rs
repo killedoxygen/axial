@@ -17,9 +17,9 @@ use crate::observability::telemetry::{
 };
 use crate::state::AppState;
 use crate::state::contracts::OperationPhase;
-use croopor_config::{AppPaths, Instance};
-use croopor_launcher::{GuardianDecision, GuardianMode, GuardianSummary};
-use croopor_minecraft::{
+use axial_config::{AppPaths, Instance};
+use axial_launcher::{GuardianDecision, GuardianMode, GuardianSummary};
+use axial_minecraft::{
     managed_runtime_contents_verified_without_probe, preferred_runtime_component, resolve_version,
 };
 use std::path::{Path, PathBuf};
@@ -154,7 +154,7 @@ fn managed_runtime_ready_marker_repair_candidate(
         return None;
     }
     let java_executable = managed_runtime_java_executable(&runtime_root);
-    if runtime_root.join(".croopor-ready").is_file()
+    if runtime_root.join(".axial-ready").is_file()
         && managed_runtime_contents_verified_without_probe(&runtime_root)
     {
         return None;

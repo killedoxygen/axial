@@ -56,7 +56,7 @@ async fn launch_preflight_readiness_reports_missing_version_json() {
 #[tokio::test]
 async fn launch_preflight_readiness_reports_missing_client_jar() {
     let fixture = TestFixture::new("preflight-readiness-missing-client-jar");
-    let component = "croopor-test-runtime-missing-client";
+    let component = "axial-test-runtime-missing-client";
     fixture.write_version_json(
         "1.21.1",
         serde_json::json!({
@@ -270,7 +270,7 @@ async fn launch_preflight_readiness_reports_missing_managed_runtime_as_recoverab
             "type": "release",
             "mainClass": "net.minecraft.client.main.Main",
             "assetIndex": {},
-            "javaVersion": { "component": "croopor-test-runtime-missing", "majorVersion": 21 },
+            "javaVersion": { "component": "axial-test-runtime-missing", "majorVersion": 21 },
             "libraries": []
         }),
     );
@@ -305,7 +305,7 @@ fn sha1_hex(bytes: &[u8]) -> String {
 #[tokio::test]
 async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking_readiness() {
     let fixture = TestFixture::new("prepare-repairs-runtime-ready-marker");
-    let component = "croopor-test-runtime-repair-marker";
+    let component = "axial-test-runtime-repair-marker";
     fixture.write_version_json(
         "1.21.1",
         serde_json::json!({
@@ -356,7 +356,7 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
     )
     .await;
 
-    assert!(runtime_root.join(".croopor-ready").is_file());
+    assert!(runtime_root.join(".axial-ready").is_file());
     assert_eq!(
         repaired.guardian_summary.decision,
         GuardianDecision::Intervened
@@ -378,7 +378,7 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
 #[tokio::test]
 async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_launch() {
     let fixture = TestFixture::new("prepare-repairs-runtime-corrupt-ready-marker");
-    let component = "croopor-test-runtime-corrupt-marker";
+    let component = "axial-test-runtime-corrupt-marker";
     fixture.write_version_json(
         "1.21.1",
         serde_json::json!({
@@ -393,7 +393,7 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
     let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
     fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
     let runtime_root = fixture.write_global_runtime_without_ready_marker(component);
-    fs::create_dir(runtime_root.join(".croopor-ready")).expect("corrupt ready marker directory");
+    fs::create_dir(runtime_root.join(".axial-ready")).expect("corrupt ready marker directory");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
     let instance = fixture
         .state
@@ -430,7 +430,7 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
     )
     .await;
 
-    assert!(runtime_root.join(".croopor-ready").is_file());
+    assert!(runtime_root.join(".axial-ready").is_file());
     assert_eq!(
         repaired.guardian_summary.decision,
         GuardianDecision::Intervened
@@ -466,7 +466,7 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
 #[tokio::test]
 async fn prepare_launch_session_blocks_present_managed_runtime_missing_java_without_session() {
     let fixture = TestFixture::new("prepare-blocks-runtime-missing-java");
-    let component = "croopor-test-runtime-missing-java";
+    let component = "axial-test-runtime-missing-java";
     fixture.write_version_json(
         "1.21.1",
         serde_json::json!({
@@ -482,7 +482,7 @@ async fn prepare_launch_session_blocks_present_managed_runtime_missing_java_with
     fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
     let runtime_root = fixture.paths.config_dir.join("runtimes").join(component);
     fs::create_dir_all(&runtime_root).expect("runtime root");
-    fs::write(runtime_root.join(".croopor-ready"), b"ready").expect("ready marker");
+    fs::write(runtime_root.join(".axial-ready"), b"ready").expect("ready marker");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
 
     let error = match prepare_launch_session(
@@ -533,7 +533,7 @@ async fn prepare_launch_session_blocks_present_managed_runtime_missing_java_with
 async fn prepare_launch_session_blocks_present_managed_runtime_non_executable_java_without_session()
 {
     let fixture = TestFixture::new("prepare-blocks-runtime-non-executable-java");
-    let component = "croopor-test-runtime-non-executable-java";
+    let component = "axial-test-runtime-non-executable-java";
     fixture.write_version_json(
         "1.21.1",
         serde_json::json!({
@@ -551,7 +551,7 @@ async fn prepare_launch_session_blocks_present_managed_runtime_non_executable_ja
     let runtime_bin = runtime_root.join("bin");
     fs::create_dir_all(&runtime_bin).expect("runtime bin");
     fs::write(runtime_bin.join("java"), b"java").expect("non executable java");
-    fs::write(runtime_root.join(".croopor-ready"), b"ready").expect("ready marker");
+    fs::write(runtime_root.join(".axial-ready"), b"ready").expect("ready marker");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
 
     let error = match prepare_launch_session(
@@ -599,7 +599,7 @@ async fn prepare_launch_session_blocks_present_managed_runtime_non_executable_ja
 #[tokio::test]
 async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
     let fixture = TestFixture::new("prepare-blocks-suppressed-runtime-repair");
-    let component = "croopor-test-runtime-suppressed";
+    let component = "axial-test-runtime-suppressed";
     fixture.write_version_json(
         "1.21.1",
         serde_json::json!({
@@ -647,7 +647,7 @@ async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
         repaired.guardian_summary.decision,
         GuardianDecision::Intervened
     );
-    fs::remove_file(runtime_root.join(".croopor-ready")).expect("remove ready marker");
+    fs::remove_file(runtime_root.join(".axial-ready")).expect("remove ready marker");
 
     let error = match prepare_launch_session(
         &fixture.state,

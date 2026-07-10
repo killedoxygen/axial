@@ -5,9 +5,9 @@ use crate::execution::runtime::{
 };
 use crate::guardian::GuardianPreflightOverrideSignals;
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
-use croopor_config::{AppConfig, Instance};
-use croopor_launcher::LaunchGuardianContext;
-use croopor_minecraft::{RuntimeOverride, parse_runtime_override};
+use axial_config::{AppConfig, Instance};
+use axial_launcher::LaunchGuardianContext;
+use axial_minecraft::{RuntimeOverride, parse_runtime_override};
 
 pub(super) fn inspect_explicit_java_override(
     instance: &Instance,

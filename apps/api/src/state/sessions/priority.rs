@@ -136,7 +136,7 @@ mod platform {
     use std::io;
     use tokio::process::Command;
 
-    /// Unix demotion via nice is intentionally disabled until Croopor has a
+    /// Unix demotion via nice is intentionally disabled until Axial has a
     /// reliable unprivileged restore path; leaving a game deprioritized after
     /// boot would be worse than skipping the startup priority sandwich.
     pub(super) fn configure_start_priority(

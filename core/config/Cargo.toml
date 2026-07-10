@@ -1,5 +1,5 @@
 [package]
-name = "croopor-config"
+name = "axial-config"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,4 +10,4 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-croopor-minecraft = { path = "../minecraft" }
+axial-minecraft = { path = "../minecraft" }

@@ -1,6 +1,6 @@
 use crate::state::AppState;
+use axial_performance::BundleHealth;
 use axum::{Json, http::StatusCode};
-use croopor_performance::BundleHealth;
 use serde::{Deserialize, Serialize};
 
 mod mutation;
@@ -10,7 +10,7 @@ mod plan_health;
 #[cfg(test)]
 use crate::state::contracts::RollbackState;
 #[cfg(test)]
-use croopor_performance::{CompositionTier, InstallError, PerformanceMode};
+use axial_performance::{CompositionTier, InstallError, PerformanceMode};
 #[cfg(test)]
 use mutation::{PERFORMANCE_INSTALL_INTERNAL_ERROR, performance_install_error};
 pub use mutation::{PerformanceRollbackListResponse, performance_rollback_list};

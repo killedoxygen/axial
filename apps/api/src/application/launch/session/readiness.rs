@@ -5,7 +5,7 @@ use crate::guardian::{
 use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
-use croopor_launcher::{LaunchReadiness, LaunchReadinessReasonId, LaunchReadinessSeverity};
+use axial_launcher::{LaunchReadiness, LaunchReadinessReasonId, LaunchReadinessSeverity};
 
 pub(super) fn readiness_has_managed_runtime_missing(readiness: &LaunchReadiness) -> bool {
     readiness

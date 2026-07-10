@@ -179,11 +179,11 @@ pub struct Library {
     #[serde(default)]
     pub size: i64,
     #[serde(
-        rename = "crooporChecksumlessAllowed",
+        rename = "axialChecksumlessAllowed",
         default,
         skip_serializing_if = "is_false"
     )]
-    pub croopor_checksumless_allowed: bool,
+    pub axial_checksumless_allowed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1362,7 +1362,7 @@ mod tests {
             auth_xuid: String::new(),
             user_type: "msa".to_string(),
             version_type: "release".to_string(),
-            launcher_name: "croopor".to_string(),
+            launcher_name: "axial".to_string(),
             launcher_version: "1.0.0".to_string(),
             natives_directory: String::new(),
             classpath: "client.jar".to_string(),
@@ -1380,7 +1380,7 @@ mod tests {
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "croopor-launch-{name}-{}",
+            "axial-launch-{name}-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time")
@@ -1409,10 +1409,10 @@ mod tests {
             ..LoggingEntry::default()
         };
 
-        let resolved = resolve_logging_arg(&entry, "C:/croopor/library/assets");
+        let resolved = resolve_logging_arg(&entry, "C:/axial/library/assets");
         assert_eq!(
             resolved,
-            "-Dlog4j.configurationFile=C:/croopor/library/assets/log_configs/client-1.12.xml"
+            "-Dlog4j.configurationFile=C:/axial/library/assets/log_configs/client-1.12.xml"
         );
     }
 
@@ -1557,7 +1557,7 @@ mod tests {
         ];
 
         let env = default_environment();
-        let resolved = resolve_libraries(&version, Path::new("/tmp/croopor"), &env);
+        let resolved = resolve_libraries(&version, Path::new("/tmp/axial"), &env);
         assert_eq!(resolved.len(), 1);
         assert!(
             resolved[0]
@@ -1589,7 +1589,7 @@ mod tests {
             features: default_environment().features,
         };
 
-        let resolved = resolve_libraries(&version, Path::new("/tmp/croopor"), &env);
+        let resolved = resolve_libraries(&version, Path::new("/tmp/axial"), &env);
 
         assert_eq!(resolved.len(), 1);
         assert!(
@@ -1643,7 +1643,7 @@ mod tests {
             features: default_environment().features,
         };
 
-        let resolved = resolve_libraries(&version, Path::new("C:/croopor/library"), &env);
+        let resolved = resolve_libraries(&version, Path::new("C:/axial/library"), &env);
 
         assert_eq!(resolved.len(), 2);
         assert!(resolved.iter().any(|library| {

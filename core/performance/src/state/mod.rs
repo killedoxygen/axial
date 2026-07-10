@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::fs as async_fs;
 
-const LOCK_FILE_NAME: &str = ".croopor-lock.json";
-const STATE_DIR_NAME: &str = ".croopor-performance";
+const LOCK_FILE_NAME: &str = ".axial-lock.json";
+const STATE_DIR_NAME: &str = ".axial-performance";
 const ROLLBACK_DIR_NAME: &str = "rollback";
 const ROLLBACK_FILE_NAME: &str = "latest.json";
 const ROLLBACK_FILES_DIR_NAME: &str = "files";
@@ -1726,7 +1726,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "croopor-performance-state-{name}-{}-{}",
+            "axial-performance-state-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

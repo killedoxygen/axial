@@ -9,7 +9,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
-const USER_AGENT: &str = "croopor/0.4.0-alpha (github.com/mateoltd/croopor)";
+const USER_AGENT: &str = "axial/0.4.0-alpha (github.com/mateoltd/axial)";
 const RATE_LIMIT_BODY_LIMIT: usize = 4096;
 const MAX_MODRINTH_VERSION_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MODRINTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -652,7 +652,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "croopor-performance-modrinth-{name}-{}-{}",
+            "axial-performance-modrinth-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

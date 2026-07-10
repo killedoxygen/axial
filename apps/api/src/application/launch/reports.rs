@@ -3,11 +3,11 @@ use crate::observability::{
     RedactionAudience, sanitize_public_diagnostic_text, sanitize_public_json_value,
 };
 use crate::state::{AppState, LaunchStatusEvent};
-use axum::Json;
-use axum::http::StatusCode;
-use croopor_launcher::{
+use axial_launcher::{
     GuardianDecision, GuardianSummary, LaunchHealingSummary, LaunchSessionRecord, snapshot_status,
 };
+use axum::Json;
+use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 

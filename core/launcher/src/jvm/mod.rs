@@ -1,4 +1,4 @@
-use croopor_minecraft::JavaRuntimeInfo;
+use axial_minecraft::JavaRuntimeInfo;
 use sysinfo::System;
 
 pub const PRESET_SMOOTH: &str = "smooth";

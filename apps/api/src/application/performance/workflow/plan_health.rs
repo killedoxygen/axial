@@ -9,13 +9,13 @@ use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass as StateOwnershipClass, RollbackState,
     StabilizationSystem, TargetDescriptor, TargetKind,
 };
-use axum::{Json, http::StatusCode};
-use croopor_minecraft::scan_versions;
-use croopor_performance::{
+use axial_minecraft::scan_versions;
+use axial_performance::{
     BundleHealth, CompositionPlan, CompositionTier, ManagedArtifactProvider, OwnershipClass,
     PerformanceMode, ResolutionRequest, StateError, derive_health, effective_performance_plan,
     load_state, parse_mode,
 };
+use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -41,7 +41,7 @@ pub struct PerformanceHealthRequest {
 #[derive(Debug, Serialize)]
 pub struct PerformancePlanResponse {
     pub active: bool,
-    pub effective: croopor_performance::EffectivePerformancePlan,
+    pub effective: axial_performance::EffectivePerformancePlan,
     pub guardian_facts: Vec<GuardianFact>,
     #[serde(flatten)]
     pub plan: CompositionPlan,
@@ -301,7 +301,7 @@ pub async fn performance_health(
 }
 
 pub(super) fn managed_artifact_summary(
-    state: Option<&croopor_performance::CompositionState>,
+    state: Option<&axial_performance::CompositionState>,
 ) -> Vec<PerformanceManagedArtifactSummary> {
     state
         .map(|state| {
@@ -419,7 +419,7 @@ pub(super) fn performance_artifacts_target(composition_id: &str) -> TargetDescri
 
 fn performance_instance_display(
     state: &AppState,
-    instance: &croopor_config::Instance,
+    instance: &axial_config::Instance,
     mode: PerformanceMode,
 ) -> PerformanceInstanceDisplay {
     let config = state.config().current();
@@ -585,7 +585,7 @@ pub(super) fn invalid_health_response(
 
 pub(super) fn resolve_instance_version_target(
     state: &AppState,
-    instance: &croopor_config::Instance,
+    instance: &axial_config::Instance,
     game_version_override: Option<&str>,
     loader_override: Option<&str>,
 ) -> Result<(String, String), (StatusCode, Json<serde_json::Value>)> {
@@ -600,7 +600,7 @@ pub(super) fn resolve_instance_version_target(
     let library_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
+            Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
     let versions = scan_versions(&std::path::PathBuf::from(library_dir)).map_err(|_| {
@@ -667,7 +667,7 @@ fn resolve_config_mode(
 
 pub(super) fn resolve_instance_mode(
     state: &AppState,
-    instance: &croopor_config::Instance,
+    instance: &axial_config::Instance,
     raw: Option<&str>,
 ) -> Result<PerformanceMode, (StatusCode, Json<serde_json::Value>)> {
     if let Some(raw) = raw.filter(|value| !value.trim().is_empty()) {
@@ -686,7 +686,7 @@ pub(super) fn resolve_instance_mode(
 
 pub(super) fn installed_mod_evidence(
     mods_dir: &std::path::Path,
-    state: Option<&croopor_performance::CompositionState>,
+    state: Option<&axial_performance::CompositionState>,
 ) -> Vec<String> {
     let mut evidence = std::collections::BTreeSet::new();
     if let Some(state) = state {

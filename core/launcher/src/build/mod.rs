@@ -1,7 +1,7 @@
 pub mod steps;
 
 use crate::runtime::RuntimeSelection;
-use croopor_minecraft::{
+use axial_minecraft::{
     LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath, client_jar_path,
     default_environment, is_legacy_assets, libraries_dir, offline_uuid, resolve_arguments,
     resolve_libraries, resolve_version,
@@ -298,27 +298,27 @@ fn effective_minecraft_version_id<'a>(
 pub fn cleanup_natives_dir(dir: &Path) -> io::Result<()> {
     let cleaned = dir.to_string_lossy();
     let managed_legacy = format!(
-        "{}croopor{}natives",
+        "{}axial{}natives",
         std::path::MAIN_SEPARATOR,
         std::path::MAIN_SEPARATOR
     );
     let managed_cache = format!(
-        "{}croopor{}cache{}natives",
+        "{}axial{}cache{}natives",
         std::path::MAIN_SEPARATOR,
         std::path::MAIN_SEPARATOR,
         std::path::MAIN_SEPARATOR
     );
     if !cleaned.contains(&managed_legacy)
-        && !cleaned.ends_with(&format!("croopor{}natives", std::path::MAIN_SEPARATOR))
+        && !cleaned.ends_with(&format!("axial{}natives", std::path::MAIN_SEPARATOR))
         && !cleaned.contains(&managed_cache)
         && !cleaned.ends_with(&format!(
-            "croopor{}cache{}natives",
+            "axial{}cache{}natives",
             std::path::MAIN_SEPARATOR,
             std::path::MAIN_SEPARATOR
         ))
     {
         return Err(io::Error::other(format!(
-            "refusing to remove non-croopor natives directory: {}",
+            "refusing to remove non-axial natives directory: {}",
             dir.display()
         )));
     }
@@ -507,7 +507,7 @@ fn natives_cache_root() -> io::Result<PathBuf> {
     .or_else(|| std::env::current_dir().ok())
     .unwrap_or_else(|| PathBuf::from("."));
 
-    Ok(cache_dir.join("croopor").join("cache").join("natives"))
+    Ok(cache_dir.join("axial").join("cache").join("natives"))
 }
 
 fn native_cache_key(version_id: &str, libraries: &[ResolvedLibrary]) -> String {
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn launch_plan_uses_instance_game_dir_but_shared_library_paths() {
         let root = std::env::temp_dir().join(format!(
-            "croopor-build-isolation-test-{}",
+            "axial-build-isolation-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time")
@@ -622,7 +622,7 @@ mod tests {
                 runtime: RuntimeSelection {
                     requested_path: String::new(),
                     selected_path: String::new(),
-                    selected_info: croopor_minecraft::JavaRuntimeInfo {
+                    selected_info: axial_minecraft::JavaRuntimeInfo {
                         id: String::new(),
                         major: 21,
                         update: 0,
@@ -630,7 +630,7 @@ mod tests {
                         path: String::new(),
                     },
                     effective_path: "/usr/bin/java".to_string(),
-                    effective_info: croopor_minecraft::JavaRuntimeInfo {
+                    effective_info: axial_minecraft::JavaRuntimeInfo {
                         id: "java".to_string(),
                         major: 21,
                         update: 0,
@@ -641,7 +641,7 @@ mod tests {
                     bypassed_requested_runtime: false,
                 },
                 game_dir: Some(instance_dir.clone()),
-                launcher_name: "croopor".to_string(),
+                launcher_name: "axial".to_string(),
                 launcher_version: "test".to_string(),
                 min_memory_mb: None,
                 max_memory_mb: None,
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn offline_auth_context_preserves_current_command_auth_args() {
-        let root = unique_temp_root("croopor-build-offline-auth-test");
+        let root = unique_temp_root("axial-build-offline-auth-test");
         let version: VersionJson = auth_version_json();
 
         let plan = plan_resolved_launch(
@@ -702,7 +702,7 @@ mod tests {
                 auth: LaunchAuthContext::offline("Player"),
                 runtime: test_runtime(),
                 game_dir: None,
-                launcher_name: "croopor".to_string(),
+                launcher_name: "axial".to_string(),
                 launcher_version: "test".to_string(),
                 min_memory_mb: None,
                 max_memory_mb: None,
@@ -727,7 +727,7 @@ mod tests {
 
     #[test]
     fn offline_authlib_multiplayer_override_applies_to_1_16_5() {
-        let root = unique_temp_root("croopor-build-offline-authlib-mp-test");
+        let root = unique_temp_root("axial-build-offline-authlib-mp-test");
         let version: VersionJson = auth_version_json();
 
         let plan = plan_resolved_launch(
@@ -739,7 +739,7 @@ mod tests {
                 auth: LaunchAuthContext::offline("Player"),
                 runtime: test_runtime(),
                 game_dir: None,
-                launcher_name: "croopor".to_string(),
+                launcher_name: "axial".to_string(),
                 launcher_version: "test".to_string(),
                 min_memory_mb: None,
                 max_memory_mb: None,
@@ -774,7 +774,7 @@ mod tests {
 
     #[test]
     fn offline_authlib_multiplayer_override_applies_to_direct_1_16_4() {
-        let root = unique_temp_root("croopor-build-offline-authlib-direct-test");
+        let root = unique_temp_root("axial-build-offline-authlib-direct-test");
         let mut version: VersionJson = auth_version_json();
         version.id = "1.16.4".to_string();
 
@@ -787,7 +787,7 @@ mod tests {
                 auth: LaunchAuthContext::offline("Player"),
                 runtime: test_runtime(),
                 game_dir: None,
-                launcher_name: "croopor".to_string(),
+                launcher_name: "axial".to_string(),
                 launcher_version: "test".to_string(),
                 min_memory_mb: None,
                 max_memory_mb: None,
@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn offline_authlib_multiplayer_override_is_exact_and_offline_only() {
-        let root = unique_temp_root("croopor-build-offline-authlib-scope-test");
+        let root = unique_temp_root("axial-build-offline-authlib-scope-test");
         let version: VersionJson = auth_version_json();
         let online_auth = LaunchAuthContext {
             player_name: "OnlinePlayer".to_string(),
@@ -829,7 +829,7 @@ mod tests {
                 auth: online_auth,
                 runtime: test_runtime(),
                 game_dir: None,
-                launcher_name: "croopor".to_string(),
+                launcher_name: "axial".to_string(),
                 launcher_version: "test".to_string(),
                 min_memory_mb: None,
                 max_memory_mb: None,
@@ -856,7 +856,7 @@ mod tests {
                     auth: LaunchAuthContext::offline("Player"),
                     runtime: test_runtime(),
                     game_dir: None,
-                    launcher_name: "croopor".to_string(),
+                    launcher_name: "axial".to_string(),
                     launcher_version: "test".to_string(),
                     min_memory_mb: None,
                     max_memory_mb: None,
@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn legacy_forge_1_5_2_uses_archived_fml_library_mirror() {
-        let root = unique_temp_root("croopor-build-legacy-fml-mirror");
+        let root = unique_temp_root("axial-build-legacy-fml-mirror");
         let version_dir = root.join("versions").join("1.5.2-forge-7.8.1.738");
         fs::create_dir_all(&version_dir).expect("version dir");
         fs::write(version_dir.join("1.5.2-forge-7.8.1.738.jar"), b"client").expect("client jar");
@@ -906,7 +906,7 @@ mod tests {
                 auth: LaunchAuthContext::offline("Player"),
                 runtime: test_runtime(),
                 game_dir: None,
-                launcher_name: "croopor".to_string(),
+                launcher_name: "axial".to_string(),
                 launcher_version: "test".to_string(),
                 min_memory_mb: None,
                 max_memory_mb: None,
@@ -930,7 +930,7 @@ mod tests {
 
     #[test]
     fn legacy_fml_library_mirror_is_scoped_to_legacyfixer_1_5_versions() {
-        let root = unique_temp_root("croopor-build-legacy-fml-mirror-scope");
+        let root = unique_temp_root("axial-build-legacy-fml-mirror-scope");
         let version: VersionJson = auth_version_json();
         let vanilla_plan = plan_resolved_launch(
             &VanillaLaunchRequest {
@@ -941,7 +941,7 @@ mod tests {
                 auth: LaunchAuthContext::offline("Player"),
                 runtime: test_runtime(),
                 game_dir: None,
-                launcher_name: "croopor".to_string(),
+                launcher_name: "axial".to_string(),
                 launcher_version: "test".to_string(),
                 min_memory_mb: None,
                 max_memory_mb: None,
@@ -962,9 +962,9 @@ mod tests {
         modern_forge.id = "1.6.4-forge-9.11.1.1345".to_string();
         modern_forge
             .libraries
-            .push(croopor_minecraft::launch::Library {
+            .push(axial_minecraft::launch::Library {
                 name: "net.minecraftforge:legacyfixer:1.0".to_string(),
-                ..croopor_minecraft::launch::Library::default()
+                ..axial_minecraft::launch::Library::default()
             });
         let modern_plan = plan_resolved_launch(
             &VanillaLaunchRequest {
@@ -975,7 +975,7 @@ mod tests {
                 auth: LaunchAuthContext::offline("Player"),
                 runtime: test_runtime(),
                 game_dir: None,
-                launcher_name: "croopor".to_string(),
+                launcher_name: "axial".to_string(),
                 launcher_version: "test".to_string(),
                 min_memory_mb: None,
                 max_memory_mb: None,
@@ -1014,7 +1014,7 @@ mod tests {
 
     #[test]
     fn explicit_auth_context_flows_into_launch_variables_and_command() {
-        let root = unique_temp_root("croopor-build-explicit-auth-test");
+        let root = unique_temp_root("axial-build-explicit-auth-test");
         let version: VersionJson = auth_version_json();
         let auth = LaunchAuthContext {
             player_name: "OnlinePlayer".to_string(),
@@ -1034,7 +1034,7 @@ mod tests {
                 auth,
                 runtime: test_runtime(),
                 game_dir: None,
-                launcher_name: "croopor".to_string(),
+                launcher_name: "axial".to_string(),
                 launcher_version: "test".to_string(),
                 min_memory_mb: None,
                 max_memory_mb: None,
@@ -1068,7 +1068,7 @@ mod tests {
     #[test]
     fn modern_native_libraries_get_explicit_native_and_temp_paths() {
         let root = std::env::temp_dir().join(format!(
-            "croopor-build-test-{}",
+            "axial-build-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time")
@@ -1129,7 +1129,7 @@ mod tests {
             runtime: RuntimeSelection {
                 requested_path: String::new(),
                 selected_path: String::new(),
-                selected_info: croopor_minecraft::JavaRuntimeInfo {
+                selected_info: axial_minecraft::JavaRuntimeInfo {
                     id: String::new(),
                     major: 21,
                     update: 0,
@@ -1137,7 +1137,7 @@ mod tests {
                     path: String::new(),
                 },
                 effective_path: "/usr/bin/java".to_string(),
-                effective_info: croopor_minecraft::JavaRuntimeInfo {
+                effective_info: axial_minecraft::JavaRuntimeInfo {
                     id: "java".to_string(),
                     major: 21,
                     update: 0,
@@ -1148,7 +1148,7 @@ mod tests {
                 bypassed_requested_runtime: false,
             },
             game_dir: None,
-            launcher_name: "croopor".to_string(),
+            launcher_name: "axial".to_string(),
             launcher_version: "test".to_string(),
             min_memory_mb: None,
             max_memory_mb: None,
@@ -1160,7 +1160,7 @@ mod tests {
         assert!(plan.natives_dir.is_some());
         let natives_dir = plan.natives_dir.as_ref().expect("natives dir");
         assert!(natives_dir.to_string_lossy().contains(&format!(
-            "croopor{}cache{}natives",
+            "axial{}cache{}natives",
             std::path::MAIN_SEPARATOR,
             std::path::MAIN_SEPARATOR
         )));
@@ -1191,7 +1191,7 @@ mod tests {
 
     #[test]
     fn native_cache_key_changes_when_native_artifact_changes() {
-        let root = unique_temp_root("croopor-build-native-cache-key-test");
+        let root = unique_temp_root("axial-build-native-cache-key-test");
         fs::create_dir_all(&root).expect("root");
         let native_jar = root.join("demo-natives.jar");
         write_native_zip(&native_jar, b"native-v1").expect("write native v1");
@@ -1211,7 +1211,7 @@ mod tests {
 
     #[test]
     fn find_client_jar_prefers_child_jar_over_parent_jar() {
-        let root = unique_temp_root("croopor-build-child-jar-preference");
+        let root = unique_temp_root("axial-build-child-jar-preference");
         let versions_dir = root.join("versions");
         fs::create_dir_all(versions_dir.join("base")).expect("base dir");
         fs::create_dir_all(versions_dir.join("child")).expect("child dir");
@@ -1245,7 +1245,7 @@ mod tests {
 
     #[test]
     fn find_client_jar_falls_back_to_parent_when_child_has_no_client_artifact() {
-        let root = unique_temp_root("croopor-build-parent-jar-fallback");
+        let root = unique_temp_root("axial-build-parent-jar-fallback");
         let versions_dir = root.join("versions");
         fs::create_dir_all(versions_dir.join("base")).expect("base dir");
         fs::create_dir_all(versions_dir.join("child")).expect("child dir");
@@ -1270,7 +1270,7 @@ mod tests {
 
     #[test]
     fn find_client_jar_does_not_fall_back_to_parent_when_child_client_is_missing() {
-        let root = unique_temp_root("croopor-build-no-parent-mask-child-client");
+        let root = unique_temp_root("axial-build-no-parent-mask-child-client");
         let versions_dir = root.join("versions");
         fs::create_dir_all(versions_dir.join("base")).expect("base dir");
         fs::create_dir_all(versions_dir.join("child")).expect("child dir");
@@ -1300,7 +1300,7 @@ mod tests {
 
     #[test]
     fn module_bootstrap_launch_keeps_game_jar_in_classpath() {
-        let root = unique_temp_root("croopor-build-module-bootstrap-classpath");
+        let root = unique_temp_root("axial-build-module-bootstrap-classpath");
         let version_id = "1.20.1-forge-47.4.20";
         let version_dir = root.join("versions").join(version_id);
         fs::create_dir_all(&version_dir).expect("version dir");
@@ -1335,7 +1335,7 @@ mod tests {
             auth: LaunchAuthContext::offline("Player"),
             runtime: test_runtime(),
             game_dir: None,
-            launcher_name: "croopor".to_string(),
+            launcher_name: "axial".to_string(),
             launcher_version: "test".to_string(),
             min_memory_mb: None,
             max_memory_mb: None,
@@ -1400,7 +1400,7 @@ mod tests {
         RuntimeSelection {
             requested_path: String::new(),
             selected_path: String::new(),
-            selected_info: croopor_minecraft::JavaRuntimeInfo {
+            selected_info: axial_minecraft::JavaRuntimeInfo {
                 id: String::new(),
                 major: 21,
                 update: 0,
@@ -1408,7 +1408,7 @@ mod tests {
                 path: String::new(),
             },
             effective_path: "/usr/bin/java".to_string(),
-            effective_info: croopor_minecraft::JavaRuntimeInfo {
+            effective_info: axial_minecraft::JavaRuntimeInfo {
                 id: "java".to_string(),
                 major: 21,
                 update: 0,

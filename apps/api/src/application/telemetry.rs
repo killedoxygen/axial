@@ -60,8 +60,8 @@ mod tests {
     use crate::app::default_frontend_dir;
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
     use crate::state::{AppStateInit, InstallStore, SessionStore};
-    use croopor_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
-    use croopor_performance::PerformanceManager;
+    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+    use axial_performance::PerformanceManager;
     use std::{fs, path::PathBuf, sync::Arc};
 
     const TEST_KEY: &str = "phc_test";
@@ -128,7 +128,7 @@ mod tests {
             FrontendErrorReportRequest {
                 kind: "render".to_string(),
                 name: "RenderError".to_string(),
-                message: "failed rendering /Users/alice/Croopor/private-instance/config.json"
+                message: "failed rendering /Users/alice/Axial/private-instance/config.json"
                     .to_string(),
             },
         )
@@ -168,7 +168,7 @@ mod tests {
             ));
             let state = AppState::new_with_telemetry(
                 AppStateInit {
-                    app_name: "Croopor".to_string(),
+                    app_name: "Axial".to_string(),
                     version: "test".to_string(),
                     instances: Arc::new(
                         InstanceStore::load_from(paths.clone()).expect("load instances"),
@@ -202,7 +202,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "croopor-api-frontend-telemetry-{name}-{}-{}",
+            "axial-api-frontend-telemetry-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

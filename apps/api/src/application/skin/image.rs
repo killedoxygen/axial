@@ -17,7 +17,7 @@ pub(super) struct NormalizedSkinPng {
 }
 
 pub(super) fn normalize_skin_png(bytes: &[u8]) -> Result<NormalizedSkinPng, ApiError> {
-    // Minecraft accepts 64x32 legacy skins, but Croopor stores normalized 64x64 PNGs.
+    // Minecraft accepts 64x32 legacy skins, but Axial stores normalized 64x64 PNGs.
     if !bytes.starts_with(PNG_SIGNATURE) {
         return Err(json_error(
             StatusCode::BAD_REQUEST,

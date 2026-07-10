@@ -28,12 +28,12 @@ use crate::state::{
     InstallQueueSnapshot, InstallQueueSpec, InstallStore, OperationJournalStore,
     QueuedInstallEntry,
 };
-use axum::{Json, http::StatusCode};
-use croopor_minecraft::{
+use axial_minecraft::{
     DownloadError, DownloadProgress, Downloader, LoaderComponentId,
     download::{ExecutionDownloadFact, SelectedDownloadArtifactDescriptor},
     resolve_build_record,
 };
+use axum::{Json, http::StatusCode};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -105,7 +105,7 @@ pub(crate) async fn start_install_version(
     let mc_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
-            Json(serde_json::json!({ "error": "Croopor library is not configured" })),
+            Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
 
@@ -575,7 +575,7 @@ async fn install_queue_spec_from_request(
             state.library_dir().ok_or_else(|| {
                 (
                     StatusCode::PRECONDITION_FAILED,
-                    Json(serde_json::json!({ "error": "Croopor library is not configured" })),
+                    Json(serde_json::json!({ "error": "Axial library is not configured" })),
                 )
             })?;
             Ok(InstallQueueSpec::vanilla(version_id, manifest_url))
@@ -598,7 +598,7 @@ async fn install_queue_spec_from_request(
             let library_dir = state.library_dir().ok_or_else(|| {
                 (
                     StatusCode::PRECONDITION_FAILED,
-                    Json(serde_json::json!({ "error": "Croopor library is not configured" })),
+                    Json(serde_json::json!({ "error": "Axial library is not configured" })),
                 )
             })?;
             let build = resolve_build_record(

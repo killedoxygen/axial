@@ -19,7 +19,7 @@ use crate::observability::{
 use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
-use croopor_minecraft::download::{
+use axial_minecraft::download::{
     ExecutionDownloadFact as MinecraftDownloadFact,
     ExecutionDownloadFactKind as MinecraftDownloadFactKind,
 };
@@ -434,7 +434,7 @@ mod tests {
     };
     use crate::guardian::{GuardianActionKind, GuardianMode};
     use crate::state::contracts::{OperationId, OperationPhase, OwnershipClass, TargetKind};
-    use croopor_minecraft::download::{
+    use axial_minecraft::download::{
         ExecutionDownloadFact as MinecraftDownloadFact,
         ExecutionDownloadFactKind as MinecraftDownloadFactKind,
     };
@@ -704,7 +704,7 @@ mod tests {
             GuardianInstallArtifactFailureKind::RuntimeRosettaRequired,
         )
         .with_field("component", "jre-legacy")
-        .with_field("path", "/Users/alice/.croopor/runtime/java");
+        .with_field("path", "/Users/alice/.axial/runtime/java");
 
         let outcome = install_artifact_failure_guardian_outcome(
             Some(OperationId::new("install-operation-1")),
@@ -805,7 +805,7 @@ mod tests {
                 "minecraft_client_1.21.5",
                 kind,
             )
-            .with_field("path", "/Users/alice/.croopor/libraries/secret.jar")
+            .with_field("path", "/Users/alice/.axial/libraries/secret.jar")
             .with_field("url", "https://example.invalid/client.jar?token=secret")
             .with_field("provider_payload", "{\"token\":\"secret\"}");
 
@@ -987,7 +987,7 @@ mod tests {
                 fields: vec![
                     (
                         "path".to_string(),
-                        "/Users/alice/.croopor/libraries/secret.jar".to_string(),
+                        "/Users/alice/.axial/libraries/secret.jar".to_string(),
                     ),
                     ("phase".to_string(), "promote".to_string()),
                 ],

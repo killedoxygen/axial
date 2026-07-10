@@ -1,5 +1,5 @@
+use axial_config::AppPaths;
 use chrono::{SecondsFormat, Utc};
-use croopor_config::AppPaths;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;

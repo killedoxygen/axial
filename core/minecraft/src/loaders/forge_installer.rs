@@ -704,7 +704,7 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         let root = std::env::temp_dir().join(format!(
-            "croopor-forge-installer-{name}-{}-{nanos:x}",
+            "axial-forge-installer-{name}-{}-{nanos:x}",
             std::process::id()
         ));
         fs::create_dir_all(&root).expect("create test root");

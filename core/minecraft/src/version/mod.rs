@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-const LOADER_METADATA_FILE: &str = ".croopor-loader.json";
+const LOADER_METADATA_FILE: &str = ".axial-loader.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionScanReport {
@@ -586,7 +586,7 @@ mod tests {
             ..test_loader_metadata(LoaderComponentId::Forge, "26.1.2", "64.0.4")
         };
         fs::write(
-            forge_dir.join(".croopor-loader.json"),
+            forge_dir.join(".axial-loader.json"),
             serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
         )
         .expect("write metadata");
@@ -640,7 +640,7 @@ mod tests {
         )
         .expect("write fabric json");
         fs::write(
-            fabric_dir.join(".croopor-loader.json"),
+            fabric_dir.join(".axial-loader.json"),
             serde_json::to_vec_pretty(&test_loader_metadata(
                 LoaderComponentId::Fabric,
                 "1.21.5",
@@ -691,6 +691,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time ok")
             .as_nanos();
-        std::env::temp_dir().join(format!("croopor-{name}-{unique}"))
+        std::env::temp_dir().join(format!("axial-{name}-{unique}"))
     }
 }

@@ -128,7 +128,7 @@ pub(super) fn runtime_download_temp_path(destination: &Path) -> PathBuf {
         .file_name()
         .unwrap_or_else(|| OsStr::new("runtime-download"))
         .to_os_string();
-    name.push(".croopor-tmp");
+    name.push(".axial-tmp");
     destination.with_file_name(name)
 }
 
@@ -271,7 +271,7 @@ pub(super) fn runtime_download_client() -> reqwest::Client {
                 .read_timeout(std::time::Duration::from_secs(
                     RUNTIME_DOWNLOAD_CLIENT_READ_TIMEOUT_SECS,
                 ))
-                .user_agent("croopor/0.3")
+                .user_agent("axial/0.3")
                 .pool_max_idle_per_host(MAX_RUNTIME_FILE_DOWNLOAD_CONCURRENCY)
                 .pool_idle_timeout(std::time::Duration::from_secs(
                     RUNTIME_DOWNLOAD_CLIENT_POOL_IDLE_TIMEOUT_SECS,

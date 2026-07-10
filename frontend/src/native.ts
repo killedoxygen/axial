@@ -116,22 +116,22 @@ export async function applyDesktopChromeAttributes(): Promise<void> {
 }
 
 export function nativeInstallEventName(installId: string): string {
-  return `croopor:install:${installId}:progress`;
+  return `axial:install:${installId}:progress`;
 }
 
 export function nativeLoaderInstallEventName(installId: string): string {
-  return `croopor:loader-install:${installId}:progress`;
+  return `axial:loader-install:${installId}:progress`;
 }
 
 export function nativeLaunchStatusEventName(sessionId: string): string {
-  return `croopor:launch:${sessionId}:status`;
+  return `axial:launch:${sessionId}:status`;
 }
 
 export function nativeLaunchLogEventName(sessionId: string): string {
-  return `croopor:launch:${sessionId}:log`;
+  return `axial:launch:${sessionId}:log`;
 }
 
-export const nativeDesktopCloseBlockedEventName = 'croopor:desktop:close-blocked';
+export const nativeDesktopCloseBlockedEventName = 'axial:desktop:close-blocked';
 
 export async function onNativeEvent(
   eventName: string,

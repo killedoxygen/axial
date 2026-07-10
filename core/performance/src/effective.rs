@@ -276,11 +276,11 @@ fn explanation(
             tier_label(plan.tier)
         )),
         PerformanceMode::Vanilla => details.push(
-            "Croopor can still apply normal launch safety checks outside the performance bundle."
+            "Axial can still apply normal launch safety checks outside the performance bundle."
                 .to_string(),
         ),
         PerformanceMode::Custom => details.push(
-            "Croopor will expose the effective result without silently changing explicit choices."
+            "Axial will expose the effective result without silently changing explicit choices."
                 .to_string(),
         ),
     }
@@ -389,7 +389,7 @@ mod tests {
             jvm_preset: "performance".to_string(),
             fallback_chain: vec!["family-f-fabric-core".to_string()],
             warnings: Vec::new(),
-            fallback_reason: "A faster performance bundle is temporarily unavailable, so Croopor chose the safest available option.".to_string(),
+            fallback_reason: "A faster performance bundle is temporarily unavailable, so Axial chose the safest available option.".to_string(),
         };
 
         let effective = effective_performance_plan(&plan);

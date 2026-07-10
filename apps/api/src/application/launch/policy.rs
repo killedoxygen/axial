@@ -1,6 +1,6 @@
-use croopor_config::{AppConfig, Instance};
-use croopor_launcher::{GuardianMode, OverrideOrigin, SessionId};
-use croopor_minecraft::{VersionEntry, compare_version_like};
+use axial_config::{AppConfig, Instance};
+use axial_launcher::{GuardianMode, OverrideOrigin, SessionId};
+use axial_minecraft::{VersionEntry, compare_version_like};
 use std::cmp::Ordering;
 use std::time::SystemTime;
 
@@ -426,12 +426,12 @@ mod tests {
 
     fn test_loader_version(id: &str, inherits_from: &str) -> VersionEntry {
         VersionEntry {
-            subject_kind: croopor_minecraft::VersionSubjectKind::InstalledVersion,
+            subject_kind: axial_minecraft::VersionSubjectKind::InstalledVersion,
             id: id.to_string(),
             raw_kind: "release".to_string(),
             release_time: String::new(),
-            minecraft_meta: croopor_minecraft::MinecraftVersionMeta::default(),
-            lifecycle: croopor_minecraft::LifecycleMeta::default(),
+            minecraft_meta: axial_minecraft::MinecraftVersionMeta::default(),
+            lifecycle: axial_minecraft::LifecycleMeta::default(),
             inherits_from: inherits_from.to_string(),
             launchable: true,
             installed: true,
@@ -441,12 +441,12 @@ mod tests {
             java_component: String::new(),
             java_major: 21,
             manifest_url: String::new(),
-            loader: Some(croopor_minecraft::VersionLoaderAttachment {
-                component_id: croopor_minecraft::LoaderComponentId::Fabric,
+            loader: Some(axial_minecraft::VersionLoaderAttachment {
+                component_id: axial_minecraft::LoaderComponentId::Fabric,
                 component_name: "Fabric".to_string(),
                 build_id: "fabric:1.21.1:0.16.10".to_string(),
                 loader_version: "0.16.10".to_string(),
-                build_meta: croopor_minecraft::LoaderBuildMetadata::default(),
+                build_meta: axial_minecraft::LoaderBuildMetadata::default(),
             }),
         }
     }

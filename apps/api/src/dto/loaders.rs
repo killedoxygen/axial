@@ -1,4 +1,4 @@
-use croopor_minecraft::{
+use axial_minecraft::{
     LoaderBuildRecord, LoaderCatalogState, LoaderComponentRecord, LoaderGameVersion,
 };
 use serde::Serialize;

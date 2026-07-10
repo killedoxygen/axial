@@ -5,13 +5,13 @@ pub(super) fn runtime_cache_dir() -> PathBuf {
     if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA")
             .map(PathBuf::from)
-            .map(|path| path.join("croopor").join("runtimes"))
-            .unwrap_or_else(|| PathBuf::from(".croopor").join("runtimes"))
+            .map(|path| path.join("axial").join("runtimes"))
+            .unwrap_or_else(|| PathBuf::from(".axial").join("runtimes"))
     } else {
         std::env::var_os("HOME")
             .map(PathBuf::from)
-            .map(|path| path.join(".croopor").join("runtimes"))
-            .unwrap_or_else(|| PathBuf::from(".croopor").join("runtimes"))
+            .map(|path| path.join(".axial").join("runtimes"))
+            .unwrap_or_else(|| PathBuf::from(".axial").join("runtimes"))
     }
 }
 pub(super) fn runtime_os_arch() -> String {

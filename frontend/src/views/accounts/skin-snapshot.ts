@@ -12,7 +12,7 @@ const SNAPSHOT_HALF_HEIGHT = 10.8;
 const MAX_SNAPSHOT_CACHE_SIZE = 180;
 const MAX_STORED_SNAPSHOT_CACHE_SIZE = 320;
 const SNAPSHOT_RENDER_VERSION = 5;
-const SNAPSHOT_DB_NAME = 'croopor-skin-snapshots';
+const SNAPSHOT_DB_NAME = 'axial-skin-snapshots';
 const SNAPSHOT_DB_VERSION = 1;
 const SNAPSHOT_STORE_NAME = 'snapshots';
 

@@ -15,7 +15,7 @@ pub struct ConfigStartupLoad {
     pub warnings: Vec<String>,
 }
 
-const CONFIG_STARTUP_WARNING: &str = "Croopor could not load settings, so it started with safe defaults. Check app data permissions or restore the settings file.";
+const CONFIG_STARTUP_WARNING: &str = "Axial could not load settings, so it started with safe defaults. Check app data permissions or restore the settings file.";
 
 #[derive(Debug, Error)]
 pub enum ConfigStoreError {
@@ -155,7 +155,7 @@ mod tests {
             .expect("clock should be after unix epoch")
             .as_nanos();
         let config_dir = std::env::temp_dir().join(format!(
-            "croopor-config-store-{name}-{}-{nonce}",
+            "axial-config-store-{name}-{}-{nonce}",
             std::process::id()
         ));
         AppPaths {

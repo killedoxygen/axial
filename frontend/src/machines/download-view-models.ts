@@ -93,7 +93,7 @@ function unavailableFailureAction(action: string, label: string): InstallActionV
     action,
     label,
     enabled: false,
-    disabled_reason: 'Action unavailable until Croopor receives backend failure details.',
+    disabled_reason: 'Action unavailable until Axial receives backend failure details.',
   };
 }
 
@@ -111,7 +111,7 @@ function boundedFailureMessage(message: string): string {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find((line) => line && !line.startsWith('at '));
-  const squashed = (firstUsefulLine || 'Install failed before Croopor received error details.')
+  const squashed = (firstUsefulLine || 'Install failed before Axial received error details.')
     .replace(/\s+/g, ' ')
     .trim();
   if (squashed.length <= 220) return squashed;

@@ -50,7 +50,7 @@ pub fn resolve_plan(manifest: Option<&Manifest>, request: ResolutionRequest) -> 
                     composition_disable_warning(disable, &definition.id),
                 );
                 if fallback_reason.is_empty() {
-                    fallback_reason = "A faster performance bundle is temporarily unavailable, so Croopor chose the safest available option.".to_string();
+                    fallback_reason = "A faster performance bundle is temporarily unavailable, so Axial chose the safest available option.".to_string();
                 }
                 continue;
             }
@@ -111,7 +111,7 @@ pub fn resolve_plan(manifest: Option<&Manifest>, request: ResolutionRequest) -> 
                     ),
                 );
                 if fallback_reason.is_empty() {
-                    fallback_reason = "A faster performance bundle is not compatible with this instance, so Croopor chose a safer option.".to_string();
+                    fallback_reason = "A faster performance bundle is not compatible with this instance, so Axial chose a safer option.".to_string();
                 }
             }
         }
@@ -121,7 +121,7 @@ pub fn resolve_plan(manifest: Option<&Manifest>, request: ResolutionRequest) -> 
     plan.warnings = fallback_warnings;
     if !plan.warnings.is_empty() {
         plan.fallback_reason = if fallback_reason.is_empty() {
-            "Managed performance bundles are temporarily unavailable, so Croopor will only tune launcher settings.".to_string()
+            "Managed performance bundles are temporarily unavailable, so Axial will only tune launcher settings.".to_string()
         } else {
             fallback_reason
         };

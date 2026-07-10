@@ -1,12 +1,12 @@
-use croopor_api::state::presence::{PresenceActivityKind, PresenceSnapshot};
+use axial_api::state::presence::{PresenceActivityKind, PresenceSnapshot};
 use serde_json::{Value, json};
 
-const DISCORD_ASSET_KEY: &str = "croopor";
-const DISCORD_ASSET_TEXT: &str = "Croopor Launcher";
-const DISCORD_IDLE_ASSET_KEY: &str = "croopor_idle";
-const DISCORD_LAUNCHING_ASSET_KEY: &str = "croopor_launching";
-const DISCORD_MINECRAFT_ASSET_KEY: &str = "croopor_minecraft";
-const DISCORD_MULTI_ASSET_KEY: &str = "croopor_multi";
+const DISCORD_ASSET_KEY: &str = "axial";
+const DISCORD_ASSET_TEXT: &str = "Axial Launcher";
+const DISCORD_IDLE_ASSET_KEY: &str = "axial_idle";
+const DISCORD_LAUNCHING_ASSET_KEY: &str = "axial_launching";
+const DISCORD_MINECRAFT_ASSET_KEY: &str = "axial_minecraft";
+const DISCORD_MULTI_ASSET_KEY: &str = "axial_multi";
 const ACTIVITY_TYPE_PLAYING: u8 = 0;
 const ACTIVITY_TYPE_WATCHING: u8 = 3;
 
@@ -34,7 +34,7 @@ pub(super) fn discord_activity(snapshot: &PresenceSnapshot) -> Value {
 
     if activity.kind == PresenceActivityKind::Multi {
         value["party"] = json!({
-            "id": "croopor-active-sessions",
+            "id": "axial-active-sessions",
             "size": [
                 activity.active_count,
                 activity.active_count,
@@ -66,10 +66,10 @@ fn small_asset(kind: PresenceActivityKind) -> (&'static str, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use croopor_api::state::presence::{PresenceActivity, PresenceActivityKind};
+    use axial_api::state::presence::{PresenceActivity, PresenceActivityKind};
 
     #[test]
-    fn activity_payload_uses_croopor_asset_and_timestamp_for_gameplay() {
+    fn activity_payload_uses_axial_asset_and_timestamp_for_gameplay() {
         let snapshot = PresenceSnapshot {
             enabled: true,
             activity: PresenceActivity {
@@ -134,7 +134,7 @@ mod tests {
         let activity = discord_activity(&snapshot);
 
         assert_eq!(activity["assets"]["small_image"], DISCORD_MULTI_ASSET_KEY);
-        assert_eq!(activity["party"]["id"], "croopor-active-sessions");
+        assert_eq!(activity["party"]["id"], "axial-active-sessions");
         assert_eq!(activity["party"]["size"], json!([2, 2]));
         assert!(activity.get("buttons").is_none());
         assert!(activity.get("secrets").is_none());

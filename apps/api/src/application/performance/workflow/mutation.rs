@@ -22,11 +22,11 @@ use crate::guardian::{
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::AppState;
 use crate::state::contracts::{OperationPhase, RollbackState};
-use axum::{Json, http::StatusCode};
-use croopor_performance::{
+use axial_performance::{
     BundleHealth, CompositionState, InstallError, PerformanceMode, ResolutionRequest,
     RollbackSnapshotSummary as CoreRollbackSnapshotSummary, StateError, derive_health, load_state,
 };
+use axum::{Json, http::StatusCode};
 use serde::Serialize;
 
 pub(super) const PERFORMANCE_INSTALL_INTERNAL_ERROR: &str =
@@ -42,10 +42,10 @@ pub struct PerformanceRollbackSnapshotSummary {
     pub id: String,
     pub created_at: String,
     pub composition_id: String,
-    pub tier: croopor_performance::CompositionTier,
+    pub tier: axial_performance::CompositionTier,
     pub installed_count: usize,
     pub artifact_count: usize,
-    pub ownership_class: croopor_performance::OwnershipClass,
+    pub ownership_class: axial_performance::OwnershipClass,
     pub rollback_available: bool,
     pub latest: bool,
 }
@@ -152,7 +152,7 @@ pub(super) async fn execute_performance_operation(
 
 fn execute_performance_rollback(
     state: &AppState,
-    performance: &croopor_performance::PerformanceManager,
+    performance: &axial_performance::PerformanceManager,
     mods_dir: &std::path::Path,
     operation: &PerformanceOperation,
 ) -> Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)> {
@@ -249,7 +249,7 @@ fn execute_performance_rollback(
 
 fn execute_performance_remove(
     state: &AppState,
-    performance: &croopor_performance::PerformanceManager,
+    performance: &axial_performance::PerformanceManager,
     mods_dir: &std::path::Path,
     linked_operation_id: Option<&str>,
 ) -> Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)> {
@@ -329,7 +329,7 @@ fn execute_performance_remove(
 
 async fn execute_performance_install(
     state: &AppState,
-    performance: &croopor_performance::PerformanceManager,
+    performance: &axial_performance::PerformanceManager,
     mods_dir: &std::path::Path,
     operation: &PerformanceOperation,
     mode: PerformanceMode,
@@ -453,7 +453,7 @@ fn supervise_performance_operation(
 
 fn performance_install_guardian_facts(
     state: &AppState,
-    plan: &croopor_performance::CompositionPlan,
+    plan: &axial_performance::CompositionPlan,
     phase: OperationPhase,
 ) -> Vec<GuardianFact> {
     let mut facts = performance_plan_guardian_facts(plan, phase);
@@ -487,10 +487,10 @@ fn rollback_preflight(
     rollback_id: Option<&str>,
 ) -> Result<(String, RollbackState), (StatusCode, Json<serde_json::Value>)> {
     let snapshot = if let Some(rollback_id) = optional_value(rollback_id) {
-        croopor_performance::state::load_rollback_snapshot_by_id(mods_dir, &rollback_id)
+        axial_performance::state::load_rollback_snapshot_by_id(mods_dir, &rollback_id)
             .map_err(|error| performance_install_error(InstallError::State(error)))?
     } else {
-        croopor_performance::state::load_rollback_snapshot(mods_dir)
+        axial_performance::state::load_rollback_snapshot(mods_dir)
             .map_err(|error| performance_install_error(InstallError::State(error)))?
     };
 

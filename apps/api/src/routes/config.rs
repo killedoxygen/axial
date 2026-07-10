@@ -2,13 +2,13 @@ use crate::{
     application::{self, ConfigPatch},
     state::AppState,
 };
+use axial_config::AppConfig;
 use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
     routing::{get, put},
 };
-use croopor_config::AppConfig;
 
 pub fn router() -> Router<AppState> {
     Router::new()

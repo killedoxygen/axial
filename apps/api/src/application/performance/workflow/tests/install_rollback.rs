@@ -134,17 +134,17 @@ async fn install_custom_mode_removes_only_managed_artifacts() {
     fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed mod");
     fs::write(mods_dir.join("user.jar"), b"user").expect("write user mod");
     fs::write(
-        mods_dir.join(".croopor-lock.json"),
-        serde_json::to_vec(&croopor_performance::CompositionState {
+        mods_dir.join(".axial-lock.json"),
+        serde_json::to_vec(&axial_performance::CompositionState {
             composition_id: "core".to_string(),
             tier: CompositionTier::Core,
-            installed_mods: vec![croopor_performance::InstalledMod {
+            installed_mods: vec![axial_performance::InstalledMod {
                 project_id: "sodium".to_string(),
                 version_id: "version".to_string(),
                 filename: "managed.jar".to_string(),
-                ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
+                ownership_class: axial_performance::OwnershipClass::CompositionManaged,
                 source: test_modrinth_source(),
-                integrity: croopor_performance::ManagedArtifactIntegrity {
+                integrity: axial_performance::ManagedArtifactIntegrity {
                     sha512: String::new(),
                     sha512_verified: false,
                 },
@@ -178,7 +178,7 @@ async fn install_custom_mode_removes_only_managed_artifacts() {
     assert_eq!(response.installed_count, 0);
     assert!(response.warnings.is_empty());
     assert!(!mods_dir.join("managed.jar").exists());
-    assert!(!mods_dir.join(".croopor-lock.json").exists());
+    assert!(!mods_dir.join(".axial-lock.json").exists());
     assert!(mods_dir.join("user.jar").is_file());
     let journal = fixture
         .state
@@ -231,7 +231,7 @@ async fn install_remove_rejects_invalid_ownership_without_deleting_files() {
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("user.jar"), b"user").expect("write user file");
     fs::write(
-        mods_dir.join(".croopor-lock.json"),
+        mods_dir.join(".axial-lock.json"),
         serde_json::to_vec(&serde_json::json!({
             "composition_id": "core",
             "tier": "core",
@@ -277,7 +277,7 @@ async fn install_remove_rejects_invalid_ownership_without_deleting_files() {
         fs::read(mods_dir.join("user.jar")).expect("read user"),
         b"user"
     );
-    assert!(mods_dir.join(".croopor-lock.json").is_file());
+    assert!(mods_dir.join(".axial-lock.json").is_file());
 }
 
 #[tokio::test]
@@ -292,7 +292,7 @@ async fn install_remove_rejects_invalid_integrity_without_deleting_files() {
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed file");
     fs::write(
-        mods_dir.join(".croopor-lock.json"),
+        mods_dir.join(".axial-lock.json"),
         serde_json::to_vec(&serde_json::json!({
             "composition_id": "core",
             "tier": "core",
@@ -338,7 +338,7 @@ async fn install_remove_rejects_invalid_integrity_without_deleting_files() {
         fs::read(mods_dir.join("managed.jar")).expect("read managed"),
         b"managed"
     );
-    assert!(mods_dir.join(".croopor-lock.json").is_file());
+    assert!(mods_dir.join(".axial-lock.json").is_file());
 }
 
 #[tokio::test]
@@ -380,7 +380,7 @@ async fn rollback_list_route_returns_snapshot_metadata() {
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed-a.jar"), b"managed-a").expect("write managed a");
     fs::write(mods_dir.join("managed-b.jar"), b"managed-b").expect("write managed b");
-    let first = croopor_performance::state::save_rollback_snapshot(
+    let first = axial_performance::state::save_rollback_snapshot(
         &mods_dir,
         &test_composition_state(
             "core-a",
@@ -388,7 +388,7 @@ async fn rollback_list_route_returns_snapshot_metadata() {
         ),
     )
     .expect("save first snapshot");
-    let second = croopor_performance::state::save_rollback_snapshot(
+    let second = axial_performance::state::save_rollback_snapshot(
         &mods_dir,
         &test_composition_state(
             "core-b",
@@ -447,7 +447,7 @@ async fn rollback_list_route_bounds_public_snapshot_descriptors() {
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed");
     let raw_composition_id = r"C:\Users\Alice\.minecraft\mods\secret.jar";
-    croopor_performance::state::save_rollback_snapshot(
+    axial_performance::state::save_rollback_snapshot(
         &mods_dir,
         &test_composition_state(
             raw_composition_id,
@@ -506,7 +506,7 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
         .join("mods");
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed-a.jar"), b"managed-a").expect("write managed a");
-    let older = croopor_performance::state::save_rollback_snapshot(
+    let older = axial_performance::state::save_rollback_snapshot(
         &mods_dir,
         &test_composition_state(
             "core-a",
@@ -516,7 +516,7 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
     .expect("save older snapshot");
     fs::remove_file(mods_dir.join("managed-a.jar")).expect("remove superseded managed a");
     fs::write(mods_dir.join("managed-b.jar"), b"managed-b").expect("write managed b");
-    croopor_performance::state::save_state(
+    axial_performance::state::save_state(
         &mods_dir,
         &test_composition_state(
             "core-b",
@@ -524,7 +524,7 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
         ),
     )
     .expect("save current state");
-    croopor_performance::state::save_rollback_snapshot(
+    axial_performance::state::save_rollback_snapshot(
         &mods_dir,
         &test_composition_state(
             "core-b",
@@ -556,8 +556,8 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
             project_id: "sodium".to_string(),
             version_id: "version".to_string(),
             filename: "managed-a.jar".to_string(),
-            ownership_class: croopor_performance::OwnershipClass::CompositionManaged,
-            source_provider: croopor_performance::ManagedArtifactProvider::Modrinth,
+            ownership_class: axial_performance::OwnershipClass::CompositionManaged,
+            source_provider: axial_performance::ManagedArtifactProvider::Modrinth,
             sha512_present: false,
             sha512_verified: false,
         }]
@@ -613,7 +613,7 @@ async fn rollback_rejects_untracked_same_name_target_without_overwriting() {
         .join("mods");
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed-a.jar"), b"snapshot-managed").expect("write managed a");
-    croopor_performance::state::save_rollback_snapshot(
+    axial_performance::state::save_rollback_snapshot(
         &mods_dir,
         &test_composition_state(
             "core-a",

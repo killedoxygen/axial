@@ -16,7 +16,7 @@ pub(crate) struct InstancesListTiming {
 
 pub(crate) fn trace_instances_list(timing: InstancesListTiming) {
     tracing::debug!(
-        target: "croopor::timing",
+        target: "axial::timing",
         route = "/api/v1/instances",
         total_ms = ms(timing.total),
         scan_ms = ms(timing.scan),
@@ -41,7 +41,7 @@ pub(crate) struct CreateViewTiming<'a> {
 
 pub(crate) fn trace_create_view(timing: CreateViewTiming<'_>) {
     tracing::debug!(
-        target: "croopor::timing",
+        target: "axial::timing",
         route = "/api/v1/instances/create-view",
         source_id = %timing.source_id,
         total_ms = ms(timing.total),
@@ -63,7 +63,7 @@ pub(crate) fn trace_slow_instance_readiness(
     reason_count: usize,
 ) {
     tracing::debug!(
-        target: "croopor::timing",
+        target: "axial::timing",
         route = "/api/v1/instances",
         instance_id = %instance_id,
         version_id = %version_id,
@@ -91,7 +91,7 @@ pub(crate) struct LaunchSessionTiming<'a> {
 
 pub(crate) fn trace_launch_session(timing: LaunchSessionTiming<'_>, message: &'static str) {
     tracing::debug!(
-        target: "croopor::timing",
+        target: "axial::timing",
         route = timing.route,
         session_id = timing.session_id.unwrap_or(""),
         instance_id = %timing.instance_id,
@@ -127,7 +127,7 @@ pub(crate) struct LaunchPreflightFactTiming<'a> {
 
 pub(crate) fn trace_launch_preflight_facts(timing: LaunchPreflightFactTiming<'_>) {
     tracing::debug!(
-        target: "croopor::timing",
+        target: "axial::timing",
         boundary = "launch_preflight_facts",
         instance_id = %timing.instance_id,
         version_id = %timing.version_id,
@@ -159,7 +159,7 @@ pub(crate) struct LaunchPreflightResponseTiming<'a> {
 
 pub(crate) fn trace_launch_preflight_response(timing: LaunchPreflightResponseTiming<'_>) {
     tracing::debug!(
-        target: "croopor::timing",
+        target: "axial::timing",
         route = "/api/v1/launch/preflight/{id}",
         instance_id = %timing.instance_id,
         version_id = %timing.version_id,

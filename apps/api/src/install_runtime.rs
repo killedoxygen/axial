@@ -1,4 +1,4 @@
-use croopor_minecraft::{DownloadProgress, ensure_java_runtime, resolve_version};
+use axial_minecraft::{DownloadProgress, ensure_java_runtime, resolve_version};
 use std::path::Path;
 
 pub async fn prewarm_version_runtime<F>(

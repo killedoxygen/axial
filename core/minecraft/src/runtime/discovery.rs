@@ -339,7 +339,7 @@ pub(super) fn classify_runtime_source(base_dir: &Path) -> RuntimeSource {
     let label = base_dir.to_string_lossy();
     if label.contains("Packages") {
         RuntimeSource::MicrosoftStore
-    } else if label.contains("croopor") {
+    } else if label.contains("axial") {
         RuntimeSource::Managed
     } else {
         RuntimeSource::MinecraftBundled
@@ -350,8 +350,8 @@ pub(super) fn detect_runtime_state(
     runtime_root: &Path,
     require_ready_marker: bool,
 ) -> RuntimeInstallState {
-    let installing_marker = runtime_root.join(".croopor-installing");
-    let ready_marker = runtime_root.join(".croopor-ready");
+    let installing_marker = runtime_root.join(".axial-installing");
+    let ready_marker = runtime_root.join(".axial-ready");
     let java_exe = java_executable(runtime_root);
 
     if require_ready_marker {

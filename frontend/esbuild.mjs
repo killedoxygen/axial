@@ -9,7 +9,7 @@ const mode = process.argv[2]; // 'serve', 'watch', or omitted (production build)
 const strictDevPort = process.argv.includes('--strict-port');
 const portOverride = process.env.PORT;
 const defaultDevPort = 3000;
-const webApiBase = process.env.CROOPOR_WEB_API_BASE ?? 'http://127.0.0.1:43430';
+const webApiBase = process.env.AXIAL_WEB_API_BASE ?? 'http://127.0.0.1:43430';
 const enableDevLab = mode === 'serve' || mode === 'watch';
 const enableMockApi = mode === 'serve' && process.argv.includes('--mock');
 
@@ -55,9 +55,9 @@ const shared = {
   jsx: 'automatic',
   jsxImportSource: 'preact',
   define: {
-    __CROOPOR_WEB_API_BASE__: JSON.stringify(webApiBase),
-    __CROOPOR_ENABLE_DEV_LAB__: JSON.stringify(enableDevLab),
-    __CROOPOR_MOCK_API__: JSON.stringify(enableMockApi),
+    __AXIAL_WEB_API_BASE__: JSON.stringify(webApiBase),
+    __AXIAL_ENABLE_DEV_LAB__: JSON.stringify(enableDevLab),
+    __AXIAL_MOCK_API__: JSON.stringify(enableMockApi),
   },
   plugins: [openaiIconSubsetPlugin, preactCompatAliasPlugin],
 };

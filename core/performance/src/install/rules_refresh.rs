@@ -154,7 +154,7 @@ pub(super) fn remote_rules_refresh_warning(action: &str, error: &RulesRefreshErr
 
 pub(super) fn rules_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .user_agent("croopor/0.4.0-alpha performance-rules")
+        .user_agent("axial/0.4.0-alpha performance-rules")
         .timeout(REMOTE_RULES_TIMEOUT)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())

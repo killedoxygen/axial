@@ -234,7 +234,7 @@ fn install_failure_outcome_copy(
             ],
         ),
         "filesystem_permission_denied" => (
-            "Guardian blocked install because Croopor could not write launcher-managed files safely.",
+            "Guardian blocked install because Axial could not write launcher-managed files safely.",
             vec!["The install did not mutate files after the filesystem refused the operation."],
             vec!["Check app data permissions and retry the install."],
         ),
@@ -272,13 +272,13 @@ fn persisted_state_load_outcome_copy(
 ) -> (&'static str, Vec<&'static str>, Vec<&'static str>) {
     match diagnosis_id {
         "persisted_state_schema_invalid" => (
-            "Guardian kept Croopor running after persisted operation state could not be trusted.",
+            "Guardian kept Axial running after persisted operation state could not be trusted.",
             vec!["Some restart-resume records were ignored instead of resuming unsafe work."],
             vec!["Retry the affected performance or benchmark operation if it is still needed."],
         ),
         _ => (
             "Guardian recorded a persisted state safety issue.",
-            vec!["Croopor ignored untrusted local operation state instead of using it."],
+            vec!["Axial ignored untrusted local operation state instead of using it."],
             vec!["Retry the affected operation if it is still needed."],
         ),
     }
@@ -443,7 +443,7 @@ mod tests {
             (
                 "filesystem_permission_denied",
                 GuardianDecisionKind::Block,
-                "Guardian blocked install because Croopor could not write launcher-managed files safely.",
+                "Guardian blocked install because Axial could not write launcher-managed files safely.",
                 "filesystem refused",
             ),
             (
@@ -494,7 +494,7 @@ mod tests {
         assert_eq!(outcome.phase, OperationPhase::Startup);
         assert_eq!(
             outcome.summary,
-            "Guardian kept Croopor running after persisted operation state could not be trusted."
+            "Guardian kept Axial running after persisted operation state could not be trusted."
         );
         assert!(
             outcome

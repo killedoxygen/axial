@@ -47,7 +47,7 @@ jobs:
   desktop-linux:
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/mateoltd/croopor-linux-ci:latest
+      image: ghcr.io/mateoltd/axial-linux-ci:latest
     steps:
       - uses: actions/checkout@v4
 
@@ -93,4 +93,4 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Release desktop build
-        run: cargo build --locked -p croopor-desktop --release
+        run: cargo build --locked -p axial-desktop --release

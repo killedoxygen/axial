@@ -6,7 +6,7 @@ use crate::observability::{
 };
 use crate::state::launch_reports::LaunchProofContext;
 use crate::state::{AppState, LaunchStatusEvent};
-use croopor_launcher::{
+use axial_launcher::{
     GuardianSummary, LaunchFailureClass, LaunchSessionOutcome, failure_class_name,
 };
 
@@ -23,7 +23,7 @@ pub(super) async fn fail_launch(
     proof_context: Option<&LaunchProofContext>,
     failure_class: LaunchFailureClass,
     message: &str,
-    healing: Option<croopor_launcher::LaunchHealingSummary>,
+    healing: Option<axial_launcher::LaunchHealingSummary>,
     guardian: Option<GuardianSummary>,
 ) -> LaunchRequestError {
     fail_launch_with_outcome(
@@ -46,7 +46,7 @@ pub(super) async fn fail_launch_with_outcome(
     proof_context: Option<&LaunchProofContext>,
     failure_class: LaunchFailureClass,
     message: &str,
-    healing: Option<croopor_launcher::LaunchHealingSummary>,
+    healing: Option<axial_launcher::LaunchHealingSummary>,
     guardian: Option<GuardianSummary>,
     outcome: Option<LaunchSessionOutcome>,
 ) -> LaunchRequestError {
@@ -100,7 +100,7 @@ async fn emit_terminal_failure(
     session_id: &str,
     failure_class: LaunchFailureClass,
     message: &str,
-    healing: Option<croopor_launcher::LaunchHealingSummary>,
+    healing: Option<axial_launcher::LaunchHealingSummary>,
     guardian: Option<GuardianSummary>,
     outcome: Option<LaunchSessionOutcome>,
 ) {
@@ -134,9 +134,9 @@ async fn emit_terminal_failure(
 mod tests {
     use super::*;
     use crate::state::{AppStateInit, InstallStore, LaunchEvent, SessionStore};
-    use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-    use croopor_launcher::{LaunchSessionExitReason, LaunchSessionRecord, LaunchState, SessionId};
-    use croopor_performance::PerformanceManager;
+    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_launcher::{LaunchSessionExitReason, LaunchSessionRecord, LaunchState, SessionId};
+    use axial_performance::PerformanceManager;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -147,7 +147,7 @@ mod tests {
     fn rosetta_required_launch_message_keeps_guidance_and_pins_core_display() {
         // built from the real core error so a Display change fails here
         // instead of silently regressing to the generic fallback
-        let error = croopor_minecraft::JavaRuntimeLookupError::RosettaRequired {
+        let error = axial_minecraft::JavaRuntimeLookupError::RosettaRequired {
             component: "jre-legacy".to_string(),
         };
         let message = format!("resolve java: {error}");
@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn rosetta_recognizer_rejects_tampered_component_tokens() {
         let message = format!(
-            "{ROSETTA_REQUIRED_LAUNCH_MESSAGE_PREFIX}/home/alice/.croopor/evil{ROSETTA_REQUIRED_LAUNCH_MESSAGE_SUFFIX}"
+            "{ROSETTA_REQUIRED_LAUNCH_MESSAGE_PREFIX}/home/alice/.axial/evil{ROSETTA_REQUIRED_LAUNCH_MESSAGE_SUFFIX}"
         );
 
         let public_message = sanitize_live_launch_failure_message(&message);
@@ -191,7 +191,7 @@ mod tests {
             .subscribe(session_id)
             .await
             .expect("subscribe");
-        let unsafe_message = "prepare failed for /home/alice/.croopor/instances/secret java.exe --accessToken raw-secret-token -Xmx8192M -Dtoken=raw provider_payload=provider-secret account_id=account-secret username=SecretPlayer\nnext command fragment C:\\Users\\Alice\\AppData\\java.exe eyJheader123456789.abcdEFGH12345678.ijklMNOP12345678";
+        let unsafe_message = "prepare failed for /home/alice/.axial/instances/secret java.exe --accessToken raw-secret-token -Xmx8192M -Dtoken=raw provider_payload=provider-secret account_id=account-secret username=SecretPlayer\nnext command fragment C:\\Users\\Alice\\AppData\\java.exe eyJheader123456789.abcdEFGH12345678.ijklMNOP12345678";
 
         let error = fail_launch(
             &state,
@@ -296,7 +296,7 @@ mod tests {
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         AppState::new(AppStateInit {
-            app_name: "Croopor".to_string(),
+            app_name: "Axial".to_string(),
             version: "test".to_string(),
             config,
             instances,

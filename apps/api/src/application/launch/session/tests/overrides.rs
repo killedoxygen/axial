@@ -743,7 +743,7 @@ fn write_probe_java(
     let java_path = bin_dir.join("java");
     fs::write(
         &java_path,
-        format!("#!/bin/sh\ncat >&2 <<'CROOPOR_JAVA_PROBE'\n{probe_output}\nCROOPOR_JAVA_PROBE\n"),
+        format!("#!/bin/sh\ncat >&2 <<'AXIAL_JAVA_PROBE'\n{probe_output}\nAXIAL_JAVA_PROBE\n"),
     )
     .expect("fake java script");
     if executable {
@@ -763,7 +763,7 @@ fn write_spawn_failing_java(fixture: &TestFixture, name: &str) -> String {
     let bin_dir = fixture.root.join(name).join("bin");
     fs::create_dir_all(&bin_dir).expect("fake java bin");
     let java_path = bin_dir.join("java");
-    fs::write(&java_path, "#!/croopor/missing/probe/interpreter\nexit 1\n")
+    fs::write(&java_path, "#!/axial/missing/probe/interpreter\nexit 1\n")
         .expect("fake java script");
     let mut permissions = fs::metadata(&java_path)
         .expect("fake java metadata")

@@ -23,7 +23,7 @@ function displayReleaseVersion(version: string): string {
 
 async function openHomepage(): Promise<void> {
   try {
-    await openExternalURL('https://github.com/mateoltd/croopor');
+    await openExternalURL('https://github.com/mateoltd/axial');
     toast('Opened homepage');
   } catch (err: unknown) {
     toast(`Failed to open homepage: ${errMessage(err)}`, 'error');
@@ -53,7 +53,7 @@ export function AboutSettingsSection(): JSX.Element {
 
   return (
     <SettingsSection>
-      <SettingRow title="Croopor" description={`Version ${appVersion.value}. A focused Minecraft launcher.`}>
+      <SettingRow title="Axial" description={`Version ${appVersion.value}. A focused Minecraft launcher.`}>
         <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <Button variant="secondary" icon="globe" onClick={() => void openHomepage()}>
             Homepage

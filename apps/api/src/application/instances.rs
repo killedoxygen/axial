@@ -46,12 +46,12 @@ use crate::application::version::{
 };
 use crate::guardian::normalize_create_jvm_preset;
 use crate::state::AppState;
-use axum::{Json, http::StatusCode};
-use croopor_config::{EnrichedInstance, InstanceStoreError, LaunchActionState};
-use croopor_launcher::{
+use axial_config::{EnrichedInstance, InstanceStoreError, LaunchActionState};
+use axial_launcher::{
     GuardianMode, LaunchReadiness, LaunchReadinessReasonId, LaunchReadinessRequest,
     LaunchReadinessSeverity, inspect_launch_readiness_summary,
 };
+use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{
     io::ErrorKind,
@@ -173,7 +173,7 @@ pub(super) fn scan_current_versions(state: &AppState) -> InstalledVersionsScan {
 
 fn enrich_instance_for_state(
     state: &AppState,
-    instance: croopor_config::Instance,
+    instance: axial_config::Instance,
 ) -> EnrichedInstance {
     let scan = scan_current_versions(state);
     enrich_instance_for_scan(state, instance, &scan)
@@ -193,7 +193,7 @@ fn enrich_instances_for_state(
 
 fn enrich_instance_for_scan(
     state: &AppState,
-    instance: croopor_config::Instance,
+    instance: axial_config::Instance,
     scan: &InstalledVersionsScan,
 ) -> EnrichedInstance {
     let version = scan
@@ -234,8 +234,8 @@ fn enrich_instance_for_scan(
 }
 
 fn selected_java_override(
-    instance: &croopor_config::Instance,
-    config: &croopor_config::AppConfig,
+    instance: &axial_config::Instance,
+    config: &axial_config::AppConfig,
 ) -> String {
     if !instance.java_path.trim().is_empty() {
         instance.java_path.trim().to_string()

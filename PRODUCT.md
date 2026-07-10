@@ -6,7 +6,7 @@ product
 
 ## Name
 
-The public brand is **Axial**. Use **Axial Launcher** when a long form is needed to identify the product category. The source tree and internal technical identifiers may continue to use `croopor` during the rebrand; do not expose that former name in new product-facing copy.
+The product name is **Axial**. Use **Axial Launcher** when a long form is needed to identify the product category.
 
 ## Users
 

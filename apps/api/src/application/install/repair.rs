@@ -11,7 +11,7 @@ use crate::guardian::{
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{OperationId, OperationJournalEntry, OperationPhase, OwnershipClass};
 use crate::state::{GuardianFailureMemoryStore, OperationJournalStore};
-use croopor_minecraft::download::{
+use axial_minecraft::download::{
     ExecutionDownloadFact, ExecutionDownloadFactKind, SelectedDownloadArtifactDescriptor,
 };
 use reqwest::Client;

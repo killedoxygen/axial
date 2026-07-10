@@ -1,14 +1,14 @@
-use croopor_api::app::{
+use axial_api::app::{
     DEFAULT_API_PORT, build_router, default_frontend_dir, spawn_benchmark_suite_drivers_resume,
     spawn_performance_operations_resume, spawn_performance_rules_refresh,
     spawn_remote_flags_refresh, spawn_telemetry_export,
 };
-use croopor_api::observability::telemetry::{
+use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
 };
-use croopor_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
-use croopor_config::{AppPaths, ConfigStore, InstanceStore};
-use croopor_performance::PerformanceManager;
+use axial_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
+use axial_config::{AppPaths, ConfigStore, InstanceStore};
+use axial_performance::PerformanceManager;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -39,7 +39,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let sessions = Arc::new(SessionStore::new());
     let performance = Arc::new(PerformanceManager::new_with_config_dir(&paths.config_dir)?);
     let state = AppState::new(AppStateInit {
-        app_name: "Croopor".to_string(),
+        app_name: "Axial".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         config,
         instances,
@@ -55,7 +55,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     spawn_telemetry_export(&state);
     spawn_remote_flags_refresh(&state);
 
-    let addr = std::env::var("CROOPOR_API_ADDR")
+    let addr = std::env::var("AXIAL_API_ADDR")
         .ok()
         .and_then(|value| value.parse::<SocketAddr>().ok())
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], DEFAULT_API_PORT)));
@@ -71,7 +71,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 async fn serve_api(state: AppState, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
-    info!("croopor api listening on http://{addr}");
+    info!("axial api listening on http://{addr}");
 
     axum::serve(listener, build_router(state))
         .with_graceful_shutdown(async {

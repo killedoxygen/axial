@@ -158,7 +158,7 @@ interface FlagDefinition {
   default_enabled: boolean;
 }
 
-console.info('Croopor mock API active — data is fake, no backend running');
+console.info('Axial mock API active — data is fake, no backend running');
 
 const missingHandlers = new Set<string>();
 const flagOverrides = new Map<string, boolean>();
@@ -187,7 +187,7 @@ let configFixture: Config = {
   telemetry_enabled: false,
   discord_rpc_enabled: true,
   discord_rpc_onboarding_seen: true,
-  library_dir: '/mock/Croopor Library',
+  library_dir: '/mock/Axial Library',
   library_mode: 'managed',
   music_enabled: false,
   music_volume: 35,
@@ -225,7 +225,7 @@ const handlers: Record<string, Handler> = {
     library_dir: configFixture.library_dir ?? '',
     library_mode: configFixture.library_mode ?? 'managed',
     setup_required: false,
-    app_name: 'Croopor',
+    app_name: 'Axial',
     version: 'mock-dev',
     dev_mode: true,
   }),
@@ -431,7 +431,7 @@ function createInstanceView(request: MockRequest | undefined): CreateInstanceVie
     optimize_option: {
       id: 'auto_optimize',
       label: 'Auto-optimize',
-      detail: "Croopor tunes this instance's performance while you play.",
+      detail: "Axial tunes this instance's performance while you play.",
       default_enabled: true,
     },
     defaults: {
@@ -461,7 +461,7 @@ function createLoaderBuildsView(request: MockRequest | undefined): CreateLoaderB
     auto: {
       selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${MOCK_FABRIC_MC_VERSION}`,
       label: 'Automatic',
-      detail: 'Croopor picks the newest stable Fabric build.',
+      detail: 'Axial picks the newest stable Fabric build.',
     },
     builds: [
       {
@@ -604,7 +604,7 @@ function createPresetOptions(): CreatePresetOption[] {
     {
       id: '',
       label: 'Auto',
-      detail: 'Croopor picks safe JVM flags automatically.',
+      detail: 'Axial picks safe JVM flags automatically.',
       default: true,
       disabled_reason: null,
     },
@@ -723,7 +723,7 @@ function cloneJsonResponse(value: unknown): unknown {
 }
 
 function normalizeRequest(path: string): MockRequest {
-  const url = new URL(path, 'http://croopor.mock');
+  const url = new URL(path, 'http://axial.mock');
   const apiPrefix = '/api/v1';
   const unprefixed = url.pathname.startsWith(apiPrefix) ? url.pathname.slice(apiPrefix.length) || '/' : url.pathname;
   return {

@@ -121,7 +121,7 @@ impl DiscordRpcClient {
 
     fn next_nonce(&mut self) -> String {
         self.nonce = self.nonce.saturating_add(1);
-        format!("croopor-{}-{}", std::process::id(), self.nonce)
+        format!("axial-{}-{}", std::process::id(), self.nonce)
     }
 }
 
