@@ -20,6 +20,8 @@ const RESTART_BUSY_MESSAGE: &str = "Restart is blocked while installs or launche
 const CLOSE_BUSY_MESSAGE: &str = "Close is blocked while installs or launches are active.";
 const AUTH_CLOSE_FAILED_MESSAGE: &str =
     "Close is blocked because secure authentication cleanup is incomplete.";
+const REMOTE_FLAGS_CLOSE_FAILED_MESSAGE: &str =
+    "Close is blocked because remote feature flag persistence is incomplete.";
 const SKIN_FILE_MAX_BYTES: u64 = 256 * 1024;
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 const MICROSOFT_SIGN_IN_WINDOW_LABEL: &str = "microsoft-signin";
@@ -280,10 +282,16 @@ pub async fn flush_pending_saved_skin_applies(action: &str, state: &AppState) {
 
 pub async fn prepare_for_exit(action: &str, state: &AppState) -> Result<(), String> {
     flush_pending_saved_skin_applies(action, state).await;
-    state
+    let auth_result = state
         .close_secure_auth()
         .await
-        .map_err(|_| AUTH_CLOSE_FAILED_MESSAGE.to_string())
+        .map_err(|_| AUTH_CLOSE_FAILED_MESSAGE.to_string());
+    let remote_flags_result = state
+        .close_remote_flags()
+        .await
+        .map_err(|_| REMOTE_FLAGS_CLOSE_FAILED_MESSAGE.to_string());
+    auth_result?;
+    remote_flags_result
 }
 
 #[tauri::command]

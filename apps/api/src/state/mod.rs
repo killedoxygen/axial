@@ -11,7 +11,7 @@ pub mod launch_reports;
 pub mod ownership;
 pub mod performance_operations;
 pub mod presence;
-pub mod remote_flags;
+mod remote_flags;
 mod sessions;
 pub mod skins;
 
@@ -50,8 +50,9 @@ pub(crate) use journals::{
     operation_journal_plan_is_visible, operation_journal_terminal_is_visible,
 };
 pub use journals::{OperationJournalStore, OperationJournalStoreError};
-pub use remote_flags::{RemoteFlagRefreshOutcome, RemoteFlagStore};
-pub(crate) use remote_flags::{ResolvedFlagSource, resolve_flag};
+pub(crate) use remote_flags::{
+    RemoteFlagRefreshOutcome, RemoteFlagStore, ResolvedFlagSource, resolve_flag,
+};
 pub(crate) use sessions::{LaunchFailureTermination, LaunchFailureTerminationErrorClass};
 pub use sessions::{SessionStore, StartupOutcome};
 
@@ -98,17 +99,35 @@ pub struct AppStateInit {
 #[error("secure authentication cleanup is incomplete")]
 pub struct SecureAuthCloseError;
 
+#[derive(Debug, thiserror::Error)]
+#[error("remote feature flag persistence is incomplete")]
+pub struct RemoteFlagCloseError;
+
 impl AppState {
     #[cfg(test)]
     pub fn new(init: AppStateInit) -> Self {
         let telemetry = Arc::new(TelemetryHub::from_env(init.config.clone()));
-        Self::new_with_telemetry_inner(init, telemetry, Arc::new(AuthLoginStore::new()))
+        Self::new_with_telemetry_inner(
+            init,
+            telemetry,
+            Arc::new(AuthLoginStore::new()),
+            Arc::new(RemoteFlagStore::default()),
+        )
     }
 
     pub async fn load(init: AppStateInit) -> Self {
         let telemetry = Arc::new(TelemetryHub::from_env(init.config.clone()));
-        let auth_logins = Arc::new(AuthLoginStore::load_from_secure_store().await);
-        Self::new_with_telemetry_inner(init, telemetry, auth_logins)
+        let remote_flags_config_dir = init.config.paths().config_dir.clone();
+        let (auth_logins, remote_flags) = tokio::join!(
+            AuthLoginStore::load_from_secure_store(),
+            RemoteFlagStore::load_from_config_dir(remote_flags_config_dir)
+        );
+        Self::new_with_telemetry_inner(
+            init,
+            telemetry,
+            Arc::new(auth_logins),
+            Arc::new(remote_flags),
+        )
     }
 
     pub async fn close_secure_auth(&self) -> Result<(), SecureAuthCloseError> {
@@ -118,9 +137,21 @@ impl AppState {
             .map_err(|_| SecureAuthCloseError)
     }
 
+    pub async fn close_remote_flags(&self) -> Result<(), RemoteFlagCloseError> {
+        self.remote_flags
+            .close()
+            .await
+            .map_err(|_| RemoteFlagCloseError)
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_telemetry(init: AppStateInit, telemetry: Arc<TelemetryHub>) -> Self {
-        Self::new_with_telemetry_inner(init, telemetry, Arc::new(AuthLoginStore::new()))
+        Self::new_with_telemetry_inner(
+            init,
+            telemetry,
+            Arc::new(AuthLoginStore::new()),
+            Arc::new(RemoteFlagStore::default()),
+        )
     }
 
     #[cfg(test)]
@@ -153,6 +184,7 @@ impl AppState {
         init: AppStateInit,
         telemetry: Arc<TelemetryHub>,
         auth_logins: Arc<AuthLoginStore>,
+        remote_flags: Arc<RemoteFlagStore>,
     ) -> Self {
         let library_dir = init.config.current().library_dir;
         let benchmark_suite_retention_claims =
@@ -177,9 +209,6 @@ impl AppState {
             init.config.paths(),
         ));
         let journals = Arc::new(OperationJournalStore::load_from_paths(init.config.paths()));
-        let remote_flags = Arc::new(RemoteFlagStore::load_from_config_dir(
-            &init.config.paths().config_dir,
-        ));
         let (config_changes, _) = broadcast::channel(32);
 
         Self {
@@ -281,7 +310,7 @@ impl AppState {
         &self.telemetry
     }
 
-    pub fn remote_flags(&self) -> &Arc<RemoteFlagStore> {
+    pub(crate) fn remote_flags(&self) -> &Arc<RemoteFlagStore> {
         &self.remote_flags
     }
 

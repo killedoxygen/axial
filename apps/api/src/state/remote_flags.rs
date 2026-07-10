@@ -1,34 +1,45 @@
+use crate::execution::persistence::{
+    AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
+    PersistenceOwnerLease, WriteUrgency,
+};
 use crate::observability::telemetry::{TelemetryHub, configured_posthog_environment};
+use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use axial_config::{FEATURE_FLAGS, FeatureFlagDef};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 const REMOTE_FLAGS_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const REMOTE_FLAGS_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_FLAGS_MAX_BYTES: usize = 1024 * 1024;
 const REMOTE_FLAGS_USER_AGENT: &str = concat!("axial/", env!("CARGO_PKG_VERSION"), " remote-flags");
 const REMOTE_FLAGS_CACHE_FILE: &str = "remote-cache.json";
+const REMOTE_FLAGS_CACHE_SCHEMA: &str = "axial.remote_flags";
+const REMOTE_FLAGS_CACHE_SCHEMA_VERSION: u32 = 1;
+const REMOTE_FLAG_STORE_LOCK_INVARIANT: &str =
+    "remote flag store lock poisoned; committed and persisted state may diverge";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedFlag {
+pub(crate) struct ResolvedFlag {
     pub enabled: bool,
     pub source: ResolvedFlagSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolvedFlagSource {
+pub(crate) enum ResolvedFlagSource {
     Default,
     Override,
     Remote,
 }
 
-pub fn resolve_flag(
+pub(crate) fn resolve_flag(
     flag: &FeatureFlagDef,
     overrides: &BTreeMap<String, bool>,
     remote_active: bool,
@@ -57,52 +68,117 @@ pub fn resolve_flag(
     }
 }
 
-pub struct RemoteFlagStore {
-    cache_path: PathBuf,
-    values: RwLock<BTreeMap<String, bool>>,
-    fetched_at: RwLock<Option<String>>,
+pub(crate) struct RemoteFlagStore {
+    state: Arc<Mutex<RemoteFlagState>>,
+    mutation_gate: Arc<AsyncMutex<()>>,
+    refresh_gate: AsyncMutex<()>,
+    persistence: Option<RemoteFlagPersistence>,
+}
+
+struct RemoteFlagState {
+    visible: Option<RemoteFlagCacheSnapshot>,
+    retry_candidate: Option<(u64, RemoteFlagCacheSnapshot)>,
+}
+
+struct RemoteFlagPersistence {
+    owner: PersistenceOwnerLease,
+    writer: AtomicSnapshotWriter,
+}
+
+impl RemoteFlagPersistence {
+    fn claim_with_coordinator(
+        cache_path: &Path,
+        coordinator: PersistenceCoordinator,
+    ) -> io::Result<Self> {
+        let owner = coordinator
+            .claim_owner(cache_path)
+            .map_err(io::Error::from)?;
+        let writer = owner
+            .writer(cache_path, remote_flags_cache_target())
+            .map_err(io::Error::from)?;
+        Ok(Self { owner, writer })
+    }
+}
+
+struct PendingRemoteFlagCommit {
+    ticket: AcceptedWrite,
+    revision: u64,
+    candidate: RemoteFlagCacheSnapshot,
 }
 
 impl RemoteFlagStore {
-    pub fn load_from_config_dir(config_dir: &Path) -> Self {
-        let cache_path = remote_flags_cache_path(config_dir);
-        let snapshot =
-            load_remote_flags_cache_with_registry(&cache_path, Utc::now(), FEATURE_FLAGS);
-        let (values, fetched_at) = snapshot
-            .map(|snapshot| (snapshot.values, Some(snapshot.fetched_at)))
-            .unwrap_or_default();
+    pub(crate) async fn load_from_config_dir(config_dir: PathBuf) -> Self {
+        tokio::task::spawn_blocking(move || {
+            Self::load_from_config_dir_blocking(
+                config_dir,
+                PersistenceCoordinator::global(),
+                Utc::now(),
+            )
+        })
+        .await
+        .unwrap_or_else(|_| panic!("remote flag startup task stopped"))
+        .unwrap_or_else(|_| panic!("failed to initialize remote flag persistence"))
+    }
 
+    fn load_from_config_dir_blocking(
+        config_dir: PathBuf,
+        coordinator: PersistenceCoordinator,
+        now: DateTime<Utc>,
+    ) -> io::Result<Self> {
+        let cache_path = remote_flags_cache_path(&config_dir);
+        let persistence = RemoteFlagPersistence::claim_with_coordinator(&cache_path, coordinator)?;
+        let visible = load_remote_flags_cache_with_registry(&cache_path, now, FEATURE_FLAGS);
+
+        Ok(Self::from_parts(visible, Some(persistence)))
+    }
+
+    fn from_parts(
+        visible: Option<RemoteFlagCacheSnapshot>,
+        persistence: Option<RemoteFlagPersistence>,
+    ) -> Self {
         Self {
-            cache_path,
-            values: RwLock::new(values),
-            fetched_at: RwLock::new(fetched_at),
+            state: Arc::new(Mutex::new(RemoteFlagState {
+                visible,
+                retry_candidate: None,
+            })),
+            mutation_gate: Arc::new(AsyncMutex::new(())),
+            refresh_gate: AsyncMutex::new(()),
+            persistence,
         }
     }
 
-    pub fn values_snapshot(&self) -> BTreeMap<String, bool> {
-        self.values
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+    pub(crate) fn values_snapshot(&self) -> BTreeMap<String, bool> {
+        self.state
+            .lock()
+            .expect(REMOTE_FLAG_STORE_LOCK_INVARIANT)
+            .visible
+            .as_ref()
+            .map(|snapshot| snapshot.values.clone())
+            .unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub fn fetched_at(&self) -> Option<String> {
-        self.fetched_at
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        self.state
+            .lock()
+            .expect(REMOTE_FLAG_STORE_LOCK_INVARIANT)
+            .visible
+            .as_ref()
+            .map(|snapshot| snapshot.fetched_at.clone())
     }
 
-    pub async fn refresh_once(
+    pub(crate) async fn refresh_once(
         &self,
         telemetry: &TelemetryHub,
     ) -> Result<RemoteFlagRefreshOutcome, RemoteFlagRefreshError> {
+        let _refresh = self.refresh_gate.lock().await;
         let Some(key) = telemetry.configured_posthog_key() else {
             return Ok(RemoteFlagRefreshOutcome::Skipped);
         };
         let Some(distinct_id) = telemetry.current_telemetry_install_id() else {
             return Ok(RemoteFlagRefreshOutcome::Skipped);
         };
+        self.reconcile_retry().await?;
         let request = RemoteFlagFetchRequest {
             host: telemetry.configured_posthog_host(),
             key,
@@ -111,25 +187,142 @@ impl RemoteFlagStore {
         let values = fetch_remote_flags(&request).await?;
         let flag_count = values.len();
         let snapshot = RemoteFlagCacheSnapshot {
+            schema: REMOTE_FLAGS_CACHE_SCHEMA.to_string(),
+            schema_version: REMOTE_FLAGS_CACHE_SCHEMA_VERSION,
             fetched_at: Utc::now().to_rfc3339(),
             values,
         };
 
-        write_remote_flags_cache(&self.cache_path, &snapshot)?;
-        self.replace_snapshot(snapshot);
+        self.commit(snapshot).await?;
 
         Ok(RemoteFlagRefreshOutcome::Refreshed { flag_count })
     }
 
-    fn replace_snapshot(&self, snapshot: RemoteFlagCacheSnapshot) {
-        *self
-            .values
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot.values;
-        *self
-            .fetched_at
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot.fetched_at);
+    pub(crate) async fn close(&self) -> Result<(), RemoteFlagRefreshError> {
+        let _refresh = self.refresh_gate.lock().await;
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let mutation = self.reconcile_retry_holding_gate(mutation).await?;
+        if let Some(persistence) = &self.persistence {
+            persistence.owner.close().await?;
+        }
+        drop(mutation);
+        Ok(())
+    }
+
+    async fn reconcile_retry(&self) -> Result<(), RemoteFlagRefreshError> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let mutation = self.reconcile_retry_holding_gate(mutation).await?;
+        drop(mutation);
+        Ok(())
+    }
+
+    async fn reconcile_retry_holding_gate(
+        &self,
+        mutation: OwnedMutexGuard<()>,
+    ) -> Result<OwnedMutexGuard<()>, RemoteFlagRefreshError> {
+        let retained = self
+            .state
+            .lock()
+            .expect(REMOTE_FLAG_STORE_LOCK_INVARIANT)
+            .retry_candidate
+            .clone();
+        let Some((candidate_revision, candidate)) = retained else {
+            return Ok(mutation);
+        };
+        let Some(persistence) = &self.persistence else {
+            self.state
+                .lock()
+                .expect(REMOTE_FLAG_STORE_LOCK_INVARIANT)
+                .retry_candidate = None;
+            return Ok(mutation);
+        };
+        let ticket = persistence.writer.retry()?;
+        let revision = ticket.revision().get();
+        assert_eq!(
+            revision, candidate_revision,
+            "remote flag retry revision diverged from its exact candidate"
+        );
+        self.await_commit_holding_gate(
+            PendingRemoteFlagCommit {
+                ticket,
+                revision,
+                candidate,
+            },
+            mutation,
+        )
+        .await
+    }
+
+    async fn commit(
+        &self,
+        candidate: RemoteFlagCacheSnapshot,
+    ) -> Result<(), RemoteFlagRefreshError> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let mutation = self.reconcile_retry_holding_gate(mutation).await?;
+        let Some(persistence) = &self.persistence else {
+            self.state
+                .lock()
+                .expect(REMOTE_FLAG_STORE_LOCK_INVARIANT)
+                .visible = Some(candidate);
+            drop(mutation);
+            return Ok(());
+        };
+        let ticket = persistence.writer.accept(
+            candidate.clone(),
+            WriteUrgency::Immediate,
+            encode_remote_flags_cache,
+        )?;
+        let revision = ticket.revision().get();
+        let mutation = self
+            .await_commit_holding_gate(
+                PendingRemoteFlagCommit {
+                    ticket,
+                    revision,
+                    candidate,
+                },
+                mutation,
+            )
+            .await?;
+        drop(mutation);
+        Ok(())
+    }
+
+    async fn await_commit_holding_gate(
+        &self,
+        commit: PendingRemoteFlagCommit,
+        mutation: OwnedMutexGuard<()>,
+    ) -> Result<OwnedMutexGuard<()>, RemoteFlagRefreshError> {
+        let state = self.state.clone();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        commit.ticket.observe(move |result| {
+            let result: Result<(), RemoteFlagRefreshError> = match result {
+                Ok(_) => {
+                    let mut state = state.lock().expect(REMOTE_FLAG_STORE_LOCK_INVARIANT);
+                    state.visible = Some(commit.candidate);
+                    if state
+                        .retry_candidate
+                        .as_ref()
+                        .is_some_and(|(revision, _)| *revision == commit.revision)
+                    {
+                        state.retry_candidate = None;
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    state
+                        .lock()
+                        .expect(REMOTE_FLAG_STORE_LOCK_INVARIANT)
+                        .retry_candidate = Some((commit.revision, commit.candidate));
+                    Err(error.into())
+                }
+            };
+            let _ = completed_tx.send((result, mutation));
+        });
+        let (result, mutation) = completed_rx
+            .await
+            .map_err(|_| RemoteFlagRefreshError::CommitObserverStopped)?;
+        result?;
+        Ok(mutation)
     }
 
     #[cfg(test)]
@@ -138,25 +331,34 @@ impl RemoteFlagStore {
         values: BTreeMap<String, bool>,
         fetched_at: Option<String>,
     ) {
-        *self
-            .values
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = values;
-        *self
-            .fetched_at
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = fetched_at;
+        let visible = fetched_at.map(|fetched_at| RemoteFlagCacheSnapshot {
+            schema: REMOTE_FLAGS_CACHE_SCHEMA.to_string(),
+            schema_version: REMOTE_FLAGS_CACHE_SCHEMA_VERSION,
+            fetched_at,
+            values,
+        });
+        self.state
+            .lock()
+            .expect(REMOTE_FLAG_STORE_LOCK_INVARIANT)
+            .visible = visible;
+    }
+}
+
+#[cfg(test)]
+impl Default for RemoteFlagStore {
+    fn default() -> Self {
+        Self::from_parts(None, None)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemoteFlagRefreshOutcome {
+pub(crate) enum RemoteFlagRefreshOutcome {
     Refreshed { flag_count: usize },
     Skipped,
 }
 
 #[derive(Debug, Error)]
-pub enum RemoteFlagRefreshError {
+pub(crate) enum RemoteFlagRefreshError {
     #[error("request failed")]
     Request(#[from] reqwest::Error),
     #[error("http status {0}")]
@@ -165,8 +367,16 @@ pub enum RemoteFlagRefreshError {
     ResponseTooLarge,
     #[error("response parse failed")]
     Parse(#[from] serde_json::Error),
-    #[error("cache write failed")]
-    Cache(#[from] std::io::Error),
+    #[error("cache persistence failed")]
+    Persistence,
+    #[error("cache commit observer stopped")]
+    CommitObserverStopped,
+}
+
+impl From<PersistenceError> for RemoteFlagRefreshError {
+    fn from(_: PersistenceError) -> Self {
+        Self::Persistence
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +389,8 @@ struct RemoteFlagFetchRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RemoteFlagCacheSnapshot {
+    schema: String,
+    schema_version: u32,
     fetched_at: String,
     values: BTreeMap<String, bool>,
 }
@@ -196,7 +408,7 @@ struct RemoteFlagEvaluation {
     enabled: Option<bool>,
 }
 
-pub fn remote_flags_cache_path(config_dir: &Path) -> PathBuf {
+fn remote_flags_cache_path(config_dir: &Path) -> PathBuf {
     config_dir.join("flags").join(REMOTE_FLAGS_CACHE_FILE)
 }
 
@@ -260,8 +472,21 @@ fn load_remote_flags_cache_with_registry(
     now: DateTime<Utc>,
     registry: &[FeatureFlagDef],
 ) -> Option<RemoteFlagCacheSnapshot> {
-    let data = fs::read_to_string(path).ok()?;
-    let mut snapshot = serde_json::from_str::<RemoteFlagCacheSnapshot>(&data).ok()?;
+    let mut file = File::open(path).ok()?;
+    let mut data = Vec::new();
+    file.by_ref()
+        .take((REMOTE_FLAGS_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut data)
+        .ok()?;
+    if data.len() > REMOTE_FLAGS_MAX_BYTES {
+        return None;
+    }
+    let mut snapshot = serde_json::from_slice::<RemoteFlagCacheSnapshot>(&data).ok()?;
+    if snapshot.schema != REMOTE_FLAGS_CACHE_SCHEMA
+        || snapshot.schema_version != REMOTE_FLAGS_CACHE_SCHEMA_VERSION
+    {
+        return None;
+    }
     let fetched_at = DateTime::parse_from_rfc3339(&snapshot.fetched_at)
         .ok()?
         .with_timezone(&Utc);
@@ -274,18 +499,9 @@ fn load_remote_flags_cache_with_registry(
     Some(snapshot)
 }
 
-fn write_remote_flags_cache(
-    path: &Path,
-    snapshot: &RemoteFlagCacheSnapshot,
-) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let data = serde_json::to_string_pretty(snapshot)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    let temp_path = path.with_extension("json.tmp");
-    fs::write(&temp_path, data)?;
-    replace_file(&temp_path, path)
+fn encode_remote_flags_cache(snapshot: RemoteFlagCacheSnapshot) -> io::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(&snapshot)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn filter_registered_remote_values_with_registry(
@@ -302,22 +518,13 @@ fn filter_registered_remote_values_with_registry(
         .collect()
 }
 
-fn replace_file(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
-    if fs::rename(source, destination).is_ok() {
-        return Ok(());
-    }
-
-    if destination.exists() && !destination.is_dir() {
-        let _ = fs::remove_file(destination);
-    }
-
-    match fs::rename(source, destination) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(source);
-            Err(error)
-        }
-    }
+fn remote_flags_cache_target() -> TargetDescriptor {
+    TargetDescriptor::new(
+        StabilizationSystem::State,
+        TargetKind::Config,
+        "remote_feature_flags",
+        OwnershipClass::LauncherManaged,
+    )
 }
 
 fn remote_flags_client() -> reqwest::Client {
@@ -336,12 +543,15 @@ fn remote_flags_client() -> reqwest::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::persistence::AtomicWriteBackend;
     use axial_config::{AppConfig, FlagStage};
     use axum::{Json, Router, extract::State, http::StatusCode, http::Uri, routing::post};
     use serde_json::Value;
-    use std::sync::Arc;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::mpsc;
+    use tokio::sync::{Notify, mpsc};
 
     const TEST_KEY: &str = "remote.test";
     const DEV_KEY: &str = "remote.dev-only";
@@ -365,6 +575,122 @@ mod tests {
             default_enabled: false,
         },
     ];
+
+    struct RecordingBackend {
+        attempts: AtomicUsize,
+        failures: AtomicUsize,
+        committed: Mutex<Vec<Vec<u8>>>,
+        started: Notify,
+        gate: Mutex<Option<Arc<WriteGate>>>,
+    }
+
+    struct WriteGate {
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    struct WriteGateHandle(Arc<WriteGate>);
+
+    impl RecordingBackend {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                failures: AtomicUsize::new(0),
+                committed: Mutex::new(Vec::new()),
+                started: Notify::new(),
+                gate: Mutex::new(None),
+            }
+        }
+
+        fn fail_next(&self) {
+            self.failures.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn gate_next(&self) -> WriteGateHandle {
+            let gate = Arc::new(WriteGate {
+                released: Mutex::new(false),
+                changed: Condvar::new(),
+            });
+            *self.gate.lock().expect("backend gate lock") = Some(gate.clone());
+            WriteGateHandle(gate)
+        }
+
+        async fn wait_for_attempt(&self, expected: usize) {
+            loop {
+                let started = self.started.notified();
+                if self.attempts.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                started.await;
+            }
+        }
+
+        fn committed_snapshots(&self) -> Vec<RemoteFlagCacheSnapshot> {
+            self.committed
+                .lock()
+                .expect("committed cache lock")
+                .iter()
+                .map(|contents| {
+                    serde_json::from_slice(contents).expect("decode committed remote flag cache")
+                })
+                .collect()
+        }
+    }
+
+    impl AtomicWriteBackend for RecordingBackend {
+        fn write(
+            &self,
+            _target: &TargetDescriptor,
+            _destination: &Path,
+            contents: &[u8],
+        ) -> io::Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            if let Some(gate) = self.gate.lock().expect("backend gate lock").take() {
+                gate.wait();
+            }
+            if self
+                .failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |failures| {
+                    (failures > 0).then(|| failures - 1)
+                })
+                .is_ok()
+            {
+                return Err(io::Error::other("injected remote flag cache failure"));
+            }
+            self.committed
+                .lock()
+                .expect("committed cache lock")
+                .push(contents.to_vec());
+            Ok(())
+        }
+    }
+
+    impl WriteGate {
+        fn release(&self) {
+            *self.released.lock().expect("write gate lock") = true;
+            self.changed.notify_all();
+        }
+
+        fn wait(&self) {
+            let mut released = self.released.lock().expect("write gate lock");
+            while !*released {
+                released = self.changed.wait(released).expect("wait on write gate");
+            }
+        }
+    }
+
+    impl WriteGateHandle {
+        fn release(&self) {
+            self.0.release();
+        }
+    }
+
+    impl Drop for WriteGateHandle {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
 
     #[test]
     fn resolver_prefers_override_then_remote_then_default_and_reports_source() {
@@ -433,15 +759,15 @@ mod tests {
         let root = test_root("cache-ttl");
         let path = remote_flags_cache_path(&root);
         let now = Utc::now();
-        let snapshot = RemoteFlagCacheSnapshot {
-            fetched_at: (now - chrono::Duration::hours(1)).to_rfc3339(),
-            values: BTreeMap::from([
+        let snapshot = cache_snapshot(
+            (now - chrono::Duration::hours(1)).to_rfc3339(),
+            BTreeMap::from([
                 (TEST_KEY.to_string(), false),
                 (DEV_KEY.to_string(), true),
                 ("unknown.flag".to_string(), true),
             ]),
-        };
-        write_remote_flags_cache(&path, &snapshot).expect("write fresh cache");
+        );
+        seed_cache(&path, &snapshot);
 
         let loaded =
             load_remote_flags_cache_with_registry(&path, now, TEST_REGISTRY).expect("fresh cache");
@@ -452,11 +778,11 @@ mod tests {
         );
         assert_eq!(loaded.fetched_at, snapshot.fetched_at);
 
-        let stale = RemoteFlagCacheSnapshot {
-            fetched_at: (now - chrono::Duration::hours(25)).to_rfc3339(),
-            values: BTreeMap::from([(TEST_KEY.to_string(), true)]),
-        };
-        write_remote_flags_cache(&path, &stale).expect("write stale cache");
+        let stale = cache_snapshot(
+            (now - chrono::Duration::hours(25)).to_rfc3339(),
+            BTreeMap::from([(TEST_KEY.to_string(), true)]),
+        );
+        seed_cache(&path, &stale);
 
         assert!(load_remote_flags_cache_with_registry(&path, now, TEST_REGISTRY).is_none());
 
@@ -471,6 +797,8 @@ mod tests {
         fs::write(
             &path,
             serde_json::to_vec(&serde_json::json!({
+                "schema": REMOTE_FLAGS_CACHE_SCHEMA,
+                "schema_version": REMOTE_FLAGS_CACHE_SCHEMA_VERSION,
                 "fetched_at": Utc::now().to_rfc3339(),
                 "values": { "remote.test": true },
                 "junk": true
@@ -483,6 +811,8 @@ mod tests {
         fs::write(
             &path,
             serde_json::to_vec(&serde_json::json!({
+                "schema": REMOTE_FLAGS_CACHE_SCHEMA,
+                "schema_version": REMOTE_FLAGS_CACHE_SCHEMA_VERSION,
                 "fetched_at": "not a timestamp",
                 "values": { "remote.test": true }
             }))
@@ -495,38 +825,35 @@ mod tests {
     }
 
     #[test]
-    fn cache_write_is_atomic_and_contains_only_timestamp_and_values() {
-        let root = test_root("cache-write");
-        let path = remote_flags_cache_path(&root);
-        let old = RemoteFlagCacheSnapshot {
-            fetched_at: "2026-01-01T00:00:00Z".to_string(),
-            values: BTreeMap::from([(TEST_KEY.to_string(), true)]),
-        };
-        write_remote_flags_cache(&path, &old).expect("write old cache");
-        let next = RemoteFlagCacheSnapshot {
-            fetched_at: "2026-01-02T00:00:00Z".to_string(),
-            values: BTreeMap::from([(TEST_KEY.to_string(), false)]),
-        };
+    fn cache_encoder_emits_only_the_strict_current_schema() {
+        let snapshot = cache_snapshot(
+            "2026-01-02T00:00:00Z".to_string(),
+            BTreeMap::from([(TEST_KEY.to_string(), false)]),
+        );
 
-        write_remote_flags_cache(&path, &next).expect("write next cache");
-
-        let raw = fs::read_to_string(&path).expect("read cache");
-        let value = serde_json::from_str::<Value>(&raw).expect("cache json");
+        let raw = encode_remote_flags_cache(snapshot).expect("encode cache");
+        let value = serde_json::from_slice::<Value>(&raw).expect("cache json");
         let object = value.as_object().expect("cache object");
-        assert_eq!(object.len(), 2);
+        assert_eq!(object.len(), 4);
+        assert_eq!(value["schema"], REMOTE_FLAGS_CACHE_SCHEMA);
+        assert_eq!(value["schema_version"], REMOTE_FLAGS_CACHE_SCHEMA_VERSION);
         assert!(object.contains_key("fetched_at"));
         assert!(object.contains_key("values"));
         assert_eq!(value["values"][TEST_KEY], false);
-        assert!(!path.with_extension("json.tmp").exists());
+    }
 
-        let _ = fs::remove_dir_all(root);
+    #[test]
+    fn remote_flag_cache_target_is_launcher_managed() {
+        let target = remote_flags_cache_target();
+
+        assert_eq!(target.system, StabilizationSystem::State);
+        assert_eq!(target.kind, TargetKind::Config);
+        assert_eq!(target.ownership, OwnershipClass::LauncherManaged);
     }
 
     #[test]
     fn store_tracks_values_and_fetch_timestamp() {
-        let root = test_root("store-snapshot");
-        let paths = test_paths(&root);
-        let store = RemoteFlagStore::load_from_config_dir(&paths.config_dir);
+        let store = RemoteFlagStore::default();
         let fetched_at = "2026-01-02T00:00:00Z".to_string();
 
         store.replace_values_for_test(
@@ -539,7 +866,112 @@ mod tests {
             BTreeMap::from([(TEST_KEY.to_string(), false)])
         );
         assert_eq!(store.fetched_at(), Some(fetched_at));
+    }
 
+    #[tokio::test]
+    async fn cancelled_cache_commit_stays_hidden_then_publishes_exact_snapshot() {
+        let (root, backend, store) = persistence_fixture("cancelled-commit");
+        let store = Arc::new(store);
+        let candidate = cache_snapshot(
+            "2026-01-02T00:00:00Z".to_string(),
+            BTreeMap::from([(TEST_KEY.to_string(), false)]),
+        );
+        let gate = backend.gate_next();
+        let task_store = store.clone();
+        let task_candidate = candidate.clone();
+        let task = tokio::spawn(async move { task_store.commit(task_candidate).await });
+
+        backend.wait_for_attempt(1).await;
+        assert!(store.values_snapshot().is_empty());
+        task.abort();
+        assert!(task.await.expect_err("caller is cancelled").is_cancelled());
+        gate.release();
+        store.close().await.expect("observer settles before close");
+
+        assert_eq!(backend.committed_snapshots(), vec![candidate.clone()]);
+        assert_eq!(store.values_snapshot(), candidate.values);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn later_cache_commit_retries_exact_failed_snapshot_before_new_candidate() {
+        let (root, backend, store) = persistence_fixture("exact-retry");
+        let first = cache_snapshot(
+            "2026-01-02T00:00:00Z".to_string(),
+            BTreeMap::from([(TEST_KEY.to_string(), true)]),
+        );
+        let second = cache_snapshot(
+            "2026-01-03T00:00:00Z".to_string(),
+            BTreeMap::from([(TEST_KEY.to_string(), false)]),
+        );
+        backend.fail_next();
+
+        assert!(matches!(
+            store.commit(first.clone()).await,
+            Err(RemoteFlagRefreshError::Persistence)
+        ));
+        assert!(store.values_snapshot().is_empty());
+        store
+            .commit(second.clone())
+            .await
+            .expect("retry first then commit second");
+
+        assert_eq!(backend.committed_snapshots(), vec![first, second.clone()]);
+        assert_eq!(store.values_snapshot(), second.values);
+        store.close().await.expect("close remote flag store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn close_retries_exact_failed_cache_and_rejects_later_commits() {
+        let (root, backend, store) = persistence_fixture("close-retry");
+        let candidate = cache_snapshot(
+            "2026-01-02T00:00:00Z".to_string(),
+            BTreeMap::from([(TEST_KEY.to_string(), true)]),
+        );
+        backend.fail_next();
+        assert!(matches!(
+            store.commit(candidate.clone()).await,
+            Err(RemoteFlagRefreshError::Persistence)
+        ));
+
+        store.close().await.expect("close retries exact cache");
+        store.close().await.expect("close is idempotent");
+
+        assert_eq!(backend.committed_snapshots(), vec![candidate.clone()]);
+        assert_eq!(store.values_snapshot(), candidate.values);
+        assert!(matches!(
+            store
+                .commit(cache_snapshot(
+                    "2026-01-03T00:00:00Z".to_string(),
+                    BTreeMap::from([(TEST_KEY.to_string(), false)]),
+                ))
+                .await,
+            Err(RemoteFlagRefreshError::Persistence)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn hostile_cache_is_rejected_without_rewrite() {
+        let root = test_root("hostile-cache");
+        let path = remote_flags_cache_path(&root);
+        fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache parent");
+        fs::write(&path, br#"{"schema":"foreign","secret":"preserve"}"#)
+            .expect("seed hostile cache");
+        let original = fs::read(&path).expect("read hostile cache");
+        let backend = Arc::new(RecordingBackend::new());
+        let coordinator =
+            PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);
+
+        let store =
+            RemoteFlagStore::load_from_config_dir_blocking(root.clone(), coordinator, Utc::now())
+                .expect("load remote flag store");
+
+        assert!(store.values_snapshot().is_empty());
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(&path).expect("reread hostile cache"), original);
+        store.close().await.expect("close remote flag store");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -628,7 +1060,7 @@ mod tests {
             Some(POSTHOG_KEY.to_string()),
             "http://127.0.0.1:9".to_string(),
         );
-        let store = RemoteFlagStore::load_from_config_dir(&paths.config_dir);
+        let store = RemoteFlagStore::default();
 
         assert_eq!(
             store.refresh_once(&telemetry).await.expect("skip refresh"),
@@ -672,6 +1104,39 @@ mod tests {
             dev_only: false,
             default_enabled,
         }
+    }
+
+    fn cache_snapshot(
+        fetched_at: String,
+        values: BTreeMap<String, bool>,
+    ) -> RemoteFlagCacheSnapshot {
+        RemoteFlagCacheSnapshot {
+            schema: REMOTE_FLAGS_CACHE_SCHEMA.to_string(),
+            schema_version: REMOTE_FLAGS_CACHE_SCHEMA_VERSION,
+            fetched_at,
+            values,
+        }
+    }
+
+    fn seed_cache(path: &Path, snapshot: &RemoteFlagCacheSnapshot) {
+        fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache parent");
+        fs::write(
+            path,
+            encode_remote_flags_cache(snapshot.clone()).expect("encode cache fixture"),
+        )
+        .expect("write cache fixture");
+    }
+
+    fn persistence_fixture(name: &str) -> (PathBuf, Arc<RecordingBackend>, RemoteFlagStore) {
+        let root = test_root(name);
+        let cache_path = remote_flags_cache_path(&root);
+        let backend = Arc::new(RecordingBackend::new());
+        let coordinator =
+            PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);
+        let persistence = RemoteFlagPersistence::claim_with_coordinator(&cache_path, coordinator)
+            .expect("claim remote flag persistence");
+        let store = RemoteFlagStore::from_parts(None, Some(persistence));
+        (root, backend, store)
     }
 
     fn test_root(name: &str) -> PathBuf {

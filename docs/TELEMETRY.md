@@ -76,7 +76,9 @@ Remote values never apply to dev-only registry keys. As of this writing, the reg
 
 The remote flag cache lives under the config directory at `flags/remote-cache.json`. It stores only:
 
+- `schema`: the current cache schema id
+- `schema_version`: the current cache schema version
 - `fetched_at`: the fetch timestamp
 - `values`: flag keys mapped to booleans
 
-The cache is used only for 24 hours, rejects unknown fields or invalid timestamps, and is filtered against the current non-dev registry on load.
+The cache is used only for 24 hours, rejects unknown fields, wrong schema versions, oversized files, or invalid timestamps, and is filtered against the current non-dev registry on load. Cache reads run off the async runtime. A refresh publishes values only after its exact canonical cache snapshot commits atomically; accepted writes survive caller cancellation, failed writes retry before a later refresh or successful shutdown, and rejected cache bytes are never rewritten during startup.
