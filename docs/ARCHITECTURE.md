@@ -188,25 +188,41 @@ Native library extraction is launch-planning owned in `core/launcher`. When a re
 ### Live session and event flow
 ```mermaid
 flowchart TD
-    A[SessionStore.start_process] --> B[store pid + command + guardian + healing]
-    B --> C[seed stage history from queued session state]
-    C --> D[spawn stdout/stderr pumps]
-    C --> E[spawn startup watchdog]
-    C --> F[spawn wait task]
-    D --> G[emit log events]
-    G --> H[update startup and boot-marker observations]
-    E --> I{boot marker observed?}
-    I -->|no| J[emit stalled terminal status]
-    I -->|yes| K[wait]
-    F --> L[process exits]
-    L --> M[emit exited status]
-    G --> N[SSE stream and Tauri bridge deliver logs]
-    M --> O[SSE stream and Tauri bridge deliver status]
-    O --> P[frontend/src/launch.ts updates runningSessions]
-    P --> Q[UI tears down session or keeps monitoring]
+    A[SessionStore.start_process] --> B[register attempt + active owner]
+    B --> C[spawn bounded stdout/stderr pumps]
+    B --> D[spawn startup watchdog]
+    B --> E[single owner takes Child]
+    C --> F[prepare and emit attempt-scoped logs]
+    F --> G{explicit boot marker?}
+    G -->|yes| H[owner promotes exact child handle]
+    G -->|no| I[continue startup monitoring]
+    D -->|timeout| J[enqueue watchdog termination]
+    K[user stop / replacement / shutdown] --> L[enqueue termination]
+    H --> E
+    J --> E
+    L --> E
+    E --> M[await Child.wait without polling]
+    M --> N[reap and answer queued controls]
+    N --> O{watchdog cause?}
+    O -->|yes| P[settle watchdog status under log-order guard]
+    O -->|no| Q[bounded pipe + accepted-log drain]
+    P --> Q
+    Q --> R{watchdog already settled?}
+    R -->|no| S[attempt-scoped terminal settlement]
+    R -->|yes| T[remove owner from active registry]
+    S --> T
+    N -->|user stop| V[lease authors public log + status + proof]
+    F --> LOGS[SSE stream and Tauri bridge deliver logs]
+    P --> STATUS[SSE stream and Tauri bridge deliver status]
+    S --> STATUS
+    V --> STATUS
+    STATUS --> UI[frontend/src/launch.ts updates runningSessions]
+    UI --> DONE[UI tears down session or keeps monitoring]
 ```
 
-`SessionStore` owns the live stage history for each launch session. Status transitions update the stored `LaunchSessionRecord.stages` array and every status payload can include the current stage records. Each stage record carries the backend stage id, label, start timestamp, optional end timestamp, optional duration, optional result, warnings, and fallback reason. When a status payload carries Guardian data, non-allowed Guardian outcomes (`warned`, `intervened`, or `blocked`) contribute bounded unique Guardian-authored `details` to the stage warnings before Healing warnings are appended without duplicates; Healing `fallback_applied` remains the source of stage fallback reasons. Benchmark launches also attach bounded benchmark metadata to the live session record so active status can be correlated before proof persistence. Startup-failure log signals are stored as timestamped observations. A terminal process exit can use such a signal as direct failure cause only when the signal is still correlated with the exit window; stale signals remain historical evidence and cannot turn a later clean external close into a crash warning. Process lifecycle observations also attach redacted Execution stage evidence for process spawn, boot marker, process exit, exit code, launcher stop intent, watchdog kill, and watchdog action, so status snapshots and proof records preserve useful facts without exposing command lines or raw process output. The startup watchdog remains active until an explicit boot marker is observed; ordinary output alone is not enough to mark startup complete, and a process that never reaches a boot marker is reported as a stalled startup instead of being treated as healthy. The route snapshot at `/api/v1/launch/{id}/status`, browser SSE stream, and desktop Tauri bridge all expose the same additive `stages` data and optional benchmark metadata. `GET /api/v1/launch/{id}/command` is a local diagnostic endpoint only: it returns the launch command with credential-looking values redacted, reports whether redaction changed the command, and does not expose the raw Java path or act as an online credential channel. The backend now emits a `prewarming` stage after launch planning and before JVM spawn; that stage performs a bounded, sequential, best-effort read of high-value local launch files and records its duration like any other launch stage. The prewarm budget is selected from the launch resource-budget snapshot: low-pressure launches keep the normal bounded prewarm, pressure reduces prewarm work, and severe CPU/install or disk-headroom pressure skips prewarm rather than adding avoidable load. On Windows, the session process helper starts the game process below normal priority and promotes it back to normal priority after an explicit boot marker is observed; setup and promotion failures are logged as warnings and never fail launch status. Other platforms intentionally no-op this priority sandwich until Axial has a reliable restore design. The live session record keeps bounded priority-management evidence for later proof persistence, but status events do not expose this evidence.
+`SessionStore` owns the live stage history for each launch session. Each registered process has one owner task that exclusively owns the Tokio `Child`, awaits its cancel-safe `wait()` future, and serializes termination and exact-handle priority commands through a per-process mailbox. No other task polls, waits, kills, or borrows the child. An attempt-id registry retains current and superseded owners until their output drain and attempt-scoped settlement finish, so replacement stays nonblocking while shutdown can request every live owner and prove reap before clearing sessions. Successful stop acknowledgement follows physical reap; accepted output is then drained with bounded pipe waits before final owner completion. User stop holds a lifecycle lease through its Application-authored log, terminal status, proof persistence, and retention release, preventing those effects from targeting a replacement attempt even if the caller is cancelled. The startup watchdog publishes its stalled terminal status while its log-order guard is held, then releases the guard for bounded output drain.
+
+Status transitions update the stored `LaunchSessionRecord.stages` array and every status payload can include the current stage records. Each stage record carries the backend stage id, label, start timestamp, optional end timestamp, optional duration, optional result, warnings, and fallback reason. When a status payload carries Guardian data, non-allowed Guardian outcomes (`warned`, `intervened`, or `blocked`) contribute bounded unique Guardian-authored `details` to the stage warnings before Healing warnings are appended without duplicates; Healing `fallback_applied` remains the source of stage fallback reasons. Benchmark launches also attach bounded benchmark metadata to the live session record so active status can be correlated before proof persistence. Startup-failure log signals are stored as timestamped observations. A terminal process exit can use such a signal as direct failure cause only when the signal is still correlated with the exit window; stale signals remain historical evidence and cannot turn a later clean external close into a crash warning. Process lifecycle observations also attach redacted Execution stage evidence for process spawn, boot marker, process exit, exit code, launcher stop intent, watchdog kill, and watchdog action, so status snapshots and proof records preserve useful facts without exposing command lines or raw process output. The startup watchdog remains active until an explicit boot marker is observed; ordinary output alone is not enough to mark startup complete, and a process that never reaches a boot marker is reported as a stalled startup instead of being treated as healthy. The route snapshot at `/api/v1/launch/{id}/status`, browser SSE stream, and desktop Tauri bridge all expose the same additive `stages` data and optional benchmark metadata. `GET /api/v1/launch/{id}/command` is a local diagnostic endpoint only: it returns the launch command with credential-looking values redacted, reports whether redaction changed the command, and does not expose the raw Java path or act as an online credential channel. The backend now emits a `prewarming` stage after launch planning and before JVM spawn; that stage performs a bounded, sequential, best-effort read of high-value local launch files and records its duration like any other launch stage. The prewarm budget is selected from the launch resource-budget snapshot: low-pressure launches keep the normal bounded prewarm, pressure reduces prewarm work, and severe CPU/install or disk-headroom pressure skips prewarm rather than adding avoidable load. On Windows, the session process helper starts the game process below normal priority and promotes it back to normal priority after an explicit boot marker is observed; setup and promotion failures are logged as warnings and never fail launch status. Other platforms intentionally no-op this priority sandwich until Axial has a reliable restore design. The live session record keeps bounded priority-management evidence for later proof persistence, but status events do not expose this evidence.
 
 The desktop Discord RPC worker subscribes to `SessionStore` change notifications and also performs a bounded snapshot poll so user settings apply even when no launch status changes. Presence text is backend-authored in `apps/api/src/state/presence.rs`: idle shows only launcher-level activity, one active session shows broad Minecraft/loader/performance context, and multiple sessions collapse to an aggregate count. The desktop payload maps those snapshots to Discord activity fields: `details`, `state`, elapsed timestamps for active game sessions, large/small rich-presence assets, and a party count only for multi-session activity. Instance names, account names, world/server names, paths, commands, mod lists, tokens, UUIDs, and raw custom version identifiers are not included. Discord RPC updates use no buttons or join secrets, and connection failures remain quiet diagnostics.
 

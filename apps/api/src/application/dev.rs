@@ -114,7 +114,11 @@ pub async fn dev_flush(state: &AppState) -> Result<DevFlushResponse, ApiError> {
     let config_paths = state.config().paths().clone();
     let current_config = state.config().current();
 
-    state.sessions().terminate_all().await;
+    state
+        .sessions()
+        .terminate_all()
+        .await
+        .map_err(internal_error)?;
     state.installs().clear().await;
     let had_msa_auth = state
         .auth_logins()
@@ -262,6 +266,38 @@ mod tests {
         assert!(response.had_msa_auth);
         assert_eq!(state.auth_logins().active_msa_token().await, None);
         assert!(state.auth_logins().account_states().await.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dev_flush_reports_shutdown_failure_without_clearing_downstream_state() {
+        let root = test_root("shutdown-failure");
+        let state = test_state(&root);
+        state
+            .auth_logins()
+            .replace_with_msa_token(NewAuthLoginMsaToken {
+                access_token: "preserved-msa-access-token".to_string(),
+                refresh_token: Some("preserved-msa-refresh-token".to_string()),
+                id_token: None,
+                token_type: "Bearer".to_string(),
+                expires_in: 3600,
+                scope: None,
+            })
+            .await;
+        state.sessions().inject_rejected_process_owner().await;
+
+        let (status, Json(body)) = match dev_flush(&state).await {
+            Ok(_) => panic!("rejected process owner must fail dev flush"),
+            Err(error) => error,
+        };
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": DEV_OPERATION_FAILED_COPY })
+        );
+        assert!(state.auth_logins().active_msa_token().await.is_some());
 
         let _ = fs::remove_dir_all(root);
     }

@@ -557,49 +557,32 @@ pub(crate) async fn stop_launch_session(
     state: &AppState,
     id: &str,
 ) -> Result<serde_json::Value, super::LaunchApplicationError> {
-    let record = state
+    let stop = state
         .sessions()
-        .acquire_terminal_retention_hold(id)
+        .begin_user_stop(id)
         .await
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "session not found" })),
-            )
-        })?;
-
-    if let Err(error) = state.sessions().kill(id).await {
-        state.sessions().release_terminal_retention_hold(id).await;
-        return Err(launch_kill_error_response(error));
-    }
+        .map_err(launch_kill_error_response)?;
+    let record = stop.record().clone();
 
     trace_launch_event(id, "kill requested by client");
-    state
-        .sessions()
-        .emit_log(id, "system", "Launch stopped by user.".to_string())
-        .await;
-    state
-        .sessions()
-        .emit_status(
-            id,
-            LaunchStatusEvent {
-                state: "exited".to_string(),
-                benchmark: None,
-                pid: record.pid,
-                exit_code: Some(-9),
-                failure_class: None,
-                failure_detail: Some("stopped by user".to_string()),
-                healing: record.healing.clone(),
-                guardian: record.guardian.clone(),
-                outcome: None,
-                notice: None,
-                evidence: Vec::new(),
-                stages: Vec::new(),
-            },
-        )
-        .await;
+    stop.emit_log("system", "Launch stopped by user.").await;
+    stop.emit_status(LaunchStatusEvent {
+        state: "exited".to_string(),
+        benchmark: None,
+        pid: record.pid,
+        exit_code: Some(-9),
+        failure_class: None,
+        failure_detail: Some("stopped by user".to_string()),
+        healing: record.healing.clone(),
+        guardian: record.guardian.clone(),
+        outcome: None,
+        notice: None,
+        evidence: Vec::new(),
+        stages: Vec::new(),
+    })
+    .await;
     persist_launch_proof_best_effort(state, id, record.launched_at.as_deref(), "stopped").await;
-    state.sessions().release_terminal_retention_hold(id).await;
+    stop.release().await;
 
     Ok(json!({ "status": "killed" }))
 }

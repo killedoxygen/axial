@@ -14,12 +14,13 @@ use axial_launcher::{
     launch_notice_from_values, launch_stage_label, launch_state_name,
 };
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::process::Command;
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast};
 
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
@@ -38,15 +39,13 @@ const FAILURE_SIGNAL_VALID_FOR_EXIT_MS: u64 = 15_000;
 
 pub(super) struct ProcessAttemptScope {
     pub(super) id: u64,
-    pub(super) child: Option<Arc<Mutex<Child>>>,
     log_transition: Mutex<()>,
 }
 
 impl ProcessAttemptScope {
-    fn new(id: u64, child: Option<Arc<Mutex<Child>>>) -> Arc<Self> {
+    fn new(id: u64) -> Arc<Self> {
         Arc::new(Self {
             id,
-            child,
             log_transition: Mutex::new(()),
         })
     }
@@ -54,6 +53,7 @@ impl ProcessAttemptScope {
 
 struct SessionEntry {
     attempt: Arc<ProcessAttemptScope>,
+    process: Option<supervisor::ProcessControlHandle>,
     record: LaunchSessionRecord,
     events: broadcast::Sender<LaunchEvent>,
     observed_failure: Option<ObservedFailureSignal>,
@@ -97,6 +97,7 @@ pub(super) struct ProcessExitContext {
 #[derive(Clone)]
 struct BootPriorityPromotionTicket {
     attempt: Arc<ProcessAttemptScope>,
+    process: Option<supervisor::ProcessControlHandle>,
     pid: Option<u32>,
 }
 
@@ -151,7 +152,7 @@ fn boot_promotion_gate(
     if entry.stop_requested {
         return BootPromotionGate::CompleteSkipped("skipped_stop_requested");
     }
-    if ticket.pid.is_some() && ticket.attempt.child.is_none() {
+    if ticket.pid.is_some() && ticket.process.is_none() {
         return BootPromotionGate::CompleteSkipped("skipped_missing_process_handle");
     }
     BootPromotionGate::Promote
@@ -159,7 +160,8 @@ fn boot_promotion_gate(
 
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, SessionEntry>>,
-    lifecycle_transition: Mutex<()>,
+    active_processes: Mutex<HashMap<u64, supervisor::ProcessControlHandle>>,
+    lifecycle_transition: Arc<Mutex<()>>,
     changes: broadcast::Sender<()>,
     next_attempt_id: AtomicU64,
     next_terminal_sequence: AtomicU64,
@@ -173,12 +175,84 @@ pub enum StartupOutcome {
     Stalled,
 }
 
+#[must_use]
+pub(crate) struct UserStopLease {
+    store: Arc<SessionStore>,
+    lifecycle_guard: Option<OwnedMutexGuard<()>>,
+    attempt: Arc<ProcessAttemptScope>,
+    session_id: String,
+    record: LaunchSessionRecord,
+    retention_hold_active: bool,
+}
+
+impl UserStopLease {
+    pub(crate) fn record(&self) -> &LaunchSessionRecord {
+        &self.record
+    }
+
+    pub(crate) async fn emit_log(&self, source: &'static str, text: impl Into<String>) {
+        self.store
+            .emit_log_for_attempt(
+                &self.session_id,
+                &self.attempt,
+                source,
+                text.into(),
+                now_ms(),
+            )
+            .await;
+    }
+
+    pub(crate) async fn emit_status(&self, event: LaunchStatusEvent) {
+        self.store
+            .emit_status_for_attempt(&self.session_id, &self.attempt, event)
+            .await;
+    }
+
+    pub(crate) async fn release(mut self) {
+        self.release_hold().await;
+        drop(self.lifecycle_guard.take());
+    }
+
+    async fn release_hold(&mut self) {
+        if !self.retention_hold_active {
+            return;
+        }
+        self.store
+            .release_terminal_retention_hold_for_attempt(&self.session_id, &self.attempt)
+            .await;
+        self.retention_hold_active = false;
+    }
+}
+
+impl Drop for UserStopLease {
+    fn drop(&mut self) {
+        let Some(lifecycle_guard) = self.lifecycle_guard.take() else {
+            return;
+        };
+        if !self.retention_hold_active {
+            drop(lifecycle_guard);
+            return;
+        }
+        self.retention_hold_active = false;
+        let store = self.store.clone();
+        let session_id = self.session_id.clone();
+        let attempt = self.attempt.clone();
+        tokio::spawn(async move {
+            store
+                .release_terminal_retention_hold_for_attempt(&session_id, &attempt)
+                .await;
+            drop(lifecycle_guard);
+        });
+    }
+}
+
 impl SessionStore {
     pub fn new() -> Self {
         let (changes, _) = broadcast::channel(64);
         Self {
             sessions: RwLock::new(HashMap::new()),
-            lifecycle_transition: Mutex::new(()),
+            active_processes: Mutex::new(HashMap::new()),
+            lifecycle_transition: Arc::new(Mutex::new(())),
             changes,
             next_attempt_id: AtomicU64::new(0),
             next_terminal_sequence: AtomicU64::new(0),
@@ -208,21 +282,18 @@ impl SessionStore {
         let _lifecycle_transition = self.lifecycle_transition.lock().await;
         let (events, _) = broadcast::channel(256);
         ensure_stage_started(&mut record, now_ms());
-        let previous_child = self
+        let previous_process = self
             .sessions
             .read()
             .await
             .get(&record.session_id.0)
-            .and_then(|entry| entry.attempt.child.clone());
-        let mut previous_child = match previous_child.as_ref() {
-            Some(child) => Some(child.lock().await),
-            None => None,
-        };
+            .and_then(|entry| entry.process.clone());
         let mut sessions = self.sessions.write().await;
         sessions.insert(
             record.session_id.0.clone(),
             SessionEntry {
-                attempt: ProcessAttemptScope::new(self.next_attempt_id(), None),
+                attempt: ProcessAttemptScope::new(self.next_attempt_id()),
+                process: None,
                 record,
                 events,
                 observed_failure: None,
@@ -233,10 +304,9 @@ impl SessionStore {
             },
         );
         drop(sessions);
-        if let Some(previous_child) = previous_child.as_mut() {
-            let _ = previous_child.start_kill();
+        if let Some(previous_process) = previous_process {
+            let _ = previous_process.terminate(supervisor::ProcessTerminalCause::Replacement);
         }
-        drop(previous_child);
         self.notify_changed();
     }
 
@@ -266,11 +336,11 @@ impl SessionStore {
         })
     }
 
-    pub(super) async fn startup_watchdog_record_for_attempt(
+    async fn startup_watchdog_process_for_attempt(
         &self,
         session_id: &str,
         attempt: &Arc<ProcessAttemptScope>,
-    ) -> Option<LaunchSessionRecord> {
+    ) -> Option<supervisor::ProcessControlHandle> {
         self.sessions
             .read()
             .await
@@ -284,7 +354,11 @@ impl SessionStore {
                     )
                     && entry.record.boot_completed_at_ms.is_none()
             })
-            .map(|entry| entry.record.clone())
+            .and_then(|entry| entry.process.clone())
+    }
+
+    pub(super) async fn process_owner_completed(&self, attempt_id: u64) {
+        self.active_processes.lock().await.remove(&attempt_id);
     }
 
     pub async fn attach_benchmark(
@@ -350,6 +424,36 @@ impl SessionStore {
         }
     }
 
+    async fn release_terminal_retention_hold_for_attempt(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
+    ) {
+        let mut sessions = self.sessions.write().await;
+        let Some(entry) = sessions
+            .get_mut(session_id)
+            .filter(|entry| attempt_scopes_match(&entry.attempt, attempt))
+        else {
+            return;
+        };
+        entry.retention_holds = entry
+            .retention_holds
+            .checked_sub(1)
+            .expect("released a session retention hold that was not acquired");
+        if entry.retention_holds == 0
+            && classify::is_terminal_state(entry.record.state)
+            && entry.terminal_sequence.is_none()
+        {
+            entry.terminal_sequence =
+                Some(self.next_terminal_sequence.fetch_add(1, Ordering::Relaxed));
+        }
+        let evicted = evict_oldest_terminal_sessions(&mut sessions);
+        drop(sessions);
+        if evicted {
+            self.notify_changed();
+        }
+    }
+
     pub async fn emit_log(
         &self,
         session_id: &str,
@@ -368,7 +472,14 @@ impl SessionStore {
                 observed_at_ms: now_ms(),
             },
             prepare_log_line,
-            |child| priority::promote_after_boot(child).map(|promotion| promotion.proof_value()),
+            |process| async move {
+                match process {
+                    Some(process) => process.promote_after_boot().await,
+                    None => supervisor::ProcessPriorityReply::Completed(
+                        priority::promote_after_boot(None).map(|promotion| promotion.proof_value()),
+                    ),
+                }
+            },
         )
         .await;
     }
@@ -390,12 +501,19 @@ impl SessionStore {
                 observed_at_ms,
             },
             prepare_log_line,
-            |child| priority::promote_after_boot(child).map(|promotion| promotion.proof_value()),
+            |process| async move {
+                match process {
+                    Some(process) => process.promote_after_boot().await,
+                    None => supervisor::ProcessPriorityReply::Completed(
+                        priority::promote_after_boot(None).map(|promotion| promotion.proof_value()),
+                    ),
+                }
+            },
         )
         .await;
     }
 
-    async fn emit_log_for_attempt_with<Prepare, Promote>(
+    async fn emit_log_for_attempt_with<Prepare, Promote, PromoteFuture>(
         &self,
         session_id: &str,
         attempt: &Arc<ProcessAttemptScope>,
@@ -404,7 +522,8 @@ impl SessionStore {
         promote_after_boot: Promote,
     ) where
         Prepare: FnOnce(&str, String, String, u64) -> PreparedLogLine,
-        Promote: FnOnce(Option<&Child>) -> std::io::Result<&'static str>,
+        Promote: FnOnce(Option<supervisor::ProcessControlHandle>) -> PromoteFuture,
+        PromoteFuture: Future<Output = supervisor::ProcessPriorityReply>,
     {
         let _log_transition_guard = attempt.log_transition.lock().await;
         let prepared = prepare(session_id, line.source, line.text, line.observed_at_ms);
@@ -430,6 +549,7 @@ impl SessionStore {
             };
             let ticket = BootPriorityPromotionTicket {
                 attempt: entry.attempt.clone(),
+                process: entry.process.clone(),
                 pid: entry.record.pid,
             };
             let gate = boot_promotion_gate(Some(entry), &ticket);
@@ -443,7 +563,7 @@ impl SessionStore {
             .await;
     }
 
-    async fn apply_boot_priority_promotion<Promote>(
+    async fn apply_boot_priority_promotion<Promote, PromoteFuture>(
         &self,
         session_id: &str,
         ticket: BootPriorityPromotionTicket,
@@ -451,65 +571,45 @@ impl SessionStore {
         pre_effect_gate: BootPromotionGate,
         promote_after_boot: Promote,
     ) where
-        Promote: FnOnce(Option<&Child>) -> std::io::Result<&'static str>,
+        Promote: FnOnce(Option<supervisor::ProcessControlHandle>) -> PromoteFuture,
+        PromoteFuture: Future<Output = supervisor::ProcessPriorityReply>,
     {
-        let child = ticket.attempt.child.clone();
-        let mut child_guard = None;
         let mut gate = pre_effect_gate;
-        if matches!(gate, BootPromotionGate::Promote) {
-            child_guard = if let Some(child) = child.as_ref() {
-                Some(child.lock().await)
-            } else {
-                None
-            };
-            gate = match child_guard
-                .as_mut()
-                .map(|child| child.try_wait())
-                .transpose()
-            {
-                Ok(Some(Some(_))) => {
-                    BootPromotionGate::CompleteSkipped("skipped_process_already_exited")
-                }
-                Ok(Some(None)) | Ok(None) => BootPromotionGate::Promote,
-                Err(_) => BootPromotionGate::CompleteSkipped("skipped_process_state_unavailable"),
-            };
-        }
         let mut raw_error = None;
         let mut promotion_error = None;
-        let mut promotion = match gate {
+        let promotion = match gate {
             BootPromotionGate::CompleteSkipped(proof) => proof,
-            BootPromotionGate::Promote => match promote_after_boot(child_guard.as_deref()) {
-                Ok(proof) => proof,
-                Err(error) => {
-                    promotion_error = priority::sanitize_priority_error(&error);
-                    raw_error = Some(error);
-                    "failed"
+            BootPromotionGate::Promote => match promote_after_boot(ticket.process.clone()).await {
+                supervisor::ProcessPriorityReply::Completed(result) => match result {
+                    Ok(proof) => proof,
+                    Err(error) => {
+                        promotion_error = priority::sanitize_priority_error(&error);
+                        raw_error = Some(error);
+                        "failed"
+                    }
+                },
+                supervisor::ProcessPriorityReply::ExitedBefore => {
+                    gate = BootPromotionGate::CompleteSkipped("skipped_process_already_exited");
+                    "skipped_process_already_exited"
+                }
+                supervisor::ProcessPriorityReply::ExitedAfter => {
+                    gate = BootPromotionGate::CompleteSkipped(
+                        "skipped_process_exited_during_promotion",
+                    );
+                    "skipped_process_exited_during_promotion"
+                }
+                supervisor::ProcessPriorityReply::StateUnavailable => {
+                    gate = BootPromotionGate::CompleteSkipped("skipped_process_state_unavailable");
+                    "skipped_process_state_unavailable"
+                }
+                supervisor::ProcessPriorityReply::StopAccepted => {
+                    gate = BootPromotionGate::CompleteSkipped("skipped_stop_requested");
+                    "skipped_stop_requested"
                 }
             },
             BootPromotionGate::Resolve => "skipped",
             BootPromotionGate::Stale => return,
         };
-        if matches!(gate, BootPromotionGate::Promote) {
-            match child_guard
-                .as_mut()
-                .map(|child| child.try_wait())
-                .transpose()
-            {
-                Ok(Some(Some(_))) => {
-                    gate = BootPromotionGate::CompleteSkipped(
-                        "skipped_process_exited_during_promotion",
-                    );
-                    promotion = "skipped_process_exited_during_promotion";
-                    promotion_error = None;
-                }
-                Err(_) => {
-                    gate = BootPromotionGate::CompleteSkipped("skipped_process_state_unavailable");
-                    promotion = "skipped_process_state_unavailable";
-                    promotion_error = None;
-                }
-                Ok(Some(None)) | Ok(None) => {}
-            }
-        }
         let published = self
             .settle_boot_promotion(
                 session_id,
@@ -682,20 +782,15 @@ impl SessionStore {
         };
         record.priority = Some(priority.clone());
         let session_id = record.session_id.0.clone();
-        let previous_child = self
+        let previous_process = self
             .sessions
             .read()
             .await
             .get(&session_id)
-            .and_then(|entry| entry.attempt.child.clone());
-        let mut previous_child = match previous_child.as_ref() {
-            Some(child) => Some(child.lock().await),
-            None => None,
-        };
+            .and_then(|entry| entry.process.clone());
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                drop(previous_child);
                 let mut sessions = self.sessions.write().await;
                 if let Some(entry) = sessions.get_mut(&session_id) {
                     entry.record.priority = Some(priority);
@@ -713,10 +808,14 @@ impl SessionStore {
         record.state = LaunchState::Starting;
         record.failure = None;
         record.outcome = None;
+        let (process, owner) = supervisor::prepare_process_owner(child);
+        let attempt = ProcessAttemptScope::new(self.next_attempt_id());
+
+        // Registration always acquires the active-owner registry before the session map. No
+        // await occurs after both guards are held, so the prepared kill-on-drop child is either
+        // wholly unregistered or synchronously installed in both places before its owner runs.
+        let mut active_processes = self.active_processes.lock().await;
         let mut sessions = self.sessions.write().await;
-        let process_attempt_id = self.next_attempt_id();
-        let child_handle = Arc::new(Mutex::new(child));
-        let attempt = ProcessAttemptScope::new(process_attempt_id, Some(child_handle));
         let (events, retention_holds) = if let Some(entry) = sessions.get(&session_id) {
             (entry.events.clone(), entry.retention_holds)
         } else {
@@ -748,6 +847,7 @@ impl SessionStore {
         };
         let mut entry = SessionEntry {
             attempt: attempt.clone(),
+            process: Some(process.clone()),
             record: stored_record,
             events,
             observed_failure: None,
@@ -761,13 +861,7 @@ impl SessionStore {
             .events
             .send(LaunchEvent::Status(Box::new(starting_status)));
         sessions.insert(session_id.clone(), entry);
-        drop(sessions);
-        if let Some(previous_child) = previous_child.as_mut() {
-            let _ = previous_child.start_kill();
-        }
-        drop(previous_child);
-        self.notify_changed();
-
+        active_processes.insert(attempt.id, process);
         let output_pumps = supervisor::spawn_output_tasks(
             self.clone(),
             session_id.clone(),
@@ -775,14 +869,27 @@ impl SessionStore {
             stdout,
             stderr,
         );
+        owner.spawn(
+            self.clone(),
+            session_id.clone(),
+            attempt.clone(),
+            output_pumps,
+        );
+        drop(sessions);
+        drop(active_processes);
+        if let Some(previous_process) = previous_process {
+            let _ = previous_process.terminate(supervisor::ProcessTerminalCause::Replacement);
+        }
+        self.notify_changed();
+
         supervisor::spawn_startup_watchdog(self.clone(), session_id.clone(), attempt.clone());
-        supervisor::spawn_wait_task(self.clone(), session_id, attempt, output_pumps);
 
         Ok(record)
     }
 
     pub async fn kill(&self, session_id: &str) -> std::io::Result<()> {
-        let child = {
+        let lifecycle_transition = self.lifecycle_transition.lock().await;
+        let process = {
             let mut sessions = self.sessions.write().await;
             let Some(entry) = sessions.get_mut(session_id) else {
                 return Err(std::io::Error::new(
@@ -795,16 +902,66 @@ impl SessionStore {
                 process_stop_stage_evidence(session_id, ProcessStopIntent::UserRequested);
             ensure_stage_started(&mut entry.record, now_ms());
             apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
-            entry.attempt.child.clone()
+            entry.process.clone()
         };
-        if let Some(child) = child {
-            child.lock().await.kill().await
+        let mut request = if let Some(process) = process {
+            process.terminate(supervisor::ProcessTerminalCause::UserStop)
         } else {
-            Err(std::io::Error::new(
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "session not found",
-            ))
+            ));
+        };
+        drop(lifecycle_transition);
+        request.reaped().await.map(|_| ())
+    }
+
+    pub(crate) async fn begin_user_stop(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> std::io::Result<UserStopLease> {
+        let lifecycle_guard = self.lifecycle_transition.clone().lock_owned().await;
+        let (attempt, process, record) = {
+            let mut sessions = self.sessions.write().await;
+            let Some(entry) = sessions.get_mut(session_id) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "session not found",
+                ));
+            };
+            let Some(process) = entry.process.clone() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "session not found",
+                ));
+            };
+            entry.retention_holds = entry
+                .retention_holds
+                .checked_add(1)
+                .expect("session retention hold count overflowed");
+            entry.terminal_sequence = None;
+            entry.stop_requested = true;
+            let evidence =
+                process_stop_stage_evidence(session_id, ProcessStopIntent::UserRequested);
+            ensure_stage_started(&mut entry.record, now_ms());
+            apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
+            (entry.attempt.clone(), process, entry.record.clone())
+        };
+        let mut lease = UserStopLease {
+            store: self.clone(),
+            lifecycle_guard: Some(lifecycle_guard),
+            attempt,
+            session_id: session_id.to_string(),
+            record,
+            retention_hold_active: true,
+        };
+        let mut request = process.terminate(supervisor::ProcessTerminalCause::UserStop);
+        if let Err(error) = request.reaped().await {
+            lease.release_hold().await;
+            drop(lease.lifecycle_guard.take());
+            return Err(error);
         }
+        Ok(lease)
     }
 
     #[cfg(test)]
@@ -826,22 +983,44 @@ impl SessionStore {
             .and_then(|signal| signal.fresh_for_exit(exit_observed_at_ms))
     }
 
-    pub async fn terminate_all(&self) {
+    pub async fn terminate_all(self: &Arc<Self>) -> std::io::Result<()> {
+        let store = self.clone();
+        tokio::spawn(async move { store.coordinate_terminate_all().await })
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("shutdown coordinator failed: {error}"))
+            })?
+    }
+
+    async fn coordinate_terminate_all(self: &Arc<Self>) -> std::io::Result<()> {
         let _lifecycle_transition = self.lifecycle_transition.lock().await;
-        let children = self
-            .sessions
-            .read()
+        let processes = self
+            .active_processes
+            .lock()
             .await
             .values()
-            .filter_map(|entry| entry.attempt.child.clone())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut requests = processes
+            .iter()
+            .map(|process| process.terminate(supervisor::ProcessTerminalCause::Shutdown))
             .collect::<Vec<_>>();
 
-        for child in children {
-            let _ = child.lock().await.kill().await;
+        let mut first_error = None;
+        for request in &mut requests {
+            if let Err(error) = request.reaped().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
 
         self.sessions.write().await.clear();
         self.notify_changed();
+        Ok(())
     }
 
     pub async fn active_records(&self) -> Vec<LaunchSessionRecord> {
@@ -852,6 +1031,14 @@ impl SessionStore {
             .filter(|entry| !classify::is_terminal_state(entry.record.state))
             .map(|entry| entry.record.clone())
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inject_rejected_process_owner(&self) {
+        self.active_processes.lock().await.insert(
+            self.next_attempt_id(),
+            supervisor::rejected_process_control_handle(),
+        );
     }
 
     pub async fn has_active_instance(&self, instance_id: &str) -> bool {
@@ -2239,33 +2426,22 @@ mod tests {
                 .await
         });
         let spawned_pid = wait_for_pid_file(&pid_path).await;
-        assert!(old_child.try_lock().is_err());
-
         start.abort();
         assert!(start.await.expect_err("cancelled start").is_cancelled());
         drop(sessions);
         let _ = std::fs::remove_file(&pid_path);
 
         assert_process_exits(spawned_pid).await;
-        assert!(
-            old_child
-                .lock()
-                .await
-                .try_wait()
-                .expect("old child")
-                .is_none()
-        );
+        assert!(process_is_live(old_child.pid));
         let current_attempt = store
             .current_process_attempt(session_id)
             .await
             .expect("current attempt");
         assert!(attempt_scopes_match(&current_attempt, &original_attempt));
-        old_child
-            .lock()
-            .await
-            .kill()
-            .await
-            .expect("cleanup old child");
+        let mut cleanup = old_child
+            .control
+            .terminate(supervisor::ProcessTerminalCause::Replacement);
+        cleanup.reaped().await.expect("cleanup old child");
     }
 
     #[cfg(unix)]
@@ -2286,37 +2462,21 @@ mod tests {
         let insert = tokio::spawn(async move {
             insert_store.insert(test_record(session_id)).await;
         });
-        for _ in 0..1_000 {
-            if old_child.try_lock().is_err() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(old_child.try_lock().is_err());
-
+        tokio::task::yield_now().await;
         insert.abort();
         assert!(insert.await.expect_err("cancelled insert").is_cancelled());
         drop(sessions);
 
-        assert!(
-            old_child
-                .lock()
-                .await
-                .try_wait()
-                .expect("old child")
-                .is_none()
-        );
+        assert!(process_is_live(old_child.pid));
         let current_attempt = store
             .current_process_attempt(session_id)
             .await
             .expect("current attempt");
         assert!(attempt_scopes_match(&current_attempt, &original_attempt));
-        old_child
-            .lock()
-            .await
-            .kill()
-            .await
-            .expect("cleanup old child");
+        let mut cleanup = old_child
+            .control
+            .terminate(supervisor::ProcessTerminalCause::Replacement);
+        cleanup.reaped().await.expect("cleanup old child");
     }
 
     #[cfg(unix)]
@@ -2365,7 +2525,7 @@ mod tests {
             store.get(session_id).await.expect("stored record").state,
             LaunchState::Starting
         );
-        store.terminate_all().await;
+        store.terminate_all().await.expect("terminate all");
     }
 
     #[cfg(unix)]
@@ -2466,7 +2626,7 @@ mod tests {
 
     #[tokio::test]
     async fn launch_boot_marker_records_completion_and_duration() {
-        let store = SessionStore::new();
+        let store = Arc::new(SessionStore::new());
         let mut record = test_record("boot-marker-duration");
         record.state = LaunchState::Starting;
         record.process_started_at_ms = Some(now_ms().saturating_sub(4_200));
@@ -2735,12 +2895,6 @@ mod tests {
         assert!(emit.await.expect_err("cancelled boot emit").is_cancelled());
         drop(sessions);
 
-        assert!(
-            store
-                .startup_watchdog_record_for_attempt(session_id, &attempt)
-                .await
-                .is_some()
-        );
         let sessions = store.sessions.read().await;
         let entry = sessions.get(session_id).expect("session entry");
         assert_eq!(entry.record.state, LaunchState::Starting);
@@ -2788,16 +2942,24 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn stale_attempt_watchdog_does_not_overwrite_a_retry() {
         let store = Arc::new(SessionStore::new());
         let session_id = "stale-attempt-watchdog";
         let stale_attempt = replace_session(&store, session_id).await;
         let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+        let (trigger, trigger_rx) = tokio::sync::oneshot::channel();
 
-        supervisor::spawn_startup_watchdog(store.clone(), session_id.to_string(), stale_attempt);
-        tokio::time::advance(Duration::from_secs(61)).await;
-        tokio::task::yield_now().await;
+        let watchdog = supervisor::spawn_startup_watchdog_with_trigger(
+            store.clone(),
+            session_id.to_string(),
+            stale_attempt,
+            async move {
+                let _ = trigger_rx.await;
+            },
+        );
+        trigger.send(()).expect("trigger stale watchdog");
+        watchdog.await.expect("stale watchdog task");
 
         let stored = store.get(session_id).await.expect("stored record");
         assert_eq!(stored.state, LaunchState::Starting);
@@ -2977,27 +3139,14 @@ mod tests {
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
         store.insert(record).await;
-        let mut command = Command::new("sh");
-        command.arg("-c").arg("exit 0");
-        let child = attach_test_child(&store, session_id, command).await;
-        loop {
-            if child
-                .lock()
-                .await
-                .try_wait()
-                .expect("child status")
-                .is_some()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
         let effect_ran = AtomicBool::new(false);
 
-        emit_test_boot(&store, session_id, "skipped_process_already_exited", |_| {
-            effect_ran.store(true, Ordering::Relaxed);
-            Ok("test_promoted")
-        })
+        emit_test_boot_reply(
+            &store,
+            session_id,
+            "skipped_process_already_exited",
+            supervisor::ProcessPriorityReply::ExitedBefore,
+        )
         .await;
 
         assert!(!effect_ran.load(Ordering::Relaxed));
@@ -3006,30 +3155,22 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn boot_marker_process_exit_during_promotion_completes_with_skipped_proof() {
-        let store = SessionStore::new();
+        let store = Arc::new(SessionStore::new());
         let session_id = "boot-marker-exit-during-promotion";
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
         store.insert(record).await;
-        let mut command = Command::new("sh");
-        command.arg("-c").arg("exec sleep 30");
-        let child = attach_test_child(&store, session_id, command).await;
-        let pid = child.lock().await.id().expect("child pid");
         let effect_ran = AtomicBool::new(false);
 
-        emit_test_boot(
+        emit_test_boot_reply(
             &store,
             session_id,
             "skipped_process_exited_during_promotion",
-            |_| {
-                effect_ran.store(true, Ordering::Relaxed);
-                terminate_process_and_wait(pid);
-                Ok("test_promoted")
-            },
+            supervisor::ProcessPriorityReply::ExitedAfter,
         )
         .await;
 
-        assert!(effect_ran.load(Ordering::Relaxed));
+        assert!(!effect_ran.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -3217,7 +3358,301 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
+    async fn concurrent_kill_requests_join_the_same_owner_reap() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "concurrent-owner-kill";
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec sleep 30");
+        let launched = store
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("spawn kill target");
+        let pid = launched.pid.expect("kill target pid");
+
+        let (first, second) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(store.kill(session_id), store.kill(session_id))
+        })
+        .await
+        .expect("concurrent kill deadline");
+
+        first.expect("first kill");
+        second.expect("second kill");
+        assert!(!process_is_live(pid));
+        let stored = store.get(session_id).await.expect("stored record");
+        assert!(
+            stored
+                .stages
+                .iter()
+                .flat_map(|stage| &stage.evidence)
+                .any(|evidence| evidence.id.contains("process_stop_requested"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn user_stop_lease_blocks_replacement_until_proof_scope_is_released() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "user-stop-blocks-replacement";
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec sleep 30");
+        store
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("spawn stop target");
+        let original_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("original attempt");
+
+        let stop = store
+            .begin_user_stop(session_id)
+            .await
+            .expect("begin user stop");
+        assert!(store.lifecycle_transition.try_lock().is_err());
+        assert_eq!(
+            store
+                .sessions
+                .read()
+                .await
+                .get(session_id)
+                .expect("stopped session")
+                .retention_holds,
+            2
+        );
+
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let replacement_store = store.clone();
+        let replacement = tokio::spawn(async move {
+            let _ = started.send(());
+            replacement_store.insert(test_record(session_id)).await;
+        });
+        started_rx.await.expect("replacement started");
+        tokio::task::yield_now().await;
+        assert!(!replacement.is_finished());
+
+        stop.release().await;
+        tokio::time::timeout(Duration::from_secs(2), replacement)
+            .await
+            .expect("replacement deadline")
+            .expect("replacement task");
+        let replacement_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("replacement attempt");
+        assert_ne!(replacement_attempt.id, original_attempt.id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_user_stop_lease_releases_retention_and_lifecycle_guard() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "dropped-user-stop-lease";
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec sleep 30");
+        store
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("spawn stop target");
+
+        let stop = store
+            .begin_user_stop(session_id)
+            .await
+            .expect("begin user stop");
+        assert_eq!(
+            store
+                .sessions
+                .read()
+                .await
+                .get(session_id)
+                .expect("stopped session")
+                .retention_holds,
+            2
+        );
+        drop(stop);
+
+        let lifecycle = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.lifecycle_transition.clone().lock_owned(),
+        )
+        .await
+        .expect("drop cleanup deadline");
+        assert_eq!(
+            store
+                .sessions
+                .read()
+                .await
+                .get(session_id)
+                .expect("stopped session")
+                .retention_holds,
+            1
+        );
+        drop(lifecycle);
+    }
+
+    #[tokio::test]
+    async fn failed_user_stop_rolls_back_retention_and_lifecycle_guard() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "failed-user-stop-lease";
+        store.insert(test_record(session_id)).await;
+        store
+            .sessions
+            .write()
+            .await
+            .get_mut(session_id)
+            .expect("stop session")
+            .process = Some(supervisor::rejected_process_control_handle());
+
+        let error = match store.begin_user_stop(session_id).await {
+            Ok(_) => panic!("rejected owner must fail stop"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            store
+                .sessions
+                .read()
+                .await
+                .get(session_id)
+                .expect("stop session")
+                .retention_holds,
+            1
+        );
+        assert!(store.lifecycle_transition.try_lock().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_begin_user_stop_detaches_retention_cleanup() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "cancelled-begin-user-stop";
+        store.insert(test_record(session_id)).await;
+        let gated = attach_reap_gated_test_child(&store, session_id).await;
+        let stop_store = store.clone();
+        let stop = tokio::spawn(async move { stop_store.begin_user_stop(session_id).await });
+
+        gated.reap_reached.await.expect("owner reached reap gate");
+        assert_eq!(
+            store
+                .sessions
+                .read()
+                .await
+                .get(session_id)
+                .expect("stop session")
+                .retention_holds,
+            2
+        );
+        assert!(store.lifecycle_transition.try_lock().is_err());
+        stop.abort();
+        match stop.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("stop task was not cancelled"),
+        }
+        let _ = gated.release_reap.send(());
+
+        let lifecycle = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.lifecycle_transition.clone().lock_owned(),
+        )
+        .await
+        .expect("cancel cleanup deadline");
+        assert_eq!(
+            store
+                .sessions
+                .read()
+                .await
+                .get(session_id)
+                .expect("stop session")
+                .retention_holds,
+            1
+        );
+        drop(lifecycle);
+        let mut completed = gated.control.completion_receiver();
+        if !*completed.borrow() {
+            tokio::time::timeout(Duration::from_secs(2), completed.changed())
+                .await
+                .expect("owner completion deadline")
+                .expect("owner completion");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_acknowledges_reap_before_inherited_output_pipe_drain_completes() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "reap-before-inherited-pipe-drain";
+        let descendant_pid_path = test_pid_path("inherited-output-pipe");
+        let _ = std::fs::remove_file(&descendant_pid_path);
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & descendant=$!; printf '%s' \"$descendant\" > \"$1\"; exec sleep 30")
+            .arg("inherited-output-pipe")
+            .arg(&descendant_pid_path);
+        store
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("spawn inherited-pipe target");
+        let descendant_pid = wait_for_pid_file(&descendant_pid_path).await;
+        let control = store
+            .sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|entry| entry.process.clone())
+            .expect("process control");
+
+        tokio::time::timeout(Duration::from_millis(250), store.kill(session_id))
+            .await
+            .expect("reap acknowledgment before drain timeout")
+            .expect("kill target");
+        let mut completed = control.completion_receiver();
+        assert!(!*completed.borrow());
+        tokio::time::timeout(Duration::from_secs(2), completed.changed())
+            .await
+            .expect("bounded output drain completion")
+            .expect("owner completion");
+
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &descendant_pid.to_string()])
+            .status();
+        let _ = std::fs::remove_file(&descendant_pid_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_all_reaps_every_current_owner_before_clearing_sessions() {
+        let store = Arc::new(SessionStore::new());
+        let mut pids = Vec::new();
+        let mut receivers = Vec::new();
+        for session_id in ["shutdown-owner-a", "shutdown-owner-b"] {
+            let mut command = Command::new("sh");
+            command.arg("-c").arg("exec sleep 30");
+            let launched = store
+                .start_process(test_record(session_id), command)
+                .await
+                .expect("spawn shutdown target");
+            pids.push(launched.pid.expect("shutdown target pid"));
+            let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+            while receiver.try_recv().is_ok() {}
+            receivers.push(receiver);
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), store.terminate_all())
+            .await
+            .expect("shutdown reap deadline")
+            .expect("shutdown owners");
+
+        assert!(pids.into_iter().all(|pid| !process_is_live(pid)));
+        assert!(store.sessions.read().await.is_empty());
+        for receiver in &mut receivers {
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn launch_watchdog_kills_outputting_process_without_boot_marker() {
         let store = Arc::new(SessionStore::new());
         let session_id = "watchdog-no-boot-marker";
@@ -3226,32 +3661,50 @@ mod tests {
         let mut command = Command::new("sh");
         command
             .arg("-c")
-            .arg("printf '%s\\n' 'ordinary startup output'; sleep 30");
+            .arg("printf '%s\\n' 'ordinary startup output'; exec sleep 30");
 
         store
             .start_process(test_record(session_id), command)
             .await
             .expect("spawn stalled process");
-        tokio::task::yield_now().await;
-        tokio::time::advance(std::time::Duration::from_secs(61)).await;
-        tokio::task::yield_now().await;
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("watchdog attempt");
+        let (trigger, trigger_rx) = tokio::sync::oneshot::channel();
+        let watchdog = supervisor::spawn_startup_watchdog_with_trigger(
+            store.clone(),
+            session_id.to_string(),
+            attempt,
+            async move {
+                let _ = trigger_rx.await;
+            },
+        );
 
-        let mut terminal_status = None;
-        for _ in 0..20 {
-            while let Ok(event) = receiver.try_recv() {
-                if let LaunchEvent::Status(status) = event
-                    && status.state == "exited"
-                {
-                    terminal_status = Some(status);
-                    break;
-                }
-            }
-            if terminal_status.is_some() {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("ordinary output deadline")
+                .expect("ordinary output broadcast");
+            if let LaunchEvent::Log(log) = event
+                && log.text.contains("ordinary startup output")
+            {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            tokio::task::yield_now().await;
         }
+        trigger.send(()).expect("trigger watchdog");
+
+        let terminal_status = loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("watchdog event")
+                .expect("watchdog broadcast");
+            if let LaunchEvent::Status(status) = event
+                && status.state == "exited"
+            {
+                break Some(status);
+            }
+        };
 
         let status = terminal_status.expect("watchdog terminal status");
         assert_eq!(
@@ -3266,6 +3719,7 @@ mod tests {
         assert!(status_json.contains("execution_process_killed"));
         assert!(status_json.contains("execution_process_watchdog_action"));
         assert_public_session_payload_excludes_sensitive_content(&status_json);
+        watchdog.await.expect("watchdog task");
     }
 
     #[tokio::test]
@@ -3633,7 +4087,7 @@ mod tests {
         promote: Promote,
     ) -> LaunchSessionRecord
     where
-        Promote: FnOnce(Option<&Child>) -> std::io::Result<&'static str>,
+        Promote: FnOnce(Option<supervisor::ProcessControlHandle>) -> std::io::Result<&'static str>,
     {
         let mut receiver = store.subscribe(session_id).await.expect("subscribe");
         emit_test_log(
@@ -3661,6 +4115,47 @@ mod tests {
         stored
     }
 
+    async fn emit_test_boot_reply(
+        store: &SessionStore,
+        session_id: &str,
+        expected_proof: &str,
+        reply: supervisor::ProcessPriorityReply,
+    ) -> LaunchSessionRecord {
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("process attempt");
+        store
+            .emit_log_for_attempt_with(
+                session_id,
+                &attempt,
+                RawLogLine {
+                    source: "stdout".to_string(),
+                    text: "[Render thread/INFO]: LWJGL Version: 3.3.3".to_string(),
+                    observed_at_ms: now_ms(),
+                },
+                prepare_log_line,
+                |_| std::future::ready(reply),
+            )
+            .await;
+        assert_eq!(recv_status(&mut receiver).await.state, "running");
+        assert!(matches!(
+            receiver.recv().await.expect("boot log"),
+            LaunchEvent::Log(_)
+        ));
+        let stored = store.get(session_id).await.expect("stored record");
+        assert_eq!(
+            stored
+                .priority
+                .as_ref()
+                .and_then(|priority| priority.promotion.as_deref()),
+            Some(expected_proof)
+        );
+        assert!(stored.boot_completed_at_ms.is_some());
+        stored
+    }
+
     async fn emit_test_log<Promote>(
         store: &SessionStore,
         session_id: &str,
@@ -3668,7 +4163,7 @@ mod tests {
         text: String,
         promote: Promote,
     ) where
-        Promote: FnOnce(Option<&Child>) -> std::io::Result<&'static str>,
+        Promote: FnOnce(Option<supervisor::ProcessControlHandle>) -> std::io::Result<&'static str>,
     {
         emit_test_log_with_prepare(store, session_id, source, text, prepare_log_line, promote)
             .await;
@@ -3683,7 +4178,7 @@ mod tests {
         promote: Promote,
     ) where
         Prepare: FnOnce(&str, String, String, u64) -> PreparedLogLine,
-        Promote: FnOnce(Option<&Child>) -> std::io::Result<&'static str>,
+        Promote: FnOnce(Option<supervisor::ProcessControlHandle>) -> std::io::Result<&'static str>,
     {
         let attempt = store
             .current_process_attempt(session_id)
@@ -3699,7 +4194,11 @@ mod tests {
                     observed_at_ms: now_ms(),
                 },
                 prepare,
-                promote,
+                |process| {
+                    std::future::ready(supervisor::ProcessPriorityReply::Completed(promote(
+                        process,
+                    )))
+                },
             )
             .await;
     }
@@ -3716,19 +4215,80 @@ mod tests {
         stale_attempt
     }
 
+    struct AttachedTestProcess {
+        pid: u32,
+        control: supervisor::ProcessControlHandle,
+    }
+
+    #[cfg(unix)]
+    struct ReapGatedTestProcess {
+        control: supervisor::ProcessControlHandle,
+        reap_reached: tokio::sync::oneshot::Receiver<()>,
+        release_reap: tokio::sync::oneshot::Sender<()>,
+    }
+
     async fn attach_test_child(
-        store: &SessionStore,
+        store: &Arc<SessionStore>,
         session_id: &str,
         mut command: Command,
-    ) -> Arc<Mutex<Child>> {
+    ) -> AttachedTestProcess {
+        command.kill_on_drop(true);
         let child = command.spawn().expect("test child");
-        let pid = child.id();
-        let child = Arc::new(Mutex::new(child));
+        let pid = child.id().expect("test child pid");
+        let (control, owner) = supervisor::prepare_process_owner(child);
+        let mut active_processes = store.active_processes.lock().await;
         let mut sessions = store.sessions.write().await;
         let entry = sessions.get_mut(session_id).expect("session entry");
-        entry.record.pid = pid;
-        entry.attempt = ProcessAttemptScope::new(entry.attempt.id, Some(child.clone()));
-        child
+        entry.record.pid = Some(pid);
+        entry.process = Some(control.clone());
+        active_processes.insert(entry.attempt.id, control.clone());
+        let attempt = entry.attempt.clone();
+        let output_pumps = supervisor::spawn_output_tasks(
+            store.clone(),
+            session_id.to_string(),
+            attempt.clone(),
+            None,
+            None,
+        );
+        owner.spawn(store.clone(), session_id.to_string(), attempt, output_pumps);
+        drop(sessions);
+        drop(active_processes);
+        AttachedTestProcess { pid, control }
+    }
+
+    #[cfg(unix)]
+    async fn attach_reap_gated_test_child(
+        store: &Arc<SessionStore>,
+        session_id: &str,
+    ) -> ReapGatedTestProcess {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec sleep 30").kill_on_drop(true);
+        let child = command.spawn().expect("reap-gated child");
+        let (control, mut owner) = supervisor::prepare_process_owner(child);
+        let (reap_reached, reap_reached_rx) = tokio::sync::oneshot::channel();
+        let (release_reap, release_reap_rx) = tokio::sync::oneshot::channel();
+        owner.set_reap_gate(reap_reached, release_reap_rx);
+        let mut active_processes = store.active_processes.lock().await;
+        let mut sessions = store.sessions.write().await;
+        let entry = sessions.get_mut(session_id).expect("session entry");
+        entry.process = Some(control.clone());
+        active_processes.insert(entry.attempt.id, control.clone());
+        let attempt = entry.attempt.clone();
+        let output_pumps = supervisor::spawn_output_tasks(
+            store.clone(),
+            session_id.to_string(),
+            attempt.clone(),
+            None,
+            None,
+        );
+        owner.spawn(store.clone(), session_id.to_string(), attempt, output_pumps);
+        drop(sessions);
+        drop(active_processes);
+        ReapGatedTestProcess {
+            control,
+            reap_reached: reap_reached_rx,
+            release_reap,
+        }
     }
 
     #[cfg(unix)]
@@ -3762,25 +4322,6 @@ mod tests {
                 "process {pid} remained live after cancellation"
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    #[cfg(unix)]
-    fn terminate_process_and_wait(pid: u32) {
-        assert!(
-            std::process::Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status()
-                .expect("terminate process")
-                .success()
-        );
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while process_is_live(pid) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "process {pid} did not exit during promotion"
-            );
-            std::thread::yield_now();
         }
     }
 
