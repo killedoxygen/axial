@@ -10,6 +10,7 @@ async-stream.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
+flate2.workspace = true
 futures-util.workspace = true
 include_dir.workspace = true
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
@@ -17,12 +18,14 @@ p256.workspace = true
 png.workspace = true
 rand.workspace = true
 reqwest = { workspace = true, features = ["blocking", "multipart"] }
+self-replace.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 shlex.workspace = true
 sysinfo.workspace = true
+tar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tower.workspace = true
@@ -31,6 +34,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
+zip.workspace = true
 axial-config = { path = "../../core/config" }
 axial-launcher = { path = "../../core/launcher" }
 axial-minecraft = { path = "../../core/minecraft" }

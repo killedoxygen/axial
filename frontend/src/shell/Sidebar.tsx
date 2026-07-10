@@ -1,11 +1,12 @@
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { InstanceTile } from '../ui/InstanceVisual';
+import { Button } from '../ui/Atoms';
 import { Icon } from '../ui/Icons';
 import { Logo } from '../ui/Logo';
 import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
 import { route, navigate, commandPaletteOpen, type Route, openCreate, openAccountSwitcher } from '../ui-state';
-import { runningSessions, config, instances, versionById } from '../store';
+import { runningSessions, config, instances, updateInfo, versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
 import { accountDisplayName, accountSkinSrc } from '../player-skin';
 import { Music, musicStateVersion } from '../music';
@@ -13,7 +14,21 @@ import { local, saveLocalState } from '../state';
 import { Sound } from '../sound';
 import { openInstanceContextMenu } from '../views/instance/instance-menu';
 import type { Instance } from '../types-instance';
+import type { UpdateFlowState } from '../types-update';
 import { shortcutHint } from '../shortcuts';
+import {
+  applyUpdateAndRestart,
+  canInstallUpdateInApp,
+  dismissAvailableUpdate,
+  hasVisibleUpdate,
+  openUpdateAction,
+  openUpdateNotes,
+  restartBlockedByActivity,
+  restartDesktopApp,
+  startUpdateDownload,
+  updateFlow,
+} from '../updater';
+import { formatBytes } from '../utils';
 
 type RailTip = {
   label: string;
@@ -210,6 +225,223 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
   );
 }
 
+const UPDATE_RING_CIRCUMFERENCE = 2 * Math.PI * 19.5;
+
+function displayUpdateVersion(version: string): string {
+  if (!version) return '';
+  return version.startsWith('v') || version.startsWith('V') ? version : `v${version}`;
+}
+
+function railUpdateTipLabel(flowState: UpdateFlowState, latest: string): string {
+  switch (flowState.phase) {
+    case 'downloading':
+      return flowState.percent != null ? `Downloading update · ${flowState.percent}%` : 'Downloading update';
+    case 'applying':
+      return 'Installing update';
+    case 'ready':
+      return `Restart to update to ${latest}`;
+    case 'restart-pending':
+      return 'Restart Axial to finish the update';
+    default:
+      return `Update ${latest} available`;
+  }
+}
+
+function UpdatePopover({ latest, onClose }: { latest: string; onClose: () => void }): JSX.Element {
+  const info = updateInfo.value;
+  const flowState = updateFlow.value;
+  const busy = flowState.phase === 'downloading' || flowState.phase === 'applying';
+  const current = displayUpdateVersion(info?.current_version || '');
+  const restartBlocked = restartBlockedByActivity();
+  const inApp = canInstallUpdateInApp();
+
+  const title =
+    flowState.phase === 'applying'
+      ? 'Installing update'
+      : flowState.phase === 'downloading'
+        ? 'Downloading update'
+        : flowState.phase === 'ready'
+          ? 'Update downloaded'
+          : flowState.phase === 'restart-pending'
+            ? 'Restart to finish'
+            : flowState.phase === 'failed'
+              ? 'Update failed'
+              : 'Update available';
+
+  const download = (): void => {
+    void startUpdateDownload();
+    if (!inApp) onClose();
+  };
+
+  return (
+    <div class="cp-update-pop" role="dialog" aria-label="App update">
+      <div class="cp-update-pop-head">
+        <span class="cp-update-pop-title">{title}</span>
+        {current && latest && (
+          <span class="cp-update-pop-versions">
+            {current} <Icon name="arrow-right" size={11} stroke={2} /> {latest}
+          </span>
+        )}
+      </div>
+      {busy && (
+        <div class="cp-update-pop-progress">
+          <div
+            class="cp-update-pop-bar"
+            data-indeterminate={flowState.percent == null || flowState.phase === 'applying'}
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={flowState.percent ?? undefined}
+          >
+            <span
+              class="cp-update-pop-bar-fill"
+              style={flowState.percent != null ? { width: `${flowState.percent}%` } : undefined}
+            />
+          </div>
+          <span class="cp-update-pop-progress-label">
+            {flowState.phase === 'applying'
+              ? 'Installing...'
+              : flowState.total_bytes
+                ? `${formatBytes(flowState.received_bytes)} of ${formatBytes(flowState.total_bytes)}`
+                : formatBytes(flowState.received_bytes)}
+          </span>
+        </div>
+      )}
+      {flowState.phase === 'failed' && flowState.message && (
+        <div class="cp-update-pop-note" data-tone="error">
+          {flowState.message}
+        </div>
+      )}
+      {flowState.phase === 'ready' && (
+        <div class="cp-update-pop-note">
+          {restartBlocked ? 'Waiting for downloads and running games to finish.' : `Axial will restart into ${latest}.`}
+        </div>
+      )}
+      {flowState.phase === 'restart-pending' && (
+        <div class="cp-update-pop-note">The update is applied and takes effect on the next start.</div>
+      )}
+      <div class="cp-update-pop-actions">
+        {(flowState.phase === 'idle' || flowState.phase === 'failed') && (
+          <>
+            <Button variant="primary" size="sm" icon="download" onClick={download}>
+              {flowState.phase === 'failed'
+                ? 'Try again'
+                : inApp
+                  ? 'Download update'
+                  : info?.action_label || 'Open release'}
+            </Button>
+            <Button variant="ghost" size="sm" icon="tag" onClick={() => void openUpdateNotes()}>
+              Notes
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                dismissAvailableUpdate();
+                onClose();
+              }}
+            >
+              Skip
+            </Button>
+          </>
+        )}
+        {flowState.phase === 'ready' && (
+          <>
+            <Button
+              variant="primary"
+              size="sm"
+              icon="refresh"
+              disabled={restartBlocked}
+              onClick={() => void applyUpdateAndRestart()}
+            >
+              Restart to update
+            </Button>
+            <Button variant="ghost" size="sm" icon="tag" onClick={() => void openUpdateNotes()}>
+              Notes
+            </Button>
+          </>
+        )}
+        {flowState.phase === 'restart-pending' && (
+          <Button variant="primary" size="sm" icon="refresh" onClick={() => void restartDesktopApp()}>
+            Restart now
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RailUpdate({ tooltip }: { tooltip: RailTooltipController }): JSX.Element | null {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const flowState = updateFlow.value;
+
+  useEffect(() => {
+    if (!open) return;
+    const onClick = (e: MouseEvent): void => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onClick);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onClick);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const busy = flowState.phase === 'downloading' || flowState.phase === 'applying';
+  const staged = flowState.phase === 'ready' || flowState.phase === 'restart-pending';
+  if (!busy && !staged && !hasVisibleUpdate()) return null;
+
+  const latest = displayUpdateVersion(flowState.version || updateInfo.value?.latest_version || '');
+  const tipLabel = railUpdateTipLabel(flowState, latest);
+  const icon = busy ? 'download' : staged ? 'check-circle' : 'sparkles';
+  const pct = flowState.percent;
+  const ringOffset =
+    pct != null
+      ? UPDATE_RING_CIRCUMFERENCE * (1 - Math.min(100, Math.max(0, pct)) / 100)
+      : UPDATE_RING_CIRCUMFERENCE * 0.72;
+
+  return (
+    <div class="cp-update-shell" ref={rootRef}>
+      {open && <UpdatePopover latest={latest} onClose={() => setOpen(false)} />}
+      <button
+        class="cp-rail-btn cp-rail-update"
+        data-update-state={busy || staged ? flowState.phase : 'available'}
+        data-open={open}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-label={tipLabel}
+        onClick={() => {
+          tooltip.hide();
+          setOpen((o) => !o);
+        }}
+        {...railTipAttrs(tipLabel, tooltip)}
+      >
+        <span class="cp-rail-update-glyph" key={icon}>
+          <RailIcon name={icon} />
+        </span>
+        {busy && (
+          <svg class="cp-rail-update-ring" viewBox="0 0 44 44" data-indeterminate={pct == null} aria-hidden="true">
+            <circle class="cp-rail-update-ring-track" cx="22" cy="22" r="19.5" />
+            <circle
+              class="cp-rail-update-ring-bar"
+              cx="22"
+              cy="22"
+              r="19.5"
+              style={{ strokeDasharray: UPDATE_RING_CIRCUMFERENCE, strokeDashoffset: ringOffset }}
+            />
+          </svg>
+        )}
+        {!busy && !staged && <span class="cp-rail-update-dot" aria-hidden="true" />}
+      </button>
+    </div>
+  );
+}
+
 function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
   musicStateVersion.value;
   const musicOn = Music.enabled;
@@ -395,6 +627,7 @@ export function Sidebar(): JSX.Element {
       </button>
       <RailInstances tooltip={tooltip} />
       <div class="cp-rail-spacer" />
+      <RailUpdate tooltip={tooltip} />
       <RailButton icon="settings" label="Settings" target={{ name: 'settings' }} tooltip={tooltip} />
       <UserTrigger tooltip={tooltip} />
       {tip && (

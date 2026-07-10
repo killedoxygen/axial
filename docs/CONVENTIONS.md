@@ -39,7 +39,7 @@ keep this short and real. if the codebase changes, update this file.
 - json in, json out
 - errors are `{\"error\":\"message\"}`
 - launch/install progress uses sse in browser mode and the Tauri desktop event bridge on desktop
-- update checks go through `/api/v1/update`
+- update checks go through `/api/v1/update`; the in-app update flow is backend-owned via `/api/v1/update/download`, `/api/v1/update/flow`, and `/api/v1/update/apply`, and the frontend renders the backend-authored flow state
 - loader selection uses component ids and build ids
 - loader version pickers must be driven by per-component supported Minecraft versions, not the vanilla catalog
 - route and frontend code must not inspect raw Fabric, Quilt, Forge, or NeoForge payloads

@@ -1,11 +1,18 @@
+mod flow;
+
+pub use flow::{
+    UpdateDownloadRequest, UpdateFlowResponse, apply_staged_update, spawn_update_staging_cleanup,
+    start_update_download, update_flow_state,
+};
+
 use crate::state::AppState;
 use axum::{Json, http::StatusCode};
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::{
-    sync::OnceLock,
-    time::{Duration, SystemTime},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime},
 };
 
 const GITHUB_LATEST_RELEASE_URL: &str =
@@ -16,10 +23,11 @@ const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const UPDATE_CHECK_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const UPDATE_CHECK_UNAVAILABLE_MESSAGE: &str = "update check unavailable";
 const MAX_UPDATE_RELEASE_BYTES: u64 = 512 << 10;
+const UPDATE_CHECK_CACHE_TTL: Duration = Duration::from_secs(300);
 
 type ApiErrorResponse = (StatusCode, Json<serde_json::Value>);
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct UpdateResponse {
     pub current_version: String,
     pub latest_version: String,
@@ -27,6 +35,7 @@ pub struct UpdateResponse {
     pub platform: String,
     pub arch: String,
     pub kind: &'static str,
+    pub install_mode: &'static str,
     pub notes_url: String,
     pub action_url: String,
     pub checksum_url: Option<String>,
@@ -48,15 +57,46 @@ struct GithubReleaseAsset {
     browser_download_url: String,
 }
 
-pub async fn update_status(state: &AppState) -> Result<UpdateResponse, ApiErrorResponse> {
+pub async fn update_status(
+    state: &AppState,
+    force: bool,
+) -> Result<UpdateResponse, ApiErrorResponse> {
+    if !force && let Some(cached) = cached_update_response() {
+        return Ok(cached);
+    }
+
     let current_version = state.version().to_string();
     let checked_at = timestamp_utc();
 
-    update_response_from_release_fetch(
+    let response = update_response_from_release_fetch(
         &current_version,
         &checked_at,
         fetch_latest_release(&current_version).await,
-    )
+    )?;
+    store_cached_update_response(&response);
+    Ok(response)
+}
+
+fn update_check_cache() -> &'static Mutex<Option<(Instant, UpdateResponse)>> {
+    static CACHE: OnceLock<Mutex<Option<(Instant, UpdateResponse)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cached_update_response() -> Option<UpdateResponse> {
+    let cache = update_check_cache()
+        .lock()
+        .expect("update check cache lock");
+    cache
+        .as_ref()
+        .filter(|(checked, _)| checked.elapsed() < UPDATE_CHECK_CACHE_TTL)
+        .map(|(_, response)| response.clone())
+}
+
+fn store_cached_update_response(response: &UpdateResponse) {
+    let mut cache = update_check_cache()
+        .lock()
+        .expect("update check cache lock");
+    *cache = Some((Instant::now(), response.clone()));
 }
 
 async fn fetch_latest_release(
@@ -140,6 +180,7 @@ fn fallback_response(current_version: &str, checked_at: &str) -> UpdateResponse 
         platform: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         kind: "none",
+        install_mode: "external",
         notes_url: String::new(),
         action_url: String::new(),
         checksum_url: None,
@@ -179,6 +220,12 @@ fn release_response_for_platform(
 
     let asset = matching_release_asset(&release.assets, &latest_version, os, arch);
     if let Some(asset) = asset {
+        // In-app staging needs a checksum sidecar to verify the download.
+        let install_mode = if asset.checksum_url.is_some() {
+            "in-app"
+        } else {
+            "external"
+        };
         return UpdateResponse {
             current_version: current_version.to_string(),
             latest_version,
@@ -186,6 +233,7 @@ fn release_response_for_platform(
             platform: os.to_string(),
             arch: arch.to_string(),
             kind: "release-asset",
+            install_mode,
             notes_url: release_url,
             action_url: asset.url,
             checksum_url: asset.checksum_url,
@@ -201,6 +249,7 @@ fn release_response_for_platform(
         platform: os.to_string(),
         arch: arch.to_string(),
         kind: "release-page",
+        install_mode: "external",
         notes_url: release_url.clone(),
         action_url: release_url,
         checksum_url: None,
@@ -227,7 +276,7 @@ fn update_unavailable_response() -> ApiErrorResponse {
 }
 
 fn normalized_version(version: &str) -> String {
-    version.trim().trim_start_matches(['v', 'V']).to_string()
+    normalized_version_str(version).to_string()
 }
 
 fn sane_release_page_url(url: &str, latest_version: &str) -> Option<String> {
@@ -328,10 +377,13 @@ fn sane_release_asset_url(url: &str, expected_name: &str) -> Option<String> {
 }
 
 fn is_version_greater(candidate: &str, current: &str) -> bool {
+    // Release tags must be plain numeric, but the running build may carry a
+    // pre-release suffix ("0.4.0-alpha"); the plain release supersedes it.
     let Some(candidate_parts) = parse_numeric_version(candidate) else {
         return false;
     };
-    let Some(current_parts) = parse_numeric_version(current) else {
+    let (current_numeric, current_is_prerelease) = split_prerelease(current);
+    let Some(current_parts) = parse_numeric_version(current_numeric) else {
         return false;
     };
 
@@ -346,7 +398,18 @@ fn is_version_greater(candidate: &str, current: &str) -> bool {
             return false;
         }
     }
-    false
+    current_is_prerelease
+}
+
+fn split_prerelease(version: &str) -> (&str, bool) {
+    match normalized_version_str(version).split_once('-') {
+        Some((numeric, suffix)) if !suffix.trim().is_empty() => (numeric, true),
+        _ => (normalized_version_str(version), false),
+    }
+}
+
+fn normalized_version_str(version: &str) -> &str {
+    version.trim().trim_start_matches(['v', 'V'])
 }
 
 fn parse_numeric_version(version: &str) -> Option<Vec<u64>> {
@@ -398,6 +461,15 @@ mod tests {
         assert!(!is_version_greater("1.2.4+build", "1.2.3"));
         assert!(!is_version_greater("release-1.2.4", "1.2.3"));
         assert!(!is_version_greater("1.2.4", "dev"));
+    }
+
+    #[test]
+    fn version_comparison_treats_plain_release_as_newer_than_its_prerelease() {
+        assert!(is_version_greater("0.4.0", "0.4.0-alpha"));
+        assert!(is_version_greater("v0.4.1", "0.4.0-alpha"));
+        assert!(!is_version_greater("0.4.0", "0.4.0"));
+        assert!(!is_version_greater("0.3.9", "0.4.0-alpha"));
+        assert!(!is_version_greater("0.4.0", "0.4.1-alpha"));
     }
 
     #[test]
@@ -660,6 +732,7 @@ mod tests {
         assert_eq!(response.kind, "release-asset");
         assert_eq!(response.action_label, "Download update");
         assert_eq!(response.checksum_url, None);
+        assert_eq!(response.install_mode, "external");
         assert_eq!(
             response.notes_url,
             "https://github.com/mateoltd/axial/releases/tag/v1.2.4"
@@ -694,6 +767,7 @@ mod tests {
         );
 
         assert_eq!(response.kind, "release-asset");
+        assert_eq!(response.install_mode, "in-app");
         assert_eq!(
             response.checksum_url.as_deref(),
             Some(

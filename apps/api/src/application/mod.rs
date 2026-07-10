@@ -117,7 +117,10 @@ pub(crate) use skin::flush_pending_saved_skin_applies_for_launch;
 pub use skin::flush_pending_saved_skin_applies_for_shutdown;
 pub use status::{StatusResponse, launcher_status};
 pub use telemetry::{FrontendErrorReportRequest, report_frontend_error};
-pub use update::{UpdateResponse, update_status};
+pub use update::{
+    UpdateDownloadRequest, UpdateFlowResponse, UpdateResponse, apply_staged_update,
+    spawn_update_staging_cleanup, start_update_download, update_flow_state, update_status,
+};
 pub use version::{
     CatalogEntry, CatalogResponse, DeleteVersionRequest, SharedDataInfo, VersionInfoResponse,
     VersionsResponse, WorldInfo, catalog, delete_version, installed_versions,

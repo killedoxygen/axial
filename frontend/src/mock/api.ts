@@ -2,6 +2,7 @@ import type { Config, SystemInfo } from '../types-settings';
 import type { EnrichedInstance } from '../types-instance';
 import type { InstallQueueStateResponse } from '../types-install';
 import type { FeatureFlagViewModel, FlagsResponse } from '../types-flags';
+import type { UpdateFlowState, UpdateInfo } from '../types-update';
 import type { Version } from '../types-version';
 
 type Handler = (body?: unknown, path?: string, request?: MockRequest) => unknown | Promise<unknown>;
@@ -284,7 +285,85 @@ const handlers: Record<string, Handler> = {
     ],
   }),
   'GET /performance/health': () => ({ health: null }),
+  'GET /update': (): UpdateInfo & { checked_at: string } => mockUpdateInfo(),
+  'GET /update/flow': () => mockUpdateFlow(),
+  'POST /update/download': () => startMockUpdateDownload(),
+  'POST /update/apply': () => applyMockUpdate(),
 };
+
+const MOCK_UPDATE_VERSION = '9.9.9';
+const MOCK_UPDATE_TOTAL_BYTES = 48 * 1024 * 1024;
+const MOCK_UPDATE_DOWNLOAD_MS = 6500;
+
+let mockUpdateDownloadStartedAt: number | null = null;
+let mockUpdateApplied = false;
+
+function mockUpdateInfo(): UpdateInfo & { checked_at: string } {
+  return {
+    current_version: 'mock-dev',
+    latest_version: MOCK_UPDATE_VERSION,
+    available: true,
+    platform: 'mock',
+    arch: 'mock',
+    kind: 'release-asset',
+    install_mode: 'in-app',
+    notes_url: `https://github.com/mateoltd/axial/releases/tag/v${MOCK_UPDATE_VERSION}`,
+    action_url: `https://github.com/mateoltd/axial/releases/download/v${MOCK_UPDATE_VERSION}/axial-mock-${MOCK_UPDATE_VERSION}.tar.gz`,
+    checksum_url: null,
+    action_label: 'Download update',
+    checked_at: new Date().toISOString(),
+  };
+}
+
+function mockUpdateFlow(): UpdateFlowState {
+  if (mockUpdateApplied) {
+    return {
+      phase: 'restart-pending',
+      version: MOCK_UPDATE_VERSION,
+      received_bytes: MOCK_UPDATE_TOTAL_BYTES,
+      total_bytes: MOCK_UPDATE_TOTAL_BYTES,
+      percent: 100,
+      message: '',
+    };
+  }
+  if (mockUpdateDownloadStartedAt === null) {
+    return { phase: 'idle', version: '', received_bytes: 0, total_bytes: null, percent: null, message: '' };
+  }
+  const elapsed = Date.now() - mockUpdateDownloadStartedAt;
+  const fraction = Math.min(1, elapsed / MOCK_UPDATE_DOWNLOAD_MS);
+  if (fraction >= 1) {
+    return {
+      phase: 'ready',
+      version: MOCK_UPDATE_VERSION,
+      received_bytes: MOCK_UPDATE_TOTAL_BYTES,
+      total_bytes: MOCK_UPDATE_TOTAL_BYTES,
+      percent: 100,
+      message: '',
+    };
+  }
+  return {
+    phase: 'downloading',
+    version: MOCK_UPDATE_VERSION,
+    received_bytes: Math.round(MOCK_UPDATE_TOTAL_BYTES * fraction),
+    total_bytes: MOCK_UPDATE_TOTAL_BYTES,
+    percent: Math.round(fraction * 100),
+    message: '',
+  };
+}
+
+function startMockUpdateDownload(): UpdateFlowState {
+  if (mockUpdateApplied) throw apiError(409, 'Conflict', { error: 'an update is already applied; restart to finish' });
+  mockUpdateDownloadStartedAt = Date.now();
+  return mockUpdateFlow();
+}
+
+function applyMockUpdate(): UpdateFlowState {
+  if (mockUpdateFlow().phase !== 'ready') {
+    throw apiError(409, 'Conflict', { error: 'no staged update is ready to apply' });
+  }
+  mockUpdateApplied = true;
+  return mockUpdateFlow();
+}
 
 const versionFixtures: Version[] = [
   vanillaVersion('1.21.6', '2025-06-17T12:00:00Z', true),

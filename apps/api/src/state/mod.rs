@@ -14,6 +14,7 @@ pub mod presence;
 pub mod remote_flags;
 mod sessions;
 pub mod skins;
+pub mod updater;
 
 use axial_config::{AppConfig, ConfigStore, ConfigStoreError, InstanceStore, find_flag};
 pub use axial_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
@@ -48,6 +49,7 @@ pub use journals::OperationJournalStore;
 pub use remote_flags::{RemoteFlagRefreshOutcome, RemoteFlagStore};
 pub(crate) use remote_flags::{ResolvedFlagSource, resolve_flag};
 pub use sessions::{SessionStore, StartupOutcome};
+pub use updater::{UpdateFlowPhase, UpdateFlowSnapshot, UpdaterStore};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -67,6 +69,7 @@ pub struct AppState {
     performance: Arc<PerformanceManager>,
     telemetry: Arc<TelemetryHub>,
     remote_flags: Arc<RemoteFlagStore>,
+    updater: Arc<UpdaterStore>,
     startup_warnings: Arc<Vec<String>>,
     config_changes: Arc<broadcast::Sender<()>>,
     library_dir: Arc<RwLock<Option<String>>>,
@@ -117,6 +120,7 @@ impl AppState {
         let remote_flags = Arc::new(RemoteFlagStore::load_from_config_dir(
             &init.config.paths().config_dir,
         ));
+        let updater = Arc::new(UpdaterStore::new(&init.config.paths().config_dir));
         let (config_changes, _) = broadcast::channel(32);
 
         Self {
@@ -136,6 +140,7 @@ impl AppState {
             performance: init.performance,
             telemetry,
             remote_flags,
+            updater,
             startup_warnings: Arc::new(bound_startup_warnings(init.startup_warnings)),
             config_changes: Arc::new(config_changes),
             library_dir: Arc::new(RwLock::new(if library_dir.is_empty() {
@@ -215,6 +220,10 @@ impl AppState {
 
     pub fn remote_flags(&self) -> &Arc<RemoteFlagStore> {
         &self.remote_flags
+    }
+
+    pub fn updater(&self) -> &Arc<UpdaterStore> {
+        &self.updater
     }
 
     pub(crate) fn remote_flags_active_for(&self, config: &AppConfig) -> bool {

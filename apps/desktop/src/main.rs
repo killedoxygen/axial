@@ -6,6 +6,7 @@ mod state;
 use axial_api::app::{
     spawn_background, spawn_benchmark_suite_drivers_resume, spawn_performance_operations_resume,
     spawn_performance_rules_refresh, spawn_remote_flags_refresh, spawn_telemetry_export,
+    spawn_update_staging_cleanup,
 };
 use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
@@ -59,6 +60,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     spawn_performance_rules_refresh(&state);
     spawn_telemetry_export(&state);
     spawn_remote_flags_refresh(&state);
+    spawn_update_staging_cleanup(&state);
     let close_event_state = state.clone();
     let close_event_presence = discord_presence.clone();
     let desktop_state = state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string());

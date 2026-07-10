@@ -426,6 +426,213 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   margin: 4px 2px;
 }
 
+.cp-update-shell {
+  position: relative;
+  z-index: 1;
+  flex-shrink: 0;
+}
+.cp-rail-update {
+  position: relative;
+  color: var(--accent);
+  animation: cp-rail-update-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.cp-rail-update:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.cp-rail-update[data-update-state='available'] {
+  animation:
+    cp-rail-update-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both,
+    cp-rail-update-breathe 2600ms ease-in-out 400ms infinite;
+}
+.cp-rail-update-glyph {
+  display: inline-flex;
+  animation: cp-rail-update-glyph-in 200ms cubic-bezier(0.34, 1.4, 0.64, 1) both;
+}
+.cp-rail-update[data-update-state='downloading'] .cp-rail-update-glyph,
+.cp-rail-update[data-update-state='applying'] .cp-rail-update-glyph {
+  animation: cp-rail-update-bob 1400ms ease-in-out infinite;
+}
+.cp-rail-update[data-update-state='ready'],
+.cp-rail-update[data-update-state='restart-pending'] {
+  color: var(--accent);
+}
+.cp-rail-update-dot {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 2.5px var(--bg-deep);
+}
+.cp-rail-update-ring {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+  pointer-events: none;
+}
+.cp-rail-update-ring circle {
+  fill: none;
+  stroke-width: 2;
+}
+.cp-rail-update-ring-track {
+  stroke: var(--line-strong);
+}
+.cp-rail-update-ring-bar {
+  stroke: var(--accent);
+  stroke-linecap: round;
+  transition: stroke-dashoffset 260ms ease;
+}
+.cp-rail-update-ring[data-indeterminate='true'] {
+  animation: cp-rail-update-spin 1100ms linear infinite;
+}
+.cp-rail-update-ring[data-indeterminate='true'] .cp-rail-update-ring-bar {
+  transition: none;
+}
+
+.cp-update-pop {
+  position: absolute;
+  bottom: 0;
+  left: calc(100% + 10px);
+  width: 252px;
+  background: var(--surface);
+  border: none;
+  border-radius: var(--r-md);
+  padding: 12px;
+  box-shadow: var(--shadow);
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  animation: cp-userm-in 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  transform-origin: left bottom;
+}
+.cp-update-pop-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.cp-update-pop-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+.cp-update-pop-versions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-mute);
+  white-space: nowrap;
+}
+.cp-update-pop-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cp-update-pop-bar {
+  position: relative;
+  height: 6px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
+  overflow: hidden;
+}
+.cp-update-pop-bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 260ms ease;
+}
+.cp-update-pop-bar[data-indeterminate='true'] .cp-update-pop-bar-fill {
+  width: 36%;
+  animation: cp-update-bar-slide 1200ms ease-in-out infinite;
+  transition: none;
+}
+.cp-update-pop-progress-label {
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-mute);
+}
+.cp-update-pop-note {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+.cp-update-pop-note[data-tone='error'] {
+  color: var(--err);
+}
+.cp-update-pop-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+@keyframes cp-rail-update-in {
+  from {
+    opacity: 0;
+    transform: scale(0.7);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes cp-rail-update-glyph-in {
+  from {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes cp-rail-update-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in oklab, var(--accent) 0%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 5px color-mix(in oklab, var(--accent) 14%, transparent);
+  }
+}
+@keyframes cp-rail-update-bob {
+  0%,
+  100% {
+    transform: translateY(-1.5px);
+  }
+  50% {
+    transform: translateY(1.5px);
+  }
+}
+@keyframes cp-rail-update-spin {
+  from {
+    transform: rotate(-90deg);
+  }
+  to {
+    transform: rotate(270deg);
+  }
+}
+@keyframes cp-update-bar-slide {
+  from {
+    left: -36%;
+  }
+  to {
+    left: 100%;
+  }
+}
+
 @keyframes cp-userm-in {
   from {
     opacity: 0;
@@ -455,11 +662,19 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   .cp-status-pill,
   .cp-status-pill .cp-status-mark,
   .cp-status-pill--installing::before,
-  .cp-music-eq > span {
+  .cp-music-eq > span,
+  .cp-rail-update,
+  .cp-rail-update-glyph,
+  .cp-rail-update-ring,
+  .cp-update-pop,
+  .cp-update-pop-bar-fill {
     animation: none !important;
     animation-duration: 0s !important;
     animation-iteration-count: 1 !important;
     transition: none !important;
+  }
+  .cp-update-pop-bar[data-indeterminate='true'] .cp-update-pop-bar-fill {
+    left: 32%;
   }
 }
 

@@ -200,6 +200,10 @@ pub fn spawn_benchmark_suite_drivers_resume(state: &AppState) -> bool {
     crate::application::launch::spawn_restart_interrupted_benchmark_suite_drivers(state)
 }
 
+pub fn spawn_update_staging_cleanup(state: &AppState) {
+    crate::application::spawn_update_staging_cleanup(state);
+}
+
 #[derive(Debug)]
 pub struct ServerHandle {
     pub addr: SocketAddr,

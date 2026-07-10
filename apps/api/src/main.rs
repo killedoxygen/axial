@@ -1,7 +1,7 @@
 use axial_api::app::{
     DEFAULT_API_PORT, build_router, default_frontend_dir, spawn_benchmark_suite_drivers_resume,
     spawn_performance_operations_resume, spawn_performance_rules_refresh,
-    spawn_remote_flags_refresh, spawn_telemetry_export,
+    spawn_remote_flags_refresh, spawn_telemetry_export, spawn_update_staging_cleanup,
 };
 use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
@@ -54,6 +54,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     spawn_performance_rules_refresh(&state);
     spawn_telemetry_export(&state);
     spawn_remote_flags_refresh(&state);
+    spawn_update_staging_cleanup(&state);
 
     let addr = std::env::var("AXIAL_API_ADDR")
         .ok()
