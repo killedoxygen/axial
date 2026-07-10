@@ -1,5 +1,5 @@
 .cp-cr-card {
-  width: min(560px, calc(100vw - 48px));
+  width: min(500px, calc(100vw - 48px));
   height: min(640px, calc(100vh - 48px));
   display: flex;
   flex-direction: column;
