@@ -125,7 +125,7 @@ pub async fn dev_flush(state: &AppState) -> Result<DevFlushResponse, ApiError> {
         .clear_all()
         .await
         .map_err(internal_error)?;
-    let had_accounts = state.accounts().clear_all().map_err(internal_error)?;
+    let had_accounts = state.accounts().clear_all().await.map_err(internal_error)?;
     let cleared_pending_skin_applies = clear_all_pending_saved_skin_applies().await;
 
     if let Some(managed_library_dir) = managed_library_dir_to_remove(&config_paths, &current_config)

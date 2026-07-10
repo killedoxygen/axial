@@ -1,14 +1,23 @@
+#[cfg(test)]
+use crate::execution::persistence::PersistenceCoordinator;
+use crate::execution::persistence::{
+    AcceptedWrite, AtomicSnapshotWriter, PersistenceOwnerLease, WriteUrgency,
+};
+use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use axial_config::{AppPaths, validate_username};
 use axial_minecraft::offline_uuid;
 use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
-    path::{Path, PathBuf},
-    sync::Mutex,
+    path::Path,
+    sync::{Arc, Mutex},
 };
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 const ACCOUNT_STORE_SCHEMA: &str = "axial.accounts";
 const ACCOUNT_STORE_SCHEMA_VERSION: u32 = 1;
+const ACCOUNT_STORE_LOCK_INVARIANT: &str =
+    "launcher account store lock poisoned; committed and persisted state may diverge";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,15 +51,94 @@ struct AccountIndex {
     accounts: Vec<LauncherAccountRecord>,
 }
 
+struct AccountPersistence {
+    owner: PersistenceOwnerLease,
+    writer: AtomicSnapshotWriter,
+}
+
+impl AccountPersistence {
+    fn claim(index_path: &Path) -> io::Result<Self> {
+        let owner = PersistenceOwnerLease::claim(index_path).map_err(io::Error::from)?;
+        Self::writer_for_owner(index_path, owner)
+    }
+
+    #[cfg(test)]
+    fn claim_with_coordinator(
+        index_path: &Path,
+        coordinator: PersistenceCoordinator,
+    ) -> io::Result<Self> {
+        let owner = coordinator
+            .claim_owner(index_path)
+            .map_err(io::Error::from)?;
+        Self::writer_for_owner(index_path, owner)
+    }
+
+    fn writer_for_owner(index_path: &Path, owner: PersistenceOwnerLease) -> io::Result<Self> {
+        let writer = owner
+            .writer(index_path, account_index_target())
+            .map_err(io::Error::from)?;
+        Ok(Self { owner, writer })
+    }
+}
+
+struct AccountState {
+    visible: AccountIndex,
+    retry_candidate: Option<(u64, AccountIndex)>,
+}
+
+struct PendingAccountCommit {
+    ticket: AcceptedWrite,
+    revision: u64,
+    candidate: AccountIndex,
+}
+
+struct AccountMutation {
+    guard: OwnedMutexGuard<()>,
+    reconciliation: Option<AccountReconciliation>,
+}
+
+struct AccountReconciliation {
+    before: AccountIndex,
+    after: AccountIndex,
+}
+
+struct OfflineRenameCandidate {
+    index: AccountIndex,
+    record: LauncherAccountRecord,
+    changed: bool,
+}
+
 pub struct LauncherAccountStore {
-    index_path: PathBuf,
-    lock: Mutex<AccountIndex>,
+    state: Arc<Mutex<AccountState>>,
+    mutation_gate: Arc<AsyncMutex<()>>,
+    persistence: Option<AccountPersistence>,
 }
 
 impl LauncherAccountStore {
     pub fn load_from_paths(paths: &AppPaths) -> Self {
+        Self::try_load_from_paths(paths).unwrap_or_else(|error| {
+            panic!("failed to initialize launcher account persistence: {error}")
+        })
+    }
+
+    pub fn try_load_from_paths(paths: &AppPaths) -> io::Result<Self> {
         let index_path = paths.config_dir.join("accounts.json");
-        let index = match load_index(&index_path) {
+        let persistence = AccountPersistence::claim(&index_path)?;
+        Ok(Self::load_with_persistence(&index_path, Some(persistence)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_load_from_paths_with_coordinator(
+        paths: &AppPaths,
+        coordinator: PersistenceCoordinator,
+    ) -> io::Result<Self> {
+        let index_path = paths.config_dir.join("accounts.json");
+        let persistence = AccountPersistence::claim_with_coordinator(&index_path, coordinator)?;
+        Ok(Self::load_with_persistence(&index_path, Some(persistence)))
+    }
+
+    fn load_with_persistence(index_path: &Path, persistence: Option<AccountPersistence>) -> Self {
+        let index = match load_index(index_path) {
             Ok(index) => index,
             Err(error) => {
                 tracing::warn!("account store could not be loaded; starting empty: {error}");
@@ -59,14 +147,18 @@ impl LauncherAccountStore {
         };
 
         Self {
-            index_path,
-            lock: Mutex::new(index),
+            state: Arc::new(Mutex::new(AccountState {
+                visible: index,
+                retry_candidate: None,
+            })),
+            mutation_gate: Arc::new(AsyncMutex::new(())),
+            persistence,
         }
     }
 
-    pub fn list(&self) -> io::Result<Vec<LauncherAccountRecord>> {
-        let guard = self.lock.lock().map_err(|_| lock_error())?;
-        let mut accounts = guard.accounts.clone();
+    pub fn list(&self) -> Vec<LauncherAccountRecord> {
+        let state = self.state.lock().expect(ACCOUNT_STORE_LOCK_INVARIANT);
+        let mut accounts = state.visible.accounts.clone();
         accounts.sort_by(|left, right| {
             kind_order(left.kind)
                 .cmp(&kind_order(right.kind))
@@ -74,29 +166,34 @@ impl LauncherAccountStore {
                 .then_with(|| left.display_name.cmp(&right.display_name))
                 .then_with(|| left.account_id.cmp(&right.account_id))
         });
-        Ok(accounts)
+        accounts
     }
 
-    pub fn active_account_id(&self) -> io::Result<Option<String>> {
-        let guard = self.lock.lock().map_err(|_| lock_error())?;
-        Ok(guard.active_account_id.clone())
+    pub fn active_account_id(&self) -> Option<String> {
+        self.state
+            .lock()
+            .expect(ACCOUNT_STORE_LOCK_INVARIANT)
+            .visible
+            .active_account_id
+            .clone()
     }
 
-    pub fn active_account(&self) -> io::Result<Option<LauncherAccountRecord>> {
-        let guard = self.lock.lock().map_err(|_| lock_error())?;
-        let Some(active_account_id) = guard.active_account_id.as_deref() else {
-            return Ok(None);
-        };
-        Ok(guard
+    pub fn active_account(&self) -> Option<LauncherAccountRecord> {
+        let state = self.state.lock().expect(ACCOUNT_STORE_LOCK_INVARIANT);
+        let active_account_id = state.visible.active_account_id.as_deref()?;
+        state
+            .visible
             .accounts
             .iter()
             .find(|account| account.account_id == active_account_id)
-            .cloned())
+            .cloned()
     }
 
-    pub fn select(&self, account_id: &str) -> io::Result<Option<LauncherAccountRecord>> {
-        let mut guard = self.lock.lock().map_err(|_| lock_error())?;
-        let mut next = guard.clone();
+    pub async fn select(&self, account_id: &str) -> io::Result<Option<LauncherAccountRecord>> {
+        let AccountMutation {
+            guard: mutation, ..
+        } = self.begin_mutation().await?;
+        let mut next = self.committed_candidate()?;
         let Some(account) = next
             .accounts
             .iter()
@@ -105,13 +202,15 @@ impl LauncherAccountStore {
         else {
             return Ok(None);
         };
+        if next.active_account_id.as_deref() == Some(account.account_id.as_str()) {
+            return Ok(Some(account));
+        }
         next.active_account_id = Some(account.account_id.clone());
-        self.persist_index(&next)?;
-        *guard = next;
+        self.commit(next, mutation).await?;
         Ok(Some(account))
     }
 
-    pub fn upsert_microsoft_account(
+    pub async fn upsert_microsoft_account(
         &self,
         login_id: &str,
         minecraft_profile_id: &str,
@@ -123,9 +222,10 @@ impl LauncherAccountStore {
             display_name,
             true,
         )
+        .await
     }
 
-    pub fn sync_microsoft_account(
+    pub async fn sync_microsoft_account(
         &self,
         login_id: &str,
         minecraft_profile_id: &str,
@@ -138,9 +238,10 @@ impl LauncherAccountStore {
             display_name,
             select,
         )
+        .await
     }
 
-    fn upsert_microsoft_account_with_selection(
+    async fn upsert_microsoft_account_with_selection(
         &self,
         login_id: &str,
         minecraft_profile_id: &str,
@@ -152,8 +253,10 @@ impl LauncherAccountStore {
         let display_name = require_nonblank(display_name, "display name")?;
         let now = chrono::Utc::now().to_rfc3339();
 
-        let mut guard = self.lock.lock().map_err(|_| lock_error())?;
-        let mut next = guard.clone();
+        let AccountMutation {
+            guard: mutation, ..
+        } = self.begin_mutation().await?;
+        let mut next = self.committed_candidate()?;
         let existing_position = next.accounts.iter().position(|account| {
             account.kind == LauncherAccountKind::Microsoft
                 && (account.login_id.as_deref() == Some(login_id.as_str())
@@ -185,20 +288,24 @@ impl LauncherAccountStore {
         if select {
             next.active_account_id = Some(record.account_id.clone());
         }
-        self.persist_index(&next)?;
-        *guard = next;
+        self.commit(next, mutation).await?;
         Ok(record)
     }
 
-    pub fn create_offline_account(&self, username: &str) -> io::Result<LauncherAccountRecord> {
+    pub async fn create_offline_account(
+        &self,
+        username: &str,
+    ) -> io::Result<LauncherAccountRecord> {
         let display_name =
             validate_username(username).map_err(|error| invalid_input(error.to_string()))?;
         let uuid = offline_uuid(&display_name);
         let account_id = offline_account_id(&uuid);
         let now = chrono::Utc::now().to_rfc3339();
 
-        let mut guard = self.lock.lock().map_err(|_| lock_error())?;
-        let mut next = guard.clone();
+        let AccountMutation {
+            guard: mutation, ..
+        } = self.begin_mutation().await?;
+        let mut next = self.committed_candidate()?;
         let existing_position = next.accounts.iter().position(|account| {
             account.kind == LauncherAccountKind::Offline
                 && account.offline_uuid.as_deref() == Some(uuid.as_str())
@@ -223,12 +330,11 @@ impl LauncherAccountStore {
             next.accounts.push(record.clone());
         }
         next.active_account_id = Some(record.account_id.clone());
-        self.persist_index(&next)?;
-        *guard = next;
+        self.commit(next, mutation).await?;
         Ok(record)
     }
 
-    pub fn rename_offline_account(
+    pub async fn rename_offline_account(
         &self,
         account_id: &str,
         username: &str,
@@ -236,148 +342,283 @@ impl LauncherAccountStore {
         let display_name =
             validate_username(username).map_err(|error| invalid_input(error.to_string()))?;
         let uuid = offline_uuid(&display_name);
-        let next_account_id = offline_account_id(&uuid);
         let now = chrono::Utc::now().to_rfc3339();
 
-        let mut guard = self.lock.lock().map_err(|_| lock_error())?;
-        let mut next = guard.clone();
-        let Some(position) = next.accounts.iter().position(|account| {
-            account.account_id == account_id && account.kind == LauncherAccountKind::Offline
-        }) else {
-            return Ok(None);
+        let AccountMutation {
+            guard: mutation,
+            reconciliation,
+        } = self.begin_mutation().await?;
+        let current = self.committed_candidate()?;
+        let Some(rename) =
+            rename_offline_candidate(&current, account_id, &display_name, &uuid, &now)?
+        else {
+            return Ok(reconciled_rename_outcome(
+                reconciliation.as_ref(),
+                account_id,
+                &display_name,
+                &uuid,
+            ));
         };
-        if next
-            .accounts
-            .iter()
-            .enumerate()
-            .any(|(candidate_position, account)| {
-                candidate_position != position
-                    && account.kind == LauncherAccountKind::Offline
-                    && account.offline_uuid.as_deref() == Some(uuid.as_str())
-            })
-        {
-            return Err(invalid_input("offline account already exists"));
+        if !rename.changed {
+            return Ok(Some(rename.record));
         }
-
-        let created_at = next.accounts[position].created_at.clone();
-        let record = LauncherAccountRecord {
-            account_id: next_account_id,
-            kind: LauncherAccountKind::Offline,
-            display_name,
-            login_id: None,
-            minecraft_profile_id: None,
-            offline_uuid: Some(uuid),
-            created_at,
-            updated_at: now,
-        };
-        let was_active = next.active_account_id.as_deref() == Some(account_id);
-        next.accounts[position] = record.clone();
-        if was_active {
-            next.active_account_id = Some(record.account_id.clone());
-        }
-        self.persist_index(&next)?;
-        *guard = next;
-        Ok(Some(record))
+        self.commit(rename.index, mutation).await?;
+        Ok(Some(rename.record))
     }
 
-    pub fn remove(&self, account_id: &str) -> io::Result<Option<LauncherAccountRecord>> {
-        let mut guard = self.lock.lock().map_err(|_| lock_error())?;
-        let mut next = guard.clone();
-        let Some(position) = next
-            .accounts
-            .iter()
-            .position(|account| account.account_id == account_id)
-        else {
-            return Ok(None);
+    pub async fn remove(&self, account_id: &str) -> io::Result<Option<LauncherAccountRecord>> {
+        let AccountMutation {
+            guard: mutation,
+            reconciliation,
+        } = self.begin_mutation().await?;
+        let current = self.committed_candidate()?;
+        let Some((next, removed)) = remove_account_candidate(&current, account_id) else {
+            return Ok(reconciled_remove_outcome(
+                reconciliation.as_ref(),
+                account_id,
+            ));
         };
-        let removed = next.accounts.remove(position);
-        if next.active_account_id.as_deref() == Some(removed.account_id.as_str()) {
-            next.active_account_id = next
-                .accounts
-                .iter()
-                .find(|account| account.kind == LauncherAccountKind::Offline)
-                .map(|account| account.account_id.clone());
-        }
-        self.persist_index(&next)?;
-        *guard = next;
+        self.commit(next, mutation).await?;
         Ok(Some(removed))
     }
 
-    pub fn remove_microsoft_login(
+    pub async fn remove_microsoft_login(
         &self,
         login_id: &str,
     ) -> io::Result<Option<LauncherAccountRecord>> {
-        let account_id = {
-            let guard = self.lock.lock().map_err(|_| lock_error())?;
-            guard
-                .accounts
-                .iter()
-                .find(|account| {
-                    account.kind == LauncherAccountKind::Microsoft
-                        && account.login_id.as_deref() == Some(login_id)
-                })
-                .map(|account| account.account_id.clone())
+        let AccountMutation {
+            guard: mutation,
+            reconciliation,
+        } = self.begin_mutation().await?;
+        let current = self.committed_candidate()?;
+        let Some((next, removed)) = remove_microsoft_login_candidate(&current, login_id) else {
+            return Ok(reconciled_remove_microsoft_login_outcome(
+                reconciliation.as_ref(),
+                login_id,
+            ));
         };
-        match account_id {
-            Some(account_id) => self.remove(&account_id),
-            None => Ok(None),
-        }
+        self.commit(next, mutation).await?;
+        Ok(Some(removed))
     }
 
-    pub fn remove_all_microsoft_accounts(&self) -> io::Result<bool> {
-        let mut guard = self.lock.lock().map_err(|_| lock_error())?;
-        let mut next = guard.clone();
-        let previous_len = next.accounts.len();
-        next.accounts
-            .retain(|account| account.kind != LauncherAccountKind::Microsoft);
-        let removed_any = next.accounts.len() != previous_len;
-        let active_missing = next.active_account_id.as_ref().is_some_and(|account_id| {
-            !next
-                .accounts
-                .iter()
-                .any(|account| &account.account_id == account_id)
-        });
-        if active_missing {
-            next.active_account_id = next
-                .accounts
-                .iter()
-                .find(|account| account.kind == LauncherAccountKind::Offline)
-                .map(|account| account.account_id.clone());
-        }
-        if !removed_any && !active_missing {
-            return Ok(false);
-        }
-        self.persist_index(&next)?;
-        *guard = next;
-        Ok(removed_any)
+    pub async fn remove_all_microsoft_accounts(&self) -> io::Result<bool> {
+        let AccountMutation {
+            guard: mutation,
+            reconciliation,
+        } = self.begin_mutation().await?;
+        let current = self.committed_candidate()?;
+        let Some(next) = remove_all_microsoft_candidate(&current) else {
+            return Ok(reconciled_remove_all_microsoft_outcome(
+                reconciliation.as_ref(),
+            ));
+        };
+        self.commit(next, mutation).await?;
+        Ok(true)
     }
 
-    pub fn clear_all(&self) -> io::Result<bool> {
-        let mut guard = self.lock.lock().map_err(|_| lock_error())?;
-        let had_accounts = !guard.accounts.is_empty() || guard.active_account_id.is_some();
+    pub async fn clear_all(&self) -> io::Result<bool> {
+        let AccountMutation {
+            guard: mutation,
+            reconciliation,
+        } = self.begin_mutation().await?;
+        let current = self.committed_candidate()?;
+        let had_accounts = !current.accounts.is_empty() || current.active_account_id.is_some();
+        if !had_accounts {
+            return Ok(reconciled_clear_all_outcome(reconciliation.as_ref()));
+        }
         let next = empty_index();
-        self.persist_index(&next)?;
-        *guard = next;
+        self.commit(next, mutation).await?;
         Ok(had_accounts)
     }
 
-    fn persist_index(&self, index: &AccountIndex) -> io::Result<()> {
-        if let Some(parent) = self.index_path.parent() {
-            fs::create_dir_all(parent)?;
+    pub async fn retry(&self) -> io::Result<()> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        if self
+            .state
+            .lock()
+            .expect(ACCOUNT_STORE_LOCK_INVARIANT)
+            .retry_candidate
+            .is_none()
+        {
+            return Err(retry_unavailable());
         }
-        let data = serde_json::to_string_pretty(index)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let temp_path = self.index_path.with_extension("json.tmp");
-        fs::write(&temp_path, data)?;
-        replace_file(&temp_path, &self.index_path)
+        let mutation = self.reconcile_retry_candidate(mutation).await?;
+        drop(mutation);
+        Ok(())
+    }
+
+    pub async fn flush(&self) -> io::Result<()> {
+        let _mutation = self.begin_mutation().await?;
+        if let Some(persistence) = &self.persistence {
+            persistence.owner.flush().await.map_err(io::Error::from)?;
+        }
+        Ok(())
+    }
+
+    pub async fn close(&self) -> io::Result<()> {
+        let _mutation = self.begin_mutation().await?;
+        if let Some(persistence) = &self.persistence {
+            persistence.owner.close().await.map_err(io::Error::from)?;
+        }
+        Ok(())
+    }
+
+    async fn begin_mutation(&self) -> io::Result<AccountMutation> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        self.reconcile_retry_candidate(mutation).await
+    }
+
+    async fn reconcile_retry_candidate(
+        &self,
+        mutation: OwnedMutexGuard<()>,
+    ) -> io::Result<AccountMutation> {
+        let (before, retained) = {
+            let state = self.state.lock().expect(ACCOUNT_STORE_LOCK_INVARIANT);
+            (
+                state.visible.clone(),
+                state
+                    .retry_candidate
+                    .as_ref()
+                    .map(|(revision, candidate)| (*revision, candidate.clone())),
+            )
+        };
+        let Some((candidate_revision, candidate)) = retained else {
+            return Ok(AccountMutation {
+                guard: mutation,
+                reconciliation: None,
+            });
+        };
+        let Some(persistence) = &self.persistence else {
+            self.state
+                .lock()
+                .expect(ACCOUNT_STORE_LOCK_INVARIANT)
+                .retry_candidate = None;
+            return Ok(AccountMutation {
+                guard: mutation,
+                reconciliation: None,
+            });
+        };
+        let ticket = persistence.writer.retry().map_err(io::Error::from)?;
+        let revision = ticket.revision().get();
+        assert_eq!(
+            revision, candidate_revision,
+            "launcher account retry revision diverged from the retained candidate"
+        );
+        let after = candidate.clone();
+        let guard = self
+            .await_commit_holding_gate(
+                Some(PendingAccountCommit {
+                    ticket,
+                    revision,
+                    candidate,
+                }),
+                mutation,
+            )
+            .await?;
+        Ok(AccountMutation {
+            guard,
+            reconciliation: Some(AccountReconciliation { before, after }),
+        })
+    }
+
+    fn committed_candidate(&self) -> io::Result<AccountIndex> {
+        let state = self.state.lock().expect(ACCOUNT_STORE_LOCK_INVARIANT);
+        if state.retry_candidate.is_some() {
+            return Err(retry_required());
+        }
+        Ok(state.visible.clone())
+    }
+
+    async fn commit(
+        &self,
+        candidate: AccountIndex,
+        mutation: OwnedMutexGuard<()>,
+    ) -> io::Result<()> {
+        let Some(persistence) = &self.persistence else {
+            self.state
+                .lock()
+                .expect(ACCOUNT_STORE_LOCK_INVARIANT)
+                .visible = candidate;
+            drop(mutation);
+            return Ok(());
+        };
+        let ticket = persistence
+            .writer
+            .accept(candidate.clone(), WriteUrgency::Immediate, encode_index)
+            .map_err(io::Error::from)?;
+        let revision = ticket.revision().get();
+        self.await_commit(
+            Some(PendingAccountCommit {
+                ticket,
+                revision,
+                candidate,
+            }),
+            mutation,
+        )
+        .await
+    }
+
+    async fn await_commit(
+        &self,
+        commit: Option<PendingAccountCommit>,
+        mutation: OwnedMutexGuard<()>,
+    ) -> io::Result<()> {
+        let mutation = self.await_commit_holding_gate(commit, mutation).await?;
+        drop(mutation);
+        Ok(())
+    }
+
+    async fn await_commit_holding_gate(
+        &self,
+        commit: Option<PendingAccountCommit>,
+        mutation: OwnedMutexGuard<()>,
+    ) -> io::Result<OwnedMutexGuard<()>> {
+        let Some(commit) = commit else {
+            return Ok(mutation);
+        };
+        let state = self.state.clone();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        commit.ticket.observe(move |result| {
+            let result = match result {
+                Ok(_) => {
+                    let mut state = state.lock().expect(ACCOUNT_STORE_LOCK_INVARIANT);
+                    state.visible = commit.candidate;
+                    if state
+                        .retry_candidate
+                        .as_ref()
+                        .is_some_and(|(revision, _)| *revision == commit.revision)
+                    {
+                        state.retry_candidate = None;
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    state
+                        .lock()
+                        .expect(ACCOUNT_STORE_LOCK_INVARIANT)
+                        .retry_candidate = Some((commit.revision, commit.candidate));
+                    Err(io::Error::from(error))
+                }
+            };
+            let _ = completed_tx.send((result, mutation));
+        });
+        let (result, mutation) = completed_rx.await.map_err(|_| {
+            io::Error::other("launcher account commit observer stopped before reporting completion")
+        })?;
+        result?;
+        Ok(mutation)
     }
 }
 
 impl Default for LauncherAccountStore {
     fn default() -> Self {
         Self {
-            index_path: PathBuf::new(),
-            lock: Mutex::new(empty_index()),
+            state: Arc::new(Mutex::new(AccountState {
+                visible: empty_index(),
+                retry_candidate: None,
+            })),
+            mutation_gate: Arc::new(AsyncMutex::new(())),
+            persistence: None,
         }
     }
 }
@@ -388,6 +629,187 @@ pub fn microsoft_account_id(login_id: &str) -> String {
 
 pub fn offline_account_id(uuid: &str) -> String {
     format!("offline-{}", account_id_component(uuid))
+}
+
+fn rename_offline_candidate(
+    current: &AccountIndex,
+    account_id: &str,
+    display_name: &str,
+    uuid: &str,
+    updated_at: &str,
+) -> io::Result<Option<OfflineRenameCandidate>> {
+    let mut next = current.clone();
+    let Some(position) = next.accounts.iter().position(|account| {
+        account.account_id == account_id && account.kind == LauncherAccountKind::Offline
+    }) else {
+        return Ok(None);
+    };
+    if next.accounts[position].display_name == display_name
+        && next.accounts[position].offline_uuid.as_deref() == Some(uuid)
+    {
+        return Ok(Some(OfflineRenameCandidate {
+            index: next.clone(),
+            record: next.accounts[position].clone(),
+            changed: false,
+        }));
+    }
+    if next
+        .accounts
+        .iter()
+        .enumerate()
+        .any(|(candidate_position, account)| {
+            candidate_position != position
+                && account.kind == LauncherAccountKind::Offline
+                && account.offline_uuid.as_deref() == Some(uuid)
+        })
+    {
+        return Err(invalid_input("offline account already exists"));
+    }
+
+    let record = LauncherAccountRecord {
+        account_id: offline_account_id(uuid),
+        kind: LauncherAccountKind::Offline,
+        display_name: display_name.to_string(),
+        login_id: None,
+        minecraft_profile_id: None,
+        offline_uuid: Some(uuid.to_string()),
+        created_at: next.accounts[position].created_at.clone(),
+        updated_at: updated_at.to_string(),
+    };
+    let was_active = next.active_account_id.as_deref() == Some(account_id);
+    next.accounts[position] = record.clone();
+    if was_active {
+        next.active_account_id = Some(record.account_id.clone());
+    }
+    Ok(Some(OfflineRenameCandidate {
+        index: next,
+        record,
+        changed: true,
+    }))
+}
+
+fn reconciled_rename_outcome(
+    reconciliation: Option<&AccountReconciliation>,
+    account_id: &str,
+    display_name: &str,
+    uuid: &str,
+) -> Option<LauncherAccountRecord> {
+    let reconciliation = reconciliation?;
+    let next_account_id = offline_account_id(uuid);
+    let updated_at = reconciliation
+        .after
+        .accounts
+        .iter()
+        .find(|account| {
+            account.account_id == next_account_id
+                && account.kind == LauncherAccountKind::Offline
+                && account.display_name == display_name
+                && account.offline_uuid.as_deref() == Some(uuid)
+        })?
+        .updated_at
+        .clone();
+    let rename = rename_offline_candidate(
+        &reconciliation.before,
+        account_id,
+        display_name,
+        uuid,
+        &updated_at,
+    )
+    .ok()??;
+    (rename.changed && rename.index == reconciliation.after).then_some(rename.record)
+}
+
+fn remove_account_candidate(
+    current: &AccountIndex,
+    account_id: &str,
+) -> Option<(AccountIndex, LauncherAccountRecord)> {
+    let mut next = current.clone();
+    let position = next
+        .accounts
+        .iter()
+        .position(|account| account.account_id == account_id)?;
+    let removed = next.accounts.remove(position);
+    if next.active_account_id.as_deref() == Some(removed.account_id.as_str()) {
+        next.active_account_id = next
+            .accounts
+            .iter()
+            .find(|account| account.kind == LauncherAccountKind::Offline)
+            .map(|account| account.account_id.clone());
+    }
+    Some((next, removed))
+}
+
+fn reconciled_remove_outcome(
+    reconciliation: Option<&AccountReconciliation>,
+    account_id: &str,
+) -> Option<LauncherAccountRecord> {
+    let reconciliation = reconciliation?;
+    let (candidate, removed) = remove_account_candidate(&reconciliation.before, account_id)?;
+    (candidate == reconciliation.after).then_some(removed)
+}
+
+fn remove_microsoft_login_candidate(
+    current: &AccountIndex,
+    login_id: &str,
+) -> Option<(AccountIndex, LauncherAccountRecord)> {
+    let account_id = current
+        .accounts
+        .iter()
+        .find(|account| {
+            account.kind == LauncherAccountKind::Microsoft
+                && account.login_id.as_deref() == Some(login_id)
+        })?
+        .account_id
+        .clone();
+    remove_account_candidate(current, &account_id)
+}
+
+fn reconciled_remove_microsoft_login_outcome(
+    reconciliation: Option<&AccountReconciliation>,
+    login_id: &str,
+) -> Option<LauncherAccountRecord> {
+    let reconciliation = reconciliation?;
+    let (candidate, removed) = remove_microsoft_login_candidate(&reconciliation.before, login_id)?;
+    (candidate == reconciliation.after).then_some(removed)
+}
+
+fn remove_all_microsoft_candidate(current: &AccountIndex) -> Option<AccountIndex> {
+    let mut next = current.clone();
+    let previous_len = next.accounts.len();
+    next.accounts
+        .retain(|account| account.kind != LauncherAccountKind::Microsoft);
+    let removed_any = next.accounts.len() != previous_len;
+    let active_missing = next.active_account_id.as_ref().is_some_and(|account_id| {
+        !next
+            .accounts
+            .iter()
+            .any(|account| &account.account_id == account_id)
+    });
+    if active_missing {
+        next.active_account_id = next
+            .accounts
+            .iter()
+            .find(|account| account.kind == LauncherAccountKind::Offline)
+            .map(|account| account.account_id.clone());
+    }
+    (removed_any || active_missing).then_some(next)
+}
+
+fn reconciled_remove_all_microsoft_outcome(reconciliation: Option<&AccountReconciliation>) -> bool {
+    let Some(reconciliation) = reconciliation else {
+        return false;
+    };
+    remove_all_microsoft_candidate(&reconciliation.before)
+        .is_some_and(|candidate| candidate == reconciliation.after)
+}
+
+fn reconciled_clear_all_outcome(reconciliation: Option<&AccountReconciliation>) -> bool {
+    let Some(reconciliation) = reconciliation else {
+        return false;
+    };
+    let had_accounts = !reconciliation.before.accounts.is_empty()
+        || reconciliation.before.active_account_id.is_some();
+    had_accounts && reconciliation.after == empty_index()
 }
 
 fn load_index(path: &Path) -> io::Result<AccountIndex> {
@@ -432,29 +854,18 @@ fn empty_index() -> AccountIndex {
     }
 }
 
-fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    let first_error = match fs::rename(source, destination) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
+fn account_index_target() -> TargetDescriptor {
+    TargetDescriptor::new(
+        StabilizationSystem::State,
+        TargetKind::Account,
+        "launcher_accounts",
+        OwnershipClass::LauncherManaged,
+    )
+}
 
-    match fs::symlink_metadata(source) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(first_error),
-        Err(error) => return Err(error),
-    }
-
-    if destination.exists() && !destination.is_dir() {
-        let _ = fs::remove_file(destination);
-    }
-
-    match fs::rename(source, destination) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(source);
-            Err(error)
-        }
-    }
+fn encode_index(index: AccountIndex) -> io::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(&index)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn kind_order(kind: LauncherAccountKind) -> u8 {
@@ -476,8 +887,18 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-fn lock_error() -> io::Error {
-    io::Error::other("account store lock poisoned")
+fn retry_required() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "launcher account persistence retry is required",
+    )
+}
+
+fn retry_unavailable() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        "launcher account persistence retry is unavailable",
+    )
 }
 
 fn account_id_component(value: &str) -> String {
@@ -490,148 +911,740 @@ fn account_id_component(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::execution::file::{FileWriteRequest, atomic_temp_path_for, write_file_atomically};
+    use crate::execution::persistence::AtomicWriteBackend;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::sync::Notify;
 
-    #[test]
-    fn account_store_does_not_create_offline_account_from_config_username() {
-        let root = test_root("empty");
-        let paths = test_paths(&root);
-        let store = LauncherAccountStore::load_from_paths(&paths);
-
-        assert_eq!(store.list().expect("list accounts"), Vec::new());
-        assert_eq!(store.active_account().expect("active account"), None);
-
-        let _ = fs::remove_dir_all(root);
+    struct RecordingFileBackend {
+        attempts: AtomicUsize,
+        failures: AtomicUsize,
+        committed: Mutex<Vec<Vec<u8>>>,
+        started: Notify,
+        gate: Mutex<Option<Arc<WriteGate>>>,
     }
 
-    #[test]
-    fn account_store_keeps_same_name_online_and_offline_distinct() {
-        let root = test_root("same-name");
-        let paths = test_paths(&root);
-        let store = LauncherAccountStore::load_from_paths(&paths);
+    struct WriteGate {
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
 
+    struct WriteGateHandle(Arc<WriteGate>);
+
+    impl RecordingFileBackend {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                failures: AtomicUsize::new(0),
+                committed: Mutex::new(Vec::new()),
+                started: Notify::new(),
+                gate: Mutex::new(None),
+            }
+        }
+
+        fn fail_next(&self) {
+            self.failures.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn committed_indexes(&self) -> Vec<AccountIndex> {
+            self.committed
+                .lock()
+                .expect("committed snapshot lock")
+                .iter()
+                .map(|contents| serde_json::from_slice(contents).expect("decode account snapshot"))
+                .collect()
+        }
+
+        async fn wait_for_attempt(&self, expected: usize) {
+            loop {
+                let started = self.started.notified();
+                if self.attempts.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                started.await;
+            }
+        }
+
+        fn gate_next(&self) -> WriteGateHandle {
+            let gate = Arc::new(WriteGate {
+                released: Mutex::new(false),
+                changed: Condvar::new(),
+            });
+            *self.gate.lock().expect("backend gate lock") = Some(gate.clone());
+            WriteGateHandle(gate)
+        }
+    }
+
+    impl AtomicWriteBackend for RecordingFileBackend {
+        fn write(
+            &self,
+            target: &TargetDescriptor,
+            destination: &Path,
+            contents: &[u8],
+        ) -> io::Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            if let Some(gate) = self.gate.lock().expect("backend gate lock").take() {
+                gate.wait();
+            }
+            if self
+                .failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |failures| {
+                    (failures > 0).then(|| failures - 1)
+                })
+                .is_ok()
+            {
+                return Err(io::Error::other("injected account snapshot write failure"));
+            }
+            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
+                .map(|_| ())
+                .map_err(io::Error::from)?;
+            self.committed
+                .lock()
+                .expect("committed snapshot lock")
+                .push(contents.to_vec());
+            Ok(())
+        }
+    }
+
+    impl WriteGate {
+        fn release(&self) {
+            *self.released.lock().expect("write gate lock") = true;
+            self.changed.notify_all();
+        }
+
+        fn wait(&self) {
+            let mut released = self.released.lock().expect("write gate lock");
+            while !*released {
+                released = self.changed.wait(released).expect("wait on write gate");
+            }
+        }
+    }
+
+    impl WriteGateHandle {
+        fn release(&self) {
+            self.0.release();
+        }
+    }
+
+    impl Drop for WriteGateHandle {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    fn persistence_fixture(
+        name: &str,
+    ) -> (
+        PathBuf,
+        AppPaths,
+        Arc<RecordingFileBackend>,
+        PersistenceCoordinator,
+        LauncherAccountStore,
+    ) {
+        let root = test_root(name);
+        let paths = test_paths(&root);
+        let backend = Arc::new(RecordingFileBackend::new());
+        let coordinator = PersistenceCoordinator::for_test(
+            backend.clone(),
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        );
+        let store =
+            LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator.clone())
+                .expect("claim account persistence");
+        (root, paths, backend, coordinator, store)
+    }
+
+    #[tokio::test]
+    async fn account_store_keeps_same_name_online_and_offline_distinct() {
+        let (root, _, _, _, store) = persistence_fixture("same-name");
         let microsoft = store
             .upsert_microsoft_account("msa-1", "profile-1", "Mateo")
+            .await
             .expect("upsert microsoft account");
         let offline = store
             .create_offline_account("Mateo")
+            .await
             .expect("create offline account");
 
         assert_ne!(microsoft.account_id, offline.account_id);
-        assert_eq!(microsoft.kind, LauncherAccountKind::Microsoft);
-        assert_eq!(offline.kind, LauncherAccountKind::Offline);
-        assert_eq!(
-            store.active_account().expect("active account").as_ref(),
-            Some(&offline)
-        );
-
+        assert_eq!(store.active_account().as_ref(), Some(&offline));
+        store.close().await.expect("close account store");
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn account_store_persists_active_selection() {
-        let root = test_root("persist-active");
-        let paths = test_paths(&root);
-        let store = LauncherAccountStore::load_from_paths(&paths);
-        let microsoft = store
-            .upsert_microsoft_account("msa-1", "profile-1", "Mateo")
-            .expect("upsert microsoft account");
-        let offline = store
-            .create_offline_account("Player")
-            .expect("create offline account");
+    #[tokio::test]
+    async fn accepted_snapshot_is_hidden_until_physical_commit() {
+        let (root, _, backend, _, store) = persistence_fixture("gated-visibility");
+        let store = Arc::new(store);
+        let gate = backend.gate_next();
+        let task_store = store.clone();
+        let task =
+            tokio::spawn(async move { task_store.create_offline_account("LocalUser").await });
 
+        backend.wait_for_attempt(1).await;
+        assert!(store.list().is_empty());
+        gate.release();
+        let account = task
+            .await
+            .expect("join account mutation")
+            .expect("commit account");
+
+        assert_eq!(store.active_account(), Some(account));
+        store.close().await.expect("close account store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_cannot_cancel_promotion_or_release_serialization() {
+        let (root, paths, backend, coordinator, store) = persistence_fixture("cancelled-caller");
+        let store = Arc::new(store);
+        let gate = backend.gate_next();
+        let task_store = store.clone();
+        let task =
+            tokio::spawn(async move { task_store.create_offline_account("LocalUser").await });
+
+        backend.wait_for_attempt(1).await;
+        task.abort();
+        assert!(task.await.expect_err("caller is cancelled").is_cancelled());
+        assert!(store.list().is_empty());
+        gate.release();
         store
-            .select(&microsoft.account_id)
-            .expect("select microsoft account");
-        let reloaded = LauncherAccountStore::load_from_paths(&paths);
+            .flush()
+            .await
+            .expect("observer releases mutation gate");
 
-        assert_eq!(
-            reloaded.active_account().expect("active account").as_ref(),
-            Some(&microsoft)
+        assert_eq!(store.list().len(), 1);
+        store.close().await.expect("close first account store");
+        drop(store);
+        let reloaded =
+            LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("reload committed account");
+        assert_eq!(reloaded.list().len(), 1);
+        reloaded.close().await.expect("close reloaded store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancelled_reconciliation_commits_exact_candidate_before_releasing_gate() {
+        let (root, paths, backend, coordinator, store) =
+            persistence_fixture("cancelled-reconciliation");
+        let store = Arc::new(store);
+        backend.fail_next();
+        store
+            .create_offline_account("FirstUser")
+            .await
+            .expect_err("initial write fails");
+        let gate = backend.gate_next();
+        let task_store = store.clone();
+        let task =
+            tokio::spawn(async move { task_store.create_offline_account("LaterUser").await });
+
+        backend.wait_for_attempt(2).await;
+        task.abort();
+        assert!(task.await.expect_err("caller is cancelled").is_cancelled());
+        assert!(store.list().is_empty());
+        gate.release();
+        store
+            .flush()
+            .await
+            .expect("retry observer releases mutation gate");
+
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.list()[0].display_name, "FirstUser");
+        assert_eq!(backend.committed_indexes().len(), 1);
+        store.close().await.expect("close account store");
+        drop(store);
+        let reloaded =
+            LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("reload reconciled account");
+        assert_eq!(reloaded.list()[0].display_name, "FirstUser");
+        reloaded.close().await.expect("close reloaded store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn later_mutation_reconciles_exact_failed_candidate_before_deriving_its_snapshot() {
+        let (root, paths, backend, coordinator, store) = persistence_fixture("exact-retry");
+        backend.fail_next();
+        let error = store
+            .create_offline_account("FirstUser")
+            .await
+            .expect_err("first write fails");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(store.list().is_empty());
+
+        let later = store
+            .create_offline_account("LaterUser")
+            .await
+            .expect("later mutation reconciles and commits");
+
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
+        let committed = backend.committed_indexes();
+        assert_eq!(committed.len(), 2);
+        assert_eq!(committed[0].accounts.len(), 1);
+        assert_eq!(committed[0].accounts[0].display_name, "FirstUser");
+        assert_eq!(committed[1].accounts.len(), 2);
+        assert!(
+            committed[1]
+                .accounts
+                .iter()
+                .any(|account| account.display_name == "FirstUser")
         );
+        assert!(
+            committed[1]
+                .accounts
+                .iter()
+                .any(|account| account == &later)
+        );
+        store.close().await.expect("close account store");
+        drop(store);
+        let reloaded =
+            LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("reload reconciled accounts");
+        assert_eq!(reloaded.list().len(), 2);
         assert!(
             reloaded
                 .list()
-                .expect("list accounts")
                 .iter()
-                .any(|account| account.account_id == offline.account_id)
+                .any(|account| account.display_name == "FirstUser")
         );
-
+        assert!(reloaded.list().iter().any(|account| account == &later));
+        reloaded.close().await.expect("close reloaded store");
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn account_store_list_order_does_not_change_when_selection_changes() {
-        let root = test_root("stable-order");
-        let paths = test_paths(&root);
-        let store = LauncherAccountStore::load_from_paths(&paths);
-        let first = store
-            .upsert_microsoft_account("msa-1", "profile-1", "First")
-            .expect("upsert first microsoft account");
-        let second = store
-            .upsert_microsoft_account("msa-2", "profile-2", "Second")
-            .expect("upsert second microsoft account");
-        let offline = store
+    #[tokio::test]
+    async fn identical_rename_retry_reports_committed_success_and_reloads() {
+        let (root, paths, backend, coordinator, store) = persistence_fixture("rename-retry");
+        let original = store
+            .create_offline_account("OldName")
+            .await
+            .expect("create original account");
+        backend.fail_next();
+        store
+            .rename_offline_account(&original.account_id, "NewName")
+            .await
+            .expect_err("rename write fails");
+
+        let renamed = store
+            .rename_offline_account(&original.account_id, "NewName")
+            .await
+            .expect("retry rename")
+            .expect("reconciled rename reports the account");
+
+        assert_eq!(renamed.display_name, "NewName");
+        assert_ne!(renamed.account_id, original.account_id);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(backend.committed_indexes().len(), 2);
+        store.close().await.expect("close account store");
+        drop(store);
+
+        let reloaded =
+            LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("reload renamed account");
+        assert_eq!(reloaded.active_account(), Some(renamed));
+        reloaded.close().await.expect("close reloaded store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn identical_remove_retry_reports_committed_success_and_reloads() {
+        let (root, paths, backend, coordinator, store) = persistence_fixture("remove-retry");
+        let account = store
             .create_offline_account("LocalUser")
-            .expect("create offline account");
-
-        let before = store
-            .list()
-            .expect("list accounts")
-            .into_iter()
-            .map(|account| account.account_id)
-            .collect::<Vec<_>>();
-
+            .await
+            .expect("create account");
+        backend.fail_next();
         store
-            .select(&first.account_id)
-            .expect("select first account");
-        store
-            .select(&offline.account_id)
-            .expect("select offline account");
-        store
-            .select(&second.account_id)
-            .expect("select second account");
+            .remove(&account.account_id)
+            .await
+            .expect_err("remove write fails");
 
-        let after = store
-            .list()
-            .expect("list accounts")
-            .into_iter()
-            .map(|account| account.account_id)
-            .collect::<Vec<_>>();
+        assert_eq!(
+            store
+                .remove(&account.account_id)
+                .await
+                .expect("retry remove"),
+            Some(account)
+        );
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(backend.committed_indexes().len(), 2);
+        store.close().await.expect("close account store");
+        drop(store);
 
-        assert_eq!(before, after);
-
+        let reloaded =
+            LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("reload removed account");
+        assert!(reloaded.list().is_empty());
+        assert_eq!(reloaded.active_account(), None);
+        reloaded.close().await.expect("close reloaded store");
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn account_store_remove_all_microsoft_preserves_offline_accounts() {
-        let root = test_root("remove-all-microsoft");
-        let paths = test_paths(&root);
-        let store = LauncherAccountStore::load_from_paths(&paths);
-        let microsoft = store
+    #[tokio::test]
+    async fn unrelated_missing_remove_stays_noop_after_reconciliation() {
+        let (root, paths, backend, coordinator, store) =
+            persistence_fixture("unrelated-remove-after-retry");
+        let account = store
+            .create_offline_account("LocalUser")
+            .await
+            .expect("create account");
+        backend.fail_next();
+        store
+            .remove(&account.account_id)
+            .await
+            .expect_err("remove write fails");
+
+        assert_eq!(
+            store
+                .remove("missing-account")
+                .await
+                .expect("missing remove"),
+            None
+        );
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
+        assert!(store.list().is_empty());
+        store.close().await.expect("close account store");
+        drop(store);
+
+        let reloaded =
+            LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("reload reconciled removal");
+        assert!(reloaded.list().is_empty());
+        reloaded.close().await.expect("close reloaded store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn identical_microsoft_login_remove_retry_reports_committed_success_and_reloads() {
+        let (root, paths, backend, coordinator, store) =
+            persistence_fixture("microsoft-remove-retry");
+        let account = store
             .upsert_microsoft_account("msa-1", "profile-1", "Mateo")
-            .expect("upsert microsoft account");
+            .await
+            .expect("create Microsoft account");
+        backend.fail_next();
+        store
+            .remove_microsoft_login("msa-1")
+            .await
+            .expect_err("Microsoft removal write fails");
+
+        assert_eq!(
+            store
+                .remove_microsoft_login("msa-1")
+                .await
+                .expect("retry Microsoft removal"),
+            Some(account)
+        );
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(backend.committed_indexes().len(), 2);
+        store.close().await.expect("close account store");
+        drop(store);
+
+        let reloaded =
+            LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("reload Microsoft removal");
+        assert!(reloaded.list().is_empty());
+        reloaded.close().await.expect("close reloaded store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn identical_remove_all_microsoft_retry_reports_committed_success_and_reloads() {
+        let (root, paths, backend, coordinator, store) =
+            persistence_fixture("remove-all-microsoft-retry");
         let offline = store
             .create_offline_account("LocalUser")
+            .await
             .expect("create offline account");
         store
-            .select(&microsoft.account_id)
-            .expect("select microsoft account");
+            .upsert_microsoft_account("msa-1", "profile-1", "Mateo")
+            .await
+            .expect("create Microsoft account");
+        backend.fail_next();
+        store
+            .remove_all_microsoft_accounts()
+            .await
+            .expect_err("Microsoft cleanup write fails");
 
         assert!(
             store
                 .remove_all_microsoft_accounts()
-                .expect("remove microsoft accounts")
+                .await
+                .expect("retry Microsoft cleanup")
         );
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(backend.committed_indexes().len(), 3);
+        store.close().await.expect("close account store");
+        drop(store);
 
-        assert_eq!(store.list().expect("list accounts"), vec![offline.clone()]);
-        assert_eq!(
-            store.active_account().expect("active account"),
-            Some(offline)
-        );
-
+        let reloaded =
+            LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("reload Microsoft cleanup");
+        assert_eq!(reloaded.list(), vec![offline.clone()]);
+        assert_eq!(reloaded.active_account(), Some(offline));
+        reloaded.close().await.expect("close reloaded store");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn identical_clear_retry_reports_committed_success_and_reloads() {
+        let (root, paths, backend, coordinator, store) = persistence_fixture("clear-retry");
+        store
+            .create_offline_account("LocalUser")
+            .await
+            .expect("create account");
+        backend.fail_next();
+        store.clear_all().await.expect_err("clear write fails");
+
+        assert!(store.clear_all().await.expect("retry clear"));
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(backend.committed_indexes().len(), 2);
+        store.close().await.expect("close account store");
+        drop(store);
+
+        let reloaded =
+            LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("reload cleared accounts");
+        assert!(reloaded.list().is_empty());
+        reloaded.close().await.expect("close reloaded store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn flush_and_close_reconcile_exact_retry_before_lifecycle_transition() {
+        let (root, paths, backend, coordinator, store) = persistence_fixture("lifecycle-retry");
+        backend.fail_next();
+        store
+            .create_offline_account("FirstUser")
+            .await
+            .expect_err("first write fails");
+
+        store.flush().await.expect("flush retries exact candidate");
+        assert_eq!(store.list()[0].display_name, "FirstUser");
+
+        backend.fail_next();
+        store
+            .create_offline_account("LaterUser")
+            .await
+            .expect_err("second write fails");
+        store.close().await.expect("close retries exact candidate");
+        assert_eq!(store.list().len(), 2);
+        drop(store);
+
+        let reloaded =
+            LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("reload lifecycle retries");
+        assert_eq!(reloaded.list().len(), 2);
+        reloaded.close().await.expect("close reloaded store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn truthful_no_ops_do_not_schedule_snapshot_writes() {
+        let (root, _, backend, _, store) = persistence_fixture("truthful-noops");
+        assert!(
+            store
+                .select("missing")
+                .await
+                .expect("missing select")
+                .is_none()
+        );
+        assert!(
+            store
+                .remove("missing")
+                .await
+                .expect("missing remove")
+                .is_none()
+        );
+        assert!(!store.clear_all().await.expect("empty clear"));
+        assert!(
+            !store
+                .remove_all_microsoft_accounts()
+                .await
+                .expect("empty Microsoft clear")
+        );
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
+
+        let account = store
+            .create_offline_account("LocalUser")
+            .await
+            .expect("create account");
+        let attempts = backend.attempts.load(Ordering::SeqCst);
+        assert_eq!(
+            store
+                .select(&account.account_id)
+                .await
+                .expect("same select"),
+            Some(account.clone())
+        );
+        assert_eq!(
+            store
+                .rename_offline_account(&account.account_id, &account.display_name)
+                .await
+                .expect("same rename"),
+            Some(account)
+        );
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), attempts);
+        store.close().await.expect("close account store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn selection_order_and_microsoft_removal_behavior_are_preserved() {
+        let (root, _, _, _, store) = persistence_fixture("selection-removal");
+        let first = store
+            .upsert_microsoft_account("msa-1", "profile-1", "First")
+            .await
+            .expect("upsert first Microsoft account");
+        let second = store
+            .upsert_microsoft_account("msa-2", "profile-2", "Second")
+            .await
+            .expect("upsert second Microsoft account");
+        let offline = store
+            .create_offline_account("LocalUser")
+            .await
+            .expect("create offline account");
+        let before = store
+            .list()
+            .into_iter()
+            .map(|account| account.account_id)
+            .collect::<Vec<_>>();
+
+        store.select(&first.account_id).await.expect("select first");
+        store
+            .select(&offline.account_id)
+            .await
+            .expect("select offline");
+        store
+            .select(&second.account_id)
+            .await
+            .expect("select second");
+        let after = store
+            .list()
+            .into_iter()
+            .map(|account| account.account_id)
+            .collect::<Vec<_>>();
+        assert_eq!(before, after);
+
+        assert!(
+            store
+                .remove_all_microsoft_accounts()
+                .await
+                .expect("remove Microsoft accounts")
+        );
+        assert_eq!(store.list(), vec![offline.clone()]);
+        assert_eq!(store.active_account(), Some(offline));
+        store.close().await.expect("close account store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn owner_and_temp_path_collisions_are_rejected() {
+        let (root, paths, _, coordinator, store) = persistence_fixture("owner-collision");
+        let duplicate = match LauncherAccountStore::try_load_from_paths_with_coordinator(
+            &paths,
+            coordinator.clone(),
+        ) {
+            Ok(_) => panic!("duplicate owner must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(duplicate.kind(), io::ErrorKind::AlreadyExists);
+        store.close().await.expect("close first owner");
+        drop(store);
+
+        let index_path = paths.config_dir.join("accounts.json");
+        let temp_path = atomic_temp_path_for(&index_path);
+        let temp_owner = coordinator
+            .claim_owner(&temp_path)
+            .expect("claim temp owner");
+        let _temp_writer = temp_owner
+            .writer(&temp_path, account_index_target())
+            .expect("claim temp writer");
+        let collision =
+            match LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator) {
+                Ok(_) => panic!("temp collision must fail"),
+                Err(error) => error,
+            };
+        assert_eq!(collision.kind(), io::ErrorKind::AlreadyExists);
+        temp_owner.close().await.expect("close temp owner");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn invalid_existing_input_is_preserved_until_explicit_mutation() {
+        let root = test_root("invalid-preserved");
+        let paths = test_paths(&root);
+        fs::create_dir_all(&paths.config_dir).expect("create config dir");
+        let index_path = paths.config_dir.join("accounts.json");
+        let invalid = br#"{"schema":"wrong","accounts":[]}"#;
+        fs::write(&index_path, invalid).expect("write invalid account index");
+        let backend = Arc::new(RecordingFileBackend::new());
+        let coordinator = PersistenceCoordinator::for_test(
+            backend,
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        );
+        let store = LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+            .expect("load invalid input safely");
+
+        assert!(store.list().is_empty());
+        assert_eq!(
+            fs::read(&index_path).expect("read untouched input"),
+            invalid
+        );
+        store
+            .create_offline_account("LocalUser")
+            .await
+            .expect("explicit mutation replaces invalid input");
+        assert_ne!(
+            fs::read(&index_path).expect("read committed input"),
+            invalid
+        );
+        store.close().await.expect("close account store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn close_rejects_mutation_and_allows_clean_restart() {
+        let (root, paths, _, coordinator, store) = persistence_fixture("close-restart");
+        let account = store
+            .create_offline_account("LocalUser")
+            .await
+            .expect("create account");
+        store.close().await.expect("close account store");
+        let error = store
+            .create_offline_account("LaterUser")
+            .await
+            .expect_err("closed store rejects mutation");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(store.active_account(), Some(account.clone()));
+        drop(store);
+
+        let reloaded =
+            LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("restart account store");
+        assert_eq!(reloaded.active_account(), Some(account));
+        reloaded.close().await.expect("close reloaded store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[should_panic(expected = "launcher account store lock poisoned")]
+    fn poisoned_lock_uses_the_single_invariant_policy() {
+        let store = LauncherAccountStore::default();
+        let state = store.state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = state.lock().expect("lock account state");
+            panic!("poison account state");
+        })
+        .join();
+        let _ = store.list();
     }
 
     fn test_paths(root: &Path) -> AppPaths {

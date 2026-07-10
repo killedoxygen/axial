@@ -205,12 +205,16 @@ pub(crate) async fn auth_refresh_for_state(
         None
     };
     if let Some(active) = active {
-        if let Ok(account) = accounts::upsert_microsoft_account(state, &active.account) {
-            if let Err(error) = accounts::sync_config_for_account(state, &account) {
-                tracing::warn!("account config sync after auth refresh failed: {error}");
+        let account = match accounts::upsert_microsoft_account(state, &active.account).await {
+            Ok(account) => account,
+            Err(error) => {
+                tracing::warn!(error_kind = ?error.kind(), "account store sync after auth refresh failed");
+                return accounts::account_persistence_failed_response();
             }
-        } else {
-            tracing::warn!("account store sync after auth refresh failed");
+        };
+        if let Err(error) = accounts::sync_config_for_account(state, &account) {
+            tracing::warn!("account config sync after auth refresh failed: {error}");
+            return accounts::account_persistence_failed_response();
         }
     }
     response
@@ -234,12 +238,16 @@ pub(crate) async fn auth_profile_sync_for_state(
         None
     };
     if let Some(active) = active {
-        if let Ok(account) = accounts::upsert_microsoft_account(state, &active.account) {
-            if let Err(error) = accounts::sync_config_for_account(state, &account) {
-                tracing::warn!("account config sync after profile sync failed: {error}");
+        let account = match accounts::upsert_microsoft_account(state, &active.account).await {
+            Ok(account) => account,
+            Err(error) => {
+                tracing::warn!(error_kind = ?error.kind(), "account store sync after profile sync failed");
+                return accounts::account_persistence_failed_response();
             }
-        } else {
-            tracing::warn!("account store sync after profile sync failed");
+        };
+        if let Err(error) = accounts::sync_config_for_account(state, &account) {
+            tracing::warn!("account config sync after profile sync failed: {error}");
+            return accounts::account_persistence_failed_response();
         }
     }
     response
@@ -545,7 +553,7 @@ async fn auth_logout(login_store: &Arc<AuthLoginStore>) -> (StatusCode, Json<ser
 pub(crate) async fn auth_logout_for_state(
     state: &AppState,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if let Err(error) = state.accounts().remove_all_microsoft_accounts() {
+    if let Err(error) = state.accounts().remove_all_microsoft_accounts().await {
         tracing::warn!("account store cleanup before auth logout failed: {error}");
         return auth_logout_cleanup_failed_response();
     }
@@ -952,14 +960,21 @@ mod tests {
     use super::*;
     use crate::application::skin;
     use crate::auth_chain::AuthChainEndpoints;
+    use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
+    use crate::state::contracts::TargetDescriptor;
     use crate::state::{
-        AppStateInit, AuthLoginMsaToken, InstallStore, NewAuthLoginMinecraftAccount,
-        NewAuthLoginMsaToken, SessionStore,
+        AppStateInit, AuthLoginMsaToken, InstallStore, LauncherAccountStore,
+        NewAuthLoginMinecraftAccount, NewAuthLoginMsaToken, SessionStore,
     };
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
     use axial_performance::PerformanceManager;
     use axum::{body::Bytes, extract::State, http::HeaderMap, routing::get};
-    use std::{fs, path::PathBuf, sync::Arc};
+    use std::{
+        fs, io,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -1493,6 +1508,7 @@ mod tests {
             .state
             .accounts()
             .create_offline_account("LocalPlayer")
+            .await
             .expect("create offline account");
         insert_active_current_login(fixture.state.auth_logins(), Some("msa-refresh-token")).await;
         let minecraft = fixture
@@ -1510,6 +1526,7 @@ mod tests {
                 &minecraft.profile.id,
                 &minecraft.profile.name,
             )
+            .await
             .expect("upsert microsoft account");
         let mut config = fixture.state.config().current();
         config.launch_auth_mode = LAUNCH_AUTH_MODE_ONLINE.to_string();
@@ -1533,20 +1550,74 @@ mod tests {
                 .await
                 .is_empty()
         );
-        let accounts = fixture.state.accounts().list().expect("list accounts");
+        let accounts = fixture.state.accounts().list();
         assert_eq!(accounts, vec![offline.clone()]);
-        assert_eq!(
-            fixture
-                .state
-                .accounts()
-                .active_account()
-                .expect("active account"),
-            Some(offline)
-        );
+        assert_eq!(fixture.state.accounts().active_account(), Some(offline));
         assert_eq!(
             fixture.state.config().current().launch_auth_mode,
             LAUNCH_AUTH_MODE_OFFLINE
         );
+    }
+
+    #[tokio::test]
+    async fn auth_refresh_does_not_report_success_or_publish_account_after_persistence_failure() {
+        let fixture =
+            TestFixture::new_with_failing_accounts("refresh-account-persistence-failure", "Player");
+        insert_active_current_login(fixture.state.auth_logins(), Some("msa-refresh-token")).await;
+
+        let response = auth_refresh_for_state(&fixture.state).await;
+
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.1.0["status"], "account_persistence_failed");
+        assert!(fixture.state.accounts().list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn profile_sync_does_not_report_success_or_publish_account_after_persistence_failure() {
+        let fixture = TestFixture::new_with_failing_accounts(
+            "profile-sync-account-persistence-failure",
+            "Player",
+        );
+        insert_active_current_login(fixture.state.auth_logins(), Some("msa-refresh-token")).await;
+        let (client, _requests) =
+            auth_chain_route_test_client(AuthChainRouteServerMode::NoJavaOwnership).await;
+        fixture.state.set_auth_chain_client_override(client);
+
+        let response = auth_profile_sync_for_state(&fixture.state).await;
+
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.1.0["status"], "account_persistence_failed");
+        assert!(fixture.state.accounts().list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auth_refresh_does_not_report_success_when_account_config_sync_fails() {
+        let fixture = TestFixture::new("refresh-account-config-failure", "Player");
+        insert_active_current_login(fixture.state.auth_logins(), Some("msa-refresh-token")).await;
+        let config_path = fixture.state.config().paths().config_file.clone();
+        if config_path.is_file() {
+            fs::remove_file(&config_path).expect("remove config file");
+        }
+        fs::create_dir_all(&config_path).expect("block config file with directory");
+
+        let response = auth_refresh_for_state(&fixture.state).await;
+
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.1.0["status"], "account_persistence_failed");
+        assert_eq!(fixture.state.accounts().list().len(), 1);
+    }
+
+    struct FailingAccountBackend;
+
+    impl AtomicWriteBackend for FailingAccountBackend {
+        fn write(
+            &self,
+            _target: &TargetDescriptor,
+            _destination: &Path,
+            _contents: &[u8],
+        ) -> io::Result<()> {
+            Err(io::Error::other("injected account persistence failure"))
+        }
     }
 
     struct TestFixture {
@@ -1556,6 +1627,14 @@ mod tests {
 
     impl TestFixture {
         fn new(name: &str, username: &str) -> Self {
+            Self::new_inner(name, username, false)
+        }
+
+        fn new_with_failing_accounts(name: &str, username: &str) -> Self {
+            Self::new_inner(name, username, true)
+        }
+
+        fn new_inner(name: &str, username: &str, failing_accounts: bool) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
             let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
@@ -1578,6 +1657,20 @@ mod tests {
                 startup_warnings: Vec::new(),
                 frontend_dir: root.join("frontend"),
             });
+            let state = if failing_accounts {
+                let coordinator = PersistenceCoordinator::for_test(
+                    Arc::new(FailingAccountBackend),
+                    Duration::from_millis(20),
+                    Duration::from_millis(100),
+                );
+                let accounts = Arc::new(
+                    LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                        .expect("claim failing account persistence"),
+                );
+                state.with_accounts(accounts)
+            } else {
+                state
+            };
 
             Self { state, root }
         }

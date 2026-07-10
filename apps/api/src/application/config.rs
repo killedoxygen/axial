@@ -47,7 +47,7 @@ pub fn current_config(state: &AppState) -> AppConfig {
     state.config().current()
 }
 
-pub fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppConfig, ApiError> {
+pub async fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppConfig, ApiError> {
     let mut next = state.config().current();
     let previous_library_dir = next.library_dir.clone();
     let sync_offline_username = patch.username.is_some();
@@ -130,6 +130,7 @@ pub fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppConfig, 
             }
             if sync_offline_username {
                 application::sync_active_offline_account_from_username(state, &config.username)
+                    .await
                     .map_err(config_account_sync_error_response)?;
             }
             Ok(config)
@@ -272,6 +273,7 @@ mod tests {
             .state
             .accounts()
             .create_offline_account("OldName")
+            .await
             .expect("create offline account");
 
         let config = super::update_config(
@@ -281,6 +283,7 @@ mod tests {
                 ..ConfigPatch::default()
             },
         )
+        .await
         .expect("update config");
 
         assert_eq!(config.username, "NewName");
@@ -288,7 +291,6 @@ mod tests {
             .state
             .accounts()
             .active_account()
-            .expect("active account")
             .expect("active account");
         assert_eq!(active.display_name, "NewName");
         assert_eq!(fixture.state.config().current().username, "NewName");
@@ -306,6 +308,7 @@ mod tests {
                 ..ConfigPatch::default()
             },
         )
+        .await
         .expect("update config");
 
         assert!(!config.discord_rpc_enabled);
@@ -315,8 +318,8 @@ mod tests {
             .expect("config change sender should remain open");
     }
 
-    #[test]
-    fn config_save_failure_emits_when_requested_config_keeps_telemetry_enabled() {
+    #[tokio::test]
+    async fn config_save_failure_emits_when_requested_config_keeps_telemetry_enabled() {
         let fixture = TestFixture::new("config-save-failure-emit");
         fixture.seed_config(AppConfig {
             telemetry_enabled: true,
@@ -331,14 +334,15 @@ mod tests {
                 discord_rpc_enabled: Some(false),
                 ..ConfigPatch::default()
             },
-        );
+        )
+        .await;
 
         assert!(result.is_err());
         assert_eq!(fixture.state.telemetry().queue_len_for_test(), 1);
     }
 
-    #[test]
-    fn config_save_failure_does_not_emit_when_request_disables_telemetry() {
+    #[tokio::test]
+    async fn config_save_failure_does_not_emit_when_request_disables_telemetry() {
         let fixture = TestFixture::new("config-save-failure-disable-telemetry");
         fixture.seed_config(AppConfig {
             telemetry_enabled: true,
@@ -353,7 +357,8 @@ mod tests {
                 telemetry_enabled: Some(false),
                 ..ConfigPatch::default()
             },
-        );
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(fixture.state.config().current().telemetry_enabled);

@@ -115,6 +115,12 @@ impl AppState {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_accounts(mut self, accounts: Arc<LauncherAccountStore>) -> Self {
+        self.accounts = accounts;
+        self
+    }
+
     fn new_with_telemetry_inner(init: AppStateInit, telemetry: Arc<TelemetryHub>) -> Self {
         let library_dir = init.config.current().library_dir;
         let benchmark_suite_drivers = Arc::new(

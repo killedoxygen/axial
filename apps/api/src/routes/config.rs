@@ -24,5 +24,5 @@ async fn handle_update_config(
     State(state): State<AppState>,
     Json(patch): Json<ConfigPatch>,
 ) -> Result<Json<AppConfig>, (StatusCode, Json<serde_json::Value>)> {
-    application::update_config(&state, patch).map(Json)
+    application::update_config(&state, patch).await.map(Json)
 }

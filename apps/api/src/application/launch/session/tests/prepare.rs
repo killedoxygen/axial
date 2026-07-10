@@ -90,6 +90,7 @@ async fn prepare_launch_session_syncs_active_offline_account_from_config_usernam
         .state
         .accounts()
         .create_offline_account("OldName")
+        .await
         .expect("create offline account");
     let mut config = fixture.state.config().current();
     config.username = "NewName".to_string();
@@ -119,7 +120,6 @@ async fn prepare_launch_session_syncs_active_offline_account_from_config_usernam
         .state
         .accounts()
         .active_account()
-        .expect("active account")
         .expect("active account");
     assert_eq!(active.display_name, "NewName");
 }
@@ -131,6 +131,7 @@ async fn prepare_launch_session_rejects_invalid_offline_request_username_as_bad_
         .state
         .accounts()
         .create_offline_account("LocalUser")
+        .await
         .expect("create offline account");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
 

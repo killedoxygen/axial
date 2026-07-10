@@ -33,6 +33,7 @@ pub(super) async fn resolve_launch_auth_context(
         .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
     let active_account =
         sync_active_offline_account_from_username(state, &requested_offline_username)
+            .await
             .map_err(launch_account_store_error_response)?;
     let requested_username = active_account
         .as_ref()
@@ -156,12 +157,12 @@ async fn online_launch_auth_context_with_refresh(
 }
 
 fn launch_account_store_error_response(
-    error: std::io::Error,
+    _error: std::io::Error,
 ) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({
-            "error": error.to_string(),
+            "error": "Could not save account changes. Check app data permissions and try again.",
             "failure_class": failure_class_name(LaunchFailureClass::AuthModeIncompatible),
             "status": "account_persistence_failed",
         })),

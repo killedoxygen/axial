@@ -11,6 +11,9 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+const ACCOUNT_SAVE_ERROR_MESSAGE: &str =
+    "Could not save account changes. Check app data permissions and try again.";
+
 #[derive(Debug, Serialize)]
 pub(crate) struct AccountListResponse {
     active_account_id: Option<String>,
@@ -92,6 +95,7 @@ pub(crate) async fn create_offline_account(
     let account = state
         .accounts()
         .create_offline_account(&request.username)
+        .await
         .map_err(account_store_error)?;
     apply_selected_account_to_config(state, &account).map_err(config_error)?;
     let response = account_response_for_record(state, account, true).await;
@@ -121,14 +125,11 @@ pub(crate) async fn patch_account(
     let account = state
         .accounts()
         .rename_offline_account(account_id, &username)
+        .await
         .map_err(account_store_error)?
         .ok_or_else(account_missing_error)?;
-    let active = state
-        .accounts()
-        .active_account_id()
-        .map_err(account_store_error)?
-        .as_deref()
-        == Some(account.account_id.as_str());
+    let active =
+        state.accounts().active_account_id().as_deref() == Some(account.account_id.as_str());
     if active {
         apply_selected_account_to_config(state, &account).map_err(config_error)?;
     }
@@ -149,7 +150,6 @@ pub(crate) async fn select_account(
     let account = state
         .accounts()
         .list()
-        .map_err(account_store_error)?
         .into_iter()
         .find(|account| account.account_id == account_id)
         .ok_or_else(account_missing_error)?;
@@ -157,6 +157,7 @@ pub(crate) async fn select_account(
     let account = state
         .accounts()
         .select(account_id)
+        .await
         .map_err(account_store_error)?
         .ok_or_else(account_missing_error)?;
     apply_selected_account_to_config(state, &account).map_err(config_error)?;
@@ -177,7 +178,6 @@ pub(crate) async fn remove_account(
     let existing = state
         .accounts()
         .list()
-        .map_err(account_store_error)?
         .into_iter()
         .find(|account| account.account_id == account_id)
         .ok_or_else(account_missing_error)?;
@@ -190,17 +190,14 @@ pub(crate) async fn remove_account(
     let removed = state
         .accounts()
         .remove(account_id)
+        .await
         .map_err(account_store_error)?
         .ok_or_else(account_missing_error)?;
     if let Some(login_id) = removed.login_id.as_deref() {
         clear_pending_saved_skin_apply_for_login_id(login_id).await;
     }
 
-    let next_active = match state
-        .accounts()
-        .active_account()
-        .map_err(account_store_error)?
-    {
+    let next_active = match state.accounts().active_account() {
         Some(active) => Some(active),
         None => select_authenticated_microsoft_replacement(state).await?,
     };
@@ -233,7 +230,7 @@ pub(crate) async fn remove_account(
 async fn select_authenticated_microsoft_replacement(
     state: &AppState,
 ) -> Result<Option<LauncherAccountRecord>, (StatusCode, Json<serde_json::Value>)> {
-    let accounts = state.accounts().list().map_err(account_store_error)?;
+    let accounts = state.accounts().list();
     let auth_states = auth_state_map(state.auth_logins().account_states().await);
     for account in accounts
         .into_iter()
@@ -259,6 +256,7 @@ async fn select_authenticated_microsoft_replacement(
         let selected = state
             .accounts()
             .select(&account.account_id)
+            .await
             .map_err(account_store_error)?
             .ok_or_else(account_missing_error)?;
         return Ok(Some(selected));
@@ -274,11 +272,8 @@ pub(crate) async fn account_list_response(
     {
         tracing::warn!("account config sync after auth account repair failed: {error}");
     }
-    let accounts = state.accounts().list().map_err(account_store_error)?;
-    let active_account_id = state
-        .accounts()
-        .active_account_id()
-        .map_err(account_store_error)?;
+    let accounts = state.accounts().list();
+    let active_account_id = state.accounts().active_account_id();
     let auth_states = auth_state_map(state.auth_logins().account_states().await);
     Ok(AccountListResponse {
         active_account_id: active_account_id.clone(),
@@ -382,11 +377,11 @@ pub(crate) fn sync_config_for_account(
     Ok(())
 }
 
-pub(crate) fn sync_active_offline_account_from_username(
+pub(crate) async fn sync_active_offline_account_from_username(
     state: &AppState,
     username: &str,
 ) -> std::io::Result<Option<LauncherAccountRecord>> {
-    let Some(active) = state.accounts().active_account()? else {
+    let Some(active) = state.accounts().active_account() else {
         return Ok(None);
     };
     if active.kind != LauncherAccountKind::Offline {
@@ -402,16 +397,17 @@ pub(crate) fn sync_active_offline_account_from_username(
     match state
         .accounts()
         .rename_offline_account(&active.account_id, &display_name)
+        .await
     {
         Ok(account) => Ok(account),
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
             let uuid = offline_uuid(&display_name);
-            let existing = state.accounts().list()?.into_iter().find(|account| {
+            let existing = state.accounts().list().into_iter().find(|account| {
                 account.kind == LauncherAccountKind::Offline
                     && account.offline_uuid.as_deref() == Some(uuid.as_str())
             });
             match existing {
-                Some(account) => state.accounts().select(&account.account_id),
+                Some(account) => state.accounts().select(&account.account_id).await,
                 None => Err(error),
             }
         }
@@ -419,15 +415,18 @@ pub(crate) fn sync_active_offline_account_from_username(
     }
 }
 
-pub(crate) fn upsert_microsoft_account(
+pub(crate) async fn upsert_microsoft_account(
     state: &AppState,
     account: &AuthLoginMinecraftAccount,
 ) -> Result<LauncherAccountRecord, std::io::Error> {
-    state.accounts().upsert_microsoft_account(
-        &account.login_id,
-        &account.profile.id,
-        &account.profile.name,
-    )
+    state
+        .accounts()
+        .upsert_microsoft_account(
+            &account.login_id,
+            &account.profile.id,
+            &account.profile.name,
+        )
+        .await
 }
 
 async fn reconcile_microsoft_accounts_from_auth(
@@ -443,10 +442,7 @@ async fn reconcile_microsoft_accounts_from_auth(
         return Ok(None);
     }
 
-    let current_active = state
-        .accounts()
-        .active_account()
-        .map_err(account_store_error)?;
+    let current_active = state.accounts().active_account();
     let active_auth_login_id = auth_states
         .iter()
         .find(|state| state.active && state.minecraft_account.is_some())
@@ -480,6 +476,7 @@ async fn reconcile_microsoft_accounts_from_auth(
                 &account.profile.name,
                 select,
             )
+            .await
             .map_err(account_store_error)?;
         if select {
             repaired_active = Some(record);
@@ -561,18 +558,16 @@ fn account_remove_failed_error() -> (StatusCode, Json<serde_json::Value>) {
 }
 
 fn account_store_error(error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
-    let status = if error.kind() == std::io::ErrorKind::InvalidInput {
-        StatusCode::BAD_REQUEST
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    };
-    (
-        status,
-        Json(serde_json::json!({
-            "error": error.to_string(),
-            "status": "account_persistence_failed",
-        })),
-    )
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": error.to_string(),
+                "status": "account_persistence_failed",
+            })),
+        );
+    }
+    account_persistence_failed_response()
 }
 
 fn invalid_account_input(message: String) -> std::io::Error {
@@ -580,10 +575,14 @@ fn invalid_account_input(message: String) -> std::io::Error {
 }
 
 fn config_error(_: ConfigStoreError) -> (StatusCode, Json<serde_json::Value>) {
+    account_persistence_failed_response()
+}
+
+pub(super) fn account_persistence_failed_response() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({
-            "error": "Could not save account selection. Check app data permissions and try again.",
+            "error": ACCOUNT_SAVE_ERROR_MESSAGE,
             "status": "account_persistence_failed",
         })),
     )
@@ -617,10 +616,7 @@ mod tests {
             )
             .await;
 
-        assert_eq!(
-            fixture.state.accounts().list().expect("list accounts"),
-            Vec::new()
-        );
+        assert_eq!(fixture.state.accounts().list(), Vec::new());
 
         let response = account_list_response(&fixture.state)
             .await
@@ -656,6 +652,7 @@ mod tests {
             .state
             .accounts()
             .create_offline_account("LocalUser")
+            .await
             .expect("create offline account");
         let (_token, minecraft_account) = fixture
             .state
@@ -699,11 +696,13 @@ mod tests {
             .state
             .accounts()
             .create_offline_account("LocalUser")
+            .await
             .expect("create offline account");
         let microsoft = fixture
             .state
             .accounts()
             .sync_microsoft_account("missing-login", "profile-1", "mateoltd", false)
+            .await
             .expect("sync microsoft account");
 
         let result = select_account(&fixture.state, &microsoft.account_id).await;
@@ -712,12 +711,7 @@ mod tests {
         assert_eq!(status, StatusCode::PRECONDITION_FAILED);
         assert_eq!(body["status"], "auth_refresh_required");
         assert_eq!(
-            fixture
-                .state
-                .accounts()
-                .active_account()
-                .expect("active account")
-                .as_ref(),
+            fixture.state.accounts().active_account().as_ref(),
             Some(&offline)
         );
     }
