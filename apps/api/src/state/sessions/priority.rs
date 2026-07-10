@@ -1,6 +1,6 @@
 use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
 use std::io;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 const MAX_PRIORITY_ERROR_CHARS: usize = 160;
 
@@ -17,7 +17,7 @@ pub(super) enum PriorityPromotion {
     #[cfg(windows)]
     Promoted,
     #[cfg(windows)]
-    MissingPid,
+    MissingHandle,
     #[cfg(not(windows))]
     Noop,
 }
@@ -39,7 +39,7 @@ impl PriorityPromotion {
             #[cfg(windows)]
             Self::Promoted => "promoted",
             #[cfg(windows)]
-            Self::MissingPid => "missing_pid",
+            Self::MissingHandle => "missing_process_handle",
             #[cfg(not(windows))]
             Self::Noop => "noop",
         }
@@ -50,8 +50,8 @@ pub(super) fn configure_start_priority(command: &mut Command) -> io::Result<Laun
     platform::configure_start_priority(command)
 }
 
-pub(super) fn promote_after_boot(pid: Option<u32>) -> io::Result<PriorityPromotion> {
-    platform::promote_after_boot(pid)
+pub(super) fn promote_after_boot(child: Option<&Child>) -> io::Result<PriorityPromotion> {
+    platform::promote_after_boot(child)
 }
 
 pub(super) fn sanitize_priority_error(error: &io::Error) -> Option<String> {
@@ -69,47 +69,10 @@ pub(super) fn sanitize_priority_error(error: &io::Error) -> Option<String> {
 mod platform {
     use super::{LaunchPriorityMode, PriorityPromotion};
     use std::io;
-    use tokio::process::Command;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use tokio::process::{Child, Command};
     use windows_sys::Win32::System::Threading::{
-        BELOW_NORMAL_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcess, PROCESS_SET_INFORMATION,
-        SetPriorityClass,
+        BELOW_NORMAL_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, SetPriorityClass,
     };
-
-    struct ProcessHandle(HANDLE);
-
-    impl ProcessHandle {
-        fn open_for_priority(pid: u32) -> io::Result<Self> {
-            // SAFETY: OpenProcess is called with a constant access mask, no inherited handle,
-            // and a pid value supplied by the launched child process metadata. A non-null
-            // return value is an owned handle that must be closed exactly once.
-            let handle = unsafe { OpenProcess(PROCESS_SET_INFORMATION, 0, pid) };
-            if handle.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-
-            Ok(Self(handle))
-        }
-
-        fn set_normal_priority(&self) -> io::Result<()> {
-            // SAFETY: self.0 is a live process handle owned by this wrapper and opened with
-            // PROCESS_SET_INFORMATION. NORMAL_PRIORITY_CLASS is a valid process priority class.
-            let result = unsafe { SetPriorityClass(self.0, NORMAL_PRIORITY_CLASS) };
-            if result == 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            Ok(())
-        }
-    }
-
-    impl Drop for ProcessHandle {
-        fn drop(&mut self) {
-            // SAFETY: ProcessHandle is constructed only from a successful OpenProcess call
-            // and owns that handle. Drop runs once, so CloseHandle is paired exactly once.
-            let _ = unsafe { CloseHandle(self.0) };
-        }
-    }
 
     pub(super) fn configure_start_priority(
         command: &mut Command,
@@ -118,13 +81,18 @@ mod platform {
         Ok(LaunchPriorityMode::BelowNormalUntilBoot)
     }
 
-    pub(super) fn promote_after_boot(pid: Option<u32>) -> io::Result<PriorityPromotion> {
-        let Some(pid) = pid else {
-            return Ok(PriorityPromotion::MissingPid);
+    pub(super) fn promote_after_boot(child: Option<&Child>) -> io::Result<PriorityPromotion> {
+        let Some(handle) = child.and_then(Child::raw_handle) else {
+            return Ok(PriorityPromotion::MissingHandle);
         };
 
-        let handle = ProcessHandle::open_for_priority(pid)?;
-        handle.set_normal_priority()?;
+        // SAFETY: raw_handle is borrowed from the locked Tokio Child and remains valid for this
+        // call. The launcher does not own or close it. A child process handle supports setting
+        // its priority class without reopening by PID.
+        let result = unsafe { SetPriorityClass(handle, NORMAL_PRIORITY_CLASS) };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
 
         Ok(PriorityPromotion::Promoted)
     }
@@ -134,7 +102,7 @@ mod platform {
 mod platform {
     use super::{LaunchPriorityMode, PriorityPromotion};
     use std::io;
-    use tokio::process::Command;
+    use tokio::process::{Child, Command};
 
     /// Unix demotion via nice is intentionally disabled until Axial has a
     /// reliable unprivileged restore path; leaving a game deprioritized after
@@ -145,7 +113,7 @@ mod platform {
         Ok(LaunchPriorityMode::Noop)
     }
 
-    pub(super) fn promote_after_boot(_pid: Option<u32>) -> io::Result<PriorityPromotion> {
+    pub(super) fn promote_after_boot(_child: Option<&Child>) -> io::Result<PriorityPromotion> {
         Ok(PriorityPromotion::Noop)
     }
 }
@@ -163,11 +131,7 @@ mod tests {
             LaunchPriorityMode::Noop
         );
         assert_eq!(
-            promote_after_boot(Some(1234)).expect("priority promotion"),
-            PriorityPromotion::Noop
-        );
-        assert_eq!(
-            promote_after_boot(None).expect("missing pid promotion"),
+            promote_after_boot(None).expect("priority promotion"),
             PriorityPromotion::Noop
         );
     }

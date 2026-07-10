@@ -16,10 +16,13 @@ use axial_launcher::{
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock, broadcast};
+
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 
 const MAX_GUARDIAN_STAGE_DETAILS: usize = 8;
 const MAX_STAGE_EVIDENCE: usize = 16;
@@ -33,14 +36,28 @@ const MAX_RETAINED_TERMINAL_SESSIONS: usize = 32;
 const PRIVATE_NOTICE_FALLBACK: &str = "Launch status details were hidden for privacy.";
 const FAILURE_SIGNAL_VALID_FOR_EXIT_MS: u64 = 15_000;
 
+pub(super) struct ProcessAttemptScope {
+    pub(super) id: u64,
+    pub(super) child: Option<Arc<Mutex<Child>>>,
+    log_transition: Mutex<()>,
+}
+
+impl ProcessAttemptScope {
+    fn new(id: u64, child: Option<Arc<Mutex<Child>>>) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            child,
+            log_transition: Mutex::new(()),
+        })
+    }
+}
+
 struct SessionEntry {
+    attempt: Arc<ProcessAttemptScope>,
     record: LaunchSessionRecord,
     events: broadcast::Sender<LaunchEvent>,
-    child: Option<Arc<Mutex<Child>>>,
-    startup_observed: Arc<AtomicBool>,
-    boot_completed: Arc<AtomicBool>,
-    log_count: Arc<AtomicUsize>,
     observed_failure: Option<ObservedFailureSignal>,
+    log_count: usize,
     stop_requested: bool,
     retention_holds: usize,
     terminal_sequence: Option<u64>,
@@ -59,9 +76,92 @@ impl ObservedFailureSignal {
     }
 }
 
+struct PreparedLogLine {
+    observed_at_ms: u64,
+    boot_evidence: Option<Vec<LaunchStageEvidence>>,
+    failure_class: Option<LaunchFailureClass>,
+    event: LaunchLogEvent,
+}
+
+struct RawLogLine {
+    source: String,
+    text: String,
+    observed_at_ms: u64,
+}
+
+pub(super) struct ProcessExitContext {
+    pub(super) record: LaunchSessionRecord,
+    pub(super) observed_failure: Option<LaunchFailureClass>,
+}
+
+#[derive(Clone)]
+struct BootPriorityPromotionTicket {
+    attempt: Arc<ProcessAttemptScope>,
+    pid: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+enum BootPromotionGate {
+    Stale,
+    Resolve,
+    CompleteSkipped(&'static str),
+    Promote,
+}
+
+fn attempt_scopes_match(
+    current: &Arc<ProcessAttemptScope>,
+    expected: &Arc<ProcessAttemptScope>,
+) -> bool {
+    current.id == expected.id
+}
+
+fn process_state_regresses(previous: LaunchState, next: LaunchState) -> bool {
+    (classify::is_terminal_state(previous)
+        && matches!(
+            next,
+            LaunchState::Starting
+                | LaunchState::Monitoring
+                | LaunchState::Running
+                | LaunchState::Degraded
+        ))
+        || (matches!(previous, LaunchState::Running | LaunchState::Degraded)
+            && matches!(next, LaunchState::Starting | LaunchState::Monitoring))
+        || (previous == LaunchState::Monitoring && next == LaunchState::Starting)
+}
+
+fn boot_promotion_gate(
+    entry: Option<&SessionEntry>,
+    ticket: &BootPriorityPromotionTicket,
+) -> BootPromotionGate {
+    let Some(entry) = entry else {
+        return BootPromotionGate::Stale;
+    };
+    if entry.record.pid != ticket.pid || !attempt_scopes_match(&entry.attempt, &ticket.attempt) {
+        return BootPromotionGate::Stale;
+    }
+    if entry.record.boot_completed_at_ms.is_some() {
+        return BootPromotionGate::Resolve;
+    }
+    if !matches!(
+        entry.record.state,
+        LaunchState::Starting | LaunchState::Monitoring
+    ) {
+        return BootPromotionGate::Resolve;
+    }
+    if entry.stop_requested {
+        return BootPromotionGate::CompleteSkipped("skipped_stop_requested");
+    }
+    if ticket.pid.is_some() && ticket.attempt.child.is_none() {
+        return BootPromotionGate::CompleteSkipped("skipped_missing_process_handle");
+    }
+    BootPromotionGate::Promote
+}
+
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, SessionEntry>>,
+    lifecycle_transition: Mutex<()>,
     changes: broadcast::Sender<()>,
+    next_attempt_id: AtomicU64,
     next_terminal_sequence: AtomicU64,
 }
 
@@ -78,7 +178,9 @@ impl SessionStore {
         let (changes, _) = broadcast::channel(64);
         Self {
             sessions: RwLock::new(HashMap::new()),
+            lifecycle_transition: Mutex::new(()),
             changes,
+            next_attempt_id: AtomicU64::new(0),
             next_terminal_sequence: AtomicU64::new(0),
         }
     }
@@ -87,26 +189,54 @@ impl SessionStore {
         let _ = self.changes.send(());
     }
 
+    fn next_attempt_id(&self) -> u64 {
+        self.next_attempt_id
+            .fetch_add(1, Ordering::Relaxed)
+            .checked_add(1)
+            .expect("process attempt id overflowed")
+    }
+
+    async fn current_process_attempt(&self, session_id: &str) -> Option<Arc<ProcessAttemptScope>> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|entry| entry.attempt.clone())
+    }
+
     pub async fn insert(&self, mut record: LaunchSessionRecord) {
+        let _lifecycle_transition = self.lifecycle_transition.lock().await;
         let (events, _) = broadcast::channel(256);
         ensure_stage_started(&mut record, now_ms());
+        let previous_child = self
+            .sessions
+            .read()
+            .await
+            .get(&record.session_id.0)
+            .and_then(|entry| entry.attempt.child.clone());
+        let mut previous_child = match previous_child.as_ref() {
+            Some(child) => Some(child.lock().await),
+            None => None,
+        };
         let mut sessions = self.sessions.write().await;
         sessions.insert(
             record.session_id.0.clone(),
             SessionEntry {
+                attempt: ProcessAttemptScope::new(self.next_attempt_id(), None),
                 record,
                 events,
-                child: None,
-                startup_observed: Arc::new(AtomicBool::new(false)),
-                boot_completed: Arc::new(AtomicBool::new(false)),
-                log_count: Arc::new(AtomicUsize::new(0)),
                 observed_failure: None,
+                log_count: 0,
                 stop_requested: false,
                 retention_holds: 1,
                 terminal_sequence: None,
             },
         );
         drop(sessions);
+        if let Some(previous_child) = previous_child.as_mut() {
+            let _ = previous_child.start_kill();
+        }
+        drop(previous_child);
         self.notify_changed();
     }
 
@@ -115,6 +245,45 @@ impl SessionStore {
             .read()
             .await
             .get(session_id)
+            .map(|entry| entry.record.clone())
+    }
+
+    pub(super) async fn process_exit_context(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
+        exit_observed_at_ms: u64,
+    ) -> Option<ProcessExitContext> {
+        let sessions = self.sessions.read().await;
+        let entry = sessions
+            .get(session_id)
+            .filter(|entry| attempt_scopes_match(&entry.attempt, attempt))?;
+        Some(ProcessExitContext {
+            record: entry.record.clone(),
+            observed_failure: entry
+                .observed_failure
+                .and_then(|signal| signal.fresh_for_exit(exit_observed_at_ms)),
+        })
+    }
+
+    pub(super) async fn startup_watchdog_record_for_attempt(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
+    ) -> Option<LaunchSessionRecord> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .filter(|entry| attempt_scopes_match(&entry.attempt, attempt))
+            .filter(|entry| {
+                !entry.stop_requested
+                    && matches!(
+                        entry.record.state,
+                        LaunchState::Starting | LaunchState::Monitoring
+                    )
+                    && entry.record.boot_completed_at_ms.is_none()
+            })
             .map(|entry| entry.record.clone())
     }
 
@@ -187,103 +356,268 @@ impl SessionStore {
         source: impl Into<String>,
         text: impl Into<String>,
     ) {
-        let source = source.into();
-        let text = text.into();
-        let now = now_ms();
-        let mut sessions = self.sessions.write().await;
-        let mut changed = false;
-        if let Some(entry) = sessions.get_mut(session_id) {
-            entry.startup_observed.store(true, Ordering::Relaxed);
-            entry.log_count.fetch_add(1, Ordering::Relaxed);
-            let boot_evidence =
-                if classify::boot_marker_detected(&text) && record_boot_completion(entry, now) {
-                    Some(process_observation_stage_evidence(
-                        session_id,
-                        ProcessObservation::BootEvidence {
-                            label: "boot_marker",
-                        },
-                    ))
-                } else {
-                    None
-                };
-            if boot_evidence.is_some() {
-                entry.observed_failure = None;
-                let pid = entry.record.pid;
-                match priority::promote_after_boot(pid) {
-                    Ok(promotion) => {
-                        record_priority_promotion(entry, promotion.proof_value(), None);
-                    }
-                    Err(error) => {
-                        let promotion_error = priority::sanitize_priority_error(&error);
-                        record_priority_promotion(entry, "failed", promotion_error);
-                        tracing::warn!(
-                            session_id,
-                            pid,
-                            error = %error,
-                            "failed to promote launched game process after boot marker"
-                        );
-                    }
-                }
-            }
-            if entry.boot_completed.load(Ordering::Relaxed)
-                && matches!(
-                    entry.record.state,
-                    LaunchState::Starting | LaunchState::Monitoring
-                )
+        let Some(attempt) = self.current_process_attempt(session_id).await else {
+            return;
+        };
+        self.emit_log_for_attempt_with(
+            session_id,
+            &attempt,
+            RawLogLine {
+                source: source.into(),
+                text: text.into(),
+                observed_at_ms: now_ms(),
+            },
+            prepare_log_line,
+            |child| priority::promote_after_boot(child).map(|promotion| promotion.proof_value()),
+        )
+        .await;
+    }
+
+    pub(super) async fn emit_log_for_attempt(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
+        source: &'static str,
+        text: String,
+        observed_at_ms: u64,
+    ) {
+        self.emit_log_for_attempt_with(
+            session_id,
+            attempt,
+            RawLogLine {
+                source: source.to_string(),
+                text,
+                observed_at_ms,
+            },
+            prepare_log_line,
+            |child| priority::promote_after_boot(child).map(|promotion| promotion.proof_value()),
+        )
+        .await;
+    }
+
+    async fn emit_log_for_attempt_with<Prepare, Promote>(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
+        line: RawLogLine,
+        prepare: Prepare,
+        promote_after_boot: Promote,
+    ) where
+        Prepare: FnOnce(&str, String, String, u64) -> PreparedLogLine,
+        Promote: FnOnce(Option<&Child>) -> std::io::Result<&'static str>,
+    {
+        let _log_transition_guard = attempt.log_transition.lock().await;
+        let prepared = prepare(session_id, line.source, line.text, line.observed_at_ms);
+        if prepared.boot_evidence.is_none() {
+            let mut sessions = self.sessions.write().await;
+            if let Some(entry) = sessions
+                .get_mut(session_id)
+                .filter(|entry| attempt_scopes_match(&entry.attempt, attempt))
             {
-                let evidence = boot_evidence.unwrap_or_default();
-                let mut status = LaunchStatusEvent {
-                    state: "running".to_string(),
-                    benchmark: entry.record.benchmark.clone(),
-                    pid: entry.record.pid,
-                    exit_code: None,
-                    failure_class: None,
-                    failure_detail: None,
-                    healing: entry.record.healing.clone(),
-                    guardian: entry.record.guardian.clone(),
-                    outcome: None,
-                    notice: None,
-                    evidence,
-                    stages: Vec::new(),
-                };
-                apply_status_update(entry, &mut status);
-                let _ = entry.events.send(LaunchEvent::Status(Box::new(status)));
-                changed = true;
-            } else if let Some(evidence) = boot_evidence {
-                apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
-                changed = true;
+                observe_log(entry);
+                publish_prepared_log(entry, prepared);
             }
-            let failure_class = classify_startup_failure_text(&text);
-            if failure_class != LaunchFailureClass::Unknown {
-                entry.observed_failure = Some(ObservedFailureSignal {
-                    class: failure_class,
-                    observed_at_ms: now,
-                });
-            }
-            let source = crate::observability::sanitize_evidence_token(
-                &source,
-                crate::observability::RedactionAudience::UserVisible,
-                32,
-            )
-            .unwrap_or_else(|| "game".to_string());
-            let text = crate::observability::sanitize_public_log_line(
-                &text,
-                crate::observability::RedactionAudience::UserVisible,
-                MAX_LAUNCH_LOG_LINE_CHARS,
-            );
-            let _ = entry
-                .events
-                .send(LaunchEvent::Log(LaunchLogEvent { source, text }));
+            return;
         }
-        drop(sessions);
-        if changed {
+
+        let (ticket, gate) = {
+            let sessions = self.sessions.read().await;
+            let Some(entry) = sessions
+                .get(session_id)
+                .filter(|entry| attempt_scopes_match(&entry.attempt, attempt))
+            else {
+                return;
+            };
+            let ticket = BootPriorityPromotionTicket {
+                attempt: entry.attempt.clone(),
+                pid: entry.record.pid,
+            };
+            let gate = boot_promotion_gate(Some(entry), &ticket);
+            (ticket, gate)
+        };
+        if matches!(gate, BootPromotionGate::Stale) {
+            return;
+        }
+
+        self.apply_boot_priority_promotion(session_id, ticket, prepared, gate, promote_after_boot)
+            .await;
+    }
+
+    async fn apply_boot_priority_promotion<Promote>(
+        &self,
+        session_id: &str,
+        ticket: BootPriorityPromotionTicket,
+        prepared: PreparedLogLine,
+        pre_effect_gate: BootPromotionGate,
+        promote_after_boot: Promote,
+    ) where
+        Promote: FnOnce(Option<&Child>) -> std::io::Result<&'static str>,
+    {
+        let child = ticket.attempt.child.clone();
+        let mut child_guard = None;
+        let mut gate = pre_effect_gate;
+        if matches!(gate, BootPromotionGate::Promote) {
+            child_guard = if let Some(child) = child.as_ref() {
+                Some(child.lock().await)
+            } else {
+                None
+            };
+            gate = match child_guard
+                .as_mut()
+                .map(|child| child.try_wait())
+                .transpose()
+            {
+                Ok(Some(Some(_))) => {
+                    BootPromotionGate::CompleteSkipped("skipped_process_already_exited")
+                }
+                Ok(Some(None)) | Ok(None) => BootPromotionGate::Promote,
+                Err(_) => BootPromotionGate::CompleteSkipped("skipped_process_state_unavailable"),
+            };
+        }
+        let mut raw_error = None;
+        let mut promotion_error = None;
+        let mut promotion = match gate {
+            BootPromotionGate::CompleteSkipped(proof) => proof,
+            BootPromotionGate::Promote => match promote_after_boot(child_guard.as_deref()) {
+                Ok(proof) => proof,
+                Err(error) => {
+                    promotion_error = priority::sanitize_priority_error(&error);
+                    raw_error = Some(error);
+                    "failed"
+                }
+            },
+            BootPromotionGate::Resolve => "skipped",
+            BootPromotionGate::Stale => return,
+        };
+        if matches!(gate, BootPromotionGate::Promote) {
+            match child_guard
+                .as_mut()
+                .map(|child| child.try_wait())
+                .transpose()
+            {
+                Ok(Some(Some(_))) => {
+                    gate = BootPromotionGate::CompleteSkipped(
+                        "skipped_process_exited_during_promotion",
+                    );
+                    promotion = "skipped_process_exited_during_promotion";
+                    promotion_error = None;
+                }
+                Err(_) => {
+                    gate = BootPromotionGate::CompleteSkipped("skipped_process_state_unavailable");
+                    promotion = "skipped_process_state_unavailable";
+                    promotion_error = None;
+                }
+                Ok(Some(None)) | Ok(None) => {}
+            }
+        }
+        let published = self
+            .settle_boot_promotion(
+                session_id,
+                &ticket,
+                prepared,
+                gate,
+                promotion,
+                promotion_error,
+            )
+            .await;
+
+        if let Some(error) = raw_error {
+            tracing::warn!(
+                session_id,
+                pid = ticket.pid,
+                error = %error,
+                "failed to promote launched game process after boot marker"
+            );
+        }
+        if published {
             self.notify_changed();
         }
     }
 
-    pub async fn emit_status(&self, session_id: &str, mut event: LaunchStatusEvent) {
+    async fn settle_boot_promotion(
+        &self,
+        session_id: &str,
+        ticket: &BootPriorityPromotionTicket,
+        prepared: PreparedLogLine,
+        pre_effect_gate: BootPromotionGate,
+        promotion: &'static str,
+        promotion_error: Option<String>,
+    ) -> bool {
         let mut sessions = self.sessions.write().await;
-        if let Some(entry) = sessions.get_mut(session_id) {
+        let Some(entry) = sessions.get_mut(session_id) else {
+            return false;
+        };
+        let final_gate = boot_promotion_gate(Some(entry), ticket);
+        let gate = match final_gate {
+            BootPromotionGate::Promote => pre_effect_gate,
+            final_gate => final_gate,
+        };
+        if matches!(gate, BootPromotionGate::Stale) {
+            return false;
+        }
+        if matches!(gate, BootPromotionGate::Resolve) {
+            observe_log(entry);
+            publish_prepared_log(entry, prepared);
+            return false;
+        }
+
+        let promotion = match gate {
+            BootPromotionGate::CompleteSkipped("skipped_stop_requested")
+                if matches!(pre_effect_gate, BootPromotionGate::Promote) =>
+            {
+                promotion
+            }
+            BootPromotionGate::CompleteSkipped(proof) => proof,
+            BootPromotionGate::Promote => promotion,
+            BootPromotionGate::Stale | BootPromotionGate::Resolve => unreachable!(),
+        };
+        observe_log(entry);
+        entry.observed_failure = None;
+        record_priority_promotion(entry, promotion, promotion_error);
+        complete_boot(entry, prepared.observed_at_ms);
+        let mut status = LaunchStatusEvent {
+            state: "running".to_string(),
+            benchmark: entry.record.benchmark.clone(),
+            pid: entry.record.pid,
+            exit_code: None,
+            failure_class: None,
+            failure_detail: None,
+            healing: entry.record.healing.clone(),
+            guardian: entry.record.guardian.clone(),
+            outcome: None,
+            notice: None,
+            evidence: prepared.boot_evidence.clone().unwrap_or_default(),
+            stages: Vec::new(),
+        };
+        apply_status_update(entry, &mut status);
+        let _ = entry.events.send(LaunchEvent::Status(Box::new(status)));
+        publish_prepared_log(entry, prepared);
+        true
+    }
+
+    pub async fn emit_status(&self, session_id: &str, event: LaunchStatusEvent) {
+        let Some(attempt) = self.current_process_attempt(session_id).await else {
+            return;
+        };
+        self.emit_status_for_attempt(session_id, &attempt, event)
+            .await;
+    }
+
+    pub(super) async fn emit_status_for_attempt(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
+        mut event: LaunchStatusEvent,
+    ) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(entry) = sessions
+            .get_mut(session_id)
+            .filter(|entry| attempt_scopes_match(&entry.attempt, attempt))
+        {
+            let next_state = classify::parse_launch_state(&event.state);
+            if process_state_regresses(entry.record.state, next_state) {
+                return;
+            }
             apply_status_update(entry, &mut event);
             if entry.retention_holds == 0 && classify::is_terminal_state(entry.record.state) {
                 if entry.terminal_sequence.is_none() {
@@ -321,7 +655,9 @@ impl SessionStore {
         mut record: LaunchSessionRecord,
         mut command: Command,
     ) -> std::io::Result<LaunchSessionRecord> {
+        let _lifecycle_transition = self.lifecycle_transition.lock().await;
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.kill_on_drop(true);
         let priority = match priority::configure_start_priority(&mut command) {
             Ok(mode) => LaunchPriorityEvidence {
                 start_mode: mode.proof_value().to_string(),
@@ -345,105 +681,104 @@ impl SessionStore {
             }
         };
         record.priority = Some(priority.clone());
-        self.record_priority_start(&record.session_id.0, priority)
-            .await;
-        let child = command.spawn()?;
+        let session_id = record.session_id.0.clone();
+        let previous_child = self
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .and_then(|entry| entry.attempt.child.clone());
+        let mut previous_child = match previous_child.as_ref() {
+            Some(child) => Some(child.lock().await),
+            None => None,
+        };
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                drop(previous_child);
+                let mut sessions = self.sessions.write().await;
+                if let Some(entry) = sessions.get_mut(&session_id) {
+                    entry.record.priority = Some(priority);
+                }
+                return Err(error);
+            }
+        };
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
         let process_started_at_ms = now_ms();
         record.pid = child.id();
         record.process_started_at_ms = Some(process_started_at_ms);
         record.boot_completed_at_ms = None;
         record.boot_duration_ms = None;
         record.state = LaunchState::Starting;
-
-        let session_id = record.session_id.0.clone();
+        record.failure = None;
+        record.outcome = None;
+        let mut sessions = self.sessions.write().await;
+        let process_attempt_id = self.next_attempt_id();
         let child_handle = Arc::new(Mutex::new(child));
-        let mut boot_completed = Arc::new(AtomicBool::new(false));
-        {
-            let mut sessions = self.sessions.write().await;
-            if let Some(entry) = sessions.get_mut(&session_id) {
-                let previous_state = entry.record.state;
-                let previous_stages = entry.record.stages.clone();
-                let previous_benchmark = entry.record.benchmark.clone();
-                record.failure = None;
-                record.outcome = None;
-                let mut stored_record = record.clone();
-                stored_record.state = previous_state;
-                stored_record.stages = previous_stages;
-                if stored_record.benchmark.is_none() {
-                    stored_record.benchmark = previous_benchmark;
-                }
-                ensure_stage_started(&mut stored_record, now_ms());
-                entry.record = stored_record;
-                entry.child = Some(child_handle.clone());
-                boot_completed = entry.boot_completed.clone();
-                entry.startup_observed.store(false, Ordering::Relaxed);
-                entry.boot_completed.store(false, Ordering::Relaxed);
-                entry.log_count.store(0, Ordering::Relaxed);
-                entry.observed_failure = None;
-                entry.stop_requested = false;
-                entry.terminal_sequence = None;
-            } else {
-                let (events, _) = broadcast::channel(256);
-                sessions.insert(
-                    session_id.clone(),
-                    SessionEntry {
-                        record: {
-                            let mut record = record.clone();
-                            ensure_stage_started(&mut record, now_ms());
-                            record
-                        },
-                        events,
-                        child: Some(child_handle.clone()),
-                        startup_observed: Arc::new(AtomicBool::new(false)),
-                        boot_completed: boot_completed.clone(),
-                        log_count: Arc::new(AtomicUsize::new(0)),
-                        observed_failure: None,
-                        stop_requested: false,
-                        retention_holds: 1,
-                        terminal_sequence: None,
-                    },
-                );
+        let attempt = ProcessAttemptScope::new(process_attempt_id, Some(child_handle));
+        let (events, retention_holds) = if let Some(entry) = sessions.get(&session_id) {
+            (entry.events.clone(), entry.retention_holds)
+        } else {
+            let (events, _) = broadcast::channel(256);
+            (events, 1)
+        };
+        let mut stored_record = record.clone();
+        if let Some(previous) = sessions.get(&session_id) {
+            stored_record.state = previous.record.state;
+            stored_record.stages = previous.record.stages.clone();
+            if stored_record.benchmark.is_none() {
+                stored_record.benchmark = previous.record.benchmark.clone();
             }
         }
+        ensure_stage_started(&mut stored_record, now_ms());
+        let mut starting_status = LaunchStatusEvent {
+            state: "starting".to_string(),
+            benchmark: stored_record.benchmark.clone(),
+            pid: record.pid,
+            exit_code: None,
+            failure_class: None,
+            failure_detail: None,
+            healing: stored_record.healing.clone(),
+            guardian: stored_record.guardian.clone(),
+            outcome: None,
+            notice: None,
+            evidence: Vec::new(),
+            stages: Vec::new(),
+        };
+        let mut entry = SessionEntry {
+            attempt: attempt.clone(),
+            record: stored_record,
+            events,
+            observed_failure: None,
+            log_count: 0,
+            stop_requested: false,
+            retention_holds,
+            terminal_sequence: None,
+        };
+        apply_status_update(&mut entry, &mut starting_status);
+        let _ = entry
+            .events
+            .send(LaunchEvent::Status(Box::new(starting_status)));
+        sessions.insert(session_id.clone(), entry);
+        drop(sessions);
+        if let Some(previous_child) = previous_child.as_mut() {
+            let _ = previous_child.start_kill();
+        }
+        drop(previous_child);
         self.notify_changed();
 
-        self.emit_status(
-            &session_id,
-            LaunchStatusEvent {
-                state: "starting".to_string(),
-                benchmark: record.benchmark.clone(),
-                pid: record.pid,
-                exit_code: None,
-                failure_class: None,
-                failure_detail: None,
-                healing: record.healing.clone(),
-                guardian: record.guardian.clone(),
-                outcome: None,
-                notice: None,
-                evidence: Vec::new(),
-                stages: Vec::new(),
-            },
-        )
-        .await;
-
-        supervisor::spawn_output_tasks(self.clone(), session_id.clone(), child_handle.clone())
-            .await;
-        supervisor::spawn_startup_watchdog(
+        let output_pumps = supervisor::spawn_output_tasks(
             self.clone(),
             session_id.clone(),
-            child_handle.clone(),
-            boot_completed,
+            attempt.clone(),
+            stdout,
+            stderr,
         );
-        supervisor::spawn_wait_task(self.clone(), session_id, child_handle);
+        supervisor::spawn_startup_watchdog(self.clone(), session_id.clone(), attempt.clone());
+        supervisor::spawn_wait_task(self.clone(), session_id, attempt, output_pumps);
 
         Ok(record)
-    }
-
-    async fn record_priority_start(&self, session_id: &str, priority: LaunchPriorityEvidence) {
-        let mut sessions = self.sessions.write().await;
-        if let Some(entry) = sessions.get_mut(session_id) {
-            entry.record.priority = Some(priority);
-        }
     }
 
     pub async fn kill(&self, session_id: &str) -> std::io::Result<()> {
@@ -460,7 +795,7 @@ impl SessionStore {
                 process_stop_stage_evidence(session_id, ProcessStopIntent::UserRequested);
             ensure_stage_started(&mut entry.record, now_ms());
             apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
-            entry.child.clone()
+            entry.attempt.child.clone()
         };
         if let Some(child) = child {
             child.lock().await.kill().await
@@ -472,6 +807,7 @@ impl SessionStore {
         }
     }
 
+    #[cfg(test)]
     pub async fn observed_failure(&self, session_id: &str) -> Option<LaunchFailureClass> {
         self.sessions
             .read()
@@ -491,12 +827,13 @@ impl SessionStore {
     }
 
     pub async fn terminate_all(&self) {
+        let _lifecycle_transition = self.lifecycle_transition.lock().await;
         let children = self
             .sessions
             .read()
             .await
             .values()
-            .filter_map(|entry| entry.child.clone())
+            .filter_map(|entry| entry.attempt.child.clone())
             .collect::<Vec<_>>();
 
         for child in children {
@@ -582,8 +919,8 @@ impl SessionStore {
             let snapshot = self.sessions.read().await.get(session_id).map(|entry| {
                 (
                     entry.record.state,
-                    entry.boot_completed.load(Ordering::Relaxed),
-                    entry.log_count.load(Ordering::Relaxed),
+                    entry.record.boot_completed_at_ms.is_some(),
+                    entry.log_count,
                 )
             });
 
@@ -653,8 +990,7 @@ fn apply_status_update(entry: &mut SessionEntry, event: &mut LaunchStatusEvent) 
             classify::classify_session_outcome(classify::SessionOutcomeInput {
                 previous_state,
                 next_state,
-                boot_completed: entry.boot_completed.load(Ordering::Relaxed)
-                    || entry.record.boot_completed_at_ms.is_some(),
+                boot_completed: entry.record.boot_completed_at_ms.is_some(),
                 stop_requested: entry.stop_requested,
                 exit_code: event.exit_code,
                 failure_class: parsed_failure_class,
@@ -706,16 +1042,64 @@ fn apply_status_update(entry: &mut SessionEntry, event: &mut LaunchStatusEvent) 
     event.stages = entry.record.stages.clone();
 }
 
-fn record_boot_completion(entry: &mut SessionEntry, now: u64) -> bool {
-    if entry.boot_completed.swap(true, Ordering::Relaxed) {
-        return false;
+fn prepare_log_line(
+    session_id: &str,
+    source: String,
+    text: String,
+    observed_at_ms: u64,
+) -> PreparedLogLine {
+    let boot_evidence = classify::boot_marker_detected(&text).then(|| {
+        process_observation_stage_evidence(
+            session_id,
+            ProcessObservation::BootEvidence {
+                label: "boot_marker",
+            },
+        )
+    });
+    let failure_class = match classify_startup_failure_text(&text) {
+        LaunchFailureClass::Unknown => None,
+        failure_class => Some(failure_class),
+    };
+    let source = crate::observability::sanitize_evidence_token(
+        &source,
+        crate::observability::RedactionAudience::UserVisible,
+        32,
+    )
+    .unwrap_or_else(|| "game".to_string());
+    let text = crate::observability::sanitize_public_log_line(
+        &text,
+        crate::observability::RedactionAudience::UserVisible,
+        MAX_LAUNCH_LOG_LINE_CHARS,
+    );
+
+    PreparedLogLine {
+        observed_at_ms,
+        boot_evidence,
+        failure_class,
+        event: LaunchLogEvent { source, text },
     }
+}
+
+fn complete_boot(entry: &mut SessionEntry, now: u64) {
     entry.record.boot_completed_at_ms = Some(now);
     entry.record.boot_duration_ms = entry
         .record
         .process_started_at_ms
         .map(|started_at| now.saturating_sub(started_at));
-    true
+}
+
+fn observe_log(entry: &mut SessionEntry) {
+    entry.log_count += 1;
+}
+
+fn publish_prepared_log(entry: &mut SessionEntry, prepared: PreparedLogLine) {
+    if let Some(failure_class) = prepared.failure_class {
+        entry.observed_failure = Some(ObservedFailureSignal {
+            class: failure_class,
+            observed_at_ms: prepared.observed_at_ms,
+        });
+    }
+    let _ = entry.events.send(LaunchEvent::Log(prepared.event));
 }
 
 fn record_priority_promotion(
@@ -1065,7 +1449,7 @@ fn command_xmx_mb(command: &[String]) -> Option<u64> {
     })
 }
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
@@ -1079,9 +1463,35 @@ impl Default for SessionStore {
 }
 
 #[cfg(test)]
+fn test_record(session_id: &str) -> LaunchSessionRecord {
+    LaunchSessionRecord {
+        session_id: axial_launcher::SessionId(session_id.to_string()),
+        instance_id: "instance".to_string(),
+        version_id: "1.21.1".to_string(),
+        launched_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+        benchmark: None,
+        state: LaunchState::Queued,
+        pid: None,
+        process_started_at_ms: None,
+        boot_completed_at_ms: None,
+        boot_duration_ms: None,
+        priority: None,
+        exit_code: None,
+        command: Vec::new(),
+        java_path: None,
+        natives_dir: None,
+        failure: None,
+        healing: None,
+        guardian: None,
+        outcome: None,
+        stages: Vec::new(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use axial_launcher::{LaunchSessionExitReason, LaunchStageEvidence, SessionId};
+    use axial_launcher::{LaunchSessionExitReason, LaunchStageEvidence};
     use serde_json::json;
     use std::sync::Arc;
     use tokio::process::Command;
@@ -1772,6 +2182,192 @@ mod tests {
         assert_eq!(stored.priority, launched.priority);
     }
 
+    #[tokio::test]
+    async fn failed_spawn_preserves_the_session_attempt() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "failed-start-registration";
+        store.insert(test_record(session_id)).await;
+        let original_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("original attempt");
+        let command = Command::new("/definitely/missing/axial-java-runtime");
+
+        assert!(
+            store
+                .start_process(test_record(session_id), command)
+                .await
+                .is_err()
+        );
+
+        let current_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("current attempt");
+        assert!(attempt_scopes_match(&current_attempt, &original_attempt));
+        let stored = store.get(session_id).await.expect("stored record");
+        assert_eq!(stored.state, LaunchState::Queued);
+        assert_eq!(stored.pid, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_post_spawn_registration_kills_only_the_unregistered_child() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "cancelled-post-spawn-registration";
+        store.insert(test_record(session_id)).await;
+        let mut old_command = Command::new("sh");
+        old_command.arg("-c").arg("exec sleep 30");
+        let old_child = attach_test_child(&store, session_id, old_command).await;
+        let original_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("original attempt");
+        let pid_path = test_pid_path("cancelled-registration");
+        let _ = std::fs::remove_file(&pid_path);
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf '%s' $$ > \"$1\"; exec sleep 30")
+            .arg("cancelled-registration")
+            .arg(&pid_path);
+        let sessions = store.sessions.read().await;
+        let start_store = store.clone();
+        let start = tokio::spawn(async move {
+            start_store
+                .start_process(test_record(session_id), command)
+                .await
+        });
+        let spawned_pid = wait_for_pid_file(&pid_path).await;
+        assert!(old_child.try_lock().is_err());
+
+        start.abort();
+        assert!(start.await.expect_err("cancelled start").is_cancelled());
+        drop(sessions);
+        let _ = std::fs::remove_file(&pid_path);
+
+        assert_process_exits(spawned_pid).await;
+        assert!(
+            old_child
+                .lock()
+                .await
+                .try_wait()
+                .expect("old child")
+                .is_none()
+        );
+        let current_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("current attempt");
+        assert!(attempt_scopes_match(&current_attempt, &original_attempt));
+        old_child
+            .lock()
+            .await
+            .kill()
+            .await
+            .expect("cleanup old child");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_insert_waiting_for_store_does_not_signal_the_old_child() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "cancelled-insert-replacement";
+        store.insert(test_record(session_id)).await;
+        let mut old_command = Command::new("sh");
+        old_command.arg("-c").arg("exec sleep 30");
+        let old_child = attach_test_child(&store, session_id, old_command).await;
+        let original_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("original attempt");
+        let sessions = store.sessions.read().await;
+        let insert_store = store.clone();
+        let insert = tokio::spawn(async move {
+            insert_store.insert(test_record(session_id)).await;
+        });
+        for _ in 0..1_000 {
+            if old_child.try_lock().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(old_child.try_lock().is_err());
+
+        insert.abort();
+        assert!(insert.await.expect_err("cancelled insert").is_cancelled());
+        drop(sessions);
+
+        assert!(
+            old_child
+                .lock()
+                .await
+                .try_wait()
+                .expect("old child")
+                .is_none()
+        );
+        let current_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("current attempt");
+        assert!(attempt_scopes_match(&current_attempt, &original_attempt));
+        old_child
+            .lock()
+            .await
+            .kill()
+            .await
+            .expect("cleanup old child");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_replacements_allocate_monotonic_attempts_and_stale_exit_is_ignored() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "concurrent-process-replacement";
+        let mut first_command = Command::new("sh");
+        first_command.arg("-c").arg("exec sleep 30");
+        store
+            .start_process(test_record(session_id), first_command)
+            .await
+            .expect("first process");
+        let first_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("first attempt");
+
+        let mut second_record = test_record(session_id);
+        second_record.version_id = "second".to_string();
+        let mut second_command = Command::new("sh");
+        second_command.arg("-c").arg("exec sleep 30");
+        let second_store = store.clone();
+        let second = async move {
+            second_store
+                .start_process(second_record, second_command)
+                .await
+        };
+        let mut third_record = test_record(session_id);
+        third_record.version_id = "third".to_string();
+        let mut third_command = Command::new("sh");
+        third_command.arg("-c").arg("exec sleep 30");
+        let third_store = store.clone();
+        let third = async move { third_store.start_process(third_record, third_command).await };
+        let (second, third) = tokio::join!(second, third);
+        second.expect("second replacement");
+        third.expect("third replacement");
+
+        let current_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("current attempt");
+        assert_eq!(current_attempt.id, first_attempt.id + 2);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            store.get(session_id).await.expect("stored record").state,
+            LaunchState::Starting
+        );
+        store.terminate_all().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn launch_process_exit_preserves_observed_failure_class_without_raw_detail() {
@@ -1829,6 +2425,45 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_exit_drains_the_final_output_failure_before_classification() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "drained-final-output-failure";
+        store.insert(test_record(session_id)).await;
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "i=0; while [ $i -lt 5000 ]; do printf '%s\\n' '[main/INFO]: loading modded game resources' >&2; i=$((i + 1)); done; printf '%s\\n' \"Unrecognized VM option '-XX:+UseZGC'\" >&2; exit 1",
+        );
+
+        store
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("spawn output-heavy failing process");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let terminal = loop {
+            let record = store.get(session_id).await.expect("session record");
+            if classify::is_terminal_state(record.state) {
+                break record;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "process did not reach terminal state"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert_eq!(terminal.state, LaunchState::Exited);
+        assert_eq!(
+            terminal.failure.map(|failure| failure.class),
+            Some(LaunchFailureClass::JvmUnsupportedOption)
+        );
+        assert_eq!(
+            store.observed_failure_for_exit(session_id).await,
+            Some(LaunchFailureClass::JvmUnsupportedOption)
+        );
+    }
+
     #[tokio::test]
     async fn launch_boot_marker_records_completion_and_duration() {
         let store = SessionStore::new();
@@ -1876,7 +2511,7 @@ mod tests {
             assert_eq!(priority.start_mode, "below_normal_until_boot");
             assert!(matches!(
                 priority.promotion.as_deref(),
-                Some("promoted" | "missing_pid" | "failed")
+                Some("promoted" | "missing_process_handle" | "failed")
             ));
         }
         #[cfg(not(windows))]
@@ -1884,6 +2519,555 @@ mod tests {
             assert_eq!(priority.start_mode, "noop");
             assert_eq!(priority.promotion.as_deref(), Some("noop"));
         }
+    }
+
+    #[tokio::test]
+    async fn log_preparation_and_priority_promotion_run_outside_the_store_write_lock() {
+        let store = SessionStore::new();
+        let session_id = "log-lock-discipline";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Starting;
+        record.process_started_at_ms = Some(now_ms().saturating_sub(1_000));
+        store.insert(record).await;
+        {
+            let mut sessions = store.sessions.write().await;
+            sessions
+                .get_mut(session_id)
+                .expect("session entry")
+                .observed_failure = Some(ObservedFailureSignal {
+                class: LaunchFailureClass::ClasspathModuleConflict,
+                observed_at_ms: now_ms(),
+            });
+        }
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+        let preparation_ran = AtomicBool::new(false);
+        let promotion_ran = AtomicBool::new(false);
+
+        emit_test_log_with_prepare(
+            &store,
+            session_id,
+            r"C:\Users\Alice\AppData\stdout".to_string(),
+            "[Render thread/INFO]: LWJGL Version: 3.3.3; Unrecognized VM option '-XX:+UseZGC'"
+                .to_string(),
+            |session_id, source, text, observed_at_ms| {
+                let available = store
+                    .sessions
+                    .try_write()
+                    .expect("log preparation must run outside the session write lock");
+                drop(available);
+                preparation_ran.store(true, Ordering::Relaxed);
+                prepare_log_line(session_id, source, text, observed_at_ms)
+            },
+            |child| {
+                let available = store
+                    .sessions
+                    .try_write()
+                    .expect("priority promotion must run after releasing the session write lock");
+                drop(available);
+                assert!(child.is_none());
+                promotion_ran.store(true, Ordering::Relaxed);
+                Ok("test_promoted")
+            },
+        )
+        .await;
+
+        assert!(preparation_ran.load(Ordering::Relaxed));
+        assert!(promotion_ran.load(Ordering::Relaxed));
+        let LaunchEvent::Status(status) = receiver.recv().await.expect("running status") else {
+            panic!("expected status before log event");
+        };
+        assert_eq!(status.state, "running");
+        let LaunchEvent::Log(log) = receiver.recv().await.expect("log event") else {
+            panic!("expected log event after status");
+        };
+        assert_eq!(log.source, "game");
+        assert_eq!(log.text, crate::observability::PUBLIC_LOG_LINE_REDACTED);
+        assert_eq!(
+            store.observed_failure(session_id).await,
+            Some(LaunchFailureClass::JvmUnsupportedOption)
+        );
+        let stored = store.get(session_id).await.expect("stored record");
+        assert!(stored.priority.and_then(|value| value.promotion).is_some());
+        assert!(
+            serde_json::to_string(&stored.stages)
+                .expect("stage evidence json")
+                .contains("execution_process_boot_evidence")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn boot_stability_waits_for_priority_promotion_before_status_and_proof_visibility() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "boot-promotion-stability";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Starting;
+        record.process_started_at_ms = Some(now_ms().saturating_sub(1_000));
+        store.insert(record).await;
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+        let effect_started = Arc::new(AtomicBool::new(false));
+        let release_effect = Arc::new(std::sync::Barrier::new(2));
+
+        let emit_store = store.clone();
+        let emit_effect_started = effect_started.clone();
+        let emit_release_effect = release_effect.clone();
+        let emit = tokio::spawn(async move {
+            emit_test_log(
+                &emit_store,
+                session_id,
+                "stdout".to_string(),
+                "[Render thread/INFO]: LWJGL Version: 3.3.3".to_string(),
+                |_| {
+                    emit_effect_started.store(true, Ordering::Release);
+                    emit_release_effect.wait();
+                    Ok("test_promoted")
+                },
+            )
+            .await;
+        });
+        while !effect_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let later_store = store.clone();
+        let later_started = Arc::new(AtomicBool::new(false));
+        let later_task_started = later_started.clone();
+        let later_log = tokio::spawn(async move {
+            later_task_started.store(true, Ordering::Release);
+            later_store
+                .emit_log(
+                    session_id,
+                    "stdout",
+                    "[main/INFO]: Loading later modded game resources",
+                )
+                .await;
+        });
+        while !later_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+
+        let pending_outcome = store.wait_for_startup(session_id, Duration::ZERO).await;
+        let pending = store.get(session_id).await;
+        let pending_stream_empty = receiver.try_recv().is_err();
+        let later_log_pending = !later_log.is_finished();
+        release_effect.wait();
+        emit.await.expect("boot log task");
+        later_log.await.expect("later log task");
+
+        assert_eq!(pending_outcome, StartupOutcome::Stalled);
+        let pending = pending.expect("pending boot record");
+        assert_eq!(pending.state, LaunchState::Starting);
+        assert_eq!(pending.boot_completed_at_ms, None);
+        assert_eq!(pending.priority, None);
+        assert!(pending_stream_empty);
+        assert!(later_log_pending);
+        assert_eq!(
+            store.wait_for_startup(session_id, Duration::ZERO).await,
+            StartupOutcome::Stable
+        );
+        let completed = store.get(session_id).await.expect("completed boot record");
+        assert_eq!(completed.state, LaunchState::Running);
+        assert!(completed.boot_completed_at_ms.is_some());
+        assert_eq!(
+            completed
+                .priority
+                .and_then(|priority| priority.promotion)
+                .as_deref(),
+            Some("test_promoted")
+        );
+        let LaunchEvent::Status(status) = receiver.recv().await.expect("running status") else {
+            panic!("expected running status before logs");
+        };
+        assert_eq!(status.state, "running");
+        let LaunchEvent::Log(boot_log) = receiver.recv().await.expect("boot log") else {
+            panic!("expected boot log after running status");
+        };
+        assert!(boot_log.text.contains("LWJGL Version"));
+        let LaunchEvent::Log(later_log) = receiver.recv().await.expect("later log") else {
+            panic!("expected later log after boot log");
+        };
+        assert!(later_log.text.contains("later modded game resources"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_boot_effect_leaves_no_claim_or_partial_log_state() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "cancelled-boot-effect";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Starting;
+        store.insert(record).await;
+        set_failure_observed_at(&store, session_id, now_ms()).await;
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("attempt");
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+        let effect_started = Arc::new(std::sync::Barrier::new(2));
+        let release_effect = Arc::new(std::sync::Barrier::new(2));
+        let effect_finished = Arc::new(AtomicBool::new(false));
+
+        let emit_store = store.clone();
+        let emit_started = effect_started.clone();
+        let emit_release = release_effect.clone();
+        let emit_finished = effect_finished.clone();
+        let emit = tokio::spawn(async move {
+            emit_test_log(
+                &emit_store,
+                session_id,
+                "stdout".to_string(),
+                "[Render thread/INFO]: LWJGL Version: 3.3.3".to_string(),
+                |_| {
+                    emit_started.wait();
+                    emit_release.wait();
+                    emit_finished.store(true, Ordering::Release);
+                    Ok("test_promoted")
+                },
+            )
+            .await;
+        });
+        effect_started.wait();
+        let sessions = store.sessions.write().await;
+        release_effect.wait();
+        while !effect_finished.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        emit.abort();
+        assert!(emit.await.expect_err("cancelled boot emit").is_cancelled());
+        drop(sessions);
+
+        assert!(
+            store
+                .startup_watchdog_record_for_attempt(session_id, &attempt)
+                .await
+                .is_some()
+        );
+        let sessions = store.sessions.read().await;
+        let entry = sessions.get(session_id).expect("session entry");
+        assert_eq!(entry.record.state, LaunchState::Starting);
+        assert_eq!(entry.record.boot_completed_at_ms, None);
+        assert_eq!(entry.record.priority, None);
+        assert_eq!(entry.log_count, 0);
+        assert_eq!(
+            entry.observed_failure.map(|signal| signal.class),
+            Some(LaunchFailureClass::JvmUnsupportedOption)
+        );
+        drop(sessions);
+        assert!(receiver.try_recv().is_err());
+        assert!(attempt.log_transition.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn stale_attempt_output_and_exit_do_not_update_a_reused_session() {
+        let store = SessionStore::new();
+        let session_id = "stale-attempt-output";
+        let stale_attempt = replace_session(&store, session_id).await;
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+
+        store
+            .emit_log_for_attempt(
+                session_id,
+                &stale_attempt,
+                "stderr",
+                "Unrecognized VM option '-XX:+UseZGC'".to_string(),
+                now_ms(),
+            )
+            .await;
+        store
+            .emit_status_for_attempt(
+                session_id,
+                &stale_attempt,
+                terminal_status(Some(1), Some("unknown"), None),
+            )
+            .await;
+
+        let stored = store.get(session_id).await.expect("stored record");
+        assert_eq!(stored.state, LaunchState::Starting);
+        assert_eq!(stored.boot_completed_at_ms, None);
+        assert_eq!(stored.exit_code, None);
+        assert_eq!(store.observed_failure(session_id).await, None);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_attempt_watchdog_does_not_overwrite_a_retry() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "stale-attempt-watchdog";
+        let stale_attempt = replace_session(&store, session_id).await;
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+
+        supervisor::spawn_startup_watchdog(store.clone(), session_id.to_string(), stale_attempt);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+
+        let stored = store.get(session_id).await.expect("stored record");
+        assert_eq!(stored.state, LaunchState::Starting);
+        assert_eq!(stored.failure, None);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn late_monitoring_status_cannot_regress_a_running_attempt() {
+        let store = SessionStore::new();
+        let session_id = "late-monitoring-status";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Starting;
+        store.insert(record).await;
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("attempt");
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+        let mut running = terminal_status(None, None, None);
+        running.state = "running".to_string();
+        store
+            .emit_status_for_attempt(session_id, &attempt, running)
+            .await;
+        assert_eq!(recv_status(&mut receiver).await.state, "running");
+
+        let mut late_monitoring = terminal_status(None, None, None);
+        late_monitoring.state = "monitoring".to_string();
+        store
+            .emit_status_for_attempt(session_id, &attempt, late_monitoring)
+            .await;
+
+        assert_eq!(
+            store.get(session_id).await.expect("stored record").state,
+            LaunchState::Running
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn late_startup_statuses_cannot_resurrect_a_fast_exit() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "late-status-after-fast-exit";
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exit 9");
+        store
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("fast-exit process");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("attempt");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = store.get(session_id).await.expect("stored record").state;
+            if classify::is_terminal_state(state) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fast-exit process did not reach terminal state"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+
+        for state in ["monitoring", "running"] {
+            let mut late = terminal_status(None, None, None);
+            late.state = state.to_string();
+            store
+                .emit_status_for_attempt(session_id, &attempt, late)
+                .await;
+        }
+
+        assert_eq!(
+            store.get(session_id).await.expect("stored record").state,
+            LaunchState::Exited
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn nonstartup_boot_marker_is_logged_without_claiming_boot() {
+        let store = SessionStore::new();
+        let session_id = "nonstartup-boot-marker";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Running;
+        store.insert(record).await;
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+
+        store
+            .emit_log(
+                session_id,
+                "stdout",
+                "[Render thread/INFO]: LWJGL Version: 3.3.3",
+            )
+            .await;
+
+        let LaunchEvent::Log(log) = receiver.recv().await.expect("boot-looking log") else {
+            panic!("expected log without status");
+        };
+        assert!(log.text.contains("LWJGL Version"));
+        assert!(receiver.try_recv().is_err());
+        let entry = store.sessions.read().await;
+        let entry = entry.get(session_id).expect("session entry");
+        assert_eq!(entry.record.boot_completed_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn stop_adjacent_boot_marker_completes_with_skipped_proof_before_log() {
+        let store = SessionStore::new();
+        let session_id = "stop-adjacent-boot-marker";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Starting;
+        store.insert(record).await;
+        mark_stop_requested(&store, session_id).await;
+        let effect_ran = AtomicBool::new(false);
+
+        let stored = emit_test_boot(&store, session_id, "skipped_stop_requested", |_| {
+            effect_ran.store(true, Ordering::Relaxed);
+            Ok("test_promoted")
+        })
+        .await;
+
+        assert!(!effect_ran.load(Ordering::Relaxed));
+        assert_eq!(stored.state, LaunchState::Running);
+    }
+
+    #[tokio::test]
+    async fn stop_racing_after_promotion_preserves_the_performed_effect_proof() {
+        let store = SessionStore::new();
+        let session_id = "stop-after-boot-promotion";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Starting;
+        store.insert(record).await;
+
+        emit_test_boot(&store, session_id, "test_promoted", |child| {
+            assert!(child.is_none());
+            store
+                .sessions
+                .try_write()
+                .expect("promotion must run outside the session write lock")
+                .get_mut(session_id)
+                .expect("session entry")
+                .stop_requested = true;
+            Ok("test_promoted")
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pid_without_child_skips_real_boot_promotion_and_keeps_the_marker() {
+        let store = SessionStore::new();
+        let session_id = "boot-marker-missing-child";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Starting;
+        record.pid = Some(41);
+        store.insert(record).await;
+        let effect_ran = AtomicBool::new(false);
+
+        emit_test_boot(&store, session_id, "skipped_missing_process_handle", |_| {
+            effect_ran.store(true, Ordering::Relaxed);
+            Ok("test_promoted")
+        })
+        .await;
+
+        assert!(!effect_ran.load(Ordering::Relaxed));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_marker_after_physical_exit_completes_with_skipped_proof() {
+        let store = SessionStore::new();
+        let session_id = "boot-marker-after-physical-exit";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Starting;
+        store.insert(record).await;
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exit 0");
+        let child = attach_test_child(&store, session_id, command).await;
+        loop {
+            if child
+                .lock()
+                .await
+                .try_wait()
+                .expect("child status")
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let effect_ran = AtomicBool::new(false);
+
+        emit_test_boot(&store, session_id, "skipped_process_already_exited", |_| {
+            effect_ran.store(true, Ordering::Relaxed);
+            Ok("test_promoted")
+        })
+        .await;
+
+        assert!(!effect_ran.load(Ordering::Relaxed));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn boot_marker_process_exit_during_promotion_completes_with_skipped_proof() {
+        let store = SessionStore::new();
+        let session_id = "boot-marker-exit-during-promotion";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Starting;
+        store.insert(record).await;
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec sleep 30");
+        let child = attach_test_child(&store, session_id, command).await;
+        let pid = child.lock().await.id().expect("child pid");
+        let effect_ran = AtomicBool::new(false);
+
+        emit_test_boot(
+            &store,
+            session_id,
+            "skipped_process_exited_during_promotion",
+            |_| {
+                effect_ran.store(true, Ordering::Relaxed);
+                terminate_process_and_wait(pid);
+                Ok("test_promoted")
+            },
+        )
+        .await;
+
+        assert!(effect_ran.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn failure_freshness_uses_the_exit_observation_boundary() {
+        let store = SessionStore::new();
+        let session_id = "failure-freshness-boundary";
+        store.insert(test_record(session_id)).await;
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("attempt");
+        let exit_observed_at_ms = now_ms();
+        set_failure_observed_at(
+            &store,
+            session_id,
+            exit_observed_at_ms - FAILURE_SIGNAL_VALID_FOR_EXIT_MS,
+        )
+        .await;
+        assert_eq!(
+            store
+                .process_exit_context(session_id, &attempt, exit_observed_at_ms)
+                .await
+                .and_then(|context| context.observed_failure),
+            Some(LaunchFailureClass::JvmUnsupportedOption)
+        );
+        set_failure_observed_at(
+            &store,
+            session_id,
+            exit_observed_at_ms - FAILURE_SIGNAL_VALID_FOR_EXIT_MS - 1,
+        )
+        .await;
+        assert_eq!(
+            store
+                .process_exit_context(session_id, &attempt, exit_observed_at_ms)
+                .await
+                .and_then(|context| context.observed_failure),
+            None
+        );
     }
 
     #[tokio::test]
@@ -2442,6 +3626,187 @@ mod tests {
         }
     }
 
+    async fn emit_test_boot<Promote>(
+        store: &SessionStore,
+        session_id: &str,
+        expected_proof: &str,
+        promote: Promote,
+    ) -> LaunchSessionRecord
+    where
+        Promote: FnOnce(Option<&Child>) -> std::io::Result<&'static str>,
+    {
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+        emit_test_log(
+            store,
+            session_id,
+            "stdout".to_string(),
+            "[Render thread/INFO]: LWJGL Version: 3.3.3".to_string(),
+            promote,
+        )
+        .await;
+        assert_eq!(recv_status(&mut receiver).await.state, "running");
+        assert!(matches!(
+            receiver.recv().await.expect("boot log"),
+            LaunchEvent::Log(_)
+        ));
+        let stored = store.get(session_id).await.expect("stored record");
+        assert_eq!(
+            stored
+                .priority
+                .as_ref()
+                .and_then(|priority| priority.promotion.as_deref()),
+            Some(expected_proof)
+        );
+        assert!(stored.boot_completed_at_ms.is_some());
+        stored
+    }
+
+    async fn emit_test_log<Promote>(
+        store: &SessionStore,
+        session_id: &str,
+        source: String,
+        text: String,
+        promote: Promote,
+    ) where
+        Promote: FnOnce(Option<&Child>) -> std::io::Result<&'static str>,
+    {
+        emit_test_log_with_prepare(store, session_id, source, text, prepare_log_line, promote)
+            .await;
+    }
+
+    async fn emit_test_log_with_prepare<Prepare, Promote>(
+        store: &SessionStore,
+        session_id: &str,
+        source: String,
+        text: String,
+        prepare: Prepare,
+        promote: Promote,
+    ) where
+        Prepare: FnOnce(&str, String, String, u64) -> PreparedLogLine,
+        Promote: FnOnce(Option<&Child>) -> std::io::Result<&'static str>,
+    {
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("process attempt");
+        store
+            .emit_log_for_attempt_with(
+                session_id,
+                &attempt,
+                RawLogLine {
+                    source,
+                    text,
+                    observed_at_ms: now_ms(),
+                },
+                prepare,
+                promote,
+            )
+            .await;
+    }
+
+    async fn replace_session(store: &SessionStore, session_id: &str) -> Arc<ProcessAttemptScope> {
+        store.insert(test_record(session_id)).await;
+        let stale_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("stale attempt");
+        let mut replacement = test_record(session_id);
+        replacement.state = LaunchState::Starting;
+        store.insert(replacement).await;
+        stale_attempt
+    }
+
+    async fn attach_test_child(
+        store: &SessionStore,
+        session_id: &str,
+        mut command: Command,
+    ) -> Arc<Mutex<Child>> {
+        let child = command.spawn().expect("test child");
+        let pid = child.id();
+        let child = Arc::new(Mutex::new(child));
+        let mut sessions = store.sessions.write().await;
+        let entry = sessions.get_mut(session_id).expect("session entry");
+        entry.record.pid = pid;
+        entry.attempt = ProcessAttemptScope::new(entry.attempt.id, Some(child.clone()));
+        child
+    }
+
+    #[cfg(unix)]
+    fn test_pid_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("axial-{label}-{}-{}", std::process::id(), now_ms()))
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pid_file(path: &std::path::Path) -> u32 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(path)
+                && let Ok(pid) = pid.parse()
+            {
+                return pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "spawned process did not publish its pid"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_exits(pid: u32) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while process_is_live(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "process {pid} remained live after cancellation"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn terminate_process_and_wait(pid: u32) {
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status()
+                .expect("terminate process")
+                .success()
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while process_is_live(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process {pid} did not exit during promotion"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_is_live(pid: u32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("inspect process state");
+        let state = String::from_utf8_lossy(&output.stdout);
+        output.status.success() && !state.trim().is_empty() && !state.trim_start().starts_with('Z')
+    }
+
+    async fn set_failure_observed_at(store: &SessionStore, session_id: &str, observed_at_ms: u64) {
+        store
+            .sessions
+            .write()
+            .await
+            .get_mut(session_id)
+            .expect("session entry")
+            .observed_failure = Some(ObservedFailureSignal {
+            class: LaunchFailureClass::JvmUnsupportedOption,
+            observed_at_ms,
+        });
+    }
+
     async fn mark_stop_requested(store: &SessionStore, session_id: &str) {
         let mut sessions = store.sessions.write().await;
         let entry = sessions
@@ -2508,31 +3873,6 @@ mod tests {
                 !data.contains(fragment),
                 "public session payload leaked fragment {fragment:?}: {data}"
             );
-        }
-    }
-
-    fn test_record(session_id: &str) -> LaunchSessionRecord {
-        LaunchSessionRecord {
-            session_id: SessionId(session_id.to_string()),
-            instance_id: "instance".to_string(),
-            version_id: "1.21.1".to_string(),
-            launched_at: Some("2026-01-01T00:00:00.000Z".to_string()),
-            benchmark: None,
-            state: LaunchState::Queued,
-            pid: None,
-            process_started_at_ms: None,
-            boot_completed_at_ms: None,
-            boot_duration_ms: None,
-            priority: None,
-            exit_code: None,
-            command: Vec::new(),
-            java_path: None,
-            natives_dir: None,
-            failure: None,
-            healing: None,
-            guardian: None,
-            outcome: None,
-            stages: Vec::new(),
         }
     }
 }
