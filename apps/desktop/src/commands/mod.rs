@@ -18,6 +18,8 @@ use tauri::{
 
 const RESTART_BUSY_MESSAGE: &str = "Restart is blocked while installs or launches are active.";
 const CLOSE_BUSY_MESSAGE: &str = "Close is blocked while installs or launches are active.";
+const AUTH_CLOSE_FAILED_MESSAGE: &str =
+    "Close is blocked because secure authentication cleanup is incomplete.";
 const SKIN_FILE_MAX_BYTES: u64 = 256 * 1024;
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 const MICROSOFT_SIGN_IN_WINDOW_LABEL: &str = "microsoft-signin";
@@ -199,7 +201,7 @@ pub async fn app_restart(app: AppHandle, state: State<'_, AppState>) -> Result<(
     let active_installs = state.installs().active_install_count().await;
     let active_sessions = state.sessions().active_session_count().await;
     restart_readiness(active_installs, active_sessions)?;
-    flush_pending_saved_skin_applies("restart", state.inner()).await;
+    prepare_for_exit("restart", state.inner()).await?;
     app.request_restart();
     Ok(())
 }
@@ -253,7 +255,7 @@ pub async fn window_close(app: AppHandle, state: State<'_, AppState>) -> Result<
         return Err(error);
     }
 
-    flush_pending_saved_skin_applies("desktop close", state.inner()).await;
+    prepare_for_exit("desktop close", state.inner()).await?;
 
     let window = app
         .get_webview_window("main")
@@ -274,6 +276,14 @@ pub async fn flush_pending_saved_skin_applies(action: &str, state: &AppState) {
             status
         );
     }
+}
+
+pub async fn prepare_for_exit(action: &str, state: &AppState) -> Result<(), String> {
+    flush_pending_saved_skin_applies(action, state).await;
+    state
+        .close_secure_auth()
+        .await
+        .map_err(|_| AUTH_CLOSE_FAILED_MESSAGE.to_string())
 }
 
 #[tauri::command]

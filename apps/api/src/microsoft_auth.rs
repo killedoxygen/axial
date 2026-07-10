@@ -199,10 +199,7 @@ pub async fn finish_login(
         minecraft_session_from_oauth(oauth, &flow.device_pair, Some(&flow.session_id)).await?;
     let profile_name = session.profile_name.clone();
     let (msa, account) = login_store
-        .replace_with_msa_and_minecraft_account_durable(
-            session.msa_token,
-            session.minecraft_account,
-        )
+        .replace_with_msa_and_minecraft_account(session.msa_token, session.minecraft_account)
         .await
         .map_err(|_| {
             MicrosoftAuthError::new(
@@ -255,6 +252,12 @@ pub async fn refresh_login(
             &refresh_token,
         )
         .await
+        .map_err(|_| {
+            MicrosoftAuthError::new(
+                MicrosoftAuthErrorKind::StoreUnavailable,
+                MicrosoftAuthStep::Store,
+            )
+        })?
     else {
         return Err(MicrosoftAuthError::new(
             MicrosoftAuthErrorKind::StoreUnavailable,

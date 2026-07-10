@@ -2,8 +2,10 @@ use super::auth_logins::{AuthLoginMinecraftAccount, AuthLoginMinecraftProfile, A
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 const AUTH_SNAPSHOT_SCHEMA_VERSION: u8 = 2;
 // Keep each credential value comfortably under small OS keyring per-secret limits.
@@ -11,32 +13,30 @@ const AUTH_SNAPSHOT_CHUNK_BYTES: usize = 900;
 const AUTH_SNAPSHOT_MAX_CHUNKS: usize = 128;
 #[cfg(not(test))]
 const AUTH_SNAPSHOT_SERVICE: &str = "axial-auth";
-#[cfg(not(test))]
-const AUTH_SNAPSHOT_PREVIOUS_USER: &str = "minecraft-auth";
-#[cfg(not(test))]
-const AUTH_SNAPSHOT_CHUNK_INDEX_USER: &str = "minecraft-auth-v2-index";
-#[cfg(not(test))]
-const AUTH_SNAPSHOT_CHUNK_USER_PREFIX: &str = "minecraft-auth-v2";
-#[cfg(not(test))]
-const AUTH_SNAPSHOT_CHUNK_INDEX_SCHEMA: &str = "axial.auth.snapshot.chunks";
-#[cfg(not(test))]
-const AUTH_SNAPSHOT_CHUNK_INDEX_VERSION: u8 = 1;
-#[cfg(not(test))]
+const AUTH_SNAPSHOT_HEAD_USER: &str = "minecraft-auth-v3-head";
+const AUTH_SNAPSHOT_CHUNK_USER_PREFIX: &str = "minecraft-auth-v3";
+const AUTH_SNAPSHOT_HEAD_SCHEMA: &str = "axial.auth.snapshot.head";
+const AUTH_SNAPSHOT_HEAD_VERSION: u8 = 1;
 const AUTH_SNAPSHOT_CHUNK_SLOT_COUNT: usize = 2;
 
 pub(crate) trait AuthSnapshotPersistence: Send + Sync {
     fn load_snapshot(&self) -> Result<Option<PersistedAuthSnapshot>, AuthPersistenceError>;
     fn save_snapshot(&self, snapshot: &PersistedAuthSnapshot) -> Result<(), AuthPersistenceError>;
     fn delete_snapshot(&self) -> Result<(), AuthPersistenceError>;
+    fn flush(&self) -> Result<(), AuthPersistenceError>;
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) enum AuthPersistenceError {
-    #[error("secure auth storage is unavailable: {0}")]
-    Unavailable(String),
-    #[error("secure auth snapshot is malformed: {0}")]
-    Malformed(String),
+    #[error("secure auth storage is unavailable")]
+    Unavailable,
+    #[error("secure auth snapshot is malformed")]
+    Malformed,
+    #[error("secure auth commit state is ambiguous")]
+    Ambiguous,
+    #[error("secure auth cleanup is incomplete")]
+    CleanupPending,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -55,14 +55,23 @@ pub(crate) struct PersistedAuthState {
     pub minecraft_accounts: Vec<AuthLoginMinecraftAccount>,
 }
 
-#[cfg(not(test))]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PersistedAuthSnapshotChunkIndex {
+struct PersistedAuthSnapshotHead {
     schema: String,
     version: u8,
-    active_slot: usize,
+    generation: u64,
+    kind: PersistedAuthSnapshotHeadKind,
+    active_slot: Option<usize>,
     chunks: usize,
+    digest: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedAuthSnapshotHeadKind {
+    Live,
+    Deleted,
 }
 
 impl PersistedAuthSnapshot {
@@ -158,8 +167,7 @@ impl fmt::Debug for PersistedAuthSnapshot {
 fn encode_snapshot_chunks(
     snapshot: &PersistedAuthSnapshot,
 ) -> Result<Vec<String>, AuthPersistenceError> {
-    let value = serde_json::to_vec(snapshot)
-        .map_err(|error| AuthPersistenceError::Malformed(error.to_string()))?;
+    let value = serde_json::to_vec(snapshot).map_err(|_| AuthPersistenceError::Malformed)?;
     let encoded = BASE64_STANDARD.encode(value);
     let chunks = encoded
         .as_bytes()
@@ -167,7 +175,7 @@ fn encode_snapshot_chunks(
         .map(|chunk| {
             std::str::from_utf8(chunk)
                 .map(str::to_string)
-                .map_err(|error| AuthPersistenceError::Malformed(error.to_string()))
+                .map_err(|_| AuthPersistenceError::Malformed)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -184,25 +192,20 @@ fn decode_snapshot_chunks(
     let mut encoded = String::with_capacity(encoded_len);
     for chunk in chunks {
         if chunk.is_empty() {
-            return Err(AuthPersistenceError::Malformed(
-                "secure auth snapshot chunk is empty".to_string(),
-            ));
+            return Err(AuthPersistenceError::Malformed);
         }
         encoded.push_str(chunk);
     }
 
     let value = BASE64_STANDARD
         .decode(encoded.as_bytes())
-        .map_err(|error| AuthPersistenceError::Malformed(error.to_string()))?;
-    serde_json::from_slice(&value)
-        .map_err(|error| AuthPersistenceError::Malformed(error.to_string()))
+        .map_err(|_| AuthPersistenceError::Malformed)?;
+    serde_json::from_slice(&value).map_err(|_| AuthPersistenceError::Malformed)
 }
 
 fn validate_snapshot_chunk_count(count: usize) -> Result<(), AuthPersistenceError> {
     if count == 0 || count > AUTH_SNAPSHOT_MAX_CHUNKS {
-        return Err(AuthPersistenceError::Malformed(
-            "secure auth snapshot chunk count is invalid".to_string(),
-        ));
+        return Err(AuthPersistenceError::Malformed);
     }
     Ok(())
 }
@@ -357,208 +360,341 @@ pub(crate) enum AuthSnapshotRejection {
     Malformed,
 }
 
-#[cfg(not(test))]
-pub(crate) struct SecureAuthSnapshotPersistence;
+trait CredentialEntryBackend: Send + Sync {
+    fn get(&self, user: &str) -> Result<Option<String>, AuthPersistenceError>;
+    fn set(&self, user: &str, value: &str) -> Result<(), AuthPersistenceError>;
+    fn delete(&self, user: &str) -> Result<(), AuthPersistenceError>;
+}
 
 #[cfg(not(test))]
+struct KeyringCredentialEntryBackend;
+
+#[cfg(not(test))]
+impl CredentialEntryBackend for KeyringCredentialEntryBackend {
+    fn get(&self, user: &str) -> Result<Option<String>, AuthPersistenceError> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            let _ = user;
+            Err(AuthPersistenceError::Unavailable)
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            let entry = keyring::Entry::new(AUTH_SNAPSHOT_SERVICE, user)
+                .map_err(|_| AuthPersistenceError::Unavailable)?;
+            match entry.get_password() {
+                Ok(value) => Ok(Some(value)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(_) => Err(AuthPersistenceError::Unavailable),
+            }
+        }
+    }
+
+    fn set(&self, user: &str, value: &str) -> Result<(), AuthPersistenceError> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            let _ = (user, value);
+            Err(AuthPersistenceError::Unavailable)
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            keyring::Entry::new(AUTH_SNAPSHOT_SERVICE, user)
+                .and_then(|entry| entry.set_password(value))
+                .map_err(|_| AuthPersistenceError::Unavailable)
+        }
+    }
+
+    fn delete(&self, user: &str) -> Result<(), AuthPersistenceError> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            let _ = user;
+            Err(AuthPersistenceError::Unavailable)
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            let entry = keyring::Entry::new(AUTH_SNAPSHOT_SERVICE, user)
+                .map_err(|_| AuthPersistenceError::Unavailable)?;
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(_) => Err(AuthPersistenceError::Unavailable),
+            }
+        }
+    }
+}
+
+pub(crate) struct SecureAuthSnapshotPersistence {
+    backend: Arc<dyn CredentialEntryBackend>,
+    cleanup: Mutex<HashSet<String>>,
+}
+
 impl SecureAuthSnapshotPersistence {
+    #[cfg(not(test))]
     pub(crate) fn new() -> Self {
-        Self
+        Self::with_backend(Arc::new(KeyringCredentialEntryBackend))
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn entry(&self, user: &str) -> Result<keyring::Entry, AuthPersistenceError> {
-        keyring::Entry::new(AUTH_SNAPSHOT_SERVICE, user)
-            .map_err(|error| AuthPersistenceError::Unavailable(error.to_string()))
+    fn with_backend(backend: Arc<dyn CredentialEntryBackend>) -> Self {
+        Self {
+            backend,
+            cleanup: Mutex::new(HashSet::new()),
+        }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn chunk_user(slot: usize, chunk: usize) -> String {
         format!("{AUTH_SNAPSHOT_CHUNK_USER_PREFIX}-slot-{slot}-chunk-{chunk}")
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn read_chunk_index(
+    fn read_head(
         &self,
-    ) -> Result<Option<PersistedAuthSnapshotChunkIndex>, AuthPersistenceError> {
-        let entry = self.entry(AUTH_SNAPSHOT_CHUNK_INDEX_USER)?;
-        let password = match entry.get_password() {
-            Ok(password) => password,
-            Err(keyring::Error::NoEntry) => return Ok(None),
-            Err(error) => return Err(AuthPersistenceError::Unavailable(error.to_string())),
-        };
-
-        serde_json::from_str(&password)
-            .map(Some)
-            .map_err(|error| AuthPersistenceError::Malformed(error.to_string()))
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn load_chunked_snapshot(&self) -> Result<Option<PersistedAuthSnapshot>, AuthPersistenceError> {
-        let Some(index) = self.read_chunk_index()? else {
+    ) -> Result<Option<(PersistedAuthSnapshotHead, String)>, AuthPersistenceError> {
+        let Some(raw) = self.backend.get(AUTH_SNAPSHOT_HEAD_USER)? else {
             return Ok(None);
         };
-        validate_chunk_index(&index)?;
-
-        let mut chunks = Vec::with_capacity(index.chunks);
-        for chunk_index in 0..index.chunks {
-            let user = Self::chunk_user(index.active_slot, chunk_index);
-            let entry = self.entry(&user)?;
-            let password = match entry.get_password() {
-                Ok(password) => password,
-                Err(keyring::Error::NoEntry) => {
-                    return Err(AuthPersistenceError::Malformed(
-                        "secure auth snapshot chunk is missing".to_string(),
-                    ));
-                }
-                Err(error) => return Err(AuthPersistenceError::Unavailable(error.to_string())),
-            };
-            chunks.push(password);
-        }
-
-        decode_snapshot_chunks(&chunks).map(Some)
+        let head: PersistedAuthSnapshotHead =
+            serde_json::from_str(&raw).map_err(|_| AuthPersistenceError::Malformed)?;
+        validate_snapshot_head(&head)?;
+        Ok(Some((head, raw)))
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn delete_entry(&self, user: &str) -> Result<(), AuthPersistenceError> {
-        let entry = self.entry(user)?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(AuthPersistenceError::Unavailable(error.to_string())),
+    fn write_entry_verified(&self, user: &str, value: &str) -> Result<(), AuthPersistenceError> {
+        let write = self.backend.set(user, value);
+        match self.backend.get(user) {
+            Ok(Some(observed)) if observed == value => Ok(()),
+            _ => Err(write.err().unwrap_or(AuthPersistenceError::Unavailable)),
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn delete_entry_best_effort(&self, user: &str) {
-        let _ = self.delete_entry(user);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn delete_chunk_range_best_effort(&self, slot: usize, start: usize, end: usize) {
-        for chunk_index in start..end.min(AUTH_SNAPSHOT_MAX_CHUNKS) {
-            let user = Self::chunk_user(slot, chunk_index);
-            self.delete_entry_best_effort(&user);
-        }
-    }
-}
-
-#[cfg(not(test))]
-impl AuthSnapshotPersistence for SecureAuthSnapshotPersistence {
-    fn load_snapshot(&self) -> Result<Option<PersistedAuthSnapshot>, AuthPersistenceError> {
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        {
-            return Err(AuthPersistenceError::Unavailable(
-                "OS secure auth storage is not configured for this platform".to_string(),
-            ));
-        }
-
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        {
-            self.load_chunked_snapshot()
-        }
-    }
-
-    fn save_snapshot(&self, snapshot: &PersistedAuthSnapshot) -> Result<(), AuthPersistenceError> {
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        {
-            let _ = snapshot;
-            return Err(AuthPersistenceError::Unavailable(
-                "OS secure auth storage is not configured for this platform".to_string(),
-            ));
-        }
-
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        {
-            let previous_index = match self.read_chunk_index() {
-                Ok(index) => index,
-                Err(AuthPersistenceError::Malformed(_)) => None,
-                Err(error) => return Err(error),
-            };
-            let next_slot = previous_index
-                .as_ref()
-                .filter(|index| index.active_slot < AUTH_SNAPSHOT_CHUNK_SLOT_COUNT)
-                .map(|index| (index.active_slot + 1) % AUTH_SNAPSHOT_CHUNK_SLOT_COUNT)
-                .unwrap_or(0);
-            let chunks = encode_snapshot_chunks(snapshot)?;
-
-            for (chunk_index, chunk) in chunks.iter().enumerate() {
-                let user = Self::chunk_user(next_slot, chunk_index);
-                self.entry(&user)?
-                    .set_password(chunk)
-                    .map_err(|error| AuthPersistenceError::Unavailable(error.to_string()))?;
+    fn write_head_verified(
+        &self,
+        value: &str,
+        previous: Option<&str>,
+    ) -> Result<(), AuthPersistenceError> {
+        let write = self.backend.set(AUTH_SNAPSHOT_HEAD_USER, value);
+        match self.backend.get(AUTH_SNAPSHOT_HEAD_USER) {
+            Ok(Some(observed)) if observed == value => Ok(()),
+            Ok(observed) if write.is_err() && observed.as_deref() == previous => {
+                Err(AuthPersistenceError::Unavailable)
             }
+            _ => Err(AuthPersistenceError::Ambiguous),
+        }
+    }
 
-            let index = PersistedAuthSnapshotChunkIndex {
-                schema: AUTH_SNAPSHOT_CHUNK_INDEX_SCHEMA.to_string(),
-                version: AUTH_SNAPSHOT_CHUNK_INDEX_VERSION,
-                active_slot: next_slot,
-                chunks: chunks.len(),
-            };
-            let value = serde_json::to_string(&index)
-                .map_err(|error| AuthPersistenceError::Malformed(error.to_string()))?;
-            self.entry(AUTH_SNAPSHOT_CHUNK_INDEX_USER)?
-                .set_password(&value)
-                .map_err(|error| AuthPersistenceError::Unavailable(error.to_string()))?;
+    fn schedule_cleanup<I>(&self, users: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.cleanup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(users);
+    }
 
-            self.delete_entry_best_effort(AUTH_SNAPSHOT_PREVIOUS_USER);
-            self.delete_chunk_range_best_effort(next_slot, chunks.len(), AUTH_SNAPSHOT_MAX_CHUNKS);
-            if let Some(index) = previous_index
-                && index.active_slot < AUTH_SNAPSHOT_CHUNK_SLOT_COUNT
-                && index.active_slot != next_slot
-            {
-                self.delete_chunk_range_best_effort(index.active_slot, 0, index.chunks);
+    fn schedule_slot_range(&self, slot: usize, start: usize, end: usize) {
+        self.schedule_cleanup(
+            (start..end.min(AUTH_SNAPSHOT_MAX_CHUNKS)).map(|chunk| Self::chunk_user(slot, chunk)),
+        );
+    }
+
+    fn schedule_all_chunks(&self) {
+        for slot in 0..AUTH_SNAPSHOT_CHUNK_SLOT_COUNT {
+            self.schedule_slot_range(slot, 0, AUTH_SNAPSHOT_MAX_CHUNKS);
+        }
+    }
+
+    fn run_cleanup(&self) -> Result<(), AuthPersistenceError> {
+        let users = self
+            .cleanup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut failed = false;
+        for user in users {
+            if self.backend.delete(&user).is_ok() {
+                self.cleanup
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&user);
+            } else {
+                failed = true;
             }
-
+        }
+        if failed {
+            Err(AuthPersistenceError::CleanupPending)
+        } else {
             Ok(())
         }
     }
+}
+
+impl AuthSnapshotPersistence for SecureAuthSnapshotPersistence {
+    fn load_snapshot(&self) -> Result<Option<PersistedAuthSnapshot>, AuthPersistenceError> {
+        let Some((head, _)) = self.read_head()? else {
+            return Ok(None);
+        };
+        if head.kind == PersistedAuthSnapshotHeadKind::Deleted {
+            self.schedule_all_chunks();
+            let _ = self.run_cleanup();
+            return Ok(None);
+        }
+
+        let slot = head.active_slot.ok_or(AuthPersistenceError::Malformed)?;
+        let mut chunks = Vec::with_capacity(head.chunks);
+        for chunk in 0..head.chunks {
+            let value = self
+                .backend
+                .get(&Self::chunk_user(slot, chunk))?
+                .ok_or(AuthPersistenceError::Malformed)?;
+            chunks.push(value);
+        }
+        let digest = snapshot_chunks_digest(&chunks);
+        if head.digest.as_deref() != Some(digest.as_str()) {
+            return Err(AuthPersistenceError::Malformed);
+        }
+        let snapshot = decode_snapshot_chunks(&chunks)?;
+        for inactive_slot in 0..AUTH_SNAPSHOT_CHUNK_SLOT_COUNT {
+            if inactive_slot != slot {
+                self.schedule_slot_range(inactive_slot, 0, AUTH_SNAPSHOT_MAX_CHUNKS);
+            }
+        }
+        self.schedule_slot_range(slot, head.chunks, AUTH_SNAPSHOT_MAX_CHUNKS);
+        let _ = self.run_cleanup();
+        Ok(Some(snapshot))
+    }
+
+    fn save_snapshot(&self, snapshot: &PersistedAuthSnapshot) -> Result<(), AuthPersistenceError> {
+        self.flush()?;
+        let previous = self.read_head()?;
+        let (generation, next_slot) = match previous.as_ref().map(|(head, _)| head) {
+            Some(head) => (
+                head.generation
+                    .checked_add(1)
+                    .ok_or(AuthPersistenceError::Malformed)?,
+                head.active_slot
+                    .map(|slot| (slot + 1) % AUTH_SNAPSHOT_CHUNK_SLOT_COUNT)
+                    .unwrap_or((head.generation as usize) % AUTH_SNAPSHOT_CHUNK_SLOT_COUNT),
+            ),
+            None => (1, 0),
+        };
+        let chunks = encode_snapshot_chunks(snapshot)?;
+        for (chunk, value) in chunks.iter().enumerate() {
+            if let Err(error) =
+                self.write_entry_verified(&Self::chunk_user(next_slot, chunk), value)
+            {
+                self.schedule_slot_range(next_slot, 0, AUTH_SNAPSHOT_MAX_CHUNKS);
+                let _ = self.run_cleanup();
+                return Err(error);
+            }
+        }
+
+        let head = PersistedAuthSnapshotHead {
+            schema: AUTH_SNAPSHOT_HEAD_SCHEMA.to_string(),
+            version: AUTH_SNAPSHOT_HEAD_VERSION,
+            generation,
+            kind: PersistedAuthSnapshotHeadKind::Live,
+            active_slot: Some(next_slot),
+            chunks: chunks.len(),
+            digest: Some(snapshot_chunks_digest(&chunks)),
+        };
+        let raw = serde_json::to_string(&head).map_err(|_| AuthPersistenceError::Malformed)?;
+        self.write_head_verified(&raw, previous.as_ref().map(|(_, raw)| raw.as_str()))?;
+
+        self.schedule_slot_range(next_slot, chunks.len(), AUTH_SNAPSHOT_MAX_CHUNKS);
+        if let Some((previous, _)) = previous
+            && let Some(previous_slot) = previous.active_slot
+            && previous_slot != next_slot
+        {
+            self.schedule_slot_range(previous_slot, 0, previous.chunks);
+        }
+        let _ = self.run_cleanup();
+        Ok(())
+    }
 
     fn delete_snapshot(&self) -> Result<(), AuthPersistenceError> {
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        let previous = self.read_head()?;
+        if previous
+            .as_ref()
+            .is_some_and(|(head, _)| head.kind == PersistedAuthSnapshotHeadKind::Deleted)
         {
-            return Err(AuthPersistenceError::Unavailable(
-                "OS secure auth storage is not configured for this platform".to_string(),
-            ));
+            self.schedule_all_chunks();
+            let _ = self.run_cleanup();
+            return Ok(());
         }
+        let generation = previous
+            .as_ref()
+            .map(|(head, _)| head.generation)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(AuthPersistenceError::Malformed)?;
+        let tombstone = PersistedAuthSnapshotHead {
+            schema: AUTH_SNAPSHOT_HEAD_SCHEMA.to_string(),
+            version: AUTH_SNAPSHOT_HEAD_VERSION,
+            generation,
+            kind: PersistedAuthSnapshotHeadKind::Deleted,
+            active_slot: None,
+            chunks: 0,
+            digest: None,
+        };
+        let raw = serde_json::to_string(&tombstone).map_err(|_| AuthPersistenceError::Malformed)?;
+        self.write_head_verified(&raw, previous.as_ref().map(|(_, raw)| raw.as_str()))?;
+        self.schedule_all_chunks();
+        let _ = self.run_cleanup();
+        Ok(())
+    }
 
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        {
-            let mut first_error = None;
-            self.delete_entry_best_effort(AUTH_SNAPSHOT_PREVIOUS_USER);
-            if let Err(error) = self.delete_entry(AUTH_SNAPSHOT_CHUNK_INDEX_USER) {
-                first_error.get_or_insert_with(|| error.to_string());
-            }
-            for slot in 0..AUTH_SNAPSHOT_CHUNK_SLOT_COUNT {
-                for chunk_index in 0..AUTH_SNAPSHOT_MAX_CHUNKS {
-                    let user = Self::chunk_user(slot, chunk_index);
-                    if let Err(error) = self.delete_entry(&user) {
-                        first_error.get_or_insert_with(|| error.to_string());
-                    }
-                }
-            }
-
-            if let Some(error) = first_error {
-                Err(AuthPersistenceError::Unavailable(error))
-            } else {
-                Ok(())
-            }
-        }
+    fn flush(&self) -> Result<(), AuthPersistenceError> {
+        self.run_cleanup()
     }
 }
 
-#[cfg(not(test))]
-fn validate_chunk_index(
-    index: &PersistedAuthSnapshotChunkIndex,
-) -> Result<(), AuthPersistenceError> {
-    if index.schema != AUTH_SNAPSHOT_CHUNK_INDEX_SCHEMA
-        || index.version != AUTH_SNAPSHOT_CHUNK_INDEX_VERSION
-        || index.active_slot >= AUTH_SNAPSHOT_CHUNK_SLOT_COUNT
+fn validate_snapshot_head(head: &PersistedAuthSnapshotHead) -> Result<(), AuthPersistenceError> {
+    if head.schema != AUTH_SNAPSHOT_HEAD_SCHEMA
+        || head.version != AUTH_SNAPSHOT_HEAD_VERSION
+        || head.generation == 0
     {
-        return Err(AuthPersistenceError::Malformed(
-            "secure auth snapshot chunk index is invalid".to_string(),
-        ));
+        return Err(AuthPersistenceError::Malformed);
     }
-    validate_snapshot_chunk_count(index.chunks)
+    match head.kind {
+        PersistedAuthSnapshotHeadKind::Live => {
+            let slot = head.active_slot.ok_or(AuthPersistenceError::Malformed)?;
+            if slot >= AUTH_SNAPSHOT_CHUNK_SLOT_COUNT {
+                return Err(AuthPersistenceError::Malformed);
+            }
+            validate_snapshot_chunk_count(head.chunks)?;
+            let digest = head
+                .digest
+                .as_deref()
+                .ok_or(AuthPersistenceError::Malformed)?;
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(AuthPersistenceError::Malformed);
+            }
+        }
+        PersistedAuthSnapshotHeadKind::Deleted => {
+            if head.active_slot.is_some() || head.chunks != 0 || head.digest.is_some() {
+                return Err(AuthPersistenceError::Malformed);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_chunks_digest(chunks: &[String]) -> String {
+    let mut digest = Sha256::new();
+    for chunk in chunks {
+        digest.update(chunk.as_bytes());
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn from_timestamp_millis(value: i64) -> Result<DateTime<Utc>, AuthSnapshotRejection> {
@@ -606,6 +742,112 @@ pub(crate) fn test_persisted_snapshot_with_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    #[derive(Clone)]
+    enum SetFault {
+        Before,
+        After,
+        ReplaceThenFail(String),
+    }
+
+    #[derive(Default)]
+    struct MockCredentialBackend {
+        state: Mutex<MockCredentialBackendState>,
+    }
+
+    #[derive(Default)]
+    struct MockCredentialBackendState {
+        entries: HashMap<String, String>,
+        set_faults: HashMap<String, SetFault>,
+        fail_deletes: bool,
+    }
+
+    impl MockCredentialBackend {
+        fn entry(&self, user: &str) -> Option<String> {
+            self.state
+                .lock()
+                .expect("backend state")
+                .entries
+                .get(user)
+                .cloned()
+        }
+
+        fn put(&self, user: &str, value: impl Into<String>) {
+            self.state
+                .lock()
+                .expect("backend state")
+                .entries
+                .insert(user.to_string(), value.into());
+        }
+
+        fn fail_next_set(&self, user: &str, fault: SetFault) {
+            self.state
+                .lock()
+                .expect("backend state")
+                .set_faults
+                .insert(user.to_string(), fault);
+        }
+
+        fn set_delete_failure(&self, fail: bool) {
+            self.state.lock().expect("backend state").fail_deletes = fail;
+        }
+    }
+
+    impl CredentialEntryBackend for MockCredentialBackend {
+        fn get(&self, user: &str) -> Result<Option<String>, AuthPersistenceError> {
+            Ok(self.entry(user))
+        }
+
+        fn set(&self, user: &str, value: &str) -> Result<(), AuthPersistenceError> {
+            let mut state = self.state.lock().expect("backend state");
+            match state.set_faults.remove(user) {
+                Some(SetFault::Before) => Err(AuthPersistenceError::Unavailable),
+                Some(SetFault::After) => {
+                    state.entries.insert(user.to_string(), value.to_string());
+                    Err(AuthPersistenceError::Unavailable)
+                }
+                Some(SetFault::ReplaceThenFail(replacement)) => {
+                    state.entries.insert(user.to_string(), replacement);
+                    Err(AuthPersistenceError::Unavailable)
+                }
+                None => {
+                    state.entries.insert(user.to_string(), value.to_string());
+                    Ok(())
+                }
+            }
+        }
+
+        fn delete(&self, user: &str) -> Result<(), AuthPersistenceError> {
+            let mut state = self.state.lock().expect("backend state");
+            if state.fail_deletes {
+                return Err(AuthPersistenceError::Unavailable);
+            }
+            state.entries.remove(user);
+            Ok(())
+        }
+    }
+
+    fn secure_store(backend: Arc<MockCredentialBackend>) -> SecureAuthSnapshotPersistence {
+        SecureAuthSnapshotPersistence::with_backend(backend)
+    }
+
+    fn snapshot(access_token: &str) -> PersistedAuthSnapshot {
+        let now = DateTime::from_timestamp_millis(Utc::now().timestamp_millis())
+            .expect("valid current timestamp");
+        let token = AuthLoginMsaToken {
+            login_id: "login-test".to_string(),
+            access_token: access_token.to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            id_token: None,
+            token_type: "Bearer".to_string(),
+            expires_in: 3600,
+            scope: Some("XboxLive.signin offline_access".to_string()),
+            authenticated_at: now,
+            expires_at: now + chrono::Duration::seconds(3600),
+        };
+        PersistedAuthSnapshot::from_state(Some("login-test"), &[token], &[])
+    }
 
     #[test]
     fn auth_snapshot_chunks_round_trip_large_snapshot() {
@@ -657,6 +899,294 @@ mod tests {
     fn auth_snapshot_chunks_reject_empty_chunk_sets() {
         let error = decode_snapshot_chunks(&[]).expect_err("empty chunks should be invalid");
 
-        assert!(matches!(error, AuthPersistenceError::Malformed(_)));
+        assert_eq!(error, AuthPersistenceError::Malformed);
+    }
+
+    #[test]
+    fn secure_auth_commit_switches_slots_and_loads_exact_snapshot() {
+        let backend = Arc::new(MockCredentialBackend::default());
+        let store = secure_store(backend.clone());
+        let first = snapshot("first-access-token");
+        let second = snapshot("second-access-token");
+
+        store.save_snapshot(&first).expect("save first snapshot");
+        let first_head: PersistedAuthSnapshotHead =
+            serde_json::from_str(&backend.entry(AUTH_SNAPSHOT_HEAD_USER).expect("first head"))
+                .expect("decode first head");
+        store.save_snapshot(&second).expect("save second snapshot");
+        let second_head: PersistedAuthSnapshotHead =
+            serde_json::from_str(&backend.entry(AUTH_SNAPSHOT_HEAD_USER).expect("second head"))
+                .expect("decode second head");
+
+        assert_eq!(first_head.generation, 1);
+        assert_eq!(first_head.active_slot, Some(0));
+        assert_eq!(second_head.generation, 2);
+        assert_eq!(second_head.active_slot, Some(1));
+        assert_eq!(store.load_snapshot().expect("load snapshot"), Some(second));
+    }
+
+    #[test]
+    fn secure_auth_restart_reconstructs_live_snapshot_cleanup() {
+        let backend = Arc::new(MockCredentialBackend::default());
+        let writer = secure_store(backend.clone());
+        let committed = snapshot("committed-access-token");
+        writer
+            .save_snapshot(&committed)
+            .expect("save committed snapshot");
+        let head: PersistedAuthSnapshotHead =
+            serde_json::from_str(&backend.entry(AUTH_SNAPSHOT_HEAD_USER).expect("head"))
+                .expect("decode head");
+        let active_slot = head.active_slot.expect("live slot");
+        let inactive_slot = (active_slot + 1) % AUTH_SNAPSHOT_CHUNK_SLOT_COUNT;
+        let active_tail = SecureAuthSnapshotPersistence::chunk_user(active_slot, head.chunks);
+        let inactive_chunk = SecureAuthSnapshotPersistence::chunk_user(inactive_slot, 0);
+        backend.put(&active_tail, "stale-active-tail-secret");
+        backend.put(&inactive_chunk, "stale-inactive-secret");
+        backend.set_delete_failure(true);
+
+        let restarted = secure_store(backend.clone());
+        assert_eq!(
+            restarted.load_snapshot().expect("load live snapshot"),
+            Some(committed.clone())
+        );
+        for chunk in 0..head.chunks {
+            assert!(
+                backend
+                    .entry(&SecureAuthSnapshotPersistence::chunk_user(
+                        active_slot,
+                        chunk
+                    ))
+                    .is_some(),
+                "active chunk {chunk} must remain readable"
+            );
+        }
+        assert_eq!(restarted.flush(), Err(AuthPersistenceError::CleanupPending));
+
+        backend.set_delete_failure(false);
+        restarted.flush().expect("retry reconstructed cleanup");
+        assert!(backend.entry(&active_tail).is_none());
+        assert!(backend.entry(&inactive_chunk).is_none());
+        assert_eq!(
+            restarted.load_snapshot().expect("reload live snapshot"),
+            Some(committed)
+        );
+    }
+
+    #[test]
+    fn secure_auth_accepts_head_write_error_when_exact_commit_reads_back() {
+        let backend = Arc::new(MockCredentialBackend::default());
+        let store = secure_store(backend.clone());
+        let candidate = snapshot("committed-after-error");
+        backend.fail_next_set(AUTH_SNAPSHOT_HEAD_USER, SetFault::After);
+
+        store
+            .save_snapshot(&candidate)
+            .expect("exact readback proves commit");
+
+        assert_eq!(
+            store.load_snapshot().expect("load committed"),
+            Some(candidate)
+        );
+    }
+
+    #[test]
+    fn secure_auth_rejects_uncommitted_head_write_and_preserves_previous_snapshot() {
+        let backend = Arc::new(MockCredentialBackend::default());
+        let store = secure_store(backend.clone());
+        let previous = snapshot("previous-access-token");
+        store
+            .save_snapshot(&previous)
+            .expect("save previous snapshot");
+        backend.fail_next_set(AUTH_SNAPSHOT_HEAD_USER, SetFault::Before);
+
+        assert_eq!(
+            store.save_snapshot(&snapshot("uncommitted-access-token")),
+            Err(AuthPersistenceError::Unavailable)
+        );
+        assert_eq!(
+            store.load_snapshot().expect("load previous"),
+            Some(previous)
+        );
+    }
+
+    #[test]
+    fn secure_auth_latches_unexpected_head_after_uncertain_write() {
+        let backend = Arc::new(MockCredentialBackend::default());
+        let store = secure_store(backend.clone());
+        backend.fail_next_set(
+            AUTH_SNAPSHOT_HEAD_USER,
+            SetFault::ReplaceThenFail("foreign-head".to_string()),
+        );
+
+        assert_eq!(
+            store.save_snapshot(&snapshot("candidate-access-token")),
+            Err(AuthPersistenceError::Ambiguous)
+        );
+        assert_eq!(
+            backend.entry(AUTH_SNAPSHOT_HEAD_USER).as_deref(),
+            Some("foreign-head")
+        );
+    }
+
+    #[test]
+    fn secure_auth_accepts_chunk_write_error_when_exact_chunk_reads_back() {
+        let backend = Arc::new(MockCredentialBackend::default());
+        let store = secure_store(backend.clone());
+        backend.fail_next_set(
+            &SecureAuthSnapshotPersistence::chunk_user(0, 0),
+            SetFault::After,
+        );
+
+        store
+            .save_snapshot(&snapshot("chunk-readback-access-token"))
+            .expect("exact chunk readback permits head commit");
+    }
+
+    #[test]
+    fn secure_auth_cleans_inactive_slot_after_partial_staging_failure() {
+        let backend = Arc::new(MockCredentialBackend::default());
+        let store = secure_store(backend.clone());
+        let candidate = snapshot(&"large-access-token".repeat(AUTH_SNAPSHOT_CHUNK_BYTES));
+        assert!(
+            encode_snapshot_chunks(&candidate)
+                .expect("encode multi-chunk candidate")
+                .len()
+                > 1
+        );
+        backend.fail_next_set(
+            &SecureAuthSnapshotPersistence::chunk_user(0, 1),
+            SetFault::Before,
+        );
+        backend.set_delete_failure(true);
+
+        assert_eq!(
+            store.save_snapshot(&candidate),
+            Err(AuthPersistenceError::Unavailable)
+        );
+        assert!(backend.entry(AUTH_SNAPSHOT_HEAD_USER).is_none());
+        assert_eq!(
+            store.load_snapshot().expect("missing head stays empty"),
+            None
+        );
+        assert!(
+            backend
+                .entry(&SecureAuthSnapshotPersistence::chunk_user(0, 0))
+                .is_some()
+        );
+        assert_eq!(store.flush(), Err(AuthPersistenceError::CleanupPending));
+
+        backend.set_delete_failure(false);
+        store.flush().expect("retry inactive-slot cleanup");
+        for chunk in 0..AUTH_SNAPSHOT_MAX_CHUNKS {
+            assert!(
+                backend
+                    .entry(&SecureAuthSnapshotPersistence::chunk_user(0, chunk))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn secure_auth_rejects_digest_mismatch_without_falling_back() {
+        let backend = Arc::new(MockCredentialBackend::default());
+        let store = secure_store(backend.clone());
+        let first = snapshot("first-access-token");
+        store.save_snapshot(&first).expect("save first");
+        let first_head: PersistedAuthSnapshotHead =
+            serde_json::from_str(&backend.entry(AUTH_SNAPSHOT_HEAD_USER).expect("first head"))
+                .expect("decode first head");
+        let first_chunk = backend
+            .entry(&SecureAuthSnapshotPersistence::chunk_user(0, 0))
+            .expect("first chunk");
+
+        store
+            .save_snapshot(&snapshot("second-access-token"))
+            .expect("save second");
+        backend.put(
+            &SecureAuthSnapshotPersistence::chunk_user(0, 0),
+            first_chunk,
+        );
+        assert_eq!(first_head.active_slot, Some(0));
+        backend.put(
+            &SecureAuthSnapshotPersistence::chunk_user(1, 0),
+            "tampered-active-chunk",
+        );
+
+        assert_eq!(store.load_snapshot(), Err(AuthPersistenceError::Malformed));
+    }
+
+    #[test]
+    fn secure_auth_refuses_to_rewrite_malformed_head() {
+        let backend = Arc::new(MockCredentialBackend::default());
+        backend.put(AUTH_SNAPSHOT_HEAD_USER, r#"{"schema":"unknown"}"#);
+        let store = secure_store(backend.clone());
+
+        assert_eq!(
+            store.save_snapshot(&snapshot("must-not-write")),
+            Err(AuthPersistenceError::Malformed)
+        );
+        assert_eq!(
+            backend.entry(AUTH_SNAPSHOT_HEAD_USER).as_deref(),
+            Some(r#"{"schema":"unknown"}"#)
+        );
+    }
+
+    #[test]
+    fn secure_auth_tombstone_is_authoritative_while_cleanup_retries() {
+        let backend = Arc::new(MockCredentialBackend::default());
+        let store = secure_store(backend.clone());
+        store
+            .save_snapshot(&snapshot("deleted-access-token"))
+            .expect("save snapshot");
+        backend.set_delete_failure(true);
+
+        store
+            .delete_snapshot()
+            .expect("tombstone commit is the delete boundary");
+
+        let head: PersistedAuthSnapshotHead = serde_json::from_str(
+            &backend
+                .entry(AUTH_SNAPSHOT_HEAD_USER)
+                .expect("tombstone head"),
+        )
+        .expect("decode tombstone");
+        assert_eq!(head.kind, PersistedAuthSnapshotHeadKind::Deleted);
+        assert_eq!(store.load_snapshot().expect("tombstone loads empty"), None);
+        assert_eq!(store.flush(), Err(AuthPersistenceError::CleanupPending));
+
+        backend.set_delete_failure(false);
+        store.flush().expect("retry stale credential cleanup");
+        for slot in 0..AUTH_SNAPSHOT_CHUNK_SLOT_COUNT {
+            for chunk in 0..AUTH_SNAPSHOT_MAX_CHUNKS {
+                assert!(
+                    backend
+                        .entry(&SecureAuthSnapshotPersistence::chunk_user(slot, chunk))
+                        .is_none()
+                );
+            }
+        }
+        assert!(backend.entry(AUTH_SNAPSHOT_HEAD_USER).is_some());
+    }
+
+    #[test]
+    fn secure_auth_rejects_live_head_with_missing_chunk() {
+        let backend = Arc::new(MockCredentialBackend::default());
+        let store = secure_store(backend.clone());
+        let chunks = encode_snapshot_chunks(&snapshot("missing-chunk")).expect("encode snapshot");
+        let head = PersistedAuthSnapshotHead {
+            schema: AUTH_SNAPSHOT_HEAD_SCHEMA.to_string(),
+            version: AUTH_SNAPSHOT_HEAD_VERSION,
+            generation: 1,
+            kind: PersistedAuthSnapshotHeadKind::Live,
+            active_slot: Some(0),
+            chunks: chunks.len(),
+            digest: Some(snapshot_chunks_digest(&chunks)),
+        };
+        backend.put(
+            AUTH_SNAPSHOT_HEAD_USER,
+            serde_json::to_string(&head).expect("encode head"),
+        );
+
+        assert_eq!(store.load_snapshot(), Err(AuthPersistenceError::Malformed));
     }
 }

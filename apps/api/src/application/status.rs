@@ -35,7 +35,8 @@ pub fn launcher_status(state: &AppState) -> StatusResponse {
 }
 
 fn state_load_issue_count(state: &AppState) -> usize {
-    state.performance_operations().load_issue_count()
+    state.auth_logins().load_issue_count()
+        + state.performance_operations().load_issue_count()
         + state.benchmark_suites().load_issue_count()
         + state.benchmark_suite_drivers().load_issue_count()
 }

@@ -614,7 +614,8 @@ mod tests {
                 test_msa_token("msa-access-token"),
                 test_minecraft_account("profile-1", "mateoltd"),
             )
-            .await;
+            .await
+            .expect("insert authenticated account");
 
         assert_eq!(fixture.state.accounts().list(), Vec::new());
 
@@ -661,7 +662,8 @@ mod tests {
                 test_msa_token("msa-access-token"),
                 test_minecraft_account("profile-1", "mateoltd"),
             )
-            .await;
+            .await
+            .expect("insert authenticated account");
 
         let response = account_list_response(&fixture.state)
             .await

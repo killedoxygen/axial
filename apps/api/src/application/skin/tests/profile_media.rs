@@ -215,9 +215,21 @@ async fn skin_profile_expired_minecraft_profile_falls_back_to_offline() {
     assert_eq!(response.auth_mode, "offline");
     assert_eq!(response.username, "ConfigUser");
     assert_eq!(response.uuid, offline_uuid("ConfigUser"));
-    assert_eq!(
-        fixture.state.auth_logins().active_minecraft_account().await,
-        None
+    assert!(
+        fixture
+            .state
+            .auth_logins()
+            .active_current_minecraft_account_state()
+            .await
+            .is_none()
+    );
+    assert!(
+        fixture
+            .state
+            .auth_logins()
+            .active_minecraft_account()
+            .await
+            .is_some()
     );
 }
 

@@ -604,7 +604,8 @@ mod tests {
                         owns_minecraft_java,
                     },
                 )
-                .await;
+                .await
+                .expect("insert Minecraft account fixture");
             account
         }
     }

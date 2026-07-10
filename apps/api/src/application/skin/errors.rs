@@ -33,6 +33,14 @@ pub(super) fn json_status_error(
     )
 }
 
+pub(super) fn skin_auth_store_error() -> ApiError {
+    json_status_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Could not save Minecraft account changes. Restart Axial and try again.",
+        "minecraft_account_store_failed",
+    )
+}
+
 pub(super) fn skin_upload_error(error: SkinUploadError) -> ApiError {
     match error {
         SkinUploadError::Auth => json_status_error(

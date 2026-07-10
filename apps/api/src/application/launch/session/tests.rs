@@ -286,7 +286,8 @@ impl TestFixture {
                     owns_minecraft_java,
                 },
             )
-            .await;
+            .await
+            .expect("insert launch auth fixture");
     }
 }
 

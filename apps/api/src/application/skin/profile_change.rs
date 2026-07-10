@@ -8,8 +8,9 @@ use super::cache::{
     profile_skin_file_cache_path, read_profile_skin_file_cache, write_profile_file_cache,
 };
 use super::errors::{
-    ApiError, bounded_error_message, json_error, json_status_error, skin_cape_error,
-    skin_preserve_download_error, skin_preserve_invalid_error, skin_reset_error, skin_upload_error,
+    ApiError, bounded_error_message, json_error, json_status_error, skin_auth_store_error,
+    skin_cape_error, skin_preserve_download_error, skin_preserve_invalid_error, skin_reset_error,
+    skin_upload_error,
 };
 use super::image::{normalize_skin_png, texture_key};
 use super::provider::{
@@ -136,6 +137,7 @@ pub(super) async fn handle_skin_profile_reset_with_clients(
             .auth_logins()
             .update_active_current_minecraft_profile(&account.login_id, profile)
             .await
+            .map_err(|_| skin_auth_store_error())?
     } else {
         false
     };
@@ -191,6 +193,7 @@ pub(super) async fn handle_skin_cape_reset_with_clients(
             .auth_logins()
             .update_active_current_minecraft_profile(&account.login_id, profile)
             .await
+            .map_err(|_| skin_auth_store_error())?
     } else {
         false
     };
@@ -352,6 +355,7 @@ async fn apply_saved_skin_for_account_with_clients(
             .auth_logins()
             .update_active_current_minecraft_profile(&account.login_id, profile)
             .await
+            .map_err(|_| skin_auth_store_error())?
     } else {
         false
     };

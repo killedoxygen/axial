@@ -240,7 +240,8 @@ mod tests {
                 expires_in: 3600,
                 scope: Some("XboxLive.signin offline_access".to_string()),
             })
-            .await;
+            .await
+            .expect("insert active MSA login");
     }
 
     async fn insert_active_current_login(
@@ -271,7 +272,8 @@ mod tests {
                     owns_minecraft_java,
                 },
             )
-            .await;
+            .await
+            .expect("insert active Minecraft login");
     }
 
     async fn profile_rejected_auth_chain_client() -> (

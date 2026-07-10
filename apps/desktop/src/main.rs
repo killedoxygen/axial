@@ -41,7 +41,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let installs = Arc::new(InstallStore::new());
     let sessions = Arc::new(SessionStore::new());
     let performance = Arc::new(PerformanceManager::new_with_config_dir(&paths.config_dir)?);
-    let state = AppState::new(AppStateInit {
+    let state = AppState::load(AppStateInit {
         app_name: "Axial".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         config,
@@ -51,7 +51,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         performance,
         startup_warnings,
         frontend_dir: axial_api::app::default_frontend_dir(),
-    });
+    })
+    .await;
     let telemetry = state.telemetry().clone();
     let discord_presence = discord_presence::spawn(state.clone());
     spawn_performance_operations_resume(&state);
@@ -68,6 +69,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => {
             emit_startup_failed(&telemetry);
             discord_presence.shutdown_blocking();
+            commands::prepare_for_exit("API startup failure", &state)
+                .await
+                .map_err(std::io::Error::other)?;
             return Err(Box::new(error));
         }
     };
@@ -76,7 +80,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let run_result = tauri::Builder::default()
         .manage(desktop_state)
-        .manage(state)
+        .manage(state.clone())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -97,6 +101,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands::window_set_resize_background
         ])
         .on_window_event(move |window, event| {
+            if window.label() != "main" {
+                return;
+            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let window = window.clone();
@@ -110,8 +117,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         return;
                     }
-                    commands::flush_pending_saved_skin_applies("window close request", &state)
-                        .await;
+                    if let Err(error) =
+                        commands::prepare_for_exit("window close request", &state).await
+                    {
+                        let _ = window.emit(
+                            events::DESKTOP_CLOSE_BLOCKED,
+                            serde_json::json!({ "error": error }),
+                        );
+                        return;
+                    }
                     let _ = tokio::task::spawn_blocking(move || {
                         discord_presence.shutdown_blocking();
                     })
@@ -136,10 +150,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(error) = run_result {
         emit_startup_failed(&telemetry);
         discord_presence.shutdown_blocking();
+        commands::prepare_for_exit("desktop event loop failure", &state)
+            .await
+            .map_err(std::io::Error::other)?;
         return Err(Box::new(error));
     }
 
     discord_presence.shutdown_blocking();
+    commands::prepare_for_exit("desktop shutdown", &state)
+        .await
+        .map_err(std::io::Error::other)?;
 
     Ok(())
 }

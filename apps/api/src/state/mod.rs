@@ -94,15 +94,33 @@ pub struct AppStateInit {
     pub frontend_dir: PathBuf,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("secure authentication cleanup is incomplete")]
+pub struct SecureAuthCloseError;
+
 impl AppState {
+    #[cfg(test)]
     pub fn new(init: AppStateInit) -> Self {
         let telemetry = Arc::new(TelemetryHub::from_env(init.config.clone()));
-        Self::new_with_telemetry_inner(init, telemetry)
+        Self::new_with_telemetry_inner(init, telemetry, Arc::new(AuthLoginStore::new()))
+    }
+
+    pub async fn load(init: AppStateInit) -> Self {
+        let telemetry = Arc::new(TelemetryHub::from_env(init.config.clone()));
+        let auth_logins = Arc::new(AuthLoginStore::load_from_secure_store().await);
+        Self::new_with_telemetry_inner(init, telemetry, auth_logins)
+    }
+
+    pub async fn close_secure_auth(&self) -> Result<(), SecureAuthCloseError> {
+        self.auth_logins
+            .close()
+            .await
+            .map_err(|_| SecureAuthCloseError)
     }
 
     #[cfg(test)]
     pub(crate) fn new_with_telemetry(init: AppStateInit, telemetry: Arc<TelemetryHub>) -> Self {
-        Self::new_with_telemetry_inner(init, telemetry)
+        Self::new_with_telemetry_inner(init, telemetry, Arc::new(AuthLoginStore::new()))
     }
 
     #[cfg(test)]
@@ -131,7 +149,11 @@ impl AppState {
         self
     }
 
-    fn new_with_telemetry_inner(init: AppStateInit, telemetry: Arc<TelemetryHub>) -> Self {
+    fn new_with_telemetry_inner(
+        init: AppStateInit,
+        telemetry: Arc<TelemetryHub>,
+        auth_logins: Arc<AuthLoginStore>,
+    ) -> Self {
         let library_dir = init.config.current().library_dir;
         let benchmark_suite_retention_claims =
             benchmark_suites::BenchmarkSuiteRetentionClaims::default();
@@ -166,7 +188,7 @@ impl AppState {
             config: init.config,
             instances: init.instances,
             accounts,
-            auth_logins: Arc::new(AuthLoginStore::load_from_secure_store()),
+            auth_logins,
             installs: init.installs,
             failure_memory,
             journals,

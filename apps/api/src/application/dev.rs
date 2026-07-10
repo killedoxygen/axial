@@ -258,7 +258,8 @@ mod tests {
                 expires_in: 3600,
                 scope: None,
             })
-            .await;
+            .await
+            .expect("insert auth fixture");
 
         let response = dev_flush(&state).await.expect("dev flush should succeed");
 
@@ -284,7 +285,8 @@ mod tests {
                 expires_in: 3600,
                 scope: None,
             })
-            .await;
+            .await
+            .expect("insert preserved auth fixture");
         state.sessions().inject_rejected_process_owner().await;
 
         let (status, Json(body)) = match dev_flush(&state).await {

@@ -664,15 +664,17 @@ async fn auth_profile_sync(
         Err(error) => return auth_chain_error_response(error),
     };
 
-    let Some(updated) = login_store
+    let updated = match login_store
         .update_active_current_minecraft_profile_and_ownership(
             &active.account.login_id,
             profile,
             Some(ownership.owns_minecraft_java),
         )
         .await
-    else {
-        return auth_profile_sync_account_required_response();
+    {
+        Ok(Some(updated)) => updated,
+        Ok(None) => return auth_profile_sync_account_required_response(),
+        Err(_) => return auth_store_failed_response(),
     };
 
     (
@@ -769,6 +771,16 @@ fn auth_clear_failed_response() -> (StatusCode, Json<serde_json::Value>) {
         Json(serde_json::json!({
             "error": "Could not clear Microsoft sign-in. Restart Axial and try again.",
             "status": "auth_clear_failed",
+        })),
+    )
+}
+
+fn auth_store_failed_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not save Microsoft account changes. Restart Axial and try again.",
+            "status": "auth_store_failed",
         })),
     )
 }
@@ -1301,7 +1313,8 @@ mod tests {
                 expires_in: 3600,
                 scope: Some("XboxLive.signin offline_access".to_string()),
             })
-            .await;
+            .await
+            .expect("insert MSA auth fixture");
 
         let response = auth_status_for_store(
             &AppConfig {
@@ -1471,7 +1484,8 @@ mod tests {
                 expires_in: 3600,
                 scope: None,
             })
-            .await;
+            .await
+            .expect("insert MSA auth fixture");
 
         let response = auth_logout(&store).await;
 
@@ -1733,6 +1747,7 @@ mod tests {
                 scope: Some("XboxLive.signin offline_access".to_string()),
             })
             .await
+            .expect("insert active refresh login")
     }
 
     async fn insert_active_current_login(
@@ -1764,7 +1779,8 @@ mod tests {
                 },
                 account,
             )
-            .await;
+            .await
+            .expect("insert active current login");
         token
     }
 

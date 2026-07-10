@@ -38,7 +38,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let installs = Arc::new(InstallStore::new());
     let sessions = Arc::new(SessionStore::new());
     let performance = Arc::new(PerformanceManager::new_with_config_dir(&paths.config_dir)?);
-    let state = AppState::new(AppStateInit {
+    let state = AppState::load(AppStateInit {
         app_name: "Axial".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         config,
@@ -48,7 +48,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         performance,
         startup_warnings,
         frontend_dir: default_frontend_dir(),
-    });
+    })
+    .await;
     spawn_performance_operations_resume(&state);
     spawn_benchmark_suite_drivers_resume(&state);
     spawn_performance_rules_refresh(&state);
@@ -69,16 +70,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn serve_api(state: AppState, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(addr).await?;
-    let addr = listener.local_addr()?;
-    info!("axial api listening on http://{addr}");
+    let serve_result: Result<(), Box<dyn std::error::Error>> = async {
+        let listener = TcpListener::bind(addr).await?;
+        let addr = listener.local_addr()?;
+        info!("axial api listening on http://{addr}");
 
-    axum::serve(listener, build_router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+        axum::serve(listener, build_router(state.clone()))
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await?;
+        Ok(())
+    }
+    .await;
+    let _ = axial_api::routes::flush_pending_saved_skin_applies_for_shutdown(&state).await;
+    let close_result = state.close_secure_auth().await;
 
+    serve_result?;
+    close_result?;
     Ok(())
 }
 
