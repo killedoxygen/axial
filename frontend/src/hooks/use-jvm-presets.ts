@@ -9,29 +9,44 @@ export interface JvmPresetOption {
   disabled_reason?: string | null;
 }
 
+let presetCache: JvmPresetOption[] | null = null;
+let presetRequest: Promise<JvmPresetOption[]> | null = null;
+
+async function loadPresets(): Promise<JvmPresetOption[]> {
+  if (presetCache) return presetCache;
+  presetRequest ??= (async () => {
+    try {
+      const res = (await api('GET', '/instances/create-view')) as {
+        preset_options?: JvmPresetOption[];
+        error?: string;
+      };
+      if (res.error) return [];
+      const list = Array.isArray(res.preset_options)
+        ? res.preset_options.filter(
+            (option): option is JvmPresetOption =>
+              typeof option.id === 'string' && typeof option.label === 'string' && typeof option.detail === 'string',
+          )
+        : [];
+      if (list.length > 0) presetCache = list;
+      return list;
+    } catch {
+      return [];
+    } finally {
+      presetRequest = null;
+    }
+  })();
+  return presetRequest;
+}
+
 export function useJvmPresets(): { options: JvmPresetOption[]; selectable: JvmPresetOption[] } {
-  const [options, setOptions] = useState<JvmPresetOption[]>([]);
+  const [options, setOptions] = useState<JvmPresetOption[]>(presetCache ?? []);
 
   useEffect(() => {
+    if (presetCache) return;
     let cancelled = false;
-    void (async () => {
-      try {
-        const res = (await api('GET', '/instances/create-view')) as {
-          preset_options?: JvmPresetOption[];
-          error?: string;
-        };
-        if (cancelled || res.error) return;
-        const list = Array.isArray(res.preset_options)
-          ? res.preset_options.filter(
-              (option): option is JvmPresetOption =>
-                typeof option.id === 'string' && typeof option.label === 'string' && typeof option.detail === 'string',
-            )
-          : [];
-        setOptions(list);
-      } catch {
-        if (!cancelled) setOptions([]);
-      }
-    })();
+    void loadPresets().then((list) => {
+      if (!cancelled && list.length > 0) setOptions(list);
+    });
     return () => {
       cancelled = true;
     };

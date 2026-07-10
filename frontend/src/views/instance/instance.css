@@ -280,7 +280,7 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
 }
 .cp-session-stop:focus-visible {
   outline: none;
-  box-shadow: inset 0 0 0 2px var(--accent-ring);
+  box-shadow: var(--focus-ring-inset);
 }
 @media (prefers-reduced-motion: reduce) {
   .cp-session-dot {
@@ -431,7 +431,7 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
 }
 .cp-instance-tabs button:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
+  box-shadow: var(--focus-ring);
 }
 .cp-instance-tabs button[data-active='true'] {
   background: var(--accent-fill);

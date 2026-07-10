@@ -3,7 +3,6 @@ import type { EnrichedInstance } from '../types-instance';
 import type { InstallQueueStateResponse } from '../types-install';
 import type { FeatureFlagViewModel, FlagsResponse } from '../types-flags';
 import type { Version } from '../types-version';
-import type { PerformanceRulesStatus } from '../types-performance';
 
 type Handler = (body?: unknown, path?: string, request?: MockRequest) => unknown | Promise<unknown>;
 
@@ -283,46 +282,6 @@ const handlers: Record<string, Handler> = {
       { path: '/mock/java/21/bin/java', component: 'java-runtime-delta-21', source: 'managed' },
       { path: '/mock/java/17/bin/java', component: 'java-runtime-gamma-17', source: 'system' },
     ],
-  }),
-  'GET /performance/status': (): PerformanceRulesStatus => ({
-    rule_source: 'built_in',
-    rule_channel: 'bundled',
-    rules_cache: {
-      recorded: true,
-      state: 'recorded',
-      updated_at: '2026-07-01T12:00:00Z',
-      loaded_at: '2026-07-08T09:00:00Z',
-      warning: null,
-    },
-    view_model: {
-      source_label: 'Built-in rules',
-      channel_label: 'Bundled',
-      validation_label: 'Valid',
-      validation_tone: 'ok',
-      validation_icon: 'shield-check',
-      summary: 'Managed performance uses the bundled rule set.',
-      refresh_label: 'Refreshes with app updates',
-      generated_label: 'Jul 1, 2026',
-      cache_label: 'Recorded',
-      emergency_disable_label: 'None',
-      details_label: 'Rule details',
-      health_states_label: 'healthy, degraded, fallback',
-      ownership_label: 'composition managed',
-      warnings: [],
-    },
-    guardian_facts: [],
-    schema_version: 3,
-    generated_at: '2026-07-01T12:00:00Z',
-    composition_count: 6,
-    family_coverage: [],
-    remote_refresh: false,
-    last_refresh_at: null,
-    validation: 'valid',
-    health_states: ['healthy', 'degraded', 'fallback'],
-    ownership_classes: ['composition_managed'],
-    emergency_disable_count: 0,
-    emergency_disables: [],
-    warnings: [],
   }),
   'GET /performance/health': () => ({ health: null }),
 };
@@ -645,7 +604,7 @@ function createPresetOptions(): CreatePresetOption[] {
     {
       id: '',
       label: 'Auto',
-      detail: 'Croopor picks safe JVM flags for this instance.',
+      detail: 'Croopor picks safe JVM flags automatically.',
       default: true,
       disabled_reason: null,
     },

@@ -133,8 +133,10 @@ input::placeholder {
   --accent-on: oklch(0.985 0.015 140);
   --accent-soft: oklch(0.78 0.14 140 / 0.16);
   --accent-softer: oklch(0.78 0.14 140 / 0.08);
-  --accent-ring: oklch(0.78 0.14 140 / 0.4);
   --accent-line: oklch(0.78 0.14 140 / 0.28);
+  --focus-ring: 0 0 0 1.5px color-mix(in oklab, var(--accent) 80%, transparent);
+  --focus-ring-inset: inset 0 0 0 1.5px color-mix(in oklab, var(--accent) 80%, transparent);
+  --focus-border: inset 0 0 0 1px color-mix(in oklab, var(--accent) 45%, var(--line-strong));
   --logo-filter: none;
   --ok: oklch(0.78 0.14 150);
   --warn: oklch(0.8 0.14 70);

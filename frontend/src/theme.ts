@@ -89,7 +89,6 @@ function applyCssVars(hue: number, dark: boolean, vibrancy: number, deferLogo = 
   set('--accent-on', `oklch(${dark ? 0.985 : 0.99} 0.015 ${hue})`);
   set('--accent-soft', `oklch(${L} ${C} ${hue} / 0.16)`);
   set('--accent-softer', `oklch(${L} ${C} ${hue} / 0.08)`);
-  set('--accent-ring', `oklch(${L} ${C} ${hue} / 0.40)`);
   set('--accent-line', `oklch(${L} ${C} ${hue} / 0.28)`);
   if (!deferLogo) applyLogoCssVars(set, hue, vibrancy);
 

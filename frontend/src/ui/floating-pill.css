@@ -1,0 +1,42 @@
+.cp-fpill-float {
+  position: fixed;
+  left: 68px;
+  right: 0;
+  bottom: 18px;
+  z-index: 850;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  padding: 0 24px;
+}
+
+.cp-fpill {
+  pointer-events: auto;
+  max-width: min(720px, 100%);
+  min-height: 48px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow:
+    var(--shadow),
+    0 0 0 1px var(--line);
+}
+
+.cp-fpill-divider {
+  width: 1px;
+  height: 24px;
+  margin: 0 2px;
+  background: var(--line);
+  flex: 0 0 auto;
+}
+
+@media (max-width: 820px) {
+  .cp-fpill {
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+}

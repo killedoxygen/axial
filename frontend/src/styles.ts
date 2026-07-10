@@ -12,6 +12,7 @@ import './ui/instance-visual.css';
 import './ui/slider.css';
 import './ui/select.css';
 import './ui/modal.css';
+import './ui/floating-pill.css';
 import './ui/selection.css';
 import './ui/context-menu.css';
 import './ui/command-palette.css';

@@ -27,7 +27,7 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
   - context menus for secondary row actions.
 - Modals use `ui/Modal.tsx` (`Modal`/`ModalContent`/`ModalHeader`/`ModalFooter`/`ModalTitle`/`ModalDescription`/`ModalClose`): portal rendering, scrim + Escape dismiss, focus trap and focus restore. Panels style themselves via `className`; pass `showCloseButton={false}` when the panel carries its own close.
 - Primitive policy: shadcn/ui is the **design and API reference** (component decomposition, `data-slot` conventions, behavior contract), but its Radix runtime does not render reliably under preact/compat. The dialog mounted only its overlay. Behavioral primitives are therefore implemented directly in Preact inside `ui/`, matching the shadcn contract, styled with `cp-*` classes. Do not add `@radix-ui/*` dependencies without smoke-testing the rendered output in the app first.
-- Text inputs and select triggers focus with a neutral ring (stronger hairline + text-tinted halo), never accent. Accent rings are for interactive focus-visible on buttons only.
+- Focus is a fine line, never a halo: text inputs and select triggers focus with `--focus-border` (1px accent-tinted inset hairline); interactive elements use `--focus-ring`/`--focus-ring-inset` (1.5px accent hairline) on `:focus-visible`. Never hand-roll thicker rings.
 - "Already installed" on version rows is the `download` icon (OpenAI icon set), not a colored status dot.
 - Do not use `cp-section-eyebrow`.
 - Do not add broad card-heavy layouts. Avoid nested cards.
@@ -101,7 +101,7 @@ Frontend surfaces render backend-authored policy. Do not add UI code that decide
 - NameMC skin discovery remains deferred until a stable allowed API boundary is verified.
 
 ### Settings Performance
-- Keep normal settings focused on launch behavior and rule readiness.
+- Keep normal settings focused on launch behavior: mode choices only. Rule-set internals (source, validation, compositions) are developer detail and stay out of the Performance section.
 - Keep proof, benchmark, and developer-only detail behind Advanced/dev disclosures.
 - Use compact controls rather than tile grids or explanatory cards for every choice.
 

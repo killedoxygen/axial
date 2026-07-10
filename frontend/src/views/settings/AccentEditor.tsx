@@ -27,7 +27,7 @@ export function AccentModeToggle({ onChange }: { onChange?: (mode: 'dark' | 'lig
       ariaLabel="Theme mode"
       options={[
         { value: 'dark', label: 'Dark' },
-        { value: 'light', label: 'Light' },
+        { value: 'light', label: 'Light', disabled: true, title: 'Light mode is in development' },
       ]}
     />
   );

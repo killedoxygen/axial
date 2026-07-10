@@ -32,7 +32,7 @@
 }
 .cp-pills > button:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
+  box-shadow: var(--focus-ring);
 }
 .cp-pills > button[data-active='true'] {
   background: var(--accent-fill);

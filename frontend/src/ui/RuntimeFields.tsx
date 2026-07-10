@@ -9,6 +9,27 @@ type JavaRuntime = { path: string; component: string; source: string };
 const MANAGED_VALUE = '';
 const CUSTOM_VALUE = '__custom__';
 
+let runtimeCache: JavaRuntime[] | null = null;
+let runtimeRequest: Promise<JavaRuntime[]> | null = null;
+
+async function loadRuntimes(): Promise<JavaRuntime[]> {
+  if (runtimeCache) return runtimeCache;
+  runtimeRequest ??= (async () => {
+    try {
+      const res = await api('GET', '/java');
+      const list = Array.isArray(res?.runtimes) ? (res.runtimes as JavaRuntime[]) : [];
+      const valid = list.filter((runtime) => runtime?.path);
+      if (valid.length > 0) runtimeCache = valid;
+      return valid;
+    } catch {
+      return [];
+    } finally {
+      runtimeRequest = null;
+    }
+  })();
+  return runtimeRequest;
+}
+
 function runtimeLabel(runtime: JavaRuntime): string {
   const major = /(\d+)/.exec(runtime.component)?.[1];
   const name = major ? `Java ${major}` : runtime.component || 'Java runtime';
@@ -31,21 +52,18 @@ export function JavaPathField({
   className?: string;
   label?: string;
 }): JSX.Element {
-  const [runtimes, setRuntimes] = useState<JavaRuntime[]>([]);
+  const [runtimes, setRuntimes] = useState<JavaRuntime[]>(runtimeCache ?? []);
   const trimmed = value.trim();
   const matchesDetected = runtimes.some((runtime) => runtime.path === trimmed);
   const isCustom = trimmed.length > 0 && !matchesDetected;
   const [customOpen, setCustomOpen] = useState(isCustom);
 
   useEffect(() => {
+    if (runtimeCache) return;
     let alive = true;
-    api('GET', '/java')
-      .then((res) => {
-        if (!alive || !res) return;
-        const list = Array.isArray(res.runtimes) ? (res.runtimes as JavaRuntime[]) : [];
-        setRuntimes(list.filter((runtime) => runtime?.path));
-      })
-      .catch(() => {});
+    void loadRuntimes().then((list) => {
+      if (alive && list.length > 0) setRuntimes(list);
+    });
     return () => {
       alive = false;
     };

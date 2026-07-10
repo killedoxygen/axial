@@ -7,7 +7,7 @@ export function AppearanceSection(): JSX.Element {
     <SettingsSection>
       <SettingRow
         title="Mode"
-        description="Light or dark canvas. Accent colors re-derive automatically so contrast stays safe."
+        description="Canvas mode. Light mode is in development and will unlock in a future update."
         control={<AccentModeToggle />}
       />
       <SettingRow

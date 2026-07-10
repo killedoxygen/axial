@@ -57,7 +57,7 @@
 }
 .cp-modal-x:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
+  box-shadow: var(--focus-ring);
 }
 
 .cp-modal-head {

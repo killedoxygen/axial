@@ -8,7 +8,6 @@ import { config } from '../../store';
 import type { Config } from '../../types-settings';
 import type { GuardianMode } from '../../types-guardian';
 import type { PerformanceMode } from '../../types-performance';
-import { PerformanceRulesStatusBlock, usePerformanceRulesStatus } from './PerformanceRulesStatus';
 
 const PERFORMANCE_OPTIONS: Array<ChoicePillOption<PerformanceMode>> = [
   { value: 'managed', label: 'Managed', note: 'Croopor applies recommended tuning and optimizations for you.' },
@@ -40,7 +39,6 @@ export function PerformanceSection(): JSX.Element {
   const savedGuardian = guardianModeFrom(cfg?.guardian_mode);
   const [performanceMode, setPerformanceMode] = useState<PerformanceMode>(savedPerformance);
   const [guardianMode, setGuardianMode] = useState<GuardianMode>(savedGuardian);
-  const rulesStatus = usePerformanceRulesStatus();
 
   useEffect(() => {
     setPerformanceMode(savedPerformance);
@@ -98,9 +96,6 @@ export function PerformanceSection(): JSX.Element {
           />
         }
       />
-      <SettingRow title="Managed rules" description="The rule set powering managed tuning and its readiness.">
-        <PerformanceRulesStatusBlock state={rulesStatus} />
-      </SettingRow>
     </SettingsSection>
   );
 }

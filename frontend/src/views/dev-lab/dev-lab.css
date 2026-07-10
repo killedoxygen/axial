@@ -45,7 +45,7 @@
 
 .cp-dev-tabs button:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
+  box-shadow: var(--focus-ring);
 }
 
 .cp-dev-tabs button[data-active='true'] {
@@ -229,7 +229,7 @@
 
 .cp-dev-inspector-row summary:focus-visible {
   outline: none;
-  box-shadow: inset 0 0 0 2px var(--accent-ring);
+  box-shadow: var(--focus-ring-inset);
 }
 
 .cp-dev-inspector-row summary svg {

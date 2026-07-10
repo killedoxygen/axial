@@ -15,10 +15,11 @@
   background: color-mix(in oklab, var(--bg) 55%, var(--surface));
   box-shadow: inset 0 0 0 1px var(--line);
 }
+.cp-ovr-field .cp-select-trigger {
+  height: 34px;
+}
 .cp-ovr-field .cp-field.cp-field--focused {
-  box-shadow:
-    inset 0 0 0 1px var(--line-strong),
-    0 0 0 3px color-mix(in oklab, var(--text) 8%, transparent);
+  box-shadow: var(--focus-border);
 }
 .cp-ovr-input {
   display: flex;
@@ -32,9 +33,7 @@
   transition: box-shadow 120ms ease;
 }
 .cp-ovr-input:focus-within {
-  box-shadow:
-    inset 0 0 0 1px var(--line-strong),
-    0 0 0 3px color-mix(in oklab, var(--text) 8%, transparent);
+  box-shadow: var(--focus-border);
 }
 .cp-ovr-input input {
   flex: 1;
@@ -56,9 +55,6 @@
   gap: 12px;
   align-items: start;
 }
-.cp-runtime-grid .cp-argbox {
-  min-height: 34px;
-}
 @media (max-width: 1150px) {
   .cp-runtime-grid {
     grid-template-columns: minmax(0, 0.8fr) minmax(0, 1fr);
@@ -74,17 +70,15 @@
 }
 .cp-argbox {
   position: relative;
-  min-height: 84px;
+  min-height: 34px;
   border-radius: var(--r-sm);
   background: color-mix(in oklab, var(--bg) 55%, var(--surface));
   box-shadow: inset 0 0 0 1px var(--line);
-  padding: 7px 8px;
+  padding: 5px 8px;
   transition: box-shadow 120ms ease;
 }
 .cp-argbox--focus {
-  box-shadow:
-    inset 0 0 0 1px var(--line-strong),
-    0 0 0 3px color-mix(in oklab, var(--text) 8%, transparent);
+  box-shadow: var(--focus-border);
 }
 .cp-argbox[data-disabled='true'] {
   opacity: 0.55;

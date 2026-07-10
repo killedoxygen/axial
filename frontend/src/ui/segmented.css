@@ -68,7 +68,7 @@
 }
 .cp-seg > button:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
+  box-shadow: var(--focus-ring);
 }
 .cp-seg > button[data-active='true'] {
   color: var(--text);

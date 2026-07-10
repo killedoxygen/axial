@@ -58,9 +58,8 @@ export function LaunchingSection(): JSX.Element {
       <SettingsSection title="Launch defaults">
         <SettingRow
           title="Memory"
-          description={`JVM heap for instances that don't set their own. Recommended ${fmtMem(recMin)} to ${fmtMem(
-            recMax,
-          )} on this system (${totalGb} GB installed).`}
+          description={`JVM heap for instances that don't set their own. Recommended ${fmtMem(recMin)} to ${fmtMem(recMax)}.`}
+          aside={<span class="cp-sheet-note">{totalGb} GB installed</span>}
         >
           <MemoryField
             minGb={minGb}

@@ -100,7 +100,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
 }
 .cp-rail-btn:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
+  box-shadow: var(--focus-ring);
 }
 .cp-rail-btn[data-active='true'] {
   background: var(--accent-fill);
@@ -209,7 +209,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
 }
 .cp-rail-tile:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
+  box-shadow: var(--focus-ring);
 }
 .cp-rail-tile-art {
   width: 38px;
@@ -344,7 +344,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
 }
 .cp-rail-user:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
+  box-shadow: var(--focus-ring);
 }
 .cp-rail-user[data-open='true'] {
   background: var(--surface);

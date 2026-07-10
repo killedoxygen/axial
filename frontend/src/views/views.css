@@ -184,7 +184,7 @@
 }
 .cp-notice-dismiss:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
+  box-shadow: var(--focus-ring);
 }
 
 .cp-feature {
@@ -221,9 +221,7 @@
 }
 .cp-feature:focus-visible {
   outline: none;
-  box-shadow:
-    var(--shadow-raised),
-    0 0 0 3px var(--accent-ring);
+  box-shadow: var(--shadow-raised), var(--focus-ring);
 }
 .cp-feature[data-installing='true'] {
   cursor: pointer;
@@ -352,9 +350,7 @@
 }
 .cp-icard:focus-visible {
   outline: none;
-  box-shadow:
-    var(--shadow-raised),
-    0 0 0 3px var(--accent-ring);
+  box-shadow: var(--shadow-raised), var(--focus-ring);
 }
 .cp-icard[data-installing='true']:hover {
   transform: translateY(-1px);

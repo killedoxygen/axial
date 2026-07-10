@@ -92,7 +92,7 @@ fn preset_catalog() -> &'static [PresetCatalogEntry] {
         PresetCatalogEntry {
             id: AUTO_PRESET_ID,
             label: "Auto",
-            detail: "Croopor picks safe JVM flags for this instance.",
+            detail: "Croopor picks safe JVM flags automatically.",
         },
         PresetCatalogEntry {
             id: PRESET_SMOOTH,

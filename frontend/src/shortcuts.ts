@@ -169,6 +169,17 @@ export function comboParts(combo: ShortcutBinding): string[] {
   return parts;
 }
 
+export function eventComboParts(e: KeyboardEvent, includeKey = true): string[] {
+  const parts: string[] = [];
+  if (e.ctrlKey) parts.push('Ctrl');
+  if (e.altKey) parts.push('Alt');
+  if (e.shiftKey) parts.push('Shift');
+  if (e.metaKey) parts.push('Cmd');
+  const isModifier = e.key === 'Control' || e.key === 'Alt' || e.key === 'Shift' || e.key === 'Meta';
+  if (includeKey && !isModifier) parts.push(displayKey(e.key));
+  return parts;
+}
+
 export function shortcutHint(id: ShortcutId, separator = ' '): string {
   return comboParts(effectiveCombos(shortcutById(id))[0]!).join(separator);
 }
