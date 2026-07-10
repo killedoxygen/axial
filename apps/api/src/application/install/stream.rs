@@ -1,6 +1,7 @@
 use super::{
     InstallApplicationError, install_operation_id,
-    operation::install_progress_history_from_journal, sanitize_install_progress,
+    operation::{install_journal_is_terminal, install_progress_history_from_journal},
+    sanitize_install_progress,
 };
 use crate::state::{AppState, InstallProgressRecord};
 use axial_minecraft::DownloadProgress;
@@ -49,6 +50,18 @@ async fn install_progress_events_stream(
             Json(serde_json::json!({ "error": missing_message })),
         ));
     }
+    if subscription.is_none()
+        && journal
+            .as_ref()
+            .is_some_and(|journal| !install_journal_is_terminal(journal.status))
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "install operation is not currently streamable"
+            })),
+        ));
+    }
 
     let (replay, mut receiver, done) = if let Some((snapshot, receiver)) = subscription {
         (snapshot.latest, Some(receiver), snapshot.done)
@@ -60,7 +73,9 @@ async fn install_progress_events_stream(
                 .and_then(|mut history| history.pop())
                 .map(InstallProgressRecord::new),
             None,
-            true,
+            journal
+                .as_ref()
+                .is_some_and(|journal| install_journal_is_terminal(journal.status)),
         )
     };
 

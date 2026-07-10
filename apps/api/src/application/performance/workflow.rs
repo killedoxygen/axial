@@ -16,13 +16,23 @@ use mutation::{PERFORMANCE_INSTALL_INTERNAL_ERROR, performance_install_error};
 pub use mutation::{PerformanceRollbackListResponse, performance_rollback_list};
 
 #[cfg(test)]
-use operations::resume_pending_performance_operations;
+use operations::{
+    PERFORMANCE_JOURNAL_ERROR, PerformanceInstallAction, PerformanceOperationExecutionError,
+    begin_performance_operation_journal, performance_journal_is_terminal,
+    record_performance_effect_started, record_performance_terminal_intent,
+    resume_pending_performance_operations, retry_performance_status_correction,
+    retry_performance_status_transition, run_queued_performance_operation,
+    terminalize_mismatched_performance_operation,
+};
 pub use operations::{
     PerformanceInstanceOperationResponse, PerformanceOperationStatusResponse,
     performance_instance_operation, performance_operation_status,
     spawn_pending_performance_operations,
 };
-use operations::{PerformanceOperation, install_action, queue_performance_operation};
+use operations::{
+    PerformanceOperation, execute_synchronous_performance_operation, install_action,
+    queue_performance_operation,
+};
 #[cfg(test)]
 use plan_health::{
     PERFORMANCE_DATA_INTERNAL_ERROR, PERFORMANCE_STATE_PARSE_WARNING, bundle_health_token,
@@ -85,13 +95,14 @@ pub async fn performance_install(
         action,
         rollback_id: payload.rollback_id.clone(),
         status_operation_id: None,
+        persistence_failure: None,
     };
 
     if payload.queued.unwrap_or(false) {
         return queue_performance_operation(state, operation).await;
     }
 
-    mutation::execute_performance_operation(&state, &operation).await
+    execute_synchronous_performance_operation(state, operation).await
 }
 
 fn required_value(

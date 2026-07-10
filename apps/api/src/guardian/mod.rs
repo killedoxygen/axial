@@ -68,7 +68,7 @@ pub use launch_recovery::{
     GuardianLaunchRecoveryPlanRejection, GuardianLaunchRecoveryPlanRequest,
     GuardianLaunchRecoveryRecordRequest, GuardianLaunchRecoveryReversibility,
     GuardianLaunchRecoveryStatus, plan_launch_recovery_directive, record_launch_recovery_attempt,
-    record_launch_recovery_failure,
+    record_launch_recovery_failure, record_launch_recovery_success,
 };
 pub use model::{
     ActionPlanPrerequisite, Diagnosis, DiagnosisId, FactReliability, GuardianAction,

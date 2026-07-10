@@ -152,14 +152,18 @@ mod tests {
             .installs()
             .emit(install_id, failed_progress.clone())
             .await;
-        begin_install_operation_journal(fixture.state.journals(), &operation_id, "1.21.5");
+        begin_install_operation_journal(fixture.state.journals(), &operation_id, "1.21.5")
+            .await
+            .expect("record install journal");
         let mut last_phase = None;
         record_install_operation_progress(
             fixture.state.journals(),
             &operation_id,
             &failed_progress,
             &mut last_phase,
-        );
+        )
+        .await
+        .expect("record install journal");
         record_install_operation_guardian_repair_outcome(
             fixture.state.journals(),
             &operation_id,
@@ -176,7 +180,9 @@ mod tests {
                 ],
                 summary: "guardian_artifact_repaired".to_string(),
             },
-        );
+        )
+        .await
+        .expect("record install journal");
 
         let (status, payload) = fixture
             .request_json(

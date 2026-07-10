@@ -1,10 +1,13 @@
 use super::*;
 use crate::application::InstallVersionCommand;
+use crate::execution::file::{FileWriteRequest, write_file_atomically};
+use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
 use crate::guardian::{
     DiagnosisId, GuardianActionKind, GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus,
 };
 use crate::state::contracts::{
-    CommandKind, OperationId, OperationOutcome, OperationStatus, OperationStepResult, TargetKind,
+    CommandKind, OperationId, OperationOutcome, OperationStatus, OperationStepResult,
+    TargetDescriptor, TargetKind,
 };
 use crate::state::{
     AppState, AppStateInit, GuardianFailureMemoryStore, InstallStore, OperationJournalStore,
@@ -23,15 +26,15 @@ use axial_performance::PerformanceManager;
 use axum::{body::to_bytes, response::IntoResponse};
 use serde_json::json;
 use sha1::{Digest, Sha1};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::{fs, sync::mpsc};
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::{Notify, mpsc as tokio_mpsc};
 use tokio::time::timeout;
 
 #[test]
@@ -551,6 +554,11 @@ async fn install_existing_active_response_includes_backend_operation_id() {
             String::new(),
         )
         .await;
+    let operation_id = install_operation_id("existing-install");
+    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
+        .await
+        .expect("create existing install journal");
+    assert!(state.installs().mark_initialized("existing-install").await);
 
     let response = start_install_version(
         &state,
@@ -561,11 +569,10 @@ async fn install_existing_active_response_includes_backend_operation_id() {
     )
     .await
     .expect("existing active install should be returned");
-    let operation_id = install_operation_id("existing-install");
 
     assert_eq!(response.install_id, "existing-install");
     assert_eq!(response.operation_id, operation_id);
-    assert!(state.journals().get(&operation_id).is_none());
+    assert!(state.journals().get(&operation_id).is_some());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -779,14 +786,18 @@ async fn install_status_exposes_backend_authored_guardian_repair_summary() {
         .installs()
         .emit(install_id, observed_install_failure_progress())
         .await;
-    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5");
+    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
+        .await
+        .expect("begin install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &observed_install_failure_progress(),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install progress");
     record_install_operation_guardian_repair_outcome(
         state.journals(),
         &operation_id,
@@ -800,7 +811,9 @@ async fn install_status_exposes_backend_authored_guardian_repair_summary() {
             facts: vec!["https://example.invalid/client.jar?token=secret".to_string()],
             summary: "guardian_artifact_repaired".to_string(),
         },
-    );
+    )
+    .await
+    .expect("record Guardian repair outcome");
 
     let response = install_status(&state, install_id)
         .await
@@ -852,7 +865,9 @@ async fn install_status_exposes_interrupted_install_as_redacted_terminal_state()
         .installs()
         .emit(install_id, interrupted_install_progress())
         .await;
-    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5");
+    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
     record_install_operation_interrupted(
             state.journals(),
             &operation_id,
@@ -869,7 +884,9 @@ async fn install_status_exposes_interrupted_install_as_redacted_terminal_state()
                             bytes_done: None,
                 bytes_total: None,
 },
-        );
+        )
+        .await
+        .expect("record install journal");
 
     let response = install_status(&state, install_id)
         .await
@@ -921,14 +938,18 @@ async fn restart_interrupted_install_retry_discards_stale_temp_without_promoting
 
     {
         let state = build_test_state(&root);
-        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5");
+        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
+            .await
+            .expect("record install journal");
         let mut last_phase = None;
         record_install_operation_progress(
             state.journals(),
             &operation_id,
             &progress("client_jar", false, None),
             &mut last_phase,
-        );
+        )
+        .await
+        .expect("record install journal");
         record_install_operation_interrupted(
             state.journals(),
             &operation_id,
@@ -945,7 +966,9 @@ async fn restart_interrupted_install_retry_discards_stale_temp_without_promoting
                             bytes_done: None,
                 bytes_total: None,
 },
-        );
+        )
+        .await
+        .expect("record install journal");
     }
 
     assert!(
@@ -1025,14 +1048,18 @@ async fn install_status_reconstructs_journal_progress_when_snapshot_is_missing()
     let state = build_test_state(&root);
     let install_id = "journal-replay-install";
     let operation_id = install_operation_id(install_id);
-    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5");
+    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &progress("libraries", false, None),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
     record_install_operation_interrupted(
         state.journals(),
         &operation_id,
@@ -1049,7 +1076,9 @@ async fn install_status_reconstructs_journal_progress_when_snapshot_is_missing()
                     bytes_done: None,
             bytes_total: None,
 },
-    );
+    )
+        .await
+        .expect("record install journal");
 
     let response = install_status(&state, install_id)
         .await
@@ -1085,14 +1114,18 @@ async fn install_status_reconstructs_restart_loaded_journal_and_guardian_repair(
     let operation_id = install_operation_id(install_id);
     {
         let state = build_test_state(&root);
-        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5");
+        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
+            .await
+            .expect("record install journal");
         let mut last_phase = None;
         record_install_operation_progress(
             state.journals(),
             &operation_id,
             &observed_install_failure_progress(),
             &mut last_phase,
-        );
+        )
+        .await
+        .expect("record install journal");
         record_install_operation_guardian_repair_outcome(
             state.journals(),
             &operation_id,
@@ -1106,7 +1139,9 @@ async fn install_status_reconstructs_restart_loaded_journal_and_guardian_repair(
                 facts: vec!["https://example.invalid/client.jar?token=secret".to_string()],
                 summary: "guardian_artifact_repair_suppressed".to_string(),
             },
-        );
+        )
+        .await
+        .expect("record install journal");
     }
 
     let reloaded = build_test_state(&root);
@@ -1158,14 +1193,18 @@ async fn install_events_replay_journal_terminal_progress_when_snapshot_is_missin
     let state = build_test_state(&root);
     let install_id = "journal-event-install";
     let operation_id = install_operation_id(install_id);
-    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5");
+    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &progress("done", true, None),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let response = install_events_stream(&state, install_id)
         .await
@@ -1191,14 +1230,18 @@ async fn install_events_replay_restart_loaded_journal_when_snapshot_is_missing()
     let operation_id = install_operation_id(install_id);
     {
         let state = build_test_state(&root);
-        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5");
+        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
+            .await
+            .expect("record install journal");
         let mut last_phase = None;
         record_install_operation_progress(
             state.journals(),
             &operation_id,
             &progress("done", true, None),
             &mut last_phase,
-        );
+        )
+        .await
+        .expect("record install journal");
     }
 
     let reloaded = build_test_state(&root);
@@ -1230,14 +1273,18 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
         .installs()
         .emit(install_id, observed_install_failure_progress())
         .await;
-    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5");
+    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &observed_install_failure_progress(),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
     record_install_operation_guardian_evidence(
         state.journals(),
         &operation_id,
@@ -1255,7 +1302,9 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
                 ),
             ],
         }],
-    );
+    )
+    .await
+    .expect("record install journal");
     record_install_operation_guardian_failure_outcome(
         state.journals(),
         &operation_id,
@@ -1273,7 +1322,9 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
                 ),
             ],
         }],
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let response = install_status(&state, install_id)
         .await
@@ -1340,14 +1391,18 @@ async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
         .installs()
         .emit(install_id, terminal_progress.clone())
         .await;
-    begin_install_operation_journal(state.journals(), &operation_id, "1.11.2");
+    begin_install_operation_journal(state.journals(), &operation_id, "1.11.2")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &terminal_progress,
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
     let facts = [
         ExecutionDownloadFact {
             kind: ExecutionDownloadFactKind::ArtifactMissing,
@@ -1360,7 +1415,9 @@ async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
             fields: Vec::new(),
         },
     ];
-    record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts);
+    record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts)
+        .await
+        .expect("record install journal");
     record_install_operation_guardian_failure_outcome_for_error_with_memory(
         state.journals(),
         &failure_memory,
@@ -1368,7 +1425,9 @@ async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
         &error,
         &facts,
         "2026-07-09T10:00:00+00:00",
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let response = install_status(&state, install_id)
         .await
@@ -1436,14 +1495,18 @@ async fn install_status_exposes_rosetta_required_failure_with_retry() {
         .installs()
         .emit(install_id, terminal_progress.clone())
         .await;
-    begin_install_operation_journal(state.journals(), &operation_id, "1.11.2");
+    begin_install_operation_journal(state.journals(), &operation_id, "1.11.2")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &terminal_progress,
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
     let facts = [
         ExecutionDownloadFact {
             kind: ExecutionDownloadFactKind::ArtifactMissing,
@@ -1456,7 +1519,9 @@ async fn install_status_exposes_rosetta_required_failure_with_retry() {
             fields: Vec::new(),
         },
     ];
-    record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts);
+    record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts)
+        .await
+        .expect("record install journal");
     record_install_operation_guardian_failure_outcome_for_error_with_memory(
         state.journals(),
         &failure_memory,
@@ -1464,7 +1529,9 @@ async fn install_status_exposes_rosetta_required_failure_with_retry() {
         &error,
         &facts,
         "2026-07-09T10:00:00+00:00",
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let response = install_status(&state, install_id)
         .await
@@ -1531,14 +1598,18 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
         .installs()
         .emit(install_id, observed_install_failure_progress())
         .await;
-    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5");
+    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &observed_install_failure_progress(),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
     let facts = [
         ExecutionDownloadFact {
             kind: ExecutionDownloadFactKind::ArtifactMissing,
@@ -1551,7 +1622,9 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
             fields: Vec::new(),
         },
     ];
-    record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts);
+    record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts)
+        .await
+        .expect("record install journal");
     record_install_operation_guardian_failure_outcome_for_error_with_memory(
         state.journals(),
         &failure_memory,
@@ -1559,7 +1632,9 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
         &error,
         &facts,
         "2026-07-09T10:05:00+00:00",
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let response = install_status(&state, install_id)
         .await
@@ -1611,6 +1686,9 @@ async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory
             fields: vec![("status".to_string(), "503".to_string())],
         },
     ];
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("create install journal");
 
     record_install_operation_guardian_failure_outcome_for_error_with_memory(
         &journals,
@@ -1619,7 +1697,9 @@ async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory
         &error,
         &facts,
         "2026-07-09T10:05:00+00:00",
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let entries = failure_memory.list();
     let entry = entries
@@ -1640,7 +1720,9 @@ async fn error_based_install_repair_skips_stale_artifact_facts_for_runtime_failu
     let journals = OperationJournalStore::new();
     let failure_memory = GuardianFailureMemoryStore::new();
     let operation_id = install_operation_id("runtime-stale-artifact-repair");
-    begin_install_operation_journal(&journals, &operation_id, "1.11.2");
+    begin_install_operation_journal(&journals, &operation_id, "1.11.2")
+        .await
+        .expect("record install journal");
     let target_id = "minecraft_client_runtime_stale";
     let facts = vec![download_fact(
         ExecutionDownloadFactKind::ChecksumMismatch,
@@ -1752,14 +1834,18 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
             .installs()
             .emit(install_id, observed_install_failure_progress())
             .await;
-        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5");
+        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
+            .await
+            .expect("record install journal");
         let mut last_phase = None;
         record_install_operation_progress(
             state.journals(),
             &operation_id,
             &observed_install_failure_progress(),
             &mut last_phase,
-        );
+        )
+        .await
+        .expect("record install journal");
         let facts = [ExecutionDownloadFact {
             kind,
             target: r"C:\Users\Alice\.minecraft\libraries\secret.jar".to_string(),
@@ -1779,8 +1865,12 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
                 ("jvm_arg".to_string(), "-Xmx8192M".to_string()),
             ],
         }];
-        record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts);
-        record_install_operation_guardian_failure_outcome(state.journals(), &operation_id, &facts);
+        record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts)
+            .await
+            .expect("record install journal");
+        record_install_operation_guardian_failure_outcome(state.journals(), &operation_id, &facts)
+            .await
+            .expect("record install journal");
 
         let response = install_status(&state, install_id)
             .await
@@ -2380,15 +2470,471 @@ async fn wait_for_active_vanilla_base_install_fails_loader_when_base_fails_while
     );
 }
 
-#[test]
-fn install_journal_records_progress_success_and_redacts_fields() {
+#[tokio::test]
+async fn cancelled_initial_commit_releases_reservation_for_duplicate_retry() {
+    let root = temp_root("cancelled-initial-journal");
+    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let installs = Arc::new(InstallStore::new());
+    let install_id = "cancelled-initial".to_string();
+    let operation_id = install_operation_id(&install_id);
+    assert!(
+        installs
+            .insert_or_existing_active(install_id.clone(), "1.21.5".to_string(), String::new(),)
+            .await
+            .1
+    );
+
+    let gate = backend.gate_attempt(1);
+    let initialization = tokio::spawn(begin_install_journal_with_detached_reconciliation(
+        installs.clone(),
+        journals.clone(),
+        install_id.clone(),
+        operation_id.clone(),
+        "1.21.5".to_string(),
+    ));
+    backend.wait_for_attempt(1).await;
+
+    let duplicate_store = installs.clone();
+    let duplicate_id = install_id.clone();
+    let duplicate = tokio::spawn(async move {
+        let (existing, inserted) = duplicate_store
+            .insert_or_existing_active(
+                "duplicate-waiter".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        assert!(!inserted);
+        assert_eq!(existing, duplicate_id);
+        let status = duplicate_store.wait_for_initialization(&existing).await;
+        assert!(matches!(
+            status,
+            InstallInitializationStatus::Reconciling | InstallInitializationStatus::Removed
+        ));
+        wait_for_install_removal(&duplicate_store, &existing).await;
+        duplicate_store
+            .insert_or_existing_active(
+                "duplicate-retry".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await
+    });
+
+    initialization.abort();
+    let cancellation = match initialization.await {
+        Ok(_) => panic!("initialization caller was not cancelled"),
+        Err(error) => error,
+    };
+    assert!(cancellation.is_cancelled());
+    gate.release();
+    let (retry_id, retry_inserted) = timeout(Duration::from_secs(1), duplicate)
+        .await
+        .expect("duplicate retry must not hang")
+        .expect("duplicate retry task");
+    assert!(retry_inserted);
+    assert_eq!(retry_id, "duplicate-retry");
+    assert_eq!(
+        journals
+            .get(&operation_id)
+            .expect("committed initial journal")
+            .status,
+        OperationStatus::Failed
+    );
+    assert_eq!(
+        journals
+            .get(&operation_id)
+            .expect("cancelled initial journal")
+            .failure_point
+            .as_deref(),
+        Some("install_initialization_cancelled")
+    );
+    installs.remove(&retry_id).await;
+    journals.close().await.expect("close journals");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn cancelled_initialized_result_before_worker_handoff_releases_reservation() {
+    let journals = Arc::new(OperationJournalStore::new());
+    let installs = Arc::new(InstallStore::new());
+    let install_id = "cancelled-handoff".to_string();
+    let operation_id = install_operation_id(&install_id);
+    let assertion_operation_id = operation_id.clone();
+    assert!(
+        installs
+            .insert_or_existing_active(install_id.clone(), "1.21.5".to_string(), String::new(),)
+            .await
+            .1
+    );
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let initialization = tokio::spawn({
+        let installs = installs.clone();
+        let journals = journals.clone();
+        async move {
+            let reservation = begin_install_journal_with_detached_reconciliation(
+                installs,
+                journals,
+                install_id,
+                operation_id,
+                "1.21.5".to_string(),
+            )
+            .await
+            .expect("receive initialized reservation");
+            let _ = received_tx.send(());
+            let _ = release_rx.await;
+            reservation.hand_off();
+        }
+    });
+    received_rx.await.expect("reservation received");
+    initialization.abort();
+    assert!(
+        initialization
+            .await
+            .expect_err("abort handoff")
+            .is_cancelled()
+    );
+
+    let removed = timeout(
+        Duration::from_secs(1),
+        installs.wait_for_initialization("cancelled-handoff"),
+    )
+    .await
+    .expect("reservation cleanup must not hang");
+    assert_eq!(removed, InstallInitializationStatus::Removed);
+    assert_eq!(
+        journals
+            .get(&assertion_operation_id)
+            .expect("cancelled handoff journal")
+            .status,
+        OperationStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn transient_initial_failure_reconciles_then_allows_retry() {
+    let root = temp_root("transient-initial-journal");
+    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let installs = Arc::new(InstallStore::new());
+    let install_id = "transient-initial".to_string();
+    let operation_id = install_operation_id(&install_id);
+    assert!(
+        installs
+            .insert_or_existing_active(install_id.clone(), "1.21.5".to_string(), String::new(),)
+            .await
+            .1
+    );
+    backend.fail_next();
+    let retry_gate = backend.gate_attempt(2);
+
+    assert!(
+        begin_install_journal_with_detached_reconciliation(
+            installs.clone(),
+            journals.clone(),
+            install_id.clone(),
+            operation_id.clone(),
+            "1.21.5".to_string(),
+        )
+        .await
+        .is_err()
+    );
+    backend.wait_for_attempt(2).await;
+    assert_eq!(
+        installs.wait_for_initialization(&install_id).await,
+        InstallInitializationStatus::Reconciling
+    );
+    let (existing, inserted) = installs
+        .insert_or_existing_active(
+            "bounded-duplicate".to_string(),
+            "1.21.5".to_string(),
+            String::new(),
+        )
+        .await;
+    assert!(!inserted);
+    assert_eq!(existing, install_id);
+    assert_eq!(
+        timeout(
+            Duration::from_millis(100),
+            installs.wait_for_initialization(&existing),
+        )
+        .await
+        .expect("reconciling duplicate response must be bounded"),
+        InstallInitializationStatus::Reconciling
+    );
+
+    retry_gate.release();
+    wait_for_install_removal(&installs, &install_id).await;
+    assert_eq!(
+        journals.get(&operation_id).expect("retried journal").status,
+        OperationStatus::Failed
+    );
+    assert!(
+        installs
+            .insert_or_existing_active(
+                "post-reconciliation-retry".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await
+            .1
+    );
+    installs.remove("post-reconciliation-retry").await;
+    journals.close().await.expect("close journals");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn persistent_initial_failure_keeps_live_owner_and_bounds_duplicates() {
+    let root = temp_root("persistent-initial-journal");
+    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let installs = Arc::new(InstallStore::new());
+    let install_id = "persistent-initial".to_string();
+    let operation_id = install_operation_id(&install_id);
+    assert!(
+        installs
+            .insert_or_existing_active(install_id.clone(), "1.21.5".to_string(), String::new(),)
+            .await
+            .1
+    );
+    backend.fail_attempts(64);
+    assert!(
+        begin_install_journal_with_detached_reconciliation(
+            installs.clone(),
+            journals,
+            install_id.clone(),
+            operation_id,
+            "1.21.5".to_string(),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        timeout(
+            Duration::from_millis(100),
+            installs.wait_for_initialization(&install_id),
+        )
+        .await
+        .expect("persistent reconciliation must not block duplicate response"),
+        InstallInitializationStatus::Reconciling
+    );
+    timeout(Duration::from_millis(250), backend.wait_for_attempt(2))
+        .await
+        .expect("detached reconciliation owner must retry");
+}
+
+#[tokio::test]
+async fn install_reconciliation_verifies_transition_after_candidate_is_cleared() {
+    let root = temp_root("competing-journal-reconciliation");
+    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let operation_id = install_operation_id("competing-reconciliation");
+    backend.fail_next();
+    let error = begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect_err("initial journal persistence fails");
+    let expected = operation::planned_install_journal(&operation_id, "1.21.5");
+    journals
+        .retry()
+        .await
+        .expect("another reconciler commits candidate");
+    let reconciliation =
+        reconcile_install_journal_transition(&journals, &operation_id, error, |entry| {
+            operation_journal_plan_is_visible(entry, &expected)
+        })
+        .await
+        .expect("transition reconciler verifies cleared candidate");
+    assert!(matches!(
+        reconciliation,
+        InstallJournalReconciliation::MutationCommitted
+    ));
+    assert_eq!(
+        journals.get(&operation_id).expect("retried journal").status,
+        OperationStatus::Planned
+    );
+    journals.close().await.expect("close journals");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn transient_terminal_failure_retries_and_emits_exactly_once() {
+    let root = temp_root("transient-terminal-journal");
+    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let installs = Arc::new(InstallStore::new());
+    let install_id = "transient-terminal";
+    let operation_id = install_operation_id(install_id);
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("initial journal");
+    installs.insert(install_id.to_string()).await;
+    let (_, mut receiver) = installs
+        .subscribe_records(install_id)
+        .await
+        .expect("install subscription");
+    let attempts_before = backend.attempts.load(Ordering::SeqCst);
+    backend.fail_next();
+    let mut last_phase = None;
+    assert!(
+        record_and_emit_install_progress(
+            &installs,
+            &journals,
+            &operation_id,
+            install_id,
+            progress("error", true, Some("sanitized failure")),
+            &mut last_phase,
+        )
+        .await
+    );
+
+    assert_eq!(backend.attempts.load(Ordering::SeqCst) - attempts_before, 2);
+    assert_eq!(
+        journals
+            .get(&operation_id)
+            .expect("terminal journal")
+            .status,
+        OperationStatus::Failed
+    );
+    let terminal = receiver.recv().await.expect("one terminal event");
+    assert!(terminal.progress.done);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert!(installs.snapshot(install_id).await.expect("snapshot").done);
+    journals.close().await.expect("close journals");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn transient_interruption_failure_retries_before_one_terminal_handoff() {
+    let root = temp_root("transient-interruption-journal");
+    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let installs = Arc::new(InstallStore::new());
+    let install_id = "transient-interruption";
+    let operation_id = install_operation_id(install_id);
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("initial journal");
+    installs.insert(install_id.to_string()).await;
+    let (_, mut receiver) = installs
+        .subscribe_records(install_id)
+        .await
+        .expect("install subscription");
+    let handoffs = Arc::new(AtomicUsize::new(0));
+    let attempts_before = backend.attempts.load(Ordering::SeqCst);
+    backend.fail_next();
+    let interruption_operation_id = operation_id.clone();
+    let worker = InstallStore::spawn_tracked_worker_with_interrupt_handler(
+        installs.clone(),
+        install_id.to_string(),
+        interrupted_install_progress(),
+        async {},
+        {
+            let journals = journals.clone();
+            let handoffs = handoffs.clone();
+            move |progress| async move {
+                record_install_operation_interrupted(
+                    &journals,
+                    &interruption_operation_id,
+                    &progress,
+                )
+                .await
+                .expect("reconcile interrupted journal");
+                handoffs.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        },
+    );
+    timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("interruption reconciliation must finish")
+        .expect("tracked worker");
+
+    assert_eq!(backend.attempts.load(Ordering::SeqCst) - attempts_before, 2);
+    assert_eq!(handoffs.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        journals
+            .get(&operation_id)
+            .expect("terminal journal")
+            .status,
+        OperationStatus::Failed
+    );
+    assert!(
+        receiver
+            .recv()
+            .await
+            .expect("one terminal event")
+            .progress
+            .done
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    journals.close().await.expect("close journals");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn persistent_interruption_failure_keeps_tracked_owner_and_nonterminal_state() {
+    let root = temp_root("persistent-interruption-journal");
+    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let installs = Arc::new(InstallStore::new());
+    let install_id = "persistent-interruption";
+    let operation_id = install_operation_id(install_id);
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("initial journal");
+    installs.insert(install_id.to_string()).await;
+    backend.fail_attempts(64);
+    let worker = InstallStore::spawn_tracked_worker_with_interrupt_handler(
+        installs.clone(),
+        install_id.to_string(),
+        interrupted_install_progress(),
+        async {},
+        {
+            let journals = journals.clone();
+            move |progress| async move {
+                record_install_operation_interrupted(&journals, &operation_id, &progress)
+                    .await
+                    .expect("persistent reconciliation ends only at shutdown");
+                true
+            }
+        },
+    );
+
+    timeout(Duration::from_millis(250), backend.wait_for_attempt(3))
+        .await
+        .expect("tracked interruption owner must keep retrying");
+    assert!(!worker.is_finished());
+    assert!(
+        !installs
+            .snapshot(install_id)
+            .await
+            .expect("active install")
+            .done
+    );
+    assert_eq!(
+        journals
+            .get(&install_operation_id(install_id))
+            .expect("nonterminal journal")
+            .status,
+        OperationStatus::Planned
+    );
+    assert!(journals.has_retry_candidate());
+    drop(worker);
+}
+
+#[tokio::test]
+async fn install_journal_records_progress_success_and_redacts_fields() {
     let journals = OperationJournalStore::new();
     let operation_id = install_operation_id(r"C:\Users\Alice\token-install");
     begin_install_operation_journal(
         &journals,
         &operation_id,
         r"C:\Users\Alice\.minecraft\versions\secret.jar",
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let mut last_phase = None;
     record_install_operation_progress(
@@ -2396,19 +2942,25 @@ fn install_journal_records_progress_success_and_redacts_fields() {
         &operation_id,
         &progress("libraries", false, None),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("libraries", false, None),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("done", true, None),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let entry = journals.get(&operation_id).expect("journal");
     assert_eq!(entry.status, OperationStatus::Succeeded);
@@ -2424,11 +2976,13 @@ fn install_journal_records_progress_success_and_redacts_fields() {
     assert_no_sensitive_fragments(&encoded);
 }
 
-#[test]
-fn install_journal_records_failure_and_interruption() {
+#[tokio::test]
+async fn install_journal_records_failure_and_interruption() {
     let journals = OperationJournalStore::new();
     let failed_operation = install_operation_id("install-failed");
-    begin_install_operation_journal(&journals, &failed_operation, "1.21.5");
+    begin_install_operation_journal(&journals, &failed_operation, "1.21.5")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         &journals,
@@ -2441,19 +2995,25 @@ fn install_journal_records_failure_and_interruption() {
             ),
         ),
         &mut last_phase,
-    );
+    )
+        .await
+        .expect("record install journal");
     let failed = journals.get(&failed_operation).expect("failed journal");
     assert_eq!(failed.status, OperationStatus::Failed);
     assert_eq!(failed.outcome, Some(OperationOutcome::Failed));
     assert_no_sensitive_fragments(&serde_json::to_string(&failed).expect("journal json"));
 
     let interrupted_operation = install_operation_id("install-interrupted");
-    begin_install_operation_journal(&journals, &interrupted_operation, "1.21.5");
+    begin_install_operation_journal(&journals, &interrupted_operation, "1.21.5")
+        .await
+        .expect("record install journal");
     record_install_operation_interrupted(
         &journals,
         &interrupted_operation,
         &progress("error", true, Some("worker interrupted")),
-    );
+    )
+    .await
+    .expect("record install journal");
     let interrupted = journals
         .get(&interrupted_operation)
         .expect("interrupted journal");
@@ -2464,24 +3024,30 @@ fn install_journal_records_failure_and_interruption() {
     );
 }
 
-#[test]
-fn install_journal_ignores_late_non_terminal_progress_after_terminal_state() {
+#[tokio::test]
+async fn install_journal_rejects_late_non_terminal_progress_after_terminal_state() {
     let journals = OperationJournalStore::new();
     let operation_id = install_operation_id("install-terminal-sticky");
-    begin_install_operation_journal(&journals, &operation_id, "1.21.5");
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("sanitized failure")),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record terminal install journal");
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("libraries", false, None),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect_err("terminal install journal must reject late progress");
 
     let entry = journals.get(&operation_id).expect("journal");
 
@@ -2491,18 +3057,22 @@ fn install_journal_ignores_late_non_terminal_progress_after_terminal_state() {
     assert_eq!(entry.completed_steps[0].step_id, "install_progress_error");
 }
 
-#[test]
-fn install_journal_records_guardian_evidence_from_core_download_facts() {
+#[tokio::test]
+async fn install_journal_records_guardian_evidence_from_core_download_facts() {
     let journals = OperationJournalStore::new();
     let operation_id = install_operation_id("install-guardian-evidence");
-    begin_install_operation_journal(&journals, &operation_id, "1.21.5");
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("sanitized failure")),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
 
     record_install_operation_guardian_evidence(
         &journals,
@@ -2525,7 +3095,9 @@ fn install_journal_records_guardian_evidence_from_core_download_facts() {
                 fields: Vec::new(),
             },
         ],
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let entry = journals.get(&operation_id).expect("journal");
     assert_eq!(entry.status, OperationStatus::Failed);
@@ -2548,18 +3120,22 @@ fn install_journal_records_guardian_evidence_from_core_download_facts() {
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
 }
 
-#[test]
-fn install_journal_treats_temp_discard_as_non_terminal_evidence_only() {
+#[tokio::test]
+async fn install_journal_treats_temp_discard_as_non_terminal_evidence_only() {
     let journals = OperationJournalStore::new();
     let operation_id = install_operation_id("install-temp-discard-evidence");
-    begin_install_operation_journal(&journals, &operation_id, "1.21.5");
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("sanitized failure")),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let facts = [ExecutionDownloadFact {
         kind: ExecutionDownloadFactKind::TempDiscarded,
@@ -2569,8 +3145,12 @@ fn install_journal_treats_temp_discard_as_non_terminal_evidence_only() {
             "/Users/alice/.axial/libraries/secret.jar".to_string(),
         )],
     }];
-    record_install_operation_guardian_evidence(&journals, &operation_id, &facts);
-    record_install_operation_guardian_failure_outcome(&journals, &operation_id, &facts);
+    record_install_operation_guardian_evidence(&journals, &operation_id, &facts)
+        .await
+        .expect("record install journal");
+    record_install_operation_guardian_failure_outcome(&journals, &operation_id, &facts)
+        .await
+        .expect("record install journal");
 
     let entry = journals.get(&operation_id).expect("journal");
     assert!(install_guardian_outcome_summary_from_journal(&entry).is_none());
@@ -2585,18 +3165,22 @@ fn install_journal_treats_temp_discard_as_non_terminal_evidence_only() {
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
 }
 
-#[test]
-fn install_journal_records_guardian_download_failure_outcome_without_raw_details() {
+#[tokio::test]
+async fn install_journal_records_guardian_download_failure_outcome_without_raw_details() {
     let journals = OperationJournalStore::new();
     let operation_id = install_operation_id("install-guardian-download-outcome");
-    begin_install_operation_journal(&journals, &operation_id, "1.21.5");
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("sanitized failure")),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let facts = [ExecutionDownloadFact {
         kind: ExecutionDownloadFactKind::NetworkFailure,
@@ -2612,8 +3196,12 @@ fn install_journal_records_guardian_download_failure_outcome_without_raw_details
             ),
         ],
     }];
-    record_install_operation_guardian_evidence(&journals, &operation_id, &facts);
-    record_install_operation_guardian_failure_outcome(&journals, &operation_id, &facts);
+    record_install_operation_guardian_evidence(&journals, &operation_id, &facts)
+        .await
+        .expect("record install journal");
+    record_install_operation_guardian_failure_outcome(&journals, &operation_id, &facts)
+        .await
+        .expect("record install journal");
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
@@ -2634,19 +3222,23 @@ fn install_journal_records_guardian_download_failure_outcome_without_raw_details
     assert_no_sensitive_fragments(&serde_json::to_string(&summary).expect("summary json"));
 }
 
-#[test]
-fn vanilla_provider_failure_records_guardian_retry_then_suppression_without_raw_details() {
+#[tokio::test]
+async fn vanilla_provider_failure_records_guardian_retry_then_suppression_without_raw_details() {
     let journals = OperationJournalStore::new();
     let failure_memory = GuardianFailureMemoryStore::new();
     let operation_id = install_operation_id("vanilla-provider-failure");
-    begin_install_operation_journal(&journals, &operation_id, "1.21.5");
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("sanitized failure")),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
     let facts = [ExecutionDownloadFact {
         kind: ExecutionDownloadFactKind::ProviderFailure,
         target: "minecraft_client_1.21.5".to_string(),
@@ -2659,7 +3251,9 @@ fn vanilla_provider_failure_records_guardian_retry_then_suppression_without_raw_
         &operation_id,
         &facts,
         "2026-06-16T10:00:00+00:00",
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
@@ -2674,21 +3268,27 @@ fn vanilla_provider_failure_records_guardian_retry_then_suppression_without_raw_
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
 
     let suppressed_operation_id = install_operation_id("vanilla-provider-failure-again");
-    begin_install_operation_journal(&journals, &suppressed_operation_id, "1.21.5");
+    begin_install_operation_journal(&journals, &suppressed_operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
     let mut suppressed_last_phase = None;
     record_install_operation_progress(
         &journals,
         &suppressed_operation_id,
         &progress("error", true, Some("sanitized failure")),
         &mut suppressed_last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
     record_install_operation_guardian_failure_outcome_with_memory(
         &journals,
         &failure_memory,
         &suppressed_operation_id,
         &facts,
         "2026-06-16T10:01:00+00:00",
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let suppressed_entry = journals.get(&suppressed_operation_id).expect("journal");
     let suppressed =
@@ -2711,19 +3311,23 @@ fn vanilla_provider_failure_records_guardian_retry_then_suppression_without_raw_
     assert_no_sensitive_fragments(&serde_json::to_string(&suppressed).expect("summary json"));
 }
 
-#[test]
-fn loader_provider_failure_records_guardian_retry_then_suppression_without_raw_details() {
+#[tokio::test]
+async fn loader_provider_failure_records_guardian_retry_then_suppression_without_raw_details() {
     let journals = OperationJournalStore::new();
     let failure_memory = GuardianFailureMemoryStore::new();
     let operation_id = install_operation_id("loader-provider-failure");
-    begin_install_operation_journal(&journals, &operation_id, "fabric-loader");
+    begin_install_operation_journal(&journals, &operation_id, "fabric-loader")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("sanitized failure")),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
     let error = LoaderError::ProviderUnavailable {
         kind: LoaderProviderFailureKind::HttpServer,
         status: Some(503),
@@ -2736,7 +3340,9 @@ fn loader_provider_failure_records_guardian_retry_then_suppression_without_raw_d
         "loader_fabric_build_1_21_5",
         &error,
         "2026-06-16T10:00:00+00:00",
-    );
+    )
+    .await
+    .expect("record loader failure outcome");
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
@@ -2751,14 +3357,18 @@ fn loader_provider_failure_records_guardian_retry_then_suppression_without_raw_d
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
 
     let suppressed_operation_id = install_operation_id("loader-provider-failure-again");
-    begin_install_operation_journal(&journals, &suppressed_operation_id, "fabric-loader");
+    begin_install_operation_journal(&journals, &suppressed_operation_id, "fabric-loader")
+        .await
+        .expect("record install journal");
     let mut suppressed_last_phase = None;
     record_install_operation_progress(
         &journals,
         &suppressed_operation_id,
         &progress("error", true, Some("sanitized failure")),
         &mut suppressed_last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
     record_loader_install_operation_guardian_failure_outcome(
         &journals,
         &failure_memory,
@@ -2766,7 +3376,9 @@ fn loader_provider_failure_records_guardian_retry_then_suppression_without_raw_d
         "loader_fabric_build_1_21_5",
         &error,
         "2026-06-16T10:01:00+00:00",
-    );
+    )
+    .await
+    .expect("record suppressed loader failure outcome");
 
     let suppressed_entry = journals.get(&suppressed_operation_id).expect("journal");
     let suppressed =
@@ -2789,25 +3401,31 @@ fn loader_provider_failure_records_guardian_retry_then_suppression_without_raw_d
     assert_no_sensitive_fragments(&serde_json::to_string(&suppressed).expect("summary json"));
 }
 
-#[test]
-fn loader_base_install_dependency_failure_records_guardian_block_without_raw_details() {
+#[tokio::test]
+async fn loader_base_install_dependency_failure_records_guardian_block_without_raw_details() {
     let journals = OperationJournalStore::new();
     let operation_id = install_operation_id("loader-base-dependency-failure");
-    begin_install_operation_journal(&journals, &operation_id, "fabric-loader");
+    begin_install_operation_journal(&journals, &operation_id, "fabric-loader")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         &journals,
         &operation_id,
         &base_install_failed_progress(),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
 
     record_loader_base_install_dependency_guardian_failure_outcome(
         &journals,
         &operation_id,
         "loader_fabric_build_1_21_5",
         "1.21.5",
-    );
+    )
+    .await
+    .expect("record loader dependency failure outcome");
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
@@ -2836,18 +3454,22 @@ fn loader_base_install_dependency_failure_records_guardian_block_without_raw_det
     assert_no_sensitive_fragments(&serde_json::to_string(&summary).expect("summary json"));
 }
 
-#[test]
-fn install_journal_records_guardian_repair_summary_without_raw_details() {
+#[tokio::test]
+async fn install_journal_records_guardian_repair_summary_without_raw_details() {
     let journals = OperationJournalStore::new();
     let operation_id = install_operation_id("install-guardian-repair-summary");
-    begin_install_operation_journal(&journals, &operation_id, "1.21.5");
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
     let mut last_phase = None;
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("sanitized failure")),
         &mut last_phase,
-    );
+    )
+    .await
+    .expect("record install journal");
 
     record_install_operation_guardian_repair_outcome(
         &journals,
@@ -2862,7 +3484,9 @@ fn install_journal_records_guardian_repair_summary_without_raw_details() {
             facts: vec!["https://example.invalid/artifact.jar?token=secret".to_string()],
             summary: "guardian_artifact_repair_suppressed".to_string(),
         },
-    );
+    )
+    .await
+    .expect("record install journal");
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_repair_summary_from_journal(&entry).expect("repair summary");
@@ -2913,6 +3537,7 @@ async fn install_guardian_repair_repairs_matching_checksum_failure() {
         "2026-06-15T10:00:00+00:00",
     )
     .await
+    .expect("repair journal")
     .expect("repair outcome");
 
     assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
@@ -3038,6 +3663,7 @@ async fn install_guardian_repair_restores_missing_matching_artifact() {
         "2026-06-15T10:00:00+00:00",
     )
     .await
+    .expect("repair journal")
     .expect("repair outcome");
 
     assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
@@ -3090,6 +3716,7 @@ async fn install_guardian_missing_artifact_repair_blocks_if_target_now_exists() 
         "2026-06-15T10:00:00+00:00",
     )
     .await
+    .expect("repair journal")
     .expect("blocked repair outcome");
 
     assert_eq!(outcome.status, GuardianArtifactRepairStatus::Blocked);
@@ -3146,7 +3773,8 @@ async fn install_guardian_repair_skips_artifact_missing_when_provider_failure_ma
         &descriptors,
         "2026-06-15T10:00:00+00:00",
     )
-    .await;
+    .await
+    .expect("repair journal");
 
     assert!(outcome.is_none());
     assert!(!destination.exists());
@@ -3193,7 +3821,8 @@ async fn install_guardian_repair_skips_artifact_missing_when_later_terminal_fail
         &descriptors,
         "2026-06-15T10:00:00+00:00",
     )
-    .await;
+    .await
+    .expect("repair journal");
 
     assert!(outcome.is_none());
     assert!(!destination.exists());
@@ -3231,7 +3860,8 @@ async fn install_guardian_repair_ignores_unrepairable_or_unmatched_facts() {
         &descriptors,
         "2026-06-15T10:00:00+00:00",
     )
-    .await;
+    .await
+    .expect("repair journal");
     let unmatched_outcome = repair_install_artifact_corruption_with_guardian(
         &journals,
         &failure_memory,
@@ -3244,7 +3874,8 @@ async fn install_guardian_repair_ignores_unrepairable_or_unmatched_facts() {
         &descriptors,
         "2026-06-15T10:00:00+00:00",
     )
-    .await;
+    .await
+    .expect("repair journal");
 
     assert!(network_outcome.is_none());
     assert!(unmatched_outcome.is_none());
@@ -3304,6 +3935,149 @@ fn build_test_state(root: &Path) -> AppState {
         startup_warnings: Vec::new(),
         frontend_dir: root.join("frontend"),
     })
+}
+
+struct InstallJournalBackend {
+    attempts: AtomicUsize,
+    failures: AtomicUsize,
+    started: Notify,
+    gate: Mutex<Option<(usize, Arc<InstallJournalWriteGate>)>>,
+}
+
+struct InstallJournalWriteGate {
+    released: Mutex<bool>,
+    changed: Condvar,
+}
+
+struct InstallJournalWriteGateHandle(Arc<InstallJournalWriteGate>);
+
+impl InstallJournalBackend {
+    fn new() -> Self {
+        Self {
+            attempts: AtomicUsize::new(0),
+            failures: AtomicUsize::new(0),
+            started: Notify::new(),
+            gate: Mutex::new(None),
+        }
+    }
+
+    fn fail_next(&self) {
+        self.fail_attempts(1);
+    }
+
+    fn fail_attempts(&self, attempts: usize) {
+        self.failures.fetch_add(attempts, Ordering::SeqCst);
+    }
+
+    fn gate_attempt(&self, attempt: usize) -> InstallJournalWriteGateHandle {
+        let gate = Arc::new(InstallJournalWriteGate {
+            released: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        *self.gate.lock().expect("journal gate lock") = Some((attempt, gate.clone()));
+        InstallJournalWriteGateHandle(gate)
+    }
+
+    async fn wait_for_attempt(&self, expected: usize) {
+        loop {
+            let started = self.started.notified();
+            if self.attempts.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            started.await;
+        }
+    }
+}
+
+impl InstallJournalWriteGate {
+    fn release(&self) {
+        *self.released.lock().expect("journal write gate lock") = true;
+        self.changed.notify_all();
+    }
+
+    fn wait(&self) {
+        let mut released = self.released.lock().expect("journal write gate lock");
+        while !*released {
+            released = self.changed.wait(released).expect("journal gate wait");
+        }
+    }
+}
+
+impl InstallJournalWriteGateHandle {
+    fn release(&self) {
+        self.0.release();
+    }
+}
+
+impl Drop for InstallJournalWriteGateHandle {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+impl AtomicWriteBackend for InstallJournalBackend {
+    fn write(
+        &self,
+        target: &TargetDescriptor,
+        destination: &Path,
+        contents: &[u8],
+    ) -> io::Result<()> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        self.started.notify_one();
+        let gate = {
+            let mut gate = self.gate.lock().expect("journal gate lock");
+            if gate
+                .as_ref()
+                .is_some_and(|(gated_attempt, _)| *gated_attempt == attempt)
+            {
+                gate.take().map(|(_, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.wait();
+        }
+        if self
+            .failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |failures| {
+                (failures > 0).then(|| failures - 1)
+            })
+            .is_ok()
+        {
+            return Err(io::Error::other("injected install journal failure"));
+        }
+        write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
+            .map(|_| ())
+            .map_err(io::Error::from)
+    }
+}
+
+fn install_journal_persistence_fixture(
+    root: &Path,
+) -> (Arc<InstallJournalBackend>, Arc<OperationJournalStore>) {
+    let backend = Arc::new(InstallJournalBackend::new());
+    let coordinator = PersistenceCoordinator::for_test(
+        backend.clone(),
+        Duration::from_millis(5),
+        Duration::from_millis(20),
+    );
+    let journals = OperationJournalStore::try_load_from_paths_with_coordinator(
+        &test_app_paths(root),
+        coordinator,
+    )
+    .expect("load journal persistence fixture");
+    (backend, Arc::new(journals))
+}
+
+async fn wait_for_install_removal(installs: &InstallStore, install_id: &str) {
+    timeout(Duration::from_secs(1), async {
+        while installs.snapshot(install_id).await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("install reservation removal");
 }
 
 fn configure_library_dir(state: &AppState, library_dir: &Path) {

@@ -212,7 +212,8 @@ mod tests {
                 &operation.id,
                 "provider_payload={\"url\":\"https://cdn.example.test/private/sodium-secret.jar?token=secret-token\"}; java_path=C:\\Users\\Alice\\Java\\bin\\java.exe; -Xmx8192M",
             )
-            .await;
+            .await
+            .expect("failure accepted");
 
         let (status, payload) = fixture
             .request_json(

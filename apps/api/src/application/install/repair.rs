@@ -1,5 +1,8 @@
-use super::InstallGuardianRepairSummary;
 use super::operation::latest_generated_fact_value;
+use super::{
+    InstallGuardianRepairSummary, InstallJournalReconciliation,
+    reconcile_install_journal_transition,
+};
 use crate::guardian::{
     GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest, GuardianArtifactRepairStatus,
     GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactRepairPlanKind,
@@ -9,8 +12,11 @@ use crate::guardian::{
     plan_install_artifact_failure_repair,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
-use crate::state::contracts::{OperationId, OperationJournalEntry, OperationPhase, OwnershipClass};
-use crate::state::{GuardianFailureMemoryStore, OperationJournalStore};
+use crate::state::contracts::{
+    CommandKind, OperationId, OperationJournalEntry, OperationPhase, OwnershipClass,
+    StabilizationSystem,
+};
+use crate::state::{GuardianFailureMemoryStore, OperationJournalStore, OperationJournalStoreError};
 use axial_minecraft::download::{
     ExecutionDownloadFact, ExecutionDownloadFactKind, SelectedDownloadArtifactDescriptor,
 };
@@ -21,11 +27,11 @@ const REPAIR_OPERATION_FACT_PREFIX: &str = "guardian_repair_operation:";
 const REPAIR_STATUS_FACT_PREFIX: &str = "guardian_repair_status:";
 const REPAIR_SUMMARY_FACT_PREFIX: &str = "guardian_repair_summary:";
 
-pub fn record_install_operation_guardian_repair_outcome(
+pub async fn record_install_operation_guardian_repair_outcome(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
     outcome: &GuardianArtifactRepairOutcome,
-) {
+) -> Result<(), OperationJournalStoreError> {
     let repair_operation_id = sanitize_evidence_token(
         outcome.operation_id.as_str(),
         RedactionAudience::UserVisible,
@@ -41,18 +47,44 @@ pub fn record_install_operation_guardian_repair_outcome(
     let summary = sanitize_evidence_token(&outcome.summary, RedactionAudience::UserVisible, 96)
         .unwrap_or_else(|| "guardian_artifact_repair".to_string());
 
-    journals.record_guardian_evidence(
-        operation_id,
-        vec![
-            format!("{REPAIR_OPERATION_FACT_PREFIX}{repair_operation_id}"),
-            format!(
-                "{REPAIR_STATUS_FACT_PREFIX}{}",
-                guardian_artifact_repair_status_id(outcome.status)
-            ),
-            format!("{REPAIR_SUMMARY_FACT_PREFIX}{summary}"),
-        ],
-        vec![diagnosis_id],
-    );
+    let facts = vec![
+        format!("{REPAIR_OPERATION_FACT_PREFIX}{repair_operation_id}"),
+        format!(
+            "{REPAIR_STATUS_FACT_PREFIX}{}",
+            guardian_artifact_repair_status_id(outcome.status)
+        ),
+        format!("{REPAIR_SUMMARY_FACT_PREFIX}{summary}"),
+    ];
+    loop {
+        match journals
+            .record_guardian_evidence(operation_id, facts.clone(), vec![diagnosis_id.clone()])
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let reconciliation =
+                    reconcile_install_journal_transition(journals, operation_id, error, |entry| {
+                        entry.operation_id == *operation_id
+                            && entry.command == CommandKind::InstallVersion
+                            && entry.owner == StabilizationSystem::Application
+                            && entry.ownership == OwnershipClass::LauncherManaged
+                            && entry.completed_steps.last().is_some_and(|step| {
+                                facts.iter().all(|fact| {
+                                    step.generated_facts.iter().any(|existing| existing == fact)
+                                })
+                            })
+                            && entry.guardian_diagnosis_ids.contains(&diagnosis_id)
+                    })
+                    .await?;
+                if matches!(
+                    reconciliation,
+                    InstallJournalReconciliation::MutationCommitted
+                ) {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 pub fn install_guardian_repair_summary_from_journal(
@@ -86,8 +118,10 @@ pub async fn repair_install_artifact_corruption_with_guardian(
     facts: &[ExecutionDownloadFact],
     descriptors: &[SelectedDownloadArtifactDescriptor],
     observed_at: &str,
-) -> Option<GuardianArtifactRepairOutcome> {
-    let repair = first_repairable_install_artifact(facts, descriptors, operation_id)?;
+) -> Result<Option<GuardianArtifactRepairOutcome>, OperationJournalStoreError> {
+    let Some(repair) = first_repairable_install_artifact(facts, descriptors, operation_id) else {
+        return Ok(None);
+    };
     let destination_missing = repair
         .descriptor
         .destination()
@@ -101,14 +135,15 @@ pub async fn repair_install_artifact_corruption_with_guardian(
     } else {
         GuardianInstallArtifactRepairPlanKind::ExistingArtifact
     };
-    let plan = plan_install_artifact_failure_repair(
+    let Ok(plan) = plan_install_artifact_failure_repair(
         Some(operation_id.clone()),
         GuardianMode::Managed,
         OperationPhase::Downloading,
         std::slice::from_ref(&repair.evidence),
         plan_kind,
-    )
-    .ok()?;
+    ) else {
+        return Ok(None);
+    };
 
     let request = GuardianArtifactRepairRequest {
         operation_id: None,
@@ -123,9 +158,11 @@ pub async fn repair_install_artifact_corruption_with_guardian(
     };
 
     if destination_missing {
-        Some(execute_guardian_missing_artifact_repair(request).await)
+        execute_guardian_missing_artifact_repair(request)
+            .await
+            .map(Some)
     } else {
-        Some(execute_guardian_artifact_repair(request).await)
+        execute_guardian_artifact_repair(request).await.map(Some)
     }
 }
 

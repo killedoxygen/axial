@@ -5,7 +5,9 @@
 
 use super::contracts::{OwnershipClass, TargetDescriptor, sanitize_target_id};
 use super::ownership::{CurrentArtifact, classify_current_artifact};
-use crate::execution::file::{FileWriteRequest, write_file_atomically};
+use crate::execution::persistence::{
+    AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease, WriteUrgency,
+};
 use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
 use axial_config::AppPaths;
 use chrono::{DateTime, FixedOffset};
@@ -20,6 +22,8 @@ use tracing::warn;
 pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v1";
 pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = 64;
 const FAILURE_MEMORY_FILE: &str = "failure-memory.json";
+const FAILURE_MEMORY_LOCK_INVARIANT: &str =
+    "Guardian failure-memory records lock poisoned; in-memory and persisted state may diverge";
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct FailureMemoryKey(pub String);
@@ -396,10 +400,62 @@ pub enum FailureMemoryValidationError {
     InvalidDecisionTimestamp,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum FailureMemoryStoreError {
+    #[error("invalid Guardian failure-memory entry: {0:?}")]
+    Validation(FailureMemoryValidationError),
+    #[error("invalid Guardian failure-memory snapshot: {0:?}")]
+    Snapshot(FailureMemoryLoadError),
+    #[error("Guardian failure-memory persistence failed: {0}")]
+    Persistence(#[source] io::Error),
+}
+
+impl FailureMemoryStoreError {
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::Validation(_) => "validation",
+            Self::Snapshot(_) => "snapshot",
+            Self::Persistence(_) => "persistence",
+        }
+    }
+}
+
+impl From<FailureMemoryValidationError> for FailureMemoryStoreError {
+    fn from(error: FailureMemoryValidationError) -> Self {
+        Self::Validation(error)
+    }
+}
+
+impl From<FailureMemoryLoadError> for FailureMemoryStoreError {
+    fn from(error: FailureMemoryLoadError) -> Self {
+        Self::Snapshot(error)
+    }
+}
+
+struct FailureMemoryPersistence {
+    owner: PersistenceOwnerLease,
+    writer: AtomicSnapshotWriter,
+}
+
+impl FailureMemoryPersistence {
+    fn claim(
+        storage_path: &Path,
+        coordinator: PersistenceCoordinator,
+    ) -> Result<Self, FailureMemoryStoreError> {
+        let owner = coordinator
+            .claim_owner(storage_path)
+            .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
+        let writer = owner
+            .writer(storage_path, failure_memory_target())
+            .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
+        Ok(Self { owner, writer })
+    }
+}
+
 pub struct GuardianFailureMemoryStore {
     records: RwLock<BTreeMap<String, GuardianFailureMemoryEntry>>,
     max_entries: usize,
-    storage_path: Option<PathBuf>,
+    persistence: Option<FailureMemoryPersistence>,
 }
 
 impl GuardianFailureMemoryStore {
@@ -410,16 +466,29 @@ impl GuardianFailureMemoryStore {
     pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
             records: RwLock::new(BTreeMap::new()),
-            max_entries: max_entries.max(1),
-            storage_path: None,
+            max_entries: max_entries.clamp(1, DEFAULT_FAILURE_MEMORY_LIMIT),
+            persistence: None,
         }
     }
 
     pub fn load_from_paths(paths: &AppPaths) -> Self {
+        Self::try_load_from_paths(paths).unwrap_or_else(|error| {
+            panic!("failed to initialize Guardian failure-memory persistence: {error}")
+        })
+    }
+
+    pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, FailureMemoryStoreError> {
+        Self::try_load_from_paths_with_coordinator(paths, PersistenceCoordinator::global())
+    }
+
+    fn try_load_from_paths_with_coordinator(
+        paths: &AppPaths,
+        coordinator: PersistenceCoordinator,
+    ) -> Result<Self, FailureMemoryStoreError> {
         let storage_path = failure_memory_path(paths);
-        let store = Self::with_max_entries_and_storage(
+        let store = Self::with_max_entries_and_persistence(
             DEFAULT_FAILURE_MEMORY_LIMIT,
-            Some(storage_path.clone()),
+            Some(FailureMemoryPersistence::claim(&storage_path, coordinator)?),
         );
 
         match fs::read_to_string(&storage_path) {
@@ -448,57 +517,56 @@ impl GuardianFailureMemoryStore {
             }
         }
 
-        store
+        Ok(store)
     }
 
-    fn with_max_entries_and_storage(max_entries: usize, storage_path: Option<PathBuf>) -> Self {
+    fn with_max_entries_and_persistence(
+        max_entries: usize,
+        persistence: Option<FailureMemoryPersistence>,
+    ) -> Self {
         Self {
             records: RwLock::new(BTreeMap::new()),
-            max_entries: max_entries.max(1),
-            storage_path,
+            max_entries: max_entries.clamp(1, DEFAULT_FAILURE_MEMORY_LIMIT),
+            persistence,
         }
     }
 
-    pub fn record(
-        &self,
-        entry: GuardianFailureMemoryEntry,
-    ) -> Result<(), FailureMemoryValidationError> {
+    /// Accepts the updated snapshot for persistence before publishing it in memory.
+    ///
+    /// Success means the revision is owned by the persistence coordinator. Call
+    /// [`Self::flush`] when the physical write must be observed before continuing.
+    pub fn record(&self, entry: GuardianFailureMemoryEntry) -> Result<(), FailureMemoryStoreError> {
+        let mut records = self.records.write().expect(FAILURE_MEMORY_LOCK_INVARIANT);
         entry.validate()?;
-        if let Ok(mut records) = self.records.write() {
-            let key = entry.key.as_str().to_string();
-            if let Some(existing) = records.get_mut(&key) {
-                let first_observed_at = existing.first_observed_at.clone();
-                let occurrence_count = existing
-                    .occurrence_count
-                    .saturating_add(entry.occurrence_count.max(1));
-                let repair_attempt_count = existing
-                    .repair_attempt_count
-                    .saturating_add(entry.repair_attempt_count);
-                *existing = entry;
-                existing.first_observed_at = first_observed_at;
-                existing.occurrence_count = occurrence_count;
-                existing.repair_attempt_count = repair_attempt_count;
-            } else {
-                records.insert(key, entry);
-            }
-            prune_records(&mut records, self.max_entries);
+        let mut candidate = records.clone();
+        apply_record(&mut candidate, entry);
+        prune_records(&mut candidate, self.max_entries);
+        let snapshot = FailureMemorySnapshot::new(candidate.values().cloned().collect())?;
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .writer
+                .accept(snapshot, WriteUrgency::Debounced, encode_snapshot)
+                .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
         }
-        self.persist_snapshot();
+        *records = candidate;
         Ok(())
     }
 
     pub fn get(&self, key: &FailureMemoryKey) -> Option<GuardianFailureMemoryEntry> {
         self.records
             .read()
-            .ok()
-            .and_then(|records| records.get(key.as_str()).cloned())
+            .expect(FAILURE_MEMORY_LOCK_INVARIANT)
+            .get(key.as_str())
+            .cloned()
     }
 
     pub fn list(&self) -> Vec<GuardianFailureMemoryEntry> {
         self.records
             .read()
-            .map(|records| records.values().cloned().collect())
-            .unwrap_or_default()
+            .expect(FAILURE_MEMORY_LOCK_INVARIANT)
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn snapshot(&self) -> Result<FailureMemorySnapshot, FailureMemoryLoadError> {
@@ -510,36 +578,48 @@ impl GuardianFailureMemoryStore {
         snapshot: FailureMemorySnapshot,
     ) -> Result<(), FailureMemoryLoadError> {
         snapshot.validate()?;
-        if let Ok(mut records) = self.records.write() {
-            records.clear();
-            for entry in snapshot.entries {
-                records.insert(entry.key.as_str().to_string(), entry);
-            }
-            prune_records(&mut records, self.max_entries);
+        let mut records = self.records.write().expect(FAILURE_MEMORY_LOCK_INVARIANT);
+        records.clear();
+        for entry in snapshot.entries {
+            records.insert(entry.key.as_str().to_string(), entry);
+        }
+        prune_records(&mut records, self.max_entries);
+        Ok(())
+    }
+
+    pub async fn flush(&self) -> Result<(), FailureMemoryStoreError> {
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .writer
+                .flush()
+                .await
+                .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
         }
         Ok(())
     }
 
-    fn persist_snapshot(&self) {
-        let Some(storage_path) = self.storage_path.as_deref() else {
-            return;
-        };
-        let snapshot = match self.snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                warn!(
-                    error = ?error,
-                    "failed to build Guardian failure memory snapshot"
-                );
-                return;
-            }
-        };
-        if let Err(error) = persist_snapshot_to_path(storage_path, &snapshot) {
-            warn!(
-                error = %error,
-                "failed to persist Guardian failure memory snapshot"
-            );
+    pub async fn retry(&self) -> Result<(), FailureMemoryStoreError> {
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .writer
+                .retry()
+                .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?
+                .persisted()
+                .await
+                .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
         }
+        Ok(())
+    }
+
+    pub async fn close(&self) -> Result<(), FailureMemoryStoreError> {
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .owner
+                .close()
+                .await
+                .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
+        }
+        Ok(())
     }
 }
 
@@ -572,6 +652,28 @@ fn prune_records(records: &mut BTreeMap<String, GuardianFailureMemoryEntry>, max
     }
 }
 
+fn apply_record(
+    records: &mut BTreeMap<String, GuardianFailureMemoryEntry>,
+    entry: GuardianFailureMemoryEntry,
+) {
+    let key = entry.key.as_str().to_string();
+    if let Some(existing) = records.get_mut(&key) {
+        let first_observed_at = existing.first_observed_at.clone();
+        let occurrence_count = existing
+            .occurrence_count
+            .saturating_add(entry.occurrence_count.max(1));
+        let repair_attempt_count = existing
+            .repair_attempt_count
+            .saturating_add(entry.repair_attempt_count);
+        *existing = entry;
+        existing.first_observed_at = first_observed_at;
+        existing.occurrence_count = occurrence_count;
+        existing.repair_attempt_count = repair_attempt_count;
+    } else {
+        records.insert(key, entry);
+    }
+}
+
 fn safe_optional_fragment(value: &str, fallback: &str) -> Option<String> {
     let value = sanitize_target_id(value, fallback);
     (!value.is_empty() && value != fallback).then_some(value)
@@ -597,30 +699,30 @@ pub fn failure_memory_path(paths: &AppPaths) -> PathBuf {
     paths.config_dir.join("guardian").join(FAILURE_MEMORY_FILE)
 }
 
-fn persist_snapshot_to_path(path: &Path, snapshot: &FailureMemorySnapshot) -> io::Result<()> {
-    let data = snapshot
+fn failure_memory_target() -> TargetDescriptor {
+    classify_current_artifact(
+        CurrentArtifact::GuardianFailureMemorySnapshot,
+        "guardian_failure_memory",
+    )
+    .target
+}
+
+fn encode_snapshot(snapshot: FailureMemorySnapshot) -> io::Result<Vec<u8>> {
+    snapshot
         .to_json()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    write_file_atomically(FileWriteRequest::new(
-        classify_current_artifact(
-            CurrentArtifact::GuardianFailureMemorySnapshot,
-            "guardian_failure_memory",
-        )
-        .target,
-        path,
-        data.as_bytes(),
-    ))
-    .map(|_| ())
-    .map_err(io::Error::from)
+        .map(String::into_bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         FailureMemoryActionOutcome, FailureMemorySafeFallback, FailureMemorySafeFallbackKind,
-        FailureMemorySnapshot, FailureMemoryUserDecision, FailureMemoryUserDecisionKind,
-        GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
+        FailureMemorySnapshot, FailureMemoryStoreError, FailureMemoryUserDecision,
+        FailureMemoryUserDecisionKind, GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
     };
+    use crate::execution::file::{FileWriteRequest, write_file_atomically};
+    use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
     use crate::state::contracts::{
         OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
@@ -628,7 +730,77 @@ mod tests {
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
     use axial_config::AppPaths;
     use std::fs;
+    use std::io;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    struct CountingFileBackend {
+        attempts: AtomicUsize,
+        failures: AtomicUsize,
+    }
+
+    impl CountingFileBackend {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                failures: AtomicUsize::new(0),
+            }
+        }
+
+        fn fail_next(&self) {
+            self.failures.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl AtomicWriteBackend for CountingFileBackend {
+        fn write(
+            &self,
+            target: &TargetDescriptor,
+            destination: &Path,
+            contents: &[u8],
+        ) -> io::Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self
+                .failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |failures| {
+                    (failures > 0).then(|| failures - 1)
+                })
+                .is_ok()
+            {
+                return Err(io::Error::other("injected failure-memory write failure"));
+            }
+            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
+                .map(|_| ())
+                .map_err(io::Error::from)
+        }
+    }
+
+    fn persistence_fixture(
+        name: &str,
+    ) -> (
+        PathBuf,
+        AppPaths,
+        Arc<CountingFileBackend>,
+        PersistenceCoordinator,
+        GuardianFailureMemoryStore,
+    ) {
+        let root = test_root(name);
+        let paths = test_paths(&root);
+        let backend = Arc::new(CountingFileBackend::new());
+        let coordinator = PersistenceCoordinator::for_test(
+            backend.clone(),
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        );
+        let store = GuardianFailureMemoryStore::try_load_from_paths_with_coordinator(
+            &paths,
+            coordinator.clone(),
+        )
+        .expect("claim failure-memory persistence");
+        (root, paths, backend, coordinator, store)
+    }
 
     #[test]
     fn failure_memory_entry_round_trips_strict_shape() {
@@ -904,8 +1076,144 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failure_memory_store_persists_snapshot_for_restart_reasoning() {
+    #[tokio::test]
+    async fn failure_memory_burst_coalesces_and_reloads_the_latest_cumulative_snapshot() {
+        let (root, paths, backend, _coordinator, store) =
+            persistence_fixture("burst-latest-reload");
+        let key = retry_entry("2026-06-15T10:00:00Z").key;
+
+        for _ in 0..100 {
+            store
+                .record(retry_entry("2026-06-15T10:00:00Z"))
+                .expect("record burst memory");
+        }
+        store.flush().await.expect("flush burst memory");
+
+        assert!(backend.attempts.load(Ordering::SeqCst) < 10);
+        let encoded = fs::read_to_string(super::failure_memory_path(&paths))
+            .expect("read latest failure-memory snapshot");
+        let snapshot = FailureMemorySnapshot::from_json(&encoded).expect("reload latest snapshot");
+        let reloaded = GuardianFailureMemoryStore::new();
+        reloaded
+            .load_snapshot(snapshot)
+            .expect("apply reloaded snapshot");
+        assert_eq!(
+            reloaded
+                .get(&key)
+                .expect("reloaded cumulative memory")
+                .occurrence_count,
+            100
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn failure_memory_physical_failure_flushes_as_error_and_retries_latest_snapshot() {
+        let (root, paths, backend, _coordinator, store) =
+            persistence_fixture("physical-failure-retry");
+        backend.fail_next();
+        let key = retry_entry("2026-06-15T10:00:00Z").key;
+        store
+            .record(retry_entry("2026-06-15T10:00:00Z"))
+            .expect("record first memory");
+        store
+            .record(retry_entry("2026-06-15T10:01:00Z"))
+            .expect("record latest memory");
+
+        assert!(matches!(
+            store.flush().await,
+            Err(FailureMemoryStoreError::Persistence(_))
+        ));
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+        store.retry().await.expect("retry latest snapshot");
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
+
+        let encoded = fs::read_to_string(super::failure_memory_path(&paths))
+            .expect("read retried failure-memory snapshot");
+        let snapshot = FailureMemorySnapshot::from_json(&encoded).expect("decode retried snapshot");
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].key, key);
+        assert_eq!(snapshot.entries[0].occurrence_count, 2);
+        assert_eq!(snapshot.entries[0].last_observed_at, "2026-06-15T10:01:00Z");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn failure_memory_snapshot_path_has_one_exclusive_owner() {
+        let (root, paths, _backend, coordinator, first) = persistence_fixture("duplicate-owner");
+        let second =
+            GuardianFailureMemoryStore::try_load_from_paths_with_coordinator(&paths, coordinator);
+
+        match second {
+            Err(FailureMemoryStoreError::Persistence(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            }
+            Err(error) => panic!("unexpected duplicate-owner error: {error}"),
+            Ok(_) => panic!("duplicate failure-memory owner was accepted"),
+        }
+
+        first.close().await.expect("close first owner");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn successful_close_rejects_record_without_publishing_to_live_memory() {
+        let (root, _paths, backend, _coordinator, store) = persistence_fixture("closed-acceptance");
+        let entry = retry_entry("2026-06-15T10:00:00Z");
+        let key = entry.key.clone();
+        store.close().await.expect("close empty persistence");
+
+        assert!(matches!(
+            store.record(entry),
+            Err(FailureMemoryStoreError::Persistence(_))
+        ));
+        assert!(store.get(&key).is_none());
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn poisoned_failure_memory_lock_panics_on_every_access_before_accepting_a_write() {
+        let (root, _paths, backend, _coordinator, store) = persistence_fixture("poisoned-lock");
+        let entry = retry_entry("2026-06-15T10:00:00Z");
+        let key = entry.key.clone();
+        let snapshot = FailureMemorySnapshot::new(vec![entry.clone()]).expect("valid snapshot");
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _records = store.records.write().expect("acquire records lock");
+            panic!("inject failure-memory lock poison");
+        }));
+        assert!(poison.is_err());
+
+        assert_lock_invariant_panic(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = store.record(entry);
+            }))
+            .expect_err("poisoned record must panic"),
+        );
+        assert_lock_invariant_panic(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.get(&key)))
+                .expect_err("poisoned get must panic"),
+        );
+        assert_lock_invariant_panic(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.list()))
+                .expect_err("poisoned list must panic"),
+        );
+        assert_lock_invariant_panic(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = store.load_snapshot(snapshot);
+            }))
+            .expect_err("poisoned load must panic"),
+        );
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn failure_memory_store_persists_snapshot_for_restart_reasoning() {
         let root = test_root("persisted-snapshot");
         let paths = test_paths(&root);
         let store = GuardianFailureMemoryStore::load_from_paths(&paths);
@@ -914,10 +1222,18 @@ mod tests {
         let key = entry.key.clone();
 
         store.record(entry).expect("record memory");
+        store.flush().await.expect("flush failure memory");
         let path = super::failure_memory_path(&paths);
         assert!(path.is_file());
 
-        let reloaded = GuardianFailureMemoryStore::load_from_paths(&paths);
+        store.close().await.expect("close failure memory");
+        drop(store);
+        let encoded = fs::read_to_string(&path).expect("read persisted failure memory");
+        let snapshot = FailureMemorySnapshot::from_json(&encoded).expect("decode persisted memory");
+        let reloaded = GuardianFailureMemoryStore::new();
+        reloaded
+            .load_snapshot(snapshot)
+            .expect("reload persisted memory");
         let persisted = reloaded.get(&key).expect("persisted memory");
         assert_eq!(
             persisted.suppression_until.as_deref(),
@@ -930,6 +1246,20 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(message) = panic.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = panic.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "non-string panic".to_string()
+        }
+    }
+
+    fn assert_lock_invariant_panic(panic: Box<dyn std::any::Any + Send>) {
+        assert!(panic_message(panic).contains(super::FAILURE_MEMORY_LOCK_INVARIANT));
     }
 
     fn retry_entry(observed_at: &str) -> GuardianFailureMemoryEntry {

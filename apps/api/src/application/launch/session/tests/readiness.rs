@@ -354,7 +354,8 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
         None,
         None,
     )
-    .await;
+    .await
+    .expect("persist managed-runtime repair journal");
 
     assert!(runtime_root.join(".axial-ready").is_file());
     assert_eq!(
@@ -428,7 +429,8 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
         None,
         None,
     )
-    .await;
+    .await
+    .expect("persist managed-runtime repair journal");
 
     assert!(runtime_root.join(".axial-ready").is_file());
     assert_eq!(
@@ -642,7 +644,8 @@ async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
         None,
         None,
     )
-    .await;
+    .await
+    .expect("persist managed-runtime repair journal");
     assert_eq!(
         repaired.guardian_summary.decision,
         GuardianDecision::Intervened

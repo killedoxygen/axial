@@ -2,7 +2,8 @@ use super::{
     BASE_INSTALL_FAILED_MESSAGE, INSTALL_REPAIR_RESUME_MAX_DEPTH, InstallApplicationError,
     InstallProgressCoalescer, InstallProgressViewModel, InstallStartResponse,
     LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
-    begin_install_operation_journal, emit_install_failed, generate_install_id,
+    begin_install_journal_with_detached_reconciliation, emit_install_failed,
+    finish_install_progress_task, generate_install_id, install_journal_error_response,
     install_operation_id, operation::install_progress_with_terminal_error,
     record_and_emit_install_progress, record_install_failure_outcome_and_repair,
     record_install_failure_outcome_and_repair_for_error, record_install_operation_interrupted,
@@ -16,6 +17,7 @@ use crate::dto::loaders::{
 };
 use crate::guardian::GuardianArtifactRepairStatus;
 use crate::install_runtime::prewarm_version_runtime;
+use crate::state::InstallInitializationStatus;
 use crate::state::{AppState, InstallStore};
 use axial_minecraft::{
     DownloadProgress, LoaderComponentId, LoaderError, LoaderProviderFailureKind, fetch_builds,
@@ -56,16 +58,34 @@ pub async fn start_loader_install(
     let (install_version_key, install_manifest_key) =
         loader_install_key_fields(build.component_id, &build.build_id, &build.version_id);
     let target_version_id = build.version_id.clone();
-    let install_id = generate_install_id("loader-install");
-    let (install_id, inserted) = state
-        .installs()
-        .insert_or_existing_active_scoped(
-            LOADER_INSTALL_SCOPE.to_string(),
-            install_id,
-            install_version_key,
-            install_manifest_key,
-        )
-        .await;
+    let install_id = loop {
+        let candidate = generate_install_id("loader-install");
+        let (install_id, inserted) = state
+            .installs()
+            .insert_or_existing_active_scoped(
+                LOADER_INSTALL_SCOPE.to_string(),
+                candidate,
+                install_version_key.clone(),
+                install_manifest_key.clone(),
+            )
+            .await;
+        if inserted {
+            break install_id;
+        }
+        match state.installs().wait_for_initialization(&install_id).await {
+            InstallInitializationStatus::Initialized => {
+                return Ok(InstallStartResponse {
+                    operation_id: install_operation_id(&install_id),
+                    install_id,
+                    view_model: InstallProgressViewModel::starting(),
+                });
+            }
+            InstallInitializationStatus::Reconciling => {
+                return Err(install_journal_error_response());
+            }
+            InstallInitializationStatus::Removed => {}
+        }
+    };
     let operation_id = install_operation_id(&install_id);
     let staging = stage_install_version_command(
         InstallVersionCommand {
@@ -75,17 +95,21 @@ pub async fn start_loader_install(
         install_id.clone(),
         operation_id.clone(),
     );
-    if !inserted {
-        return Ok(InstallStartResponse {
-            install_id,
-            operation_id,
-            view_model: InstallProgressViewModel::starting(),
-        });
-    }
-    begin_install_operation_journal(state.journals(), &operation_id, &target_version_id);
-
     let store = state.installs().clone();
     let journals = state.journals().clone();
+    let reservation = begin_install_journal_with_detached_reconciliation(
+        store.clone(),
+        journals.clone(),
+        install_id.clone(),
+        operation_id.clone(),
+        target_version_id.clone(),
+    )
+    .await
+    .map_err(|_| install_journal_error_response())?;
+    if !store.mark_initialized(&install_id).await {
+        return Err(install_journal_error_response());
+    }
+
     let telemetry = state.telemetry().clone();
     let library_dir = PathBuf::from(library_dir);
     let install_id_task = install_id.clone();
@@ -103,18 +127,20 @@ pub async fn start_loader_install(
         interrupted_loader_install_progress(),
         async move {
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+            let journal_failed = Arc::new(tokio::sync::Notify::new());
             let store_task = {
                 let store = worker_store.clone();
                 let install_id = worker_install_id.clone();
                 let journals = worker_journals.clone();
                 let operation_id = worker_operation_id.clone();
+                let journal_failed = journal_failed.clone();
                 tokio::spawn(async move {
                     let mut coalescer = InstallProgressCoalescer::default();
                     let mut last_journal_phase = None;
                     while let Some(progress) = progress_rx.recv().await {
                         let progress = sanitize_install_progress(progress);
                         for progress in coalescer.push(progress) {
-                            record_and_emit_install_progress(
+                            if !record_and_emit_install_progress(
                                 store.as_ref(),
                                 journals.as_ref(),
                                 &operation_id,
@@ -122,11 +148,15 @@ pub async fn start_loader_install(
                                 progress,
                                 &mut last_journal_phase,
                             )
-                            .await;
+                            .await
+                            {
+                                journal_failed.notify_one();
+                                return false;
+                            }
                         }
                     }
-                    if let Some(progress) = coalescer.flush() {
-                        record_and_emit_install_progress(
+                    if let Some(progress) = coalescer.flush()
+                        && !record_and_emit_install_progress(
                             store.as_ref(),
                             journals.as_ref(),
                             &operation_id,
@@ -134,8 +164,12 @@ pub async fn start_loader_install(
                             progress,
                             &mut last_journal_phase,
                         )
-                        .await;
+                        .await
+                    {
+                        journal_failed.notify_one();
+                        return false;
                     }
+                    true
                 })
             };
 
@@ -155,17 +189,24 @@ pub async fn start_loader_install(
                     &worker_operation_id,
                     &loader_target_id,
                     &base_version_id,
-                );
-                emit_install_failed(
-                    worker_telemetry.as_ref(),
-                    progress
-                        .error
-                        .as_deref()
-                        .unwrap_or(BASE_INSTALL_FAILED_MESSAGE),
-                );
+                )
+                .await
+                .ok();
+                let failure_summary = progress
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| BASE_INSTALL_FAILED_MESSAGE.to_string());
                 let _ = progress_tx.send(progress);
                 drop(progress_tx);
-                let _ = store_task.await;
+                if finish_install_progress_task(
+                    store_task,
+                    worker_store.as_ref(),
+                    &worker_install_id,
+                )
+                .await
+                {
+                    emit_install_failed(worker_telemetry.as_ref(), &failure_summary);
+                }
                 return;
             }
 
@@ -176,16 +217,32 @@ pub async fn start_loader_install(
                     *final_progress = None;
                 }
                 let final_progress_for_install = Arc::clone(&final_progress);
-                let result = install_build(&library_dir, build.clone(), |progress| {
-                    if progress.done {
-                        if let Ok(mut final_progress) = final_progress_for_install.lock() {
-                            *final_progress = Some(progress);
+                let result = {
+                    let install = install_build(&library_dir, build.clone(), |progress| {
+                        if progress.done {
+                            if let Ok(mut final_progress) = final_progress_for_install.lock() {
+                                *final_progress = Some(progress);
+                            }
+                            return;
                         }
-                        return;
+                        let _ = progress_tx.send(progress);
+                    });
+                    tokio::pin!(install);
+                    tokio::select! {
+                        result = &mut install => Some(result),
+                        () = journal_failed.notified() => None,
                     }
-                    let _ = progress_tx.send(progress);
-                })
-                .await;
+                };
+                let Some(result) = result else {
+                    drop(progress_tx);
+                    let _ = finish_install_progress_task(
+                        store_task,
+                        worker_store.as_ref(),
+                        &worker_install_id,
+                    )
+                    .await;
+                    return;
+                };
 
                 if let Err(error) = result {
                     let observed_at = chrono::Utc::now().to_rfc3339();
@@ -203,7 +260,9 @@ pub async fn start_loader_install(
                                     &worker_operation_id,
                                     &loader_target_id,
                                     &base_version_id,
-                                );
+                                )
+                                .await
+                                .ok();
                             }
                             record_install_failure_outcome_and_repair_for_error(
                                 worker_journals.as_ref(),
@@ -235,7 +294,9 @@ pub async fn start_loader_install(
                                 &loader_target_id,
                                 &error,
                                 &observed_at,
-                            );
+                            )
+                            .await
+                            .ok();
                             None
                         }
                     };
@@ -248,16 +309,21 @@ pub async fn start_loader_install(
                         continue;
                     }
                     let progress = loader_error_progress(&error);
-                    emit_install_failed(
-                        worker_telemetry.as_ref(),
-                        progress
-                            .error
-                            .as_deref()
-                            .unwrap_or(BASE_INSTALL_FAILED_MESSAGE),
-                    );
+                    let failure_summary = progress
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| BASE_INSTALL_FAILED_MESSAGE.to_string());
                     let _ = progress_tx.send(progress);
                     drop(progress_tx);
-                    let _ = store_task.await;
+                    if finish_install_progress_task(
+                        store_task,
+                        worker_store.as_ref(),
+                        &worker_install_id,
+                    )
+                    .await
+                    {
+                        emit_install_failed(worker_telemetry.as_ref(), &failure_summary);
+                    }
                     return;
                 }
                 break;
@@ -278,12 +344,25 @@ pub async fn start_loader_install(
             }
 
             drop(progress_tx);
-            let _ = store_task.await;
+            finish_install_progress_task(store_task, worker_store.as_ref(), &worker_install_id)
+                .await;
         },
-        move |progress| {
-            record_install_operation_interrupted(journals.as_ref(), &operation_id_task, &progress);
+        move |progress| async move {
+            if record_install_operation_interrupted(
+                journals.as_ref(),
+                &operation_id_task,
+                &progress,
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("failed to commit interrupted loader-install journal");
+                return false;
+            }
+            true
         },
     );
+    reservation.hand_off();
 
     Ok(InstallStartResponse {
         install_id,

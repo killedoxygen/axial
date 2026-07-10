@@ -219,6 +219,63 @@ async fn rules_refresh_route_requires_configured_remote_url() {
 }
 
 #[tokio::test]
+async fn rules_refresh_journal_failure_prevents_refresh() {
+    let fixture = TestFixture::new("rules-refresh-journal-failure");
+    let before = fixture.state.performance().rules_status();
+    let journal_path = fixture
+        .root
+        .join("config")
+        .join("state")
+        .join("operation-journals.json");
+    fs::create_dir_all(journal_path).expect("block journal snapshot destination");
+
+    let response = router()
+        .with_state(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/performance/rules/refresh")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).expect("error json"),
+        serde_json::json!({
+            "error": "Could not load performance data. Check app data permissions and try again."
+        })
+    );
+    assert_omits_raw_fragments(
+        &body,
+        &[
+            "operation-journals.json",
+            "/Users/alice",
+            "C:\\Users\\Alice",
+        ],
+    );
+
+    let after = fixture.state.performance().rules_status();
+    assert_eq!(after.rule_source, before.rule_source);
+    assert_eq!(after.rule_channel, before.rule_channel);
+    assert_eq!(after.generated_at, before.generated_at);
+    assert_eq!(after.last_refresh_at, before.last_refresh_at);
+    assert!(
+        fixture
+            .state
+            .journals()
+            .latest_for_command(crate::state::contracts::CommandKind::RefreshPerformanceRules)
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn rules_refresh_route_accepts_configured_remote_manifest() {
     let mut manifest = axial_performance::builtin_manifest().expect("builtin manifest");
     manifest.generated_at = "2026-05-30T13:00:00Z".to_string();
@@ -289,6 +346,132 @@ async fn rules_refresh_route_accepts_configured_remote_manifest() {
             .map(|target| target.ownership),
         Some(crate::state::contracts::OwnershipClass::LauncherManaged)
     );
+}
+
+#[tokio::test]
+async fn slow_rules_provider_runs_after_planned_ownership_without_false_timeout() {
+    let root = test_root("rules-refresh-slow-provider");
+    let mut manifest = axial_performance::builtin_manifest().expect("builtin manifest");
+    manifest.generated_at = "2026-05-30T13:05:00Z".to_string();
+    let signed = signed_rules_response(&manifest);
+    let remote_url = spawn_delayed_rules_server(
+        serde_json::to_vec(&manifest).expect("serialize remote manifest"),
+        Some(signed.signature),
+        Duration::from_millis(700),
+    )
+    .await;
+    let state = build_test_state(&root, Some(remote_url), Some(signed.public_key));
+
+    let response = router()
+        .with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/performance/rules/refresh")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        state.performance().rules_status().generated_at,
+        manifest.generated_at
+    );
+    let journal = state
+        .journals()
+        .latest_for_command(crate::state::contracts::CommandKind::RefreshPerformanceRules)
+        .expect("slow refresh journal");
+    assert_eq!(
+        journal.status,
+        crate::state::contracts::OperationStatus::Succeeded
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn terminal_journal_failure_returns_bounded_then_reconciles_without_refresh_replay() {
+    let root = test_root("rules-refresh-terminal-journal-retry");
+    let mut manifest = axial_performance::builtin_manifest().expect("builtin manifest");
+    manifest.generated_at = "2026-05-30T13:06:00Z".to_string();
+    let signed = signed_rules_response(&manifest);
+    let remote_url = spawn_delayed_rules_server(
+        serde_json::to_vec(&manifest).expect("serialize remote manifest"),
+        Some(signed.signature),
+        Duration::from_millis(100),
+    )
+    .await;
+    let journal_backend = Arc::new(ScriptedOperationBackend::default());
+    let status_backend = Arc::new(ScriptedOperationBackend::default());
+    journal_backend.gate_attempt(1);
+    let base = build_test_state(&root, Some(remote_url), Some(signed.public_key));
+    let state = replace_operation_backends(base, &root, journal_backend.clone(), status_backend);
+    let request_state = state.clone();
+    let request = tokio::spawn(async move {
+        router()
+            .with_state(request_state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/performance/rules/refresh")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("route response")
+    });
+    journal_backend.wait_for_attempt(1).await;
+    journal_backend.release();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state
+                .journals()
+                .latest_for_command(crate::state::contracts::CommandKind::RefreshPerformanceRules)
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("planned rules journal");
+    journal_backend.set_fail_all(true);
+
+    let response = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("bounded terminal persistence response")
+        .expect("request task");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        state.performance().rules_status().generated_at,
+        manifest.generated_at
+    );
+
+    journal_backend.set_fail_all(false);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state
+                .journals()
+                .latest_for_command(crate::state::contracts::CommandKind::RefreshPerformanceRules)
+                .is_some_and(|journal| {
+                    journal.status == crate::state::contracts::OperationStatus::Succeeded
+                })
+                && !state.journals().has_retry_candidate()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal journal reconciliation");
+
+    let next = handle_rules_refresh(State(state.clone())).await;
+    assert!(next.is_ok());
+    assert!(!state.journals().has_retry_candidate());
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]

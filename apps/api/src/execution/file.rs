@@ -196,7 +196,7 @@ pub fn write_file_atomically(
         })?;
     }
 
-    let temp_path = temp_path_for(request.destination);
+    let temp_path = atomic_temp_path_for(request.destination);
     if temp_path.exists() {
         facts.push(file_fact(
             ExecutionFactKind::FileTempLeftover,
@@ -416,7 +416,7 @@ pub(crate) fn io_error_fact(
     file_fact(fact_kind, operation_id, target)
 }
 
-fn temp_path_for(destination: &Path) -> PathBuf {
+pub(crate) fn atomic_temp_path_for(destination: &Path) -> PathBuf {
     destination.with_extension(
         match destination.extension().and_then(|value| value.to_str()) {
             Some(extension) if !extension.is_empty() => format!("{extension}.tmp"),

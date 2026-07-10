@@ -2478,7 +2478,7 @@ async fn benchmark_suite_driver_startup_resume_starts_fresh_driver_from_restart_
     let suite_id = "suite-auto-resume-success";
     fixture.persist_suite_runs(suite_id, &[0]);
     let interrupted = fixture.active_driver(suite_id, "development", 45_000).await;
-    let reloaded = fixture.reload();
+    let reloaded = fixture.reload().await;
     reloaded
         .state
         .sessions()
@@ -2537,7 +2537,7 @@ async fn benchmark_suite_driver_startup_resume_missing_manifest_fails_boundedly(
     let interrupted = fixture
         .active_driver("suite-auto-resume-missing-manifest", "development", 30_000)
         .await;
-    let reloaded = fixture.reload();
+    let reloaded = fixture.reload().await;
 
     let summary = resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone()).await;
 
@@ -2570,7 +2570,7 @@ async fn benchmark_suite_driver_startup_resume_complete_manifest_fails_boundedly
     let suite_id = "suite-auto-resume-complete-manifest";
     fixture.persist_suite_runs(suite_id, &[0, 1]);
     let interrupted = fixture.active_driver(suite_id, "development", 30_000).await;
-    let reloaded = fixture.reload();
+    let reloaded = fixture.reload().await;
 
     let summary = resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone()).await;
 
@@ -3205,7 +3205,22 @@ impl RouteTestFixture {
         Self::from_root_paths(root, paths)
     }
 
-    fn reload(&self) -> Self {
+    async fn reload(&self) -> Self {
+        self.state
+            .performance_operations()
+            .close()
+            .await
+            .expect("close performance operation store before reload");
+        self.state
+            .journals()
+            .close()
+            .await
+            .expect("close operation journal store before reload");
+        self.state
+            .failure_memory()
+            .close()
+            .await
+            .expect("close failure memory store before reload");
         Self::from_root_paths(self.root.clone(), self.paths.clone())
     }
 

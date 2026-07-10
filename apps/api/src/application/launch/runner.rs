@@ -23,14 +23,17 @@ use crate::observability::telemetry::{
     TelemetryLaunchOutcome,
 };
 use crate::state::launch_reports::LaunchProofContext;
-use crate::state::{AppState, StartupOutcome};
+use crate::state::{
+    AppState, LaunchFailureTermination, LaunchFailureTerminationErrorClass,
+    OperationJournalStoreError, StartupOutcome,
+};
 use axial_launcher::{
     GuardianSummary, LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome,
     LaunchState, PreparedLaunchAttempt, build_healing_summary, prepare_launch_attempt_with_events,
 };
 use axial_minecraft::download::repair_virtual_assets_from_index;
 use axial_minecraft::paths::assets_dir;
-use failure::{fail_launch, fail_launch_with_outcome};
+use failure::{fail_launch, fail_launch_for_journal, fail_launch_with_outcome};
 use metadata::persist_launch_metadata;
 use prewarm::{format_prewarm_run_summary, prewarm_launch_plan};
 use proof::persist_launch_proof_best_effort_with_context;
@@ -39,7 +42,7 @@ use recovery::{
     block_guardian_for_suppressed_launch_recovery, block_guardian_with_user_outcome,
     plan_guardian_launch_recovery_directive, record_failed_self_healing_if_any,
     record_guardian_launch_recovery_attempt, record_prelaunch_preset_adjustment_directive,
-    suppressed_launch_recovery_outcome,
+    record_successful_self_healing_if_any, suppressed_launch_recovery_outcome,
 };
 use spawn::{
     launch_command_target, launch_spawn_failed_stage_evidence, launch_spawn_stage_evidence,
@@ -79,10 +82,17 @@ pub struct LaunchSuccess {
     pub guardian: Option<GuardianSummary>,
 }
 
+#[derive(Clone)]
 pub struct LaunchRequestError {
     pub message: String,
     pub healing: Option<axial_launcher::LaunchHealingSummary>,
     pub guardian: Option<GuardianSummary>,
+}
+
+enum LaunchTerminalizationDisposition {
+    Complete(Result<LaunchSuccess, LaunchRequestError>),
+    Retained(Result<LaunchSuccess, LaunchRequestError>),
+    Settled(Result<LaunchSuccess, LaunchRequestError>),
 }
 
 pub async fn launch_session(
@@ -91,9 +101,103 @@ pub async fn launch_session(
 ) -> Result<LaunchSuccess, LaunchRequestError> {
     let session_id = task.intent.session_id.clone();
     let sessions = state.sessions().clone();
-    let result = launch_session_inner(state, task).await;
-    sessions.release_terminal_retention_hold(&session_id).await;
-    result
+    let result = launch_session_inner(state.clone(), task).await;
+    match terminalize_unhandled_launch_error(&state, &session_id, result).await {
+        LaunchTerminalizationDisposition::Complete(result) => {
+            sessions.release_terminal_retention_hold(&session_id).await;
+            result
+        }
+        LaunchTerminalizationDisposition::Retained(result)
+        | LaunchTerminalizationDisposition::Settled(result) => result,
+    }
+}
+
+async fn terminalize_unhandled_launch_error(
+    state: &AppState,
+    session_id: &str,
+    result: Result<LaunchSuccess, LaunchRequestError>,
+) -> LaunchTerminalizationDisposition {
+    let error = match result {
+        Ok(success) => {
+            return LaunchTerminalizationDisposition::Complete(Ok(success));
+        }
+        Err(error) => error,
+    };
+    let error = LaunchRequestError {
+        message: sanitize_live_launch_failure_message(&error.message),
+        healing: error.healing,
+        guardian: error.guardian,
+    };
+    let Some(record) = state.sessions().get(session_id).await else {
+        return LaunchTerminalizationDisposition::Complete(Err(error));
+    };
+    if matches!(record.state, LaunchState::Failed | LaunchState::Exited) {
+        return LaunchTerminalizationDisposition::Complete(Err(error));
+    }
+
+    match state
+        .sessions()
+        .terminate_for_launch_failure(session_id)
+        .await
+    {
+        LaunchFailureTermination::Ready(lease) => {
+            let terminal_error = finalize_unhandled_launch_error(state, session_id, error).await;
+            lease.release().await;
+            LaunchTerminalizationDisposition::Settled(Err(terminal_error))
+        }
+        LaunchFailureTermination::Pending(pending) => {
+            trace_unconfirmed_launch_failure_termination(pending.error_class());
+            let deferred_state = state.clone();
+            let deferred_session_id = session_id.to_string();
+            let deferred_error = error.clone();
+            tokio::spawn(async move {
+                match pending.wait_for_settlement().await {
+                    Ok(lease) => {
+                        let _ = finalize_unhandled_launch_error(
+                            &deferred_state,
+                            &deferred_session_id,
+                            deferred_error,
+                        )
+                        .await;
+                        lease.release().await;
+                    }
+                    Err(error_class) => {
+                        trace_unconfirmed_launch_failure_termination(error_class);
+                    }
+                }
+            });
+            LaunchTerminalizationDisposition::Retained(Err(error))
+        }
+        LaunchFailureTermination::Unconfirmed(error_class) => {
+            trace_unconfirmed_launch_failure_termination(error_class);
+            LaunchTerminalizationDisposition::Retained(Err(error))
+        }
+    }
+}
+
+async fn finalize_unhandled_launch_error(
+    state: &AppState,
+    session_id: &str,
+    error: LaunchRequestError,
+) -> LaunchRequestError {
+    state.telemetry().emit(TelemetryEvent::launch_completed(
+        TelemetryLaunchOutcome::Failure,
+    ));
+    fail_launch_for_journal(
+        state,
+        session_id,
+        &error.message,
+        error.healing,
+        error.guardian,
+    )
+    .await
+}
+
+fn trace_unconfirmed_launch_failure_termination(error_class: LaunchFailureTerminationErrorClass) {
+    tracing::warn!(
+        termination_error_class = error_class.as_str(),
+        "launch failure termination remains unconfirmed"
+    );
 }
 
 async fn launch_session_inner(
@@ -191,8 +295,18 @@ async fn launch_session_inner(
         let prepared = match prepared_result {
             Ok(prepared) => prepared,
             Err(error) => {
-                trace_launch_event(&session_id, &format!("prepare failed: {}", error.message));
                 let failure_class = error.failure_class.unwrap_or(LaunchFailureClass::Unknown);
+                if let Some(recovery_plan) = last_recovery_plan.take() {
+                    record_failed_self_healing_if_any(
+                        &state,
+                        &session_id,
+                        Some(&recovery_plan),
+                        failure_class,
+                    )
+                    .await
+                    .map_err(guardian_journal_error)?;
+                }
+                trace_launch_event(&session_id, &format!("prepare failed: {}", error.message));
                 let prepare_outcome =
                     guardian_prepare_failure_outcome(GuardianPrepareFailureRequest {
                         mode: launch_policy_guardian_mode(intent.guardian.mode),
@@ -212,6 +326,7 @@ async fn launch_session_inner(
                         &intent,
                         directive,
                         launch_policy_guardian_mode(intent.guardian.mode),
+                        failure_class,
                     ) {
                         Ok(recovery_plan) => recovery_plan,
                         Err(_) => {
@@ -233,7 +348,9 @@ async fn launch_session_inner(
                         &session_id,
                         &recovery_plan,
                         failure_class,
-                    );
+                    )
+                    .await
+                    .map_err(guardian_journal_error)?;
                     if recovery_outcome.status == GuardianLaunchRecoveryStatus::Suppressed {
                         let recovery_user_outcome =
                             suppressed_launch_recovery_outcome(&recovery_plan);
@@ -271,13 +388,6 @@ async fn launch_session_inner(
                     continue;
                 }
                 block_guardian_with_user_outcome(&mut guardian, &prepare_outcome.user_outcome);
-                record_failed_self_healing_if_any(
-                    &state,
-                    &session_id,
-                    last_recovery_plan.as_ref(),
-                    failure_class,
-                )
-                .await;
                 emit_pending_launch_failure(&state, &mut launch_completion_pending);
                 return Err(fail_launch(
                     &state,
@@ -303,6 +413,7 @@ async fn launch_session_inner(
                 &intent,
                 directive,
                 launch_policy_guardian_mode(intent.guardian.mode),
+                LaunchFailureClass::Unknown,
             )
         {
             record_prelaunch_preset_adjustment_directive(&mut guardian, &plan);
@@ -372,6 +483,14 @@ async fn launch_session_inner(
                 command
             }
             Err(error) => {
+                record_failed_self_healing_if_any(
+                    &state,
+                    &session_id,
+                    last_recovery_plan.as_ref(),
+                    LaunchFailureClass::Unknown,
+                )
+                .await
+                .map_err(guardian_journal_error)?;
                 state
                     .sessions()
                     .record_stage_evidence(&session_id, launch_command_stage_evidence(&error.facts))
@@ -380,13 +499,6 @@ async fn launch_session_inner(
                     &session_id,
                     &format!("launch command preparation failed: {}", error),
                 );
-                record_failed_self_healing_if_any(
-                    &state,
-                    &session_id,
-                    last_recovery_plan.as_ref(),
-                    LaunchFailureClass::Unknown,
-                )
-                .await;
                 emit_pending_launch_failure(&state, &mut launch_completion_pending);
                 return Err(fail_launch(
                     &state,
@@ -404,17 +516,18 @@ async fn launch_session_inner(
         if let Err(error) =
             repair_legacy_virtual_assets_before_launch(&intent, &prepared.plan).await
         {
-            trace_launch_event(
-                &session_id,
-                &format!("legacy virtual asset repair failed: {error}"),
-            );
             record_failed_self_healing_if_any(
                 &state,
                 &session_id,
                 last_recovery_plan.as_ref(),
                 LaunchFailureClass::Unknown,
             )
-            .await;
+            .await
+            .map_err(guardian_journal_error)?;
+            trace_launch_event(
+                &session_id,
+                &format!("legacy virtual asset repair failed: {error}"),
+            );
             emit_pending_launch_failure(&state, &mut launch_completion_pending);
             return Err(fail_launch(
                 &state,
@@ -500,6 +613,14 @@ async fn launch_session_inner(
                 record
             }
             Err(error) => {
+                record_failed_self_healing_if_any(
+                    &state,
+                    &session_id,
+                    last_recovery_plan.as_ref(),
+                    LaunchFailureClass::Unknown,
+                )
+                .await
+                .map_err(guardian_journal_error)?;
                 state
                     .sessions()
                     .record_stage_evidence(&session_id, launch_spawn_failed_stage_evidence())
@@ -516,13 +637,6 @@ async fn launch_session_inner(
                     LaunchSessionExitReason::SpawnFailed.summary(),
                 ));
                 trace_launch_event(&session_id, &format!("spawn failed: {error}"));
-                record_failed_self_healing_if_any(
-                    &state,
-                    &session_id,
-                    last_recovery_plan.as_ref(),
-                    LaunchFailureClass::Unknown,
-                )
-                .await;
                 return Err(fail_launch_with_outcome(
                     &state,
                     &session_id,
@@ -558,6 +672,13 @@ async fn launch_session_inner(
 
         match outcome {
             StartupOutcome::Stable | StartupOutcome::TimedOut => {
+                record_successful_self_healing_if_any(
+                    &state,
+                    &session_id,
+                    last_recovery_plan.as_ref(),
+                )
+                .await
+                .map_err(guardian_journal_error)?;
                 emit_launch_completed(
                     &state,
                     &mut launch_completion_pending,
@@ -634,6 +755,16 @@ async fn launch_session_inner(
                         effective_preset: &prepared.effective_preset,
                     });
                 let failure_class = startup_outcome.failure_class;
+                if let Some(recovery_plan) = last_recovery_plan.take() {
+                    record_failed_self_healing_if_any(
+                        &state,
+                        &session_id,
+                        Some(&recovery_plan),
+                        failure_class,
+                    )
+                    .await
+                    .map_err(guardian_journal_error)?;
+                }
                 state.telemetry().emit(TelemetryEvent::error_captured(
                     TelemetryErrorKind::LaunchStartupFailed,
                     TelemetryErrorArea::Launch,
@@ -646,6 +777,7 @@ async fn launch_session_inner(
                         &intent,
                         directive,
                         launch_policy_guardian_mode(intent.guardian.mode),
+                        failure_class,
                     ) {
                         Ok(recovery_plan) => recovery_plan,
                         Err(_) => {
@@ -677,7 +809,9 @@ async fn launch_session_inner(
                         &session_id,
                         &recovery_plan,
                         failure_class,
-                    );
+                    )
+                    .await
+                    .map_err(guardian_journal_error)?;
                     if recovery_outcome.status == GuardianLaunchRecoveryStatus::Suppressed {
                         let recovery_user_outcome =
                             suppressed_launch_recovery_outcome(&recovery_plan);
@@ -722,13 +856,6 @@ async fn launch_session_inner(
                 }
 
                 let healing = startup_failure_healing(&intent, &prepared, &attempt, failure_class);
-                record_failed_self_healing_if_any(
-                    &state,
-                    &session_id,
-                    last_recovery_plan.as_ref(),
-                    failure_class,
-                )
-                .await;
                 block_guardian_with_user_outcome(&mut guardian, &startup_outcome.user_outcome);
                 emit_launch_completed(
                     &state,
@@ -747,6 +874,16 @@ async fn launch_session_inner(
                 .await);
             }
         }
+    }
+}
+
+fn guardian_journal_error(_error: OperationJournalStoreError) -> LaunchRequestError {
+    LaunchRequestError {
+        message:
+            "Could not record the launch recovery safely. Check app data permissions and try again."
+                .to_string(),
+        healing: None,
+        guardian: None,
     }
 }
 
@@ -918,6 +1055,206 @@ mod tests {
             .expect("proof persisted");
         assert_eq!(proof.session_id, session_id);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn nonretryable_journal_error_cannot_leave_a_queued_session_orphaned() {
+        let root = unique_test_dir("nonretryable-launch-journal-error");
+        let state = test_app_state(&root);
+        let session_id = "nonretryable-launch-journal-error";
+        state.sessions().insert(test_record(session_id)).await;
+        let error = guardian_journal_error(OperationJournalStoreError::MissingOperation);
+
+        let result = match terminalize_unhandled_launch_error(&state, session_id, Err(error)).await
+        {
+            LaunchTerminalizationDisposition::Complete(result)
+            | LaunchTerminalizationDisposition::Retained(result)
+            | LaunchTerminalizationDisposition::Settled(result) => result,
+        };
+
+        assert!(result.is_err());
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("terminal session");
+        assert_eq!(record.state, LaunchState::Failed);
+        assert_eq!(
+            state.sessions().retention_hold_count(session_id).await,
+            Some(0)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_process_journal_error_settles_as_guardian_failure() {
+        let root = unique_test_dir("spawned-launch-journal-error");
+        let state = test_app_state(&root);
+        let session_id = "spawned-launch-journal-error";
+        state.sessions().insert(test_record(session_id)).await;
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 30");
+        state
+            .sessions()
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("spawn test process");
+        let error = guardian_journal_error(OperationJournalStoreError::MissingOperation);
+        let expected_message = error.message.clone();
+
+        let result = match terminalize_unhandled_launch_error(&state, session_id, Err(error)).await
+        {
+            LaunchTerminalizationDisposition::Complete(result)
+            | LaunchTerminalizationDisposition::Retained(result)
+            | LaunchTerminalizationDisposition::Settled(result) => result,
+        };
+
+        assert!(result.is_err());
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("terminal session");
+        assert_eq!(record.state, LaunchState::Failed);
+        assert_eq!(
+            record
+                .failure
+                .as_ref()
+                .and_then(|failure| failure.detail.as_deref()),
+            Some(expected_message.as_str())
+        );
+        assert_ne!(
+            record.outcome.expect("failure outcome").reason,
+            LaunchSessionExitReason::LauncherStopped
+        );
+        assert_eq!(
+            state.sessions().retention_hold_count(session_id).await,
+            Some(0)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_process_termination_retains_active_launch_until_confirmed_settlement() {
+        let root = unique_test_dir("rejected-launch-failure-termination");
+        let state = test_app_state_with_library(&root);
+        let instance = state
+            .instances()
+            .add(
+                "Termination rejection".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add test instance");
+        let session_id = "rejected-launch-failure-termination";
+        let process_release = root.join("release-process");
+        let mut record = test_record(session_id);
+        record.instance_id = instance.id.clone();
+        state.sessions().insert(record.clone()).await;
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("while [ ! -f \"$1\" ]; do sleep 0.01; done")
+            .arg("rejected-launch-failure-termination")
+            .arg(&process_release);
+        state
+            .sessions()
+            .start_process(record, command)
+            .await
+            .expect("spawn test process");
+        assert!(
+            state
+                .sessions()
+                .reject_next_process_start_kill(session_id)
+                .await
+        );
+        let error = guardian_journal_error(OperationJournalStoreError::MissingOperation);
+        let expected_message = error.message.clone();
+
+        let result = match terminalize_unhandled_launch_error(&state, session_id, Err(error)).await
+        {
+            LaunchTerminalizationDisposition::Complete(result)
+            | LaunchTerminalizationDisposition::Retained(result)
+            | LaunchTerminalizationDisposition::Settled(result) => result,
+        };
+
+        let returned_error = match result {
+            Ok(_) => panic!("journal error must remain public"),
+            Err(error) => error,
+        };
+        assert_eq!(returned_error.message, expected_message);
+        let active = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("active session");
+        assert!(!matches!(
+            active.state,
+            LaunchState::Failed | LaunchState::Exited
+        ));
+        assert!(active.pid.is_some());
+        assert!(state.sessions().has_active_instance(&instance.id).await);
+        assert_eq!(
+            state.sessions().retention_hold_count(session_id).await,
+            Some(1)
+        );
+
+        let conflict = match super::super::prepare_launch_session(
+            &state,
+            super::super::LaunchRequest {
+                instance_id: instance.id.clone(),
+                username: None,
+                max_memory_mb: None,
+                min_memory_mb: None,
+                client_started_at_ms: None,
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("a live retained child must block a second launch"),
+            Err(error) => error,
+        };
+        assert_eq!(conflict.0, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            conflict.1.0["error"],
+            "instance already has an active session"
+        );
+
+        fs::write(&process_release, b"release").expect("release process naturally");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let settled = state
+                    .sessions()
+                    .get(session_id)
+                    .await
+                    .expect("settled session");
+                if settled.state == LaunchState::Failed
+                    && state.sessions().retention_hold_count(session_id).await == Some(0)
+                {
+                    assert_eq!(
+                        settled
+                            .failure
+                            .as_ref()
+                            .and_then(|failure| failure.detail.as_deref()),
+                        Some(expected_message.as_str())
+                    );
+                    assert_ne!(
+                        settled.outcome.expect("failure outcome").reason,
+                        LaunchSessionExitReason::LauncherStopped
+                    );
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred launch failure settlement");
+        assert!(!state.sessions().has_active_instance(&instance.id).await);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1097,6 +1434,30 @@ mod tests {
             },
             telemetry,
         )
+    }
+
+    fn test_app_state_with_library(root: &Path) -> AppState {
+        let paths = test_paths(root);
+        let config_store = ConfigStore::load_from(paths.clone()).expect("load config");
+        config_store
+            .replace_in_memory(AppConfig {
+                library_dir: paths.library_dir.to_string_lossy().to_string(),
+                ..AppConfig::default()
+            })
+            .expect("set test library");
+        let config = Arc::new(config_store);
+        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        })
     }
 
     fn test_paths(root: &Path) -> AppPaths {

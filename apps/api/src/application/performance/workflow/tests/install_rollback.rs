@@ -197,13 +197,13 @@ async fn install_custom_mode_removes_only_managed_artifacts() {
         target.id == "core"
             && target.ownership == crate::state::contracts::OwnershipClass::CompositionManaged
     }));
-    assert_eq!(journal.completed_steps.len(), 1);
+    let completed = journal
+        .completed_steps
+        .iter()
+        .find(|step| step.step_id == "remove_performance_plan")
+        .expect("completed remove step");
     assert_eq!(
-        journal.completed_steps[0].step_id,
-        "remove_performance_plan"
-    );
-    assert_eq!(
-        journal.completed_steps[0]
+        completed
             .changed_target
             .as_ref()
             .map(|target| (target.id.as_str(), target.ownership)),
@@ -213,9 +213,25 @@ async fn install_custom_mode_removes_only_managed_artifacts() {
         ))
     );
     assert!(
-        journal.completed_steps[0]
+        completed
             .generated_facts
             .contains(&"performance_rollback_evidence".to_string())
+    );
+    assert_eq!(
+        journal
+            .completed_steps
+            .iter()
+            .filter(|step| step.step_id == "performance_effect_started")
+            .count(),
+        1
+    );
+    assert_eq!(
+        journal
+            .completed_steps
+            .iter()
+            .filter(|step| step.step_id == "performance_terminal_intent")
+            .count(),
+        1
     );
 }
 
@@ -580,13 +596,17 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
         journal.rollback,
         crate::state::contracts::RollbackState::Available
     );
-    assert_eq!(journal.completed_steps.len(), 1);
+    let completed = journal
+        .completed_steps
+        .iter()
+        .find(|step| step.step_id == "rollback_performance_plan")
+        .expect("completed rollback step");
     assert_eq!(
-        journal.completed_steps[0].rollback,
+        completed.rollback,
         crate::state::contracts::RollbackState::Applied
     );
     assert_eq!(
-        journal.completed_steps[0]
+        completed
             .changed_target
             .as_ref()
             .map(|target| (target.id.as_str(), target.ownership)),
@@ -596,9 +616,25 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
         ))
     );
     assert!(
-        journal.completed_steps[0]
+        completed
             .generated_facts
             .contains(&"performance_rollback_evidence".to_string())
+    );
+    assert_eq!(
+        journal
+            .completed_steps
+            .iter()
+            .filter(|step| step.step_id == "performance_effect_started")
+            .count(),
+        1
+    );
+    assert_eq!(
+        journal
+            .completed_steps
+            .iter()
+            .filter(|step| step.step_id == "performance_terminal_intent")
+            .count(),
+        1
     );
 }
 

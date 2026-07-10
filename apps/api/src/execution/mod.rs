@@ -7,6 +7,7 @@ pub mod download;
 pub mod file;
 pub mod jvm;
 pub mod launch;
+pub(crate) mod persistence;
 pub mod process;
 pub mod runtime;
 

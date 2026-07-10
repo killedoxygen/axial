@@ -1,27 +1,88 @@
-use crate::execution::file::{FileWriteRequest, write_file_atomically};
 #[cfg(test)]
-use crate::execution::file::{PromoteTempFileRequest, promote_temp_file};
+use crate::execution::file::{
+    FileWriteRequest, PromoteTempFileRequest, promote_temp_file, write_file_atomically,
+};
+use crate::execution::persistence::{
+    AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
+    WriteUrgency,
+};
 use crate::logging::timestamp_utc;
 use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
+use crate::state::contracts::RollbackState;
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
 use axial_config::AppPaths;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as SyncMutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
 pub const PERFORMANCE_OPERATION_ID_PREFIX: &str = "performance-install-";
-pub const INTERRUPTED_BY_RESTART_ERROR: &str = "performance operation interrupted by restart";
+pub const PERFORMANCE_COMMITTING_COMPLETE_STATE: &str = "committing_complete";
+pub const PERFORMANCE_COMMITTING_FAILED_STATE: &str = "committing_failed";
+pub const PERFORMANCE_EFFECT_STARTED_STATE: &str = "effect_started";
+pub const PERFORMANCE_RESUME_BLOCKED_STATE: &str = "resume_blocked";
+pub const PERFORMANCE_RESUME_INVALID_STATE: &str = "resume_invalid";
 const MAX_OPERATION_ERROR_CHARS: usize = 160;
 const MAX_OPERATION_FILENAME_STEM: usize = 96;
 const MAX_RESUMABLE_OPERATIONS: usize = 16;
-const DUPLICATE_RESUME_ERROR: &str =
-    "duplicate pending performance operation ignored after restart";
-const RESUME_LIMIT_ERROR: &str = "pending performance operation ignored after restart resume limit";
+const PERFORMANCE_OPERATION_LOCK_INVARIANT: &str =
+    "performance operation records lock poisoned; in-memory and persisted state may diverge";
+
+#[derive(Debug, thiserror::Error)]
+pub enum PerformanceOperationStoreError {
+    #[error("performance operation persistence failed: {0}")]
+    Persistence(#[source] io::Error),
+    #[error("performance operation has no failed critical transition to retry")]
+    RetryUnavailable,
+    #[error("performance operation has a failed critical transition that must be retried")]
+    RetryRequired,
+    #[error("performance operation does not exist")]
+    MissingOperation,
+    #[error("performance operation is already terminal with a different state")]
+    TerminalMismatch,
+    #[error("performance operation journal identity is invalid")]
+    InvalidIdentity,
+}
+
+impl PerformanceOperationStoreError {
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::Persistence(_) => "persistence",
+            Self::RetryUnavailable => "retry_unavailable",
+            Self::RetryRequired => "retry_required",
+            Self::MissingOperation => "missing_operation",
+            Self::TerminalMismatch => "terminal_mismatch",
+            Self::InvalidIdentity => "invalid_identity",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PerformanceOperationStartError {
+    #[error("a performance operation is already queued for this instance")]
+    Conflict,
+    #[error("performance operation {operation_id} could not be started: {source}")]
+    Store {
+        operation_id: String,
+        #[source]
+        source: PerformanceOperationStoreError,
+    },
+}
+
+impl PerformanceOperationStartError {
+    pub fn operation_id(&self) -> Option<&str> {
+        match self {
+            Self::Conflict => None,
+            Self::Store { operation_id, .. } => Some(operation_id),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +109,78 @@ pub struct PerformanceOperationStatus {
     pub error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(skip)]
+    pub(crate) journal_identity: Option<PerformanceOperationJournalIdentity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PerformanceOperationJournalIdentity {
+    pub action: String,
+    pub target_id: String,
+    pub rollback: RollbackState,
+}
+
+impl PerformanceOperationJournalIdentity {
+    pub(crate) fn new(
+        action: impl Into<String>,
+        target_id: impl Into<String>,
+        rollback: RollbackState,
+    ) -> Self {
+        Self {
+            action: action.into(),
+            target_id: target_id.into(),
+            rollback,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedPerformanceOperationStatus {
+    id: String,
+    instance_id: String,
+    action: String,
+    payload: PerformanceOperationPayload,
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    created_at: String,
+    updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    journal_identity: Option<PerformanceOperationJournalIdentity>,
+}
+
+impl From<PerformanceOperationStatus> for PersistedPerformanceOperationStatus {
+    fn from(status: PerformanceOperationStatus) -> Self {
+        Self {
+            id: status.id,
+            instance_id: status.instance_id,
+            action: status.action,
+            payload: status.payload,
+            state: status.state,
+            error: status.error,
+            created_at: status.created_at,
+            updated_at: status.updated_at,
+            journal_identity: status.journal_identity,
+        }
+    }
+}
+
+impl From<PersistedPerformanceOperationStatus> for PerformanceOperationStatus {
+    fn from(status: PersistedPerformanceOperationStatus) -> Self {
+        Self {
+            id: status.id,
+            instance_id: status.instance_id,
+            action: status.action,
+            payload: status.payload,
+            state: status.state,
+            error: status.error,
+            created_at: status.created_at,
+            updated_at: status.updated_at,
+            journal_identity: status.journal_identity,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +194,8 @@ pub enum PerformanceOperationLoadIssueKind {
     StatusInvalid,
     UnsafeOperationId,
     MalformedOperationStatus,
+    NonCanonicalFilename,
+    DuplicateOperationId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,49 +208,102 @@ pub struct PerformanceOperationLoadIssue {
 struct PerformanceOperationInner {
     operations: HashMap<String, PerformanceOperationStatus>,
     active_by_instance: HashMap<String, String>,
+    starting_by_instance: HashMap<String, String>,
     pending_resume_ids: Vec<String>,
 }
 
 #[derive(Default)]
 struct PerformanceOperationLoadState {
     inner: PerformanceOperationInner,
-    interrupted: Vec<PerformanceOperationStatus>,
     issues: Vec<PerformanceOperationLoadIssue>,
 }
 
+struct PerformanceOperationPersistence {
+    owner: PersistenceOwnerLease,
+    storage_dir: PathBuf,
+    writers: SyncMutex<HashMap<String, AtomicSnapshotWriter>>,
+}
+
+impl PerformanceOperationPersistence {
+    fn claim(
+        storage_dir: &Path,
+        coordinator: PersistenceCoordinator,
+    ) -> Result<Self, PerformanceOperationStoreError> {
+        let owner = coordinator
+            .claim_owner(storage_dir)
+            .map_err(performance_operation_persistence_error)?;
+        Ok(Self {
+            owner,
+            storage_dir: storage_dir.to_path_buf(),
+            writers: SyncMutex::new(HashMap::new()),
+        })
+    }
+
+    fn writer(
+        &self,
+        operation_id: &str,
+    ) -> Result<AtomicSnapshotWriter, PerformanceOperationStoreError> {
+        let mut writers = self
+            .writers
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
+        if let Some(writer) = writers.get(operation_id) {
+            return Ok(writer.clone());
+        }
+        let path = operation_path(&self.storage_dir, operation_id);
+        let writer = self
+            .owner
+            .writer(&path, performance_operation_status_target(operation_id))
+            .map_err(performance_operation_persistence_error)?;
+        writers.insert(operation_id.to_string(), writer.clone());
+        Ok(writer)
+    }
+}
+
 pub struct PerformanceOperationStore {
-    inner: Mutex<PerformanceOperationInner>,
-    storage_dir: Option<PathBuf>,
+    inner: Arc<RwLock<PerformanceOperationInner>>,
+    mutation_gate: Arc<AsyncMutex<()>>,
+    persistence: Option<PerformanceOperationPersistence>,
+    retry_candidates: Arc<SyncMutex<HashMap<String, PerformanceOperationStatus>>>,
     load_issues: Vec<PerformanceOperationLoadIssue>,
 }
 
 impl PerformanceOperationStore {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(PerformanceOperationInner::default()),
-            storage_dir: None,
+            inner: Arc::new(RwLock::new(PerformanceOperationInner::default())),
+            mutation_gate: Arc::new(AsyncMutex::new(())),
+            persistence: None,
+            retry_candidates: Arc::new(SyncMutex::new(HashMap::new())),
             load_issues: Vec::new(),
         }
     }
 
     pub fn load_from_paths(paths: &AppPaths) -> Self {
+        Self::try_load_from_paths(paths).unwrap_or_else(|error| {
+            panic!("failed to initialize performance operation persistence: {error}")
+        })
+    }
+
+    pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, PerformanceOperationStoreError> {
+        Self::try_load_from_paths_with_coordinator(paths, PersistenceCoordinator::global())
+    }
+
+    pub(crate) fn try_load_from_paths_with_coordinator(
+        paths: &AppPaths,
+        coordinator: PersistenceCoordinator,
+    ) -> Result<Self, PerformanceOperationStoreError> {
         let storage_dir = operation_dir(paths);
         let load_state = load_persisted_operation_inner(&storage_dir);
-        for status in &load_state.interrupted {
-            if let Err(error) = persist_status_to_dir(&storage_dir, status) {
-                warn!(
-                    operation_id = %status.id,
-                    error = %error,
-                    "failed to persist interrupted performance operation status during load"
-                );
-            }
-        }
+        let persistence = PerformanceOperationPersistence::claim(&storage_dir, coordinator)?;
 
-        Self {
-            inner: Mutex::new(load_state.inner),
-            storage_dir: Some(storage_dir),
+        Ok(Self {
+            inner: Arc::new(RwLock::new(load_state.inner)),
+            mutation_gate: Arc::new(AsyncMutex::new(())),
+            persistence: Some(persistence),
+            retry_candidates: Arc::new(SyncMutex::new(HashMap::new())),
             load_issues: load_state.issues,
-        }
+        })
     }
 
     pub async fn start(
@@ -123,9 +311,44 @@ impl PerformanceOperationStore {
         instance_id: String,
         action: String,
         payload: PerformanceOperationPayload,
-    ) -> Result<PerformanceOperationStatus, PerformanceOperationConflict> {
+    ) -> Result<PerformanceOperationStatus, PerformanceOperationStartError> {
+        self.start_internal(instance_id, action, payload, None)
+            .await
+    }
+
+    pub(crate) async fn start_with_identity(
+        &self,
+        instance_id: String,
+        action: String,
+        payload: PerformanceOperationPayload,
+        journal_identity: PerformanceOperationJournalIdentity,
+    ) -> Result<PerformanceOperationStatus, PerformanceOperationStartError> {
+        self.start_internal(instance_id, action, payload, Some(journal_identity))
+            .await
+    }
+
+    async fn start_internal(
+        &self,
+        instance_id: String,
+        action: String,
+        payload: PerformanceOperationPayload,
+        journal_identity: Option<PerformanceOperationJournalIdentity>,
+    ) -> Result<PerformanceOperationStatus, PerformanceOperationStartError> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        if journal_identity
+            .as_ref()
+            .is_some_and(|identity| !valid_journal_identity(identity, &action))
+        {
+            return Err(PerformanceOperationStartError::Store {
+                operation_id: String::new(),
+                source: PerformanceOperationStoreError::InvalidIdentity,
+            });
+        }
         let status = {
-            let mut inner = self.inner.lock().await;
+            let inner = self
+                .inner
+                .read()
+                .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
             if let Some(existing_id) = inner.active_by_instance.get(&instance_id)
                 && inner
                     .operations
@@ -133,12 +356,15 @@ impl PerformanceOperationStore {
                     .map(|status| is_non_terminal(&status.state))
                     .unwrap_or(false)
             {
-                return Err(PerformanceOperationConflict);
+                return Err(PerformanceOperationStartError::Conflict);
+            }
+            if inner.starting_by_instance.contains_key(&instance_id) {
+                return Err(PerformanceOperationStartError::Conflict);
             }
 
             let id = generate_performance_operation_id();
             let now = timestamp_utc();
-            let status = PerformanceOperationStatus {
+            PerformanceOperationStatus {
                 id: id.clone(),
                 instance_id: instance_id.clone(),
                 action,
@@ -147,18 +373,46 @@ impl PerformanceOperationStore {
                 error: None,
                 created_at: now.clone(),
                 updated_at: now,
-            };
-            inner.operations.insert(id.clone(), status.clone());
-            inner.active_by_instance.insert(instance_id, id);
-            status
+                journal_identity,
+            }
         };
-        self.persist_transition(&status);
+        self.inner
+            .write()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .starting_by_instance
+            .insert(instance_id, status.id.clone());
+        if let Err(source) = self.commit_transition(status.clone(), mutation).await {
+            if !self.has_retry_candidate(&status.id) {
+                let mut inner = self
+                    .inner
+                    .write()
+                    .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
+                if inner
+                    .starting_by_instance
+                    .get(&status.instance_id)
+                    .is_some_and(|id| id == &status.id)
+                {
+                    inner.starting_by_instance.remove(&status.instance_id);
+                }
+            }
+            return Err(PerformanceOperationStartError::Store {
+                operation_id: status.id,
+                source,
+            });
+        }
         Ok(status)
     }
 
     pub async fn take_pending_resumable_operations(&self) -> Vec<PerformanceOperationStatus> {
-        let mut inner = self.inner.lock().await;
-        let ids = std::mem::take(&mut inner.pending_resume_ids);
+        let mut inner = self
+            .inner
+            .write()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
+        let take_count = inner.pending_resume_ids.len().min(MAX_RESUMABLE_OPERATIONS);
+        let ids = inner
+            .pending_resume_ids
+            .drain(..take_count)
+            .collect::<Vec<_>>();
         ids.into_iter()
             .filter_map(|id| inner.operations.get(&id).cloned())
             .filter(|status| is_non_terminal(&status.state))
@@ -169,7 +423,22 @@ impl PerformanceOperationStore {
         if !is_safe_operation_id(id) {
             return None;
         }
-        self.inner.lock().await.operations.get(id).cloned()
+        self.inner
+            .read()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .operations
+            .get(id)
+            .cloned()
+    }
+
+    pub(crate) fn list(&self) -> Vec<PerformanceOperationStatus> {
+        self.inner
+            .read()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .operations
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn load_issues(&self) -> Vec<PerformanceOperationLoadIssue> {
@@ -189,7 +458,10 @@ impl PerformanceOperationStore {
             return None;
         }
 
-        let inner = self.inner.lock().await;
+        let inner = self
+            .inner
+            .read()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
         if let Some(active_id) = inner.active_by_instance.get(instance_id)
             && let Some(status) = inner.operations.get(active_id)
             && is_non_terminal(&status.state)
@@ -205,70 +477,317 @@ impl PerformanceOperationStore {
             .cloned()
     }
 
-    pub async fn record_progress(&self, id: &str, state: &str) {
+    pub async fn record_progress(
+        &self,
+        id: &str,
+        state: &str,
+    ) -> Result<(), PerformanceOperationStoreError> {
+        let _mutation = self.mutation_gate.lock().await;
         let status = {
-            let mut inner = self.inner.lock().await;
-            let Some(status) = inner.operations.get_mut(id) else {
-                return;
+            let inner = self
+                .inner
+                .read()
+                .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
+            let Some(status) = inner.operations.get(id) else {
+                return Err(PerformanceOperationStoreError::MissingOperation);
             };
             if !is_non_terminal(&status.state) {
-                return;
+                return Err(PerformanceOperationStoreError::TerminalMismatch);
             }
+            let mut status = status.clone();
             status.state = state.to_string();
             status.error = None;
             status.updated_at = timestamp_utc();
-            status.clone()
+            status
         };
-        self.persist_transition(&status);
+        self.accept_progress(status)?;
+        Ok(())
     }
 
-    pub async fn record_complete(&self, id: &str) {
-        self.record_terminal(id, "complete", None).await;
+    pub async fn record_effect_started(
+        &self,
+        id: &str,
+    ) -> Result<(), PerformanceOperationStoreError> {
+        self.record_critical_state(id, PERFORMANCE_EFFECT_STARTED_STATE, None)
+            .await
     }
 
-    pub async fn record_failed(&self, id: &str, error: &str) {
-        self.record_terminal(id, "failed", Some(sanitize_operation_error(error)))
-            .await;
+    pub async fn record_committing_complete(
+        &self,
+        id: &str,
+    ) -> Result<(), PerformanceOperationStoreError> {
+        self.record_critical_state(id, PERFORMANCE_COMMITTING_COMPLETE_STATE, None)
+            .await
     }
 
-    async fn record_terminal(&self, id: &str, state: &str, error: Option<String>) {
+    pub async fn record_committing_failed(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<(), PerformanceOperationStoreError> {
+        self.record_critical_state(
+            id,
+            PERFORMANCE_COMMITTING_FAILED_STATE,
+            Some(sanitize_operation_error(error)),
+        )
+        .await
+    }
+
+    pub async fn record_complete(&self, id: &str) -> Result<(), PerformanceOperationStoreError> {
+        self.record_critical_state(id, "complete", None).await
+    }
+
+    pub async fn record_failed(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<(), PerformanceOperationStoreError> {
+        self.record_critical_state(id, "failed", Some(sanitize_operation_error(error)))
+            .await
+    }
+
+    pub(crate) async fn record_reconciliation_failed(
+        &self,
+        id: &str,
+        error: &str,
+        action: &str,
+    ) -> Result<(), PerformanceOperationStoreError> {
+        if !matches!(action, "install" | "remove" | "rollback") {
+            return Err(PerformanceOperationStoreError::InvalidIdentity);
+        }
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let message = sanitize_operation_error(error);
         let status = {
-            let mut inner = self.inner.lock().await;
-            let Some(status) = inner.operations.get_mut(id) else {
-                return;
+            let inner = self
+                .inner
+                .read()
+                .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
+            let Some(status) = inner.operations.get(id) else {
+                return Err(PerformanceOperationStoreError::MissingOperation);
+            };
+            if status.state == "failed"
+                && status.error.as_deref() == Some(message.as_str())
+                && status.action == action
+                && status.journal_identity.as_ref().is_some_and(|identity| {
+                    identity.action == action
+                        && identity.target_id == "performance_reconciliation"
+                        && identity.rollback == RollbackState::Unavailable
+                })
+            {
+                return Ok(());
+            }
+            let mut status = status.clone();
+            status.action = action.to_string();
+            status.state = "failed".to_string();
+            status.error = Some(message);
+            status.updated_at = timestamp_utc();
+            status.journal_identity = Some(PerformanceOperationJournalIdentity::new(
+                action,
+                "performance_reconciliation",
+                RollbackState::Unavailable,
+            ));
+            status
+        };
+        self.commit_transition(status, mutation).await
+    }
+
+    async fn record_critical_state(
+        &self,
+        id: &str,
+        state: &str,
+        error: Option<String>,
+    ) -> Result<(), PerformanceOperationStoreError> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let status = {
+            let inner = self
+                .inner
+                .read()
+                .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
+            let Some(status) = inner.operations.get(id) else {
+                return Err(PerformanceOperationStoreError::MissingOperation);
             };
             if !is_non_terminal(&status.state) {
-                return;
+                let requested_error = error.as_deref().map(sanitize_operation_error);
+                if status.state == state && status.error == requested_error {
+                    return Ok(());
+                }
+                return Err(PerformanceOperationStoreError::TerminalMismatch);
             }
+            let mut status = status.clone();
             status.state = state.to_string();
             status.error = error;
             status.updated_at = timestamp_utc();
-            let instance_id = status.instance_id.clone();
-            let status = status.clone();
-            if inner
-                .active_by_instance
-                .get(&instance_id)
-                .map(|active_id| active_id == id)
-                .unwrap_or(false)
-            {
-                inner.active_by_instance.remove(&instance_id);
-            }
             status
         };
-        self.persist_transition(&status);
+        self.commit_transition(status, mutation).await
     }
 
-    fn persist_transition(&self, status: &PerformanceOperationStatus) {
-        let Some(storage_dir) = &self.storage_dir else {
-            return;
-        };
-        if let Err(error) = persist_status_to_dir(storage_dir, status) {
-            warn!(
-                operation_id = %status.id,
-                error = %error,
-                "failed to persist performance operation status"
+    pub async fn retry_critical(&self, id: &str) -> Result<(), PerformanceOperationStoreError> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let candidate = self
+            .retry_candidates
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .get(id)
+            .cloned()
+            .ok_or(PerformanceOperationStoreError::RetryUnavailable)?;
+        let Some(persistence) = &self.persistence else {
+            apply_status_transition(
+                &mut self
+                    .inner
+                    .write()
+                    .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT),
+                candidate,
             );
+            drop(mutation);
+            return Ok(());
+        };
+        let ticket = persistence
+            .writer(id)?
+            .retry()
+            .map_err(performance_operation_persistence_error)?;
+        self.await_commit(candidate, ticket, mutation).await
+    }
+
+    pub(crate) fn has_retry_candidate(&self, id: &str) -> bool {
+        self.retry_candidates
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .contains_key(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retry_candidate_ids(&self) -> Vec<String> {
+        self.retry_candidates
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub async fn flush(&self) -> Result<(), PerformanceOperationStoreError> {
+        let _mutation = self.mutation_gate.lock().await;
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .owner
+                .flush()
+                .await
+                .map_err(performance_operation_persistence_error)?;
         }
+        Ok(())
+    }
+
+    pub async fn close(&self) -> Result<(), PerformanceOperationStoreError> {
+        let _mutation = self.mutation_gate.lock().await;
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .owner
+                .close()
+                .await
+                .map_err(performance_operation_persistence_error)?;
+        }
+        Ok(())
+    }
+
+    fn accept_progress(
+        &self,
+        status: PerformanceOperationStatus,
+    ) -> Result<(), PerformanceOperationStoreError> {
+        if self
+            .retry_candidates
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .contains_key(&status.id)
+        {
+            return Err(PerformanceOperationStoreError::RetryRequired);
+        }
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .writer(&status.id)?
+                .accept(status.clone(), WriteUrgency::Debounced, encode_status)
+                .map_err(performance_operation_persistence_error)?;
+        }
+        apply_status_transition(
+            &mut self
+                .inner
+                .write()
+                .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT),
+            status,
+        );
+        Ok(())
+    }
+
+    async fn commit_transition(
+        &self,
+        status: PerformanceOperationStatus,
+        mutation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), PerformanceOperationStoreError> {
+        if self
+            .retry_candidates
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .contains_key(&status.id)
+        {
+            return Err(PerformanceOperationStoreError::RetryRequired);
+        }
+        let Some(persistence) = &self.persistence else {
+            apply_status_transition(
+                &mut self
+                    .inner
+                    .write()
+                    .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT),
+                status,
+            );
+            drop(mutation);
+            return Ok(());
+        };
+        let ticket = persistence
+            .writer(&status.id)?
+            .accept(status.clone(), WriteUrgency::Immediate, encode_status)
+            .map_err(performance_operation_persistence_error)?;
+        self.await_commit(status, ticket, mutation).await
+    }
+
+    async fn await_commit(
+        &self,
+        status: PerformanceOperationStatus,
+        ticket: AcceptedWrite,
+        mutation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), PerformanceOperationStoreError> {
+        let inner = self.inner.clone();
+        let retry_candidates = self.retry_candidates.clone();
+        let operation_id = status.id.clone();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        ticket.observe(move |result| {
+            let result = match result {
+                Ok(_) => {
+                    apply_status_transition(
+                        &mut inner.write().expect(PERFORMANCE_OPERATION_LOCK_INVARIANT),
+                        status,
+                    );
+                    retry_candidates
+                        .lock()
+                        .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+                        .remove(&operation_id);
+                    Ok(())
+                }
+                Err(error) => {
+                    retry_candidates
+                        .lock()
+                        .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+                        .insert(operation_id, status);
+                    Err(performance_operation_persistence_error(error))
+                }
+            };
+            drop(mutation);
+            let _ = completed_tx.send(result);
+        });
+        completed_rx.await.map_err(|_| {
+            PerformanceOperationStoreError::Persistence(io::Error::other(
+                "performance operation commit observer stopped",
+            ))
+        })?
     }
 }
 
@@ -278,15 +797,60 @@ impl Default for PerformanceOperationStore {
     }
 }
 
+fn apply_status_transition(
+    inner: &mut PerformanceOperationInner,
+    status: PerformanceOperationStatus,
+) {
+    let operation_id = status.id.clone();
+    let instance_id = status.instance_id.clone();
+    if inner
+        .starting_by_instance
+        .get(&instance_id)
+        .is_some_and(|starting_id| starting_id == &operation_id)
+    {
+        inner.starting_by_instance.remove(&instance_id);
+    }
+    if is_non_terminal(&status.state) && !instance_id.trim().is_empty() {
+        match inner.active_by_instance.get(&instance_id) {
+            None => {
+                inner
+                    .active_by_instance
+                    .insert(instance_id.clone(), operation_id.clone());
+            }
+            Some(active_id) if active_id == &operation_id => {}
+            Some(_) => {}
+        }
+    } else if inner
+        .active_by_instance
+        .get(&instance_id)
+        .is_some_and(|active_id| active_id == &operation_id)
+    {
+        inner.active_by_instance.remove(&instance_id);
+    }
+    inner.operations.insert(operation_id, status);
+}
+
+fn encode_status(status: PerformanceOperationStatus) -> io::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(&PersistedPerformanceOperationStatus::from(status))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn performance_operation_persistence_error(
+    error: crate::execution::persistence::PersistenceError,
+) -> PerformanceOperationStoreError {
+    PerformanceOperationStoreError::Persistence(error.into())
+}
+
 fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoadState {
     let mut load_state = PerformanceOperationLoadState::default();
+    let mut candidates = HashMap::<String, PerformanceOperationStatus>::new();
+    let mut conflicting_ids = HashSet::<String>::new();
     let entries = match fs::read_dir(storage_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return load_state,
         Err(error) => {
             warn!(
-                path = %storage_dir.display(),
-                error = %error,
+                error_kind = ?error.kind(),
                 "failed to read performance operation status directory"
             );
             record_load_issue(
@@ -302,7 +866,7 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
             Ok(entry) => entry,
             Err(error) => {
                 warn!(
-                    error = %error,
+                    error_kind = ?error.kind(),
                     "failed to read performance operation status directory entry"
                 );
                 record_load_issue(
@@ -320,8 +884,7 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
             Ok(status) => status,
             Err(error) => {
                 warn!(
-                    path = %path.display(),
-                    error = %error,
+                    error_kind = ?error.kind(),
                     "failed to load performance operation status"
                 );
                 record_load_issue(
@@ -339,42 +902,72 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
             );
             continue;
         }
+        let canonical_filename = safe_operation_filename(&status.id);
+        if path.file_name().and_then(|value| value.to_str()) != Some(canonical_filename.as_str()) {
+            record_load_issue(
+                &mut load_state.issues,
+                PerformanceOperationLoadIssueKind::NonCanonicalFilename,
+            );
+            conflicting_ids.insert(status.id);
+            continue;
+        }
         if let Some(error) = status.error.take() {
             status.error = Some(sanitize_operation_error(&error));
         }
+        let created_at_valid = normalize_operation_timestamp(&mut status.created_at);
+        let updated_at_valid = normalize_operation_timestamp(&mut status.updated_at);
+        let operation_id = status.id.clone();
+        if candidates.insert(operation_id.clone(), status).is_some() {
+            record_load_issue(
+                &mut load_state.issues,
+                PerformanceOperationLoadIssueKind::DuplicateOperationId,
+            );
+            conflicting_ids.insert(operation_id.clone());
+        }
+        if !created_at_valid || !updated_at_valid {
+            record_load_issue(
+                &mut load_state.issues,
+                PerformanceOperationLoadIssueKind::MalformedOperationStatus,
+            );
+            conflicting_ids.insert(operation_id);
+        }
+    }
+
+    let mut candidates = candidates.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.id.cmp(&right.id));
+    for mut status in candidates {
+        if !is_valid_loaded_status(&status) || conflicting_ids.contains(&status.id) {
+            warn!(
+                operation_id = %status.id,
+                "loaded performance operation requires fail-safe reconciliation"
+            );
+            record_load_issue(
+                &mut load_state.issues,
+                PerformanceOperationLoadIssueKind::MalformedOperationStatus,
+            );
+            status.state = PERFORMANCE_RESUME_INVALID_STATE.to_string();
+        }
         if is_non_terminal(&status.state) {
-            if !is_valid_loaded_status(&status) {
-                warn!(
-                    operation_id = %status.id,
-                    "skipping malformed persisted performance operation"
-                );
-                record_load_issue(
-                    &mut load_state.issues,
-                    PerformanceOperationLoadIssueKind::MalformedOperationStatus,
-                );
-                continue;
-            }
-            if load_state.inner.pending_resume_ids.len() >= MAX_RESUMABLE_OPERATIONS {
-                status.state = "interrupted".to_string();
-                status.error = Some(RESUME_LIMIT_ERROR.to_string());
-                status.updated_at = timestamp_utc();
-                load_state.interrupted.push(status.clone());
-            } else if load_state
-                .inner
-                .active_by_instance
-                .contains_key(&status.instance_id)
+            let duplicate_instance = !status.instance_id.trim().is_empty()
+                && load_state
+                    .inner
+                    .active_by_instance
+                    .contains_key(&status.instance_id);
+            let beyond_batch =
+                load_state.inner.pending_resume_ids.len() >= MAX_RESUMABLE_OPERATIONS;
+            if status.state != PERFORMANCE_RESUME_INVALID_STATE
+                && (duplicate_instance || beyond_batch)
             {
-                status.state = "interrupted".to_string();
-                status.error = Some(DUPLICATE_RESUME_ERROR.to_string());
-                status.updated_at = timestamp_utc();
-                load_state.interrupted.push(status.clone());
-            } else {
+                status.state = PERFORMANCE_RESUME_BLOCKED_STATE.to_string();
+            } else if status.state != PERFORMANCE_RESUME_INVALID_STATE
+                && !status.instance_id.trim().is_empty()
+            {
                 load_state
                     .inner
                     .active_by_instance
                     .insert(status.instance_id.clone(), status.id.clone());
-                load_state.inner.pending_resume_ids.push(status.id.clone());
             }
+            load_state.inner.pending_resume_ids.push(status.id.clone());
         }
         load_state
             .inner
@@ -409,27 +1002,80 @@ fn is_non_terminal(state: &str) -> bool {
 }
 
 fn is_valid_loaded_status(status: &PerformanceOperationStatus) -> bool {
-    matches!(status.action.as_str(), "install" | "remove" | "rollback")
+    matches!(
+        status.state.as_str(),
+        "queued"
+            | "planning"
+            | "applying"
+            | "removing"
+            | "rolling_back"
+            | PERFORMANCE_EFFECT_STARTED_STATE
+            | PERFORMANCE_COMMITTING_COMPLETE_STATE
+            | PERFORMANCE_COMMITTING_FAILED_STATE
+            | "complete"
+            | "failed"
+            | "interrupted"
+    ) && matches!(status.action.as_str(), "install" | "remove" | "rollback")
         && !status.instance_id.trim().is_empty()
+        && status
+            .journal_identity
+            .as_ref()
+            .is_some_and(|identity| valid_journal_identity(identity, &status.action))
+}
+
+fn valid_journal_identity(
+    identity: &PerformanceOperationJournalIdentity,
+    expected_action: &str,
+) -> bool {
+    matches!(
+        (expected_action, identity.action.as_str()),
+        ("install", "install" | "remove") | ("remove", "remove") | ("rollback", "rollback")
+    ) && !identity.target_id.trim().is_empty()
+        && identity.target_id.len() <= MAX_OPERATION_FILENAME_STEM
+        && identity
+            .target_id
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
+}
+
+fn normalize_operation_timestamp(value: &mut String) -> bool {
+    let Some(normalized) = normalized_operation_timestamp(value) else {
+        *value = "unknown".to_string();
+        return false;
+    };
+    *value = normalized;
+    true
+}
+
+pub(crate) fn normalized_operation_timestamp(value: &str) -> Option<String> {
+    DateTime::parse_from_rfc3339(value.trim())
+        .ok()
+        .map(|value| {
+            value
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::AutoSi, true)
+        })
 }
 
 fn load_status_file(path: &Path) -> io::Result<PerformanceOperationStatus> {
     let data = fs::read_to_string(path)?;
-    serde_json::from_str(&data).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    serde_json::from_str::<PersistedPerformanceOperationStatus>(&data)
+        .map(Into::into)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+#[cfg(test)]
 fn persist_status_to_dir(
     storage_dir: &Path,
     status: &PerformanceOperationStatus,
 ) -> io::Result<()> {
     fs::create_dir_all(storage_dir)?;
     let path = operation_path(storage_dir, &status.id);
-    let data = serde_json::to_string_pretty(status)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let data = encode_status(status.clone())?;
     write_file_atomically(FileWriteRequest::new(
         performance_operation_status_target(&status.id),
         &path,
-        data.as_bytes(),
+        &data,
     ))
     .map(|_| ())
     .map_err(io::Error::from)
@@ -496,10 +1142,20 @@ fn compare_operation_recency(
     left: &&PerformanceOperationStatus,
     right: &&PerformanceOperationStatus,
 ) -> std::cmp::Ordering {
-    left.updated_at
-        .cmp(&right.updated_at)
-        .then_with(|| left.created_at.cmp(&right.created_at))
+    parsed_operation_timestamp(&left.updated_at)
+        .cmp(&parsed_operation_timestamp(&right.updated_at))
+        .then_with(|| {
+            parsed_operation_timestamp(&left.created_at)
+                .cmp(&parsed_operation_timestamp(&right.created_at))
+        })
         .then_with(|| operation_id_index(&left.id).cmp(&operation_id_index(&right.id)))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn parsed_operation_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value.trim())
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
 }
 
 pub fn generate_performance_operation_id() -> String {
@@ -522,7 +1178,77 @@ pub fn sanitize_operation_error(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
+    use crate::state::contracts::TargetDescriptor;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct ControlledBackend {
+        fail_writes: AtomicBool,
+        gate_writes: AtomicBool,
+        entered_write: AtomicBool,
+        writes: SyncMutex<Vec<(PathBuf, Vec<u8>)>>,
+    }
+
+    impl ControlledBackend {
+        fn coordinator(self: &Arc<Self>) -> PersistenceCoordinator {
+            PersistenceCoordinator::for_test(
+                self.clone(),
+                Duration::from_millis(25),
+                Duration::from_millis(100),
+            )
+        }
+
+        fn set_fail_writes(&self, fail: bool) {
+            self.fail_writes.store(fail, Ordering::SeqCst);
+        }
+
+        fn gate(&self) {
+            self.entered_write.store(false, Ordering::SeqCst);
+            self.gate_writes.store(true, Ordering::SeqCst);
+        }
+
+        fn release(&self) {
+            self.gate_writes.store(false, Ordering::SeqCst);
+        }
+
+        fn write_count_for(&self, destination: &Path) -> usize {
+            self.writes
+                .lock()
+                .expect("controlled backend writes lock")
+                .iter()
+                .filter(|(path, _)| path == destination)
+                .count()
+        }
+    }
+
+    impl AtomicWriteBackend for ControlledBackend {
+        fn write(
+            &self,
+            _target: &TargetDescriptor,
+            destination: &Path,
+            contents: &[u8],
+        ) -> io::Result<()> {
+            self.entered_write.store(true, Ordering::SeqCst);
+            while self.gate_writes.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if self.fail_writes.load(Ordering::SeqCst) {
+                return Err(io::Error::other("injected performance status failure"));
+            }
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(destination, contents)?;
+            self.writes
+                .lock()
+                .expect("controlled backend writes lock")
+                .push((destination.to_path_buf(), contents.to_vec()));
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn persisted_operation_status_survives_restart_as_pending_resume() {
@@ -530,20 +1256,30 @@ mod tests {
         let paths = test_paths(&root);
         let store = PerformanceOperationStore::load_from_paths(&paths);
         let started = store
-            .start(
+            .start_with_identity(
                 "instance-a".to_string(),
                 "install".to_string(),
                 test_payload(),
+                PerformanceOperationJournalIdentity::new(
+                    "install",
+                    "restart_composition",
+                    RollbackState::Unavailable,
+                ),
             )
             .await
             .expect("operation starts");
-        store.record_progress(&started.id, "applying").await;
+        store
+            .record_progress(&started.id, "applying")
+            .await
+            .expect("progress accepted");
+        store.flush().await.expect("progress persisted");
 
         let path = operation_path(&operation_dir(&paths), &started.id);
         assert!(path.is_file());
         let persisted = load_status_file(&path).expect("persisted status should load");
         assert_eq!(persisted.state, "applying");
 
+        store.close().await.expect("store closes before restart");
         let reloaded = PerformanceOperationStore::load_from_paths(&paths);
         let resumable = reloaded
             .get(&started.id)
@@ -574,8 +1310,14 @@ mod tests {
                 test_payload(),
             )
             .await;
-        assert_eq!(conflict.err(), Some(PerformanceOperationConflict));
-        reloaded.record_complete(&started.id).await;
+        assert!(matches!(
+            conflict,
+            Err(PerformanceOperationStartError::Conflict)
+        ));
+        reloaded
+            .record_complete(&started.id)
+            .await
+            .expect("operation completes");
         reloaded
             .start(
                 "instance-a".to_string(),
@@ -594,14 +1336,23 @@ mod tests {
         let paths = test_paths(&root);
         let store = PerformanceOperationStore::load_from_paths(&paths);
         let started = store
-            .start(
+            .start_with_identity(
                 "instance-a".to_string(),
                 "remove".to_string(),
                 test_payload(),
+                PerformanceOperationJournalIdentity::new(
+                    "remove",
+                    "terminal_visible",
+                    RollbackState::Unavailable,
+                ),
             )
             .await
             .expect("operation starts");
-        store.record_complete(&started.id).await;
+        store
+            .record_complete(&started.id)
+            .await
+            .expect("operation completes");
+        store.close().await.expect("store closes before restart");
 
         let reloaded = PerformanceOperationStore::load_from_paths(&paths);
         let status = reloaded
@@ -632,7 +1383,10 @@ mod tests {
             )
             .await
             .expect("operation starts");
-        store.record_failed(&failed.id, "failed").await;
+        store
+            .record_failed(&failed.id, "failed")
+            .await
+            .expect("operation fails");
         let active = store
             .start(
                 "instance-a".to_string(),
@@ -649,6 +1403,41 @@ mod tests {
 
         assert_eq!(by_instance.id, active.id);
         assert_eq!(by_instance.state, "queued");
+    }
+
+    #[tokio::test]
+    async fn progress_rejects_missing_and_terminal_operations() {
+        let store = PerformanceOperationStore::new();
+        assert!(matches!(
+            store.record_progress("missing-operation", "applying").await,
+            Err(PerformanceOperationStoreError::MissingOperation)
+        ));
+
+        let started = store
+            .start(
+                "instance-a".to_string(),
+                "install".to_string(),
+                test_payload(),
+            )
+            .await
+            .expect("operation starts");
+        store
+            .record_complete(&started.id)
+            .await
+            .expect("operation completes");
+
+        assert!(matches!(
+            store.record_progress(&started.id, "applying").await,
+            Err(PerformanceOperationStoreError::TerminalMismatch)
+        ));
+        assert_eq!(
+            store
+                .get(&started.id)
+                .await
+                .expect("terminal status retained")
+                .state,
+            "complete"
+        );
     }
 
     #[tokio::test]
@@ -671,7 +1460,10 @@ mod tests {
             )
             .await;
 
-        assert_eq!(conflict.err(), Some(PerformanceOperationConflict));
+        assert!(matches!(
+            conflict,
+            Err(PerformanceOperationStartError::Conflict)
+        ));
     }
 
     #[tokio::test]
@@ -685,7 +1477,10 @@ mod tests {
             )
             .await
             .expect("operation starts");
-        store.record_failed(&started.id, "failed").await;
+        store
+            .record_failed(&started.id, "failed")
+            .await
+            .expect("operation fails");
 
         store
             .start(
@@ -695,6 +1490,322 @@ mod tests {
             )
             .await
             .expect("terminal operation should not conflict");
+    }
+
+    #[tokio::test]
+    async fn persistence_owner_rejects_duplicate_store_for_exact_directory() {
+        let root = test_root("duplicate-owner");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        let coordinator = backend.coordinator();
+        let first = PerformanceOperationStore::try_load_from_paths_with_coordinator(
+            &paths,
+            coordinator.clone(),
+        )
+        .expect("first owner");
+
+        let duplicate = PerformanceOperationStore::try_load_from_paths_with_coordinator(
+            &paths,
+            coordinator.clone(),
+        );
+        assert!(matches!(
+            duplicate,
+            Err(PerformanceOperationStoreError::Persistence(ref error))
+                if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+
+        first.close().await.expect("first owner closes");
+        PerformanceOperationStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+            .expect("closed owner releases exact directory");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn failed_start_reserves_instance_until_exact_candidate_is_reconciled() {
+        let root = test_root("failed-start-reservation");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        backend.set_fail_writes(true);
+        let store = PerformanceOperationStore::try_load_from_paths_with_coordinator(
+            &paths,
+            backend.coordinator(),
+        )
+        .expect("store");
+
+        let failed = store
+            .start(
+                "instance-a".to_string(),
+                "install".to_string(),
+                test_payload(),
+            )
+            .await
+            .expect_err("physical start write fails");
+        let failed_id = failed.operation_id().expect("failed start id").to_string();
+        assert!(store.has_retry_candidate(&failed_id));
+        assert!(
+            store
+                .current_or_latest_for_instance("instance-a")
+                .await
+                .is_none()
+        );
+        assert!(matches!(
+            store
+                .start(
+                    "instance-a".to_string(),
+                    "remove".to_string(),
+                    test_payload(),
+                )
+                .await,
+            Err(PerformanceOperationStartError::Conflict)
+        ));
+
+        backend.set_fail_writes(false);
+        store
+            .retry_critical(&failed_id)
+            .await
+            .expect("exact queued candidate retries");
+        store
+            .record_failed(&failed_id, "start persistence failed")
+            .await
+            .expect("reconciled start terminalizes");
+        store
+            .start(
+                "instance-a".to_string(),
+                "remove".to_string(),
+                test_payload(),
+            )
+            .await
+            .expect("terminalized reservation releases instance");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn critical_commit_promotes_after_awaiting_caller_is_aborted() {
+        let root = test_root("critical-abort-observer");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        backend.gate();
+        let store = Arc::new(
+            PerformanceOperationStore::try_load_from_paths_with_coordinator(
+                &paths,
+                backend.coordinator(),
+            )
+            .expect("store"),
+        );
+        let task_store = store.clone();
+        let task = tokio::spawn(async move {
+            task_store
+                .start(
+                    "instance-a".to_string(),
+                    "install".to_string(),
+                    test_payload(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !backend.entered_write.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer entered");
+        task.abort();
+        backend.release();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store
+                    .current_or_latest_for_instance("instance-a")
+                    .await
+                    .is_some_and(|status| status.state == "queued")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached observer promotes queued status");
+        assert!(matches!(
+            store
+                .start(
+                    "instance-a".to_string(),
+                    "remove".to_string(),
+                    test_payload(),
+                )
+                .await,
+            Err(PerformanceOperationStartError::Conflict)
+        ));
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn critical_failure_retries_exact_bytes_and_competing_retrier_exits() {
+        let root = test_root("critical-retry-race");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        let store = Arc::new(
+            PerformanceOperationStore::try_load_from_paths_with_coordinator(
+                &paths,
+                backend.coordinator(),
+            )
+            .expect("store"),
+        );
+        let started = store
+            .start(
+                "instance-a".to_string(),
+                "install".to_string(),
+                test_payload(),
+            )
+            .await
+            .expect("start");
+        backend.set_fail_writes(true);
+        assert!(matches!(
+            store.record_effect_started(&started.id).await,
+            Err(PerformanceOperationStoreError::Persistence(_))
+        ));
+        assert_eq!(
+            store.get(&started.id).await.expect("visible status").state,
+            "queued"
+        );
+        assert!(matches!(
+            store.record_committing_complete(&started.id).await,
+            Err(PerformanceOperationStoreError::RetryRequired)
+        ));
+
+        backend.set_fail_writes(false);
+        let first_store = store.clone();
+        let first_id = started.id.clone();
+        let first = tokio::spawn(async move { first_store.retry_critical(&first_id).await });
+        let second_store = store.clone();
+        let second_id = started.id.clone();
+        let second = tokio::spawn(async move { second_store.retry_critical(&second_id).await });
+        let first = first.await.expect("first retrier task");
+        let second = second.await.expect("second retrier task");
+        assert!(first.is_ok() ^ second.is_ok());
+        assert!(matches!(
+            first.as_ref().err().or(second.as_ref().err()),
+            Some(PerformanceOperationStoreError::RetryUnavailable)
+        ));
+        assert!(!store.has_retry_candidate(&started.id));
+        assert_eq!(
+            store.get(&started.id).await.expect("promoted status").state,
+            PERFORMANCE_EFFECT_STARTED_STATE
+        );
+        let persisted = load_status_file(&operation_path(&operation_dir(&paths), &started.id))
+            .expect("retried exact status bytes");
+        assert_eq!(persisted.state, PERFORMANCE_EFFECT_STARTED_STATE);
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn critical_missing_and_terminal_mismatch_are_typed() {
+        let store = PerformanceOperationStore::new();
+        assert!(matches!(
+            store
+                .record_failed(
+                    "performance-install-00000000000000000000000000000000",
+                    "missing",
+                )
+                .await,
+            Err(PerformanceOperationStoreError::MissingOperation)
+        ));
+        let started = store
+            .start(
+                "instance-a".to_string(),
+                "install".to_string(),
+                test_payload(),
+            )
+            .await
+            .expect("start");
+        store
+            .record_failed(&started.id, "same failure")
+            .await
+            .expect("terminal failure");
+        store
+            .record_failed(&started.id, "same failure")
+            .await
+            .expect("same terminal transition is idempotent");
+        assert!(matches!(
+            store.record_complete(&started.id).await,
+            Err(PerformanceOperationStoreError::TerminalMismatch)
+        ));
+        assert!(matches!(
+            store.record_failed(&started.id, "different").await,
+            Err(PerformanceOperationStoreError::TerminalMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn progress_bursts_coalesce_independently_per_operation_id() {
+        let root = test_root("per-id-coalescing");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        let store = PerformanceOperationStore::try_load_from_paths_with_coordinator(
+            &paths,
+            backend.coordinator(),
+        )
+        .expect("store");
+        let first = store
+            .start(
+                "instance-a".to_string(),
+                "install".to_string(),
+                test_payload(),
+            )
+            .await
+            .expect("first start");
+        let second = store
+            .start(
+                "instance-b".to_string(),
+                "remove".to_string(),
+                test_payload(),
+            )
+            .await
+            .expect("second start");
+        for index in 0..40 {
+            store
+                .record_progress(&first.id, &format!("first_{index}"))
+                .await
+                .expect("first progress");
+            store
+                .record_progress(&second.id, &format!("second_{index}"))
+                .await
+                .expect("second progress");
+        }
+        store.flush().await.expect("bursts flush");
+        let dir = operation_dir(&paths);
+        let first_path = operation_path(&dir, &first.id);
+        let second_path = operation_path(&dir, &second.id);
+        assert!(backend.write_count_for(&first_path) <= 2);
+        assert!(backend.write_count_for(&second_path) <= 2);
+        assert_eq!(
+            load_status_file(&first_path).expect("first latest").state,
+            "first_39"
+        );
+        assert_eq!(
+            load_status_file(&second_path).expect("second latest").state,
+            "second_39"
+        );
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn poisoned_operation_lock_panics_instead_of_returning_partial_state() {
+        let store = Arc::new(PerformanceOperationStore::new());
+        let inner = store.inner.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = inner.write().expect("lock initially available");
+            panic!("inject poison");
+        });
+        let task_store = store.clone();
+        let failure = tokio::spawn(async move {
+            task_store
+                .get("performance-install-00000000000000000000000000000000")
+                .await
+        })
+        .await
+        .expect_err("poisoned invariant must panic");
+        assert!(failure.is_panic());
     }
 
     #[test]
@@ -718,6 +1829,205 @@ mod tests {
         cleanup(&root);
     }
 
+    #[tokio::test]
+    async fn persisted_identity_is_internal_and_survives_reload() {
+        let root = test_root("internal-journal-identity");
+        let paths = test_paths(&root);
+        let store = PerformanceOperationStore::load_from_paths(&paths);
+        let started = store
+            .start_with_identity(
+                "instance-a".to_string(),
+                "install".to_string(),
+                test_payload(),
+                PerformanceOperationJournalIdentity::new(
+                    "install",
+                    "stable_composition",
+                    RollbackState::Available,
+                ),
+            )
+            .await
+            .expect("operation starts with identity");
+        store.close().await.expect("status store closes");
+
+        let public = serde_json::to_value(&started).expect("public status serializes");
+        assert!(public.get("journal_identity").is_none());
+        let path = operation_path(&operation_dir(&paths), &started.id);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("persisted status bytes"))
+                .expect("persisted status json");
+        assert_eq!(persisted["journal_identity"]["action"], "install");
+        assert_eq!(
+            persisted["journal_identity"]["target_id"],
+            "stable_composition"
+        );
+
+        let reloaded = PerformanceOperationStore::load_from_paths(&paths);
+        let status = reloaded.get(&started.id).await.expect("status reloads");
+        assert_eq!(status.journal_identity, started.journal_identity);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn noncanonical_duplicate_id_loads_once_and_is_blocked_for_reconciliation() {
+        let root = test_root("noncanonical-duplicate-id");
+        let paths = test_paths(&root);
+        let dir = operation_dir(&paths);
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let id = "performance-install-00000000000000000000000000000001";
+        let status = test_status(id, "instance-a", "install", "applying", test_payload());
+        persist_status_to_dir(&dir, &status).expect("persist canonical status");
+        fs::copy(operation_path(&dir, id), dir.join("copied-status.json"))
+            .expect("copy status under noncanonical filename");
+
+        let load_state = load_persisted_operation_inner(&dir);
+
+        assert_eq!(load_state.inner.operations.len(), 1);
+        assert_eq!(load_state.inner.pending_resume_ids, vec![id.to_string()]);
+        assert_eq!(
+            load_state.inner.operations[id].state,
+            PERFORMANCE_RESUME_INVALID_STATE
+        );
+        assert!(load_state.issues.iter().any(|issue| {
+            issue.kind == PerformanceOperationLoadIssueKind::NonCanonicalFilename
+                && issue.count == 1
+        }));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn invalid_terminal_records_are_queued_for_fail_safe_reconciliation() {
+        let root = test_root("invalid-terminal-records");
+        let paths = test_paths(&root);
+        let dir = operation_dir(&paths);
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let missing_identity_id = "performance-install-00000000000000000000000000000001";
+        let malformed_action_id = "performance-install-00000000000000000000000000000002";
+        let empty_instance_id = "performance-install-00000000000000000000000000000003";
+        let mut missing_identity = test_status(
+            missing_identity_id,
+            "instance-a",
+            "install",
+            "complete",
+            test_payload(),
+        );
+        missing_identity.journal_identity = None;
+        let malformed_action = test_status(
+            malformed_action_id,
+            "instance-b",
+            "unexpected",
+            "failed",
+            test_payload(),
+        );
+        let empty_instance =
+            test_status(empty_instance_id, "", "remove", "complete", test_payload());
+        for status in [&missing_identity, &malformed_action, &empty_instance] {
+            persist_status_to_dir(&dir, status).expect("persist invalid terminal status");
+        }
+
+        let load_state = load_persisted_operation_inner(&dir);
+
+        for id in [missing_identity_id, malformed_action_id, empty_instance_id] {
+            assert_eq!(
+                load_state.inner.operations[id].state,
+                PERFORMANCE_RESUME_INVALID_STATE
+            );
+            assert!(
+                load_state
+                    .inner
+                    .pending_resume_ids
+                    .contains(&id.to_string())
+            );
+        }
+        cleanup(&root);
+    }
+
+    #[test]
+    fn noncanonical_terminal_duplicate_cannot_remain_successful() {
+        let root = test_root("noncanonical-terminal-duplicate");
+        let paths = test_paths(&root);
+        let dir = operation_dir(&paths);
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let id = "performance-install-00000000000000000000000000000001";
+        let status = test_status(id, "instance-a", "install", "complete", test_payload());
+        persist_status_to_dir(&dir, &status).expect("persist canonical terminal status");
+        fs::copy(operation_path(&dir, id), dir.join("copied-terminal.json"))
+            .expect("copy terminal status under noncanonical filename");
+
+        let load_state = load_persisted_operation_inner(&dir);
+
+        assert_eq!(
+            load_state.inner.operations[id].state,
+            PERFORMANCE_RESUME_INVALID_STATE
+        );
+        assert_eq!(load_state.inner.pending_resume_ids, vec![id.to_string()]);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn invalid_persisted_timestamps_are_replaced_and_block_resume() {
+        let root = test_root("invalid-timestamps");
+        let paths = test_paths(&root);
+        let dir = operation_dir(&paths);
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let id = "performance-install-00000000000000000000000000000001";
+        let mut status = test_status(id, "instance-a", "remove", "removing", test_payload());
+        status.created_at = "/Users/alice/private/token=secret".to_string();
+        status.updated_at = "not-a-timestamp".to_string();
+        persist_status_to_dir(&dir, &status).expect("persist invalid timestamps");
+
+        let load_state = load_persisted_operation_inner(&dir);
+        let loaded = &load_state.inner.operations[id];
+
+        assert_eq!(loaded.created_at, "unknown");
+        assert_eq!(loaded.updated_at, "unknown");
+        assert_eq!(loaded.state, PERFORMANCE_RESUME_INVALID_STATE);
+        assert!(load_state.issues.iter().any(|issue| {
+            issue.kind == PerformanceOperationLoadIssueKind::MalformedOperationStatus
+        }));
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn latest_terminal_operation_compares_timestamp_instants_across_offsets() {
+        let root = test_root("timestamp-offset-order");
+        let paths = test_paths(&root);
+        let dir = operation_dir(&paths);
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let earlier_id = "performance-install-00000000000000000000000000000001";
+        let later_id = "performance-install-00000000000000000000000000000002";
+        let mut earlier = test_status(
+            earlier_id,
+            "instance-a",
+            "remove",
+            "complete",
+            test_payload(),
+        );
+        earlier.created_at = "2026-07-10T01:30:00+02:00".to_string();
+        earlier.updated_at = earlier.created_at.clone();
+        let mut later = test_status(later_id, "instance-a", "remove", "complete", test_payload());
+        later.created_at = "2026-07-10T00:00:00Z".to_string();
+        later.updated_at = later.created_at.clone();
+        persist_status_to_dir(&dir, &earlier).expect("persist offset status");
+        persist_status_to_dir(&dir, &later).expect("persist UTC status");
+
+        let store = PerformanceOperationStore::load_from_paths(&paths);
+        let latest = store
+            .current_or_latest_for_instance("instance-a")
+            .await
+            .expect("latest terminal operation");
+
+        assert_eq!(latest.id, later_id);
+        assert_eq!(
+            store
+                .get(earlier_id)
+                .await
+                .expect("offset status loaded")
+                .updated_at,
+            "2026-07-09T23:30:00Z"
+        );
+        cleanup(&root);
+    }
+
     #[test]
     fn unsafe_operation_ids_are_not_loaded_or_returned() {
         let root = test_root("unsafe-id");
@@ -733,13 +2043,13 @@ mod tests {
             error: None,
             created_at: timestamp_utc(),
             updated_at: timestamp_utc(),
+            journal_identity: None,
         };
         persist_status_to_dir(&dir, &status).expect("persist unsafe status");
 
         let load_state = load_persisted_operation_inner(&dir);
 
         assert!(load_state.inner.operations.is_empty());
-        assert!(load_state.interrupted.is_empty());
         assert_eq!(
             load_state.issues,
             vec![PerformanceOperationLoadIssue {
@@ -752,7 +2062,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_pending_operations_for_instance_interrupt_extra_records() {
+    fn duplicate_pending_operations_for_instance_retain_extra_records_for_reconciliation() {
         let root = test_root("duplicate-pending");
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
@@ -776,12 +2086,14 @@ mod tests {
 
         let load_state = load_persisted_operation_inner(&dir);
 
-        assert_eq!(load_state.inner.pending_resume_ids.len(), 1);
-        assert_eq!(load_state.interrupted.len(), 1);
-        assert_eq!(
-            load_state.interrupted[0].error.as_deref(),
-            Some(DUPLICATE_RESUME_ERROR)
-        );
+        assert_eq!(load_state.inner.pending_resume_ids.len(), 2);
+        let blocked = load_state
+            .inner
+            .operations
+            .values()
+            .filter(|status| status.state == PERFORMANCE_RESUME_BLOCKED_STATE)
+            .count();
+        assert_eq!(blocked, 1);
         assert_eq!(
             load_state.inner.active_by_instance.get("instance-a"),
             load_state.inner.pending_resume_ids.first()
@@ -792,7 +2104,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_current_schema_pending_operation_is_not_resumed() {
+    fn malformed_current_schema_pending_operation_is_retained_for_reconciliation() {
         let root = test_root("malformed-pending");
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
@@ -808,10 +2120,18 @@ mod tests {
 
         let load_state = load_persisted_operation_inner(&dir);
 
-        assert!(load_state.inner.operations.is_empty());
+        assert_eq!(load_state.inner.operations.len(), 1);
         assert!(load_state.inner.active_by_instance.is_empty());
-        assert!(load_state.inner.pending_resume_ids.is_empty());
-        assert!(load_state.interrupted.is_empty());
+        assert_eq!(load_state.inner.pending_resume_ids.len(), 1);
+        assert_eq!(
+            load_state
+                .inner
+                .operations
+                .values()
+                .next()
+                .map(|status| status.state.as_str()),
+            Some(PERFORMANCE_RESUME_INVALID_STATE)
+        );
         assert_eq!(
             load_state.issues,
             vec![PerformanceOperationLoadIssue {
@@ -851,7 +2171,6 @@ mod tests {
         let load_state = load_persisted_operation_inner(&dir);
 
         assert!(load_state.inner.operations.is_empty());
-        assert!(load_state.interrupted.is_empty());
         assert_eq!(
             load_state.issues,
             vec![PerformanceOperationLoadIssue {
@@ -957,6 +2276,11 @@ mod tests {
             error: None,
             created_at: timestamp_utc(),
             updated_at: timestamp_utc(),
+            journal_identity: Some(PerformanceOperationJournalIdentity::new(
+                action,
+                "test_performance_target",
+                RollbackState::Unavailable,
+            )),
         }
     }
 

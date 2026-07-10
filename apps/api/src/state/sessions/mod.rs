@@ -175,6 +175,75 @@ pub enum StartupOutcome {
     Stalled,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchFailureTerminationErrorClass {
+    MissingProcess,
+    OwnerUnavailable,
+    SettlementUnavailable,
+    StaleAttempt,
+    TerminationRejected,
+}
+
+impl LaunchFailureTerminationErrorClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingProcess => "missing_process",
+            Self::OwnerUnavailable => "owner_unavailable",
+            Self::SettlementUnavailable => "settlement_unavailable",
+            Self::StaleAttempt => "stale_attempt",
+            Self::TerminationRejected => "termination_rejected",
+        }
+    }
+}
+
+pub(crate) enum LaunchFailureTermination {
+    Ready(LaunchFailureTerminalizationLease),
+    Pending(PendingLaunchFailureTermination),
+    Unconfirmed(LaunchFailureTerminationErrorClass),
+}
+
+pub(crate) struct PendingLaunchFailureTermination {
+    store: Arc<SessionStore>,
+    session_id: String,
+    attempt: Arc<ProcessAttemptScope>,
+    request: supervisor::ProcessTerminationRequest,
+}
+
+pub(crate) struct LaunchFailureTerminalizationLease {
+    store: Arc<SessionStore>,
+    session_id: String,
+    attempt: Arc<ProcessAttemptScope>,
+    lifecycle_guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl PendingLaunchFailureTermination {
+    pub(crate) fn error_class(&self) -> LaunchFailureTerminationErrorClass {
+        LaunchFailureTerminationErrorClass::TerminationRejected
+    }
+
+    pub(crate) async fn wait_for_settlement(
+        mut self,
+    ) -> Result<LaunchFailureTerminalizationLease, LaunchFailureTerminationErrorClass> {
+        let settled = self.request.settled().await;
+        if settled.is_err() && !self.request.terminal_is_settled() {
+            return Err(LaunchFailureTerminationErrorClass::SettlementUnavailable);
+        }
+
+        self.store
+            .acquire_launch_failure_terminalization_lease(&self.session_id, self.attempt, None)
+            .await
+    }
+}
+
+impl LaunchFailureTerminalizationLease {
+    pub(crate) async fn release(mut self) {
+        self.store
+            .release_terminal_retention_hold_for_attempt(&self.session_id, &self.attempt)
+            .await;
+        drop(self.lifecycle_guard.take());
+    }
+}
+
 #[must_use]
 pub(crate) struct UserStopLease {
     store: Arc<SessionStore>,
@@ -276,6 +345,31 @@ impl SessionStore {
             .await
             .get(session_id)
             .map(|entry| entry.attempt.clone())
+    }
+
+    async fn acquire_launch_failure_terminalization_lease(
+        self: &Arc<Self>,
+        session_id: &str,
+        attempt: Arc<ProcessAttemptScope>,
+        lifecycle_guard: Option<OwnedMutexGuard<()>>,
+    ) -> Result<LaunchFailureTerminalizationLease, LaunchFailureTerminationErrorClass> {
+        let lifecycle_guard = match lifecycle_guard {
+            Some(lifecycle_guard) => lifecycle_guard,
+            None => self.lifecycle_transition.clone().lock_owned().await,
+        };
+        let current_attempt = self.current_process_attempt(session_id).await;
+        if !current_attempt
+            .as_ref()
+            .is_some_and(|current| attempt_scopes_match(current, &attempt))
+        {
+            return Err(LaunchFailureTerminationErrorClass::StaleAttempt);
+        }
+        Ok(LaunchFailureTerminalizationLease {
+            store: self.clone(),
+            session_id: session_id.to_string(),
+            attempt,
+            lifecycle_guard: Some(lifecycle_guard),
+        })
     }
 
     pub async fn insert(&self, mut record: LaunchSessionRecord) {
@@ -916,6 +1010,109 @@ impl SessionStore {
         request.reaped().await.map(|_| ())
     }
 
+    pub(crate) async fn terminate_for_launch_failure(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> LaunchFailureTermination {
+        let lifecycle_guard = self.lifecycle_transition.clone().lock_owned().await;
+        let Some((attempt, process, pid)) =
+            self.sessions.read().await.get(session_id).map(|entry| {
+                (
+                    entry.attempt.clone(),
+                    entry.process.clone(),
+                    entry.record.pid,
+                )
+            })
+        else {
+            return LaunchFailureTermination::Unconfirmed(
+                LaunchFailureTerminationErrorClass::MissingProcess,
+            );
+        };
+        let Some(process) = process else {
+            if pid.is_some() {
+                return LaunchFailureTermination::Unconfirmed(
+                    LaunchFailureTerminationErrorClass::MissingProcess,
+                );
+            }
+            return match self
+                .acquire_launch_failure_terminalization_lease(
+                    session_id,
+                    attempt,
+                    Some(lifecycle_guard),
+                )
+                .await
+            {
+                Ok(lease) => LaunchFailureTermination::Ready(lease),
+                Err(error_class) => LaunchFailureTermination::Unconfirmed(error_class),
+            };
+        };
+
+        let mut request = process.terminate(supervisor::ProcessTerminalCause::LaunchFailure);
+        if request.accepted().await.is_err() {
+            if request.terminal_is_settled() {
+                return match self
+                    .acquire_launch_failure_terminalization_lease(
+                        session_id,
+                        attempt,
+                        Some(lifecycle_guard),
+                    )
+                    .await
+                {
+                    Ok(lease) => LaunchFailureTermination::Ready(lease),
+                    Err(error_class) => LaunchFailureTermination::Unconfirmed(error_class),
+                };
+            }
+
+            let owner_active = self.active_processes.lock().await.contains_key(&attempt.id);
+            let attempt_current = self
+                .sessions
+                .read()
+                .await
+                .get(session_id)
+                .is_some_and(|entry| attempt_scopes_match(&entry.attempt, &attempt));
+            if request.terminal_is_settled() && attempt_current {
+                return match self
+                    .acquire_launch_failure_terminalization_lease(
+                        session_id,
+                        attempt,
+                        Some(lifecycle_guard),
+                    )
+                    .await
+                {
+                    Ok(lease) => LaunchFailureTermination::Ready(lease),
+                    Err(error_class) => LaunchFailureTermination::Unconfirmed(error_class),
+                };
+            }
+            drop(lifecycle_guard);
+            if owner_active && attempt_current {
+                return LaunchFailureTermination::Pending(PendingLaunchFailureTermination {
+                    store: self.clone(),
+                    session_id: session_id.to_string(),
+                    attempt,
+                    request,
+                });
+            }
+            return LaunchFailureTermination::Unconfirmed(
+                LaunchFailureTerminationErrorClass::OwnerUnavailable,
+            );
+        }
+
+        drop(lifecycle_guard);
+        let settled = request.settled().await;
+        if settled.is_err() && !request.terminal_is_settled() {
+            return LaunchFailureTermination::Unconfirmed(
+                LaunchFailureTerminationErrorClass::SettlementUnavailable,
+            );
+        }
+        match self
+            .acquire_launch_failure_terminalization_lease(session_id, attempt, None)
+            .await
+        {
+            Ok(lease) => LaunchFailureTermination::Ready(lease),
+            Err(error_class) => LaunchFailureTermination::Unconfirmed(error_class),
+        }
+    }
+
     pub(crate) async fn begin_user_stop(
         self: &Arc<Self>,
         session_id: &str,
@@ -971,6 +1168,29 @@ impl SessionStore {
             .await
             .get(session_id)
             .and_then(|entry| entry.observed_failure.map(|signal| signal.class))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn reject_next_process_start_kill(&self, session_id: &str) -> bool {
+        let process = self
+            .sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|entry| entry.process.clone());
+        process.is_some_and(|process| {
+            process.reject_next_start_kill();
+            true
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retention_hold_count(&self, session_id: &str) -> Option<usize> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|entry| entry.retention_holds)
     }
 
     pub async fn observed_failure_for_exit(&self, session_id: &str) -> Option<LaunchFailureClass> {
@@ -2530,6 +2750,46 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn pending_launch_failure_settlement_cannot_claim_a_replacement_attempt() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "pending-launch-failure-replacement";
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec sleep 30");
+        store
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("spawn replacement target");
+        assert!(store.reject_next_process_start_kill(session_id).await);
+        let pending = match store.terminate_for_launch_failure(session_id).await {
+            LaunchFailureTermination::Pending(pending) => pending,
+            _ => panic!("rejected termination must remain pending"),
+        };
+
+        let mut replacement = test_record(session_id);
+        replacement.version_id = "replacement".to_string();
+        store.insert(replacement).await;
+        let error_class =
+            match tokio::time::timeout(Duration::from_secs(2), pending.wait_for_settlement())
+                .await
+                .expect("stale settlement deadline")
+            {
+                Ok(_) => panic!("stale attempt must not acquire a terminalization lease"),
+                Err(error_class) => error_class,
+            };
+
+        assert_eq!(
+            error_class,
+            LaunchFailureTerminationErrorClass::StaleAttempt
+        );
+        let stored = store.get(session_id).await.expect("replacement session");
+        assert_eq!(stored.version_id, "replacement");
+        assert_eq!(stored.state, LaunchState::Queued);
+        assert!(stored.failure.is_none());
+        assert_eq!(store.retention_hold_count(session_id).await, Some(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn launch_process_exit_preserves_observed_failure_class_without_raw_detail() {
         let store = Arc::new(SessionStore::new());
         let session_id = "class-only-observed-failure";
@@ -3520,6 +3780,36 @@ mod tests {
             1
         );
         assert!(store.lifecycle_transition.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn unavailable_launch_failure_settlement_keeps_the_session_active_and_retained() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "unavailable-launch-failure-settlement";
+        store.insert(test_record(session_id)).await;
+        {
+            let mut sessions = store.sessions.write().await;
+            let entry = sessions.get_mut(session_id).expect("session entry");
+            entry.record.pid = Some(42);
+            entry.process = Some(supervisor::rejected_process_control_handle());
+        }
+
+        let error_class = match store.terminate_for_launch_failure(session_id).await {
+            LaunchFailureTermination::Unconfirmed(error_class) => error_class,
+            _ => panic!("unavailable owner must remain unconfirmed"),
+        };
+
+        assert_eq!(
+            error_class,
+            LaunchFailureTerminationErrorClass::OwnerUnavailable
+        );
+        let stored = store.get(session_id).await.expect("retained session");
+        assert!(!matches!(
+            stored.state,
+            LaunchState::Failed | LaunchState::Exited
+        ));
+        assert!(store.has_active_instance(&stored.instance_id).await);
+        assert_eq!(store.retention_hold_count(session_id).await, Some(1));
     }
 
     #[cfg(unix)]

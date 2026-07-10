@@ -22,11 +22,12 @@ use crate::observability::{
     },
 };
 use crate::state::AppState;
-use crate::state::contracts::OperationId;
+use crate::state::contracts::{OperationId, OperationJournalEntry};
 use crate::state::{
-    ActiveQueuedInstallEntry, InstallQueueEnqueueOutcome, InstallQueuePlacement,
-    InstallQueueSnapshot, InstallQueueSpec, InstallStore, OperationJournalStore,
-    QueuedInstallEntry,
+    ActiveQueuedInstallEntry, InstallInitializationStatus, InstallQueueEnqueueOutcome,
+    InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec, InstallStore,
+    OperationJournalReconciliation, OperationJournalStore, OperationJournalStoreError,
+    QueuedInstallEntry, operation_journal_plan_is_visible,
 };
 use axial_minecraft::{
     DownloadError, DownloadProgress, Downloader, LoaderComponentId,
@@ -36,7 +37,7 @@ use axial_minecraft::{
 use axum::{Json, http::StatusCode};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
@@ -47,6 +48,152 @@ pub(crate) const LOADER_INSTALL_INTERRUPTED_MESSAGE: &str =
 pub(crate) const BASE_INSTALL_FAILED_MESSAGE: &str =
     "Base game install failed. Retry the install from Downloads.";
 const INSTALL_REPAIR_RESUME_MAX_DEPTH: u8 = 1;
+const INSTALL_JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const INSTALL_JOURNAL_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+pub(super) enum InstallJournalReconciliation {
+    MutationCommitted,
+    RetryMutation,
+}
+
+struct InstallInitializationReservation {
+    store: Arc<InstallStore>,
+    journals: Arc<OperationJournalStore>,
+    install_id: Option<String>,
+    operation_id: OperationId,
+}
+
+impl InstallInitializationReservation {
+    fn new(
+        store: Arc<InstallStore>,
+        journals: Arc<OperationJournalStore>,
+        install_id: String,
+        operation_id: OperationId,
+    ) -> Self {
+        Self {
+            store,
+            journals,
+            install_id: Some(install_id),
+            operation_id,
+        }
+    }
+
+    fn hand_off(mut self) {
+        self.install_id = None;
+    }
+}
+
+impl Drop for InstallInitializationReservation {
+    fn drop(&mut self) {
+        let Some(install_id) = self.install_id.take() else {
+            return;
+        };
+        let store = self.store.clone();
+        let journals = self.journals.clone();
+        let operation_id = self.operation_id.clone();
+        tokio::spawn(async move {
+            let _ = store.mark_initialization_reconciling(&install_id).await;
+            let _ = operation::record_install_operation_initialization_cancelled(
+                &journals,
+                &operation_id,
+            )
+            .await;
+            store.remove(&install_id).await;
+        });
+    }
+}
+
+pub(super) async fn reconcile_install_journal_transition(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    error: OperationJournalStoreError,
+    expected: impl Fn(&OperationJournalEntry) -> bool,
+) -> Result<InstallJournalReconciliation, OperationJournalStoreError> {
+    match journals
+        .reconcile_transition(
+            operation_id,
+            error,
+            INSTALL_JOURNAL_RETRY_INITIAL_DELAY,
+            INSTALL_JOURNAL_RETRY_MAX_DELAY,
+            expected,
+        )
+        .await?
+    {
+        OperationJournalReconciliation::CommittedAfterPersistenceFailure(_)
+        | OperationJournalReconciliation::RequestedTransitionAlreadyCommitted => {
+            Ok(InstallJournalReconciliation::MutationCommitted)
+        }
+        OperationJournalReconciliation::RetryRequestedTransition => {
+            Ok(InstallJournalReconciliation::RetryMutation)
+        }
+    }
+}
+
+async fn begin_install_journal_with_detached_reconciliation(
+    store: Arc<InstallStore>,
+    journals: Arc<OperationJournalStore>,
+    install_id: String,
+    operation_id: OperationId,
+    version_id: String,
+) -> Result<InstallInitializationReservation, ()> {
+    let reservation = InstallInitializationReservation::new(
+        store,
+        journals.clone(),
+        install_id,
+        operation_id.clone(),
+    );
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        match begin_install_operation_journal(&journals, &operation_id, &version_id).await {
+            Ok(()) => {
+                let _ = result_tx.send(Ok(reservation));
+            }
+            Err(error) => {
+                let retryable = matches!(
+                    &error,
+                    OperationJournalStoreError::Persistence(_)
+                        | OperationJournalStoreError::RetryRequired
+                );
+                if retryable {
+                    let _ = reservation
+                        .store
+                        .mark_initialization_reconciling(
+                            reservation.install_id.as_deref().unwrap_or_default(),
+                        )
+                        .await;
+                }
+                let _ = result_tx.send(Err(()));
+                if !retryable {
+                    return;
+                }
+                let expected = operation::planned_install_journal(&operation_id, &version_id);
+                let mut error = error;
+                loop {
+                    match reconcile_install_journal_transition(
+                        &journals,
+                        &operation_id,
+                        error,
+                        |entry| operation_journal_plan_is_visible(entry, &expected),
+                    )
+                    .await
+                    {
+                        Ok(InstallJournalReconciliation::MutationCommitted) => return,
+                        Ok(InstallJournalReconciliation::RetryMutation) => {}
+                        Err(_) => return,
+                    }
+                    match begin_install_operation_journal(&journals, &operation_id, &version_id)
+                        .await
+                    {
+                        Ok(()) => return,
+                        Err(next_error) => error = next_error,
+                    }
+                }
+            }
+        }
+    });
+    result_rx.await.unwrap_or(Err(()))
+}
 
 pub type InstallApplicationError = (StatusCode, Json<serde_json::Value>);
 
@@ -109,11 +256,29 @@ pub(crate) async fn start_install_version(
         )
     })?;
 
-    let install_id = generate_install_id("install");
-    let (install_id, inserted) = state
-        .installs()
-        .insert_or_existing_active(install_id, version_id.clone(), manifest_url.clone())
-        .await;
+    let install_id = loop {
+        let candidate = generate_install_id("install");
+        let (install_id, inserted) = state
+            .installs()
+            .insert_or_existing_active(candidate, version_id.clone(), manifest_url.clone())
+            .await;
+        if inserted {
+            break install_id;
+        }
+        match state.installs().wait_for_initialization(&install_id).await {
+            InstallInitializationStatus::Initialized => {
+                return Ok(InstallStartResponse {
+                    operation_id: install_operation_id(&install_id),
+                    install_id,
+                    view_model: InstallProgressViewModel::starting(),
+                });
+            }
+            InstallInitializationStatus::Reconciling => {
+                return Err(install_journal_error_response());
+            }
+            InstallInitializationStatus::Removed => {}
+        }
+    };
     let operation_id = install_operation_id(&install_id);
     let staging = stage_install_version_command(
         InstallVersionCommand {
@@ -123,17 +288,21 @@ pub(crate) async fn start_install_version(
         install_id.clone(),
         operation_id.clone(),
     );
-    if !inserted {
-        return Ok(InstallStartResponse {
-            install_id,
-            operation_id,
-            view_model: InstallProgressViewModel::starting(),
-        });
-    }
-    begin_install_operation_journal(state.journals(), &operation_id, &version_id);
-
     let store = state.installs().clone();
     let journals = state.journals().clone();
+    let reservation = begin_install_journal_with_detached_reconciliation(
+        store.clone(),
+        journals.clone(),
+        install_id.clone(),
+        operation_id.clone(),
+        version_id.clone(),
+    )
+    .await
+    .map_err(|_| install_journal_error_response())?;
+    if !store.mark_initialized(&install_id).await {
+        return Err(install_journal_error_response());
+    }
+
     let failure_memory = state.failure_memory().clone();
     let telemetry = state.telemetry().clone();
     let mc_dir = PathBuf::from(mc_dir);
@@ -152,19 +321,21 @@ pub(crate) async fn start_install_version(
         interrupted_install_progress(),
         async move {
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+            let journal_failed = Arc::new(tokio::sync::Notify::new());
             let terminal_progress = Arc::new(Mutex::new(None::<DownloadProgress>));
             let store_task = {
                 let store = worker_store.clone();
                 let install_id = worker_install_id.clone();
                 let journals = worker_journals.clone();
                 let operation_id = worker_operation_id.clone();
+                let journal_failed = journal_failed.clone();
                 tokio::spawn(async move {
                     let mut coalescer = InstallProgressCoalescer::default();
                     let mut last_journal_phase = None;
                     while let Some(progress) = progress_rx.recv().await {
                         let progress = sanitize_install_progress(progress);
                         for progress in coalescer.push(progress) {
-                            record_and_emit_install_progress(
+                            if !record_and_emit_install_progress(
                                 store.as_ref(),
                                 journals.as_ref(),
                                 &operation_id,
@@ -172,11 +343,15 @@ pub(crate) async fn start_install_version(
                                 progress,
                                 &mut last_journal_phase,
                             )
-                            .await;
+                            .await
+                            {
+                                journal_failed.notify_one();
+                                return false;
+                            }
                         }
                     }
-                    if let Some(progress) = coalescer.flush() {
-                        record_and_emit_install_progress(
+                    if let Some(progress) = coalescer.flush()
+                        && !record_and_emit_install_progress(
                             store.as_ref(),
                             journals.as_ref(),
                             &operation_id,
@@ -184,8 +359,12 @@ pub(crate) async fn start_install_version(
                             progress,
                             &mut last_journal_phase,
                         )
-                        .await;
+                        .await
+                    {
+                        journal_failed.notify_one();
+                        return false;
                     }
+                    true
                 })
             };
 
@@ -199,8 +378,8 @@ pub(crate) async fn start_install_version(
                 let terminal_progress_for_downloader = Arc::clone(&terminal_progress);
                 let mut install_facts = Vec::new();
                 let mut install_descriptors = Vec::new();
-                let install_result = downloader
-                    .install_version_with_facts_and_descriptors(
+                let install_result = {
+                    let install = downloader.install_version_with_facts_and_descriptors(
                         &version_id,
                         (!manifest_url.is_empty()).then_some(manifest_url.as_str()),
                         move |progress| {
@@ -216,8 +395,23 @@ pub(crate) async fn start_install_version(
                         },
                         |fact| install_facts.push(fact),
                         |descriptor| install_descriptors.push(descriptor),
+                    );
+                    tokio::pin!(install);
+                    tokio::select! {
+                        result = &mut install => Some(result),
+                        () = journal_failed.notified() => None,
+                    }
+                };
+                let Some(install_result) = install_result else {
+                    drop(progress_tx);
+                    let _ = finish_install_progress_task(
+                        store_task,
+                        worker_store.as_ref(),
+                        &worker_install_id,
                     )
                     .await;
+                    return;
+                };
                 let attempt_terminal_progress = terminal_progress
                     .lock()
                     .ok()
@@ -264,24 +458,41 @@ pub(crate) async fn start_install_version(
             } else {
                 final_terminal_progress.unwrap_or_else(observed_install_failure_progress)
             };
-            if !final_install_succeeded {
+            let failure_summary = if !final_install_succeeded {
                 let sanitized = sanitize_install_progress(terminal_progress.clone());
-                emit_install_failed(
-                    worker_telemetry.as_ref(),
+                Some(
                     sanitized
                         .error
-                        .as_deref()
-                        .unwrap_or(INSTALL_FAILURE_MESSAGE),
-                );
-            }
+                        .unwrap_or_else(|| INSTALL_FAILURE_MESSAGE.to_string()),
+                )
+            } else {
+                None
+            };
             let _ = progress_tx.send(terminal_progress);
             drop(progress_tx);
-            let _ = store_task.await;
+            let journal_committed =
+                finish_install_progress_task(store_task, worker_store.as_ref(), &worker_install_id)
+                    .await;
+            if journal_committed && let Some(summary) = failure_summary {
+                emit_install_failed(worker_telemetry.as_ref(), &summary);
+            }
         },
-        move |progress| {
-            record_install_operation_interrupted(journals.as_ref(), &operation_id_task, &progress);
+        move |progress| async move {
+            if record_install_operation_interrupted(
+                journals.as_ref(),
+                &operation_id_task,
+                &progress,
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("failed to commit interrupted install journal");
+                return false;
+            }
+            true
         },
     );
+    reservation.hand_off();
 
     Ok(InstallStartResponse {
         install_id,
@@ -298,14 +509,22 @@ pub(super) async fn record_install_failure_outcome_and_repair(
     install_descriptors: &[SelectedDownloadArtifactDescriptor],
     observed_at: &str,
 ) -> Option<GuardianArtifactRepairOutcome> {
-    record_install_operation_guardian_evidence(journals, operation_id, install_facts);
+    if record_install_operation_guardian_evidence(journals, operation_id, install_facts)
+        .await
+        .is_err()
+    {
+        tracing::warn!("failed to commit install Guardian evidence");
+        return None;
+    }
     record_install_operation_guardian_failure_outcome_with_memory(
         journals,
         failure_memory,
         operation_id,
         install_facts,
         observed_at,
-    );
+    )
+    .await
+    .ok()?;
     repair_install_failure_with_guardian(
         journals,
         failure_memory,
@@ -326,7 +545,13 @@ pub(super) async fn record_install_failure_outcome_and_repair_for_error(
     install_descriptors: &[SelectedDownloadArtifactDescriptor],
     observed_at: &str,
 ) -> Option<GuardianArtifactRepairOutcome> {
-    record_install_operation_guardian_evidence(journals, operation_id, install_facts);
+    if record_install_operation_guardian_evidence(journals, operation_id, install_facts)
+        .await
+        .is_err()
+    {
+        tracing::warn!("failed to commit install Guardian evidence");
+        return None;
+    }
     record_install_operation_guardian_failure_outcome_for_error_with_memory(
         journals,
         failure_memory,
@@ -334,7 +559,9 @@ pub(super) async fn record_install_failure_outcome_and_repair_for_error(
         error,
         install_facts,
         observed_at,
-    );
+    )
+    .await
+    .ok()?;
     let repair_facts = install_repair_facts_from_download_error_or_facts(error, install_facts);
     repair_install_failure_with_guardian(
         journals,
@@ -369,7 +596,7 @@ async fn repair_install_failure_with_guardian(
     observed_at: &str,
 ) -> Option<GuardianArtifactRepairOutcome> {
     let repair_client = reqwest::Client::new();
-    let repair_outcome = repair_install_artifact_corruption_with_guardian(
+    let repair_outcome = match repair_install_artifact_corruption_with_guardian(
         journals,
         failure_memory,
         &repair_client,
@@ -378,9 +605,21 @@ async fn repair_install_failure_with_guardian(
         install_descriptors,
         observed_at,
     )
-    .await;
-    if let Some(repair_outcome) = repair_outcome.as_ref() {
-        record_install_operation_guardian_repair_outcome(journals, operation_id, repair_outcome);
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            tracing::warn!("failed to commit install artifact-repair journal");
+            return None;
+        }
+    };
+    if let Some(repair_outcome) = repair_outcome.as_ref()
+        && record_install_operation_guardian_repair_outcome(journals, operation_id, repair_outcome)
+            .await
+            .is_err()
+    {
+        tracing::warn!("failed to commit install Guardian repair outcome");
+        return None;
     }
     repair_outcome
 }
@@ -407,11 +646,43 @@ async fn record_and_emit_install_progress(
     install_id: &str,
     progress: DownloadProgress,
     last_journal_phase: &mut Option<String>,
-) {
-    record_install_operation_progress(journals, operation_id, &progress, last_journal_phase);
+) -> bool {
+    if record_install_operation_progress(journals, operation_id, &progress, last_journal_phase)
+        .await
+        .is_err()
+    {
+        tracing::warn!("failed to record install journal progress");
+        return false;
+    }
     store
         .emit_record(install_id, install_progress_record(progress))
         .await;
+    true
+}
+
+fn install_journal_error_response() -> InstallApplicationError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not start the install safely. Check app data permissions and try again."
+        })),
+    )
+}
+
+async fn finish_install_progress_task(
+    task: tokio::task::JoinHandle<bool>,
+    store: &InstallStore,
+    install_id: &str,
+) -> bool {
+    match task.await {
+        Ok(true) => true,
+        Ok(false) => {
+            store.remove(install_id).await;
+            false
+        }
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => panic!("install progress task stopped unexpectedly: {error}"),
+    }
 }
 
 fn vanilla_install_done_progress() -> DownloadProgress {

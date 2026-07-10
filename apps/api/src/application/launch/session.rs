@@ -219,7 +219,8 @@ async fn prepare_launch_session_with_auth_refresh(
         payload.max_memory_mb,
         payload.min_memory_mb,
     )
-    .await;
+    .await
+    .map_err(launch_journal_error_response)?;
     let repair_elapsed = repair_started_at.elapsed();
     if guardian_preflight_blocks_launch(&preflight.guardian_outcome) {
         trace_launch_session(
@@ -356,6 +357,17 @@ fn launch_layout_error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({
             "error": "Could not prepare the instance folder. Check app data permissions and try again."
+        })),
+    )
+}
+
+fn launch_journal_error_response(
+    _error: impl std::fmt::Display,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "Could not record the launch repair safely. Check app data permissions and try again."
         })),
     )
 }

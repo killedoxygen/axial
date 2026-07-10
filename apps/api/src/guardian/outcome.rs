@@ -523,6 +523,7 @@ mod tests {
                 description: "Guardian removed incompatible explicit JVM args before launch"
                     .to_string(),
             },
+            failure_class: axial_launcher::LaunchFailureClass::JvmUnsupportedOption,
             user_intent_hash: Some("raw_jvm_args_present:1.21.1"),
         })
         .expect("recovery plan");

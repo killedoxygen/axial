@@ -17,13 +17,14 @@ use crate::observability::{
     sanitize_evidence_token,
 };
 use crate::state::{
-    AppState,
+    AppState, OperationJournalReconciliation, OperationJournalStoreError,
     contracts::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
-        OperationOutcome, OperationPhase, OperationStepResult, OwnershipClass, RollbackState,
-        StabilizationSystem, TargetDescriptor,
+        OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
+        RollbackState, StabilizationSystem, TargetDescriptor,
     },
     failure_memory::GuardianFailureMemoryEntry,
+    operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
     ownership::{CurrentArtifact, classify_current_artifact},
 };
 use axial_performance::{
@@ -32,7 +33,50 @@ use axial_performance::{
 };
 use axum::{Json, http::StatusCode};
 use serde::Serialize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use thiserror::Error;
+
+const RULES_REFRESH_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+const RULES_JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(20);
+const RULES_JOURNAL_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+
+enum RulesJournalReconciliation {
+    MutationCommitted,
+    AcceptedFailure(OperationJournalStoreError),
+    RetryMutation,
+}
+
+struct RulesRefreshRequestGuard {
+    abandoned: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl RulesRefreshRequestGuard {
+    fn new(abandoned: Arc<AtomicBool>) -> Self {
+        Self {
+            abandoned,
+            armed: true,
+        }
+    }
+
+    fn finish(mut self) {
+        self.armed = false;
+    }
+
+    fn abandon(&self) {
+        self.abandoned.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for RulesRefreshRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.abandon();
+        }
+    }
+}
 
 pub(crate) use benchmark_matrix::{
     BenchmarkMatrix, BenchmarkSuiteRunSpec, benchmark_matrix, benchmark_suite_manifest_run_inputs,
@@ -372,11 +416,74 @@ pub fn performance_rules_status(state: &AppState) -> PerformanceRulesStatusRespo
 pub async fn refresh_performance_rules(
     state: &AppState,
 ) -> Result<PerformanceRulesStatusResponse, RefreshPerformanceRulesError> {
-    handle_refresh_performance_rules(
-        state,
-        ApplicationCommand::new(CommandKind::RefreshPerformanceRules),
-    )
-    .await
+    let state = state.clone();
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let request_guard = RulesRefreshRequestGuard::new(abandoned.clone());
+    let terminal_failure = Arc::new(tokio::sync::Notify::new());
+    let terminal_failure_task = terminal_failure.clone();
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = handle_refresh_performance_rules(
+            &state,
+            ApplicationCommand::new(CommandKind::RefreshPerformanceRules),
+            abandoned.as_ref(),
+            ready_tx,
+            terminal_failure_task,
+        )
+        .await;
+        let _ = result_tx.send(result);
+    });
+    let mut result_rx = result_rx;
+    tokio::select! {
+        result = &mut result_rx => {
+            request_guard.finish();
+            result.unwrap_or_else(|_| {
+                Err(RefreshPerformanceRulesError::Journal(
+                    OperationJournalStoreError::Persistence(std::io::Error::other(
+                        "performance-rules refresh owner stopped before responding",
+                    )),
+                ))
+            })
+        }
+        ready = &mut ready_rx => {
+            if ready.is_err() {
+                request_guard.finish();
+                result_rx.await.unwrap_or_else(|_| {
+                    Err(RefreshPerformanceRulesError::Journal(
+                        OperationJournalStoreError::Persistence(std::io::Error::other(
+                            "performance-rules refresh owner stopped before effect ownership",
+                        )),
+                    ))
+                })
+            } else {
+                request_guard.finish();
+                tokio::select! {
+                    result = &mut result_rx => result.unwrap_or_else(|_| {
+                        Err(RefreshPerformanceRulesError::Journal(
+                            OperationJournalStoreError::Persistence(std::io::Error::other(
+                                "performance-rules refresh owner stopped before responding",
+                            )),
+                        ))
+                    }),
+                    () = terminal_failure.notified() => Err(RefreshPerformanceRulesError::Journal(
+                        OperationJournalStoreError::Persistence(std::io::Error::other(
+                            "performance-rules terminal journal reconciliation is still pending",
+                        )),
+                    )),
+                }
+            }
+        }
+        () = tokio::time::sleep(RULES_REFRESH_RESPONSE_TIMEOUT) => {
+            request_guard.abandon();
+            Err(RefreshPerformanceRulesError::Journal(
+                OperationJournalStoreError::Persistence(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "performance-rules journal reconciliation is still pending",
+                )),
+            ))
+        }
+    }
 }
 
 pub fn refresh_performance_rules_error_response(
@@ -401,6 +508,9 @@ pub fn refresh_performance_rules_error_response(
 async fn handle_refresh_performance_rules(
     state: &AppState,
     command: ApplicationCommand,
+    abandoned: &AtomicBool,
+    ready_for_effect: tokio::sync::oneshot::Sender<()>,
+    terminal_failure: Arc<tokio::sync::Notify>,
 ) -> Result<PerformanceRulesStatusResponse, RefreshPerformanceRulesError> {
     if command.kind != CommandKind::RefreshPerformanceRules {
         return Err(RefreshPerformanceRulesError::UnsupportedCommand {
@@ -421,29 +531,210 @@ async fn handle_refresh_performance_rules(
         .planned_steps
         .push(refresh_rules_step(OperationStepResult::Planned));
     entry.targets = refresh_rules_targets();
-    state.journals().create(entry);
+    if let Some(error) = create_rules_journal_reconciled(state, entry).await? {
+        terminalize_recovered_rules_journal(state, &operation_id).await?;
+        return Err(error.into());
+    }
+    if abandoned.load(Ordering::Acquire) {
+        terminalize_recovered_rules_journal(state, &operation_id).await?;
+        return Err(
+            OperationJournalStoreError::Persistence(std::io::Error::other(
+                "performance-rules request ended before journal reconciliation",
+            ))
+            .into(),
+        );
+    }
+    if ready_for_effect.send(()).is_err() {
+        terminalize_recovered_rules_journal(state, &operation_id).await?;
+        return Err(
+            OperationJournalStoreError::Persistence(std::io::Error::other(
+                "performance-rules request ended before effect ownership",
+            ))
+            .into(),
+        );
+    }
 
     let before = state.performance().rules_status();
     match state.performance().refresh_rules().await {
         Ok(status) => {
             let cache_changed = performance_rules_cache_changed(&before, &status);
-            state.journals().record_success(
+            if let Some(error) = record_rules_terminal_reconciled(
+                state,
                 &operation_id,
                 refresh_rules_step_with_cache_change(OperationStepResult::Completed, cache_changed),
-                OperationOutcome::Succeeded,
-            );
+                None,
+                Some(terminal_failure.as_ref()),
+            )
+            .await?
+            {
+                return Err(error.into());
+            }
             Ok(performance_rules_status_response(state, status))
         }
         Err(error) => {
-            state.journals().record_failure(
+            if let Some(journal_error) = record_rules_terminal_reconciled(
+                state,
                 &operation_id,
                 refresh_rules_step(OperationStepResult::Failed),
-                "refresh_remote_rules",
-                OperationOutcome::Failed,
-            );
+                Some("refresh_remote_rules"),
+                Some(terminal_failure.as_ref()),
+            )
+            .await?
+            {
+                return Err(journal_error.into());
+            }
             Err(RefreshPerformanceRulesError::from(error))
         }
     }
+}
+
+async fn create_rules_journal_reconciled(
+    state: &AppState,
+    entry: OperationJournalEntry,
+) -> Result<Option<OperationJournalStoreError>, OperationJournalStoreError> {
+    loop {
+        match state.journals().create(entry.clone()).await {
+            Ok(()) => return Ok(None),
+            Err(OperationJournalStoreError::AlreadyExists)
+                if state
+                    .journals()
+                    .get(&entry.operation_id)
+                    .is_some_and(|current| operation_journal_plan_is_visible(&current, &entry)) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                match reconcile_rules_journal_error(state, &entry.operation_id, error, |current| {
+                    operation_journal_plan_is_visible(current, &entry)
+                })
+                .await?
+                {
+                    RulesJournalReconciliation::MutationCommitted => return Ok(None),
+                    RulesJournalReconciliation::AcceptedFailure(error) => return Ok(Some(error)),
+                    RulesJournalReconciliation::RetryMutation => {}
+                }
+            }
+        }
+    }
+}
+
+async fn record_rules_terminal_reconciled(
+    state: &AppState,
+    operation_id: &OperationId,
+    step: OperationJournalStep,
+    failure_point: Option<&str>,
+    terminal_failure: Option<&tokio::sync::Notify>,
+) -> Result<Option<OperationJournalStoreError>, OperationJournalStoreError> {
+    loop {
+        let result = if let Some(failure_point) = failure_point {
+            state
+                .journals()
+                .record_failure(
+                    operation_id,
+                    step.clone(),
+                    failure_point,
+                    OperationOutcome::Failed,
+                )
+                .await
+        } else {
+            state
+                .journals()
+                .record_success(operation_id, step.clone(), OperationOutcome::Succeeded)
+                .await
+        };
+        match result {
+            Ok(()) => return Ok(None),
+            Err(OperationJournalStoreError::AlreadyTerminal)
+                if state.journals().get(operation_id).is_some_and(|entry| {
+                    rules_terminal_transition_matches(&entry, operation_id, failure_point, &step)
+                }) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                if matches!(error, OperationJournalStoreError::Persistence(_))
+                    && let Some(terminal_failure) = terminal_failure
+                {
+                    terminal_failure.notify_one();
+                }
+                match reconcile_rules_journal_error(state, operation_id, error, |entry| {
+                    rules_terminal_transition_matches(entry, operation_id, failure_point, &step)
+                })
+                .await?
+                {
+                    RulesJournalReconciliation::MutationCommitted => return Ok(None),
+                    RulesJournalReconciliation::AcceptedFailure(error) => return Ok(Some(error)),
+                    RulesJournalReconciliation::RetryMutation => {}
+                }
+            }
+        }
+    }
+}
+
+async fn terminalize_recovered_rules_journal(
+    state: &AppState,
+    operation_id: &OperationId,
+) -> Result<(), OperationJournalStoreError> {
+    record_rules_terminal_reconciled(
+        state,
+        operation_id,
+        refresh_rules_step(OperationStepResult::Failed),
+        Some("refresh_rules_journal_reconciliation"),
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn reconcile_rules_journal_error(
+    state: &AppState,
+    operation_id: &OperationId,
+    error: OperationJournalStoreError,
+    expected: impl Fn(&OperationJournalEntry) -> bool,
+) -> Result<RulesJournalReconciliation, OperationJournalStoreError> {
+    match state
+        .journals()
+        .reconcile_transition(
+            operation_id,
+            error,
+            RULES_JOURNAL_RETRY_INITIAL_DELAY,
+            RULES_JOURNAL_RETRY_MAX_DELAY,
+            expected,
+        )
+        .await?
+    {
+        OperationJournalReconciliation::CommittedAfterPersistenceFailure(error) => {
+            Ok(RulesJournalReconciliation::AcceptedFailure(error))
+        }
+        OperationJournalReconciliation::RequestedTransitionAlreadyCommitted => {
+            Ok(RulesJournalReconciliation::MutationCommitted)
+        }
+        OperationJournalReconciliation::RetryRequestedTransition => {
+            Ok(RulesJournalReconciliation::RetryMutation)
+        }
+    }
+}
+
+fn rules_terminal_transition_matches(
+    entry: &OperationJournalEntry,
+    operation_id: &OperationId,
+    failure_point: Option<&str>,
+    step: &OperationJournalStep,
+) -> bool {
+    let (status, outcome) = if failure_point.is_some() {
+        (OperationStatus::Failed, OperationOutcome::Failed)
+    } else {
+        (OperationStatus::Succeeded, OperationOutcome::Succeeded)
+    };
+    entry.operation_id == *operation_id
+        && entry.command == CommandKind::RefreshPerformanceRules
+        && entry.owner == StabilizationSystem::Application
+        && entry.ownership == OwnershipClass::LauncherManaged
+        && entry.targets == refresh_rules_targets()
+        && entry.status == status
+        && entry.outcome == Some(outcome)
+        && entry.failure_point.as_deref() == failure_point
+        && operation_journal_completed_step_is_visible(entry, step)
 }
 
 fn performance_rules_status_response(
@@ -705,6 +996,8 @@ pub enum RefreshPerformanceRulesError {
     UnsupportedCommand { actual: CommandKind },
     #[error(transparent)]
     Refresh(RulesRefreshError),
+    #[error(transparent)]
+    Journal(#[from] OperationJournalStoreError),
 }
 
 impl From<RulesRefreshError> for RefreshPerformanceRulesError {

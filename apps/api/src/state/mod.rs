@@ -39,14 +39,20 @@ pub use auth_logins::{
     NewAuthLoginMsaToken,
 };
 pub use failure_memory::GuardianFailureMemoryStore;
+pub(crate) use installs::InstallInitializationStatus;
 pub use installs::{
     ActiveQueuedInstallEntry, InstallProgressRecord, InstallQueueEnqueueOutcome,
     InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec, InstallSnapshot, InstallStore,
     QueuedInstallEntry,
 };
-pub use journals::OperationJournalStore;
+pub(crate) use journals::{
+    OperationJournalReconciliation, operation_journal_completed_step_is_visible,
+    operation_journal_plan_is_visible, operation_journal_terminal_is_visible,
+};
+pub use journals::{OperationJournalStore, OperationJournalStoreError};
 pub use remote_flags::{RemoteFlagRefreshOutcome, RemoteFlagStore};
 pub(crate) use remote_flags::{ResolvedFlagSource, resolve_flag};
+pub(crate) use sessions::{LaunchFailureTermination, LaunchFailureTerminationErrorClass};
 pub use sessions::{SessionStore, StartupOutcome};
 
 #[derive(Clone)]
@@ -96,6 +102,17 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn new_with_telemetry(init: AppStateInit, telemetry: Arc<TelemetryHub>) -> Self {
         Self::new_with_telemetry_inner(init, telemetry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_operation_stores(
+        mut self,
+        journals: Arc<OperationJournalStore>,
+        performance_operations: Arc<performance_operations::PerformanceOperationStore>,
+    ) -> Self {
+        self.journals = journals;
+        self.performance_operations = performance_operations;
+        self
     }
 
     fn new_with_telemetry_inner(init: AppStateInit, telemetry: Arc<TelemetryHub>) -> Self {

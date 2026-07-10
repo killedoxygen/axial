@@ -9,6 +9,8 @@ use std::future::Future;
 use std::io;
 use std::process::ExitStatus;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout};
@@ -23,6 +25,7 @@ const OUTPUT_QUEUE_CAPACITY: usize = 256;
 pub(super) enum ProcessTerminalCause {
     UserStop,
     StartupWatchdog,
+    LaunchFailure,
     Replacement,
     Shutdown,
 }
@@ -83,6 +86,8 @@ pub(super) struct ProcessControlHandle {
     reaped: watch::Receiver<Option<ProcessReap>>,
     terminal_settled: watch::Receiver<bool>,
     #[cfg(test)]
+    reject_next_start_kill: Arc<AtomicBool>,
+    #[cfg(test)]
     completed: watch::Receiver<bool>,
 }
 
@@ -139,9 +144,18 @@ impl ProcessControlHandle {
     pub(super) fn completion_receiver(&self) -> watch::Receiver<bool> {
         self.completed.clone()
     }
+
+    #[cfg(test)]
+    pub(super) fn reject_next_start_kill(&self) {
+        self.reject_next_start_kill.store(true, Ordering::SeqCst);
+    }
 }
 
 impl ProcessTerminationRequest {
+    pub(super) fn terminal_is_settled(&self) -> bool {
+        *self.terminal_settled.borrow()
+    }
+
     pub(super) async fn accepted(&mut self) -> io::Result<ProcessTerminationAcceptance> {
         if let Some(acceptance) = self.acceptance {
             return Ok(acceptance);
@@ -256,6 +270,8 @@ pub(super) struct PreparedProcessOwner {
     reaped: watch::Sender<Option<ProcessReap>>,
     terminal_settled: watch::Sender<bool>,
     #[cfg(test)]
+    reject_next_start_kill: Arc<AtomicBool>,
+    #[cfg(test)]
     completed: watch::Sender<bool>,
     #[cfg(test)]
     control_closed_probe: Option<oneshot::Sender<()>>,
@@ -269,11 +285,15 @@ pub(super) fn prepare_process_owner(child: Child) -> (ProcessControlHandle, Prep
     let (terminal_settled, terminal_settled_rx) = watch::channel(false);
     #[cfg(test)]
     let (completed, completed_rx) = watch::channel(false);
+    #[cfg(test)]
+    let reject_next_start_kill = Arc::new(AtomicBool::new(false));
     (
         ProcessControlHandle {
             commands,
             reaped: reaped_rx,
             terminal_settled: terminal_settled_rx,
+            #[cfg(test)]
+            reject_next_start_kill: reject_next_start_kill.clone(),
             #[cfg(test)]
             completed: completed_rx,
         },
@@ -282,6 +302,8 @@ pub(super) fn prepare_process_owner(child: Child) -> (ProcessControlHandle, Prep
             commands: commands_rx,
             reaped,
             terminal_settled,
+            #[cfg(test)]
+            reject_next_start_kill,
             #[cfg(test)]
             completed,
             #[cfg(test)]
@@ -306,6 +328,7 @@ pub(super) fn rejected_process_control_handle() -> ProcessControlHandle {
         commands,
         reaped: reaped_rx,
         terminal_settled: terminal_settled_rx,
+        reject_next_start_kill: Arc::new(AtomicBool::new(false)),
         completed: completed_rx,
     }
 }
@@ -459,6 +482,8 @@ impl PreparedProcessOwner {
                             &mut self.child,
                             &mut requested_cause,
                             control,
+                            #[cfg(test)]
+                            &self.reject_next_start_kill,
                         ) {
                             break status;
                         }
@@ -519,6 +544,7 @@ fn handle_process_control(
     child: &mut Child,
     requested_cause: &mut Option<ProcessTerminalCause>,
     control: ProcessControl,
+    #[cfg(test)] reject_next_start_kill: &AtomicBool,
 ) -> Option<io::Result<ExitStatus>> {
     match control {
         ProcessControl::Terminate { cause, accepted } => {
@@ -531,21 +557,32 @@ fn handle_process_control(
                     let _ = accepted.send(Ok(ProcessTerminationAcceptance::ProcessExited));
                     Some(Ok(status))
                 }
-                Ok(None) => match child.start_kill() {
-                    Ok(()) => {
-                        *requested_cause = Some(cause);
-                        let _ = accepted.send(Ok(ProcessTerminationAcceptance::Accepted(cause)));
-                        None
+                Ok(None) => {
+                    #[cfg(test)]
+                    if reject_next_start_kill.swap(false, Ordering::SeqCst) {
+                        let _ = accepted.send(Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "injected start_kill rejection",
+                        )));
+                        return None;
                     }
-                    Err(error) => {
-                        let _ = accepted.send(Err(error));
-                        match child.try_wait() {
-                            Ok(Some(status)) => Some(Ok(status)),
-                            Ok(None) => None,
-                            Err(error) => Some(Err(error)),
+                    match child.start_kill() {
+                        Ok(()) => {
+                            *requested_cause = Some(cause);
+                            let _ =
+                                accepted.send(Ok(ProcessTerminationAcceptance::Accepted(cause)));
+                            None
+                        }
+                        Err(error) => {
+                            let _ = accepted.send(Err(error));
+                            match child.try_wait() {
+                                Ok(Some(status)) => Some(Ok(status)),
+                                Ok(None) => None,
+                                Err(error) => Some(Err(error)),
+                            }
                         }
                     }
-                },
+                }
                 Err(error) => {
                     let copied = copy_io_error(&error);
                     let _ = accepted.send(Err(error));
@@ -622,7 +659,11 @@ async fn settle_process_exit(
 ) {
     if matches!(
         requested_cause,
-        Some(ProcessTerminalCause::Replacement | ProcessTerminalCause::Shutdown)
+        Some(
+            ProcessTerminalCause::LaunchFailure
+                | ProcessTerminalCause::Replacement
+                | ProcessTerminalCause::Shutdown
+        )
     ) {
         return;
     }
@@ -633,7 +674,11 @@ async fn settle_process_exit(
     else {
         return;
     };
-    if exit_context.record.state == LaunchState::Exited && exit_context.record.failure.is_some() {
+    if matches!(
+        exit_context.record.state,
+        LaunchState::Failed | LaunchState::Exited
+    ) && exit_context.record.failure.is_some()
+    {
         return;
     }
     let (exit_code, failure_class, failure_detail, evidence) = if let Some(error) =
@@ -801,11 +846,55 @@ where
 mod tests {
     use super::super::test_record;
     use super::*;
-    use axial_launcher::LaunchFailureClass;
+    use axial_launcher::{LaunchFailure, LaunchFailureClass, LaunchSessionOutcome};
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
     use tokio::sync::Notify;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_exit_settlement_preserves_failed_record_with_failure_evidence() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "preserve-guardian-failed-session";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Failed;
+        record.failure = Some(LaunchFailure {
+            class: LaunchFailureClass::Unknown,
+            detail: Some("Could not record the launch recovery safely.".to_string()),
+        });
+        record.outcome = Some(LaunchSessionOutcome::from_reason(
+            LaunchSessionExitReason::CrashedBeforeBoot,
+        ));
+        store.insert(record.clone()).await;
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("process attempt");
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .status()
+            .await
+            .expect("exit status");
+
+        settle_process_exit(
+            store.as_ref(),
+            session_id,
+            &attempt,
+            Ok(status),
+            None,
+            None,
+            now_ms(),
+        )
+        .await;
+
+        let preserved = store.get(session_id).await.expect("preserved session");
+        assert_eq!(preserved.state, LaunchState::Failed);
+        assert_eq!(preserved.failure, record.failure);
+        assert_eq!(preserved.outcome, record.outcome);
+        assert_eq!(preserved.exit_code, record.exit_code);
+    }
 
     #[tokio::test]
     async fn output_drain_waits_until_an_inflight_failure_line_is_committed() {

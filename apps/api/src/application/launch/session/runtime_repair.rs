@@ -15,14 +15,49 @@ use crate::logging::timestamp_utc;
 use crate::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
 };
-use crate::state::AppState;
 use crate::state::contracts::OperationPhase;
+use crate::state::{AppState, OperationJournalStoreError};
 use axial_config::{AppPaths, Instance};
 use axial_launcher::{GuardianDecision, GuardianMode, GuardianSummary};
 use axial_minecraft::{
     managed_runtime_contents_verified_without_probe, preferred_runtime_component, resolve_version,
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+const RUNTIME_REPAIR_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+
+struct RuntimeRepairRequestGuard {
+    abandoned: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl RuntimeRepairRequestGuard {
+    fn new(abandoned: Arc<AtomicBool>) -> Self {
+        Self {
+            abandoned,
+            armed: true,
+        }
+    }
+
+    fn finish(mut self) {
+        self.armed = false;
+    }
+
+    fn abandon(&self) {
+        self.abandoned.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for RuntimeRepairRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.abandon();
+        }
+    }
+}
 
 pub(super) async fn maybe_repair_managed_runtime_before_launch(
     state: &AppState,
@@ -32,11 +67,11 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch(
     game_dir: &Path,
     requested_max_memory_mb: Option<i32>,
     requested_min_memory_mb: Option<i32>,
-) -> LaunchPreflightFacts {
+) -> Result<LaunchPreflightFacts, OperationJournalStoreError> {
     if preflight.guardian.mode != GuardianMode::Managed
         || !readiness_has_managed_runtime_missing(&preflight.readiness)
     {
-        return preflight;
+        return Ok(preflight);
     }
 
     let Some(candidate) = managed_runtime_ready_marker_repair_candidate(
@@ -44,14 +79,14 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch(
         library_dir,
         instance,
     ) else {
-        return preflight;
+        return Ok(preflight);
     };
     let Ok(runtime_root) = ManagedRuntimeRoot::from_app_paths(
         state.config().paths(),
         &candidate.runtime_root,
         &candidate.java_executable,
     ) else {
-        return preflight;
+        return Ok(preflight);
     };
 
     let verification = verify_managed_runtime(ManagedRuntimeVerificationRequest::new(
@@ -60,7 +95,7 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch(
         &candidate.java_executable,
     ));
     let Err(verification_error) = verification else {
-        return preflight;
+        return Ok(preflight);
     };
     let guardian_facts = verification_error
         .facts
@@ -78,20 +113,93 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch(
         &repair_boundary.guardian_decision,
         GuardianRepairPlanningContext::current_operation(),
     ) else {
-        return preflight;
+        return Ok(preflight);
     };
 
-    let outcome =
-        execute_managed_runtime_ready_marker_repair(GuardianManagedRuntimeRepairRequest {
-            operation_id: repair_boundary.guardian_decision.operation_id.clone(),
-            mode: repair_boundary.guardian_decision.mode,
-            plan: &repair_plan,
-            runtime_root,
-            journals: state.journals().as_ref(),
-            failure_memory: state.failure_memory().as_ref(),
-            observed_at: timestamp_utc().as_str(),
-            suppression_until_on_failure: None,
-        });
+    let state_task = state.clone();
+    let runtime_root_path = candidate.runtime_root.clone();
+    let java_executable = candidate.java_executable.clone();
+    let operation_id = repair_boundary.guardian_decision.operation_id.clone();
+    let mode = repair_boundary.guardian_decision.mode;
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let request_guard = RuntimeRepairRequestGuard::new(abandoned.clone());
+    let terminal_failure = Arc::new(tokio::sync::Notify::new());
+    let terminal_failure_task = terminal_failure.clone();
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = match ManagedRuntimeRoot::from_app_paths(
+            state_task.config().paths(),
+            &runtime_root_path,
+            &java_executable,
+        ) {
+            Ok(runtime_root) => {
+                let observed_at = timestamp_utc();
+                execute_managed_runtime_ready_marker_repair(GuardianManagedRuntimeRepairRequest {
+                    operation_id,
+                    mode,
+                    plan: &repair_plan,
+                    runtime_root,
+                    journals: state_task.journals().as_ref(),
+                    failure_memory: state_task.failure_memory().as_ref(),
+                    observed_at: observed_at.as_str(),
+                    suppression_until_on_failure: None,
+                    abandoned: Some(abandoned.as_ref()),
+                    ready_for_effect: Some(ready_tx),
+                    terminal_failure: Some(terminal_failure_task.as_ref()),
+                })
+                .await
+            }
+            Err(_) => Err(OperationJournalStoreError::Persistence(
+                std::io::Error::other("managed-runtime repair ownership changed before execution"),
+            )),
+        };
+        let _ = result_tx.send(result);
+    });
+    let mut result_rx = result_rx;
+    let outcome = tokio::select! {
+        result = &mut result_rx => {
+            request_guard.finish();
+            result.map_err(|_| {
+                OperationJournalStoreError::Persistence(std::io::Error::other(
+                    "managed-runtime repair owner stopped before responding",
+                ))
+            })??
+        }
+        ready = &mut ready_rx => {
+            if ready.is_err() {
+                request_guard.finish();
+                result_rx.await.map_err(|_| {
+                    OperationJournalStoreError::Persistence(std::io::Error::other(
+                        "managed-runtime repair owner stopped before effect ownership",
+                    ))
+                })??
+            } else {
+                request_guard.finish();
+                tokio::select! {
+                    result = &mut result_rx => result.map_err(|_| {
+                        OperationJournalStoreError::Persistence(std::io::Error::other(
+                            "managed-runtime repair owner stopped before responding",
+                        ))
+                    })??,
+                    () = terminal_failure.notified() => {
+                        return Err(OperationJournalStoreError::Persistence(std::io::Error::other(
+                            "managed-runtime terminal journal reconciliation is still pending",
+                        )));
+                    }
+                }
+            }
+        }
+        () = tokio::time::sleep(RUNTIME_REPAIR_RESPONSE_TIMEOUT) => {
+            request_guard.abandon();
+            return Err(OperationJournalStoreError::Persistence(
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "managed-runtime repair journal reconciliation is still pending",
+                ),
+            ));
+        }
+    };
 
     if outcome.status == GuardianRepairStatus::Failed {
         state.telemetry().emit(TelemetryEvent::error_captured(
@@ -118,7 +226,7 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch(
                 &mut repaired.guardian_summary,
                 &repair_user_outcome,
             );
-            repaired
+            Ok(repaired)
         }
         GuardianRepairStatus::Blocked
         | GuardianRepairStatus::Failed
@@ -131,9 +239,9 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch(
                 &mut preflight.guardian_outcome,
                 &repair_user_outcome,
             );
-            preflight
+            Ok(preflight)
         }
-        GuardianRepairStatus::NotNeeded => preflight,
+        GuardianRepairStatus::NotNeeded => Ok(preflight),
     }
 }
 

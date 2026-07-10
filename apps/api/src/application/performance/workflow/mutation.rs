@@ -1,7 +1,8 @@
 use super::operations::{
-    PerformanceInstallAction, begin_performance_operation_journal,
-    record_performance_guardian_supervision, record_performance_operation_failure,
-    record_performance_operation_result,
+    PerformanceApplicationError, PerformanceInstallAction, PerformanceJournalTransition,
+    PerformanceOperationExecutionError, begin_performance_operation_journal,
+    record_performance_effect_started, record_performance_effect_started_status,
+    record_performance_guardian_supervision, record_performance_operation_result,
 };
 use super::plan_health::{
     PerformanceManagedArtifactSummary, installed_mod_evidence_from_mods_dir,
@@ -21,7 +22,7 @@ use crate::guardian::{
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::AppState;
-use crate::state::contracts::{OperationPhase, RollbackState};
+use crate::state::contracts::{OperationId, OperationPhase, RollbackState};
 use axial_performance::{
     BundleHealth, CompositionState, InstallError, PerformanceMode, ResolutionRequest,
     RollbackSnapshotSummary as CoreRollbackSnapshotSummary, StateError, derive_health, load_state,
@@ -31,6 +32,13 @@ use serde::Serialize;
 
 pub(super) const PERFORMANCE_INSTALL_INTERNAL_ERROR: &str =
     "Could not update managed performance files. Check instance folder permissions and try again.";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PerformanceJournalIdentity {
+    pub(super) action: PerformanceInstallAction,
+    pub(super) target_id: String,
+    pub(super) rollback: RollbackState,
+}
 
 #[derive(Debug, Serialize)]
 pub struct PerformanceRollbackListResponse {
@@ -103,7 +111,7 @@ fn public_performance_timestamp(value: &str) -> String {
 pub(super) async fn execute_performance_operation(
     state: &AppState,
     operation: &PerformanceOperation,
-) -> Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
     let performance = state.performance().clone();
     let instance = state
         .instances()
@@ -117,19 +125,14 @@ pub(super) async fn execute_performance_operation(
     let mods_dir = state.instances().game_dir(&instance.id).join("mods");
 
     if matches!(operation.action, PerformanceInstallAction::Rollback) {
-        return execute_performance_rollback(state, &performance, &mods_dir, operation);
+        return execute_performance_rollback(state, &performance, &mods_dir, operation).await;
     }
 
     let mode = resolve_instance_mode(state, &instance, operation.mode.as_deref())?;
     if matches!(operation.action, PerformanceInstallAction::Remove)
         || !matches!(mode, PerformanceMode::Managed)
     {
-        return execute_performance_remove(
-            state,
-            &performance,
-            &mods_dir,
-            operation.status_operation_id.as_deref(),
-        );
+        return execute_performance_remove(state, &performance, &mods_dir, operation).await;
     }
 
     let (game_version, loader) = resolve_instance_version_target(
@@ -150,12 +153,88 @@ pub(super) async fn execute_performance_operation(
     .await
 }
 
-fn execute_performance_rollback(
+pub(super) fn performance_operation_journal_identity(
+    state: &AppState,
+    operation: &PerformanceOperation,
+) -> Result<PerformanceJournalIdentity, PerformanceApplicationError> {
+    let instance = state
+        .instances()
+        .get(&operation.instance_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "instance not found" })),
+            )
+        })?;
+    let mods_dir = state.instances().game_dir(&instance.id).join("mods");
+
+    if matches!(operation.action, PerformanceInstallAction::Rollback) {
+        return Ok(
+            match rollback_preflight(&mods_dir, operation.rollback_id.as_deref()) {
+                Ok((target_id, rollback)) => PerformanceJournalIdentity {
+                    action: PerformanceInstallAction::Rollback,
+                    target_id,
+                    rollback,
+                },
+                Err(_) => PerformanceJournalIdentity {
+                    action: PerformanceInstallAction::Rollback,
+                    target_id: "performance_rollback_snapshot".to_string(),
+                    rollback: RollbackState::Unavailable,
+                },
+            },
+        );
+    }
+
+    let mode = resolve_instance_mode(state, &instance, operation.mode.as_deref())?;
+    if matches!(operation.action, PerformanceInstallAction::Remove)
+        || !matches!(mode, PerformanceMode::Managed)
+    {
+        return Ok(match preflight_current_performance_state(&mods_dir) {
+            Ok(current) => PerformanceJournalIdentity {
+                action: PerformanceInstallAction::Remove,
+                target_id: current
+                    .as_ref()
+                    .map(|state| state.composition_id.clone())
+                    .unwrap_or_else(|| "performance_composition_lock".to_string()),
+                rollback: rollback_state_for_current_state(current.as_ref()),
+            },
+            Err(_) => PerformanceJournalIdentity {
+                action: PerformanceInstallAction::Remove,
+                target_id: "performance_composition_lock".to_string(),
+                rollback: RollbackState::Unavailable,
+            },
+        });
+    }
+
+    let (game_version, loader) = resolve_instance_version_target(
+        state,
+        &instance,
+        operation.game_version.as_deref(),
+        operation.loader.as_deref(),
+    )?;
+    let plan = state.performance().get_plan(ResolutionRequest {
+        game_version,
+        loader,
+        mode,
+        hardware: state.performance().hardware(),
+        installed_mods: installed_mod_evidence_from_mods_dir(&mods_dir),
+    });
+    let rollback = preflight_current_performance_state(&mods_dir)
+        .map(|current| rollback_state_for_current_state(current.as_ref()))
+        .unwrap_or(RollbackState::Unavailable);
+    Ok(PerformanceJournalIdentity {
+        action: PerformanceInstallAction::Install,
+        target_id: plan.composition_id,
+        rollback,
+    })
+}
+
+async fn execute_performance_rollback(
     state: &AppState,
     performance: &axial_performance::PerformanceManager,
     mods_dir: &std::path::Path,
     operation: &PerformanceOperation,
-) -> Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
     let preflight = rollback_preflight(mods_dir, operation.rollback_id.as_deref());
     let (target_id, rollback_state) = match &preflight {
         Ok((target_id, rollback_state)) => (target_id.clone(), *rollback_state),
@@ -170,16 +249,28 @@ fn execute_performance_rollback(
         &target_id,
         rollback_state,
         operation.status_operation_id.as_deref(),
-    );
+    )
+    .await
+    .map_err(|error| {
+        PerformanceOperationExecutionError::journal_transition(
+            operation.status_operation_id.clone().map(OperationId::new),
+            error,
+            PerformanceJournalTransition::created(operation.action, &target_id, rollback_state),
+        )
+    })?;
     if let Err(error) = preflight {
-        record_performance_operation_failure(
+        let result = Err(error);
+        record_performance_operation_result(
             state,
             &operation_id,
             operation.action,
             &target_id,
             rollback_state,
-        );
-        return Err(error);
+            &result,
+            operation.persistence_failure.as_ref(),
+        )
+        .await?;
+        return result.map_err(Into::into);
     }
     let supervision = match supervise_performance_operation(
         state,
@@ -192,20 +283,62 @@ fn execute_performance_rollback(
     ) {
         Ok(supervision) => supervision,
         Err(error) => {
-            record_performance_operation_failure(
+            let result = Err(performance_supervision_error(
+                error,
+                OperationPhase::RollingBack,
+            ));
+            record_performance_operation_result(
                 state,
                 &operation_id,
                 operation.action,
                 &target_id,
                 rollback_state,
-            );
-            return Err(performance_supervision_error(
-                error,
-                OperationPhase::RollingBack,
-            ));
+                &result,
+                operation.persistence_failure.as_ref(),
+            )
+            .await?;
+            return result.map_err(Into::into);
         }
     };
-    record_performance_guardian_supervision(state, &operation_id, &supervision);
+    record_performance_guardian_supervision(state, &operation_id, &supervision)
+        .await
+        .map_err(|error| {
+            PerformanceOperationExecutionError::journal_transition(
+                Some(operation_id.clone()),
+                error,
+                PerformanceJournalTransition::guardian(
+                    operation.action,
+                    &target_id,
+                    rollback_state,
+                    &supervision,
+                ),
+            )
+        })?;
+    record_performance_effect_started(
+        state,
+        &operation_id,
+        operation.action,
+        &target_id,
+        rollback_state,
+    )
+    .await
+    .map_err(|error| {
+        PerformanceOperationExecutionError::journal_transition(
+            Some(operation_id.clone()),
+            error,
+            PerformanceJournalTransition::effect_started(
+                operation.action,
+                &target_id,
+                rollback_state,
+            ),
+        )
+    })?;
+    record_performance_effect_started_status(
+        state,
+        &operation_id,
+        operation.persistence_failure.as_ref(),
+    )
+    .await?;
 
     let result = (|| {
         let restored_state =
@@ -242,17 +375,19 @@ fn execute_performance_rollback(
         &target_id,
         rollback_state,
         &result,
-    );
+        operation.persistence_failure.as_ref(),
+    )
+    .await?;
 
-    result
+    result.map_err(Into::into)
 }
 
-fn execute_performance_remove(
+async fn execute_performance_remove(
     state: &AppState,
     performance: &axial_performance::PerformanceManager,
     mods_dir: &std::path::Path,
-    linked_operation_id: Option<&str>,
-) -> Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)> {
+    operation: &PerformanceOperation,
+) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
     let journal_action = PerformanceInstallAction::Remove;
     let current_state = preflight_current_performance_state(mods_dir);
     let (target_id, rollback_state) = match &current_state {
@@ -273,8 +408,16 @@ fn execute_performance_remove(
         journal_action,
         &target_id,
         rollback_state,
-        linked_operation_id,
-    );
+        operation.status_operation_id.as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        PerformanceOperationExecutionError::journal_transition(
+            operation.status_operation_id.clone().map(OperationId::new),
+            error,
+            PerformanceJournalTransition::created(journal_action, &target_id, rollback_state),
+        )
+    })?;
     let supervision = match supervise_performance_operation(
         state,
         GuardianPerformanceOperationKind::RemoveManagedComposition,
@@ -286,30 +429,76 @@ fn execute_performance_remove(
     ) {
         Ok(supervision) => supervision,
         Err(error) => {
-            record_performance_operation_failure(
+            let result = Err(performance_supervision_error(
+                error,
+                OperationPhase::Installing,
+            ));
+            record_performance_operation_result(
                 state,
                 &operation_id,
                 journal_action,
                 &target_id,
                 rollback_state,
-            );
-            return Err(performance_supervision_error(
-                error,
-                OperationPhase::Installing,
-            ));
+                &result,
+                operation.persistence_failure.as_ref(),
+            )
+            .await?;
+            return result.map_err(Into::into);
         }
     };
-    record_performance_guardian_supervision(state, &operation_id, &supervision);
+    record_performance_guardian_supervision(state, &operation_id, &supervision)
+        .await
+        .map_err(|error| {
+            PerformanceOperationExecutionError::journal_transition(
+                Some(operation_id.clone()),
+                error,
+                PerformanceJournalTransition::guardian(
+                    journal_action,
+                    &target_id,
+                    rollback_state,
+                    &supervision,
+                ),
+            )
+        })?;
     if let Err(error) = current_state {
-        record_performance_operation_failure(
+        let result = Err(error);
+        record_performance_operation_result(
             state,
             &operation_id,
             journal_action,
             &target_id,
             rollback_state,
-        );
-        return Err(error);
+            &result,
+            operation.persistence_failure.as_ref(),
+        )
+        .await?;
+        return result.map_err(Into::into);
     }
+    record_performance_effect_started(
+        state,
+        &operation_id,
+        journal_action,
+        &target_id,
+        rollback_state,
+    )
+    .await
+    .map_err(|error| {
+        PerformanceOperationExecutionError::journal_transition(
+            Some(operation_id.clone()),
+            error,
+            PerformanceJournalTransition::effect_started(
+                journal_action,
+                &target_id,
+                rollback_state,
+            ),
+        )
+    })?;
+    record_performance_effect_started_status(
+        state,
+        &operation_id,
+        operation.persistence_failure.as_ref(),
+    )
+    .await?;
 
     let result = performance
         .remove_managed(mods_dir)
@@ -322,9 +511,11 @@ fn execute_performance_remove(
         &target_id,
         rollback_state,
         &result,
-    );
+        operation.persistence_failure.as_ref(),
+    )
+    .await?;
 
-    result
+    result.map_err(Into::into)
 }
 
 async fn execute_performance_install(
@@ -335,7 +526,7 @@ async fn execute_performance_install(
     mode: PerformanceMode,
     game_version: String,
     loader: String,
-) -> Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
     let plan = state.performance().get_plan(ResolutionRequest {
         game_version: game_version.clone(),
         loader,
@@ -354,7 +545,19 @@ async fn execute_performance_install(
         &plan.composition_id,
         rollback_state,
         operation.status_operation_id.as_deref(),
-    );
+    )
+    .await
+    .map_err(|error| {
+        PerformanceOperationExecutionError::journal_transition(
+            operation.status_operation_id.clone().map(OperationId::new),
+            error,
+            PerformanceJournalTransition::created(
+                operation.action,
+                &plan.composition_id,
+                rollback_state,
+            ),
+        )
+    })?;
     let guardian_facts =
         performance_install_guardian_facts(state, &plan, OperationPhase::Installing);
     let supervision = match supervise_performance_operation(
@@ -368,30 +571,76 @@ async fn execute_performance_install(
     ) {
         Ok(supervision) => supervision,
         Err(error) => {
-            record_performance_operation_failure(
+            let result = Err(performance_supervision_error(
+                error,
+                OperationPhase::Installing,
+            ));
+            record_performance_operation_result(
                 state,
                 &operation_id,
                 operation.action,
                 &plan.composition_id,
                 rollback_state,
-            );
-            return Err(performance_supervision_error(
-                error,
-                OperationPhase::Installing,
-            ));
+                &result,
+                operation.persistence_failure.as_ref(),
+            )
+            .await?;
+            return result.map_err(Into::into);
         }
     };
-    record_performance_guardian_supervision(state, &operation_id, &supervision);
+    record_performance_guardian_supervision(state, &operation_id, &supervision)
+        .await
+        .map_err(|error| {
+            PerformanceOperationExecutionError::journal_transition(
+                Some(operation_id.clone()),
+                error,
+                PerformanceJournalTransition::guardian(
+                    operation.action,
+                    &plan.composition_id,
+                    rollback_state,
+                    &supervision,
+                ),
+            )
+        })?;
     if let Err(error) = current_state {
-        record_performance_operation_failure(
+        let result = Err(error);
+        record_performance_operation_result(
             state,
             &operation_id,
             operation.action,
             &plan.composition_id,
             rollback_state,
-        );
-        return Err(error);
+            &result,
+            operation.persistence_failure.as_ref(),
+        )
+        .await?;
+        return result.map_err(Into::into);
     }
+    record_performance_effect_started(
+        state,
+        &operation_id,
+        operation.action,
+        &plan.composition_id,
+        rollback_state,
+    )
+    .await
+    .map_err(|error| {
+        PerformanceOperationExecutionError::journal_transition(
+            Some(operation_id.clone()),
+            error,
+            PerformanceJournalTransition::effect_started(
+                operation.action,
+                &plan.composition_id,
+                rollback_state,
+            ),
+        )
+    })?;
+    record_performance_effect_started_status(
+        state,
+        &operation_id,
+        operation.persistence_failure.as_ref(),
+    )
+    .await?;
 
     let result = match performance
         .ensure_installed(&plan, &game_version, mods_dir)
@@ -424,9 +673,11 @@ async fn execute_performance_install(
         &plan.composition_id,
         rollback_state,
         &result,
-    );
+        operation.persistence_failure.as_ref(),
+    )
+    .await?;
 
-    result
+    result.map_err(Into::into)
 }
 
 fn supervise_performance_operation(

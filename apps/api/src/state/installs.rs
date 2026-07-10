@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Notify, RwLock, broadcast};
 use tokio::task::JoinHandle;
 
 struct InstallEntry {
@@ -15,6 +15,17 @@ struct InstallEntry {
     events: broadcast::Sender<DownloadProgress>,
     record_events: broadcast::Sender<InstallProgressRecord>,
     done: bool,
+    initializing: bool,
+    initialization_reconciling: bool,
+    terminalizing: bool,
+    changed: Arc<Notify>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InstallInitializationStatus {
+    Initialized,
+    Reconciling,
+    Removed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,8 +232,66 @@ impl InstallStore {
             return (existing_id, false);
         }
 
-        installs.insert(install_id.clone(), new_install_entry(Some(key)));
+        let mut entry = new_install_entry(Some(key));
+        entry.initializing = true;
+        installs.insert(install_id.clone(), entry);
         (install_id, true)
+    }
+
+    pub async fn mark_initialized(&self, install_id: &str) -> bool {
+        let changed = {
+            let mut installs = self.installs.write().await;
+            let Some(entry) = installs.get_mut(install_id) else {
+                return false;
+            };
+            entry.initializing = false;
+            entry.initialization_reconciling = false;
+            entry.changed.clone()
+        };
+        changed.notify_waiters();
+        true
+    }
+
+    pub async fn wait_until_initialized(&self, install_id: &str) -> bool {
+        self.wait_for_initialization(install_id).await == InstallInitializationStatus::Initialized
+    }
+
+    pub(crate) async fn wait_for_initialization(
+        &self,
+        install_id: &str,
+    ) -> InstallInitializationStatus {
+        loop {
+            let changed = {
+                let installs = self.installs.read().await;
+                let Some(entry) = installs.get(install_id) else {
+                    return InstallInitializationStatus::Removed;
+                };
+                if entry.initialization_reconciling {
+                    return InstallInitializationStatus::Reconciling;
+                };
+                if !entry.initializing {
+                    return InstallInitializationStatus::Initialized;
+                }
+                entry.changed.clone().notified_owned()
+            };
+            changed.await;
+        }
+    }
+
+    pub(crate) async fn mark_initialization_reconciling(&self, install_id: &str) -> bool {
+        let changed = {
+            let mut installs = self.installs.write().await;
+            let Some(entry) = installs.get_mut(install_id) else {
+                return false;
+            };
+            if !entry.initializing {
+                return false;
+            }
+            entry.initialization_reconciling = true;
+            entry.changed.clone()
+        };
+        changed.notify_waiters();
+        true
     }
 
     async fn insert_entry(&self, install_id: String, key: Option<InstallKey>) {
@@ -242,7 +311,7 @@ impl InstallStore {
             let Some(entry) = installs.get_mut(install_id) else {
                 return;
             };
-            if entry.done {
+            if entry.done || entry.terminalizing {
                 return;
             }
             entry.done = record.progress.done;
@@ -272,6 +341,45 @@ impl InstallStore {
         let _ = senders.0.send(record.progress.clone());
         let _ = senders.1.send(record);
         true
+    }
+
+    async fn reserve_terminal_if_active(&self, install_id: &str) -> bool {
+        let mut installs = self.installs.write().await;
+        let Some(entry) = installs.get_mut(install_id) else {
+            return false;
+        };
+        if entry.done || entry.terminalizing {
+            return false;
+        }
+        entry.terminalizing = true;
+        true
+    }
+
+    async fn finish_reserved(&self, install_id: &str, mut progress: DownloadProgress) -> bool {
+        progress.done = true;
+        let record = InstallProgressRecord::new(progress);
+        let senders = {
+            let mut installs = self.installs.write().await;
+            let Some(entry) = installs.get_mut(install_id) else {
+                return false;
+            };
+            if entry.done || !entry.terminalizing {
+                return false;
+            }
+            entry.terminalizing = false;
+            entry.done = true;
+            entry.latest = Some(record.clone());
+            (entry.events.clone(), entry.record_events.clone())
+        };
+        let _ = senders.0.send(record.progress.clone());
+        let _ = senders.1.send(record);
+        true
+    }
+
+    async fn cancel_reserved_terminal(&self, install_id: &str) {
+        if let Some(entry) = self.installs.write().await.get_mut(install_id) {
+            entry.terminalizing = false;
+        }
     }
 
     pub async fn subscribe(
@@ -326,11 +434,11 @@ impl InstallStore {
             install_id,
             interrupted_progress,
             worker,
-            |_| {},
+            |_| async { true },
         )
     }
 
-    pub fn spawn_tracked_worker_with_interrupt_handler<F, H>(
+    pub fn spawn_tracked_worker_with_interrupt_handler<F, H, HFut>(
         store: Arc<Self>,
         install_id: String,
         interrupted_progress: DownloadProgress,
@@ -339,15 +447,20 @@ impl InstallStore {
     ) -> JoinHandle<()>
     where
         F: Future<Output = ()> + Send + 'static,
-        H: FnOnce(DownloadProgress) + Send + 'static,
+        H: FnOnce(DownloadProgress) -> HFut + Send + 'static,
+        HFut: Future<Output = bool> + Send + 'static,
     {
         tokio::spawn(async move {
             let _ = tokio::spawn(worker).await;
-            if store
-                .finish_if_active(&install_id, interrupted_progress.clone())
-                .await
-            {
-                on_interrupted(interrupted_progress);
+            if !store.reserve_terminal_if_active(&install_id).await {
+                return;
+            }
+            if on_interrupted(interrupted_progress.clone()).await {
+                let _ = store
+                    .finish_reserved(&install_id, interrupted_progress)
+                    .await;
+            } else {
+                store.cancel_reserved_terminal(&install_id).await;
             }
         })
     }
@@ -531,7 +644,9 @@ impl InstallStore {
     }
 
     pub async fn remove(&self, install_id: &str) {
-        self.installs.write().await.remove(install_id);
+        if let Some(entry) = self.installs.write().await.remove(install_id) {
+            entry.changed.notify_waiters();
+        }
     }
 
     pub async fn clear(&self) {
@@ -550,6 +665,10 @@ fn new_install_entry(key: Option<InstallKey>) -> InstallEntry {
         events,
         record_events,
         done: false,
+        initializing: false,
+        initialization_reconciling: false,
+        terminalizing: false,
+        changed: Arc::new(Notify::new()),
     }
 }
 
@@ -996,8 +1115,9 @@ mod tests {
             "early-install".to_string(),
             failed_progress(),
             async {},
-            move |progress| {
+            move |progress| async move {
                 *interrupted_capture.lock().expect("lock") = Some(progress.phase);
+                true
             },
         )
         .await
@@ -1014,14 +1134,91 @@ mod tests {
             "done-install".to_string(),
             failed_progress(),
             async {},
-            move |_| {
+            move |_| async move {
                 *not_interrupted_capture.lock().expect("lock") = true;
+                true
             },
         )
         .await
         .expect("tracked worker should complete");
 
         assert!(!*not_interrupted.lock().expect("lock"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_install_waits_for_initialization_and_observes_removal() {
+        let store = Arc::new(InstallStore::new());
+        let (install_id, inserted) = store
+            .insert_or_existing_active(
+                "initializing-install".to_string(),
+                "1.21.5".to_string(),
+                String::new(),
+            )
+            .await;
+        assert!(inserted);
+        let waiting_store = store.clone();
+        let waiting_id = install_id.clone();
+        let waiting =
+            tokio::spawn(async move { waiting_store.wait_until_initialized(&waiting_id).await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        assert!(store.mark_initialized(&install_id).await);
+        assert!(waiting.await.expect("initialization waiter"));
+
+        let (removed_id, inserted) = store
+            .insert_or_existing_active(
+                "removed-initialization".to_string(),
+                "1.21.6".to_string(),
+                String::new(),
+            )
+            .await;
+        assert!(inserted);
+        let removed_store = store.clone();
+        let removed_wait_id = removed_id.clone();
+        let removed =
+            tokio::spawn(
+                async move { removed_store.wait_until_initialized(&removed_wait_id).await },
+            );
+        tokio::task::yield_now().await;
+        assert!(!removed.is_finished());
+        store.remove(&removed_id).await;
+        assert!(!removed.await.expect("removed initialization waiter"));
+    }
+
+    #[tokio::test]
+    async fn interrupted_status_is_published_only_after_async_handler_succeeds() {
+        let store = Arc::new(InstallStore::new());
+        store.insert("ordered-interruption".to_string()).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let worker = InstallStore::spawn_tracked_worker_with_interrupt_handler(
+            store.clone(),
+            "ordered-interruption".to_string(),
+            failed_progress(),
+            async {},
+            move |_| async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+                true
+            },
+        );
+        entered_rx.await.expect("interruption handler entered");
+        assert!(
+            !store
+                .snapshot("ordered-interruption")
+                .await
+                .expect("active install")
+                .done
+        );
+        let _ = release_tx.send(());
+        worker.await.expect("tracked worker");
+        assert!(
+            store
+                .snapshot("ordered-interruption")
+                .await
+                .expect("terminal install")
+                .done
+        );
     }
 
     #[tokio::test]

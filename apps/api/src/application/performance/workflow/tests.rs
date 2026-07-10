@@ -1,5 +1,7 @@
 use super::*;
-use crate::state::performance_operations::PerformanceOperationPayload;
+use crate::state::performance_operations::{
+    PERFORMANCE_COMMITTING_COMPLETE_STATE, PerformanceOperationPayload,
+};
 use crate::state::{AppStateInit, DownloadProgress, InstallStore, SessionStore};
 use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
 use axial_performance::modrinth::ModrinthError;
@@ -11,13 +13,22 @@ use axum::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use std::{
-    fs,
+    collections::HashSet,
+    fs, io,
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex as SyncMutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
+
+use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
+use crate::state::OperationJournalStore;
+use crate::state::contracts::TargetDescriptor;
+use crate::state::performance_operations::PerformanceOperationStore;
 
 type PlanQuery = PerformancePlanRequest;
 type HealthQuery = PerformanceHealthRequest;
@@ -177,6 +188,84 @@ struct TestFixture {
     root: PathBuf,
 }
 
+#[derive(Default)]
+struct ScriptedOperationBackend {
+    attempts: AtomicUsize,
+    fail_all: AtomicBool,
+    fail_attempts: SyncMutex<HashSet<usize>>,
+    gate_attempt: AtomicUsize,
+    release_gate: AtomicBool,
+}
+
+impl ScriptedOperationBackend {
+    fn coordinator(self: &Arc<Self>) -> PersistenceCoordinator {
+        PersistenceCoordinator::for_test(
+            self.clone(),
+            Duration::from_millis(1),
+            Duration::from_millis(5),
+        )
+    }
+
+    fn fail_attempt(&self, attempt: usize) {
+        self.fail_attempts
+            .lock()
+            .expect("scripted failures lock")
+            .insert(attempt);
+    }
+
+    fn set_fail_all(&self, fail: bool) {
+        self.fail_all.store(fail, Ordering::SeqCst);
+    }
+
+    fn gate_attempt(&self, attempt: usize) {
+        self.gate_attempt.store(attempt, Ordering::SeqCst);
+        self.release_gate.store(false, Ordering::SeqCst);
+    }
+
+    fn release(&self) {
+        self.release_gate.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_for_attempt(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while self.attempts.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scripted persistence attempt");
+    }
+}
+
+impl AtomicWriteBackend for ScriptedOperationBackend {
+    fn write(
+        &self,
+        _target: &TargetDescriptor,
+        destination: &FsPath,
+        contents: &[u8],
+    ) -> io::Result<()> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.gate_attempt.load(Ordering::SeqCst) == attempt {
+            while !self.release_gate.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if self.fail_all.load(Ordering::SeqCst)
+            || self
+                .fail_attempts
+                .lock()
+                .expect("scripted failures lock")
+                .remove(&attempt)
+        {
+            return Err(io::Error::other("injected operation persistence failure"));
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(destination, contents)
+    }
+}
+
 impl TestFixture {
     fn new(name: &str) -> Self {
         Self::new_with_remote_url(name, None)
@@ -248,6 +337,14 @@ impl TestFixture {
 }
 
 async fn spawn_rules_server(body: Vec<u8>, signature: Option<String>) -> String {
+    spawn_delayed_rules_server(body, signature, Duration::ZERO).await
+}
+
+async fn spawn_delayed_rules_server(
+    body: Vec<u8>,
+    signature: Option<String>,
+    delay: Duration,
+) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind rules server");
@@ -256,6 +353,7 @@ async fn spawn_rules_server(body: Vec<u8>, signature: Option<String>) -> String 
         let (mut socket, _) = listener.accept().await.expect("accept rules request");
         let mut request = [0_u8; 1024];
         let _ = socket.read(&mut request).await;
+        tokio::time::sleep(delay).await;
         let signature_header = signature
             .as_ref()
             .map(|signature| {
@@ -347,6 +445,39 @@ fn build_test_state(
         startup_warnings: Vec::new(),
         frontend_dir: root.join("frontend"),
     })
+}
+
+fn build_test_state_with_operation_backends(
+    root: &FsPath,
+    journal_backend: Arc<ScriptedOperationBackend>,
+    status_backend: Arc<ScriptedOperationBackend>,
+) -> AppState {
+    let state = build_test_state(root, None, None);
+    replace_operation_backends(state, root, journal_backend, status_backend)
+}
+
+fn replace_operation_backends(
+    state: AppState,
+    root: &FsPath,
+    journal_backend: Arc<ScriptedOperationBackend>,
+    status_backend: Arc<ScriptedOperationBackend>,
+) -> AppState {
+    let paths = test_paths(root);
+    let journals = Arc::new(
+        OperationJournalStore::try_load_from_paths_with_coordinator(
+            &paths,
+            journal_backend.coordinator(),
+        )
+        .expect("scripted journal store"),
+    );
+    let performance_operations = Arc::new(
+        PerformanceOperationStore::try_load_from_paths_with_coordinator(
+            &paths,
+            status_backend.coordinator(),
+        )
+        .expect("scripted performance status store"),
+    );
+    state.with_operation_stores(journals, performance_operations)
 }
 
 fn seed_repeated_performance_memory(state: &AppState, composition_id: &str, count: u32) {

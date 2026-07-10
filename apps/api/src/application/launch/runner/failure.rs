@@ -39,6 +39,35 @@ pub(super) async fn fail_launch(
     .await
 }
 
+pub(super) async fn fail_launch_for_journal(
+    state: &AppState,
+    session_id: &str,
+    message: &str,
+    healing: Option<axial_launcher::LaunchHealingSummary>,
+    guardian: Option<GuardianSummary>,
+) -> LaunchRequestError {
+    let public_message = sanitize_live_launch_failure_message(message);
+    emit_terminal_failure(
+        state,
+        session_id,
+        TerminalFailureEvent {
+            state: "failed",
+            class: LaunchFailureClass::Unknown,
+            message: &public_message,
+            healing: healing.clone(),
+            guardian: guardian.clone(),
+            outcome: None,
+        },
+    )
+    .await;
+    persist_launch_proof_best_effort_with_context(state, session_id, None, "failed", None).await;
+    LaunchRequestError {
+        message: public_message,
+        healing,
+        guardian,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn fail_launch_with_outcome(
     state: &AppState,
@@ -55,11 +84,14 @@ pub(super) async fn fail_launch_with_outcome(
     emit_terminal_failure(
         state,
         session_id,
-        failure_class,
-        &public_message,
-        healing.clone(),
-        guardian.clone(),
-        outcome,
+        TerminalFailureEvent {
+            state: "exited",
+            class: failure_class,
+            message: &public_message,
+            healing: healing.clone(),
+            guardian: guardian.clone(),
+            outcome,
+        },
     )
     .await;
     persist_launch_proof_best_effort_with_context(state, session_id, None, "failed", proof_context)
@@ -95,33 +127,38 @@ fn rosetta_required_launch_failure_message(message: &str) -> Option<String> {
     ))
 }
 
-async fn emit_terminal_failure(
-    state: &AppState,
-    session_id: &str,
-    failure_class: LaunchFailureClass,
-    message: &str,
+struct TerminalFailureEvent<'a> {
+    state: &'static str,
+    class: LaunchFailureClass,
+    message: &'a str,
     healing: Option<axial_launcher::LaunchHealingSummary>,
     guardian: Option<GuardianSummary>,
     outcome: Option<LaunchSessionOutcome>,
+}
+
+async fn emit_terminal_failure(
+    state: &AppState,
+    session_id: &str,
+    event: TerminalFailureEvent<'_>,
 ) {
     state
         .sessions()
-        .emit_log(session_id, "system", message.to_string())
+        .emit_log(session_id, "system", event.message.to_string())
         .await;
     state
         .sessions()
         .emit_status(
             session_id,
             LaunchStatusEvent {
-                state: "exited".to_string(),
+                state: event.state.to_string(),
                 benchmark: None,
                 pid: None,
                 exit_code: Some(-1),
-                failure_class: Some(failure_class_name(failure_class).to_string()),
-                failure_detail: Some(message.to_string()),
-                healing: serialize_healing(healing),
-                guardian: serialize_guardian(guardian),
-                outcome,
+                failure_class: Some(failure_class_name(event.class).to_string()),
+                failure_detail: Some(event.message.to_string()),
+                healing: serialize_healing(event.healing),
+                guardian: serialize_guardian(event.guardian),
+                outcome: event.outcome,
                 notice: None,
                 evidence: Vec::new(),
                 stages: Vec::new(),
