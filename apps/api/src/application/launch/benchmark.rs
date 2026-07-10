@@ -3,8 +3,9 @@ use crate::application::performance::{
     self, BenchmarkMatrix, BenchmarkSuiteRunSpec, benchmark_suite_manifest_run_inputs,
     benchmark_suite_run_descriptor, benchmark_suite_run_id,
 };
-use crate::state::AppState;
-use axial_launcher::LaunchState;
+use crate::state::launch_reports::LaunchProofContext;
+use crate::state::{AppState, LaunchStatusEvent};
+use axial_launcher::{LaunchStageEvidence, LaunchState};
 use axum::Json;
 use axum::http::StatusCode;
 use serde::Deserialize;
@@ -555,7 +556,7 @@ pub(crate) async fn launch_benchmark_suite_run(
     let benchmark_response = super::launch_benchmark_status_payload(&benchmark);
     let suite_response = benchmark_suite_status_payload(&suite_id, &mode, run_index, &plan);
     prepared.task.benchmark = Some(benchmark.clone());
-    persist_benchmark_suite_run_reservation(
+    let reservation = persist_benchmark_suite_run_reservation(
         state.config().paths(),
         &suite_id,
         &mode,
@@ -564,7 +565,11 @@ pub(crate) async fn launch_benchmark_suite_run(
         &prepared.task.intent.instance_id,
         &prepared.task.intent.session_id,
         &prepared.task.launched_at,
-    )?;
+    );
+    if let Err(error) = reservation {
+        finish_benchmark_suite_reservation_failure(&state, &prepared.task, benchmark).await;
+        return Err(error);
+    }
     let launched = super::launch_session(state.clone(), prepared.task)
         .await
         .map_err(super::launch_request_error_response)?;
@@ -573,6 +578,75 @@ pub(crate) async fn launch_benchmark_suite_run(
     response["benchmark"] = benchmark_response;
     response["suite"] = suite_response;
     Ok(response)
+}
+
+async fn finish_benchmark_suite_reservation_failure(
+    state: &AppState,
+    task: &super::LaunchSessionTask,
+    benchmark: crate::state::launch_reports::LaunchBenchmarkMetadata,
+) {
+    let session_id = task.intent.session_id.as_str();
+    let mut initial_evidence = super::launch_application_stage_evidence(&task.application);
+    initial_evidence.extend(super::launch_boundary_stage_evidence(&task.boundary));
+    state
+        .sessions()
+        .record_stage_evidence(session_id, initial_evidence)
+        .await;
+    state
+        .sessions()
+        .attach_benchmark(
+            session_id,
+            super::launch_benchmark_status_payload(&benchmark),
+        )
+        .await;
+    state
+        .sessions()
+        .emit_log(
+            session_id,
+            "system",
+            BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE.to_string(),
+        )
+        .await;
+    state
+        .sessions()
+        .emit_status(
+            session_id,
+            LaunchStatusEvent {
+                state: "failed".to_string(),
+                benchmark: None,
+                pid: None,
+                exit_code: None,
+                failure_class: Some("unknown".to_string()),
+                failure_detail: Some(BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE.to_string()),
+                healing: None,
+                guardian: serde_json::to_value(&task.guardian).ok(),
+                outcome: None,
+                notice: None,
+                evidence: vec![LaunchStageEvidence {
+                    id: "application_benchmark_suite_reservation_failed".to_string(),
+                    system: "application".to_string(),
+                    summary: "Benchmark suite reservation failed before process start.".to_string(),
+                    details: vec!["storage:benchmark_suite".to_string()],
+                }],
+                stages: Vec::new(),
+            },
+        )
+        .await;
+
+    let proof_context = LaunchProofContext::from_intent(&task.intent)
+        .with_benchmark(Some(benchmark))
+        .with_resource_budget(task.resource_budget.clone());
+    super::runner::persist_launch_proof_for_reservation_failure(
+        state,
+        session_id,
+        Some(task.launched_at.as_str()),
+        &proof_context,
+    )
+    .await;
+    state
+        .sessions()
+        .release_terminal_retention_hold(session_id)
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1145,4 +1219,272 @@ pub(crate) fn bounded_status_token(value: &str) -> Option<String> {
     Some(crate::observability::bounded_descriptor_token(
         value, "session",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{AppStateInit, InstallStore, SessionStore};
+    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+    use axial_launcher::{LaunchSessionRecord, SessionId};
+    use axial_performance::PerformanceManager;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn benchmark_suite_reservation_failure_finalizes_and_releases_prepared_session() {
+        let fixture = BenchmarkFixture::new("reservation-finalizes-session");
+        fixture.write_ready_install("1.21.1");
+        let instance_id = fixture.add_instance("Benchmark", "1.21.1");
+        let suite_id = "reservation-finalizes-session";
+        let corrupt_manifest = crate::state::benchmark_suites::suite_path(&fixture.paths, suite_id);
+        fs::create_dir_all(corrupt_manifest.parent().expect("suite parent"))
+            .expect("create suite parent");
+        fs::write(&corrupt_manifest, b"{not-json").expect("corrupt suite manifest");
+        let plan = performance::benchmark_suite_plan("development").expect("development plan");
+
+        let error = launch_benchmark_suite_run(
+            fixture.state.clone(),
+            BenchmarkSuiteLaunchInput {
+                launch: super::super::LaunchRequest {
+                    instance_id,
+                    username: None,
+                    max_memory_mb: None,
+                    min_memory_mb: None,
+                    client_started_at_ms: None,
+                },
+                suite_id: suite_id.to_string(),
+                mode: "development".to_string(),
+                run_index: 0,
+                plan,
+            },
+        )
+        .await
+        .expect_err("corrupt suite manifest should reject reservation");
+
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.1.0,
+            json!({ "error": BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE })
+        );
+        let proofs = crate::state::launch_reports::list_recent(&fixture.paths, 5)
+            .expect("list launch proofs");
+        assert_eq!(proofs.len(), 1);
+        let proof = &proofs[0];
+        assert_eq!(proof.outcome, "failed");
+        assert_eq!(
+            proof.scenario.benchmark_mode.as_deref(),
+            Some("development")
+        );
+        assert_eq!(
+            proof.failure_detail.as_deref(),
+            Some(BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE)
+        );
+        assert!(proof.stages.iter().any(|stage| {
+            stage.evidence.iter().any(|evidence| {
+                evidence.id == "application_benchmark_suite_reservation_failed"
+                    && evidence.system == "application"
+            })
+        }));
+
+        let session_id = proof.session_id.clone();
+        let record = fixture
+            .state
+            .sessions()
+            .get(&session_id)
+            .await
+            .expect("terminal prepared session");
+        assert_eq!(record.state, LaunchState::Failed);
+        assert!(fixture.state.sessions().active_records().await.is_empty());
+
+        for index in 0..=32 {
+            let completed_id = format!("completed-{index}");
+            fixture
+                .state
+                .sessions()
+                .insert(test_record(&completed_id))
+                .await;
+            fixture
+                .state
+                .sessions()
+                .release_terminal_retention_hold(&completed_id)
+                .await;
+            fixture
+                .state
+                .sessions()
+                .emit_status(&completed_id, terminal_status())
+                .await;
+        }
+        assert!(fixture.state.sessions().get(&session_id).await.is_none());
+    }
+
+    struct BenchmarkFixture {
+        state: AppState,
+        paths: AppPaths,
+        root: PathBuf,
+    }
+
+    impl BenchmarkFixture {
+        fn new(name: &str) -> Self {
+            let root = test_root(name);
+            let paths = test_paths(&root);
+            fs::create_dir_all(&paths.library_dir).expect("create library dir");
+            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+            config
+                .replace_in_memory(AppConfig {
+                    library_dir: paths.library_dir.to_string_lossy().to_string(),
+                    ..AppConfig::default()
+                })
+                .expect("set library dir");
+            let instances =
+                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+            let state = AppState::new(AppStateInit {
+                app_name: "Axial".to_string(),
+                version: "test".to_string(),
+                config,
+                instances,
+                installs: Arc::new(InstallStore::new()),
+                sessions: Arc::new(SessionStore::new()),
+                performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+                startup_warnings: Vec::new(),
+                frontend_dir: root.join("frontend"),
+            });
+            Self { state, paths, root }
+        }
+
+        fn add_instance(&self, name: &str, version_id: &str) -> String {
+            self.state
+                .instances()
+                .add(
+                    name.to_string(),
+                    version_id.to_string(),
+                    String::new(),
+                    String::new(),
+                    None,
+                )
+                .expect("add instance")
+                .id
+        }
+
+        fn write_ready_install(&self, version_id: &str) {
+            let version_dir = self.paths.library_dir.join("versions").join(version_id);
+            fs::create_dir_all(&version_dir).expect("version dir");
+            fs::write(
+                version_dir.join(format!("{version_id}.json")),
+                serde_json::to_vec(&json!({
+                    "id": version_id,
+                    "type": "release",
+                    "mainClass": "net.minecraft.client.main.Main",
+                    "assetIndex": {},
+                    "javaVersion": {
+                        "component": "java-runtime-delta",
+                        "majorVersion": 21
+                    },
+                    "libraries": []
+                }))
+                .expect("version json"),
+            )
+            .expect("write version json");
+            fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
+                .expect("write client jar");
+
+            let runtime_bin = self
+                .paths
+                .library_dir
+                .join("runtime")
+                .join("java-runtime-delta")
+                .join("bin");
+            fs::create_dir_all(&runtime_bin).expect("runtime bin");
+            let java_name = if cfg!(target_os = "windows") {
+                "javaw.exe"
+            } else {
+                "java"
+            };
+            let java_path = runtime_bin.join(java_name);
+            fs::write(&java_path, b"java").expect("runtime java");
+            make_executable(&java_path);
+        }
+    }
+
+    impl Drop for BenchmarkFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn test_record(session_id: &str) -> LaunchSessionRecord {
+        LaunchSessionRecord {
+            session_id: SessionId(session_id.to_string()),
+            instance_id: "instance".to_string(),
+            version_id: "1.21.1".to_string(),
+            launched_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            benchmark: None,
+            state: LaunchState::Queued,
+            pid: None,
+            process_started_at_ms: None,
+            boot_completed_at_ms: None,
+            boot_duration_ms: None,
+            priority: None,
+            exit_code: None,
+            command: Vec::new(),
+            java_path: None,
+            natives_dir: None,
+            failure: None,
+            healing: None,
+            guardian: None,
+            outcome: None,
+            stages: Vec::new(),
+        }
+    }
+
+    fn terminal_status() -> LaunchStatusEvent {
+        LaunchStatusEvent {
+            state: "exited".to_string(),
+            benchmark: None,
+            pid: None,
+            exit_code: Some(0),
+            failure_class: None,
+            failure_detail: None,
+            healing: None,
+            guardian: None,
+            outcome: None,
+            notice: None,
+            evidence: Vec::new(),
+            stages: Vec::new(),
+        }
+    }
+
+    fn test_root(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("axial-benchmark-{name}-{nanos}"))
+    }
+
+    fn test_paths(root: &Path) -> AppPaths {
+        let config_dir = root.join("config");
+        AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: config_dir.join("instances"),
+            music_dir: config_dir.join("music"),
+            library_dir: config_dir.join("library"),
+            config_dir,
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("set executable");
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(_path: &Path) {}
 }

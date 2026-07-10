@@ -557,18 +557,21 @@ pub(crate) async fn stop_launch_session(
     state: &AppState,
     id: &str,
 ) -> Result<serde_json::Value, super::LaunchApplicationError> {
-    let record = state.sessions().get(id).await.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "session not found" })),
-        )
-    })?;
-
-    state
+    let record = state
         .sessions()
-        .kill(id)
+        .acquire_terminal_retention_hold(id)
         .await
-        .map_err(launch_kill_error_response)?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "session not found" })),
+            )
+        })?;
+
+    if let Err(error) = state.sessions().kill(id).await {
+        state.sessions().release_terminal_retention_hold(id).await;
+        return Err(launch_kill_error_response(error));
+    }
 
     trace_launch_event(id, "kill requested by client");
     state
@@ -596,6 +599,7 @@ pub(crate) async fn stop_launch_session(
         )
         .await;
     persist_launch_proof_best_effort(state, id, record.launched_at.as_deref(), "stopped").await;
+    state.sessions().release_terminal_retention_hold(id).await;
 
     Ok(json!({ "status": "killed" }))
 }
@@ -625,8 +629,53 @@ pub(crate) fn launch_report_storage_error_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{LaunchStatusViewModel, public_launch_status_json};
-    use crate::state::LaunchStatusEvent;
+    use super::{LaunchStatusViewModel, public_launch_status_json, stop_launch_session};
+    use crate::state::{AppState, AppStateInit, InstallStore, LaunchStatusEvent, SessionStore};
+    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
+    use axial_performance::PerformanceManager;
+    use axum::http::StatusCode;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn stop_launch_session_releases_its_retention_hold_when_kill_fails() {
+        let root = unique_test_dir("stop-launch-retention-error");
+        let state = test_app_state(&root);
+        let session_id = "stop-kill-error";
+        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .release_terminal_retention_hold(session_id)
+            .await;
+
+        let error = stop_launch_session(&state, session_id)
+            .await
+            .expect_err("missing child should fail stop");
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+
+        state
+            .sessions()
+            .emit_status(session_id, terminal_status())
+            .await;
+        for index in 0..=32 {
+            let completed_id = format!("completed-{index}");
+            state.sessions().insert(test_record(&completed_id)).await;
+            state
+                .sessions()
+                .release_terminal_retention_hold(&completed_id)
+                .await;
+            state
+                .sessions()
+                .emit_status(&completed_id, terminal_status())
+                .await;
+        }
+
+        assert!(state.sessions().get(session_id).await.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn launch_status_view_model_authors_progress_copy() {
@@ -670,5 +719,84 @@ mod tests {
         assert_eq!(payload["view_model"]["state_id"], "monitoring");
         assert_eq!(payload["view_model"]["label"], "Monitoring startup");
         assert_eq!(payload["view_model"]["progress_pct"], 88);
+    }
+
+    fn test_app_state(root: &Path) -> AppState {
+        let paths = test_paths(root);
+        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        })
+    }
+
+    fn test_paths(root: &Path) -> AppPaths {
+        let config_dir = root.join("config");
+        AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: config_dir.join("instances"),
+            music_dir: config_dir.join("music"),
+            library_dir: config_dir.join("library"),
+            config_dir,
+        }
+    }
+
+    fn test_record(session_id: &str) -> LaunchSessionRecord {
+        LaunchSessionRecord {
+            session_id: SessionId(session_id.to_string()),
+            instance_id: "instance".to_string(),
+            version_id: "1.21.1".to_string(),
+            launched_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            benchmark: None,
+            state: LaunchState::Queued,
+            pid: None,
+            process_started_at_ms: None,
+            boot_completed_at_ms: None,
+            boot_duration_ms: None,
+            priority: None,
+            exit_code: None,
+            command: Vec::new(),
+            java_path: None,
+            natives_dir: None,
+            failure: None,
+            healing: None,
+            guardian: None,
+            outcome: None,
+            stages: Vec::new(),
+        }
+    }
+
+    fn terminal_status() -> LaunchStatusEvent {
+        LaunchStatusEvent {
+            state: "exited".to_string(),
+            benchmark: None,
+            pid: None,
+            exit_code: Some(0),
+            failure_class: None,
+            failure_detail: None,
+            healing: None,
+            guardian: None,
+            outcome: None,
+            notice: None,
+            evidence: Vec::new(),
+            stages: Vec::new(),
+        }
+    }
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 }

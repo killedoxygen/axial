@@ -13,8 +13,9 @@ use crate::execution::launch::{
 use crate::guardian::{
     GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryStatus, GuardianPrepareFailureRequest,
     GuardianPresetAdjustmentRequest, GuardianStartupFailureObservation,
-    GuardianStartupFailureRequest, guardian_prelaunch_preset_adjustment_directive,
-    guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
+    GuardianStartupFailureRequest, GuardianUserOutcome,
+    guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
+    guardian_startup_failure_outcome,
 };
 use crate::logging::append_trace;
 use crate::observability::telemetry::{
@@ -49,6 +50,22 @@ use tokio::process::Command;
 pub use failure::sanitize_live_launch_failure_message;
 pub use proof::persist_launch_proof_best_effort;
 
+pub(super) async fn persist_launch_proof_for_reservation_failure(
+    state: &AppState,
+    session_id: &str,
+    launched_at: Option<&str>,
+    proof_context: &LaunchProofContext,
+) {
+    persist_launch_proof_best_effort_with_context(
+        state,
+        session_id,
+        launched_at,
+        "failed",
+        Some(proof_context),
+    )
+    .await;
+}
+
 const STARTUP_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct LaunchSuccess {
@@ -69,6 +86,17 @@ pub struct LaunchRequestError {
 }
 
 pub async fn launch_session(
+    state: AppState,
+    task: super::session::LaunchSessionTask,
+) -> Result<LaunchSuccess, LaunchRequestError> {
+    let session_id = task.intent.session_id.clone();
+    let sessions = state.sessions().clone();
+    let result = launch_session_inner(state, task).await;
+    sessions.release_terminal_retention_hold(&session_id).await;
+    result
+}
+
+async fn launch_session_inner(
     state: AppState,
     task: super::session::LaunchSessionTask,
 ) -> Result<LaunchSuccess, LaunchRequestError> {
@@ -188,11 +216,16 @@ pub async fn launch_session(
                         Ok(recovery_plan) => recovery_plan,
                         Err(_) => {
                             emit_pending_launch_failure(&state, &mut launch_completion_pending);
-                            return Err(LaunchRequestError {
-                                message: prepare_outcome.user_outcome.summary.clone(),
-                                healing: error.healing.clone(),
-                                guardian: Some(guardian.clone()),
-                            });
+                            return Err(fail_rejected_launch_recovery_plan(
+                                &state,
+                                &session_id,
+                                Some(&proof_context),
+                                failure_class,
+                                &prepare_outcome.user_outcome,
+                                error.healing.clone(),
+                                &mut guardian,
+                            )
+                            .await);
                         }
                     };
                     let recovery_outcome = record_guardian_launch_recovery_attempt(
@@ -616,21 +649,27 @@ pub async fn launch_session(
                     ) {
                         Ok(recovery_plan) => recovery_plan,
                         Err(_) => {
+                            let healing = startup_failure_healing(
+                                &intent,
+                                &prepared,
+                                &attempt,
+                                failure_class,
+                            );
                             emit_launch_completed(
                                 &state,
                                 &mut launch_completion_pending,
                                 TelemetryLaunchOutcome::Failure,
                             );
-                            return Err(LaunchRequestError {
-                                message: startup_outcome.user_outcome.summary.clone(),
-                                healing: startup_failure_healing(
-                                    &intent,
-                                    &prepared,
-                                    &attempt,
-                                    failure_class,
-                                ),
-                                guardian: Some(guardian.clone()),
-                            });
+                            return Err(fail_rejected_launch_recovery_plan(
+                                &state,
+                                &session_id,
+                                Some(&proof_context),
+                                failure_class,
+                                &startup_outcome.user_outcome,
+                                healing,
+                                &mut guardian,
+                            )
+                            .await);
                         }
                     };
                     let recovery_outcome = record_guardian_launch_recovery_attempt(
@@ -709,6 +748,28 @@ pub async fn launch_session(
             }
         }
     }
+}
+
+async fn fail_rejected_launch_recovery_plan(
+    state: &AppState,
+    session_id: &str,
+    proof_context: Option<&LaunchProofContext>,
+    failure_class: LaunchFailureClass,
+    user_outcome: &GuardianUserOutcome,
+    healing: Option<axial_launcher::LaunchHealingSummary>,
+    guardian: &mut GuardianSummary,
+) -> LaunchRequestError {
+    block_guardian_with_user_outcome(guardian, user_outcome);
+    fail_launch(
+        state,
+        session_id,
+        proof_context,
+        failure_class,
+        &user_outcome.summary,
+        healing,
+        Some(guardian.clone()),
+    )
+    .await
 }
 
 fn emit_launch_started(
@@ -802,7 +863,9 @@ pub fn trace_launch_event(session_id: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guardian::GuardianDecisionKind;
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
+    use crate::state::contracts::OperationPhase;
     use crate::state::{AppStateInit, InstallStore, LaunchEvent, SessionStore};
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
     use axial_launcher::{LaunchSessionRecord, SessionId};
@@ -815,6 +878,48 @@ mod tests {
 
     const TEST_TELEMETRY_INSTALL_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
     const TEST_TELEMETRY_KEY: &str = "phc_test";
+
+    #[tokio::test]
+    async fn rejected_launch_recovery_plan_finishes_terminal_and_persists_proof() {
+        let root = unique_test_dir("rejected-launch-recovery-plan");
+        let state = test_app_state(&root);
+        let session_id = "rejected-launch-recovery-plan";
+        state.sessions().insert(test_record(session_id)).await;
+        let mut guardian = GuardianSummary::new(axial_launcher::GuardianMode::Managed);
+        let user_outcome = GuardianUserOutcome {
+            decision: GuardianDecisionKind::Block,
+            phase: OperationPhase::Preparing,
+            summary: "Guardian blocked launch recovery planning.".to_string(),
+            details: vec!["The recovery directive could not be planned safely.".to_string()],
+            guidance: Vec::new(),
+        };
+
+        let error = fail_rejected_launch_recovery_plan(
+            &state,
+            session_id,
+            None,
+            LaunchFailureClass::Unknown,
+            &user_outcome,
+            None,
+            &mut guardian,
+        )
+        .await;
+
+        assert_eq!(error.message, user_outcome.summary);
+        assert_eq!(guardian.decision, axial_launcher::GuardianDecision::Blocked);
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("terminal session");
+        assert_eq!(record.state, LaunchState::Exited);
+        let proof = crate::state::launch_reports::load(state.config().paths(), session_id)
+            .expect("load proof")
+            .expect("proof persisted");
+        assert_eq!(proof.session_id, session_id);
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn launch_started_emits_once_while_completion_is_pending() {

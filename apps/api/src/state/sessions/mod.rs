@@ -16,7 +16,7 @@ use axial_launcher::{
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -29,6 +29,7 @@ const MAX_NOTICE_MESSAGE_CHARS: usize = 180;
 const MAX_NOTICE_DETAIL_CHARS: usize = 240;
 const MAX_NOTICE_DETAILS: usize = 8;
 const MAX_LAUNCH_LOG_LINE_CHARS: usize = 1_000;
+const MAX_RETAINED_TERMINAL_SESSIONS: usize = 32;
 const PRIVATE_NOTICE_FALLBACK: &str = "Launch status details were hidden for privacy.";
 const FAILURE_SIGNAL_VALID_FOR_EXIT_MS: u64 = 15_000;
 
@@ -41,6 +42,8 @@ struct SessionEntry {
     log_count: Arc<AtomicUsize>,
     observed_failure: Option<ObservedFailureSignal>,
     stop_requested: bool,
+    retention_holds: usize,
+    terminal_sequence: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +62,7 @@ impl ObservedFailureSignal {
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, SessionEntry>>,
     changes: broadcast::Sender<()>,
+    next_terminal_sequence: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +79,7 @@ impl SessionStore {
         Self {
             sessions: RwLock::new(HashMap::new()),
             changes,
+            next_terminal_sequence: AtomicU64::new(0),
         }
     }
 
@@ -97,6 +102,8 @@ impl SessionStore {
                 log_count: Arc::new(AtomicUsize::new(0)),
                 observed_failure: None,
                 stop_requested: false,
+                retention_holds: 1,
+                terminal_sequence: None,
             },
         );
         drop(sessions);
@@ -135,6 +142,43 @@ impl SessionStore {
 
     pub fn subscribe_changes(&self) -> broadcast::Receiver<()> {
         self.changes.subscribe()
+    }
+
+    pub async fn acquire_terminal_retention_hold(
+        &self,
+        session_id: &str,
+    ) -> Option<LaunchSessionRecord> {
+        let mut sessions = self.sessions.write().await;
+        let entry = sessions.get_mut(session_id)?;
+        entry.retention_holds = entry
+            .retention_holds
+            .checked_add(1)
+            .expect("session retention hold count overflowed");
+        entry.terminal_sequence = None;
+        Some(entry.record.clone())
+    }
+
+    pub async fn release_terminal_retention_hold(&self, session_id: &str) {
+        let mut sessions = self.sessions.write().await;
+        let Some(entry) = sessions.get_mut(session_id) else {
+            return;
+        };
+        entry.retention_holds = entry
+            .retention_holds
+            .checked_sub(1)
+            .expect("released a session retention hold that was not acquired");
+        if entry.retention_holds == 0
+            && classify::is_terminal_state(entry.record.state)
+            && entry.terminal_sequence.is_none()
+        {
+            entry.terminal_sequence =
+                Some(self.next_terminal_sequence.fetch_add(1, Ordering::Relaxed));
+        }
+        let evicted = evict_oldest_terminal_sessions(&mut sessions);
+        drop(sessions);
+        if evicted {
+            self.notify_changed();
+        }
     }
 
     pub async fn emit_log(
@@ -241,7 +285,16 @@ impl SessionStore {
         let mut sessions = self.sessions.write().await;
         if let Some(entry) = sessions.get_mut(session_id) {
             apply_status_update(entry, &mut event);
+            if entry.retention_holds == 0 && classify::is_terminal_state(entry.record.state) {
+                if entry.terminal_sequence.is_none() {
+                    entry.terminal_sequence =
+                        Some(self.next_terminal_sequence.fetch_add(1, Ordering::Relaxed));
+                }
+            } else {
+                entry.terminal_sequence = None;
+            }
             let _ = entry.events.send(LaunchEvent::Status(Box::new(event)));
+            evict_oldest_terminal_sessions(&mut sessions);
             drop(sessions);
             self.notify_changed();
         }
@@ -328,6 +381,7 @@ impl SessionStore {
                 entry.log_count.store(0, Ordering::Relaxed);
                 entry.observed_failure = None;
                 entry.stop_requested = false;
+                entry.terminal_sequence = None;
             } else {
                 let (events, _) = broadcast::channel(256);
                 sessions.insert(
@@ -345,6 +399,8 @@ impl SessionStore {
                         log_count: Arc::new(AtomicUsize::new(0)),
                         observed_failure: None,
                         stop_requested: false,
+                        retention_holds: 1,
+                        terminal_sequence: None,
                     },
                 );
             }
@@ -414,11 +470,6 @@ impl SessionStore {
                 "session not found",
             ))
         }
-    }
-
-    pub async fn remove(&self, session_id: &str) {
-        self.sessions.write().await.remove(session_id);
-        self.notify_changed();
     }
 
     pub async fn observed_failure(&self, session_id: &str) -> Option<LaunchFailureClass> {
@@ -555,6 +606,32 @@ impl SessionStore {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+}
+
+fn evict_oldest_terminal_sessions(sessions: &mut HashMap<String, SessionEntry>) -> bool {
+    let terminal_count = sessions
+        .values()
+        .filter(|entry| entry.terminal_sequence.is_some())
+        .count();
+    let excess = terminal_count.saturating_sub(MAX_RETAINED_TERMINAL_SESSIONS);
+    if excess == 0 {
+        return false;
+    }
+
+    let mut terminal_sessions = sessions
+        .iter()
+        .filter_map(|(session_id, entry)| {
+            entry
+                .terminal_sequence
+                .map(|sequence| (sequence, session_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    terminal_sessions.sort_unstable();
+
+    for (_, session_id) in terminal_sessions.into_iter().take(excess) {
+        sessions.remove(&session_id);
+    }
+    true
 }
 
 fn apply_status_update(entry: &mut SessionEntry, event: &mut LaunchStatusEvent) {
@@ -1008,6 +1085,188 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use tokio::process::Command;
+
+    #[tokio::test]
+    async fn launch_terminal_session_retention_bounds_repeated_transitions_and_keeps_active() {
+        let store = SessionStore::new();
+        store.insert(test_record("active-session")).await;
+
+        let overflow = 5;
+        for index in 0..MAX_RETAINED_TERMINAL_SESSIONS + overflow {
+            let session_id = format!("terminal-{index}");
+            store.insert(test_record(&session_id)).await;
+            store.release_terminal_retention_hold(&session_id).await;
+            store
+                .emit_status(&session_id, terminal_status(Some(0), None, None))
+                .await;
+        }
+
+        let sessions = store.sessions.read().await;
+        assert_eq!(sessions.len(), MAX_RETAINED_TERMINAL_SESSIONS + 1);
+        assert!(sessions.contains_key("active-session"));
+        assert_eq!(
+            sessions
+                .values()
+                .filter(|entry| entry.terminal_sequence.is_some())
+                .count(),
+            MAX_RETAINED_TERMINAL_SESSIONS
+        );
+        for index in 0..overflow {
+            assert!(!sessions.contains_key(&format!("terminal-{index}")));
+        }
+        for index in overflow..MAX_RETAINED_TERMINAL_SESSIONS + overflow {
+            assert!(sessions.contains_key(&format!("terminal-{index}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_retained_terminal_session_replays_the_broadcast_status_snapshot() {
+        let store = SessionStore::new();
+        let retained_session_id = format!("terminal-{MAX_RETAINED_TERMINAL_SESSIONS}");
+        let mut retained_receiver = None;
+
+        for index in 0..=MAX_RETAINED_TERMINAL_SESSIONS {
+            let session_id = format!("terminal-{index}");
+            store.insert(test_record(&session_id)).await;
+            if session_id == retained_session_id {
+                retained_receiver = store.subscribe(&session_id).await;
+            }
+            store.release_terminal_retention_hold(&session_id).await;
+            store
+                .emit_status(&session_id, terminal_status(Some(index as i32), None, None))
+                .await;
+        }
+
+        assert!(store.get("terminal-0").await.is_none());
+        let emitted = recv_status(&mut retained_receiver.expect("retained receiver")).await;
+        let retained = store
+            .get(&retained_session_id)
+            .await
+            .expect("retained terminal record");
+        let replay = axial_launcher::snapshot_status(&retained);
+
+        assert_eq!(replay.state, emitted.state);
+        assert_eq!(replay.exit_code, emitted.exit_code);
+        assert_eq!(replay.outcome, emitted.outcome);
+        assert_eq!(replay.notice, emitted.notice);
+        assert_eq!(replay.stages, emitted.stages);
+        assert!(store.subscribe(&retained_session_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn launch_retry_pending_terminal_survives_pressure_and_resumes_original_stream() {
+        let store = SessionStore::new();
+        let retry_session_id = "retry-pending";
+        store.insert(test_record(retry_session_id)).await;
+        let mut receiver = store
+            .subscribe(retry_session_id)
+            .await
+            .expect("retry receiver");
+        store
+            .emit_status(
+                retry_session_id,
+                terminal_status(Some(1), Some("unknown"), None),
+            )
+            .await;
+
+        insert_retention_ready_terminal_burst(&store, "completed").await;
+
+        assert!(store.get(retry_session_id).await.is_some());
+        let mut resumed = terminal_status(None, None, None);
+        resumed.state = "preparing".to_string();
+        store.emit_status(retry_session_id, resumed).await;
+
+        assert_eq!(recv_status(&mut receiver).await.state, "exited");
+        assert_eq!(recv_status(&mut receiver).await.state, "preparing");
+    }
+
+    #[tokio::test]
+    async fn launch_nested_retention_holds_require_the_final_release_for_eligibility() {
+        let store = SessionStore::new();
+        let session_id = "nested-holds";
+        store.insert(test_record(session_id)).await;
+        assert!(
+            store
+                .acquire_terminal_retention_hold(session_id)
+                .await
+                .is_some()
+        );
+        store
+            .emit_status(session_id, terminal_status(Some(0), None, None))
+            .await;
+
+        store.release_terminal_retention_hold(session_id).await;
+        assert_eq!(
+            store
+                .sessions
+                .read()
+                .await
+                .get(session_id)
+                .expect("held session")
+                .terminal_sequence,
+            None
+        );
+
+        store.release_terminal_retention_hold(session_id).await;
+        assert!(
+            store
+                .sessions
+                .read()
+                .await
+                .get(session_id)
+                .expect("eligible session")
+                .terminal_sequence
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_proof_pending_terminal_survives_pressure_until_its_hold_is_released() {
+        let store = SessionStore::new();
+        let proof_session_id = "proof-pending";
+        store.insert(test_record(proof_session_id)).await;
+        store
+            .emit_status(
+                proof_session_id,
+                terminal_status(Some(-9), None, Some("stopped by user")),
+            )
+            .await;
+
+        insert_retention_ready_terminal_burst(&store, "completed").await;
+
+        let proof_record = store
+            .get(proof_session_id)
+            .await
+            .expect("proof source record must remain available");
+        assert_eq!(proof_record.state, LaunchState::Exited);
+        assert_eq!(proof_record.exit_code, Some(-9));
+
+        store
+            .release_terminal_retention_hold(proof_session_id)
+            .await;
+        assert!(store.get(proof_session_id).await.is_some());
+        assert_eq!(
+            store
+                .sessions
+                .read()
+                .await
+                .values()
+                .filter(|entry| entry.terminal_sequence.is_some())
+                .count(),
+            MAX_RETAINED_TERMINAL_SESSIONS
+        );
+    }
+
+    async fn insert_retention_ready_terminal_burst(store: &SessionStore, prefix: &str) {
+        for index in 0..=MAX_RETAINED_TERMINAL_SESSIONS {
+            let session_id = format!("{prefix}-{index}");
+            store.insert(test_record(&session_id)).await;
+            store.release_terminal_retention_hold(&session_id).await;
+            store
+                .emit_status(&session_id, terminal_status(Some(0), None, None))
+                .await;
+        }
+    }
 
     #[tokio::test]
     async fn launch_stage_history_tracks_transitions_results_and_healing_notes() {
