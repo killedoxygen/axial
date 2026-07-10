@@ -583,6 +583,18 @@ impl AcceptedWrite {
             completed(self.persisted().await);
         });
     }
+
+    pub(crate) fn observe_async<Completed, Completion>(self, completed: Completed)
+    where
+        Completed:
+            FnOnce(Result<PersistenceRevision, PersistenceError>) -> Completion + Send + 'static,
+        Completion: Future<Output = ()> + Send + 'static,
+    {
+        let executor = self.executor.clone();
+        executor.spawn(async move {
+            completed(self.persisted().await).await;
+        });
+    }
 }
 
 impl AtomicSnapshotWriter {
@@ -677,6 +689,15 @@ impl AtomicSnapshotWriter {
 
     pub(crate) async fn flush(&self) -> Result<PersistenceRevision, PersistenceError> {
         self.ticket_for_latest()?.persisted().await
+    }
+
+    pub(crate) async fn settle(&self) -> Result<PersistenceRevision, PersistenceError> {
+        let revision = match self.flush().await {
+            Ok(revision) => revision,
+            Err(_) => self.retry()?.persisted().await?,
+        };
+        await_all_lanes_idle(std::slice::from_ref(&self.lane)).await;
+        Ok(revision)
     }
 
     pub(crate) fn retry(&self) -> Result<AcceptedWrite, PersistenceError> {

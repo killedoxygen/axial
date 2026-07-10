@@ -58,6 +58,23 @@ pub struct QuarantineFileRequest<'a> {
     pub source: &'a Path,
 }
 
+#[derive(Clone, Debug)]
+pub struct DeleteFileRequest<'a> {
+    pub operation_id: Option<OperationId>,
+    pub target: TargetDescriptor,
+    pub path: &'a Path,
+}
+
+impl<'a> DeleteFileRequest<'a> {
+    pub fn new(target: TargetDescriptor, path: &'a Path) -> Self {
+        Self {
+            operation_id: None,
+            target,
+            path,
+        }
+    }
+}
+
 impl<'a> QuarantineFileRequest<'a> {
     pub fn new(target: TargetDescriptor, source: &'a Path) -> Self {
         Self {
@@ -144,6 +161,9 @@ impl fmt::Display for FileCapabilityError {
             FileCapabilityErrorKind::QuarantineFailed => {
                 formatter.write_str("file capability failed to quarantine source")
             }
+            FileCapabilityErrorKind::DeleteFailed => {
+                formatter.write_str("file capability failed to delete source")
+            }
         }
     }
 }
@@ -172,6 +192,7 @@ pub enum FileCapabilityErrorKind {
     TempWriteFailed,
     PromoteFailed,
     QuarantineFailed,
+    DeleteFailed,
 }
 
 pub fn write_file_atomically(
@@ -353,6 +374,66 @@ pub fn quarantine_launcher_managed_file(
     })
 }
 
+pub fn delete_launcher_managed_file(
+    request: DeleteFileRequest<'_>,
+) -> Result<FileCapabilityReport, FileCapabilityError> {
+    let mut facts = Vec::new();
+    validate_managed_ownership(&request.target, request.operation_id.as_ref(), &mut facts)?;
+
+    let metadata = match fs::symlink_metadata(request.path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            facts.push(file_fact(
+                ExecutionFactKind::FileMissing,
+                request.operation_id,
+                &request.target,
+            ));
+            return Ok(FileCapabilityReport {
+                target: safe_target_descriptor(&request.target),
+                facts,
+            });
+        }
+        Err(error) => {
+            facts.push(io_error_fact(
+                error.kind(),
+                request.operation_id.clone(),
+                &request.target,
+            ));
+            return Err(FileCapabilityError::with_source(
+                FileCapabilityErrorKind::DeleteFailed,
+                facts,
+                error,
+            ));
+        }
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        facts.push(file_fact(
+            ExecutionFactKind::PrimitiveRefused,
+            request.operation_id,
+            &request.target,
+        ));
+        return Err(FileCapabilityError::new(
+            FileCapabilityErrorKind::UnsupportedSource,
+            facts,
+        ));
+    }
+
+    fs::remove_file(request.path).map_err(|error| {
+        let mut error_facts = facts.clone();
+        error_facts.push(io_error_fact(
+            error.kind(),
+            request.operation_id,
+            &request.target,
+        ));
+        FileCapabilityError::with_source(FileCapabilityErrorKind::DeleteFailed, error_facts, error)
+    })?;
+
+    Ok(FileCapabilityReport {
+        target: safe_target_descriptor(&request.target),
+        facts,
+    })
+}
+
 pub fn file_fact(
     kind: ExecutionFactKind,
     operation_id: Option<OperationId>,
@@ -478,8 +559,9 @@ fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::{
-        FileCapabilityErrorKind, FileWriteRequest, PromoteTempFileRequest, QuarantineFileRequest,
-        file_fact, promote_temp_file, quarantine_launcher_managed_file, write_file_atomically,
+        DeleteFileRequest, FileCapabilityErrorKind, FileWriteRequest, PromoteTempFileRequest,
+        QuarantineFileRequest, delete_launcher_managed_file, file_fact, promote_temp_file,
+        quarantine_launcher_managed_file, write_file_atomically,
     };
     use crate::execution::ExecutionFactKind;
     use crate::state::contracts::{
@@ -546,6 +628,96 @@ mod tests {
                 .any(|fact| fact.kind == ExecutionFactKind::FileOwnershipUnknown)
         );
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn managed_file_delete_is_idempotent_and_refuses_directories() {
+        let root = test_root("managed-delete");
+        let path = root.join("status.json");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(&path, b"terminal").expect("write status");
+
+        delete_launcher_managed_file(DeleteFileRequest::new(
+            launcher_target("operation_status"),
+            &path,
+        ))
+        .expect("delete managed status");
+        assert!(!path.exists());
+
+        let missing = delete_launcher_managed_file(DeleteFileRequest::new(
+            launcher_target("operation_status"),
+            &path,
+        ))
+        .expect("missing delete is idempotent");
+        assert!(
+            missing
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionFactKind::FileMissing)
+        );
+
+        fs::create_dir(&path).expect("create directory at status path");
+        let error = delete_launcher_managed_file(DeleteFileRequest::new(
+            launcher_target("operation_status"),
+            &path,
+        ))
+        .expect_err("directory delete is refused");
+        assert_eq!(error.kind, FileCapabilityErrorKind::UnsupportedSource);
+        assert!(path.is_dir());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn unknown_ownership_blocks_managed_file_delete() {
+        let root = test_root("unknown-delete");
+        let path = root.join("status.json");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(&path, b"terminal").expect("write status");
+
+        let error = delete_launcher_managed_file(DeleteFileRequest::new(
+            TargetDescriptor::new(
+                StabilizationSystem::State,
+                TargetKind::FilesystemPath,
+                "unknown_status",
+                OwnershipClass::Unknown,
+            ),
+            &path,
+        ))
+        .expect_err("unknown ownership should block delete");
+
+        assert_eq!(error.kind, FileCapabilityErrorKind::OwnershipUnknown);
+        assert_eq!(fs::read(&path).expect("status retained"), b"terminal");
+        assert!(
+            error
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionFactKind::FileOwnershipUnknown)
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn user_owned_file_delete_is_refused_and_preserves_source() {
+        let root = test_root("user-owned-delete");
+        let path = root.join("status.json");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(&path, b"user-owned").expect("write status");
+
+        let error = delete_launcher_managed_file(DeleteFileRequest::new(
+            TargetDescriptor::new(
+                StabilizationSystem::State,
+                TargetKind::FilesystemPath,
+                "user_status",
+                OwnershipClass::UserOwned,
+            ),
+            &path,
+        ))
+        .expect_err("user-owned file delete should be refused");
+
+        assert_eq!(error.kind, FileCapabilityErrorKind::OwnershipRefused);
+        assert_eq!(fs::read(&path).expect("user file retained"), b"user-owned");
+        assert!(error.facts.is_empty());
         cleanup(&root);
     }
 

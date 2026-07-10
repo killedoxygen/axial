@@ -1,3 +1,4 @@
+use crate::execution::file::{DeleteFileRequest, delete_launcher_managed_file, file_fact};
 #[cfg(test)]
 use crate::execution::file::{
     FileWriteRequest, PromoteTempFileRequest, promote_temp_file, write_file_atomically,
@@ -6,6 +7,7 @@ use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
 };
+use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::logging::timestamp_utc;
 use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
 use crate::state::contracts::RollbackState;
@@ -31,6 +33,7 @@ pub const PERFORMANCE_RESUME_INVALID_STATE: &str = "resume_invalid";
 const MAX_OPERATION_ERROR_CHARS: usize = 160;
 const MAX_OPERATION_FILENAME_STEM: usize = 96;
 const MAX_RESUMABLE_OPERATIONS: usize = 16;
+const MAX_RETAINED_TERMINAL_OPERATIONS: usize = 32;
 const PERFORMANCE_OPERATION_LOCK_INVARIANT: &str =
     "performance operation records lock poisoned; in-memory and persisted state may diverge";
 
@@ -204,6 +207,20 @@ pub struct PerformanceOperationLoadIssue {
     pub count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PerformanceOperationRetentionIssueKind {
+    WriterSettlement,
+    Delete,
+    BlockingTask,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerformanceOperationRetentionIssue {
+    pub operation_id: String,
+    pub kind: PerformanceOperationRetentionIssueKind,
+    pub facts: Vec<ExecutionFact>,
+}
+
 #[derive(Default)]
 struct PerformanceOperationInner {
     operations: HashMap<String, PerformanceOperationStatus>,
@@ -258,13 +275,49 @@ impl PerformanceOperationPersistence {
         writers.insert(operation_id.to_string(), writer.clone());
         Ok(writer)
     }
+
+    fn take_writer(
+        &self,
+        operation_id: &str,
+    ) -> Result<AtomicSnapshotWriter, PerformanceOperationStoreError> {
+        if let Some(writer) = self
+            .writers
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .remove(operation_id)
+        {
+            return Ok(writer);
+        }
+        self.owner
+            .writer(
+                operation_path(&self.storage_dir, operation_id),
+                performance_operation_status_target(operation_id),
+            )
+            .map_err(performance_operation_persistence_error)
+    }
+
+    fn restore_writer(&self, operation_id: &str, writer: AtomicSnapshotWriter) {
+        self.writers
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .insert(operation_id.to_string(), writer);
+    }
+
+    #[cfg(test)]
+    fn writer_count(&self) -> usize {
+        self.writers
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .len()
+    }
 }
 
 pub struct PerformanceOperationStore {
     inner: Arc<RwLock<PerformanceOperationInner>>,
     mutation_gate: Arc<AsyncMutex<()>>,
-    persistence: Option<PerformanceOperationPersistence>,
+    persistence: Option<Arc<PerformanceOperationPersistence>>,
     retry_candidates: Arc<SyncMutex<HashMap<String, PerformanceOperationStatus>>>,
+    retention_issues: Arc<SyncMutex<HashMap<String, PerformanceOperationRetentionIssue>>>,
     load_issues: Vec<PerformanceOperationLoadIssue>,
 }
 
@@ -275,6 +328,7 @@ impl PerformanceOperationStore {
             mutation_gate: Arc::new(AsyncMutex::new(())),
             persistence: None,
             retry_candidates: Arc::new(SyncMutex::new(HashMap::new())),
+            retention_issues: Arc::new(SyncMutex::new(HashMap::new())),
             load_issues: Vec::new(),
         }
     }
@@ -295,13 +349,17 @@ impl PerformanceOperationStore {
     ) -> Result<Self, PerformanceOperationStoreError> {
         let storage_dir = operation_dir(paths);
         let load_state = load_persisted_operation_inner(&storage_dir);
-        let persistence = PerformanceOperationPersistence::claim(&storage_dir, coordinator)?;
+        let persistence = Arc::new(PerformanceOperationPersistence::claim(
+            &storage_dir,
+            coordinator,
+        )?);
 
         Ok(Self {
             inner: Arc::new(RwLock::new(load_state.inner)),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             persistence: Some(persistence),
             retry_candidates: Arc::new(SyncMutex::new(HashMap::new())),
+            retention_issues: Arc::new(SyncMutex::new(HashMap::new())),
             load_issues: load_state.issues,
         })
     }
@@ -404,6 +462,14 @@ impl PerformanceOperationStore {
     }
 
     pub async fn take_pending_resumable_operations(&self) -> Vec<PerformanceOperationStatus> {
+        let _mutation = self.mutation_gate.lock().await;
+        prune_terminal_operations(
+            self.inner.clone(),
+            self.persistence.clone(),
+            self.retry_candidates.clone(),
+            self.retention_issues.clone(),
+        )
+        .await;
         let mut inner = self
             .inner
             .write()
@@ -656,6 +722,30 @@ impl PerformanceOperationStore {
             .contains_key(id)
     }
 
+    pub fn retention_issues(&self) -> Vec<PerformanceOperationRetentionIssue> {
+        let mut issues = self
+            .retention_issues
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        issues.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+        issues
+    }
+
+    pub async fn retry_terminal_retention(&self) -> Vec<PerformanceOperationRetentionIssue> {
+        let _mutation = self.mutation_gate.lock().await;
+        prune_terminal_operations(
+            self.inner.clone(),
+            self.persistence.clone(),
+            self.retry_candidates.clone(),
+            self.retention_issues.clone(),
+        )
+        .await;
+        self.retention_issues()
+    }
+
     #[cfg(test)]
     pub(crate) fn retry_candidate_ids(&self) -> Vec<String> {
         self.retry_candidates
@@ -668,6 +758,13 @@ impl PerformanceOperationStore {
 
     pub async fn flush(&self) -> Result<(), PerformanceOperationStoreError> {
         let _mutation = self.mutation_gate.lock().await;
+        prune_terminal_operations(
+            self.inner.clone(),
+            self.persistence.clone(),
+            self.retry_candidates.clone(),
+            self.retention_issues.clone(),
+        )
+        .await;
         if let Some(persistence) = &self.persistence {
             persistence
                 .owner
@@ -675,11 +772,35 @@ impl PerformanceOperationStore {
                 .await
                 .map_err(performance_operation_persistence_error)?;
         }
+        if !self.retention_issues().is_empty() {
+            return Err(PerformanceOperationStoreError::Persistence(
+                io::Error::other("performance operation terminal retention cleanup is pending"),
+            ));
+        }
         Ok(())
     }
 
     pub async fn close(&self) -> Result<(), PerformanceOperationStoreError> {
         let _mutation = self.mutation_gate.lock().await;
+        prune_terminal_operations(
+            self.inner.clone(),
+            self.persistence.clone(),
+            self.retry_candidates.clone(),
+            self.retention_issues.clone(),
+        )
+        .await;
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .owner
+                .flush()
+                .await
+                .map_err(performance_operation_persistence_error)?;
+        }
+        if !self.retention_issues().is_empty() {
+            return Err(PerformanceOperationStoreError::Persistence(
+                io::Error::other("performance operation terminal retention cleanup is pending"),
+            ));
+        }
         if let Some(persistence) = &self.persistence {
             persistence
                 .owner
@@ -739,6 +860,13 @@ impl PerformanceOperationStore {
                     .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT),
                 status,
             );
+            prune_terminal_operations(
+                self.inner.clone(),
+                None,
+                self.retry_candidates.clone(),
+                self.retention_issues.clone(),
+            )
+            .await;
             drop(mutation);
             return Ok(());
         };
@@ -757,11 +885,14 @@ impl PerformanceOperationStore {
     ) -> Result<(), PerformanceOperationStoreError> {
         let inner = self.inner.clone();
         let retry_candidates = self.retry_candidates.clone();
+        let persistence = self.persistence.clone();
+        let retention_issues = self.retention_issues.clone();
         let operation_id = status.id.clone();
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        ticket.observe(move |result| {
+        ticket.observe_async(move |result| async move {
             let result = match result {
                 Ok(_) => {
+                    let is_terminal = !is_non_terminal(&status.state);
                     apply_status_transition(
                         &mut inner.write().expect(PERFORMANCE_OPERATION_LOCK_INVARIANT),
                         status,
@@ -770,6 +901,15 @@ impl PerformanceOperationStore {
                         .lock()
                         .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
                         .remove(&operation_id);
+                    if is_terminal {
+                        prune_terminal_operations(
+                            inner,
+                            persistence,
+                            retry_candidates,
+                            retention_issues,
+                        )
+                        .await;
+                    }
                     Ok(())
                 }
                 Err(error) => {
@@ -828,6 +968,177 @@ fn apply_status_transition(
         inner.active_by_instance.remove(&instance_id);
     }
     inner.operations.insert(operation_id, status);
+}
+
+async fn prune_terminal_operations(
+    inner: Arc<RwLock<PerformanceOperationInner>>,
+    persistence: Option<Arc<PerformanceOperationPersistence>>,
+    retry_candidates: Arc<SyncMutex<HashMap<String, PerformanceOperationStatus>>>,
+    retention_issues: Arc<SyncMutex<HashMap<String, PerformanceOperationRetentionIssue>>>,
+) {
+    let retry_ids = retry_candidates
+        .lock()
+        .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let candidates = {
+        let inner = inner.read().expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
+        terminal_prune_candidates(&inner, &retry_ids)
+    };
+    for status in candidates {
+        prune_terminal_operation(
+            &status,
+            inner.clone(),
+            persistence.clone(),
+            retention_issues.clone(),
+        )
+        .await;
+    }
+}
+
+fn terminal_prune_candidates(
+    inner: &PerformanceOperationInner,
+    retry_ids: &HashSet<String>,
+) -> Vec<PerformanceOperationStatus> {
+    let mut terminals = inner
+        .operations
+        .values()
+        .filter(|status| !is_non_terminal(&status.state) && !retry_ids.contains(&status.id))
+        .collect::<Vec<_>>();
+    terminals.sort_by(compare_operation_recency);
+    terminals.reverse();
+
+    let mut retained_ids = HashSet::new();
+    let mut retained_instances = HashSet::new();
+    for status in &terminals {
+        if retained_ids.len() >= MAX_RETAINED_TERMINAL_OPERATIONS {
+            break;
+        }
+        if retained_instances.insert(status.instance_id.clone()) {
+            retained_ids.insert(status.id.clone());
+        }
+    }
+    for status in &terminals {
+        if retained_ids.len() >= MAX_RETAINED_TERMINAL_OPERATIONS {
+            break;
+        }
+        retained_ids.insert(status.id.clone());
+    }
+
+    let mut candidates = terminals
+        .into_iter()
+        .filter(|status| !retained_ids.contains(&status.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| compare_operation_recency(&left, &right));
+    candidates
+}
+
+async fn prune_terminal_operation(
+    status: &PerformanceOperationStatus,
+    inner: Arc<RwLock<PerformanceOperationInner>>,
+    persistence: Option<Arc<PerformanceOperationPersistence>>,
+    retention_issues: Arc<SyncMutex<HashMap<String, PerformanceOperationRetentionIssue>>>,
+) {
+    let operation_id = status.id.clone();
+    let target = performance_operation_status_target(&operation_id);
+    if let Some(persistence) = persistence {
+        let writer = match persistence.take_writer(&operation_id) {
+            Ok(writer) => writer,
+            Err(_) => {
+                record_retention_issue(
+                    &retention_issues,
+                    &operation_id,
+                    PerformanceOperationRetentionIssueKind::WriterSettlement,
+                    vec![file_fact(
+                        ExecutionFactKind::PrimitiveRefused,
+                        None,
+                        &target,
+                    )],
+                );
+                return;
+            }
+        };
+        if writer.settle().await.is_err() {
+            persistence.restore_writer(&operation_id, writer);
+            record_retention_issue(
+                &retention_issues,
+                &operation_id,
+                PerformanceOperationRetentionIssueKind::WriterSettlement,
+                vec![file_fact(
+                    ExecutionFactKind::PrimitiveRefused,
+                    None,
+                    &target,
+                )],
+            );
+            return;
+        }
+
+        let path = operation_path(&persistence.storage_dir, &operation_id);
+        let delete_target = target.clone();
+        let delete = tokio::task::spawn_blocking(move || {
+            delete_launcher_managed_file(DeleteFileRequest::new(delete_target, &path))
+        })
+        .await;
+        match delete {
+            Ok(Ok(_)) => drop(writer),
+            Ok(Err(error)) => {
+                let facts = error.facts.clone();
+                persistence.restore_writer(&operation_id, writer);
+                record_retention_issue(
+                    &retention_issues,
+                    &operation_id,
+                    PerformanceOperationRetentionIssueKind::Delete,
+                    facts,
+                );
+                return;
+            }
+            Err(_) => {
+                persistence.restore_writer(&operation_id, writer);
+                record_retention_issue(
+                    &retention_issues,
+                    &operation_id,
+                    PerformanceOperationRetentionIssueKind::BlockingTask,
+                    vec![file_fact(
+                        ExecutionFactKind::PrimitiveRefused,
+                        None,
+                        &target,
+                    )],
+                );
+                return;
+            }
+        }
+    }
+
+    let mut inner = inner.write().expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
+    if inner.operations.get(&operation_id) == Some(status) {
+        inner.operations.remove(&operation_id);
+        inner.pending_resume_ids.retain(|id| id != &operation_id);
+    }
+    retention_issues
+        .lock()
+        .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+        .remove(&operation_id);
+}
+
+fn record_retention_issue(
+    retention_issues: &SyncMutex<HashMap<String, PerformanceOperationRetentionIssue>>,
+    operation_id: &str,
+    kind: PerformanceOperationRetentionIssueKind,
+    facts: Vec<ExecutionFact>,
+) {
+    retention_issues
+        .lock()
+        .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+        .insert(
+            operation_id.to_string(),
+            PerformanceOperationRetentionIssue {
+                operation_id: operation_id.to_string(),
+                kind,
+                facts,
+            },
+        );
 }
 
 fn encode_status(status: PerformanceOperationStatus) -> io::Result<Vec<u8>> {
@@ -1187,6 +1498,7 @@ mod tests {
     #[derive(Default)]
     struct ControlledBackend {
         fail_writes: AtomicBool,
+        fail_destination: SyncMutex<Option<PathBuf>>,
         gate_writes: AtomicBool,
         entered_write: AtomicBool,
         writes: SyncMutex<Vec<(PathBuf, Vec<u8>)>>,
@@ -1203,6 +1515,13 @@ mod tests {
 
         fn set_fail_writes(&self, fail: bool) {
             self.fail_writes.store(fail, Ordering::SeqCst);
+        }
+
+        fn set_fail_destination(&self, destination: Option<PathBuf>) {
+            *self
+                .fail_destination
+                .lock()
+                .expect("controlled backend failure destination lock") = destination;
         }
 
         fn gate(&self) {
@@ -1235,7 +1554,13 @@ mod tests {
             while self.gate_writes.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            if self.fail_writes.load(Ordering::SeqCst) {
+            let destination_failed = self
+                .fail_destination
+                .lock()
+                .expect("controlled backend failure destination lock")
+                .as_ref()
+                .is_some_and(|failed| failed == destination);
+            if self.fail_writes.load(Ordering::SeqCst) || destination_failed {
                 return Err(io::Error::other("injected performance status failure"));
             }
             if let Some(parent) = destination.parent() {
@@ -1786,6 +2111,527 @@ mod tests {
             load_status_file(&second_path).expect("second latest").state,
             "second_39"
         );
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn terminal_retention_is_absolute_and_preserves_recent_instance_lookup() {
+        let root = test_root("terminal-retention-bound");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        let coordinator = backend.coordinator();
+        let store = PerformanceOperationStore::try_load_from_paths_with_coordinator(
+            &paths,
+            coordinator.clone(),
+        )
+        .expect("store");
+        let mut ids = Vec::new();
+        for index in 0..(MAX_RETAINED_TERMINAL_OPERATIONS + 8) {
+            let instance_id = if index >= MAX_RETAINED_TERMINAL_OPERATIONS {
+                "repeat-instance".to_string()
+            } else {
+                format!("instance-{index:02}")
+            };
+            let started = store
+                .start_with_identity(
+                    instance_id,
+                    "install".to_string(),
+                    test_payload(),
+                    PerformanceOperationJournalIdentity::new(
+                        "install",
+                        format!("composition-{index:02}"),
+                        RollbackState::Unavailable,
+                    ),
+                )
+                .await
+                .expect("operation starts");
+            if index % 2 == 0 {
+                store
+                    .record_reconciliation_failed(&started.id, "reconciled", "install")
+                    .await
+                    .expect("reconciliation terminalizes");
+            } else {
+                store
+                    .record_complete(&started.id)
+                    .await
+                    .expect("operation completes");
+            }
+            ids.push(started.id);
+        }
+
+        let statuses = store.list();
+        assert_eq!(statuses.len(), MAX_RETAINED_TERMINAL_OPERATIONS);
+        assert!(
+            statuses
+                .iter()
+                .all(|status| !is_non_terminal(&status.state))
+        );
+        let pruned_ids = std::iter::once(&ids[0])
+            .chain(ids[MAX_RETAINED_TERMINAL_OPERATIONS..39].iter())
+            .collect::<Vec<_>>();
+        for pruned in pruned_ids {
+            assert!(store.get(pruned).await.is_none());
+            assert!(!operation_path(&operation_dir(&paths), pruned).exists());
+        }
+        for retained in ids[1..MAX_RETAINED_TERMINAL_OPERATIONS]
+            .iter()
+            .chain(std::iter::once(&ids[39]))
+        {
+            assert!(store.get(retained).await.is_some());
+            assert!(operation_path(&operation_dir(&paths), retained).is_file());
+        }
+        assert!(
+            store
+                .current_or_latest_for_instance("instance-00")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .current_or_latest_for_instance("repeat-instance")
+                .await
+                .expect("repeated instance latest status")
+                .id,
+            ids[39]
+        );
+        assert_eq!(
+            store
+                .persistence
+                .as_ref()
+                .expect("persistence")
+                .writer_count(),
+            MAX_RETAINED_TERMINAL_OPERATIONS
+        );
+
+        let reclaimed_path = operation_path(&operation_dir(&paths), &ids[0]);
+        let reclaimed = coordinator
+            .claim_owner(&reclaimed_path)
+            .expect("pruned exact path owner is released");
+        reclaimed
+            .writer(
+                &reclaimed_path,
+                performance_operation_status_target(&ids[0]),
+            )
+            .expect("pruned exact path writer is released");
+        reclaimed.close().await.expect("reclaimed owner closes");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn terminal_retention_keeps_nonterminal_and_critical_retry_records() {
+        let mut inner = PerformanceOperationInner::default();
+        let retry_id = "performance-install-00000000000000000000000000000001";
+        let active_id = "performance-install-00000000000000000000000000000002";
+        inner.operations.insert(
+            retry_id.to_string(),
+            test_status(
+                retry_id,
+                "retry-instance",
+                "install",
+                "failed",
+                test_payload(),
+            ),
+        );
+        inner.operations.insert(
+            active_id.to_string(),
+            test_status(
+                active_id,
+                "active-instance",
+                "install",
+                "applying",
+                test_payload(),
+            ),
+        );
+        for index in 3..=(MAX_RETAINED_TERMINAL_OPERATIONS + 4) {
+            let id = format!("performance-install-{index:032x}");
+            inner.operations.insert(
+                id.clone(),
+                test_status(
+                    &id,
+                    &format!("instance-{index}"),
+                    "install",
+                    "complete",
+                    test_payload(),
+                ),
+            );
+        }
+        let retry_ids = HashSet::from([retry_id.to_string()]);
+
+        let candidates = terminal_prune_candidates(&inner, &retry_ids);
+
+        assert!(!candidates.iter().any(|status| status.id == retry_id));
+        assert!(!candidates.iter().any(|status| status.id == active_id));
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_delete_blocks_shutdown_until_retry_and_releases_owner() {
+        let root = test_root("terminal-retention-delete-retry");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        let coordinator = backend.coordinator();
+        let store = PerformanceOperationStore::try_load_from_paths_with_coordinator(
+            &paths,
+            coordinator.clone(),
+        )
+        .expect("store");
+        let mut ids = Vec::new();
+        for index in 0..MAX_RETAINED_TERMINAL_OPERATIONS {
+            let started = store
+                .start(
+                    format!("instance-{index}"),
+                    "install".to_string(),
+                    test_payload(),
+                )
+                .await
+                .expect("operation starts");
+            store
+                .record_complete(&started.id)
+                .await
+                .expect("operation completes");
+            ids.push(started.id);
+        }
+        let oldest_path = operation_path(&operation_dir(&paths), &ids[0]);
+        fs::remove_file(&oldest_path).expect("remove oldest status");
+        fs::create_dir(&oldest_path).expect("block oldest status deletion");
+
+        let newest = store
+            .start(
+                "instance-new".to_string(),
+                "install".to_string(),
+                test_payload(),
+            )
+            .await
+            .expect("new operation starts");
+        store
+            .record_complete(&newest.id)
+            .await
+            .expect("terminal commit remains authoritative");
+
+        assert_eq!(store.list().len(), MAX_RETAINED_TERMINAL_OPERATIONS + 1);
+        assert!(store.get(&ids[0]).await.is_some());
+        let issues = store.retention_issues();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].operation_id, ids[0]);
+        assert_eq!(
+            issues[0].kind,
+            PerformanceOperationRetentionIssueKind::Delete
+        );
+        assert!(
+            issues[0]
+                .facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionFactKind::PrimitiveRefused)
+        );
+        assert_eq!(
+            store
+                .persistence
+                .as_ref()
+                .expect("persistence")
+                .writer_count(),
+            MAX_RETAINED_TERMINAL_OPERATIONS + 1
+        );
+
+        assert!(matches!(
+            store.flush().await,
+            Err(PerformanceOperationStoreError::Persistence(ref error))
+                if error.to_string()
+                    == "performance operation terminal retention cleanup is pending"
+        ));
+        assert!(matches!(
+            store.close().await,
+            Err(PerformanceOperationStoreError::Persistence(ref error))
+                if error.to_string()
+                    == "performance operation terminal retention cleanup is pending"
+        ));
+        let open_after_failed_close = store
+            .start(
+                "instance-open-after-failed-close".to_string(),
+                "install".to_string(),
+                test_payload(),
+            )
+            .await
+            .expect("failed close leaves owner open and retryable");
+        assert!(store.get(&open_after_failed_close.id).await.is_some());
+
+        fs::remove_dir(&oldest_path).expect("unblock oldest status deletion");
+        assert!(store.retry_terminal_retention().await.is_empty());
+        assert!(store.get(&ids[0]).await.is_none());
+        assert_eq!(
+            store
+                .list()
+                .into_iter()
+                .filter(|status| !is_non_terminal(&status.state))
+                .count(),
+            MAX_RETAINED_TERMINAL_OPERATIONS
+        );
+        assert_eq!(store.list().len(), MAX_RETAINED_TERMINAL_OPERATIONS + 1);
+        assert!(
+            store
+                .get(&open_after_failed_close.id)
+                .await
+                .is_some_and(|status| is_non_terminal(&status.state))
+        );
+        assert_eq!(
+            store
+                .persistence
+                .as_ref()
+                .expect("persistence")
+                .writer_count(),
+            MAX_RETAINED_TERMINAL_OPERATIONS + 1
+        );
+        store
+            .flush()
+            .await
+            .expect("cleanup retry makes flush truthful");
+        store.close().await.expect("cleanup retry allows close");
+
+        let reclaimed = coordinator
+            .claim_owner(operation_dir(&paths))
+            .expect("closed status owner is released");
+        reclaimed
+            .writer(&oldest_path, performance_operation_status_target(&ids[0]))
+            .expect("pruned status path is released");
+        reclaimed.close().await.expect("reclaimed owner closes");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_writer_settlement_retains_status_until_exact_retry() {
+        let root = test_root("terminal-retention-settle-retry");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        let store = PerformanceOperationStore::try_load_from_paths_with_coordinator(
+            &paths,
+            backend.coordinator(),
+        )
+        .expect("store");
+        let mut ids = Vec::new();
+        for index in 0..MAX_RETAINED_TERMINAL_OPERATIONS {
+            let started = store
+                .start(
+                    format!("instance-{index}"),
+                    "install".to_string(),
+                    test_payload(),
+                )
+                .await
+                .expect("operation starts");
+            store
+                .record_complete(&started.id)
+                .await
+                .expect("operation completes");
+            ids.push(started.id);
+        }
+
+        let oldest_id = &ids[0];
+        let oldest_path = operation_path(&operation_dir(&paths), oldest_id);
+        let oldest_status = store.get(oldest_id).await.expect("oldest terminal status");
+        backend.set_fail_destination(Some(oldest_path.clone()));
+        store
+            .persistence
+            .as_ref()
+            .expect("persistence")
+            .writer(oldest_id)
+            .expect("oldest writer")
+            .accept(oldest_status, WriteUrgency::Debounced, encode_status)
+            .expect("pending exact status accepted");
+
+        let newest = store
+            .start(
+                "instance-new".to_string(),
+                "install".to_string(),
+                test_payload(),
+            )
+            .await
+            .expect("new operation starts");
+        store
+            .record_complete(&newest.id)
+            .await
+            .expect("new terminal commit remains authoritative");
+
+        let issues = store.retention_issues();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].operation_id, *oldest_id);
+        assert_eq!(
+            issues[0].kind,
+            PerformanceOperationRetentionIssueKind::WriterSettlement
+        );
+        assert!(store.get(oldest_id).await.is_some());
+        assert!(oldest_path.is_file());
+        assert_eq!(
+            store
+                .persistence
+                .as_ref()
+                .expect("persistence")
+                .writer_count(),
+            MAX_RETAINED_TERMINAL_OPERATIONS + 1
+        );
+
+        backend.set_fail_destination(None);
+        assert!(store.retry_terminal_retention().await.is_empty());
+        assert!(store.get(oldest_id).await.is_none());
+        assert!(!oldest_path.exists());
+        assert_eq!(store.list().len(), MAX_RETAINED_TERMINAL_OPERATIONS);
+        store.close().await.expect("store closes after exact retry");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn startup_retention_prunes_only_valid_canonical_terminal_records() {
+        let root = test_root("startup-terminal-retention");
+        let paths = test_paths(&root);
+        let dir = operation_dir(&paths);
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let total = MAX_RETAINED_TERMINAL_OPERATIONS + 3;
+        let mut ids = Vec::new();
+        for index in 1..=total {
+            let id = format!("performance-install-{index:032x}");
+            let mut status = test_status(
+                &id,
+                &format!("instance-{index:02}"),
+                "install",
+                "complete",
+                test_payload(),
+            );
+            status.created_at = format!("2026-07-10T00:{index:02}:00Z");
+            status.updated_at = status.created_at.clone();
+            persist_status_to_dir(&dir, &status).expect("persist terminal status");
+            ids.push(id);
+        }
+        let malformed_id = "performance-install-00000000000000000000000000000100";
+        let malformed_path = operation_path(&dir, malformed_id);
+        fs::write(&malformed_path, b"{not-json").expect("write malformed status");
+        let noncanonical_id = "performance-install-00000000000000000000000000000101";
+        let noncanonical_path = dir.join("copied-terminal.json");
+        fs::write(
+            &noncanonical_path,
+            encode_status(test_status(
+                noncanonical_id,
+                "noncanonical-instance",
+                "install",
+                "complete",
+                test_payload(),
+            ))
+            .expect("encode noncanonical status"),
+        )
+        .expect("write noncanonical status");
+        let unsafe_path = dir.join("unknown-owned.json");
+        let mut unsafe_status = test_status(
+            "../../unknown-owned",
+            "unsafe-instance",
+            "install",
+            "complete",
+            test_payload(),
+        );
+        unsafe_status.id = "../../unknown-owned".to_string();
+        fs::write(
+            &unsafe_path,
+            encode_status(unsafe_status).expect("encode unsafe status"),
+        )
+        .expect("write unsafe status");
+
+        let store = PerformanceOperationStore::load_from_paths(&paths);
+        let pending = store.take_pending_resumable_operations().await;
+
+        assert_eq!(store.list().len(), MAX_RETAINED_TERMINAL_OPERATIONS);
+        assert!(pending.is_empty());
+        for id in &ids[..3] {
+            assert!(store.get(id).await.is_none());
+            assert!(!operation_path(&dir, id).exists());
+        }
+        for id in &ids[3..] {
+            assert!(store.get(id).await.is_some());
+            assert!(operation_path(&dir, id).is_file());
+        }
+        assert!(malformed_path.is_file());
+        assert!(noncanonical_path.is_file());
+        assert!(unsafe_path.is_file());
+        store.close().await.expect("store closes");
+
+        let reloaded = PerformanceOperationStore::load_from_paths(&paths);
+        reloaded.take_pending_resumable_operations().await;
+        assert_eq!(
+            reloaded
+                .list()
+                .into_iter()
+                .filter(|status| !is_non_terminal(&status.state))
+                .count(),
+            MAX_RETAINED_TERMINAL_OPERATIONS
+        );
+        assert!(malformed_path.is_file());
+        assert!(noncanonical_path.is_file());
+        assert!(unsafe_path.is_file());
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn terminal_retention_completes_after_awaiting_caller_is_aborted() {
+        let root = test_root("terminal-retention-abort");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        let store = Arc::new(
+            PerformanceOperationStore::try_load_from_paths_with_coordinator(
+                &paths,
+                backend.coordinator(),
+            )
+            .expect("store"),
+        );
+        let mut ids = Vec::new();
+        for index in 0..MAX_RETAINED_TERMINAL_OPERATIONS {
+            let started = store
+                .start(
+                    format!("instance-{index}"),
+                    "install".to_string(),
+                    test_payload(),
+                )
+                .await
+                .expect("operation starts");
+            store
+                .record_complete(&started.id)
+                .await
+                .expect("operation completes");
+            ids.push(started.id);
+        }
+        let newest = store
+            .start(
+                "instance-new".to_string(),
+                "install".to_string(),
+                test_payload(),
+            )
+            .await
+            .expect("new operation starts");
+        backend.gate();
+        let task_store = store.clone();
+        let terminal_id = newest.id.clone();
+        let task = tokio::spawn(async move { task_store.record_complete(&terminal_id).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !backend.entered_write.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal writer entered");
+        task.abort();
+        backend.release();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store.get(&ids[0]).await.is_none()
+                    && store
+                        .get(&newest.id)
+                        .await
+                        .is_some_and(|status| status.state == "complete")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached terminal observer prunes old status");
+        assert_eq!(store.list().len(), MAX_RETAINED_TERMINAL_OPERATIONS);
+        assert!(!operation_path(&operation_dir(&paths), &ids[0]).exists());
+        assert!(store.retention_issues().is_empty());
         cleanup(&root);
     }
 
