@@ -1838,6 +1838,7 @@ mod tests {
     #[tokio::test]
     async fn start_conflicts_for_non_terminal_suite_driver() {
         let store = BenchmarkSuiteDriverStore::new();
+        let suite_id = test_suite_id("start-conflict", "development");
         let summary = BenchmarkSuiteDriverSuiteSummary {
             run_count: 2,
             launched_run_count: 0,
@@ -1846,7 +1847,7 @@ mod tests {
 
         store
             .start(
-                "suite-dev".to_string(),
+                suite_id.clone(),
                 "development".to_string(),
                 30_000,
                 summary.clone(),
@@ -1854,12 +1855,7 @@ mod tests {
             .await
             .expect("first driver should start");
         let conflict = store
-            .start(
-                "suite-dev".to_string(),
-                "development".to_string(),
-                30_000,
-                summary,
-            )
+            .start(suite_id, "development".to_string(), 30_000, summary)
             .await;
 
         assert!(matches!(
@@ -1871,6 +1867,7 @@ mod tests {
     #[tokio::test]
     async fn stopped_driver_blocks_successor_until_effect_owner_exits() {
         let store = BenchmarkSuiteDriverStore::new();
+        let suite_id = test_suite_id("stopped-owner", "development");
         let summary = BenchmarkSuiteDriverSuiteSummary {
             run_count: 2,
             launched_run_count: 0,
@@ -1878,7 +1875,7 @@ mod tests {
         };
         let started = store
             .start(
-                "suite-dev".to_string(),
+                suite_id.clone(),
                 "development".to_string(),
                 30_000,
                 summary.clone(),
@@ -1900,7 +1897,7 @@ mod tests {
         assert!(matches!(
             store
                 .start(
-                    "suite-dev".to_string(),
+                    suite_id.clone(),
                     "development".to_string(),
                     30_000,
                     summary.clone(),
@@ -1910,12 +1907,7 @@ mod tests {
         ));
         drop(started.effect_owner);
         store
-            .start(
-                "suite-dev".to_string(),
-                "development".to_string(),
-                30_000,
-                summary,
-            )
+            .start(suite_id, "development".to_string(), 30_000, summary)
             .await
             .expect("terminal driver should not conflict");
     }
@@ -1923,6 +1915,7 @@ mod tests {
     #[tokio::test]
     async fn stopping_terminal_driver_does_not_clear_new_active_driver() {
         let store = BenchmarkSuiteDriverStore::new();
+        let suite_id = test_suite_id("terminal-successor", "development");
         let summary = BenchmarkSuiteDriverSuiteSummary {
             run_count: 2,
             launched_run_count: 0,
@@ -1930,7 +1923,7 @@ mod tests {
         };
         let first = store
             .start(
-                "suite-dev".to_string(),
+                suite_id.clone(),
                 "development".to_string(),
                 30_000,
                 summary.clone(),
@@ -1944,7 +1937,7 @@ mod tests {
         drop(first.effect_owner);
         let _second = store
             .start(
-                "suite-dev".to_string(),
+                suite_id.clone(),
                 "development".to_string(),
                 30_000,
                 summary.clone(),
@@ -1954,12 +1947,7 @@ mod tests {
 
         let stopped_first = store.stop(&first.status.id).await;
         let conflict = store
-            .start(
-                "suite-dev".to_string(),
-                "development".to_string(),
-                30_000,
-                summary,
-            )
+            .start(suite_id, "development".to_string(), 30_000, summary)
             .await;
 
         assert!(matches!(
@@ -2028,7 +2016,7 @@ mod tests {
         let task = tokio::spawn(async move {
             task_store
                 .start(
-                    "suite-a".to_string(),
+                    test_suite_id("suite-a", "development"),
                     "development".to_string(),
                     30_000,
                     test_summary(),
@@ -2083,7 +2071,7 @@ mod tests {
 
         let started = store
             .start(
-                "suite-a".to_string(),
+                test_suite_id("suite-a", "development"),
                 "development".to_string(),
                 30_000,
                 test_summary(),
@@ -2122,7 +2110,7 @@ mod tests {
         let original = tokio::spawn(async move {
             original_store
                 .start(
-                    "suite-a".to_string(),
+                    test_suite_id("suite-a", "development"),
                     "development".to_string(),
                     30_000,
                     test_summary(),
@@ -2135,7 +2123,7 @@ mod tests {
         assert!(matches!(
             store
                 .start(
-                    "suite-a".to_string(),
+                    test_suite_id("suite-a", "development"),
                     "development".to_string(),
                     30_000,
                     test_summary(),
@@ -2163,7 +2151,7 @@ mod tests {
         assert!(matches!(
             store
                 .start(
-                    "suite-a".to_string(),
+                    test_suite_id("suite-a", "development"),
                     "development".to_string(),
                     30_000,
                     test_summary(),
@@ -2192,7 +2180,7 @@ mod tests {
         let task = tokio::spawn(async move {
             task_store
                 .start(
-                    "suite-a".to_string(),
+                    test_suite_id("suite-a", "development"),
                     "development".to_string(),
                     30_000,
                     test_summary(),
@@ -2209,7 +2197,7 @@ mod tests {
         assert!(matches!(
             store
                 .start(
-                    "suite-a".to_string(),
+                    test_suite_id("suite-a", "development"),
                     "development".to_string(),
                     30_000,
                     test_summary(),
@@ -2243,7 +2231,7 @@ mod tests {
         .expect("store");
         let started = store
             .start(
-                "suite-a".to_string(),
+                test_suite_id("suite-a", "development"),
                 "development".to_string(),
                 30_000,
                 test_summary(),
@@ -2293,7 +2281,7 @@ mod tests {
         );
         let started = store
             .start(
-                "suite-a".to_string(),
+                test_suite_id("suite-a", "development"),
                 "development".to_string(),
                 30_000,
                 test_summary(),
@@ -2354,7 +2342,7 @@ mod tests {
         .expect("store");
         let started = store
             .start(
-                "suite-a".to_string(),
+                test_suite_id("suite-a", "development"),
                 "development".to_string(),
                 30_000,
                 test_summary(),
@@ -2411,7 +2399,7 @@ mod tests {
         .expect("store");
         let started = store
             .start(
-                "suite-a".to_string(),
+                test_suite_id("suite-a", "development"),
                 "development".to_string(),
                 30_000,
                 test_summary(),
@@ -2469,7 +2457,7 @@ mod tests {
         let store = BenchmarkSuiteDriverStore::load_from_paths(&paths);
         let started = store
             .start(
-                "suite-dev".to_string(),
+                test_suite_id("suite-dev", "development"),
                 "development".to_string(),
                 30_000,
                 summary.clone(),
@@ -2527,7 +2515,7 @@ mod tests {
 
         let next = reloaded
             .start(
-                "suite-dev".to_string(),
+                test_suite_id("suite-dev", "development"),
                 "development".to_string(),
                 30_000,
                 summary,
@@ -2640,9 +2628,9 @@ mod tests {
         let dir = driver_dir(&paths);
         fs::create_dir_all(&dir).expect("create driver dir");
         let mut legacy = status_fixture(1, "interrupted", Some(INTERRUPTED_BY_RESTART_ERROR));
-        legacy.suite_id = "same-suite".to_string();
+        legacy.suite_id = test_suite_id("same-suite", "development");
         let mut successor = status_fixture(2, "scheduled", None);
-        successor.suite_id = "same-suite".to_string();
+        successor.suite_id = test_suite_id("same-suite", "development");
         write_status_fixture(&dir, &legacy);
         write_status_fixture(&dir, &successor);
 
@@ -2665,9 +2653,9 @@ mod tests {
         let dir = driver_dir(&paths);
         fs::create_dir_all(&dir).expect("create driver dir");
         let mut legacy = status_fixture(1, "interrupted", Some(INTERRUPTED_BY_RESTART_ERROR));
-        legacy.suite_id = "same-suite".to_string();
+        legacy.suite_id = test_suite_id("same-suite", "development");
         let mut terminal = status_fixture(2, "failed", Some("bounded failure"));
-        terminal.suite_id = "same-suite".to_string();
+        terminal.suite_id = test_suite_id("same-suite", "development");
         write_status_fixture(&dir, &legacy);
         write_status_fixture(&dir, &terminal);
 
@@ -2690,9 +2678,9 @@ mod tests {
             let dir = driver_dir(&paths);
             fs::create_dir_all(&dir).expect("create driver dir");
             let mut previous = status_fixture(1, "interrupted", Some(marker));
-            previous.suite_id = "same-suite".to_string();
+            previous.suite_id = test_suite_id("same-suite", "development");
             let mut successor = status_fixture(2, "scheduled", None);
-            successor.suite_id = "same-suite".to_string();
+            successor.suite_id = test_suite_id("same-suite", "development");
             write_status_fixture(&dir, &previous);
             write_status_fixture(&dir, &successor);
 
@@ -2726,9 +2714,9 @@ mod tests {
         let dir = driver_dir(&paths);
         fs::create_dir_all(&dir).expect("create driver dir");
         let mut previous = status_fixture(1, "interrupted", Some(AUTOMATIC_RESUME_QUEUED_ERROR));
-        previous.suite_id = "same-suite".to_string();
+        previous.suite_id = test_suite_id("same-suite", "development");
         let mut terminal = status_fixture(2, "stopped", None);
-        terminal.suite_id = "same-suite".to_string();
+        terminal.suite_id = test_suite_id("same-suite", "development");
         write_status_fixture(&dir, &previous);
         write_status_fixture(&dir, &terminal);
 
@@ -2754,7 +2742,7 @@ mod tests {
             (5, "scheduled", None),
         ] {
             let mut status = status_fixture(index, state, error);
-            status.suite_id = "same-suite".to_string();
+            status.suite_id = test_suite_id("same-suite", "development");
             write_status_fixture(&dir, &status);
         }
 
@@ -2782,7 +2770,7 @@ mod tests {
             (3, "active", None),
         ] {
             let mut status = status_fixture(index, state, error);
-            status.suite_id = "same-suite".to_string();
+            status.suite_id = test_suite_id("same-suite", "development");
             write_status_fixture(&dir, &status);
         }
 
@@ -2812,9 +2800,9 @@ mod tests {
             let dir = driver_dir(&paths);
             fs::create_dir_all(&dir).expect("create driver dir");
             let mut nonterminal = status_fixture(1, "scheduled", None);
-            nonterminal.suite_id = "same-suite".to_string();
+            nonterminal.suite_id = test_suite_id("same-suite", "development");
             let mut newer_marker = status_fixture(2, "interrupted", Some(marker));
-            newer_marker.suite_id = "same-suite".to_string();
+            newer_marker.suite_id = test_suite_id("same-suite", "development");
             write_status_fixture(&dir, &nonterminal);
             write_status_fixture(&dir, &newer_marker);
 
@@ -2855,9 +2843,9 @@ mod tests {
             let dir = driver_dir(&paths);
             fs::create_dir_all(&dir).expect("create driver dir");
             let mut stale = status_fixture(1, "scheduled", None);
-            stale.suite_id = "same-suite".to_string();
+            stale.suite_id = test_suite_id("same-suite", "development");
             let mut terminal = status_fixture(2, terminal_state, None);
-            terminal.suite_id = "same-suite".to_string();
+            terminal.suite_id = test_suite_id("same-suite", "development");
             if terminal_state == "complete" {
                 terminal.launched_run_count = terminal.run_count;
             }
@@ -2898,7 +2886,7 @@ mod tests {
         let start_task = tokio::spawn(async move {
             task_store
                 .start(
-                    "suite-a".to_string(),
+                    test_suite_id("suite-a", "development"),
                     "development".to_string(),
                     30_000,
                     test_summary(),
@@ -2931,7 +2919,7 @@ mod tests {
         let competing_start = tokio::spawn(async move {
             competing_store
                 .start(
-                    "suite-a".to_string(),
+                    test_suite_id("suite-a", "development"),
                     "development".to_string(),
                     30_000,
                     test_summary(),
@@ -3074,7 +3062,7 @@ mod tests {
         let store = BenchmarkSuiteDriverStore::load_from_paths(&paths);
         let started = store
             .start(
-                "suite-dev".to_string(),
+                test_suite_id("suite-dev", "development"),
                 "development".to_string(),
                 30_000,
                 summary.clone(),
@@ -3120,9 +3108,9 @@ mod tests {
         let mut ids = Vec::new();
         for index in 0..(MAX_RETAINED_TERMINAL_DRIVERS + 8) {
             let suite_id = if index >= MAX_RETAINED_TERMINAL_DRIVERS {
-                "suite-repeat".to_string()
+                test_suite_id("suite-repeat", "development")
             } else {
-                format!("suite-{index:02}")
+                test_suite_id(&format!("suite-{index:02}"), "development")
             };
             ids.push(persist_complete_driver(&store, suite_id).await);
         }
@@ -3257,9 +3245,10 @@ mod tests {
         let root = test_root("terminal-retention-live-effect");
         let paths = test_paths(&root);
         let store = BenchmarkSuiteDriverStore::load_from_paths(&paths);
+        let held_suite_id = test_suite_id("suite-held", "development");
         let held = store
             .start(
-                "suite-held".to_string(),
+                held_suite_id.clone(),
                 "development".to_string(),
                 30_000,
                 test_summary(),
@@ -3280,7 +3269,11 @@ mod tests {
             .await
             .expect("held driver completes");
         for index in 0..MAX_RETAINED_TERMINAL_DRIVERS {
-            persist_complete_driver(&store, format!("suite-new-{index}")).await;
+            persist_complete_driver(
+                &store,
+                test_suite_id(&format!("suite-new-{index}"), "development"),
+            )
+            .await;
         }
 
         assert!(store.get(&held_id).await.is_none());
@@ -3288,7 +3281,7 @@ mod tests {
         assert!(matches!(
             store
                 .start(
-                    "suite-held".to_string(),
+                    held_suite_id.clone(),
                     "development".to_string(),
                     30_000,
                     test_summary(),
@@ -3300,7 +3293,7 @@ mod tests {
         drop(held_owner);
         let replacement = store
             .start(
-                "suite-held".to_string(),
+                held_suite_id,
                 "development".to_string(),
                 30_000,
                 test_summary(),
@@ -3371,13 +3364,19 @@ mod tests {
         .expect("store");
         let mut ids = Vec::new();
         for index in 0..MAX_RETAINED_TERMINAL_DRIVERS {
-            ids.push(persist_complete_driver(&store, format!("suite-{index}")).await);
+            ids.push(
+                persist_complete_driver(
+                    &store,
+                    test_suite_id(&format!("suite-{index}"), "development"),
+                )
+                .await,
+            );
         }
         let oldest_path = driver_path(&driver_dir(&paths), &ids[0]);
         fs::remove_file(&oldest_path).expect("remove oldest status");
         fs::create_dir(&oldest_path).expect("block oldest status deletion");
 
-        persist_complete_driver(&store, "suite-new".to_string()).await;
+        persist_complete_driver(&store, test_suite_id("suite-new", "development")).await;
 
         assert_eq!(
             store.list_recent(100).await.len(),
@@ -3448,7 +3447,13 @@ mod tests {
         .expect("store");
         let mut ids = Vec::new();
         for index in 0..MAX_RETAINED_TERMINAL_DRIVERS {
-            ids.push(persist_complete_driver(&store, format!("suite-{index}")).await);
+            ids.push(
+                persist_complete_driver(
+                    &store,
+                    test_suite_id(&format!("suite-{index}"), "development"),
+                )
+                .await,
+            );
         }
         let oldest_id = &ids[0];
         let oldest_path = driver_path(&driver_dir(&paths), oldest_id);
@@ -3463,7 +3468,7 @@ mod tests {
             .accept(oldest_status, WriteUrgency::Debounced, encode_driver_status)
             .expect("pending exact status accepted");
 
-        persist_complete_driver(&store, "suite-new".to_string()).await;
+        persist_complete_driver(&store, test_suite_id("suite-new", "development")).await;
 
         let issues = store.retention_issues();
         assert_eq!(issues.len(), 1);
@@ -3521,7 +3526,7 @@ mod tests {
         .expect("write unsafe status");
 
         let mut ambiguous_terminal = status_fixture(200, "complete", None);
-        ambiguous_terminal.suite_id = "suite-ambiguous".to_string();
+        ambiguous_terminal.suite_id = test_suite_id("suite-ambiguous", "development");
         write_status_fixture(&dir, &ambiguous_terminal);
         for index in [201, 202] {
             let mut active = status_fixture(index, "active", None);
@@ -3604,11 +3609,17 @@ mod tests {
         );
         let mut ids = Vec::new();
         for index in 0..MAX_RETAINED_TERMINAL_DRIVERS {
-            ids.push(persist_complete_driver(&store, format!("suite-{index}")).await);
+            ids.push(
+                persist_complete_driver(
+                    &store,
+                    test_suite_id(&format!("suite-{index}"), "development"),
+                )
+                .await,
+            );
         }
         let started = store
             .start(
-                "suite-new".to_string(),
+                test_suite_id("suite-new", "development"),
                 "development".to_string(),
                 30_000,
                 test_summary(),
@@ -3674,11 +3685,12 @@ mod tests {
         let dir = driver_dir(&paths);
         fs::create_dir_all(&dir).expect("create driver dir");
         let path = driver_path(&dir, "benchmark-suite-driver-0000000000000001");
+        let suite_id = test_suite_id("unknown-field", "development");
         fs::write(
             path,
             serde_json::to_string_pretty(&serde_json::json!({
                 "id": "benchmark-suite-driver-0000000000000001",
-                "suite_id": "suite-dev",
+                "suite_id": suite_id,
                 "mode": "development",
                 "state": "complete",
                 "interval_ms": 30000,
@@ -3809,12 +3821,13 @@ mod tests {
         ];
         for (index, state, error) in shapes {
             let mut status = status_fixture(index, state, error);
-            status.mode = match index % 3 {
+            let mode = match index % 3 {
                 0 => "development",
                 1 => "qualification",
                 _ => "release_validation",
-            }
-            .to_string();
+            };
+            status.mode = mode.to_string();
+            status.suite_id = test_suite_id(&format!("fixture-{index}"), mode);
             if state == "launched_next" {
                 status.last_run_index = Some(0);
                 status.last_session_id = Some(format!("session-{index}"));
@@ -3923,7 +3936,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("create driver dir");
         for index in [1, 2] {
             let mut status = status_fixture(index, "active", None);
-            status.suite_id = "same-suite".to_string();
+            status.suite_id = test_suite_id("same-suite", "development");
             fs::write(
                 driver_path(&dir, &status.id),
                 serde_json::to_vec_pretty(&status).expect("serialize driver"),
@@ -4028,6 +4041,10 @@ mod tests {
         }
     }
 
+    fn test_suite_id(label: &str, mode: &str) -> String {
+        crate::state::benchmark_suites::derive_suite_id(label, mode)
+    }
+
     async fn persist_complete_driver(
         store: &BenchmarkSuiteDriverStore,
         suite_id: String,
@@ -4067,7 +4084,7 @@ mod tests {
     fn status_fixture(index: u64, state: &str, error: Option<&str>) -> BenchmarkSuiteDriverStatus {
         BenchmarkSuiteDriverStatus {
             id: format!("benchmark-suite-driver-{index:016x}"),
-            suite_id: format!("suite-{index}"),
+            suite_id: test_suite_id(&format!("fixture-{index}"), "development"),
             mode: "development".to_string(),
             state: state.to_string(),
             interval_ms: 30_000,

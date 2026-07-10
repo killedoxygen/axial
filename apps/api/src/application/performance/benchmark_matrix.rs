@@ -338,13 +338,13 @@ pub(crate) fn benchmark_suite_run_id(
     run_index: usize,
     run: BenchmarkSuiteRunSpec,
 ) -> String {
-    match run.target_id {
-        Some(target_id) => format!("suite-{mode}-{run_index:02}-{target_id}-{}", run.run_type),
-        None => format!(
-            "suite-{mode}-{run_index:02}-{}-{}",
-            run.profile, run.run_type
-        ),
-    }
+    let identity = format!(
+        "{mode}|{run_index}|{}|{}|{}",
+        run.profile,
+        run.run_type,
+        run.target_id.unwrap_or_default()
+    );
+    crate::observability::bounded_descriptor_token(&identity, "benchmark")
 }
 
 pub(crate) fn benchmark_suite_run_descriptor(
@@ -561,6 +561,80 @@ mod tests {
             }
         }
         assert_eq!(benchmark_suite_plan("nightly-check"), None);
+    }
+
+    #[test]
+    fn benchmark_suite_run_ids_are_opaque_bounded_stable_and_unique() {
+        let mut ids = HashSet::new();
+        for mode in ["development", "qualification", "release_validation"] {
+            let plan = benchmark_suite_plan(mode).expect("suite plan");
+            for (run_index, run) in plan.iter().copied().enumerate() {
+                let first = benchmark_suite_run_id(mode, run_index, run);
+                let second = benchmark_suite_run_id(mode, run_index, run);
+
+                assert_eq!(first, second);
+                assert!(first.starts_with("benchmark-"));
+                assert!(first.chars().count() < 48);
+                assert!(!first.contains(mode));
+                assert!(!first.contains(run.profile));
+                assert!(!first.contains(run.run_type));
+                if let Some(target_id) = run.target_id {
+                    assert!(!first.contains(target_id));
+                }
+                assert_eq!(
+                    crate::observability::sanitize_evidence_token(
+                        &first,
+                        crate::observability::RedactionAudience::UserVisible,
+                        96,
+                    )
+                    .as_deref(),
+                    Some(first.as_str())
+                );
+                assert!(ids.insert(first), "benchmark run id collision");
+            }
+        }
+
+        let run = BenchmarkSuiteRunSpec {
+            profile: "managed_default",
+            run_type: "coldish",
+            target_id: Some("family_c_forge_1_12_2_family_c_forge_core"),
+        };
+        let base = benchmark_suite_run_id("release_validation", 1, run);
+        assert_ne!(base, benchmark_suite_run_id("development", 1, run));
+        assert_ne!(base, benchmark_suite_run_id("release_validation", 2, run));
+        assert_ne!(
+            base,
+            benchmark_suite_run_id(
+                "release_validation",
+                1,
+                BenchmarkSuiteRunSpec {
+                    profile: "vanilla_baseline",
+                    ..run
+                },
+            )
+        );
+        assert_ne!(
+            base,
+            benchmark_suite_run_id(
+                "release_validation",
+                1,
+                BenchmarkSuiteRunSpec {
+                    run_type: "repeat",
+                    ..run
+                },
+            )
+        );
+        assert_ne!(
+            base,
+            benchmark_suite_run_id(
+                "release_validation",
+                1,
+                BenchmarkSuiteRunSpec {
+                    target_id: Some("family_c_forge_1_12_2_vanilla_baseline"),
+                    ..run
+                },
+            )
+        );
     }
 
     #[test]

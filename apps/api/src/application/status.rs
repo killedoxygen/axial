@@ -36,6 +36,7 @@ pub fn launcher_status(state: &AppState) -> StatusResponse {
 
 fn state_load_issue_count(state: &AppState) -> usize {
     state.performance_operations().load_issue_count()
+        + state.benchmark_suites().load_issue_count()
         + state.benchmark_suite_drivers().load_issue_count()
 }
 
@@ -128,6 +129,45 @@ mod tests {
         assert!(!response.warnings[0].contains(&root.to_string_lossy().to_string()));
         assert!(!response.warnings[0].contains("unexpected_mode"));
         assert!(!response.warnings[0].contains("line"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn status_includes_guardian_warning_for_rejected_benchmark_suite_manifest() {
+        let root = test_root("status-benchmark-suite-warning");
+        let paths = test_paths(&root);
+        let suite_id =
+            crate::state::benchmark_suites::derive_suite_id("status-rejected-suite", "development");
+        let suite_path = crate::state::benchmark_suites::suite_path(&paths, &suite_id);
+        fs::create_dir_all(suite_path.parent().expect("suite directory"))
+            .expect("create suite directory");
+        fs::write(&suite_path, b"{not-json").expect("write malformed suite");
+
+        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        let state = AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        });
+
+        let response = launcher_status(&state);
+
+        assert_eq!(response.status, "ok");
+        assert_eq!(response.warnings.len(), 1);
+        assert_eq!(
+            response.warnings[0],
+            "Guardian kept Axial running after persisted operation state could not be trusted."
+        );
+        assert!(!response.warnings[0].contains(&root.to_string_lossy().to_string()));
+        assert!(!response.warnings[0].contains("not-json"));
 
         let _ = fs::remove_dir_all(root);
     }

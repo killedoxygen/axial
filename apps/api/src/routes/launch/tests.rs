@@ -5,6 +5,9 @@ use crate::application::performance::{
     FAMILY_C_QUALIFICATION_VERSION, benchmark_suite_manifest_run_inputs, benchmark_suite_plan,
     benchmark_suite_run_id, family_c_qualification_payload, family_c_qualification_preview_payload,
 };
+use crate::execution::file::{FileWriteRequest, write_file_atomically};
+use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
+use crate::state::contracts::TargetDescriptor;
 use crate::state::{AppStateInit, InstallStore, SessionStore};
 use axial_config::{AppConfig, AppPaths, ConfigStore, Instance, InstanceStore};
 use axial_launcher::{
@@ -19,6 +22,7 @@ use axum::{
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 
@@ -195,7 +199,11 @@ fn launch_report_internal_error_response_hides_raw_io_details() {
 
 #[test]
 fn benchmark_suite_storage_error_response_hides_raw_io_details() {
-    let response = benchmark_suite_storage_error_response(raw_benchmark_suite_storage_io_error());
+    let response = benchmark_suite_store_error_response(
+        crate::state::benchmark_suites::BenchmarkSuiteStoreError::Persistence(
+            raw_benchmark_suite_storage_io_error(),
+        ),
+    );
 
     assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
@@ -562,155 +570,34 @@ fn benchmark_suite_defaults_to_development_first_run() {
     assert_eq!(input.launch.min_memory_mb, Some(1024));
     assert_eq!(input.launch.client_started_at_ms, Some(42));
     assert_eq!(input.mode, "development");
-    assert_eq!(input.run_index, 0);
+    assert_eq!(input.requested_run_index, None);
     assert_eq!(input.plan.len(), 2);
     assert_eq!(input.plan[0].profile, "vanilla_baseline");
     assert_eq!(input.plan[0].run_type, "coldish");
 }
 
 #[test]
-fn benchmark_suite_omitted_run_index_resumes_first_unlaunched_manifest_run() {
-    let root = test_root("suite-auto-resume");
-    let paths = test_paths(&root);
-    let suite_id = "suite-auto-resume";
-    let plan = benchmark_suite_plan("development").expect("development plan");
-    let manifest_runs = benchmark_suite_manifest_run_inputs("development", &plan);
-    crate::state::benchmark_suites::persist_launched_run(
-        &paths,
-        suite_id,
-        "instance",
-        "development",
-        &manifest_runs,
-        0,
-        "session-0",
-        "2026-01-01T00:00:00.000Z",
-    )
-    .expect("persist launched run");
+fn benchmark_suite_request_preserves_explicit_run_index_for_store_selection() {
+    let suite_id = test_suite_id("explicit-run-index", "development");
     let request: BenchmarkLaunchRequest = serde_json::from_value(serde_json::json!({
         "instance_id": "instance",
         "suite_mode": "development",
-        "suite_id": suite_id
-    }))
-    .expect("deserialize suite request");
-
-    let input = request
-        .into_suite_launch_input_with_manifest(Some(&paths))
-        .expect("suite input should parse");
-
-    assert_eq!(input.run_index, 1);
-
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn benchmark_suite_omitted_run_index_conflicts_when_manifest_is_complete() {
-    let root = test_root("suite-auto-complete");
-    let paths = test_paths(&root);
-    let suite_id = "suite-auto-complete";
-    let plan = benchmark_suite_plan("development").expect("development plan");
-    let manifest_runs = benchmark_suite_manifest_run_inputs("development", &plan);
-    crate::state::benchmark_suites::persist_launched_run(
-        &paths,
-        suite_id,
-        "instance",
-        "development",
-        &manifest_runs,
-        0,
-        "session-0",
-        "2026-01-01T00:00:00.000Z",
-    )
-    .expect("persist first launched run");
-    crate::state::benchmark_suites::persist_launched_run(
-        &paths,
-        suite_id,
-        "instance",
-        "development",
-        &manifest_runs,
-        1,
-        "session-1",
-        "2026-01-01T00:01:00.000Z",
-    )
-    .expect("persist second launched run");
-    let request: BenchmarkLaunchRequest = serde_json::from_value(serde_json::json!({
-        "instance_id": "instance",
-        "suite_mode": "development",
-        "suite_id": suite_id
-    }))
-    .expect("deserialize suite request");
-
-    let error = request
-        .into_suite_launch_input_with_manifest(Some(&paths))
-        .expect_err("complete suite should conflict");
-
-    assert_eq!(error.0, StatusCode::CONFLICT);
-    assert_eq!(
-        error.1.0,
-        serde_json::json!({ "error": "benchmark suite is complete" })
-    );
-
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn benchmark_suite_omitted_run_index_without_manifest_selects_first_run() {
-    let root = test_root("suite-auto-no-manifest");
-    let paths = test_paths(&root);
-    let request: BenchmarkLaunchRequest = serde_json::from_value(serde_json::json!({
-        "instance_id": "instance",
-        "suite_mode": "development",
-        "suite_id": "suite-auto-no-manifest"
-    }))
-    .expect("deserialize suite request");
-
-    let input = request
-        .into_suite_launch_input_with_manifest(Some(&paths))
-        .expect("suite input should parse");
-
-    assert_eq!(input.run_index, 0);
-
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn benchmark_suite_explicit_run_index_bypasses_manifest_auto_selection() {
-    let root = test_root("suite-explicit-bypass");
-    let paths = test_paths(&root);
-    let suite_id = "suite-explicit-bypass";
-    let plan = benchmark_suite_plan("development").expect("development plan");
-    let manifest_runs = benchmark_suite_manifest_run_inputs("development", &plan);
-    crate::state::benchmark_suites::persist_launched_run(
-        &paths,
-        suite_id,
-        "instance",
-        "development",
-        &manifest_runs,
-        0,
-        "session-0",
-        "2026-01-01T00:00:00.000Z",
-    )
-    .expect("persist launched run");
-    let request: BenchmarkLaunchRequest = serde_json::from_value(serde_json::json!({
-        "instance_id": "instance",
-        "suite_mode": "development",
-        "suite_id": suite_id,
+        "suite_id": &suite_id,
         "run_index": 0
     }))
     .expect("deserialize suite request");
 
     let input = request
-        .into_suite_launch_input_with_manifest(Some(&paths))
+        .into_suite_launch_input()
         .expect("suite input should parse");
 
-    assert_eq!(input.run_index, 0);
-
-    let _ = std::fs::remove_dir_all(root);
+    assert_eq!(input.requested_run_index, Some(0));
 }
 
-#[test]
-fn benchmark_suite_run_reservation_records_prepared_session_before_launch_execution() {
-    let root = test_root("suite-run-reservation");
-    let paths = test_paths(&root);
-    let suite_id = "suite-run-reservation";
+#[tokio::test]
+async fn benchmark_suite_run_reservation_records_prepared_session_before_launch_execution() {
+    let store = crate::state::benchmark_suites::BenchmarkSuiteStore::new();
+    let suite_id = test_suite_id("run-reservation", "development");
     let plan = benchmark_suite_plan("development").expect("development plan");
     let input = BenchmarkSuiteLaunchInput {
         launch: launch_app::LaunchRequest {
@@ -720,22 +607,24 @@ fn benchmark_suite_run_reservation_records_prepared_session_before_launch_execut
             min_memory_mb: None,
             client_started_at_ms: None,
         },
-        suite_id: suite_id.to_string(),
+        suite_id,
         mode: "development".to_string(),
-        run_index: 1,
+        requested_run_index: Some(1),
         plan,
     };
 
-    let manifest = persist_benchmark_suite_run_reservation(
-        &paths,
+    let manifest_runs = benchmark_suite_manifest_run_inputs(&input.mode, &input.plan);
+    let manifest = persist_suite_run(
+        &store,
         &input.suite_id,
-        &input.mode,
-        &input.plan,
-        input.run_index,
         "instance",
+        &input.mode,
+        &manifest_runs,
+        input.requested_run_index.expect("explicit run index"),
         "session-prepared-before-spawn",
         "2026-01-01T00:00:00.000Z",
     )
+    .await
     .expect("reservation should persist");
 
     let selected = manifest
@@ -747,10 +636,13 @@ fn benchmark_suite_run_reservation_records_prepared_session_before_launch_execut
         selected.session_id.as_deref(),
         Some("session-prepared-before-spawn")
     );
-    assert_eq!(
-        selected.launched_at.as_deref(),
-        Some("2026-01-01T00:00:00.000Z")
-    );
+    let launched_at = chrono::DateTime::parse_from_rfc3339(
+        selected.launched_at.as_deref().expect("launch timestamp"),
+    )
+    .expect("stored launch timestamp");
+    let expected_launched_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00.000Z")
+        .expect("expected launch timestamp");
+    assert_eq!(launched_at, expected_launched_at);
     assert_eq!(selected.state, "launching");
 
     let pending = manifest
@@ -760,42 +652,54 @@ fn benchmark_suite_run_reservation_records_prepared_session_before_launch_execut
         .expect("pending run");
     assert_eq!(pending.session_id, None);
     assert_eq!(pending.state, "pending");
-
-    cleanup(&root);
 }
 
-#[test]
-fn benchmark_suite_run_reservation_storage_error_is_bounded() {
+#[tokio::test]
+async fn benchmark_suite_run_reservation_storage_error_is_bounded() {
     let root = test_root("suite-run-reservation-error");
-    std::fs::create_dir_all(&root).expect("create test root");
     let paths = test_paths(&root);
-    std::fs::write(&paths.config_dir, "not a directory").expect("write config path as file");
+    let backend = Arc::new(FailOnceBenchmarkSuiteBackend::new());
+    let coordinator = PersistenceCoordinator::for_test(backend, Duration::ZERO, Duration::ZERO);
+    let store =
+        crate::state::benchmark_suites::BenchmarkSuiteStore::try_load_from_paths_with_coordinator(
+            &paths,
+            coordinator,
+        )
+        .expect("load injected suite store");
     let plan = benchmark_suite_plan("development").expect("development plan");
-    let input = BenchmarkSuiteLaunchInput {
-        launch: launch_app::LaunchRequest {
-            instance_id: "instance".to_string(),
-            username: None,
-            max_memory_mb: None,
-            min_memory_mb: None,
-            client_started_at_ms: None,
-        },
-        suite_id: "suite-run-reservation-error".to_string(),
-        mode: "development".to_string(),
-        run_index: 0,
-        plan,
+    let manifest_runs = benchmark_suite_manifest_run_inputs("development", &plan);
+    let suite_id = test_suite_id("bounded-storage-error", "development");
+    let selection = store
+        .select_reservation(
+            &suite_id,
+            "instance",
+            "development",
+            &manifest_runs,
+            Some(0),
+        )
+        .await
+        .expect("select suite reservation");
+    let reserve_error = store
+        .reserve(
+            selection,
+            "session-bounded-storage-error",
+            "2026-01-01T00:00:00.000Z",
+            false,
+        )
+        .await
+        .expect_err("injected storage write should fail");
+    let (handle, source) = match reserve_error {
+        crate::state::benchmark_suites::BenchmarkSuiteReserveError::AcceptedWriteFailed {
+            handle,
+            source,
+        } => (handle, source),
+        crate::state::benchmark_suites::BenchmarkSuiteReserveError::PreAccept(error) => {
+            panic!("reservation failed before acceptance: {}", error.class())
+        }
     };
-
-    let error = persist_benchmark_suite_run_reservation(
-        &paths,
-        &input.suite_id,
-        &input.mode,
-        &input.plan,
-        input.run_index,
-        "instance",
-        "session-prepared-before-spawn",
-        "2026-01-01T00:00:00.000Z",
-    )
-    .expect_err("storage failure should be bounded");
+    let error = benchmark_suite_store_error_response(
+        crate::state::benchmark_suites::BenchmarkSuiteStoreError::Persistence(source),
+    );
 
     assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
@@ -804,7 +708,14 @@ fn benchmark_suite_run_reservation_storage_error_is_bounded() {
     );
     let body = serde_json::to_string(&error.1.0).expect("error json");
     assert!(!body.contains(root.to_string_lossy().as_ref()));
-    assert!(!body.contains("not a directory"));
+    assert!(!body.contains("Alice"));
+    assert!(!body.contains("suite.json"));
+
+    store
+        .settle_compensation(&handle)
+        .await
+        .expect("settle exact compensation");
+    store.close().await.expect("close injected suite store");
 
     cleanup(&root);
 }
@@ -887,12 +798,15 @@ fn benchmark_suite_request_rejects_negative_run_index() {
 #[test]
 fn benchmark_suite_response_payload_exposes_selected_and_remaining_runs() {
     let plan = benchmark_suite_plan("development").expect("development plan");
-    let payload = benchmark_suite_status_payload("suite-dev", "development", 0, &plan);
+    let suite_id = test_suite_id("response-payload", "development");
+    let payload = benchmark_suite_status_payload(&suite_id, "development", 0, &plan);
+    let selected_benchmark_id = benchmark_suite_run_id("development", 0, plan[0]);
+    let remaining_benchmark_id = benchmark_suite_run_id("development", 1, plan[1]);
 
     assert_eq!(
         payload,
         serde_json::json!({
-            "suite_id": "suite-dev",
+            "suite_id": suite_id,
             "mode": "development",
             "run_index": 0,
             "run_count": 2,
@@ -904,7 +818,7 @@ fn benchmark_suite_response_payload_exposes_selected_and_remaining_runs() {
                 "profile": "vanilla_baseline",
                 "run_type": "coldish",
                 "target_id": null,
-                "benchmark_id": "suite-development-00-vanilla_baseline-coldish",
+                "benchmark_id": selected_benchmark_id,
             },
             "remaining": [
                 {
@@ -912,7 +826,7 @@ fn benchmark_suite_response_payload_exposes_selected_and_remaining_runs() {
                     "profile": "managed_default",
                     "run_type": "repeat",
                     "target_id": null,
-                    "benchmark_id": "suite-development-01-managed_default-repeat",
+                    "benchmark_id": remaining_benchmark_id,
                 }
             ],
         })
@@ -922,7 +836,8 @@ fn benchmark_suite_response_payload_exposes_selected_and_remaining_runs() {
 #[test]
 fn benchmark_suite_release_validation_carries_family_c_target_identity() {
     let plan = benchmark_suite_plan("release_validation").expect("release plan");
-    let payload = benchmark_suite_status_payload("suite-release", "release_validation", 0, &plan);
+    let suite_id = test_suite_id("family-c-target-identity", "release_validation");
+    let payload = benchmark_suite_status_payload(&suite_id, "release_validation", 0, &plan);
     let manifest_runs = benchmark_suite_manifest_run_inputs("release_validation", &plan);
 
     assert_eq!(
@@ -947,17 +862,17 @@ fn benchmark_suite_release_validation_carries_family_c_target_identity() {
     );
 }
 
-#[test]
-fn benchmark_suite_manifest_persists_family_c_target_identity() {
-    let root = test_root("suite-family-c-target-manifest");
-    let paths = test_paths(&root);
-    let suite_id = "suite-family-c-target-manifest";
+#[tokio::test]
+async fn benchmark_suite_manifest_persists_family_c_target_identity() {
+    let store = crate::state::benchmark_suites::BenchmarkSuiteStore::new();
+    let suite_id =
+        crate::state::benchmark_suites::derive_suite_id("instance", "release_validation");
     let plan = benchmark_suite_plan("release_validation").expect("release plan");
     let manifest_runs = benchmark_suite_manifest_run_inputs("release_validation", &plan);
 
-    crate::state::benchmark_suites::persist_launched_run(
-        &paths,
-        suite_id,
+    persist_suite_run(
+        &store,
+        &suite_id,
         "instance",
         "release_validation",
         &manifest_runs,
@@ -965,8 +880,10 @@ fn benchmark_suite_manifest_persists_family_c_target_identity() {
         "session-1",
         "2026-01-01T00:00:00.000Z",
     )
+    .await
     .expect("persist launched run");
-    let manifest = crate::state::benchmark_suites::load(&paths, suite_id)
+    let manifest = store
+        .get(&suite_id)
         .expect("load suite")
         .expect("suite should exist");
 
@@ -980,27 +897,49 @@ fn benchmark_suite_manifest_persists_family_c_target_identity() {
         "family_c_forge_1_12_2_family_c_forge_core"
     );
     assert!(manifest.runs.len() <= 16);
+}
 
-    cleanup(&root);
+#[tokio::test]
+async fn every_benchmark_suite_plan_passes_strict_store_admission() {
+    let store = crate::state::benchmark_suites::BenchmarkSuiteStore::new();
+    for mode in ["development", "qualification", "release_validation"] {
+        let suite_id = crate::state::benchmark_suites::derive_suite_id("instance", mode);
+        let plan = benchmark_suite_plan(mode).expect("suite plan");
+        let manifest_runs = benchmark_suite_manifest_run_inputs(mode, &plan);
+
+        assert!(manifest_runs.iter().all(|run| run.benchmark_id.len() < 48));
+        let manifest = persist_suite_run(
+            &store,
+            &suite_id,
+            "instance",
+            mode,
+            &manifest_runs,
+            0,
+            &format!("session-{mode}"),
+            "2026-01-01T00:00:00.000Z",
+        )
+        .await
+        .expect("strict store accepts current suite plan");
+
+        assert_eq!(manifest.suite_id, suite_id);
+        assert_eq!(manifest.runs.len(), plan.len());
+    }
 }
 
 #[test]
-fn benchmark_suite_ids_include_family_c_target_identity_and_stay_bounded() {
+fn benchmark_suite_ids_are_opaque_and_change_with_family_c_target_identity() {
     let plan = benchmark_suite_plan("release_validation").expect("release plan");
     let baseline_id = benchmark_suite_run_id("release_validation", 0, plan[0]);
     let managed_id = benchmark_suite_run_id("release_validation", 1, plan[1]);
 
     assert_ne!(baseline_id, managed_id);
-    assert_eq!(
-        baseline_id,
-        "suite-release_validation-00-family_c_forge_1_12_2_vanilla_baseline-coldish"
-    );
-    assert_eq!(
-        managed_id,
-        "suite-release_validation-01-family_c_forge_1_12_2_family_c_forge_core-coldish"
-    );
     for benchmark_id in [baseline_id, managed_id] {
-        assert!(benchmark_id.len() <= 96);
+        assert!(benchmark_id.starts_with("benchmark-"));
+        assert!(benchmark_id.len() < 48);
+        assert!(!benchmark_id.contains("release_validation"));
+        assert!(!benchmark_id.contains("family_c"));
+        assert!(!benchmark_id.contains("vanilla_baseline"));
+        assert!(!benchmark_id.contains("managed_default"));
         assert!(
             benchmark_id
                 .chars()
@@ -1012,17 +951,28 @@ fn benchmark_suite_ids_include_family_c_target_identity_and_stay_bounded() {
 #[tokio::test]
 async fn family_c_qualification_complete_suite_and_proofs_are_ready() {
     let fixture = RouteTestFixture::new("family-c-qualification-ready");
-    let suite_id = "family-c-qualification-ready";
     let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+    let suite_id = test_suite_id(&instance_id, "release_validation");
     persist_family_c_suite_run(
-        &fixture.paths,
-        suite_id,
+        &fixture.state,
+        &suite_id,
         &instance_id,
         0,
         "baseline-session",
-    );
-    persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
-    let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
+    )
+    .await;
+    persist_family_c_suite_run(
+        &fixture.state,
+        &suite_id,
+        &instance_id,
+        1,
+        "managed-session",
+    )
+    .await;
+    let manifest = fixture
+        .state
+        .benchmark_suites()
+        .get(&suite_id)
         .expect("load suite")
         .expect("suite exists");
     let baseline_run = manifest
@@ -1035,6 +985,9 @@ async fn family_c_qualification_complete_suite_and_proofs_are_ready() {
         .iter()
         .find(|run| run.target_id == FAMILY_C_MANAGED_TARGET_ID)
         .expect("managed run");
+    let plan = benchmark_suite_plan("release_validation").expect("release plan");
+    let expected_baseline_benchmark_id = benchmark_suite_run_id("release_validation", 0, plan[0]);
+    let expected_managed_benchmark_id = benchmark_suite_run_id("release_validation", 1, plan[1]);
     write_family_c_proof(&fixture.paths, baseline_run, &instance_id, "vanilla", None);
     write_family_c_proof(
         &fixture.paths,
@@ -1054,7 +1007,7 @@ async fn family_c_qualification_complete_suite_and_proofs_are_ready() {
     );
     write_family_c_managed_state(&fixture, &instance_id);
 
-    let payload = family_c_qualification_payload(&fixture.state, suite_id)
+    let payload = family_c_qualification_payload(&fixture.state, &suite_id)
         .await
         .expect("qualification payload");
 
@@ -1084,17 +1037,13 @@ async fn family_c_qualification_complete_suite_and_proofs_are_ready() {
         payload["targets"][1]["proof"]["present"],
         serde_json::json!(true)
     );
-    assert!(
-        payload["targets"][0]["proof"]["benchmark_id"]
-            .as_str()
-            .expect("baseline proof benchmark id")
-            .contains(FAMILY_C_BASELINE_TARGET_ID)
+    assert_eq!(
+        payload["targets"][0]["proof"]["benchmark_id"],
+        serde_json::json!(expected_baseline_benchmark_id)
     );
-    assert!(
-        payload["targets"][1]["proof"]["benchmark_id"]
-            .as_str()
-            .expect("managed proof benchmark id")
-            .contains(FAMILY_C_MANAGED_TARGET_ID)
+    assert_eq!(
+        payload["targets"][1]["proof"]["benchmark_id"],
+        serde_json::json!(expected_managed_benchmark_id)
     );
     assert_eq!(
         payload["targets"][1]["proof"]["comparison"]["present"],
@@ -1153,19 +1102,83 @@ async fn family_c_qualification_complete_suite_and_proofs_are_ready() {
 }
 
 #[tokio::test]
+async fn family_c_qualification_rejects_wrong_opaque_benchmark_id() {
+    let fixture = RouteTestFixture::new("family-c-qualification-wrong-benchmark-id");
+    let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+    let suite_id = test_suite_id(&instance_id, "release_validation");
+    let plan = benchmark_suite_plan("release_validation").expect("release plan");
+    let mut manifest_runs = benchmark_suite_manifest_run_inputs("release_validation", &plan);
+    let wrong_plan = benchmark_suite_plan("development").expect("development plan");
+    let wrong_benchmark_id = benchmark_suite_run_id("development", 0, wrong_plan[0]);
+    assert_ne!(wrong_benchmark_id, manifest_runs[0].benchmark_id);
+    manifest_runs[0].benchmark_id = wrong_benchmark_id.clone();
+    persist_suite_run(
+        fixture.state.benchmark_suites(),
+        &suite_id,
+        &instance_id,
+        "release_validation",
+        &manifest_runs,
+        0,
+        "baseline-session",
+        "2026-01-01T00:00:00.000Z",
+    )
+    .await
+    .expect("persist suite with wrong opaque benchmark id");
+    let manifest = fixture
+        .state
+        .benchmark_suites()
+        .get(&suite_id)
+        .expect("load suite")
+        .expect("suite exists");
+    let baseline_run = manifest
+        .runs
+        .iter()
+        .find(|run| run.target_id == FAMILY_C_BASELINE_TARGET_ID)
+        .expect("baseline run");
+    write_family_c_proof(&fixture.paths, baseline_run, &instance_id, "vanilla", None);
+
+    let payload = family_c_qualification_payload(&fixture.state, &suite_id)
+        .await
+        .expect("qualification payload");
+
+    assert_eq!(payload["status"], serde_json::json!("incomplete"));
+    assert_eq!(
+        payload["targets"][0]["missing"],
+        serde_json::json!(["suite_run_benchmark_id_mismatch"])
+    );
+    assert_eq!(
+        payload["targets"][0]["proof"]["benchmark_id"],
+        serde_json::json!(wrong_benchmark_id)
+    );
+
+    cleanup(&fixture.root);
+}
+
+#[tokio::test]
 async fn family_c_qualification_managed_comparison_must_match_suite_baseline() {
     let fixture = RouteTestFixture::new("family-c-qualification-wrong-comparison-baseline");
-    let suite_id = "family-c-qualification-wrong-comparison-baseline";
     let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+    let suite_id = test_suite_id(&instance_id, "release_validation");
     persist_family_c_suite_run(
-        &fixture.paths,
-        suite_id,
+        &fixture.state,
+        &suite_id,
         &instance_id,
         0,
         "baseline-session",
-    );
-    persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
-    let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
+    )
+    .await;
+    persist_family_c_suite_run(
+        &fixture.state,
+        &suite_id,
+        &instance_id,
+        1,
+        "managed-session",
+    )
+    .await;
+    let manifest = fixture
+        .state
+        .benchmark_suites()
+        .get(&suite_id)
         .expect("load suite")
         .expect("suite exists");
     let baseline_run = manifest
@@ -1190,7 +1203,7 @@ async fn family_c_qualification_managed_comparison_must_match_suite_baseline() {
     );
     write_family_c_managed_state(&fixture, &instance_id);
 
-    let payload = family_c_qualification_payload(&fixture.state, suite_id)
+    let payload = family_c_qualification_payload(&fixture.state, &suite_id)
         .await
         .expect("qualification payload");
 
@@ -1227,17 +1240,28 @@ async fn family_c_qualification_managed_comparison_must_match_suite_baseline() {
 #[tokio::test]
 async fn family_c_qualification_missing_managed_state_only_blocks_managed_target() {
     let fixture = RouteTestFixture::new("family-c-qualification-missing-managed-state");
-    let suite_id = "family-c-qualification-missing-managed-state";
     let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+    let suite_id = test_suite_id(&instance_id, "release_validation");
     persist_family_c_suite_run(
-        &fixture.paths,
-        suite_id,
+        &fixture.state,
+        &suite_id,
         &instance_id,
         0,
         "baseline-session",
-    );
-    persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
-    let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
+    )
+    .await;
+    persist_family_c_suite_run(
+        &fixture.state,
+        &suite_id,
+        &instance_id,
+        1,
+        "managed-session",
+    )
+    .await;
+    let manifest = fixture
+        .state
+        .benchmark_suites()
+        .get(&suite_id)
         .expect("load suite")
         .expect("suite exists");
     let baseline_run = manifest
@@ -1259,7 +1283,7 @@ async fn family_c_qualification_missing_managed_state_only_blocks_managed_target
         Some(family_c_comparison()),
     );
 
-    let payload = family_c_qualification_payload(&fixture.state, suite_id)
+    let payload = family_c_qualification_payload(&fixture.state, &suite_id)
         .await
         .expect("qualification payload");
 
@@ -1280,17 +1304,28 @@ async fn family_c_qualification_missing_managed_state_only_blocks_managed_target
 #[tokio::test]
 async fn family_c_qualification_invalid_managed_state_only_blocks_managed_target() {
     let fixture = RouteTestFixture::new("family-c-qualification-invalid-managed-state");
-    let suite_id = "family-c-qualification-invalid-managed-state";
     let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+    let suite_id = test_suite_id(&instance_id, "release_validation");
     persist_family_c_suite_run(
-        &fixture.paths,
-        suite_id,
+        &fixture.state,
+        &suite_id,
         &instance_id,
         0,
         "baseline-session",
-    );
-    persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
-    let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
+    )
+    .await;
+    persist_family_c_suite_run(
+        &fixture.state,
+        &suite_id,
+        &instance_id,
+        1,
+        "managed-session",
+    )
+    .await;
+    let manifest = fixture
+        .state
+        .benchmark_suites()
+        .get(&suite_id)
         .expect("load suite")
         .expect("suite exists");
     let baseline_run = manifest
@@ -1313,7 +1348,7 @@ async fn family_c_qualification_invalid_managed_state_only_blocks_managed_target
     );
     write_invalid_family_c_managed_state(&fixture, &instance_id);
 
-    let payload = family_c_qualification_payload(&fixture.state, suite_id)
+    let payload = family_c_qualification_payload(&fixture.state, &suite_id)
         .await
         .expect("qualification payload");
 
@@ -1334,17 +1369,28 @@ async fn family_c_qualification_invalid_managed_state_only_blocks_managed_target
 #[tokio::test]
 async fn family_c_qualification_proofs_without_guardian_and_resource_budget_are_incomplete() {
     let fixture = RouteTestFixture::new("family-c-qualification-missing-proof-evidence");
-    let suite_id = "family-c-qualification-missing-proof-evidence";
     let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+    let suite_id = test_suite_id(&instance_id, "release_validation");
     persist_family_c_suite_run(
-        &fixture.paths,
-        suite_id,
+        &fixture.state,
+        &suite_id,
         &instance_id,
         0,
         "baseline-session",
-    );
-    persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
-    let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
+    )
+    .await;
+    persist_family_c_suite_run(
+        &fixture.state,
+        &suite_id,
+        &instance_id,
+        1,
+        "managed-session",
+    )
+    .await;
+    let manifest = fixture
+        .state
+        .benchmark_suites()
+        .get(&suite_id)
         .expect("load suite")
         .expect("suite exists");
     let baseline_run = manifest
@@ -1384,7 +1430,7 @@ async fn family_c_qualification_proofs_without_guardian_and_resource_budget_are_
     write_family_c_proof_record(&fixture.paths, &managed_proof);
     write_family_c_managed_state(&fixture, &instance_id);
 
-    let payload = family_c_qualification_payload(&fixture.state, suite_id)
+    let payload = family_c_qualification_payload(&fixture.state, &suite_id)
         .await
         .expect("qualification payload");
 
@@ -1435,11 +1481,11 @@ async fn family_c_qualification_proofs_without_guardian_and_resource_budget_are_
 #[tokio::test]
 async fn family_c_qualification_missing_baseline_and_managed_evidence_is_incomplete() {
     let fixture = RouteTestFixture::new("family-c-qualification-incomplete");
-    let suite_id = "family-c-qualification-incomplete";
     let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
-    persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 2, "legacy-session");
+    let suite_id = test_suite_id(&instance_id, "release_validation");
+    persist_family_c_suite_run(&fixture.state, &suite_id, &instance_id, 2, "legacy-session").await;
 
-    let payload = family_c_qualification_payload(&fixture.state, suite_id)
+    let payload = family_c_qualification_payload(&fixture.state, &suite_id)
         .await
         .expect("qualification payload");
 
@@ -1764,17 +1810,28 @@ async fn launch_route_online_auth_unready_returns_backend_notice_without_session
 #[tokio::test]
 async fn family_c_qualification_route_returns_ready_for_complete_suite() {
     let fixture = RouteTestFixture::new("family-c-qualification-ready-route");
-    let suite_id = "family-c-qualification-ready-route";
     let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+    let suite_id = test_suite_id(&instance_id, "release_validation");
     persist_family_c_suite_run(
-        &fixture.paths,
-        suite_id,
+        &fixture.state,
+        &suite_id,
         &instance_id,
         0,
         "baseline-session",
-    );
-    persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
-    let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
+    )
+    .await;
+    persist_family_c_suite_run(
+        &fixture.state,
+        &suite_id,
+        &instance_id,
+        1,
+        "managed-session",
+    )
+    .await;
+    let manifest = fixture
+        .state
+        .benchmark_suites()
+        .get(&suite_id)
         .expect("load suite")
         .expect("suite exists");
     let baseline_run = manifest
@@ -1906,6 +1963,9 @@ fn family_c_qualification_preview_payload_is_descriptor_only() {
     let payload = family_c_qualification_preview_payload().expect("family c qualification preview");
     let data = serde_json::to_string(&payload).expect("serialize payload");
     let lower_data = data.to_ascii_lowercase();
+    let plan = benchmark_suite_plan("release_validation").expect("release plan");
+    let baseline_benchmark_id = benchmark_suite_run_id("release_validation", 0, plan[0]);
+    let managed_benchmark_id = benchmark_suite_run_id("release_validation", 1, plan[1]);
 
     assert_eq!(payload["status"], serde_json::json!("incomplete"));
     assert_eq!(
@@ -1954,15 +2014,11 @@ fn family_c_qualification_preview_payload_is_descriptor_only() {
     );
     assert_eq!(
         payload["targets"][0]["suite_run"]["benchmark_id"],
-        serde_json::json!(
-            "suite-release_validation-00-family_c_forge_1_12_2_vanilla_baseline-coldish"
-        )
+        serde_json::json!(baseline_benchmark_id)
     );
     assert_eq!(
         payload["targets"][1]["suite_run"]["benchmark_id"],
-        serde_json::json!(
-            "suite-release_validation-01-family_c_forge_1_12_2_family_c_forge_core-coldish"
-        )
+        serde_json::json!(managed_benchmark_id)
     );
 
     assert!(data.len() < 4096);
@@ -1977,19 +2033,30 @@ fn family_c_qualification_preview_payload_is_descriptor_only() {
 }
 
 #[tokio::test]
-async fn family_c_qualification_wrong_suite_mode_is_incomplete() {
+async fn family_c_qualification_uses_committed_memory_not_external_manifest_rewrite() {
     let fixture = RouteTestFixture::new("family-c-qualification-wrong-mode");
-    let suite_id = "family-c-qualification-wrong-mode";
     let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+    let suite_id = test_suite_id(&instance_id, "release_validation");
     persist_family_c_suite_run(
-        &fixture.paths,
-        suite_id,
+        &fixture.state,
+        &suite_id,
         &instance_id,
         0,
         "baseline-session",
-    );
-    persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
-    let mut manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
+    )
+    .await;
+    persist_family_c_suite_run(
+        &fixture.state,
+        &suite_id,
+        &instance_id,
+        1,
+        "managed-session",
+    )
+    .await;
+    let mut manifest = fixture
+        .state
+        .benchmark_suites()
+        .get(&suite_id)
         .expect("load suite")
         .expect("suite exists");
     let baseline_run = manifest
@@ -2023,20 +2090,23 @@ async fn family_c_qualification_wrong_suite_mode_is_incomplete() {
     manifest.mode = "development".to_string();
     write_family_c_suite_manifest(&fixture.paths, &manifest);
 
-    let payload = family_c_qualification_payload(&fixture.state, suite_id)
+    let manifest_payload = benchmark_suite_manifest(&fixture.state, &suite_id)
+        .expect("manifest payload uses committed memory");
+    let payload = family_c_qualification_payload(&fixture.state, &suite_id)
         .await
         .expect("qualification payload");
 
-    assert_eq!(payload["status"], serde_json::json!("incomplete"));
-    assert_eq!(payload["suite"]["mode"], serde_json::json!("development"));
     assert_eq!(
-        payload["targets"][0]["missing"],
-        serde_json::json!(["suite_mode_mismatch"])
+        manifest_payload["mode"],
+        serde_json::json!("release_validation")
     );
+    assert_eq!(payload["status"], serde_json::json!("ready"));
     assert_eq!(
-        payload["targets"][1]["missing"],
-        serde_json::json!(["suite_mode_mismatch"])
+        payload["suite"]["mode"],
+        serde_json::json!("release_validation")
     );
+    assert_eq!(payload["targets"][0]["missing"], serde_json::json!([]));
+    assert_eq!(payload["targets"][1]["missing"], serde_json::json!([]));
 
     cleanup(&fixture.root);
 }
@@ -2044,17 +2114,28 @@ async fn family_c_qualification_wrong_suite_mode_is_incomplete() {
 #[tokio::test]
 async fn family_c_qualification_payload_excludes_sensitive_fields() {
     let fixture = RouteTestFixture::new("family-c-qualification-sensitive");
-    let suite_id = "family-c-qualification-sensitive";
     let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
+    let suite_id = test_suite_id(&instance_id, "release_validation");
     persist_family_c_suite_run(
-        &fixture.paths,
-        suite_id,
+        &fixture.state,
+        &suite_id,
         &instance_id,
         0,
         "baseline-session",
-    );
-    persist_family_c_suite_run(&fixture.paths, suite_id, &instance_id, 1, "managed-session");
-    let manifest = crate::state::benchmark_suites::load(&fixture.paths, suite_id)
+    )
+    .await;
+    persist_family_c_suite_run(
+        &fixture.state,
+        &suite_id,
+        &instance_id,
+        1,
+        "managed-session",
+    )
+    .await;
+    let manifest = fixture
+        .state
+        .benchmark_suites()
+        .get(&suite_id)
         .expect("load suite")
         .expect("suite exists");
     let baseline_run = manifest
@@ -2093,7 +2174,7 @@ async fn family_c_qualification_payload_excludes_sensitive_fields() {
     write_family_c_proof_record(&fixture.paths, &managed_proof);
     write_family_c_managed_state(&fixture, &instance_id);
 
-    let payload = family_c_qualification_payload(&fixture.state, suite_id)
+    let payload = family_c_qualification_payload(&fixture.state, &suite_id)
         .await
         .expect("qualification payload");
     let data = serde_json::to_string(&payload).expect("serialize payload");
@@ -2134,12 +2215,24 @@ fn benchmark_suite_request_accepts_or_derives_suite_id() {
         .into_suite_launch_input()
         .expect("derived suite id input");
 
-    assert!(explicit.suite_id.starts_with("chosen_suite-"));
-    assert!(derived.suite_id.starts_with("suite-instance-development-"));
+    let expected_explicit = crate::state::benchmark_suites::normalize_suite_id("../chosen suite")
+        .expect("normalized explicit suite id");
+    assert_eq!(explicit.suite_id, expected_explicit);
     assert_eq!(
         derived.suite_id,
         crate::state::benchmark_suites::derive_suite_id("instance", "development")
     );
+    for suite_id in [&explicit.suite_id, &derived.suite_id] {
+        assert!(suite_id.chars().count() < 48);
+        assert_eq!(
+            crate::state::benchmark_suites::normalize_suite_id(suite_id).as_deref(),
+            Some(suite_id.as_str())
+        );
+        assert!(!suite_id.contains("chosen"));
+        assert!(!suite_id.contains("instance"));
+        assert!(!suite_id.contains('/'));
+        assert!(!suite_id.contains(' '));
+    }
 }
 
 #[tokio::test]
@@ -2193,17 +2286,24 @@ async fn benchmark_suite_driver_start_status_normalizes_mode_and_clamps_interval
         payload["suite"]["mode"],
         serde_json::json!("release_validation")
     );
-    assert!(
-        payload["driver"]["suite_id"]
-            .as_str()
-            .expect("suite id")
-            .starts_with("driver_suite-")
+    let suite_id = payload["driver"]["suite_id"].as_str().expect("suite id");
+    let expected_suite_id = crate::state::benchmark_suites::normalize_suite_id("../driver suite")
+        .expect("normalized driver suite id");
+    assert_eq!(suite_id, expected_suite_id);
+    assert!(suite_id.chars().count() < 48);
+    assert_eq!(
+        crate::state::benchmark_suites::normalize_suite_id(suite_id).as_deref(),
+        Some(suite_id)
     );
+    assert!(!suite_id.contains("driver"));
+    assert!(!suite_id.contains('/'));
+    assert!(!suite_id.contains(' '));
 }
 
 #[tokio::test]
 async fn benchmark_suite_driver_duplicate_start_conflicts_until_terminal() {
     let store = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverStore::new();
+    let suite_id = test_suite_id("driver-duplicate", "development");
     let summary = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary {
         run_count: 2,
         launched_run_count: 0,
@@ -2211,7 +2311,7 @@ async fn benchmark_suite_driver_duplicate_start_conflicts_until_terminal() {
     };
     let first = store
         .start(
-            "suite-driver".to_string(),
+            suite_id.clone(),
             "development".to_string(),
             30_000,
             summary.clone(),
@@ -2221,7 +2321,7 @@ async fn benchmark_suite_driver_duplicate_start_conflicts_until_terminal() {
 
     let conflict = store
         .start(
-            "suite-driver".to_string(),
+            suite_id.clone(),
             "development".to_string(),
             30_000,
             summary.clone(),
@@ -2235,12 +2335,7 @@ async fn benchmark_suite_driver_duplicate_start_conflicts_until_terminal() {
         .expect("first driver stops");
     drop(first.effect_owner);
     store
-        .start(
-            "suite-driver".to_string(),
-            "development".to_string(),
-            30_000,
-            summary,
-        )
+        .start(suite_id, "development".to_string(), 30_000, summary)
         .await
         .expect("terminal driver no longer conflicts");
 }
@@ -2248,6 +2343,7 @@ async fn benchmark_suite_driver_duplicate_start_conflicts_until_terminal() {
 #[tokio::test]
 async fn benchmark_suite_driver_stop_reports_stopped_without_killing_sessions() {
     let store = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverStore::new();
+    let suite_id = test_suite_id("driver-stop", "development");
     let sessions = crate::state::SessionStore::new();
     sessions.insert(test_record("active-suite-session")).await;
     let summary = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary {
@@ -2256,12 +2352,7 @@ async fn benchmark_suite_driver_stop_reports_stopped_without_killing_sessions() 
         pending_run_index: Some(1),
     };
     let started = store
-        .start(
-            "suite-driver".to_string(),
-            "development".to_string(),
-            30_000,
-            summary,
-        )
+        .start(suite_id, "development".to_string(), 30_000, summary)
         .await
         .expect("driver starts");
 
@@ -2286,7 +2377,7 @@ async fn benchmark_suite_driver_list_payload_is_bounded_and_recent_first() {
     for index in 0..30 {
         let started = store
             .start(
-                format!("suite-driver-{index}"),
+                test_suite_id(&format!("driver-list-{index}"), "development"),
                 "development".to_string(),
                 30_000,
                 summary.clone(),
@@ -2362,6 +2453,7 @@ async fn benchmark_suite_driver_resume_missing_id_returns_404() {
 #[tokio::test]
 async fn benchmark_suite_driver_resume_rejects_non_terminal_driver() {
     let fixture = RouteTestFixture::new("driver-resume-active");
+    let suite_id = test_suite_id("driver-resume-active", "development");
     let summary = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary {
         run_count: 2,
         launched_run_count: 0,
@@ -2370,12 +2462,7 @@ async fn benchmark_suite_driver_resume_rejects_non_terminal_driver() {
     let started = fixture
         .state
         .benchmark_suite_drivers()
-        .start(
-            "suite-resume-active".to_string(),
-            "development".to_string(),
-            30_000,
-            summary,
-        )
+        .start(suite_id, "development".to_string(), 30_000, summary)
         .await
         .expect("driver starts");
 
@@ -2395,8 +2482,9 @@ async fn benchmark_suite_driver_resume_rejects_non_terminal_driver() {
 #[tokio::test]
 async fn benchmark_suite_driver_resume_missing_manifest_returns_404() {
     let fixture = RouteTestFixture::new("driver-resume-missing-manifest");
+    let suite_id = test_suite_id("driver-resume-missing-manifest", "development");
     let stopped = fixture
-        .stopped_driver("suite-resume-missing-manifest", "development", 30_000)
+        .stopped_driver(&suite_id, "development", 30_000)
         .await;
 
     let error = resume_benchmark_suite_driver(fixture.state.clone(), stopped.id)
@@ -2415,10 +2503,10 @@ async fn benchmark_suite_driver_resume_missing_manifest_returns_404() {
 #[tokio::test]
 async fn benchmark_suite_driver_resume_complete_manifest_conflicts() {
     let fixture = RouteTestFixture::new("driver-resume-complete-manifest");
-    let suite_id = "suite-resume-complete-manifest";
-    fixture.persist_suite_runs(suite_id, &[0, 1]);
+    let suite_id = test_suite_id("driver-resume-complete-manifest", "development");
+    fixture.persist_suite_runs(&suite_id, &[0, 1]).await;
     let stopped = fixture
-        .stopped_driver(suite_id, "development", 30_000)
+        .stopped_driver(&suite_id, "development", 30_000)
         .await;
 
     let error = resume_benchmark_suite_driver(fixture.state.clone(), stopped.id)
@@ -2437,15 +2525,15 @@ async fn benchmark_suite_driver_resume_complete_manifest_conflicts() {
 #[tokio::test]
 async fn benchmark_suite_driver_resume_starts_fresh_driver_from_terminal_record() {
     let fixture = RouteTestFixture::new("driver-resume-success");
-    let suite_id = "suite-resume-success";
-    fixture.persist_suite_runs(suite_id, &[0]);
+    let suite_id = test_suite_id("driver-resume-success", "development");
+    fixture.persist_suite_runs(&suite_id, &[0]).await;
     fixture
         .state
         .sessions()
         .insert(test_record("session-0"))
         .await;
     let stopped = fixture
-        .stopped_driver(suite_id, "development", 45_000)
+        .stopped_driver(&suite_id, "development", 45_000)
         .await;
 
     let payload = resume_benchmark_suite_driver(fixture.state.clone(), stopped.id.clone())
@@ -2482,9 +2570,11 @@ async fn benchmark_suite_driver_resume_starts_fresh_driver_from_terminal_record(
 #[tokio::test]
 async fn benchmark_suite_driver_startup_resume_starts_fresh_driver_from_restart_interruption() {
     let fixture = RouteTestFixture::new("driver-auto-resume-success");
-    let suite_id = "suite-auto-resume-success";
-    fixture.persist_suite_runs(suite_id, &[0]);
-    let interrupted = fixture.active_driver(suite_id, "development", 45_000).await;
+    let suite_id = test_suite_id("driver-auto-resume-success", "development");
+    fixture.persist_suite_runs(&suite_id, &[0]).await;
+    let interrupted = fixture
+        .active_driver(&suite_id, "development", 45_000)
+        .await;
     let reloaded = fixture.reload().await;
     reloaded
         .state
@@ -2543,8 +2633,9 @@ async fn benchmark_suite_driver_startup_resume_starts_fresh_driver_from_restart_
 #[tokio::test]
 async fn benchmark_suite_driver_startup_resume_missing_manifest_fails_boundedly() {
     let fixture = RouteTestFixture::new("driver-auto-resume-missing-manifest");
+    let suite_id = test_suite_id("driver-auto-resume-missing-manifest", "development");
     let interrupted = fixture
-        .active_driver("suite-auto-resume-missing-manifest", "development", 30_000)
+        .active_driver(&suite_id, "development", 30_000)
         .await;
     let reloaded = fixture.reload().await;
 
@@ -2578,9 +2669,11 @@ async fn benchmark_suite_driver_startup_resume_missing_manifest_fails_boundedly(
 #[tokio::test]
 async fn benchmark_suite_driver_startup_resume_complete_manifest_fails_boundedly() {
     let fixture = RouteTestFixture::new("driver-auto-resume-complete-manifest");
-    let suite_id = "suite-auto-resume-complete-manifest";
-    fixture.persist_suite_runs(suite_id, &[0, 1]);
-    let interrupted = fixture.active_driver(suite_id, "development", 30_000).await;
+    let suite_id = test_suite_id("driver-auto-resume-complete-manifest", "development");
+    fixture.persist_suite_runs(&suite_id, &[0, 1]).await;
+    let interrupted = fixture
+        .active_driver(&suite_id, "development", 30_000)
+        .await;
     let reloaded = fixture.reload().await;
 
     let summary = resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone())
@@ -2613,18 +2706,14 @@ async fn benchmark_suite_driver_startup_resume_complete_manifest_fails_boundedly
 #[tokio::test]
 async fn benchmark_suite_driver_error_status_payload_is_bounded_and_sanitized() {
     let store = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverStore::new();
+    let suite_id = test_suite_id("driver-error", "development");
     let summary = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary {
         run_count: 2,
         launched_run_count: 0,
         pending_run_index: Some(0),
     };
     let started = store
-        .start(
-            "suite-sensitive".to_string(),
-            "development".to_string(),
-            30_000,
-            summary,
-        )
+        .start(suite_id, "development".to_string(), 30_000, summary)
         .await
         .expect("driver starts");
     store
@@ -2654,9 +2743,10 @@ async fn benchmark_suite_driver_error_status_payload_is_bounded_and_sanitized() 
 #[tokio::test]
 async fn benchmark_suite_driver_response_defensively_redacts_tampered_fields() {
     let store = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverStore::new();
+    let suite_id = test_suite_id("driver-tampered", "development");
     let started = store
         .start(
-            "safe-suite".to_string(),
+            suite_id,
             "development".to_string(),
             30_000,
             crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary {
@@ -2748,58 +2838,11 @@ fn benchmark_suite_missing_lookup_error_uses_json_404() {
 }
 
 #[tokio::test]
-async fn benchmark_suite_auto_driver_conflicts_when_manifest_run_is_active() {
-    let store = crate::state::SessionStore::new();
-    store.insert(test_record("active-suite-session")).await;
-    let manifest = test_manifest(vec![
-        test_manifest_run(0, Some("missing-session")),
-        test_manifest_run(1, Some("active-suite-session")),
-    ]);
-
-    let error = ensure_no_active_benchmark_suite_auto_run(&store, Some(&manifest), true)
-        .await
-        .expect_err("active suite session should conflict");
-
-    assert_eq!(error.0, StatusCode::CONFLICT);
-    assert_eq!(
-        error.1.0,
-        serde_json::json!({ "error": "benchmark suite has active run" })
-    );
-}
-
-#[tokio::test]
-async fn benchmark_suite_auto_driver_ignores_missing_terminal_and_explicit_runs() {
-    let store = crate::state::SessionStore::new();
-    let mut failed = test_record("failed-suite-session");
-    failed.state = LaunchState::Failed;
-    store.insert(failed).await;
-    let mut exited = test_record("exited-suite-session");
-    exited.state = LaunchState::Exited;
-    store.insert(exited).await;
-    store.insert(test_record("active-suite-session")).await;
-    let terminal_manifest = test_manifest(vec![
-        test_manifest_run(0, Some("missing-session")),
-        test_manifest_run(1, Some("failed-suite-session")),
-        test_manifest_run(2, Some("exited-suite-session")),
-    ]);
-    let active_manifest = test_manifest(vec![test_manifest_run(0, Some("active-suite-session"))]);
-
-    ensure_no_active_benchmark_suite_auto_run(&store, None, true)
-        .await
-        .expect("missing manifest should not block");
-    ensure_no_active_benchmark_suite_auto_run(&store, Some(&terminal_manifest), true)
-        .await
-        .expect("missing and terminal sessions should not block");
-    ensure_no_active_benchmark_suite_auto_run(&store, Some(&active_manifest), false)
-        .await
-        .expect("explicit run_index path should bypass active auto-driver guard");
-}
-
-#[tokio::test]
 async fn benchmark_suite_tick_active_returns_non_error_without_launching() {
     let store = crate::state::SessionStore::new();
     store.insert(test_record("active-suite-session")).await;
     let plan = benchmark_suite_plan("development").expect("development plan");
+    let suite_id = test_suite_id("tick-active", "development");
     let input = BenchmarkSuitePlanInput {
         launch: launch_app::LaunchRequest {
             instance_id: "instance".to_string(),
@@ -2808,13 +2851,13 @@ async fn benchmark_suite_tick_active_returns_non_error_without_launching() {
             min_memory_mb: None,
             client_started_at_ms: None,
         },
-        suite_id: "suite-test".to_string(),
+        suite_id: suite_id.clone(),
         mode: "development".to_string(),
         plan,
-        manifest: Some(test_manifest(vec![test_manifest_run(
-            0,
-            Some("active-suite-session"),
-        )])),
+        manifest: Some(test_manifest(
+            &suite_id,
+            vec![test_manifest_run(0, Some("active-suite-session"))],
+        )),
     };
 
     let decision = benchmark_suite_driver_decision(&store, input)
@@ -2827,7 +2870,7 @@ async fn benchmark_suite_tick_active_returns_non_error_without_launching() {
             active_session_id,
         } => {
             assert_eq!(active_session_id, "active-suite-session");
-            assert_eq!(suite["suite_id"], "suite-test");
+            assert_eq!(suite["suite_id"], suite_id);
             assert_eq!(suite["pending_run_index"], serde_json::json!(1));
         }
         BenchmarkSuiteDriverDecision::Complete { .. } | BenchmarkSuiteDriverDecision::Launch(_) => {
@@ -2840,6 +2883,7 @@ async fn benchmark_suite_tick_active_returns_non_error_without_launching() {
 async fn benchmark_suite_tick_complete_returns_non_error_without_launching() {
     let store = crate::state::SessionStore::new();
     let plan = benchmark_suite_plan("development").expect("development plan");
+    let suite_id = test_suite_id("tick-complete", "development");
     let input = BenchmarkSuitePlanInput {
         launch: launch_app::LaunchRequest {
             instance_id: "instance".to_string(),
@@ -2848,13 +2892,16 @@ async fn benchmark_suite_tick_complete_returns_non_error_without_launching() {
             min_memory_mb: None,
             client_started_at_ms: None,
         },
-        suite_id: "suite-test".to_string(),
+        suite_id: suite_id.clone(),
         mode: "development".to_string(),
         plan,
-        manifest: Some(test_manifest(vec![
-            test_manifest_run(0, Some("session-0")),
-            test_manifest_run(1, Some("session-1")),
-        ])),
+        manifest: Some(test_manifest(
+            &suite_id,
+            vec![
+                test_manifest_run(0, Some("session-0")),
+                test_manifest_run(1, Some("session-1")),
+            ],
+        )),
     };
 
     let decision = benchmark_suite_driver_decision(&store, input)
@@ -2863,7 +2910,7 @@ async fn benchmark_suite_tick_complete_returns_non_error_without_launching() {
 
     match decision {
         BenchmarkSuiteDriverDecision::Complete { suite } => {
-            assert_eq!(suite["suite_id"], "suite-test");
+            assert_eq!(suite["suite_id"], suite_id);
             assert_eq!(suite["pending_run_index"], serde_json::Value::Null);
             assert_eq!(suite["launched_run_count"], serde_json::json!(2));
         }
@@ -2876,14 +2923,13 @@ async fn benchmark_suite_tick_complete_returns_non_error_without_launching() {
 #[tokio::test]
 async fn benchmark_suite_tick_selects_next_unlaunched_manifest_run() {
     let store = crate::state::SessionStore::new();
-    let root = test_root("suite-tick-pending");
-    let paths = test_paths(&root);
-    let suite_id = "suite-tick-pending";
+    let suite_store = crate::state::benchmark_suites::BenchmarkSuiteStore::new();
+    let suite_id = test_suite_id("tick-pending", "development");
     let plan = benchmark_suite_plan("development").expect("development plan");
     let manifest_runs = benchmark_suite_manifest_run_inputs("development", &plan);
-    crate::state::benchmark_suites::persist_launched_run(
-        &paths,
-        suite_id,
+    persist_suite_run(
+        &suite_store,
+        &suite_id,
         "instance",
         "development",
         &manifest_runs,
@@ -2891,15 +2937,16 @@ async fn benchmark_suite_tick_selects_next_unlaunched_manifest_run() {
         "session-0",
         "2026-01-01T00:00:00.000Z",
     )
+    .await
     .expect("persist launched run");
     let request: BenchmarkLaunchRequest = serde_json::from_value(serde_json::json!({
         "instance_id": "instance",
         "suite_mode": "development",
-        "suite_id": suite_id
+        "suite_id": &suite_id
     }))
     .expect("deserialize suite tick request");
     let input = request
-        .into_suite_plan_input_with_manifest(Some(&paths))
+        .into_suite_plan_input_with_manifest(Some(&suite_store))
         .expect("suite input should parse");
 
     let decision = benchmark_suite_driver_decision(&store, input)
@@ -2908,7 +2955,7 @@ async fn benchmark_suite_tick_selects_next_unlaunched_manifest_run() {
 
     match decision {
         BenchmarkSuiteDriverDecision::Launch(input) => {
-            assert_eq!(input.run_index, 1);
+            assert_eq!(input.requested_run_index, None);
             assert_eq!(input.suite_id, suite_id);
         }
         BenchmarkSuiteDriverDecision::Active { .. }
@@ -2916,23 +2963,21 @@ async fn benchmark_suite_tick_selects_next_unlaunched_manifest_run() {
             panic!("pending manifest should launch next run")
         }
     }
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn benchmark_suite_tick_without_manifest_starts_first_run() {
     let store = crate::state::SessionStore::new();
-    let root = test_root("suite-tick-no-manifest");
-    let paths = test_paths(&root);
+    let suite_store = crate::state::benchmark_suites::BenchmarkSuiteStore::new();
+    let suite_id = test_suite_id("tick-no-manifest", "development");
     let request: BenchmarkLaunchRequest = serde_json::from_value(serde_json::json!({
         "instance_id": "instance",
         "suite_mode": "development",
-        "suite_id": "suite-tick-no-manifest"
+        "suite_id": &suite_id
     }))
     .expect("deserialize suite tick request");
     let input = request
-        .into_suite_plan_input_with_manifest(Some(&paths))
+        .into_suite_plan_input_with_manifest(Some(&suite_store))
         .expect("suite input should parse");
 
     let decision = benchmark_suite_driver_decision(&store, input)
@@ -2941,7 +2986,7 @@ async fn benchmark_suite_tick_without_manifest_starts_first_run() {
 
     match decision {
         BenchmarkSuiteDriverDecision::Launch(input) => {
-            assert_eq!(input.run_index, 0);
+            assert_eq!(input.requested_run_index, None);
             assert_eq!(input.plan.len(), 2);
         }
         BenchmarkSuiteDriverDecision::Active { .. }
@@ -2949,19 +2994,18 @@ async fn benchmark_suite_tick_without_manifest_starts_first_run() {
             panic!("missing manifest should launch first run")
         }
     }
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn benchmark_suite_tick_status_payload_excludes_sensitive_fields() {
     let plan = benchmark_suite_plan("development").expect("development plan");
-    let manifest = test_manifest(vec![test_manifest_run(0, Some("session-0"))]);
+    let suite_id = test_suite_id("tick-status-sensitive", "development");
+    let manifest = test_manifest(&suite_id, vec![test_manifest_run(0, Some("session-0"))]);
     let payload = serde_json::json!({
         "status": "active",
         "driver": { "state": "active" },
         "suite": benchmark_suite_driver_status_payload(
-            "suite-sensitive",
+            &suite_id,
             "development",
             &plan,
             Some(&manifest),
@@ -2997,9 +3041,10 @@ fn benchmark_suite_metadata_has_no_sensitive_request_fields() {
     let input = request
         .into_suite_launch_input()
         .expect("suite input should parse");
-    let selected = input.plan[input.run_index];
+    let run_index = input.requested_run_index.expect("explicit run index");
+    let selected = input.plan[run_index];
     let benchmark = crate::state::launch_reports::LaunchBenchmarkMetadata::new(
-        Some(benchmark_suite_run_id(&input.mode, input.run_index, selected).as_str()),
+        Some(benchmark_suite_run_id(&input.mode, run_index, selected).as_str()),
         Some(selected.profile),
         Some(selected.run_type),
         Some(input.mode.as_str()),
@@ -3009,7 +3054,7 @@ fn benchmark_suite_metadata_has_no_sensitive_request_fields() {
         "suite": benchmark_suite_status_payload(
             &input.suite_id,
             &input.mode,
-            input.run_index,
+            run_index,
             &input.plan
         ),
     });
@@ -3291,6 +3336,11 @@ impl RouteTestFixture {
             .await
             .expect("close account store before reload");
         self.state
+            .benchmark_suites()
+            .close()
+            .await
+            .expect("close benchmark suite store before reload");
+        self.state
             .benchmark_suite_drivers()
             .close()
             .await
@@ -3488,12 +3538,12 @@ impl RouteTestFixture {
             .expect("stopped driver status")
     }
 
-    fn persist_suite_runs(&self, suite_id: &str, launched_run_indexes: &[usize]) {
+    async fn persist_suite_runs(&self, suite_id: &str, launched_run_indexes: &[usize]) {
         let plan = benchmark_suite_plan("development").expect("development plan");
         let manifest_runs = benchmark_suite_manifest_run_inputs("development", &plan);
         for run_index in launched_run_indexes {
-            crate::state::benchmark_suites::persist_launched_run(
-                &self.paths,
+            persist_suite_run(
+                self.state.benchmark_suites(),
                 suite_id,
                 "instance",
                 "development",
@@ -3502,6 +3552,7 @@ impl RouteTestFixture {
                 &format!("session-{run_index}"),
                 "2026-01-01T00:00:00.000Z",
             )
+            .await
             .expect("persist launched suite run");
         }
     }
@@ -3531,6 +3582,10 @@ fn cleanup(root: &Path) {
     let _ = std::fs::remove_dir_all(root);
 }
 
+fn test_suite_id(identity: &str, mode: &str) -> String {
+    crate::state::benchmark_suites::derive_suite_id(identity, mode)
+}
+
 #[cfg(unix)]
 fn make_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -3543,8 +3598,8 @@ fn make_executable(path: &Path) {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) {}
 
-fn persist_family_c_suite_run(
-    paths: &AppPaths,
+async fn persist_family_c_suite_run(
+    state: &AppState,
     suite_id: &str,
     instance_id: &str,
     run_index: usize,
@@ -3552,8 +3607,8 @@ fn persist_family_c_suite_run(
 ) {
     let plan = benchmark_suite_plan("release_validation").expect("release plan");
     let manifest_runs = benchmark_suite_manifest_run_inputs("release_validation", &plan);
-    crate::state::benchmark_suites::persist_launched_run(
-        paths,
+    persist_suite_run(
+        state.benchmark_suites(),
         suite_id,
         instance_id,
         "release_validation",
@@ -3562,7 +3617,32 @@ fn persist_family_c_suite_run(
         session_id,
         "2026-01-01T00:00:00.000Z",
     )
+    .await
     .expect("persist launched family c suite run");
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_suite_run(
+    store: &crate::state::benchmark_suites::BenchmarkSuiteStore,
+    suite_id: &str,
+    instance_id: &str,
+    mode: &str,
+    plan: &[crate::state::benchmark_suites::BenchmarkSuiteRunInput],
+    run_index: usize,
+    session_id: &str,
+    launched_at: &str,
+) -> Result<
+    crate::state::benchmark_suites::BenchmarkSuiteManifest,
+    crate::state::benchmark_suites::BenchmarkSuiteReserveError,
+> {
+    let selection = store
+        .select_reservation(suite_id, instance_id, mode, plan, Some(run_index))
+        .await
+        .map_err(crate::state::benchmark_suites::BenchmarkSuiteReserveError::PreAccept)?;
+    store
+        .reserve(selection, session_id, launched_at, false)
+        .await
+        .map(|reservation| reservation.manifest)
 }
 
 fn write_family_c_suite_manifest(
@@ -3757,12 +3837,13 @@ fn family_c_resource_budget() -> crate::state::launch_reports::LaunchProofResour
 }
 
 fn test_manifest(
+    suite_id: &str,
     runs: Vec<crate::state::benchmark_suites::BenchmarkSuiteManifestRun>,
 ) -> crate::state::benchmark_suites::BenchmarkSuiteManifest {
     crate::state::benchmark_suites::BenchmarkSuiteManifest {
         schema: "axial.launch.benchmark.suite".to_string(),
         schema_version: 2,
-        suite_id: "suite-test".to_string(),
+        suite_id: suite_id.to_string(),
         instance_id: "instance".to_string(),
         mode: "development".to_string(),
         created_at: "2026-01-01T00:00:00.000Z".to_string(),
@@ -3775,12 +3856,14 @@ fn test_manifest_run(
     run_index: usize,
     session_id: Option<&str>,
 ) -> crate::state::benchmark_suites::BenchmarkSuiteManifestRun {
+    let plan = benchmark_suite_plan("development").expect("development plan");
+    let run = plan.get(run_index).copied().expect("planned run index");
     crate::state::benchmark_suites::BenchmarkSuiteManifestRun {
         run_index,
-        profile: "vanilla_baseline".to_string(),
-        run_type: "coldish".to_string(),
-        target_id: String::new(),
-        benchmark_id: format!("suite-development-{run_index:02}-vanilla_baseline-coldish"),
+        profile: run.profile.to_string(),
+        run_type: run.run_type.to_string(),
+        target_id: run.target_id.unwrap_or_default().to_string(),
+        benchmark_id: benchmark_suite_run_id("development", run_index, run),
         session_id: session_id.map(str::to_string),
         launched_at: session_id.map(|_| "2026-01-01T00:00:00.000Z".to_string()),
         state: if session_id.is_some() {
@@ -3818,6 +3901,40 @@ fn raw_benchmark_suite_storage_io_error() -> std::io::Error {
         std::io::ErrorKind::PermissionDenied,
         "failed to load benchmark suite manifest family-c-1-12-2 from /home/alice/.axial/benchmark-suites/family-c-1-12-2.json and C:\\Users\\Alice\\AppData\\Roaming\\Axial\\benchmark-suites\\suite-release_validation-00-family_c_forge.json: Permission denied (os error 13)",
     )
+}
+
+struct FailOnceBenchmarkSuiteBackend {
+    failures: AtomicUsize,
+}
+
+impl FailOnceBenchmarkSuiteBackend {
+    fn new() -> Self {
+        Self {
+            failures: AtomicUsize::new(1),
+        }
+    }
+}
+
+impl AtomicWriteBackend for FailOnceBenchmarkSuiteBackend {
+    fn write(
+        &self,
+        target: &TargetDescriptor,
+        destination: &Path,
+        contents: &[u8],
+    ) -> std::io::Result<()> {
+        if self
+            .failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(raw_benchmark_suite_storage_io_error());
+        }
+        write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
+            .map(|_| ())
+            .map_err(std::io::Error::from)
+    }
 }
 
 fn assert_public_error_excludes_raw_launch_control_fragments(

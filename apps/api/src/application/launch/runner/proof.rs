@@ -30,29 +30,28 @@ pub(super) async fn persist_launch_proof_best_effort_with_context(
         outcome,
         proof_context,
     ) {
-        Ok(_) => {
-            trace_launch_event(session_id, "launch proof persisted");
-            if let Err(error) = crate::state::benchmark_suites::update_run_state_for_session(
-                state.config().paths(),
-                session_id,
-                outcome,
-            ) {
-                trace_launch_event(
-                    session_id,
-                    &format!("benchmark suite manifest state update failed: {error}"),
-                );
-            }
-        }
-        Err(error) => trace_launch_event(
-            session_id,
-            &format!("launch proof persistence failed: {error}"),
-        ),
+        Ok(_) => trace_launch_event(session_id, "launch proof persisted"),
+        Err(_) => trace_launch_event(session_id, "launch proof persistence failed"),
+    }
+    if let Err(error) = state
+        .benchmark_suites()
+        .update_run_state_for_session(session_id, outcome)
+        .await
+    {
+        tracing::warn!(
+            error_class = error.class(),
+            "benchmark suite outcome persistence failed"
+        );
+        trace_launch_event(session_id, "benchmark suite outcome persistence failed");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::performance::{
+        benchmark_suite_manifest_run_inputs, benchmark_suite_plan,
+    };
     use crate::execution::launch::{
         LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
     };
@@ -96,25 +95,19 @@ mod tests {
             .record_stage_evidence(session_id, launch_command_stage_evidence(&prepared.facts))
             .await;
 
-        let suite_id = "launch-proof-persistence-suite";
-        let plan = vec![crate::state::benchmark_suites::BenchmarkSuiteRunInput {
-            run_index: 0,
-            profile: "managed_default".to_string(),
-            run_type: "coldish".to_string(),
-            target_id: Some("managed_default".to_string()),
-            benchmark_id: "launch-proof-benchmark".to_string(),
-        }];
-        crate::state::benchmark_suites::persist_launched_run(
-            state.config().paths(),
-            suite_id,
-            "instance",
-            "development",
-            &plan,
-            0,
-            session_id,
-            "2026-01-01T00:00:00.000Z",
-        )
-        .expect("persist benchmark suite run");
+        let instance_id = "instance";
+        let suite_id = crate::state::benchmark_suites::derive_suite_id(instance_id, "development");
+        let plan = development_suite_plan();
+        let selection = state
+            .benchmark_suites()
+            .select_reservation(&suite_id, instance_id, "development", &plan, Some(0))
+            .await
+            .expect("select benchmark suite run");
+        state
+            .benchmark_suites()
+            .reserve(selection, session_id, "2026-01-01T00:00:00.000Z", false)
+            .await
+            .expect("persist benchmark suite run");
 
         persist_launch_proof_best_effort(&state, session_id, None, "running").await;
 
@@ -126,13 +119,61 @@ mod tests {
         assert!(proof_json.contains("arg_count:3"));
         assert_no_sensitive_stage_evidence(&proof_json);
 
-        let manifest = crate::state::benchmark_suites::load(state.config().paths(), suite_id)
+        let manifest = state
+            .benchmark_suites()
+            .get(&suite_id)
             .expect("load suite")
             .expect("suite exists");
         assert_eq!(manifest.runs[0].session_id.as_deref(), Some(session_id));
         assert_eq!(manifest.runs[0].state, "running");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn benchmark_outcome_commits_even_when_launch_proof_write_fails() {
+        let root = unique_test_dir("launch-proof-failure-suite-outcome");
+        let state = test_app_state(&root);
+        let session_id = "launch-proof-failure-suite-outcome";
+        state.sessions().insert(test_record(session_id)).await;
+        let instance_id = "instance";
+        let suite_id = crate::state::benchmark_suites::derive_suite_id(instance_id, "development");
+        let plan = development_suite_plan();
+        let selection = state
+            .benchmark_suites()
+            .select_reservation(&suite_id, instance_id, "development", &plan, Some(0))
+            .await
+            .expect("select benchmark suite run");
+        state
+            .benchmark_suites()
+            .reserve(selection, session_id, "2026-01-01T00:00:00.000Z", false)
+            .await
+            .expect("persist benchmark suite run");
+        let report_dir = state
+            .config()
+            .paths()
+            .config_dir
+            .join("benchmarks")
+            .join("launch");
+        fs::create_dir_all(report_dir.parent().expect("report parent"))
+            .expect("create report parent");
+        fs::write(&report_dir, b"not a directory").expect("block report directory");
+
+        persist_launch_proof_best_effort(&state, session_id, None, "running").await;
+
+        let manifest = state
+            .benchmark_suites()
+            .get(&suite_id)
+            .expect("read committed suite")
+            .expect("suite exists");
+        assert_eq!(manifest.runs[0].state, "running");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn development_suite_plan() -> Vec<crate::state::benchmark_suites::BenchmarkSuiteRunInput> {
+        let plan = benchmark_suite_plan("development").expect("development benchmark suite plan");
+        benchmark_suite_manifest_run_inputs("development", &plan)
     }
 
     fn test_app_state(root: &Path) -> AppState {

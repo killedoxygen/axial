@@ -68,6 +68,7 @@ pub struct AppState {
     journals: Arc<OperationJournalStore>,
     sessions: Arc<SessionStore>,
     skins: Arc<skins::SavedSkinStore>,
+    benchmark_suites: Arc<benchmark_suites::BenchmarkSuiteStore>,
     benchmark_suite_drivers: Arc<benchmark_suite_drivers::BenchmarkSuiteDriverStore>,
     performance_operations: Arc<performance_operations::PerformanceOperationStore>,
     performance: Arc<PerformanceManager>,
@@ -121,8 +122,20 @@ impl AppState {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_benchmark_suites(
+        mut self,
+        benchmark_suites: Arc<benchmark_suites::BenchmarkSuiteStore>,
+    ) -> Self {
+        self.benchmark_suites = benchmark_suites;
+        self
+    }
+
     fn new_with_telemetry_inner(init: AppStateInit, telemetry: Arc<TelemetryHub>) -> Self {
         let library_dir = init.config.current().library_dir;
+        let benchmark_suites = Arc::new(benchmark_suites::BenchmarkSuiteStore::load_from_paths(
+            init.config.paths(),
+        ));
         let benchmark_suite_drivers = Arc::new(
             benchmark_suite_drivers::BenchmarkSuiteDriverStore::load_from_paths(
                 init.config.paths(),
@@ -154,6 +167,7 @@ impl AppState {
             journals,
             sessions: init.sessions,
             skins,
+            benchmark_suites,
             benchmark_suite_drivers,
             performance_operations,
             performance: init.performance,
@@ -208,6 +222,10 @@ impl AppState {
         &self,
     ) -> &Arc<benchmark_suite_drivers::BenchmarkSuiteDriverStore> {
         &self.benchmark_suite_drivers
+    }
+
+    pub fn benchmark_suites(&self) -> &Arc<benchmark_suites::BenchmarkSuiteStore> {
+        &self.benchmark_suites
     }
 
     pub fn performance_operations(

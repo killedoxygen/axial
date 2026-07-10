@@ -7,8 +7,8 @@ use crate::state::benchmark_suite_drivers::{
     BenchmarkSuiteDriverStartError, BenchmarkSuiteDriverStoreError,
 };
 use crate::state::launch_reports::LaunchProofContext;
-use crate::state::{AppState, LaunchStatusEvent};
-use axial_launcher::{LaunchStageEvidence, LaunchState};
+use crate::state::{AppState, LaunchEvent, LaunchStatusEvent};
+use axial_launcher::{LaunchSessionOutcomeKind, LaunchStageEvidence, LaunchState};
 use axum::Json;
 use axum::http::StatusCode;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -63,8 +63,14 @@ pub(crate) struct BenchmarkSuiteLaunchInput {
     pub(crate) launch: super::LaunchRequest,
     pub(crate) suite_id: String,
     pub(crate) mode: String,
-    pub(crate) run_index: usize,
+    pub(crate) requested_run_index: Option<usize>,
     pub(crate) plan: Vec<BenchmarkSuiteRunSpec>,
+}
+
+#[derive(Debug)]
+struct BenchmarkSuiteOwnedLaunch {
+    payload: serde_json::Value,
+    run_index: usize,
 }
 
 #[derive(Debug)]
@@ -211,48 +217,26 @@ impl BenchmarkLaunchRequest {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn into_suite_launch_input(
         self,
     ) -> Result<BenchmarkSuiteLaunchInput, (StatusCode, Json<serde_json::Value>)> {
-        self.into_suite_launch_input_with_manifest(None)
-    }
-
-    pub(crate) fn into_suite_launch_input_with_manifest(
-        self,
-        paths: Option<&axial_config::AppPaths>,
-    ) -> Result<BenchmarkSuiteLaunchInput, (StatusCode, Json<serde_json::Value>)> {
         let requested_run_index = self.run_index;
-        let manifest_paths = if requested_run_index.is_none() {
-            paths
-        } else {
-            None
-        };
-        let input = self.into_suite_plan_input_with_manifest(manifest_paths)?;
-        let run_index = match requested_run_index {
-            Some(run_index) => validate_benchmark_suite_run_index(run_index, input.plan.len())?,
-            None => match paths {
-                Some(_) => crate::state::benchmark_suites::next_pending_run_index(
-                    input.manifest.as_ref(),
-                    input.plan.len(),
-                )
-                .ok_or_else(benchmark_suite_complete_error)?,
-                None => validate_benchmark_suite_run_index(0, input.plan.len())?,
-            },
-        };
+        let input = self.into_suite_plan_input_with_manifest(None)?;
 
         Ok(BenchmarkSuiteLaunchInput {
             launch: input.launch,
             suite_id: input.suite_id,
             mode: input.mode,
-            run_index,
+            requested_run_index: requested_run_index
+                .map(|run_index| validate_benchmark_suite_run_index(run_index, input.plan.len()))
+                .transpose()?,
             plan: input.plan,
         })
     }
 
     pub(crate) fn into_suite_plan_input_with_manifest(
         self,
-        paths: Option<&axial_config::AppPaths>,
+        store: Option<&crate::state::benchmark_suites::BenchmarkSuiteStore>,
     ) -> Result<BenchmarkSuitePlanInput, (StatusCode, Json<serde_json::Value>)> {
         if self
             .benchmark_mode
@@ -278,9 +262,10 @@ impl BenchmarkLaunchRequest {
             });
         let plan =
             performance::benchmark_suite_plan(&mode).ok_or_else(unsupported_suite_mode_error)?;
-        let manifest = match paths {
-            Some(paths) => crate::state::benchmark_suites::load(paths, &suite_id)
-                .map_err(benchmark_suite_storage_error_response)?,
+        let manifest = match store {
+            Some(store) => store
+                .get(&suite_id)
+                .map_err(benchmark_suite_store_error_response)?,
             None => None,
         };
 
@@ -344,30 +329,7 @@ pub(crate) async fn launch_benchmark_suite(
     state: AppState,
     payload: BenchmarkLaunchRequest,
 ) -> Result<serde_json::Value, LaunchApplicationError> {
-    let auto_next_run = payload.run_index.is_none();
-    if auto_next_run {
-        let launch = payload.launch_request()?;
-        let mode = benchmark_suite_mode_or_default(payload.suite_mode.as_deref())?;
-        let _ =
-            performance::benchmark_suite_plan(&mode).ok_or_else(unsupported_suite_mode_error)?;
-        let suite_id = payload
-            .suite_id
-            .as_deref()
-            .and_then(crate::state::benchmark_suites::normalize_suite_id)
-            .unwrap_or_else(|| {
-                crate::state::benchmark_suites::derive_suite_id(&launch.instance_id, &mode)
-            });
-        let manifest = crate::state::benchmark_suites::load(state.config().paths(), &suite_id)
-            .map_err(benchmark_suite_storage_error_response)?;
-        ensure_no_active_benchmark_suite_auto_run(
-            state.sessions().as_ref(),
-            manifest.as_ref(),
-            auto_next_run,
-        )
-        .await?;
-    }
-
-    let input = payload.into_suite_launch_input_with_manifest(Some(state.config().paths()))?;
+    let input = payload.into_suite_launch_input()?;
     launch_benchmark_suite_run(state, input).await
 }
 
@@ -375,7 +337,7 @@ pub(crate) async fn tick_benchmark_suite(
     state: AppState,
     payload: BenchmarkLaunchRequest,
 ) -> Result<serde_json::Value, LaunchApplicationError> {
-    let input = payload.into_suite_plan_input_with_manifest(Some(state.config().paths()))?;
+    let input = payload.into_suite_plan_input_with_manifest(Some(state.benchmark_suites()))?;
     match benchmark_suite_driver_decision(state.sessions().as_ref(), input).await? {
         BenchmarkSuiteDriverDecision::Active {
             suite,
@@ -406,7 +368,7 @@ pub(crate) async fn start_benchmark_suite_driver(
     let interval_ms = clamp_benchmark_suite_driver_interval_ms(payload.interval_ms);
     let input = payload
         .clone()
-        .into_suite_plan_input_with_manifest(Some(state.config().paths()))?;
+        .into_suite_plan_input_with_manifest(Some(state.benchmark_suites()))?;
     let summary = benchmark_suite_driver_suite_summary(&input);
     if summary.pending_run_index.is_none() {
         return Err(benchmark_suite_complete_error());
@@ -480,8 +442,10 @@ pub(crate) fn benchmark_suite_manifest(
     state: &AppState,
     id: &str,
 ) -> Result<serde_json::Value, LaunchApplicationError> {
-    let manifest = crate::state::benchmark_suites::load(state.config().paths(), id)
-        .map_err(benchmark_suite_storage_error_response)?
+    let manifest = state
+        .benchmark_suites()
+        .get(id)
+        .map_err(benchmark_suite_store_error_response)?
         .ok_or_else(benchmark_suite_not_found_error)?;
 
     Ok(json!(manifest))
@@ -538,8 +502,10 @@ async fn prepare_benchmark_suite_driver_resume(
         return Err(benchmark_suite_driver_already_active_error());
     }
 
-    let manifest = crate::state::benchmark_suites::load(state.config().paths(), &status.suite_id)
-        .map_err(benchmark_suite_storage_error_response)?
+    let manifest = state
+        .benchmark_suites()
+        .get(&status.suite_id)
+        .map_err(benchmark_suite_store_error_response)?
         .ok_or_else(benchmark_suite_not_found_error)?;
     // Prefer persisted driver identity, then manifest identity, then a derived fallback.
     let suite_id = crate::state::benchmark_suites::normalize_suite_id(&status.suite_id)
@@ -570,7 +536,7 @@ async fn prepare_benchmark_suite_driver_resume(
     };
     let input = payload
         .clone()
-        .into_suite_plan_input_with_manifest(Some(state.config().paths()))?;
+        .into_suite_plan_input_with_manifest(Some(state.benchmark_suites()))?;
     let summary = benchmark_suite_driver_suite_summary(&input);
     if summary.pending_run_index.is_none() {
         return Err(benchmark_suite_complete_error());
@@ -639,16 +605,37 @@ pub(crate) async fn launch_benchmark_suite_run(
     state: AppState,
     input: BenchmarkSuiteLaunchInput,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    launch_benchmark_suite_run_owned(state, input)
+        .await
+        .map(|launched| launched.payload)
+}
+
+async fn launch_benchmark_suite_run_owned(
+    state: AppState,
+    input: BenchmarkSuiteLaunchInput,
+) -> Result<BenchmarkSuiteOwnedLaunch, (StatusCode, Json<serde_json::Value>)> {
     let BenchmarkSuiteLaunchInput {
         launch,
         suite_id,
         mode,
-        run_index,
+        requested_run_index,
         plan,
     } = input;
+    let manifest_runs = benchmark_suite_manifest_run_inputs(&mode, &plan);
+    let selection = state
+        .benchmark_suites()
+        .select_reservation(
+            &suite_id,
+            &launch.instance_id,
+            &mode,
+            &manifest_runs,
+            requested_run_index,
+        )
+        .await
+        .map_err(benchmark_suite_store_error_response)?;
+    let run_index = selection.run_index();
     let selected = plan[run_index];
     let benchmark_id = benchmark_suite_run_id(&mode, run_index, selected);
-    let mut prepared = super::prepare_launch_session(&state, launch).await?;
     let benchmark = crate::state::launch_reports::LaunchBenchmarkMetadata::new(
         Some(benchmark_id.as_str()),
         Some(selected.profile),
@@ -657,35 +644,186 @@ pub(crate) async fn launch_benchmark_suite_run(
     );
     let benchmark_response = super::launch_benchmark_status_payload(&benchmark);
     let suite_response = benchmark_suite_status_payload(&suite_id, &mode, run_index, &plan);
-    prepared.task.benchmark = Some(benchmark.clone());
-    let reservation = persist_benchmark_suite_run_reservation(
-        state.config().paths(),
-        &suite_id,
-        &mode,
-        &plan,
-        run_index,
-        &prepared.task.intent.instance_id,
-        &prepared.task.intent.session_id,
-        &prepared.task.launched_at,
-    );
-    if let Err(error) = reservation {
-        finish_benchmark_suite_reservation_failure(&state, &prepared.task, benchmark).await;
-        return Err(error);
-    }
-    let launched = super::launch_session(state.clone(), prepared.task)
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        own_benchmark_suite_launch(
+            state,
+            OwnedBenchmarkSuiteLaunchInput {
+                launch,
+                selection,
+                run_index,
+                benchmark,
+                benchmark_response,
+                suite_response,
+            },
+            result_tx,
+        )
+        .await;
+    });
+
+    result_rx
         .await
-        .map_err(super::launch_request_error_response)?;
+        .unwrap_or_else(|_| Err(benchmark_suite_storage_error_response()))
+}
+
+struct OwnedBenchmarkSuiteLaunchInput {
+    launch: super::LaunchRequest,
+    selection: crate::state::benchmark_suites::BenchmarkSuiteSelection,
+    run_index: usize,
+    benchmark: crate::state::launch_reports::LaunchBenchmarkMetadata,
+    benchmark_response: serde_json::Value,
+    suite_response: serde_json::Value,
+}
+
+async fn own_benchmark_suite_launch(
+    state: AppState,
+    input: OwnedBenchmarkSuiteLaunchInput,
+    result_tx: tokio::sync::oneshot::Sender<
+        Result<BenchmarkSuiteOwnedLaunch, LaunchApplicationError>,
+    >,
+) {
+    let OwnedBenchmarkSuiteLaunchInput {
+        launch,
+        selection,
+        run_index,
+        benchmark,
+        benchmark_response,
+        suite_response,
+    } = input;
+    let mut prepared = match super::prepare_launch_session(&state, launch).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = result_tx.send(Err(error));
+            return;
+        }
+    };
+    let session_id = prepared.task.intent.session_id.clone();
+    prepared.task.benchmark = Some(benchmark.clone());
+    if state
+        .sessions()
+        .attach_benchmark(
+            &session_id,
+            super::launch_benchmark_status_payload(&benchmark),
+        )
+        .await
+        .is_none()
+    {
+        tracing::warn!("prepared benchmark suite session disappeared before reservation");
+        finish_benchmark_suite_reservation_failure(
+            &state,
+            &prepared.task,
+            benchmark,
+            BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE,
+            "prepared_session_missing",
+            true,
+        )
+        .await;
+        let _ = result_tx.send(Err(benchmark_suite_storage_error_response()));
+        return;
+    }
+    let Some(terminal_events) = state.sessions().subscribe(&session_id).await else {
+        tracing::warn!("prepared benchmark suite session could not be observed");
+        finish_benchmark_suite_reservation_failure(
+            &state,
+            &prepared.task,
+            benchmark,
+            BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE,
+            "prepared_session_unobservable",
+            true,
+        )
+        .await;
+        let _ = result_tx.send(Err(benchmark_suite_storage_error_response()));
+        return;
+    };
+    let displaced_session_active = match selection.displaced_session_id() {
+        Some(displaced_session_id) => state
+            .sessions()
+            .get(displaced_session_id)
+            .await
+            .is_some_and(|record| {
+                !matches!(record.state, LaunchState::Failed | LaunchState::Exited)
+            }),
+        None => false,
+    };
+    let reservation = state
+        .benchmark_suites()
+        .reserve(
+            selection,
+            &session_id,
+            &prepared.task.launched_at,
+            displaced_session_active,
+        )
+        .await;
+    match reservation {
+        Ok(_) => {}
+        Err(crate::state::benchmark_suites::BenchmarkSuiteReserveError::PreAccept(error)) => {
+            let failure = BenchmarkSuiteReservationFailure::from_store_error(&error);
+            finish_benchmark_suite_reservation_failure(
+                &state,
+                &prepared.task,
+                benchmark,
+                failure.message,
+                error.class(),
+                true,
+            )
+            .await;
+            let _ = result_tx.send(Err(failure.response()));
+            return;
+        }
+        Err(crate::state::benchmark_suites::BenchmarkSuiteReserveError::AcceptedWriteFailed {
+            handle,
+            ..
+        }) => {
+            finish_benchmark_suite_reservation_failure(
+                &state,
+                &prepared.task,
+                benchmark,
+                BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE,
+                "accepted_write_failed",
+                false,
+            )
+            .await;
+            let _ = result_tx.send(Err(benchmark_suite_storage_error_response()));
+            match state.benchmark_suites().settle_compensation(&handle).await {
+                Ok(()) => {
+                    state
+                        .sessions()
+                        .release_terminal_retention_hold(&session_id)
+                        .await;
+                }
+                Err(error) => tracing::warn!(
+                    error_class = error.class(),
+                    "benchmark suite compensation remained unsettled; terminal hold retained"
+                ),
+            }
+            return;
+        }
+    }
+    let launched = match super::launch_session(state.clone(), prepared.task).await {
+        Ok(launched) => launched,
+        Err(error) => {
+            let _ = result_tx.send(Err(super::launch_request_error_response(error)));
+            return;
+        }
+    };
 
     let mut response = super::launch_success_response_payload(&launched);
     response["benchmark"] = benchmark_response;
     response["suite"] = suite_response;
-    Ok(response)
+    let _ = result_tx.send(Ok(BenchmarkSuiteOwnedLaunch {
+        payload: response,
+        run_index,
+    }));
+    own_benchmark_suite_terminal_outcome(state, session_id, terminal_events).await;
 }
 
 async fn finish_benchmark_suite_reservation_failure(
     state: &AppState,
     task: &super::LaunchSessionTask,
     benchmark: crate::state::launch_reports::LaunchBenchmarkMetadata,
+    message: &'static str,
+    error_class: &'static str,
+    release_retention_hold: bool,
 ) {
     let session_id = task.intent.session_id.as_str();
     let mut initial_evidence = super::launch_application_stage_evidence(&task.application);
@@ -696,18 +834,7 @@ async fn finish_benchmark_suite_reservation_failure(
         .await;
     state
         .sessions()
-        .attach_benchmark(
-            session_id,
-            super::launch_benchmark_status_payload(&benchmark),
-        )
-        .await;
-    state
-        .sessions()
-        .emit_log(
-            session_id,
-            "system",
-            BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE.to_string(),
-        )
+        .emit_log(session_id, "system", message.to_string())
         .await;
     state
         .sessions()
@@ -719,7 +846,7 @@ async fn finish_benchmark_suite_reservation_failure(
                 pid: None,
                 exit_code: None,
                 failure_class: Some("unknown".to_string()),
-                failure_detail: Some(BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE.to_string()),
+                failure_detail: Some(message.to_string()),
                 healing: None,
                 guardian: serde_json::to_value(&task.guardian).ok(),
                 outcome: None,
@@ -728,7 +855,7 @@ async fn finish_benchmark_suite_reservation_failure(
                     id: "application_benchmark_suite_reservation_failed".to_string(),
                     system: "application".to_string(),
                     summary: "Benchmark suite reservation failed before process start.".to_string(),
-                    details: vec!["storage:benchmark_suite".to_string()],
+                    details: vec![format!("reason:{error_class}")],
                 }],
                 stages: Vec::new(),
             },
@@ -745,44 +872,183 @@ async fn finish_benchmark_suite_reservation_failure(
         &proof_context,
     )
     .await;
-    state
-        .sessions()
-        .release_terminal_retention_hold(session_id)
-        .await;
+    if release_retention_hold {
+        state
+            .sessions()
+            .release_terminal_retention_hold(session_id)
+            .await;
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn persist_benchmark_suite_run_reservation(
-    paths: &axial_config::AppPaths,
-    suite_id: &str,
-    mode: &str,
-    plan: &[BenchmarkSuiteRunSpec],
-    run_index: usize,
-    instance_id: &str,
+async fn own_benchmark_suite_terminal_outcome(
+    state: AppState,
+    session_id: String,
+    mut terminal_events: tokio::sync::broadcast::Receiver<LaunchEvent>,
+) {
+    loop {
+        match terminal_events.recv().await {
+            Ok(LaunchEvent::Status(status)) => {
+                let Some(outcome) = benchmark_suite_terminal_outcome(&status) else {
+                    continue;
+                };
+                persist_benchmark_suite_terminal_outcome(&state, &session_id, outcome).await;
+                return;
+            }
+            Ok(LaunchEvent::Log(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let Some(record) = state.sessions().get(&session_id).await else {
+                    tracing::warn!(
+                        "benchmark suite terminal observer lost its exact session record"
+                    );
+                    return;
+                };
+                let outcome = benchmark_suite_record_terminal_outcome(&record);
+                if let Some(outcome) = outcome {
+                    persist_benchmark_suite_terminal_outcome(&state, &session_id, outcome).await;
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                let outcome = state
+                    .sessions()
+                    .get(&session_id)
+                    .await
+                    .and_then(|record| benchmark_suite_record_terminal_outcome(&record));
+                if let Some(outcome) = outcome {
+                    persist_benchmark_suite_terminal_outcome(&state, &session_id, outcome).await;
+                } else {
+                    tracing::warn!(
+                        "benchmark suite terminal observer closed before exact settlement"
+                    );
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn benchmark_suite_terminal_outcome(status: &LaunchStatusEvent) -> Option<&'static str> {
+    status
+        .outcome
+        .as_ref()
+        .map(|outcome| benchmark_suite_outcome_kind(outcome.kind))
+        .or_else(|| benchmark_suite_state_only_terminal_outcome(&status.state))
+}
+
+fn benchmark_suite_record_terminal_outcome(
+    record: &crate::state::LaunchSessionRecord,
+) -> Option<&'static str> {
+    record
+        .outcome
+        .as_ref()
+        .map(|outcome| benchmark_suite_outcome_kind(outcome.kind))
+        .or(match record.state {
+            LaunchState::Failed => Some("failed"),
+            LaunchState::Exited => Some("exited"),
+            _ => None,
+        })
+}
+
+fn benchmark_suite_outcome_kind(kind: LaunchSessionOutcomeKind) -> &'static str {
+    match kind {
+        LaunchSessionOutcomeKind::Clean | LaunchSessionOutcomeKind::Unknown => "exited",
+        LaunchSessionOutcomeKind::Stopped => "stopped",
+        LaunchSessionOutcomeKind::Failed => "failed",
+    }
+}
+
+fn benchmark_suite_state_only_terminal_outcome(state: &str) -> Option<&'static str> {
+    match state.trim() {
+        "failed" => Some("failed"),
+        "stopped" => Some("stopped"),
+        "exited" => Some("exited"),
+        "completed" => Some("completed"),
+        _ => None,
+    }
+}
+
+async fn persist_benchmark_suite_terminal_outcome(
+    state: &AppState,
     session_id: &str,
-    launched_at: &str,
-) -> Result<crate::state::benchmark_suites::BenchmarkSuiteManifest, LaunchApplicationError> {
-    let manifest_runs = benchmark_suite_manifest_run_inputs(mode, plan);
-    crate::state::benchmark_suites::persist_launched_run(
-        paths,
-        suite_id,
-        instance_id,
-        mode,
-        &manifest_runs,
-        run_index,
-        session_id,
-        launched_at,
-    )
-    .map_err(benchmark_suite_storage_error_response)
+    outcome: &str,
+) {
+    if let Err(error) = state
+        .benchmark_suites()
+        .update_run_state_for_session(session_id, outcome)
+        .await
+    {
+        tracing::warn!(
+            error_class = error.class(),
+            "benchmark suite terminal outcome persistence failed"
+        );
+    }
 }
 
-pub(crate) fn benchmark_suite_storage_error_response(
-    _error: std::io::Error,
-) -> (StatusCode, Json<serde_json::Value>) {
+fn benchmark_suite_storage_error_response() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE })),
     )
+}
+
+pub(crate) fn benchmark_suite_store_error_response(
+    error: crate::state::benchmark_suites::BenchmarkSuiteStoreError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    BenchmarkSuiteReservationFailure::from_store_error(&error).response()
+}
+
+#[derive(Clone, Copy)]
+struct BenchmarkSuiteReservationFailure {
+    status: StatusCode,
+    message: &'static str,
+}
+
+impl BenchmarkSuiteReservationFailure {
+    fn from_store_error(error: &crate::state::benchmark_suites::BenchmarkSuiteStoreError) -> Self {
+        use crate::state::benchmark_suites::BenchmarkSuiteStoreError;
+        match error {
+            BenchmarkSuiteStoreError::InvalidSuiteId => Self {
+                status: StatusCode::BAD_REQUEST,
+                message: "benchmark suite id is invalid",
+            },
+            BenchmarkSuiteStoreError::InvalidRunIndex => Self {
+                status: StatusCode::BAD_REQUEST,
+                message: "run_index is out of range",
+            },
+            BenchmarkSuiteStoreError::SuiteIdentityMismatch => Self {
+                status: StatusCode::CONFLICT,
+                message: "benchmark suite does not match this instance and mode",
+            },
+            BenchmarkSuiteStoreError::AutoConflict
+            | BenchmarkSuiteStoreError::ExplicitActiveConflict => Self {
+                status: StatusCode::CONFLICT,
+                message: "benchmark suite has active run",
+            },
+            BenchmarkSuiteStoreError::StaleSelection
+            | BenchmarkSuiteStoreError::SessionConflict => Self {
+                status: StatusCode::CONFLICT,
+                message: "benchmark suite changed before launch",
+            },
+            BenchmarkSuiteStoreError::Complete => Self {
+                status: StatusCode::CONFLICT,
+                message: "benchmark suite is complete",
+            },
+            BenchmarkSuiteStoreError::RejectedManifest
+            | BenchmarkSuiteStoreError::MutationLatched
+            | BenchmarkSuiteStoreError::RetryRequired
+            | BenchmarkSuiteStoreError::Closed
+            | BenchmarkSuiteStoreError::GenerationOverflow
+            | BenchmarkSuiteStoreError::ObligationOverflow
+            | BenchmarkSuiteStoreError::Persistence(_) => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE,
+            },
+        }
+    }
+
+    fn response(self) -> (StatusCode, Json<serde_json::Value>) {
+        (self.status, Json(json!({ "error": self.message })))
+    }
 }
 
 pub(crate) fn trimmed_string(value: &str) -> Option<String> {
@@ -1170,40 +1436,11 @@ pub(crate) fn benchmark_suite_complete_error() -> (StatusCode, Json<serde_json::
     )
 }
 
-pub(crate) fn benchmark_suite_active_run_error() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::CONFLICT,
-        Json(json!({ "error": "benchmark suite has active run" })),
-    )
-}
-
 pub(crate) fn unsupported_suite_mode_error() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({ "error": "suite_mode is not supported" })),
     )
-}
-
-pub(crate) async fn ensure_no_active_benchmark_suite_auto_run(
-    sessions: &crate::state::SessionStore,
-    manifest: Option<&crate::state::benchmark_suites::BenchmarkSuiteManifest>,
-    auto_next_run: bool,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if !auto_next_run {
-        return Ok(());
-    }
-
-    let Some(manifest) = manifest else {
-        return Ok(());
-    };
-    if active_benchmark_suite_session_id(sessions, manifest)
-        .await
-        .is_some()
-    {
-        return Err(benchmark_suite_active_run_error());
-    }
-
-    Ok(())
 }
 
 pub(crate) async fn benchmark_suite_driver_decision(
@@ -1232,16 +1469,16 @@ pub(crate) async fn benchmark_suite_driver_decision(
         });
     }
 
-    let Some(run_index) = pending_run_index else {
+    if pending_run_index.is_none() {
         return Ok(BenchmarkSuiteDriverDecision::Complete { suite });
-    };
+    }
 
     Ok(BenchmarkSuiteDriverDecision::Launch(
         BenchmarkSuiteLaunchInput {
             launch: input.launch,
             suite_id: input.suite_id,
             mode: input.mode,
-            run_index,
+            requested_run_index: None,
             plan: input.plan,
         },
     ))
@@ -1292,7 +1529,7 @@ pub(crate) async fn run_benchmark_suite_driver_loop(
 
         let input = match request
             .clone()
-            .into_suite_plan_input_with_manifest(Some(state.config().paths()))
+            .into_suite_plan_input_with_manifest(Some(state.benchmark_suites()))
         {
             Ok(input) => input,
             Err(error) => {
@@ -1325,21 +1562,21 @@ pub(crate) async fn run_benchmark_suite_driver_loop(
                 if *stop_rx.borrow() {
                     break;
                 }
-                let run_index = input.run_index;
-                match launch_benchmark_suite_run(state.clone(), input).await {
-                    Ok(payload) => {
-                        let session_id = payload
+                match launch_benchmark_suite_run_owned(state.clone(), input).await {
+                    Ok(launched) => {
+                        let session_id = launched
+                            .payload
                             .get("session_id")
                             .and_then(|value| value.as_str())
                             .and_then(bounded_status_token);
                         let summary = request
                             .clone()
-                            .into_suite_plan_input_with_manifest(Some(state.config().paths()))
+                            .into_suite_plan_input_with_manifest(Some(state.benchmark_suites()))
                             .map(|input| benchmark_suite_driver_suite_summary(&input))
                             .unwrap_or(summary);
                         state
                             .benchmark_suite_drivers()
-                            .record_launched(&driver_id, summary, run_index, session_id)
+                            .record_launched(&driver_id, summary, launched.run_index, session_id)
                             .await?;
                     }
                     Err(error) => {
@@ -1420,6 +1657,8 @@ pub(crate) fn bounded_status_token(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::file::{FileWriteRequest, write_file_atomically};
+    use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::state::{AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
     use axial_launcher::{LaunchSessionRecord, SessionId};
@@ -1427,25 +1666,199 @@ mod tests {
     use std::fs;
     use std::future::Future;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::task::{Context, Poll};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::Notify;
+
+    struct FailingReservationBackend {
+        attempts: AtomicUsize,
+        started: Notify,
+        first_gate: BlockingGate,
+        compensation_gate: BlockingGate,
+    }
+
+    struct GatedReservationBackend {
+        attempts: AtomicUsize,
+        started: Notify,
+        gate: BlockingGate,
+    }
+
+    struct BlockingGate {
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl FailingReservationBackend {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                started: Notify::new(),
+                first_gate: BlockingGate::new(),
+                compensation_gate: BlockingGate::new(),
+            }
+        }
+
+        async fn wait_for_attempt(&self, expected: usize) {
+            loop {
+                let started = self.started.notified();
+                if self.attempts.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                started.await;
+            }
+        }
+    }
+
+    impl GatedReservationBackend {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                started: Notify::new(),
+                gate: BlockingGate::new(),
+            }
+        }
+
+        async fn wait_for_attempt(&self) {
+            loop {
+                let started = self.started.notified();
+                if self.attempts.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                started.await;
+            }
+        }
+    }
+
+    impl BlockingGate {
+        fn new() -> Self {
+            Self {
+                released: Mutex::new(false),
+                changed: Condvar::new(),
+            }
+        }
+
+        fn wait(&self) {
+            let mut released = self.released.lock().expect("write gate lock");
+            while !*released {
+                released = self.changed.wait(released).expect("write gate wait");
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().expect("write gate lock") = true;
+            self.changed.notify_all();
+        }
+    }
+
+    impl AtomicWriteBackend for FailingReservationBackend {
+        fn write(
+            &self,
+            target: &crate::state::contracts::TargetDescriptor,
+            destination: &Path,
+            contents: &[u8],
+        ) -> io::Result<()> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            self.started.notify_waiters();
+            match attempt {
+                1 => {
+                    self.first_gate.wait();
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "secret reservation path C:\\Users\\Alice\\suite.json",
+                    ))
+                }
+                2 => {
+                    self.compensation_gate.wait();
+                    write_file_atomically(FileWriteRequest::new(
+                        target.clone(),
+                        destination,
+                        contents,
+                    ))
+                    .map(|_| ())
+                    .map_err(io::Error::from)
+                }
+                _ => write_file_atomically(FileWriteRequest::new(
+                    target.clone(),
+                    destination,
+                    contents,
+                ))
+                .map(|_| ())
+                .map_err(io::Error::from),
+            }
+        }
+    }
+
+    impl AtomicWriteBackend for GatedReservationBackend {
+        fn write(
+            &self,
+            target: &crate::state::contracts::TargetDescriptor,
+            destination: &Path,
+            contents: &[u8],
+        ) -> io::Result<()> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            self.started.notify_waiters();
+            if attempt == 1 {
+                self.gate.wait();
+            }
+            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
+                .map(|_| ())
+                .map_err(io::Error::from)
+        }
+    }
 
     #[tokio::test]
-    async fn benchmark_suite_reservation_failure_finalizes_and_releases_prepared_session() {
+    async fn benchmark_suite_preaccept_failure_finalizes_and_releases_prepared_session() {
         let fixture = BenchmarkFixture::new("reservation-finalizes-session");
         fixture.write_ready_install("1.21.1");
         let instance_id = fixture.add_instance("Benchmark", "1.21.1");
-        let suite_id = "reservation-finalizes-session";
-        let corrupt_manifest = crate::state::benchmark_suites::suite_path(&fixture.paths, suite_id);
-        fs::create_dir_all(corrupt_manifest.parent().expect("suite parent"))
-            .expect("create suite parent");
-        fs::write(&corrupt_manifest, b"{not-json").expect("corrupt suite manifest");
+        let suite_id = crate::state::benchmark_suites::derive_suite_id(&instance_id, "development");
         let plan = performance::benchmark_suite_plan("development").expect("development plan");
+        let manifest_runs = benchmark_suite_manifest_run_inputs("development", &plan);
+        let stale_selection = fixture
+            .state
+            .benchmark_suites()
+            .select_reservation(&suite_id, &instance_id, "development", &manifest_runs, None)
+            .await
+            .expect("select reservation under test");
+        let competing_selection = fixture
+            .state
+            .benchmark_suites()
+            .select_reservation(&suite_id, &instance_id, "development", &manifest_runs, None)
+            .await
+            .expect("select competing reservation");
+        fixture
+            .state
+            .benchmark_suites()
+            .reserve(
+                competing_selection,
+                "competing-session",
+                "2026-01-01T00:00:00.000Z",
+                false,
+            )
+            .await
+            .expect("commit competing reservation");
+        let selected_run_index = stale_selection.run_index();
+        let selected = plan[selected_run_index];
+        let benchmark = crate::state::launch_reports::LaunchBenchmarkMetadata::new(
+            Some(&benchmark_suite_run_id(
+                "development",
+                selected_run_index,
+                selected,
+            )),
+            Some(selected.profile),
+            Some(selected.run_type),
+            Some("development"),
+        );
+        let benchmark_response = super::super::launch_benchmark_status_payload(&benchmark);
+        let suite_response =
+            benchmark_suite_status_payload(&suite_id, "development", selected_run_index, &plan);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
-        let error = launch_benchmark_suite_run(
+        own_benchmark_suite_launch(
             fixture.state.clone(),
-            BenchmarkSuiteLaunchInput {
+            OwnedBenchmarkSuiteLaunchInput {
                 launch: super::super::LaunchRequest {
                     instance_id,
                     username: None,
@@ -1453,19 +1866,24 @@ mod tests {
                     min_memory_mb: None,
                     client_started_at_ms: None,
                 },
-                suite_id: suite_id.to_string(),
-                mode: "development".to_string(),
-                run_index: 0,
-                plan,
+                selection: stale_selection,
+                run_index: selected_run_index,
+                benchmark,
+                benchmark_response,
+                suite_response,
             },
+            result_tx,
         )
-        .await
-        .expect_err("corrupt suite manifest should reject reservation");
+        .await;
+        let error = result_rx
+            .await
+            .expect("owner reports result")
+            .expect_err("stale suite selection should reject reservation");
 
-        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.0, StatusCode::CONFLICT);
         assert_eq!(
             error.1.0,
-            json!({ "error": BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE })
+            json!({ "error": "benchmark suite has active run" })
         );
         let proofs = crate::state::launch_reports::list_recent(&fixture.paths, 5)
             .expect("list launch proofs");
@@ -1478,7 +1896,7 @@ mod tests {
         );
         assert_eq!(
             proof.failure_detail.as_deref(),
-            Some(BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE)
+            Some("benchmark suite has active run")
         );
         assert!(proof.stages.iter().any(|stage| {
             stage.evidence.iter().any(|evidence| {
@@ -1518,13 +1936,318 @@ mod tests {
         assert!(fixture.state.sessions().get(&session_id).await.is_none());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_reservation_failure_holds_session_until_exact_compensation() {
+        let mut fixture = BenchmarkFixture::new("accepted-reservation-compensation");
+        fixture.write_ready_install("1.21.1");
+        let instance_id = fixture.add_instance("Benchmark", "1.21.1");
+        fixture
+            .state
+            .benchmark_suites()
+            .close()
+            .await
+            .expect("close default suite store");
+        let backend = Arc::new(FailingReservationBackend::new());
+        let coordinator =
+            PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);
+        let suite_store = Arc::new(
+            crate::state::benchmark_suites::BenchmarkSuiteStore::try_load_from_paths_with_coordinator(
+                &fixture.paths,
+                coordinator,
+            )
+            .expect("load injected suite store"),
+        );
+        fixture.state = fixture.state.clone().with_benchmark_suites(suite_store);
+        let report_dir = fixture.paths.config_dir.join("benchmarks").join("launch");
+        fs::create_dir_all(report_dir.parent().expect("report parent"))
+            .expect("create report parent");
+        fs::write(&report_dir, b"not a directory").expect("block proof directory");
+        let plan = performance::benchmark_suite_plan("development").expect("development plan");
+        let suite_id = crate::state::benchmark_suites::derive_suite_id(&instance_id, "development");
+        let state = fixture.state.clone();
+        let waiter = tokio::spawn(launch_benchmark_suite_run(
+            state.clone(),
+            BenchmarkSuiteLaunchInput {
+                launch: super::super::LaunchRequest {
+                    instance_id,
+                    username: None,
+                    max_memory_mb: None,
+                    min_memory_mb: None,
+                    client_started_at_ms: None,
+                },
+                suite_id: suite_id.clone(),
+                mode: "development".to_string(),
+                requested_run_index: None,
+                plan,
+            },
+        ));
+
+        backend.wait_for_attempt(1).await;
+        let prepared = state.sessions().active_records().await;
+        assert_eq!(prepared.len(), 1);
+        let session_id = prepared[0].session_id.0.clone();
+        backend.first_gate.release();
+        backend.wait_for_attempt(2).await;
+        let error = waiter
+            .await
+            .expect("suite launch waiter joins")
+            .expect_err("accepted reservation write fails");
+
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.1.0,
+            json!({ "error": BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE })
+        );
+        let terminal = state
+            .sessions()
+            .get(&session_id)
+            .await
+            .expect("terminal session retained");
+        assert_eq!(terminal.state, LaunchState::Failed);
+        assert_eq!(
+            state.sessions().retention_hold_count(&session_id).await,
+            Some(1)
+        );
+        assert!(
+            state
+                .benchmark_suites()
+                .get(&suite_id)
+                .expect("read committed suite")
+                .is_none()
+        );
+        assert_eq!(
+            terminal
+                .failure
+                .as_ref()
+                .and_then(|failure| failure.detail.as_deref()),
+            Some(BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE)
+        );
+        assert!(terminal.command.is_empty());
+        assert!(terminal.java_path.is_none());
+        assert!(terminal.natives_dir.is_none());
+
+        backend.compensation_gate.release();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.sessions().retention_hold_count(&session_id).await == Some(0) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compensation releases terminal hold");
+        state
+            .benchmark_suites()
+            .close()
+            .await
+            .expect("close compensated suite store");
+        let reloaded =
+            crate::state::benchmark_suites::BenchmarkSuiteStore::load_from_paths(&fixture.paths);
+        let manifest = reloaded
+            .get(&suite_id)
+            .expect("read reloaded suite")
+            .expect("compensation checkpoint exists");
+        assert!(
+            manifest
+                .runs
+                .iter()
+                .all(|run| run.state == "pending" && run.session_id.is_none())
+        );
+        reloaded.close().await.expect("close reloaded suite store");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_suite_launch_waiter_does_not_cancel_owned_continuation() {
+        let mut fixture = BenchmarkFixture::new("aborted-suite-launch-waiter");
+        fixture.write_ready_install("1.21.1");
+        let instance_id = fixture.add_instance("Benchmark", "1.21.1");
+        fixture
+            .state
+            .benchmark_suites()
+            .close()
+            .await
+            .expect("close default suite store");
+        let backend = Arc::new(GatedReservationBackend::new());
+        let coordinator =
+            PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);
+        let suite_store = Arc::new(
+            crate::state::benchmark_suites::BenchmarkSuiteStore::try_load_from_paths_with_coordinator(
+                &fixture.paths,
+                coordinator,
+            )
+            .expect("load injected suite store"),
+        );
+        fixture.state = fixture.state.clone().with_benchmark_suites(suite_store);
+        let suite_id = crate::state::benchmark_suites::derive_suite_id(&instance_id, "development");
+        let state = fixture.state.clone();
+        let waiter = tokio::spawn(launch_benchmark_suite_run(
+            state.clone(),
+            BenchmarkSuiteLaunchInput {
+                launch: super::super::LaunchRequest {
+                    instance_id,
+                    username: None,
+                    max_memory_mb: None,
+                    min_memory_mb: None,
+                    client_started_at_ms: None,
+                },
+                suite_id: suite_id.clone(),
+                mode: "development".to_string(),
+                requested_run_index: None,
+                plan: performance::benchmark_suite_plan("development").expect("development plan"),
+            },
+        ));
+
+        backend.wait_for_attempt().await;
+        let prepared = state.sessions().active_records().await;
+        assert_eq!(prepared.len(), 1);
+        let session_id = prepared[0].session_id.0.clone();
+        waiter.abort();
+        let _ = waiter.await;
+        backend.gate.release();
+
+        let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(record) = state.sessions().get(&session_id).await
+                    && matches!(record.state, LaunchState::Failed | LaunchState::Exited)
+                {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned continuation terminalizes after waiter abort");
+        assert_eq!(
+            terminal.outcome.as_ref().map(|outcome| outcome.kind),
+            Some(LaunchSessionOutcomeKind::Failed)
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let manifest = state
+                    .benchmark_suites()
+                    .get(&suite_id)
+                    .expect("read committed suite")
+                    .expect("suite reservation committed");
+                if manifest.runs[0].state == "failed"
+                    && state.sessions().retention_hold_count(&session_id).await == Some(0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned continuation commits terminal outcome");
+        let manifest = state
+            .benchmark_suites()
+            .get(&suite_id)
+            .expect("read committed suite")
+            .expect("suite reservation committed");
+        assert_eq!(
+            manifest.runs[0].session_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        assert_eq!(manifest.runs[0].state, "failed");
+        assert_eq!(
+            state.sessions().retention_hold_count(&session_id).await,
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn natural_terminal_session_releases_suite_for_next_auto_selection() {
+        let fixture = BenchmarkFixture::new("natural-terminal-suite-outcome");
+        let state = fixture.state.clone();
+        let instance_id = "instance";
+        let suite_id = crate::state::benchmark_suites::derive_suite_id(instance_id, "development");
+        let session_id = "natural-terminal-session";
+        let plan = performance::benchmark_suite_plan("development").expect("development plan");
+        let manifest_runs = benchmark_suite_manifest_run_inputs("development", &plan);
+        let selection = state
+            .benchmark_suites()
+            .select_reservation(&suite_id, instance_id, "development", &manifest_runs, None)
+            .await
+            .expect("select first run");
+        state
+            .benchmark_suites()
+            .reserve(selection, session_id, "2026-01-01T00:00:00.000Z", false)
+            .await
+            .expect("reserve first run");
+        state
+            .benchmark_suites()
+            .update_run_state_for_session(session_id, "running")
+            .await
+            .expect("commit running outcome");
+        state.sessions().insert(test_record(session_id)).await;
+        let terminal_events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe exact session");
+        let terminal_owner = tokio::spawn(own_benchmark_suite_terminal_outcome(
+            state.clone(),
+            session_id.to_string(),
+            terminal_events,
+        ));
+
+        state
+            .sessions()
+            .emit_status(session_id, terminal_status())
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let manifest = state
+                    .benchmark_suites()
+                    .get(&suite_id)
+                    .expect("read committed suite")
+                    .expect("suite exists");
+                if manifest.runs[0].state == "exited" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal continuation commits suite outcome");
+        terminal_owner.await.expect("terminal owner joins");
+        let next = state
+            .benchmark_suites()
+            .select_reservation(&suite_id, instance_id, "development", &manifest_runs, None)
+            .await
+            .expect("auto selection advances after natural exit");
+        assert_eq!(next.run_index(), 1);
+    }
+
+    #[test]
+    fn terminal_suite_outcome_preserves_stop_crash_and_clean_classification() {
+        let mut status = terminal_status();
+        status.outcome = Some(axial_launcher::LaunchSessionOutcome::from_reason(
+            axial_launcher::LaunchSessionExitReason::LauncherStopped,
+        ));
+        assert_eq!(benchmark_suite_terminal_outcome(&status), Some("stopped"));
+
+        status.outcome = Some(axial_launcher::LaunchSessionOutcome::from_reason(
+            axial_launcher::LaunchSessionExitReason::CrashedAfterBoot,
+        ));
+        assert_eq!(benchmark_suite_terminal_outcome(&status), Some("failed"));
+
+        status.outcome = Some(axial_launcher::LaunchSessionOutcome::from_reason(
+            axial_launcher::LaunchSessionExitReason::CleanExit,
+        ));
+        assert_eq!(benchmark_suite_terminal_outcome(&status), Some("exited"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn canceled_start_waiter_does_not_drop_detached_effect_owner() {
         let fixture = BenchmarkFixture::new("canceled-driver-start-waiter");
         let state = fixture.state.clone();
+        let suite_id =
+            crate::state::benchmark_suites::derive_suite_id("missing-instance", "development");
         let mut waiter = Box::pin(start_owned_benchmark_suite_driver(
             state.clone(),
-            "detached-suite".to_string(),
+            suite_id.clone(),
             "development".to_string(),
             crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary {
                 run_count: 2,
@@ -1541,7 +2264,7 @@ mod tests {
                 run_type: None,
                 benchmark_mode: None,
                 suite_mode: Some("development".to_string()),
-                suite_id: Some("detached-suite".to_string()),
+                suite_id: Some(suite_id.clone()),
                 run_index: None,
                 interval_ms: Some(30_000),
             },
@@ -1570,12 +2293,12 @@ mod tests {
         })
         .await
         .expect("detached owner terminalizes driver");
-        assert_eq!(failed.suite_id, "detached-suite");
+        assert_eq!(failed.suite_id, suite_id);
 
         let successor = state
             .benchmark_suite_drivers()
             .start(
-                "detached-suite".to_string(),
+                failed.suite_id,
                 "development".to_string(),
                 30_000,
                 crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary {

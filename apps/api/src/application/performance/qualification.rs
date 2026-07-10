@@ -1,4 +1,7 @@
-use super::{benchmark_suite_manifest_run_inputs, benchmark_suite_plan};
+use super::{
+    BenchmarkSuiteRunSpec, benchmark_suite_manifest_run_inputs, benchmark_suite_plan,
+    benchmark_suite_run_id,
+};
 use crate::observability::bounded_descriptor_token;
 use crate::state::AppState;
 use axum::{Json, http::StatusCode};
@@ -33,10 +36,11 @@ pub(crate) async fn family_c_qualification_payload(
 ) -> Result<Value, (StatusCode, Json<Value>)> {
     let normalized_suite_id = crate::state::benchmark_suites::normalize_suite_id(suite_id)
         .ok_or_else(benchmark_suite_not_found_error)?;
-    let manifest =
-        crate::state::benchmark_suites::load(state.config().paths(), &normalized_suite_id)
-            .map_err(benchmark_suite_storage_error_response)?
-            .ok_or_else(benchmark_suite_not_found_error)?;
+    let manifest = state
+        .benchmark_suites()
+        .get(&normalized_suite_id)
+        .map_err(|_| benchmark_suite_storage_error_response())?
+        .ok_or_else(benchmark_suite_not_found_error)?;
     if manifest.schema != "axial.launch.benchmark.suite" || manifest.schema_version != 2 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -98,7 +102,10 @@ fn family_c_qualification_preview_manifest()
     Ok(crate::state::benchmark_suites::BenchmarkSuiteManifest {
         schema: "axial.launch.benchmark.suite".to_string(),
         schema_version: 2,
-        suite_id: "family-c-1-12-2-preview".to_string(),
+        suite_id: crate::state::benchmark_suites::derive_suite_id(
+            "preview",
+            FAMILY_C_QUALIFICATION_MODE,
+        ),
         instance_id: "preview".to_string(),
         mode: FAMILY_C_QUALIFICATION_MODE.to_string(),
         created_at: "preview".to_string(),
@@ -422,6 +429,7 @@ fn family_c_qualification_targets() -> [FamilyCQualificationTarget; 2] {
     [
         FamilyCQualificationTarget {
             role: "baseline",
+            run_index: 0,
             target_id: FAMILY_C_BASELINE_TARGET_ID,
             profile: "vanilla_baseline",
             run_type: "coldish",
@@ -430,6 +438,7 @@ fn family_c_qualification_targets() -> [FamilyCQualificationTarget; 2] {
         },
         FamilyCQualificationTarget {
             role: "managed",
+            run_index: 1,
             target_id: FAMILY_C_MANAGED_TARGET_ID,
             profile: "managed_default",
             run_type: "coldish",
@@ -475,6 +484,15 @@ fn family_c_qualification_target_payload(
 ) -> Value {
     let mut missing = Vec::new();
     missing.extend(extra_missing.iter().copied());
+    let expected_benchmark_id = benchmark_suite_run_id(
+        FAMILY_C_QUALIFICATION_MODE,
+        target.run_index,
+        BenchmarkSuiteRunSpec {
+            profile: target.profile,
+            run_type: target.run_type,
+            target_id: Some(target.target_id),
+        },
+    );
     let run = manifest
         .runs
         .iter()
@@ -497,8 +515,8 @@ fn family_c_qualification_target_payload(
         }
         if run.benchmark_id.trim().is_empty() {
             missing.push("suite_run_benchmark_id_missing");
-        } else if !run.benchmark_id.contains(target.target_id) {
-            missing.push("suite_run_benchmark_id_target_mismatch");
+        } else if run.benchmark_id != expected_benchmark_id {
+            missing.push("suite_run_benchmark_id_mismatch");
         }
         if run.session_id.as_deref().and_then(trimmed_string).is_none() {
             missing.push("suite_run_session_missing");
@@ -509,14 +527,6 @@ fn family_c_qualification_target_payload(
         Some(proof) => {
             if proof.scenario.benchmark_id.as_deref() != run.map(|run| run.benchmark_id.as_str()) {
                 missing.push("proof_benchmark_id_mismatch");
-            }
-            if !proof
-                .scenario
-                .benchmark_id
-                .as_deref()
-                .is_some_and(|benchmark_id| benchmark_id.contains(target.target_id))
-            {
-                missing.push("proof_benchmark_id_target_missing");
             }
             if proof.scenario.benchmark_profile.as_deref() != Some(target.profile) {
                 missing.push("proof_profile_mismatch");
@@ -798,14 +808,9 @@ fn family_c_qualification_matching_proof<'a>(
         return Some(proof);
     }
 
-    proofs.iter().find(|proof| {
-        proof.scenario.benchmark_id.as_deref() == Some(run.benchmark_id.as_str())
-            && proof
-                .scenario
-                .benchmark_id
-                .as_deref()
-                .is_some_and(|benchmark_id| benchmark_id.contains(run.target_id.as_str()))
-    })
+    proofs
+        .iter()
+        .find(|proof| proof.scenario.benchmark_id.as_deref() == Some(run.benchmark_id.as_str()))
 }
 
 fn family_c_qualification_managed_comparison_evidence(
@@ -1032,7 +1037,7 @@ fn unsupported_suite_mode_error() -> (StatusCode, Json<Value>) {
     )
 }
 
-fn benchmark_suite_storage_error_response(_error: std::io::Error) -> (StatusCode, Json<Value>) {
+fn benchmark_suite_storage_error_response() -> (StatusCode, Json<Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE })),
@@ -1049,6 +1054,7 @@ fn launch_report_storage_error_response(_error: std::io::Error) -> (StatusCode, 
 #[derive(Clone, Copy)]
 struct FamilyCQualificationTarget {
     role: &'static str,
+    run_index: usize,
     target_id: &'static str,
     profile: &'static str,
     run_type: &'static str,
