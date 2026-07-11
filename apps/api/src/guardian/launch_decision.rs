@@ -28,7 +28,7 @@ pub struct GuardianPrepareFailureRequest<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct GuardianPrepareFailureOutcome {
+pub struct GuardianLaunchFailureOutcome {
     pub failure_class: LaunchFailureClass,
     pub safety_case: SafetyCase,
     pub guardian_decision: GuardianDecision,
@@ -66,18 +66,9 @@ pub struct GuardianStartupFailureRequest<'a> {
     pub effective_preset: &'a str,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct GuardianStartupFailureOutcome {
-    pub failure_class: LaunchFailureClass,
-    pub safety_case: SafetyCase,
-    pub guardian_decision: GuardianDecision,
-    pub user_outcome: GuardianUserOutcome,
-    pub directive: Option<GuardianLaunchRecoveryDirective>,
-}
-
 pub fn guardian_prepare_failure_outcome(
     request: GuardianPrepareFailureRequest<'_>,
-) -> GuardianPrepareFailureOutcome {
+) -> GuardianLaunchFailureOutcome {
     let diagnosis = prepare_failure_diagnosis(&request);
     let safety_case = safety_case(request.mode, OperationPhase::Preparing, diagnosis);
     let guardian_decision = decide_guardian_policy(
@@ -88,7 +79,7 @@ pub fn guardian_prepare_failure_outcome(
     let user_outcome =
         prepare_failure_user_outcome(&request, &guardian_decision, directive.as_ref());
 
-    GuardianPrepareFailureOutcome {
+    GuardianLaunchFailureOutcome {
         failure_class: request.failure_class,
         safety_case,
         guardian_decision,
@@ -154,7 +145,7 @@ pub fn guardian_prelaunch_preset_adjustment_directive(
 
 pub fn guardian_startup_failure_outcome(
     request: GuardianStartupFailureRequest<'_>,
-) -> GuardianStartupFailureOutcome {
+) -> GuardianLaunchFailureOutcome {
     let failure_class = startup_failure_class(request.observation);
     let recovery_template = startup_recovery_template(&request, failure_class);
     let diagnosis = startup_failure_diagnosis(&request, failure_class, recovery_template.as_ref());
@@ -171,7 +162,7 @@ pub fn guardian_startup_failure_outcome(
         directive.as_ref(),
     );
 
-    GuardianStartupFailureOutcome {
+    GuardianLaunchFailureOutcome {
         failure_class,
         safety_case,
         guardian_decision,

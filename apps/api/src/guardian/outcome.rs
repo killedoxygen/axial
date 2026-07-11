@@ -1,7 +1,6 @@
 use super::{
-    GuardianArtifactRepairStatus, GuardianDecisionKind, GuardianLaunchRecoveryKind,
-    GuardianLaunchRecoveryPlan, GuardianPerformanceSupervisionRejection, GuardianRepairOutcome,
-    GuardianRepairStatus,
+    GuardianDecisionKind, GuardianLaunchRecoveryKind, GuardianLaunchRecoveryPlan,
+    GuardianPerformanceSupervisionRejection, GuardianRepairOutcome, GuardianRepairStatus,
 };
 use crate::state::contracts::OperationPhase;
 use serde::{Deserialize, Serialize};
@@ -48,17 +47,6 @@ pub fn install_artifact_repair_user_outcome(status: &str) -> GuardianUserOutcome
         details: detail.into_iter().map(str::to_string).collect(),
         guidance: Vec::new(),
     }
-}
-
-pub fn install_artifact_repair_user_outcome_from_status(
-    status: GuardianArtifactRepairStatus,
-) -> GuardianUserOutcome {
-    install_artifact_repair_user_outcome(match status {
-        GuardianArtifactRepairStatus::Repaired => "repaired",
-        GuardianArtifactRepairStatus::Blocked => "blocked",
-        GuardianArtifactRepairStatus::Failed => "failed",
-        GuardianArtifactRepairStatus::Suppressed => "suppressed",
-    })
 }
 
 pub fn install_failure_user_outcome(
@@ -281,14 +269,13 @@ fn persisted_state_load_outcome_copy(
 #[cfg(test)]
 mod tests {
     use super::{
-        install_artifact_repair_user_outcome, install_artifact_repair_user_outcome_from_status,
-        install_failure_user_outcome, launch_recovery_suppressed_user_outcome,
-        performance_supervision_rejection_user_outcome, persisted_state_load_user_outcome,
-        runtime_repair_user_outcome,
+        install_artifact_repair_user_outcome, install_failure_user_outcome,
+        launch_recovery_suppressed_user_outcome, performance_supervision_rejection_user_outcome,
+        persisted_state_load_user_outcome, runtime_repair_user_outcome,
     };
     use crate::guardian::{
-        DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianDecisionKind,
-        GuardianLaunchRecoveryDirective, GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind,
+        DiagnosisId, GuardianActionKind, GuardianDecisionKind, GuardianLaunchRecoveryDirective,
+        GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind,
         GuardianLaunchRecoveryPlanRequest, GuardianPerformanceSupervisionRejection,
         GuardianRepairOutcome, GuardianRepairStatus, plan_launch_recovery_directive,
     };
@@ -385,14 +372,6 @@ mod tests {
             assert_eq!(outcome.summary, summary);
             assert_eq!(outcome.details, vec![detail.to_string()]);
         }
-
-        assert_eq!(
-            install_artifact_repair_user_outcome_from_status(
-                GuardianArtifactRepairStatus::Suppressed
-            )
-            .summary,
-            "Guardian paused automatic install repair after repeated failure."
-        );
     }
 
     #[test]

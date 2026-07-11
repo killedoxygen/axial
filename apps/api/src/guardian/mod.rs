@@ -51,13 +51,12 @@ pub use jvm_preset::{
     normalize_create_jvm_preset,
 };
 pub use launch_decision::{
-    GuardianObservedLaunchFailurePhase, GuardianPrepareFailureOutcome,
+    GuardianLaunchFailureOutcome, GuardianObservedLaunchFailurePhase,
     GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
-    GuardianStartupFailureObservation, GuardianStartupFailureOutcome,
-    GuardianStartupFailureRequest, conservative_launch_recovery_preset,
-    guardian_observed_launch_failure_outcome, guardian_prelaunch_preset_adjustment_directive,
-    guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
-    is_guardian_launch_crash_class,
+    GuardianStartupFailureObservation, GuardianStartupFailureRequest,
+    conservative_launch_recovery_preset, guardian_observed_launch_failure_outcome,
+    guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
+    guardian_startup_failure_outcome, is_guardian_launch_crash_class,
 };
 pub use launch_failure_memory::{
     GuardianLaunchFailureMemoryIntakeRequest, launch_failure_memory_guardian_facts,
@@ -81,8 +80,7 @@ pub use model::{
     SafetyOutcome,
 };
 pub use outcome::{
-    GuardianUserOutcome, install_artifact_repair_user_outcome,
-    install_artifact_repair_user_outcome_from_status, install_failure_user_outcome,
+    GuardianUserOutcome, install_artifact_repair_user_outcome, install_failure_user_outcome,
     launch_recovery_public_action_label, launch_recovery_suppressed_user_outcome,
     performance_supervision_rejection_user_outcome, persisted_state_load_user_outcome,
     runtime_repair_user_outcome,
