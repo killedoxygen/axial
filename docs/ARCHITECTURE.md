@@ -153,7 +153,7 @@ flowchart TD
 ### Launch pipeline: backend detail
 ```mermaid
 flowchart TD
-    A[LaunchIntent] --> B[prepare_launch_attempt]
+    A[LaunchIntent] --> B[prepare_launch_attempt_with_events]
     B --> C[resolve_version]
     C --> D[emit ensuring_runtime]
     D --> E[runtime fact gathering]

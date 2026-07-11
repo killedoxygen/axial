@@ -7,8 +7,9 @@ use super::install::install_managed_runtime;
 use super::layout::runtime_cache_dir;
 use super::model::{
     JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureAction, RuntimeEnsureEvent,
-    RuntimeEnsureResult, RuntimeOverride, RuntimeRecord, RuntimeRequirement,
+    RuntimeEnsureResult, RuntimeOverride, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement,
 };
+use super::probe::JavaRuntimeProbeReceipt;
 use crate::launch::JavaVersion;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,7 +21,15 @@ pub async fn ensure_java_runtime(
     java_version: &JavaVersion,
     override_path: &str,
 ) -> Result<JavaRuntimeResult, JavaRuntimeLookupError> {
-    let result = ensure_runtime(library_dir, java_version, override_path, false).await?;
+    let result = ensure_runtime_with_events(
+        library_dir,
+        java_version,
+        override_path,
+        false,
+        None,
+        |_| {},
+    )
+    .await?;
     Ok(JavaRuntimeResult {
         path: result.effective.java_path,
         component: result.effective.id.0,
@@ -28,27 +37,12 @@ pub async fn ensure_java_runtime(
     })
 }
 
-pub async fn ensure_runtime(
-    library_dir: &Path,
-    java_version: &JavaVersion,
-    override_path: &str,
-    force_managed: bool,
-) -> Result<RuntimeEnsureResult, JavaRuntimeLookupError> {
-    ensure_runtime_with_events(
-        library_dir,
-        java_version,
-        override_path,
-        force_managed,
-        |_| {},
-    )
-    .await
-}
-
 pub async fn ensure_runtime_with_events<F>(
     library_dir: &Path,
     java_version: &JavaVersion,
     override_path: &str,
     force_managed: bool,
+    probe_receipt: Option<JavaRuntimeProbeReceipt>,
     mut observer: F,
 ) -> Result<RuntimeEnsureResult, JavaRuntimeLookupError>
 where
@@ -57,20 +51,33 @@ where
     let requirement = runtime_requirement(java_version);
     let requested_override = parse_runtime_override(override_path);
 
-    let requested = if force_managed {
-        None
+    let (requested, probe_usage) = if force_managed {
+        (None, RuntimeProbeUsage::default())
     } else {
         match &requested_override {
-            RuntimeOverride::None => None,
-            RuntimeOverride::Component(component) => Some(resolve_component_runtime(
-                library_dir,
-                component,
-                java_version.major_version,
-            )?),
-            RuntimeOverride::ExecutablePath(path) => Some(resolve_override_runtime(
-                path,
-                &requirement.preferred_component,
-            )?),
+            RuntimeOverride::None => (None, RuntimeProbeUsage::default()),
+            RuntimeOverride::Component(component) => (
+                Some(resolve_component_runtime(
+                    library_dir,
+                    component,
+                    java_version.major_version,
+                )?),
+                RuntimeProbeUsage::default(),
+            ),
+            RuntimeOverride::ExecutablePath(path) => {
+                let path = path.clone();
+                let preferred_component = requirement.preferred_component.clone();
+                let resolved = tokio::task::spawn_blocking(move || {
+                    resolve_override_runtime(&path, &preferred_component, probe_receipt)
+                })
+                .await
+                .map_err(|_| {
+                    JavaRuntimeLookupError::Probe(
+                        "java runtime probe task stopped unexpectedly".to_string(),
+                    )
+                })??;
+                (Some(resolved.record), resolved.probe_usage)
+            }
         }
     };
 
@@ -81,6 +88,7 @@ where
             bypassed_requested_runtime: false,
             install_performed: false,
             action: RuntimeEnsureAction::UseRequested,
+            probe_usage,
         });
     }
 
@@ -93,6 +101,7 @@ where
         bypassed_requested_runtime: false,
         install_performed: managed.install_performed,
         action: RuntimeEnsureAction::UseManaged,
+        probe_usage,
     })
 }
 struct ManagedEnsure {

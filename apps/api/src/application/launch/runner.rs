@@ -297,10 +297,11 @@ async fn launch_session_inner(
             }
             let _ = preparation_status_done_tx.send(());
         });
-        let prepared_result = prepare_launch_attempt_with_events(&intent, &attempt, move |event| {
-            let _ = preparation_event_sender.send(event);
-        })
-        .await;
+        let prepared_result =
+            prepare_launch_attempt_with_events(&intent, &attempt, None, move |event| {
+                let _ = preparation_event_sender.send(event);
+            })
+            .await;
         drop(preparation_event_tx);
         let _ = preparation_status_done_rx.await;
 

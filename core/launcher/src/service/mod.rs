@@ -17,8 +17,7 @@ pub use mapping::{
     launch_notice_from_values, launch_stage_label, launch_state_name, snapshot_status,
 };
 pub use prepare::{
-    LaunchPreparationEvent, prepare_launch_attempt, prepare_launch_attempt_with_events,
-    sanitize_effective_runtime_major,
+    LaunchPreparationEvent, prepare_launch_attempt_with_events, sanitize_effective_runtime_major,
 };
 
 #[derive(Debug, Clone)]
@@ -96,6 +95,8 @@ pub struct LaunchPreparationMetrics {
     pub runtime_ms: u128,
     pub planning_ms: u128,
     pub total_ms: u128,
+    pub java_probe_count: u8,
+    pub java_probe_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

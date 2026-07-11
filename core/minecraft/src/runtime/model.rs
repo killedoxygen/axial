@@ -101,6 +101,32 @@ pub enum RuntimeEnsureAction {
     UseManaged,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RuntimeProbeSource {
+    #[default]
+    None,
+    Fresh,
+    Receipt,
+    FreshAfterReceiptMismatch,
+}
+
+impl RuntimeProbeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Fresh => "fresh",
+            Self::Receipt => "receipt",
+            Self::FreshAfterReceiptMismatch => "fresh_after_receipt_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeProbeUsage {
+    pub spawn_count: u8,
+    pub source: RuntimeProbeSource,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeEnsureResult {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,6 +135,8 @@ pub struct RuntimeEnsureResult {
     pub bypassed_requested_runtime: bool,
     pub install_performed: bool,
     pub action: RuntimeEnsureAction,
+    #[serde(skip)]
+    pub probe_usage: RuntimeProbeUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

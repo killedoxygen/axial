@@ -1,7 +1,6 @@
-use crate::find_java_runtime;
-use crate::java::JavaRuntimeLookupError;
 use crate::launch::{JavaVersion, Library, maven_to_path};
 use crate::paths::{libraries_dir, versions_dir};
+use crate::{JavaRuntimeLookupError, find_java_runtime};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsStr;

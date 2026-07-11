@@ -11,7 +11,7 @@ use super::model::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeId, RuntimeInstallState,
     RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource,
 };
-use super::probe::probe_java_runtime_info;
+use super::probe::{JavaRuntimeProbeReceipt, probe_java_runtime_info, probe_java_runtime_receipt};
 use super::rosetta::rosetta_required_error_for_current_host;
 use crate::launch::{JavaVersion, java_component_for_major};
 use crate::paths::runtime_dirs;
@@ -112,7 +112,7 @@ pub fn find_java_runtime(
             resolve_component_runtime(library_dir, &component, java_version.major_version)?
         }
         RuntimeOverride::ExecutablePath(path) => {
-            resolve_override_runtime(&path, &requirement.preferred_component)?
+            resolve_override_runtime(&path, &requirement.preferred_component, None)?.record
         }
     };
 
@@ -230,30 +230,63 @@ pub(super) fn resolve_managed_runtime(
     resolve_component_runtime(library_dir, component, 0)
 }
 
+pub(super) struct ResolvedOverrideRuntime {
+    pub(super) record: RuntimeRecord,
+    pub(super) probe_usage: super::model::RuntimeProbeUsage,
+}
+
 pub(super) fn resolve_override_runtime(
     path: &Path,
     preferred_component: &RuntimeId,
-) -> Result<RuntimeRecord, JavaRuntimeLookupError> {
+    receipt: Option<JavaRuntimeProbeReceipt>,
+) -> Result<ResolvedOverrideRuntime, JavaRuntimeLookupError> {
     if !runtime_filesystem_path(path).as_ref().is_file() {
         return Err(JavaRuntimeLookupError::NotFound {
-            component: path.to_string_lossy().to_string(),
+            component: "external-java-override".to_string(),
             major: 0,
         });
     }
 
-    let info = probe_java_runtime_info(path, Some(preferred_component.as_str()))?;
-    Ok(RuntimeRecord {
-        id: preferred_component.clone(),
-        java_path: path.to_string_lossy().to_string(),
-        info,
-        source: RuntimeSource::ExternalOverride,
-        install_state: RuntimeInstallState::Ready,
-        root_dir: path
-            .parent()
-            .and_then(Path::parent)
-            .unwrap_or_else(|| Path::new(""))
-            .to_string_lossy()
-            .to_string(),
+    let receipt_supplied = receipt.is_some();
+    let (info, probe_usage) = match receipt {
+        Some(receipt) if receipt.matches_path(path).unwrap_or(false) => (
+            receipt.into_info(),
+            super::model::RuntimeProbeUsage {
+                spawn_count: 0,
+                source: super::model::RuntimeProbeSource::Receipt,
+            },
+        ),
+        _ => {
+            let receipt = probe_java_runtime_receipt(path, Some(preferred_component.as_str()))?;
+            (
+                receipt.into_info(),
+                super::model::RuntimeProbeUsage {
+                    spawn_count: 1,
+                    source: if receipt_supplied {
+                        super::model::RuntimeProbeSource::FreshAfterReceiptMismatch
+                    } else {
+                        super::model::RuntimeProbeSource::Fresh
+                    },
+                },
+            )
+        }
+    };
+    let canonical_path = PathBuf::from(&info.path);
+    Ok(ResolvedOverrideRuntime {
+        record: RuntimeRecord {
+            id: preferred_component.clone(),
+            java_path: info.path.clone(),
+            info,
+            source: RuntimeSource::ExternalOverride,
+            install_state: RuntimeInstallState::Ready,
+            root_dir: canonical_path
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or_else(|| Path::new(""))
+                .to_string_lossy()
+                .to_string(),
+        },
+        probe_usage,
     })
 }
 pub(super) fn inspect_component_runtime(base_dir: &Path, component: &str) -> Option<RuntimeRecord> {

@@ -8,7 +8,8 @@ use crate::jvm::{boot_throttle_args, gc_preset_args, recommended_preset};
 use crate::runtime::RuntimeSelection;
 use crate::types::LaunchFailureClass;
 use axial_minecraft::{
-    JavaRuntimeInfo, JavaVersion, RuntimeEnsureEvent, ensure_runtime_with_events, resolve_version,
+    JavaRuntimeInfo, JavaRuntimeProbeReceipt, JavaVersion, RuntimeEnsureEvent,
+    ensure_runtime_with_events, resolve_version,
 };
 use std::time::Instant;
 
@@ -21,16 +22,10 @@ pub enum LaunchPreparationEvent {
     Preparing,
 }
 
-pub async fn prepare_launch_attempt(
-    intent: &LaunchIntent,
-    attempt: &AttemptOverrides,
-) -> Result<PreparedLaunchAttempt, LaunchPreparationError> {
-    prepare_launch_attempt_with_events(intent, attempt, |_| {}).await
-}
-
 pub async fn prepare_launch_attempt_with_events<F>(
     intent: &LaunchIntent,
     attempt: &AttemptOverrides,
+    probe_receipt: Option<JavaRuntimeProbeReceipt>,
     mut observer: F,
 ) -> Result<PreparedLaunchAttempt, LaunchPreparationError>
 where
@@ -56,6 +51,7 @@ where
         &version.java_version,
         &intent.requested_java,
         attempt.force_managed_runtime,
+        probe_receipt,
         |event| observer(launch_preparation_event_for_runtime_event(event)),
     )
     .await
@@ -74,6 +70,7 @@ where
         }),
     })?;
     let runtime_ms = runtime_started_at.elapsed().as_millis();
+    let probe_usage = ensured_runtime.probe_usage;
 
     if intent.guardian.has_java_override()
         && let Some(requested_runtime) = ensured_runtime.requested.as_ref()
@@ -230,6 +227,8 @@ where
             runtime_ms,
             planning_ms,
             total_ms: started_at.elapsed().as_millis(),
+            java_probe_count: probe_usage.spawn_count,
+            java_probe_source: probe_usage.source.as_str().to_string(),
         },
     })
 }
@@ -404,14 +403,19 @@ mod tests {
                 performance_mode: "managed".to_string(),
             };
 
-            let prepared = prepare_launch_attempt(&intent, &AttemptOverrides::default())
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "prepare failed for {} Fabric {}: {}",
-                        target.family, target.minecraft_version, error.message
-                    )
-                });
+            let prepared = prepare_launch_attempt_with_events(
+                &intent,
+                &AttemptOverrides::default(),
+                None,
+                |_| {},
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "prepare failed for {} Fabric {}: {}",
+                    target.family, target.minecraft_version, error.message
+                )
+            });
 
             let plan = prepared.plan;
             assert_eq!(
@@ -538,9 +542,10 @@ mod tests {
             performance_mode: "managed".to_string(),
         };
 
-        let prepared = prepare_launch_attempt(&intent, &AttemptOverrides::default())
-            .await
-            .expect("prepared launch");
+        let prepared =
+            prepare_launch_attempt_with_events(&intent, &AttemptOverrides::default(), None, |_| {})
+                .await
+                .expect("prepared launch");
 
         assert_arg_value(&prepared.plan.game_args, "--username", "Player");
         assert_arg_value(
@@ -613,9 +618,10 @@ mod tests {
             performance_mode: "managed".to_string(),
         };
 
-        let prepared = prepare_launch_attempt(&intent, &AttemptOverrides::default())
-            .await
-            .expect("core preparation preserves explicit Custom preset intent");
+        let prepared =
+            prepare_launch_attempt_with_events(&intent, &AttemptOverrides::default(), None, |_| {})
+                .await
+                .expect("core preparation preserves explicit Custom preset intent");
 
         assert_eq!(prepared.effective_preset, crate::jvm::PRESET_SMOOTH);
         assert!(prepared.guardian_interventions.is_empty());
@@ -703,9 +709,10 @@ mod tests {
             performance_mode: "managed".to_string(),
         };
 
-        let prepared = prepare_launch_attempt(&intent, &AttemptOverrides::default())
-            .await
-            .expect("prepared launch");
+        let prepared =
+            prepare_launch_attempt_with_events(&intent, &AttemptOverrides::default(), None, |_| {})
+                .await
+                .expect("prepared launch");
 
         assert_arg_value(&prepared.plan.game_args, "--username", "ProfileName");
         assert_arg_value(
@@ -781,12 +788,16 @@ mod tests {
         };
         let mut events = Vec::new();
 
-        let prepared =
-            prepare_launch_attempt_with_events(&intent, &AttemptOverrides::default(), |event| {
+        let prepared = prepare_launch_attempt_with_events(
+            &intent,
+            &AttemptOverrides::default(),
+            None,
+            |event| {
                 events.push(event);
-            })
-            .await
-            .expect("prepared launch");
+            },
+        )
+        .await
+        .expect("prepared launch");
 
         assert_eq!(prepared.runtime.effective_source, "override");
         assert_eq!(
@@ -799,6 +810,150 @@ mod tests {
             ]
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preflight_receipt_reuses_java_info_without_a_second_probe_spawn() {
+        let root = unique_temp_root("axial-prepare-java-receipt-reuse");
+        let counter = root.join("probe-count");
+        let java_path = root.join("fake-java").join("bin").join("java");
+        write_counting_java(&java_path, &counter, 21);
+        let intent = write_receipt_test_intent(&root, &java_path);
+        let receipt = axial_minecraft::probe_java_runtime_receipt(&java_path, None)
+            .expect("preflight Java receipt");
+
+        let prepared = prepare_launch_attempt_with_events(
+            &intent,
+            &AttemptOverrides::default(),
+            Some(receipt),
+            |_| {},
+        )
+        .await
+        .expect("receipt-backed launch preparation");
+
+        assert_eq!(
+            fs::read_to_string(&counter).expect("probe count").trim(),
+            "1"
+        );
+        assert_eq!(prepared.metrics.java_probe_count, 0);
+        assert_eq!(prepared.metrics.java_probe_source, "receipt");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replaced_java_invalidates_receipt_and_fails_before_launch_planning() {
+        let root = unique_temp_root("axial-prepare-java-receipt-replacement");
+        let counter = root.join("probe-count");
+        let java_path = root.join("fake-java").join("bin").join("java");
+        write_counting_java(&java_path, &counter, 21);
+        let intent = write_receipt_test_intent(&root, &java_path);
+        let receipt = axial_minecraft::probe_java_runtime_receipt(&java_path, None)
+            .expect("preflight Java receipt");
+        let replacement = java_path.with_file_name("java-replacement");
+        write_counting_java(&replacement, &counter, 17);
+        fs::rename(&replacement, &java_path).expect("replace Java executable");
+
+        let error = prepare_launch_attempt_with_events(
+            &intent,
+            &AttemptOverrides::default(),
+            Some(receipt),
+            |_| {},
+        )
+        .await
+        .expect_err("changed Java must be freshly probed and rejected");
+
+        assert_eq!(
+            error.failure_class,
+            Some(LaunchFailureClass::JavaRuntimeMismatch)
+        );
+        assert_eq!(
+            fs::read_to_string(&counter).expect("probe count").trim(),
+            "2"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relative_java_override_prepares_an_absolute_command_for_a_different_game_dir() {
+        let working_dir = std::env::current_dir().expect("working directory");
+        let root = working_dir.join(format!(
+            "target/axial-relative-java-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let counter = root.join("probe-count");
+        let java_path = root.join("fake-java").join("bin").join("java");
+        write_counting_java(&java_path, &counter, 21);
+        let relative_java = java_path
+            .strip_prefix(&working_dir)
+            .expect("Java under working directory");
+        let intent = write_receipt_test_intent(&root, relative_java);
+        let receipt = axial_minecraft::probe_java_runtime_receipt(relative_java, None)
+            .expect("relative Java receipt");
+
+        let prepared = prepare_launch_attempt_with_events(
+            &intent,
+            &AttemptOverrides::default(),
+            Some(receipt),
+            |_| {},
+        )
+        .await
+        .expect("relative receipt-backed launch preparation");
+
+        let absolute_java = std::path::absolute(relative_java).expect("absolute Java path");
+        let absolute_java_string = absolute_java.to_string_lossy().to_string();
+        assert_eq!(
+            prepared.plan.command.first().map(String::as_str),
+            Some(absolute_java_string.as_str())
+        );
+        assert_eq!(prepared.plan.game_dir, root.join("instances/receipt-test"));
+        assert_ne!(prepared.plan.game_dir, absolute_java);
+        assert_eq!(prepared.metrics.java_probe_source, "receipt");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removing_execute_permission_invalidates_java_receipt() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = unique_temp_root("axial-prepare-java-receipt-permission");
+        let counter = root.join("probe-count");
+        let java_path = root.join("fake-java").join("bin").join("java");
+        write_counting_java(&java_path, &counter, 21);
+        let intent = write_receipt_test_intent(&root, &java_path);
+        let receipt = axial_minecraft::probe_java_runtime_receipt(&java_path, None)
+            .expect("preflight Java receipt");
+        let mut permissions = fs::metadata(&java_path)
+            .expect("Java metadata")
+            .permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&java_path, permissions).expect("remove execute permission");
+
+        let error = prepare_launch_attempt_with_events(
+            &intent,
+            &AttemptOverrides::default(),
+            Some(receipt),
+            |_| {},
+        )
+        .await
+        .expect_err("non-executable Java must not reuse a healthy receipt");
+
+        assert_eq!(
+            error.failure_class,
+            Some(LaunchFailureClass::JavaRuntimeMismatch)
+        );
+        assert_eq!(
+            fs::read_to_string(&counter).expect("probe count").trim(),
+            "1"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -888,6 +1043,79 @@ echo 'openjdk version "21.0.3" 2024-04-16' >&2
             fs::set_permissions(&java_path, permissions).expect("fake java permissions");
         }
         java_path
+    }
+
+    #[cfg(unix)]
+    fn write_counting_java(path: &Path, counter: &Path, major: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::create_dir_all(path.parent().expect("counting Java parent"))
+            .expect("counting Java directory");
+        fs::write(
+            path,
+            format!(
+                "#!/bin/sh\ncount=0\nif [ -f '{counter}' ]; then count=$(cat '{counter}'); fi\necho $((count + 1)) > '{counter}'\necho 'java.vendor = OpenJDK' >&2\necho 'openjdk version \"{major}.0.3\"' >&2\n",
+                counter = counter.display(),
+            ),
+        )
+        .expect("counting Java");
+        let mut permissions = fs::metadata(path)
+            .expect("counting Java metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("counting Java permissions");
+    }
+
+    fn write_receipt_test_intent(root: &Path, java_path: &Path) -> LaunchIntent {
+        let library_dir = root.join("library");
+        let game_dir = root.join("instances").join("receipt-test");
+        let version_id = "receipt-test";
+        let version_dir = library_dir.join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("receipt version dir");
+        fs::create_dir_all(&game_dir).expect("receipt game dir");
+        fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
+            .expect("receipt client jar");
+        write_version_json(
+            &version_dir.join(format!("{version_id}.json")),
+            serde_json::json!({
+                "id": version_id,
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "javaVersion": {
+                    "component": "java-runtime-delta",
+                    "majorVersion": 21
+                },
+                "assetIndex": { "id": "receipt-assets" },
+                "arguments": { "jvm": [], "game": [] },
+                "libraries": []
+            }),
+        );
+        LaunchIntent {
+            session_id: "receipt-test".to_string(),
+            library_dir,
+            instance_id: "receipt-test".to_string(),
+            version_id: version_id.to_string(),
+            target_version_id: version_id.to_string(),
+            loader: "vanilla".to_string(),
+            is_modded: false,
+            username: "Player".to_string(),
+            auth: LaunchAuthContext::offline("Player"),
+            requested_java: java_path.to_string_lossy().to_string(),
+            requested_preset: String::new(),
+            extra_jvm_args: Vec::new(),
+            max_memory_mb: 2048,
+            min_memory_mb: 512,
+            resolution: None,
+            launcher_name: "axial".to_string(),
+            launcher_version: "test".to_string(),
+            game_dir: Some(game_dir),
+            guardian: LaunchGuardianContext {
+                mode: GuardianMode::Custom,
+                java_override_origin: Some(OverrideOrigin::Instance),
+                ..LaunchGuardianContext::default()
+            },
+            performance_mode: "managed".to_string(),
+        }
     }
 
     fn write_fabric_version(library_dir: &Path, target: RepresentativeTarget) -> String {

@@ -21,13 +21,13 @@ pub use discovery::{
     runtime_component_ready_without_probe, runtime_executable_ready_without_probe,
     runtime_requirement,
 };
-pub use ensure::{ensure_java_runtime, ensure_runtime, ensure_runtime_with_events};
+pub use ensure::{ensure_java_runtime, ensure_runtime_with_events};
 pub use model::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureAction,
     RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride,
-    RuntimeRecord, RuntimeRequirement, RuntimeSource,
+    RuntimeProbeSource, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource,
 };
-pub use probe::probe_java_runtime_info;
+pub use probe::{JavaRuntimeProbeReceipt, probe_java_runtime_info, probe_java_runtime_receipt};
 
 #[cfg(test)]
 use discovery::{detect_runtime_state, resolve_component_runtime_from_roots};

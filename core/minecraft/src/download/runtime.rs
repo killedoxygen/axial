@@ -27,7 +27,7 @@ pub(super) fn spawn_runtime_ensure_pipeline(
         let mut plan_contribution_resolved = false;
         let mut plan_done_seen = 0_u64;
         let ensure_result =
-            ensure_runtime_with_events(&mc_dir, &java_version, "", false, |event| {
+            ensure_runtime_with_events(&mc_dir, &java_version, "", false, None, |event| {
                 match &event {
                     RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
                         bytes_done,
