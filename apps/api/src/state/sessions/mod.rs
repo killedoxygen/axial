@@ -274,15 +274,19 @@ struct PendingUserStop {
     request: Option<supervisor::ProcessTerminationRequest>,
     lifecycle_guard: Option<OwnedMutexGuard<()>>,
     prior_terminal_sequence: Option<Option<u64>>,
+    acceptance_rejected: bool,
 }
 
 impl PendingUserStop {
     async fn accepted(&mut self) -> std::io::Result<supervisor::ProcessTerminationAcceptance> {
-        self.request
+        let acceptance = self
+            .request
             .as_mut()
             .expect("pending user stop request was already settled")
             .accepted()
-            .await
+            .await;
+        self.acceptance_rejected = acceptance.is_err();
+        acceptance
     }
 
     async fn publish_intent(
@@ -314,7 +318,7 @@ impl PendingUserStop {
     }
 
     async fn rollback_rejection(&mut self) {
-        if let Some(prior_terminal_sequence) = self.prior_terminal_sequence.take() {
+        if let Some(prior_terminal_sequence) = self.prior_terminal_sequence {
             self.store
                 .rollback_user_stop_retention_for_attempt(
                     &self.session_id,
@@ -322,16 +326,18 @@ impl PendingUserStop {
                     prior_terminal_sequence,
                 )
                 .await;
+            self.prior_terminal_sequence = None;
         }
         self.disarm_request();
         self.release_lifecycle_guard();
     }
 
     async fn release_retention(&mut self) {
-        if self.prior_terminal_sequence.take().is_some() {
+        if self.prior_terminal_sequence.is_some() {
             self.store
                 .release_terminal_retention_hold_for_attempt(&self.session_id, &self.attempt)
                 .await;
+            self.prior_terminal_sequence = None;
         }
     }
 
@@ -359,7 +365,21 @@ impl Drop for PendingUserStop {
         let attempt = self.attempt.clone();
         let lifecycle_guard = self.lifecycle_guard.take();
         let prior_terminal_sequence = self.prior_terminal_sequence.take();
+        let acceptance_rejected = self.acceptance_rejected;
         tokio::spawn(async move {
+            if acceptance_rejected {
+                if let Some(prior_terminal_sequence) = prior_terminal_sequence {
+                    store
+                        .rollback_user_stop_retention_for_attempt(
+                            &session_id,
+                            &attempt,
+                            prior_terminal_sequence,
+                        )
+                        .await;
+                }
+                drop(lifecycle_guard);
+                return;
+            }
             match request.accepted().await {
                 Ok(acceptance) => {
                     if user_stop_was_accepted(acceptance) {
@@ -1186,6 +1206,7 @@ impl SessionStore {
             request: Some(process.terminate(supervisor::ProcessTerminalCause::UserStop)),
             lifecycle_guard: Some(lifecycle_guard),
             prior_terminal_sequence: None,
+            acceptance_rejected: false,
         };
         let acceptance = match stop.accepted().await {
             Ok(acceptance) => acceptance,
@@ -1338,6 +1359,7 @@ impl SessionStore {
             request: Some(process.terminate(supervisor::ProcessTerminalCause::UserStop)),
             lifecycle_guard: Some(lifecycle_guard),
             prior_terminal_sequence: Some(prior_terminal_sequence),
+            acceptance_rejected: false,
         };
         let acceptance = match stop.accepted().await {
             Ok(acceptance) => acceptance,
@@ -1349,13 +1371,13 @@ impl SessionStore {
         let Some(record) = stop.publish_intent(acceptance).await else {
             stop.release_lifecycle_guard();
             let _ = stop.reaped().await;
-            stop.disarm_request();
             stop.release_retention().await;
+            stop.disarm_request();
             return Err(SessionStopError::NoLiveProcess);
         };
         if let Err(error) = stop.reaped().await {
-            stop.disarm_request();
             stop.release_retention().await;
+            stop.disarm_request();
             stop.release_lifecycle_guard();
             return Err(SessionStopError::Process(error));
         }
@@ -4494,6 +4516,143 @@ mod tests {
             Some(LaunchSessionExitReason::LauncherStopped)
         );
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn cancelled_user_stop_reap_error_keeps_blocked_retention_cleanup_owned() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "cancelled-stop-reap-error-cleanup";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let (attempt, prior_terminal_sequence) = {
+            let mut sessions = store.sessions.write().await;
+            let entry = sessions.get_mut(session_id).expect("session");
+            entry.retention_holds = entry
+                .retention_holds
+                .checked_add(1)
+                .expect("retention hold count");
+            let prior_terminal_sequence = entry.terminal_sequence;
+            entry.terminal_sequence = None;
+            (entry.attempt.clone(), prior_terminal_sequence)
+        };
+        let lifecycle_guard = store.lifecycle_transition.clone().lock_owned().await;
+        let mut gated = supervisor::gated_termination_control();
+        let request = gated
+            .handle
+            .terminate(supervisor::ProcessTerminalCause::UserStop);
+        gated.capture_user_stop_request().await;
+        let mut stop = PendingUserStop {
+            store: store.clone(),
+            session_id: session_id.to_string(),
+            attempt,
+            request: Some(request),
+            lifecycle_guard: Some(lifecycle_guard),
+            prior_terminal_sequence: Some(prior_terminal_sequence),
+            acceptance_rejected: false,
+        };
+        gated.accept_user_stop();
+        let acceptance = stop.accepted().await.expect("accepted user stop");
+        stop.publish_intent(acceptance)
+            .await
+            .expect("current user-stop attempt");
+        gated.publish_user_stop_reap(Err(std::io::Error::other("injected reap failure")));
+        stop.reaped().await.expect_err("errored user-stop reap");
+
+        let sessions = store.sessions.write().await;
+        let (cleanup_started, cleanup_started_rx) = tokio::sync::oneshot::channel();
+        let cleanup = tokio::spawn(async move {
+            let _ = cleanup_started.send(());
+            stop.release_retention().await;
+            stop.disarm_request();
+            stop.release_lifecycle_guard();
+        });
+        cleanup_started_rx.await.expect("cleanup started");
+        cleanup.abort();
+        assert!(cleanup.await.expect_err("cancelled cleanup").is_cancelled());
+        drop(sessions);
+
+        let lifecycle = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.lifecycle_transition.clone().lock_owned(),
+        )
+        .await
+        .expect("detached cleanup deadline");
+        assert_eq!(store.retention_hold_count(session_id).await, Some(1));
+        assert_eq!(user_stop_evidence_count(&store, session_id).await, 1);
+        drop(lifecycle);
+    }
+
+    #[tokio::test]
+    async fn cancelled_user_stop_rejection_keeps_blocked_rollback_owned() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "cancelled-stop-rejection-cleanup";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let prior_terminal_sequence = Some(17);
+        let attempt = {
+            let mut sessions = store.sessions.write().await;
+            let entry = sessions.get_mut(session_id).expect("session");
+            entry.retention_holds = entry
+                .retention_holds
+                .checked_add(1)
+                .expect("retention hold count");
+            entry.terminal_sequence = None;
+            entry.attempt.clone()
+        };
+        let lifecycle_guard = store.lifecycle_transition.clone().lock_owned().await;
+        let mut gated = supervisor::gated_termination_control();
+        let request = gated
+            .handle
+            .terminate(supervisor::ProcessTerminalCause::UserStop);
+        gated.capture_user_stop_request().await;
+        let mut stop = PendingUserStop {
+            store: store.clone(),
+            session_id: session_id.to_string(),
+            attempt,
+            request: Some(request),
+            lifecycle_guard: Some(lifecycle_guard),
+            prior_terminal_sequence: Some(prior_terminal_sequence),
+            acceptance_rejected: false,
+        };
+        gated.reject_user_stop(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected user-stop rejection",
+        ));
+        stop.accepted().await.expect_err("rejected user stop");
+
+        let sessions = store.sessions.write().await;
+        let (rollback_started, rollback_started_rx) = tokio::sync::oneshot::channel();
+        let rollback = tokio::spawn(async move {
+            let _ = rollback_started.send(());
+            stop.rollback_rejection().await;
+        });
+        rollback_started_rx.await.expect("rollback started");
+        rollback.abort();
+        assert!(
+            rollback
+                .await
+                .expect_err("cancelled rollback")
+                .is_cancelled()
+        );
+        drop(sessions);
+
+        let lifecycle = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.lifecycle_transition.clone().lock_owned(),
+        )
+        .await
+        .expect("detached rollback deadline");
+        let sessions = store.sessions.read().await;
+        let entry = sessions.get(session_id).expect("session");
+        assert_eq!(entry.retention_holds, 1);
+        assert_eq!(entry.terminal_sequence, prior_terminal_sequence);
+        assert!(!entry.stop_requested);
+        drop(sessions);
+        drop(lifecycle);
     }
 
     #[cfg(unix)]

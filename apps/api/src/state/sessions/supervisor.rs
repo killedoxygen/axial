@@ -379,6 +379,14 @@ impl GatedTerminationControl {
             .ok();
     }
 
+    pub(super) fn reject_user_stop(&mut self, error: io::Error) {
+        self.pending_acceptance
+            .take()
+            .expect("captured termination acceptance")
+            .send(Err(error))
+            .ok();
+    }
+
     pub(super) fn publish_user_stop_reap(&self, result: io::Result<()>) {
         self.reaped.send_replace(Some(ProcessReap {
             cause: Some(ProcessTerminalCause::UserStop),
