@@ -91,6 +91,18 @@ fn compare_app_versions(left: &AppVersion, right: &AppVersion) -> std::cmp::Orde
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (Some(_), None) => std::cmp::Ordering::Less,
-        (Some(left), Some(right)) => left.cmp(right),
+        (Some(left), Some(right)) => prerelease_channel_rank(left)
+            .cmp(&prerelease_channel_rank(right))
+            .then_with(|| left.cmp(right)),
+    }
+}
+
+fn prerelease_channel_rank(pre_release: &str) -> u8 {
+    match pre_release.split('.').next().unwrap_or_default() {
+        "dev" => 0,
+        "alpha" => 1,
+        "beta" => 2,
+        "rc" => 3,
+        _ => 0,
     }
 }

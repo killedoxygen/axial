@@ -9,7 +9,11 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
-const USER_AGENT: &str = "axial/0.4.0-alpha (github.com/mateoltd/axial)";
+const USER_AGENT: &str = concat!(
+    "axial/",
+    env!("CARGO_PKG_VERSION"),
+    " (github.com/mateoltd/axial)"
+);
 const RATE_LIMIT_BODY_LIMIT: usize = 4096;
 const MAX_MODRINTH_VERSION_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MODRINTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

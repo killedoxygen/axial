@@ -144,7 +144,7 @@ fn select_newest_release(releases: Vec<GithubRelease>) -> Option<GithubRelease> 
     releases
         .into_iter()
         .filter_map(|release| parse_semver(&release.tag_name).map(|version| (version, release)))
-        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .max_by(|(left, _), (right, _)| compare_versions(left, right))
         .map(|(_, release)| release)
 }
 
@@ -390,8 +390,38 @@ fn sane_release_asset_url(
 
 fn is_version_greater(candidate: &str, current: &str) -> bool {
     match (parse_semver(candidate), parse_semver(current)) {
-        (Some(candidate), Some(current)) => candidate > current,
+        (Some(candidate), Some(current)) => compare_versions(&candidate, &current).is_gt(),
         _ => false,
+    }
+}
+
+fn compare_versions(left: &semver::Version, right: &semver::Version) -> std::cmp::Ordering {
+    for ordering in [
+        left.major.cmp(&right.major),
+        left.minor.cmp(&right.minor),
+        left.patch.cmp(&right.patch),
+    ] {
+        if !ordering.is_eq() {
+            return ordering;
+        }
+    }
+    match (left.pre.is_empty(), right.pre.is_empty()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => prerelease_channel_rank(left.pre.as_str())
+            .cmp(&prerelease_channel_rank(right.pre.as_str()))
+            .then_with(|| left.pre.cmp(&right.pre)),
+    }
+}
+
+fn prerelease_channel_rank(pre_release: &str) -> u8 {
+    match pre_release.split('.').next().unwrap_or_default() {
+        "dev" => 0,
+        "alpha" => 1,
+        "beta" => 2,
+        "rc" => 3,
+        _ => 0,
     }
 }
 
@@ -430,6 +460,8 @@ mod tests {
         assert!(is_version_greater("1.2.4-beta", "1.2.3"));
         assert!(is_version_greater("1.2.4+build", "1.2.3"));
         assert!(is_version_greater("1.2.4-rc.2", "1.2.4-rc.1"));
+        assert!(is_version_greater("1.2.4-dev.2", "1.2.4-dev.1"));
+        assert!(is_version_greater("1.2.4-alpha.1", "1.2.4-dev.1"));
         assert!(!is_version_greater("1.2.4-alpha", "1.2.4"));
         assert!(!is_version_greater("release-1.2.4", "1.2.3"));
         assert!(!is_version_greater("1.2.4", "dev"));
@@ -449,35 +481,35 @@ mod tests {
                 assets: Vec::new(),
             },
             GithubRelease {
-                tag_name: "v0.4.0-alpha".to_string(),
+                tag_name: "v0.4.0-dev.1".to_string(),
                 html_url: String::new(),
                 assets: Vec::new(),
             },
             GithubRelease {
-                tag_name: "v0.4.0-alpha.2".to_string(),
+                tag_name: "v0.4.0-dev.2".to_string(),
                 html_url: String::new(),
                 assets: Vec::new(),
             },
         ])
         .expect("a semver-tagged release");
-        assert_eq!(selected.tag_name, "v0.4.0-alpha.2");
+        assert_eq!(selected.tag_name, "v0.4.0-dev.2");
     }
 
     #[test]
     fn prerelease_asset_urls_validate_against_hyphenated_version() {
         let asset_url = matching_release_asset_url(
             &[release_asset(
-                "axial-linux-amd64-0.4.0-alpha.tar.gz",
-                "https://github.com/mateoltd/axial/releases/download/v0.4.0-alpha/axial-linux-amd64-0.4.0-alpha.tar.gz",
+                "axial-linux-amd64-0.4.0-dev.1.tar.gz",
+                "https://github.com/mateoltd/axial/releases/download/v0.4.0-dev.1/axial-linux-amd64-0.4.0-dev.1.tar.gz",
             )],
-            "0.4.0-alpha",
+            "0.4.0-dev.1",
             "linux",
             "x86_64",
         )
         .expect("hyphenated prerelease asset should validate");
         assert_eq!(
             asset_url,
-            "https://github.com/mateoltd/axial/releases/download/v0.4.0-alpha/axial-linux-amd64-0.4.0-alpha.tar.gz"
+            "https://github.com/mateoltd/axial/releases/download/v0.4.0-dev.1/axial-linux-amd64-0.4.0-dev.1.tar.gz"
         );
     }
 

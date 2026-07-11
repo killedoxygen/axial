@@ -55,6 +55,11 @@ jobs:
             exit 1
           fi
 
+          node -e "const version = process.argv[1]; if (!/^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$/.test(version)) process.exit(1)" "$TAG_VERSION" || {
+            echo "Release version '$TAG_VERSION' is not valid SemVer." >&2
+            exit 1
+          }
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -140,6 +145,7 @@ jobs:
       - name: Upload linux release asset
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             dist/axial-linux-amd64-*.tar.gz
             dist/axial-linux-amd64-*.tar.gz.sha256
@@ -190,6 +196,7 @@ jobs:
       - name: Upload windows release asset
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             dist/axial-windows-amd64-*.zip
             dist/axial-windows-amd64-*.zip.sha256

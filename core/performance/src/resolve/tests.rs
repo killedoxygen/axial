@@ -711,6 +711,18 @@ fn validation_accepts_current_and_older_minimum_app_versions() {
 }
 
 #[test]
+fn app_version_lifecycle_orders_dev_before_alpha_beta_and_rc() {
+    for running in ["0.4.0-alpha.1", "0.4.0-beta.1", "0.4.0-rc.1", "0.4.0"] {
+        validate_app_version_compatibility_with_running("0.4.0-dev.1", running)
+            .expect("later lifecycle should accept dev rules");
+    }
+
+    assert!(
+        validate_app_version_compatibility_with_running("0.4.0-alpha.1", "0.4.0-dev.1").is_err()
+    );
+}
+
+#[test]
 fn validation_rejects_invalid_running_app_version_without_panicking() {
     assert_error_kind(
         validate_app_version_compatibility_with_running("0.4.0-alpha", "development-build"),
