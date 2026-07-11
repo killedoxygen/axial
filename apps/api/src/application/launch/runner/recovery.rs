@@ -1,9 +1,11 @@
 use super::trace_launch_event;
 use crate::guardian::{
-    GuardianLaunchRecoveryDirective, GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind,
-    GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
+    GuardianLaunchRecoveryCurrentIntent, GuardianLaunchRecoveryDirective,
+    GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind, GuardianLaunchRecoveryOutcome,
+    GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
     GuardianLaunchRecoveryPlanRequest, GuardianLaunchRecoveryRecordRequest, GuardianUserOutcome,
-    launch_recovery_public_action_label, launch_recovery_suppressed_user_outcome,
+    launch_recovery_diagnosis_id, launch_recovery_public_action_label,
+    launch_recovery_suppressed_user_outcome, launch_recovery_user_intent_fingerprint,
     plan_launch_recovery_directive, record_launch_recovery_attempt, record_launch_recovery_failure,
     record_launch_recovery_success,
 };
@@ -30,7 +32,15 @@ pub(super) fn plan_guardian_launch_recovery_directive(
     mode: crate::guardian::GuardianMode,
     failure_class: LaunchFailureClass,
 ) -> Result<GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection> {
-    let user_intent_hash = launch_recovery_user_intent_hash(intent, directive.kind);
+    let user_intent_hash = launch_recovery_user_intent_fingerprint(
+        GuardianLaunchRecoveryCurrentIntent {
+            target_version_id: &intent.target_version_id,
+            explicit_java_override_present: intent.guardian.has_java_override(),
+            explicit_jvm_args_present: intent.guardian.has_raw_jvm_args(),
+            explicit_jvm_preset_present: intent.guardian.has_named_preset(),
+        },
+        directive.kind,
+    );
     plan_launch_recovery_directive(GuardianLaunchRecoveryPlanRequest {
         instance_id: &intent.instance_id,
         mode,
@@ -322,14 +332,17 @@ fn launch_recovery_entry_matches(
         | LaunchRecoveryJournalTransition::Success(failure_class)
         | LaunchRecoveryJournalTransition::Failure(failure_class) => failure_class,
     };
-    let diagnosis_id = launch_recovery_diagnosis_id(plan, failure_class);
+    let diagnosis_id = launch_recovery_diagnosis_id(plan.directive.kind, failure_class);
     let identity_matches = entry.operation_id == plan.operation_id
         && entry.command == CommandKind::LaunchInstance
         && entry.owner == StabilizationSystem::Guardian
         && entry.ownership == plan.target.ownership
         && entry.targets == [plan.target.clone()]
         && entry.planned_steps == [planned_step]
-        && entry.guardian_diagnosis_ids.contains(&diagnosis_id);
+        && entry
+            .guardian_diagnosis_ids
+            .iter()
+            .any(|stored| stored == diagnosis_id.as_str());
     if !identity_matches {
         return false;
     }
@@ -390,61 +403,6 @@ fn launch_recovery_step_id(plan: &GuardianLaunchRecoveryPlan) -> &'static str {
         GuardianLaunchRecoveryKind::DowngradePreset => "launch_recovery_downgrade_preset",
         GuardianLaunchRecoveryKind::DisableCustomGc => "launch_recovery_disable_custom_gc",
     }
-}
-
-fn launch_recovery_diagnosis_id(
-    plan: &GuardianLaunchRecoveryPlan,
-    failure_class: LaunchFailureClass,
-) -> String {
-    match (plan.directive.kind, failure_class) {
-        (GuardianLaunchRecoveryKind::SwitchManagedRuntime, _) => "java_runtime_recovery",
-        (
-            GuardianLaunchRecoveryKind::StripRawJvmArgs
-            | GuardianLaunchRecoveryKind::DisableCustomGc,
-            LaunchFailureClass::JvmUnsupportedOption
-            | LaunchFailureClass::JvmExperimentalUnlock
-            | LaunchFailureClass::JvmOptionOrdering,
-        ) => "jvm_arg_unsupported",
-        (GuardianLaunchRecoveryKind::DowngradePreset, _) => "jvm_preset_recovery",
-        _ => "launch_startup_recovery",
-    }
-    .to_string()
-}
-
-fn launch_recovery_user_intent_hash(
-    intent: &axial_launcher::LaunchIntent,
-    kind: GuardianLaunchRecoveryKind,
-) -> String {
-    let override_marker = match kind {
-        GuardianLaunchRecoveryKind::SwitchManagedRuntime => {
-            if intent.guardian.has_java_override() {
-                "java_override_present"
-            } else {
-                "java_override_absent"
-            }
-        }
-        GuardianLaunchRecoveryKind::StripRawJvmArgs => {
-            if intent.guardian.has_raw_jvm_args() {
-                "raw_jvm_args_present"
-            } else {
-                "raw_jvm_args_absent"
-            }
-        }
-        GuardianLaunchRecoveryKind::DowngradePreset
-        | GuardianLaunchRecoveryKind::DisableCustomGc => {
-            if intent.guardian.has_named_preset() {
-                "jvm_preset_present"
-            } else {
-                "jvm_preset_recommended"
-            }
-        }
-    };
-    let version_marker = if intent.target_version_id.trim().is_empty() {
-        "unknown_version"
-    } else {
-        intent.target_version_id.trim()
-    };
-    format!("{override_marker}:{version_marker}")
 }
 
 pub(super) fn suppressed_launch_recovery_outcome(

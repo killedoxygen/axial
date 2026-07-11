@@ -64,15 +64,20 @@ pub use launch_decision::{
     guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
     is_guardian_launch_crash_class,
 };
-pub use launch_failure_memory::record_launch_failure_observation;
+pub use launch_failure_memory::{
+    GuardianLaunchFailureMemoryIntakeRequest, launch_failure_memory_guardian_facts,
+    record_launch_failure_observation,
+};
 pub use launch_recovery::{
-    GuardianLaunchRecoveryActionTemplate, GuardianLaunchRecoveryDirective,
-    GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryExecutor, GuardianLaunchRecoveryKind,
-    GuardianLaunchRecoveryMutation, GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryPlan,
-    GuardianLaunchRecoveryPlanRejection, GuardianLaunchRecoveryPlanRequest,
-    GuardianLaunchRecoveryRecordRequest, GuardianLaunchRecoveryReversibility,
-    GuardianLaunchRecoveryStatus, plan_launch_recovery_directive, record_launch_recovery_attempt,
-    record_launch_recovery_failure, record_launch_recovery_success,
+    GuardianLaunchRecoveryActionTemplate, GuardianLaunchRecoveryCurrentIntent,
+    GuardianLaunchRecoveryDirective, GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryExecutor,
+    GuardianLaunchRecoveryKind, GuardianLaunchRecoveryMutation, GuardianLaunchRecoveryOutcome,
+    GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
+    GuardianLaunchRecoveryPlanRequest, GuardianLaunchRecoveryRecordRequest,
+    GuardianLaunchRecoveryReversibility, GuardianLaunchRecoveryStatus,
+    launch_recovery_diagnosis_id, launch_recovery_user_intent_fingerprint,
+    plan_launch_recovery_directive, record_launch_recovery_attempt, record_launch_recovery_failure,
+    record_launch_recovery_success,
 };
 pub use model::{
     ActionPlanPrerequisite, Diagnosis, DiagnosisId, FactReliability, GuardianAction,

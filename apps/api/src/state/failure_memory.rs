@@ -1,7 +1,7 @@
 //! Guardian failure-memory state contracts.
 //!
-//! This module defines the State-owned shape Guardian will later consume for
-//! loop suppression. It records memory; it does not decide Guardian policy.
+//! This module owns the bounded records Guardian consumes for loop suppression
+//! and later-operation guidance. It stores memory; it does not decide policy.
 
 use super::contracts::{OwnershipClass, TargetDescriptor, sanitize_target_id};
 use super::ownership::{CurrentArtifact, classify_current_artifact};

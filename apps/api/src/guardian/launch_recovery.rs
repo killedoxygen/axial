@@ -3,7 +3,7 @@ use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
     CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
     OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
-    RollbackState, StabilizationSystem, TargetDescriptor, TargetKind,
+    RollbackState, StabilizationSystem, TargetDescriptor, TargetKind, sanitize_target_id,
 };
 use crate::state::failure_memory::{
     FailureMemoryActionOutcome, FailureMemoryKey, GuardianFailureMemoryEntry,
@@ -52,6 +52,92 @@ impl GuardianLaunchRecoveryKind {
             Self::DowngradePreset => "guardian_launch_recovery_downgrade_preset",
             Self::DisableCustomGc => "guardian_launch_recovery_disable_custom_gc",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuardianLaunchRecoveryCurrentIntent<'a> {
+    pub target_version_id: &'a str,
+    pub explicit_java_override_present: bool,
+    pub explicit_jvm_args_present: bool,
+    pub explicit_jvm_preset_present: bool,
+}
+
+pub fn launch_recovery_user_intent_fingerprint(
+    current: GuardianLaunchRecoveryCurrentIntent<'_>,
+    kind: GuardianLaunchRecoveryKind,
+) -> String {
+    let override_marker = match kind {
+        GuardianLaunchRecoveryKind::SwitchManagedRuntime => {
+            if current.explicit_java_override_present {
+                "java_override_present"
+            } else {
+                "java_override_absent"
+            }
+        }
+        GuardianLaunchRecoveryKind::StripRawJvmArgs => {
+            if current.explicit_jvm_args_present {
+                "raw_jvm_args_present"
+            } else {
+                "raw_jvm_args_absent"
+            }
+        }
+        GuardianLaunchRecoveryKind::DowngradePreset
+        | GuardianLaunchRecoveryKind::DisableCustomGc => {
+            if current.explicit_jvm_preset_present {
+                "jvm_preset_present"
+            } else {
+                "jvm_preset_recommended"
+            }
+        }
+    };
+    let version_marker = sanitize_evidence_token(
+        current.target_version_id,
+        RedactionAudience::UserVisible,
+        64,
+    )
+    .unwrap_or_else(|| "unknown_version".to_string());
+    format!("{override_marker}:{version_marker}")
+}
+
+pub(super) fn launch_recovery_intent_fingerprint_matches(
+    diagnosis_id: &DiagnosisId,
+    action: Option<GuardianActionKind>,
+    stored_fingerprint: Option<&str>,
+    current: GuardianLaunchRecoveryCurrentIntent<'_>,
+) -> bool {
+    let Some(stored_fingerprint) = stored_fingerprint else {
+        return false;
+    };
+    compatible_recovery_kinds(diagnosis_id, action)
+        .iter()
+        .any(|kind| {
+            sanitize_target_id(
+                &launch_recovery_user_intent_fingerprint(current, *kind),
+                "intent",
+            ) == stored_fingerprint
+        })
+}
+
+fn compatible_recovery_kinds(
+    diagnosis_id: &DiagnosisId,
+    action: Option<GuardianActionKind>,
+) -> &'static [GuardianLaunchRecoveryKind] {
+    match (diagnosis_id.as_str(), action) {
+        ("java_runtime_recovery", Some(GuardianActionKind::Fallback))
+        | ("launch_startup_recovery", Some(GuardianActionKind::Fallback)) => {
+            &[GuardianLaunchRecoveryKind::SwitchManagedRuntime]
+        }
+        ("jvm_arg_unsupported", Some(GuardianActionKind::Strip))
+        | ("launch_startup_recovery", Some(GuardianActionKind::Strip)) => &[
+            GuardianLaunchRecoveryKind::StripRawJvmArgs,
+            GuardianLaunchRecoveryKind::DisableCustomGc,
+        ],
+        ("jvm_preset_recovery", Some(GuardianActionKind::Downgrade))
+        | ("launch_startup_recovery", Some(GuardianActionKind::Downgrade)) => {
+            &[GuardianLaunchRecoveryKind::DowngradePreset]
+        }
+        _ => &[],
     }
 }
 
@@ -341,7 +427,7 @@ pub async fn record_launch_recovery_failure(
     ))
 }
 
-fn launch_recovery_diagnosis_id(
+pub fn launch_recovery_diagnosis_id(
     kind: GuardianLaunchRecoveryKind,
     failure_class: LaunchFailureClass,
 ) -> DiagnosisId {
@@ -599,10 +685,11 @@ fn safe_id(value: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardianLaunchRecoveryDirective, GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind,
-        GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
-        GuardianLaunchRecoveryPlanRequest, GuardianLaunchRecoveryRecordRequest,
-        GuardianLaunchRecoveryStatus, plan_launch_recovery_directive,
+        GuardianLaunchRecoveryCurrentIntent, GuardianLaunchRecoveryDirective,
+        GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind, GuardianLaunchRecoveryPlan,
+        GuardianLaunchRecoveryPlanRejection, GuardianLaunchRecoveryPlanRequest,
+        GuardianLaunchRecoveryRecordRequest, GuardianLaunchRecoveryStatus,
+        launch_recovery_user_intent_fingerprint, plan_launch_recovery_directive,
         record_launch_recovery_attempt, record_launch_recovery_failure,
         record_launch_recovery_success,
     };
@@ -658,6 +745,24 @@ mod tests {
                 .map(|_| ())
                 .map_err(io::Error::from)
         }
+    }
+
+    #[test]
+    fn launch_recovery_intent_fingerprint_bounds_version_material_at_its_source() {
+        let fingerprint = launch_recovery_user_intent_fingerprint(
+            GuardianLaunchRecoveryCurrentIntent {
+                target_version_id: "/home/alice/-Dtoken=secret-token",
+                explicit_java_override_present: true,
+                explicit_jvm_args_present: false,
+                explicit_jvm_preset_present: false,
+            },
+            GuardianLaunchRecoveryKind::SwitchManagedRuntime,
+        );
+
+        assert_eq!(fingerprint, "java_override_present:unknown_version");
+        assert!(fingerprint.chars().count() <= 96);
+        assert!(!fingerprint.contains("alice"));
+        assert!(!fingerprint.contains("secret"));
     }
 
     #[tokio::test]
