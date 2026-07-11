@@ -1,17 +1,29 @@
 use crate::MANAGED_ARTIFACT_MAX_BYTES;
-use crate::types::{CompositionState, CompositionTier, OwnershipClass};
+use crate::types::{CompositionState, CompositionTier, InstalledMod, OwnershipClass};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use tracing::warn;
 
 const LOCK_FILE_NAME: &str = ".axial-lock.json";
-const STATE_DIR_NAME: &str = ".axial-performance";
+const LOCK_STAGED_FILE_NAME: &str = ".axial-lock.json.new.tmp";
+const LOCK_BACKUP_FILE_NAME: &str = ".axial-lock.json.previous.tmp";
+const LOCK_DELETE_FILE_NAME: &str = ".axial-lock.json.delete.tmp";
+const LOCK_DELETE_MARKER: &[u8] = b"axial-performance-state-delete-v1\n";
+const STATE_SCHEMA_VERSION: i32 = 1;
+const STATE_MAX_BYTES: u64 = 1024 * 1024;
+const STATE_MAX_INSTALLED_MODS: usize = 256;
+const STATE_TOKEN_MAX_CHARS: usize = 256;
+const STATE_TIMESTAMP_MAX_CHARS: usize = 64;
+const STATE_FAILURE_MAX_CHARS: usize = 512;
+const STATE_FILENAME_MAX_BYTES: usize = 255;
+pub(crate) const STATE_DIR_NAME: &str = ".axial-performance";
+const MUTATION_DIR_NAME: &str = "mutations";
+const REMOVAL_DIR_NAME: &str = "removals";
 const ROLLBACK_DIR_NAME: &str = "rollback";
 const ROLLBACK_FILE_NAME: &str = "latest.json";
 const ROLLBACK_FILES_DIR_NAME: &str = "files";
@@ -43,6 +55,47 @@ pub enum StateError {
     InvalidRollbackId,
     #[error("invalid rollback snapshot: {0}")]
     InvalidRollback(String),
+    #[error("invalid performance state: {0}")]
+    InvalidState(String),
+    #[error("performance state publication failed during {phase}: {source}")]
+    Publication {
+        phase: StatePublicationPhase,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatePublicationPhase {
+    Reconcile,
+    Stage,
+    Backup,
+    Publish,
+    Cleanup,
+}
+
+impl std::fmt::Display for StatePublicationPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Reconcile => "reconciliation",
+            Self::Stage => "staging",
+            Self::Backup => "backup",
+            Self::Publish => "publication",
+            Self::Cleanup => "cleanup",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedCompositionState {
+    schema_version: i32,
+    state: CompositionState,
+}
+
+struct AdmittedPersistedCompositionState {
+    snapshot: PersistedCompositionState,
+    sha512: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,21 +129,19 @@ pub struct RollbackArtifact {
     pub project_id: String,
     pub version_id: String,
     pub ownership_class: OwnershipClass,
-    pub sha512_present: bool,
+    pub sha512: String,
     pub sha512_verified: bool,
 }
 
 pub fn load_state(instance_mods_dir: &Path) -> Result<Option<CompositionState>, StateError> {
+    reconcile_state_publication(instance_mods_dir)?;
     let path = lock_file_path(instance_mods_dir);
-    match fs::read_to_string(path) {
-        Ok(data) => {
-            let state = serde_json::from_str(&data)?;
-            validate_state(&state)?;
-            Ok(Some(state))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(StateError::Read(error)),
-    }
+    let Some(snapshot) = read_state_snapshot_if_present(&path)? else {
+        reconcile_managed_removal_obligations(instance_mods_dir, None)?;
+        return Ok(None);
+    };
+    reconcile_managed_removal_obligations(instance_mods_dir, Some(&snapshot.snapshot.state))?;
+    Ok(Some(snapshot.snapshot.state))
 }
 
 pub async fn load_state_async(
@@ -108,26 +159,351 @@ pub async fn load_state_async(
 
 pub fn save_state(instance_mods_dir: &Path, state: &CompositionState) -> Result<(), StateError> {
     validate_state(state)?;
-    fs::create_dir_all(instance_mods_dir)?;
-    let data = serde_json::to_string_pretty(state)?;
+    ensure_instance_mods_directory(instance_mods_dir)?;
+    reconcile_state_publication(instance_mods_dir)?;
+    let snapshot = PersistedCompositionState {
+        schema_version: STATE_SCHEMA_VERSION,
+        state: state.clone(),
+    };
+    let data = serde_json::to_vec_pretty(&snapshot)?;
+    if data.len() as u64 > STATE_MAX_BYTES {
+        return Err(StateError::InvalidState(
+            "performance state exceeds the byte budget".to_string(),
+        ));
+    }
     let path = lock_file_path(instance_mods_dir);
-    let temp_path = path.with_extension("json.tmp");
-    fs::write(&temp_path, data)?;
-    replace_file_atomic(&temp_path, &path)?;
-    Ok(())
+    let staged = state_staged_path(instance_mods_dir);
+    write_exclusive_file(&staged, &data, StatePublicationPhase::Stage)?;
+    publish_staged_state(instance_mods_dir, &staged, &path)
 }
 
 pub fn remove_state(instance_mods_dir: &Path) -> Result<(), StateError> {
+    reconcile_state_publication(instance_mods_dir)?;
     let path = lock_file_path(instance_mods_dir);
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(StateError::Read(error)),
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::Read(error)),
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(StateError::InvalidState(
+                "performance state is not a regular file".to_string(),
+            ));
+        }
     }
+    let admitted_sha512 = admitted_state_file_sha512(&path)?;
+    let marker = state_delete_path(instance_mods_dir);
+    write_exclusive_file(&marker, LOCK_DELETE_MARKER, StatePublicationPhase::Stage)?;
+    let backup = state_backup_path(instance_mods_dir);
+    reserve_backup_exclusive(
+        &path,
+        &backup,
+        StatePublicationPhase::Backup,
+        Some(&admitted_sha512),
+    )?;
+    remove_file_matching_sha512(&backup, &admitted_sha512, STATE_MAX_BYTES)?;
+    let marker_sha512 = hex::encode(Sha512::digest(LOCK_DELETE_MARKER));
+    remove_file_matching_sha512(&marker, &marker_sha512, LOCK_DELETE_MARKER.len() as u64)
 }
 
 pub fn lock_file_path(instance_mods_dir: &Path) -> PathBuf {
     instance_mods_dir.join(LOCK_FILE_NAME)
+}
+
+fn state_staged_path(instance_mods_dir: &Path) -> PathBuf {
+    instance_mods_dir.join(LOCK_STAGED_FILE_NAME)
+}
+
+fn state_backup_path(instance_mods_dir: &Path) -> PathBuf {
+    instance_mods_dir.join(LOCK_BACKUP_FILE_NAME)
+}
+
+fn state_delete_path(instance_mods_dir: &Path) -> PathBuf {
+    instance_mods_dir.join(LOCK_DELETE_FILE_NAME)
+}
+
+fn publication(phase: StatePublicationPhase, source: std::io::Error) -> StateError {
+    StateError::Publication { phase, source }
+}
+
+fn ensure_instance_mods_directory(instance_mods_dir: &Path) -> Result<(), StateError> {
+    match fs::symlink_metadata(instance_mods_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(StateError::InvalidState(
+            "performance state parent is not a regular directory".to_string(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(instance_mods_dir)?;
+            match fs::symlink_metadata(instance_mods_dir) {
+                Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+                Ok(_) => Err(StateError::InvalidState(
+                    "performance state parent is not a regular directory".to_string(),
+                )),
+                Err(error) => Err(StateError::Read(error)),
+            }
+        }
+        Err(error) => Err(StateError::Read(error)),
+    }
+}
+
+fn write_exclusive_file(
+    path: &Path,
+    contents: &[u8],
+    phase: StatePublicationPhase,
+) -> Result<(), StateError> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| publication(phase, source))?;
+    if let Err(source) = file.write_all(contents).and_then(|()| file.sync_all()) {
+        drop(file);
+        let cleanup = remove_publication_file(path, StatePublicationPhase::Cleanup);
+        return cleanup.and(Err(publication(phase, source)));
+    }
+    Ok(())
+}
+
+fn publish_staged_state(
+    instance_mods_dir: &Path,
+    staged: &Path,
+    destination: &Path,
+) -> Result<(), StateError> {
+    let backup = state_backup_path(instance_mods_dir);
+    let backup_sha512 = match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let admitted_sha512 = admitted_state_file_sha512(destination)?;
+            reserve_backup_exclusive(
+                destination,
+                &backup,
+                StatePublicationPhase::Backup,
+                Some(&admitted_sha512),
+            )?;
+            Some(admitted_sha512)
+        }
+        Ok(_) => {
+            return Err(StateError::InvalidState(
+                "performance state is not a regular file".to_string(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(StateError::Read(error)),
+    };
+
+    if let Err(source) = fs::rename(staged, destination) {
+        if path_exists(&backup)? && !path_exists(destination)? {
+            fs::rename(&backup, destination)
+                .map_err(|restore| publication(StatePublicationPhase::Reconcile, restore))?;
+        }
+        return Err(publication(StatePublicationPhase::Publish, source));
+    }
+    if let Some(backup_sha512) = backup_sha512 {
+        remove_file_matching_sha512(&backup, &backup_sha512, STATE_MAX_BYTES)?;
+    }
+    Ok(())
+}
+
+fn reconcile_state_publication(instance_mods_dir: &Path) -> Result<(), StateError> {
+    let destination = lock_file_path(instance_mods_dir);
+    let staged = state_staged_path(instance_mods_dir);
+    let backup = state_backup_path(instance_mods_dir);
+    let deletion = state_delete_path(instance_mods_dir);
+
+    let deletion_present = read_delete_marker_if_present(&deletion)?;
+    if deletion_present {
+        if path_exists(&destination)? {
+            let admitted_destination = read_state_snapshot_file(&destination)?;
+            if path_exists(&backup)? {
+                let admitted_backup = read_state_snapshot_file(&backup)?;
+                let destination_metadata = fs::symlink_metadata(&destination)?;
+                let backup_metadata = fs::symlink_metadata(&backup)?;
+                if !same_file_identity(&destination_metadata, &backup_metadata)
+                    || admitted_destination.sha512 != admitted_backup.sha512
+                {
+                    return Err(StateError::InvalidState(
+                        "performance state deletion backup identity is ambiguous".to_string(),
+                    ));
+                }
+                remove_file_matching_sha512(
+                    &destination,
+                    &admitted_destination.sha512,
+                    STATE_MAX_BYTES,
+                )?;
+            } else {
+                reserve_backup_exclusive(
+                    &destination,
+                    &backup,
+                    StatePublicationPhase::Reconcile,
+                    Some(&admitted_destination.sha512),
+                )?;
+            }
+        }
+        if path_exists(&backup)? {
+            let admitted_backup = read_state_snapshot_file(&backup)?;
+            remove_file_matching_sha512(&backup, &admitted_backup.sha512, STATE_MAX_BYTES)?;
+        }
+        let marker_sha512 = hex::encode(Sha512::digest(LOCK_DELETE_MARKER));
+        remove_file_matching_sha512(&deletion, &marker_sha512, LOCK_DELETE_MARKER.len() as u64)?;
+    }
+
+    let destination_snapshot = read_state_snapshot_if_present(&destination)?;
+    let staged_snapshot = read_state_snapshot_if_present(&staged)?;
+    let backup_snapshot = read_state_snapshot_if_present(&backup)?;
+    match (destination_snapshot, staged_snapshot, backup_snapshot) {
+        (Some(destination_admitted), Some(_staged_admitted), Some(backup_admitted)) => {
+            let destination_metadata = fs::symlink_metadata(&destination)?;
+            let backup_metadata = fs::symlink_metadata(&backup)?;
+            if !same_file_identity(&destination_metadata, &backup_metadata)
+                || destination_admitted.sha512 != backup_admitted.sha512
+            {
+                return Err(StateError::InvalidState(
+                    "performance state publication backup identity is ambiguous".to_string(),
+                ));
+            }
+            remove_file_matching_sha512(
+                &destination,
+                &destination_admitted.sha512,
+                STATE_MAX_BYTES,
+            )?;
+            fs::rename(&staged, &destination)
+                .map_err(|source| publication(StatePublicationPhase::Reconcile, source))?;
+            remove_file_matching_sha512(&backup, &backup_admitted.sha512, STATE_MAX_BYTES)
+        }
+        (Some(_), Some(staged_admitted), None) => {
+            remove_file_matching_sha512(&staged, &staged_admitted.sha512, STATE_MAX_BYTES)
+        }
+        (Some(_), None, Some(backup_admitted)) => {
+            remove_file_matching_sha512(&backup, &backup_admitted.sha512, STATE_MAX_BYTES)
+        }
+        (None, Some(_staged_admitted), Some(backup_admitted)) => {
+            fs::rename(&staged, &destination)
+                .map_err(|source| publication(StatePublicationPhase::Reconcile, source))?;
+            remove_file_matching_sha512(&backup, &backup_admitted.sha512, STATE_MAX_BYTES)
+        }
+        (None, Some(_), None) => fs::rename(&staged, &destination)
+            .map_err(|source| publication(StatePublicationPhase::Reconcile, source)),
+        (None, None, Some(_)) => fs::rename(&backup, &destination)
+            .map_err(|source| publication(StatePublicationPhase::Reconcile, source)),
+        (Some(_), None, None) | (None, None, None) => Ok(()),
+    }
+}
+
+fn read_delete_marker_if_present(path: &Path) -> Result<bool, StateError> {
+    let Some(data) = read_bounded_regular_file_if_present(path, LOCK_DELETE_MARKER.len() as u64)?
+    else {
+        return Ok(false);
+    };
+    if data == LOCK_DELETE_MARKER {
+        Ok(true)
+    } else {
+        Err(StateError::InvalidState(
+            "performance state deletion marker ownership cannot be proven".to_string(),
+        ))
+    }
+}
+
+fn read_state_snapshot_if_present(
+    path: &Path,
+) -> Result<Option<AdmittedPersistedCompositionState>, StateError> {
+    let Some(data) = read_bounded_regular_file_if_present(path, STATE_MAX_BYTES)? else {
+        return Ok(None);
+    };
+    let snapshot = serde_json::from_slice::<PersistedCompositionState>(&data)?;
+    validate_persisted_state(&snapshot)?;
+    Ok(Some(AdmittedPersistedCompositionState {
+        snapshot,
+        sha512: hex::encode(Sha512::digest(data)),
+    }))
+}
+
+fn read_state_snapshot_file(path: &Path) -> Result<AdmittedPersistedCompositionState, StateError> {
+    read_state_snapshot_if_present(path)?.ok_or_else(|| {
+        StateError::InvalidState("performance state disappeared during admission".to_string())
+    })
+}
+
+fn admitted_state_file_sha512(path: &Path) -> Result<String, StateError> {
+    Ok(read_state_snapshot_file(path)?.sha512)
+}
+
+fn read_bounded_regular_file_if_present(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, StateError> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    if !before.file_type().is_file() || before.len() > max_bytes {
+        return Err(StateError::InvalidState(
+            "performance state obligation is not a bounded regular file".to_string(),
+        ));
+    }
+    let mut file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    let after = fs::symlink_metadata(path)?;
+    if !opened.is_file()
+        || !after.file_type().is_file()
+        || !same_file_identity(&before, &opened)
+        || !same_file_identity(&opened, &after)
+        || before.len() != opened.len()
+        || before.len() != after.len()
+    {
+        return Err(StateError::InvalidState(
+            "performance state file identity changed during admission".to_string(),
+        ));
+    }
+    let mut data = Vec::with_capacity(before.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut data)?;
+    if data.len() as u64 != before.len() {
+        return Err(StateError::InvalidState(
+            "performance state bytes changed during admission".to_string(),
+        ));
+    }
+    Ok(Some(data))
+}
+
+fn remove_publication_file(path: &Path, phase: StatePublicationPhase) -> Result<(), StateError> {
+    remove_admitted_regular_file(path).map_err(|source| publication(phase, source))
+}
+
+fn reserve_backup_exclusive(
+    source: &Path,
+    backup: &Path,
+    phase: StatePublicationPhase,
+    expected_sha512: Option<&str>,
+) -> Result<(), StateError> {
+    fs::hard_link(source, backup).map_err(|source| publication(phase, source))?;
+    let source_metadata = fs::symlink_metadata(source)
+        .map_err(|source| publication(StatePublicationPhase::Reconcile, source))?;
+    let backup_metadata = fs::symlink_metadata(backup)
+        .map_err(|source| publication(StatePublicationPhase::Reconcile, source))?;
+    let digest_matches = match expected_sha512 {
+        Some(expected) => path_matches_sha512(backup, expected)?,
+        None => true,
+    };
+    if !source_metadata.file_type().is_file()
+        || !backup_metadata.file_type().is_file()
+        || !same_file_identity(&source_metadata, &backup_metadata)
+        || !digest_matches
+    {
+        remove_publication_file(backup, StatePublicationPhase::Cleanup)?;
+        return Err(StateError::InvalidState(
+            "performance state backup ownership cannot be proven".to_string(),
+        ));
+    }
+    let current = fs::symlink_metadata(source)
+        .map_err(|source| publication(StatePublicationPhase::Reconcile, source))?;
+    if !same_file_identity(&current, &backup_metadata) {
+        remove_publication_file(backup, StatePublicationPhase::Cleanup)?;
+        return Err(StateError::InvalidState(
+            "performance state destination changed during backup".to_string(),
+        ));
+    }
+    remove_admitted_regular_file(source).map_err(|source| publication(phase, source))?;
+    Ok(())
 }
 
 pub fn save_rollback_snapshot(
@@ -155,9 +531,7 @@ pub fn save_rollback_snapshot(
         rollback_candidate_storage_bytes(&snapshot, planned.total_bytes)?,
     )?;
     commit_rollback_snapshot(instance_mods_dir, &planned, &snapshot)?;
-    if let Err(_cleanup_error) = finish_rollback_retention(instance_mods_dir) {
-        warn!("rollback retention cleanup remains pending after snapshot publication");
-    }
+    finish_rollback_retention(instance_mods_dir)?;
     Ok(snapshot)
 }
 
@@ -193,13 +567,18 @@ fn plan_rollback_artifacts(
     state: &CompositionState,
     snapshot_id: &str,
 ) -> Result<PlannedRollbackSnapshot, StateError> {
-    let mut artifacts = Vec::new();
+    let mut admitted = Vec::with_capacity(state.installed_mods.len());
     let mut total_bytes = 0_u64;
     for (index, installed) in state.installed_mods.iter().enumerate() {
         let source_path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
         let source_metadata = match fs::symlink_metadata(&source_path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StateError::InvalidRollback(format!(
+                    "tracked rollback source {} is missing",
+                    installed.filename
+                )));
+            }
             Err(error) => return Err(StateError::Read(error)),
         };
         if !source_metadata.file_type().is_file() {
@@ -210,6 +589,18 @@ fn plan_rollback_artifacts(
         }
         let expected_bytes = source_metadata.len();
         validate_rollback_artifact_budget(&installed.filename, expected_bytes, &mut total_bytes)?;
+        admitted.push((index, installed, source_path, expected_bytes));
+    }
+
+    let mut artifacts = Vec::with_capacity(admitted.len());
+    for (index, installed, source_path, expected_bytes) in admitted {
+        if !managed_artifact_matches(instance_mods_dir, installed)? {
+            return Err(StateError::InvalidIntegrity {
+                filename: installed.filename.clone(),
+                reason: "rollback source bytes do not match the recorded ownership digest"
+                    .to_string(),
+            });
+        }
         artifacts.push(planned_rollback_artifact(
             instance_mods_dir,
             snapshot_id,
@@ -266,7 +657,7 @@ fn planned_rollback_artifact(
             project_id: installed.project_id.clone(),
             version_id: installed.version_id.clone(),
             ownership_class: installed.ownership_class,
-            sha512_present: !installed.integrity.sha512.trim().is_empty(),
+            sha512: installed.integrity.sha512.clone(),
             sha512_verified: installed.integrity.sha512_verified,
         },
     })
@@ -388,16 +779,16 @@ fn commit_rollback_snapshot(
     if let Err(error) = write_rollback_snapshot(&rollback_file_path(instance_mods_dir), snapshot) {
         let history_cleanup = remove_owned_file(&history_temp);
         let artifact_cleanup = cleanup_created_rollback_artifacts(&copied_paths);
-        artifact_cleanup.or(history_cleanup)?;
+        match (artifact_cleanup, history_cleanup) {
+            (Err(cleanup), _) | (Ok(()), Err(cleanup)) => return Err(cleanup),
+            (Ok(()), Ok(())) => {}
+        }
         return Err(error);
     }
     if let Err(error) = fs::hard_link(&history_temp, history_path) {
-        warn!("rollback history publication remains pending after latest publication");
         return Err(StateError::Read(error));
     }
-    if let Err(_cleanup_error) = remove_owned_file(&history_temp) {
-        warn!("rollback history temp cleanup remains pending after publication");
-    }
+    remove_owned_file(&history_temp)?;
     Ok(())
 }
 
@@ -445,21 +836,33 @@ fn copy_rollback_artifact(artifact: &PlannedRollbackArtifact) -> Result<(), Stat
             artifact.metadata.filename
         )));
     }
+    let source_digest = bounded_file_sha512(&artifact.source_path, artifact.expected_bytes)?;
+    let stored_digest = bounded_file_sha512(&artifact.stored_path, artifact.expected_bytes)?;
+    let expected_digest = &artifact.metadata.sha512;
+    if source_digest.is_empty()
+        || stored_digest != source_digest
+        || !hex::encode(stored_digest).eq_ignore_ascii_case(expected_digest)
+    {
+        remove_owned_file(&artifact.stored_path)?;
+        return Err(StateError::InvalidIntegrity {
+            filename: artifact.metadata.filename.clone(),
+            reason: "rollback copy does not match the recorded ownership digest".to_string(),
+        });
+    }
     Ok(())
 }
 
 fn cleanup_created_rollback_artifacts(paths: &[&Path]) -> Result<(), StateError> {
     let mut first_error = None;
     for path in paths {
-        if let Err(error) = fs::remove_file(path)
-            && error.kind() != std::io::ErrorKind::NotFound
+        if let Err(error) = remove_owned_file(path)
             && first_error.is_none()
         {
             first_error = Some(error);
         }
     }
     if let Some(error) = first_error {
-        Err(StateError::Read(error))
+        Err(error)
     } else {
         Ok(())
     }
@@ -467,11 +870,63 @@ fn cleanup_created_rollback_artifacts(paths: &[&Path]) -> Result<(), StateError>
 
 fn finish_rollback_retention(instance_mods_dir: &Path) -> Result<(), StateError> {
     reconcile_restore_stage_temps(instance_mods_dir)?;
+    reconcile_prune_artifact_temps(instance_mods_dir)?;
     cleanup_proven_history_temps(instance_mods_dir)?;
     prune_rollback_history(instance_mods_dir)?;
-    let snapshots = load_retained_rollback_snapshots(instance_mods_dir)?;
-    cleanup_unreferenced_rollback_artifacts(instance_mods_dir, &snapshots)?;
     cleanup_proven_latest_temp(instance_mods_dir)
+}
+
+fn reconcile_prune_artifact_temps(instance_mods_dir: &Path) -> Result<(), StateError> {
+    let files_dir = rollback_files_dir_path(instance_mods_dir);
+    let entries = match fs::read_dir(&files_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let Some(filename) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some((original_name, digest)) = filename.rsplit_once(".prune-") else {
+            continue;
+        };
+        let Some(digest) = digest.strip_suffix(".tmp").filter(|digest| {
+            digest.len() == 128 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) else {
+            continue;
+        };
+        if !path_matches_sha512(&entry.path(), digest)? {
+            return Err(StateError::InvalidRollback(
+                "rollback prune obligation ownership cannot be proven".to_string(),
+            ));
+        }
+        let original = files_dir.join(original_name);
+        let snapshot_id = original_name
+            .strip_suffix(".bin")
+            .and_then(|stem| stem.rsplit_once('-').map(|(snapshot_id, _)| snapshot_id))
+            .filter(|snapshot_id| validate_rollback_snapshot_id(snapshot_id).is_ok())
+            .ok_or_else(|| {
+                StateError::InvalidRollback(
+                    "rollback prune obligation identity is invalid".to_string(),
+                )
+            })?;
+        let history_exists =
+            path_exists(&rollback_history_file_path(instance_mods_dir, snapshot_id))?;
+        if history_exists && path_exists(&original)? {
+            if !path_matches_sha512(&original, digest)? {
+                return Err(StateError::InvalidRollback(
+                    "rollback prune source ownership cannot be proven".to_string(),
+                ));
+            }
+            remove_file_matching_sha512(&entry.path(), digest, MANAGED_ARTIFACT_MAX_BYTES)?;
+        } else if history_exists {
+            fs::rename(entry.path(), original)?;
+        } else {
+            remove_file_matching_sha512(&entry.path(), digest, MANAGED_ARTIFACT_MAX_BYTES)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn load_rollback_snapshot(
@@ -479,6 +934,7 @@ pub fn load_rollback_snapshot(
 ) -> Result<Option<RollbackSnapshot>, StateError> {
     validate_rollback_internal_roots(instance_mods_dir)?;
     let path = rollback_file_path(instance_mods_dir);
+    reconcile_rollback_metadata_publication(&path)?;
     let snapshot = match fs::symlink_metadata(&path) {
         Ok(_) => read_rollback_snapshot_file(&path)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -583,40 +1039,48 @@ pub fn restore_rollback_snapshot(
         .map(|installed| installed.filename.clone())
         .collect();
     let current_state = load_state(instance_mods_dir)?;
-    let current_filenames = managed_filenames(current_state.as_ref());
+    let current_artifacts = managed_artifacts(current_state.as_ref());
+    let superseded = current_state
+        .as_ref()
+        .map(|state| {
+            state
+                .installed_mods
+                .iter()
+                .filter(|installed| !snapshot_filenames.contains(&installed.filename))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     let restore_targets =
-        prepare_rollback_restore_targets(instance_mods_dir, snapshot, &current_filenames)?;
+        prepare_rollback_restore_targets(instance_mods_dir, snapshot, &current_artifacts)?;
     stage_rollback_restore_targets(&restore_targets)?;
-    let result = (|| {
-        if let Some(current_state) = current_state {
-            for installed in current_state.installed_mods {
-                if snapshot_filenames.contains(&installed.filename) {
-                    continue;
-                }
-                let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
-                match fs::remove_file(path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(StateError::Read(error)),
-                }
-            }
+    for installed in &superseded {
+        if let Err(error) = stage_managed_artifact_removal(instance_mods_dir, installed) {
+            load_state(instance_mods_dir)?;
+            cleanup_rollback_restore_targets(&restore_targets)?;
+            return Err(error);
         }
-
-        for target in &restore_targets {
-            replace_file_atomic(&target.temp_path, &target.final_path)?;
-        }
-
-        save_state(instance_mods_dir, &snapshot.state)?;
-        Ok(snapshot.state.clone())
-    })();
-    let cleanup = cleanup_rollback_restore_targets(&restore_targets);
-
-    match (result, cleanup) {
-        (Ok(state), Ok(())) => Ok(state),
-        (Err(error), Ok(())) => Err(error),
-        (_, Err(cleanup_error)) => Err(cleanup_error),
     }
+    let publication = (|| {
+        for target in &restore_targets {
+            publish_rollback_restore_target(target)?;
+        }
+        save_state(instance_mods_dir, &snapshot.state)?;
+        Ok::<(), StateError>(())
+    })();
+    if let Err(error) = publication {
+        compensate_rollback_restore_targets(&restore_targets)?;
+        load_state(instance_mods_dir)?;
+        cleanup_rollback_restore_targets(&restore_targets)?;
+        return Err(error);
+    }
+    cleanup_rollback_restore_backups(&restore_targets)?;
+    cleanup_rollback_restore_targets(&restore_targets)?;
+    for installed in &superseded {
+        settle_managed_artifact_removal(instance_mods_dir, installed)?;
+    }
+    Ok(snapshot.state.clone())
 }
 
 pub async fn restore_rollback_snapshot_async(
@@ -640,6 +1104,207 @@ pub fn managed_artifact_path(
 ) -> Result<PathBuf, StateError> {
     validate_managed_filename(filename)?;
     Ok(instance_mods_dir.join(filename))
+}
+
+pub(crate) fn managed_artifact_matches(
+    instance_mods_dir: &Path,
+    installed: &InstalledMod,
+) -> Result<bool, StateError> {
+    path_matches_sha512(
+        &managed_artifact_path(instance_mods_dir, &installed.filename)?,
+        &installed.integrity.sha512,
+    )
+}
+
+pub(crate) fn remove_managed_artifact(
+    instance_mods_dir: &Path,
+    installed: &InstalledMod,
+) -> Result<(), StateError> {
+    let backup = stage_managed_artifact_removal(instance_mods_dir, installed)?;
+    remove_owned_file(&backup)
+}
+
+pub(crate) fn stage_managed_artifact_removal(
+    instance_mods_dir: &Path,
+    installed: &InstalledMod,
+) -> Result<PathBuf, StateError> {
+    let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
+    let backup = removal_backup_path(instance_mods_dir, installed);
+    if path_exists(&backup)? {
+        if !path_matches_sha512(&backup, &installed.integrity.sha512)? {
+            return Err(StateError::InvalidIntegrity {
+                filename: installed.filename.clone(),
+                reason: "managed removal backup ownership cannot be proven".to_string(),
+            });
+        }
+        if !path_exists(&path)? {
+            return Ok(backup);
+        }
+        if !path_matches_sha512(&path, &installed.integrity.sha512)? {
+            return Err(StateError::InvalidIntegrity {
+                filename: installed.filename.clone(),
+                reason: "managed removal destination ownership cannot be proven".to_string(),
+            });
+        }
+        remove_file_matching_sha512(
+            &backup,
+            &installed.integrity.sha512,
+            MANAGED_ARTIFACT_MAX_BYTES,
+        )?;
+    }
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(removal_backup_path(instance_mods_dir, installed));
+        }
+        Err(error) => return Err(StateError::Read(error)),
+        Ok(_) => {}
+    }
+    if !managed_artifact_matches(instance_mods_dir, installed)? {
+        return Err(StateError::InvalidIntegrity {
+            filename: installed.filename.clone(),
+            reason: "current bytes do not match the recorded ownership digest".to_string(),
+        });
+    }
+    let parent = backup.parent().ok_or_else(|| {
+        StateError::InvalidState("managed removal backup path is invalid".to_string())
+    })?;
+    ensure_mutation_directory_tree(instance_mods_dir, parent)?;
+    reserve_backup_exclusive(
+        &path,
+        &backup,
+        StatePublicationPhase::Backup,
+        Some(&installed.integrity.sha512),
+    )?;
+    Ok(backup)
+}
+
+pub(crate) fn settle_managed_artifact_removal(
+    instance_mods_dir: &Path,
+    installed: &InstalledMod,
+) -> Result<(), StateError> {
+    let backup = removal_backup_path(instance_mods_dir, installed);
+    if path_exists(&backup)? {
+        if !path_matches_sha512(&backup, &installed.integrity.sha512)? {
+            return Err(StateError::InvalidIntegrity {
+                filename: installed.filename.clone(),
+                reason: "managed removal backup ownership cannot be proven".to_string(),
+            });
+        }
+        remove_file_matching_sha512(
+            &backup,
+            &installed.integrity.sha512,
+            MANAGED_ARTIFACT_MAX_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+fn removal_backup_path(instance_mods_dir: &Path, installed: &InstalledMod) -> PathBuf {
+    instance_mods_dir
+        .join(STATE_DIR_NAME)
+        .join(MUTATION_DIR_NAME)
+        .join(REMOVAL_DIR_NAME)
+        .join(&installed.integrity.sha512)
+        .join(&installed.filename)
+}
+
+fn ensure_mutation_directory_tree(instance_mods_dir: &Path, leaf: &Path) -> Result<(), StateError> {
+    for path in [
+        instance_mods_dir.join(STATE_DIR_NAME),
+        instance_mods_dir
+            .join(STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME),
+        instance_mods_dir
+            .join(STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME)
+            .join(REMOVAL_DIR_NAME),
+        leaf.to_path_buf(),
+    ] {
+        ensure_managed_directory(&path)?;
+    }
+    Ok(())
+}
+
+fn reconcile_managed_removal_obligations(
+    instance_mods_dir: &Path,
+    current_state: Option<&CompositionState>,
+) -> Result<(), StateError> {
+    let root = instance_mods_dir
+        .join(STATE_DIR_NAME)
+        .join(MUTATION_DIR_NAME)
+        .join(REMOVAL_DIR_NAME);
+    let digest_dirs = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    let mut count = 0_usize;
+    for digest_dir in digest_dirs {
+        let digest_dir = digest_dir?;
+        if !digest_dir.file_type()?.is_dir() {
+            return Err(StateError::InvalidState(
+                "managed removal digest path is not a directory".to_string(),
+            ));
+        }
+        let digest = digest_dir
+            .file_name()
+            .to_str()
+            .filter(|value| {
+                value.len() == 128 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .ok_or_else(|| {
+                StateError::InvalidState("managed removal digest is invalid".to_string())
+            })?
+            .to_string();
+        for entry in fs::read_dir(digest_dir.path())? {
+            let entry = entry?;
+            count = count.saturating_add(1);
+            if count > STATE_MAX_INSTALLED_MODS {
+                return Err(StateError::InvalidState(
+                    "managed removal obligations exceed the limit".to_string(),
+                ));
+            }
+            let filename = entry
+                .file_name()
+                .to_str()
+                .ok_or_else(|| StateError::InvalidFilename("managed removal".to_string()))?
+                .to_string();
+            validate_managed_filename(&filename)?;
+            if !entry.file_type()?.is_file() || !path_matches_sha512(&entry.path(), &digest)? {
+                return Err(StateError::InvalidIntegrity {
+                    filename,
+                    reason: "managed removal obligation ownership cannot be proven".to_string(),
+                });
+            }
+            let tracked = current_state.is_some_and(|state| {
+                state.installed_mods.iter().any(|installed| {
+                    installed.filename == filename
+                        && installed.integrity.sha512.eq_ignore_ascii_case(&digest)
+                })
+            });
+            let final_path = managed_artifact_path(instance_mods_dir, &filename)?;
+            if tracked {
+                if !path_exists(&final_path)? {
+                    fs::rename(entry.path(), final_path)?;
+                } else if path_matches_sha512(&final_path, &digest)? {
+                    remove_file_matching_sha512(
+                        &entry.path(),
+                        &digest,
+                        MANAGED_ARTIFACT_MAX_BYTES,
+                    )?;
+                } else {
+                    return Err(StateError::InvalidIntegrity {
+                        filename,
+                        reason: "managed removal destination conflicts with retained ownership"
+                            .to_string(),
+                    });
+                }
+            } else {
+                remove_file_matching_sha512(&entry.path(), &digest, MANAGED_ARTIFACT_MAX_BYTES)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn rollback_dir_path(instance_mods_dir: &Path) -> PathBuf {
@@ -750,11 +1415,36 @@ fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateEr
         )));
     }
     validate_rollback_snapshot_id(&snapshot.id)?;
+    if snapshot.created_at.trim() != snapshot.created_at
+        || snapshot.created_at.is_empty()
+        || snapshot.created_at.chars().count() > STATE_TIMESTAMP_MAX_CHARS
+    {
+        return Err(StateError::InvalidRollback(
+            "rollback timestamp is invalid".to_string(),
+        ));
+    }
     validate_state(&snapshot.state)?;
+    if snapshot.artifacts.len() > STATE_MAX_INSTALLED_MODS {
+        return Err(StateError::InvalidRollback(
+            "rollback artifact count exceeds the limit".to_string(),
+        ));
+    }
+
+    let mut artifact_filenames = HashSet::new();
+    let mut stored_filenames = HashSet::new();
 
     for artifact in &snapshot.artifacts {
         validate_managed_filename(&artifact.filename)?;
         validate_managed_filename(&artifact.stored_filename)?;
+        validate_state_token("rollback project id", &artifact.project_id)?;
+        validate_state_token("rollback version id", &artifact.version_id)?;
+        if !artifact_filenames.insert(artifact.filename.to_ascii_lowercase())
+            || !stored_filenames.insert(artifact.stored_filename.to_ascii_lowercase())
+        {
+            return Err(StateError::InvalidRollback(
+                "rollback contains duplicate or case-colliding artifact identities".to_string(),
+            ));
+        }
         let Some(installed) = snapshot
             .state
             .installed_mods
@@ -776,7 +1466,7 @@ fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateEr
         }
         if artifact.project_id != installed.project_id
             || artifact.version_id != installed.version_id
-            || artifact.sha512_present == installed.integrity.sha512.trim().is_empty()
+            || artifact.sha512 != installed.integrity.sha512
             || artifact.sha512_verified != installed.integrity.sha512_verified
         {
             return Err(StateError::InvalidRollback(format!(
@@ -784,12 +1474,13 @@ fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateEr
                 artifact.filename
             )));
         }
-        if artifact.sha512_verified && !artifact.sha512_present {
-            return Err(StateError::InvalidRollback(format!(
-                "artifact {} has invalid rollback integrity evidence",
-                artifact.filename
-            )));
-        }
+        validate_sha512_integrity(&artifact.filename, &artifact.sha512)?;
+    }
+
+    if artifact_filenames.len() != snapshot.state.installed_mods.len() {
+        return Err(StateError::InvalidRollback(
+            "rollback artifacts do not cover the complete managed state".to_string(),
+        ));
     }
 
     Ok(())
@@ -808,13 +1499,13 @@ fn validate_rollback_snapshot_id(snapshot_id: &str) -> Result<(), StateError> {
     }
 }
 
-fn managed_filenames(state: Option<&CompositionState>) -> HashSet<String> {
+fn managed_artifacts(state: Option<&CompositionState>) -> HashMap<String, InstalledMod> {
     state
         .map(|state| {
             state
                 .installed_mods
                 .iter()
-                .map(|installed| installed.filename.clone())
+                .map(|installed| (installed.filename.clone(), installed.clone()))
                 .collect()
         })
         .unwrap_or_default()
@@ -823,13 +1514,17 @@ fn managed_filenames(state: Option<&CompositionState>) -> HashSet<String> {
 struct RollbackRestoreTarget {
     source_path: PathBuf,
     temp_path: PathBuf,
+    backup_path: PathBuf,
     final_path: PathBuf,
+    filename: String,
+    previous_sha512: Option<String>,
+    restored_sha512: String,
 }
 
 fn prepare_rollback_restore_targets(
     instance_mods_dir: &Path,
     snapshot: &RollbackSnapshot,
-    current_filenames: &HashSet<String>,
+    current_artifacts: &HashMap<String, InstalledMod>,
 ) -> Result<Vec<RollbackRestoreTarget>, StateError> {
     reconcile_restore_stage_temps(instance_mods_dir)?;
     let files_dir = rollback_files_dir_path(instance_mods_dir);
@@ -842,16 +1537,40 @@ fn prepare_rollback_restore_targets(
             regular_rollback_artifact_bytes(&source_path, &artifact.stored_filename)?;
         validate_rollback_artifact_budget(&artifact.filename, artifact_bytes, &mut total_bytes)?;
         let final_path = managed_artifact_path(instance_mods_dir, &artifact.filename)?;
-        if !current_filenames.contains(&artifact.filename) && path_exists(&final_path)? {
+        let previous = current_artifacts.get(&artifact.filename);
+        let final_exists = path_exists(&final_path)?;
+        if previous.is_none() && final_exists {
             return Err(StateError::InvalidRollback(format!(
                 "rollback target {} is not tracked by current managed state",
                 artifact.filename
             )));
         }
+        if let Some(previous) = previous
+            && final_exists
+            && !managed_artifact_matches(instance_mods_dir, previous)?
+        {
+            return Err(StateError::InvalidIntegrity {
+                filename: previous.filename.clone(),
+                reason: "rollback target bytes do not match the recorded ownership digest"
+                    .to_string(),
+            });
+        }
+        let temp_path = rollback_restore_temp_path(instance_mods_dir, &stage_id, index);
+        let previous_sha512 = previous
+            .filter(|_| final_exists)
+            .map(|installed| installed.integrity.sha512.clone());
+        let backup_path = previous_sha512.as_ref().map_or_else(
+            || PathBuf::from(format!("{}.unused", temp_path.display())),
+            |digest| PathBuf::from(format!("{}.previous-{digest}", temp_path.display())),
+        );
         targets.push(RollbackRestoreTarget {
             source_path,
-            temp_path: rollback_restore_temp_path(instance_mods_dir, &stage_id, index),
+            backup_path,
+            temp_path,
             final_path,
+            filename: artifact.filename.clone(),
+            previous_sha512,
+            restored_sha512: artifact.sha512.clone(),
         });
     }
     prepare_rollback_storage(instance_mods_dir, total_bytes)?;
@@ -875,6 +1594,8 @@ fn new_rollback_restore_stage_id(snapshot: &RollbackSnapshot) -> String {
 
 fn reconcile_restore_stage_temps(instance_mods_dir: &Path) -> Result<(), StateError> {
     let snapshots = load_retained_rollback_snapshots(instance_mods_dir)?;
+    let current = read_state_snapshot_if_present(&lock_file_path(instance_mods_dir))?
+        .map(|snapshot| snapshot.snapshot.state);
     let entries = match fs::read_dir(rollback_tmp_dir_path(instance_mods_dir)) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -889,7 +1610,15 @@ fn reconcile_restore_stage_temps(instance_mods_dir: &Path) -> Result<(), StateEr
         let Some(filename) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        let Some(stem) = filename.strip_suffix("-restore.tmp") else {
+        let (stem, backup_digest) = if let Some((stem, digest)) = filename
+            .split_once("-restore.tmp.previous-")
+            .filter(|(_, digest)| {
+                digest.len() == 128 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+            (stem, Some(digest))
+        } else if let Some(stem) = filename.strip_suffix("-restore.tmp") {
+            (stem, None)
+        } else {
             continue;
         };
         let Some((prefix, raw_index)) = stem.rsplit_once('-') else {
@@ -909,12 +1638,96 @@ fn reconcile_restore_stage_temps(instance_mods_dir: &Path) -> Result<(), StateEr
         let Some(artifact) = snapshot.artifacts.get(index) else {
             continue;
         };
+        if let Some(backup_digest) = backup_digest {
+            let Some(previous) = current.as_ref().and_then(|state| {
+                state
+                    .installed_mods
+                    .iter()
+                    .find(|installed| installed.filename == artifact.filename)
+            }) else {
+                return Err(StateError::InvalidRollback(
+                    "rollback restore backup has no exact prior ownership record".to_string(),
+                ));
+            };
+            if !path_matches_sha512(&entry.path(), backup_digest)? {
+                return Err(StateError::InvalidRollback(
+                    "rollback restore backup ownership cannot be proven".to_string(),
+                ));
+            }
+            let final_path = managed_artifact_path(instance_mods_dir, &artifact.filename)?;
+            if previous
+                .integrity
+                .sha512
+                .eq_ignore_ascii_case(&artifact.sha512)
+            {
+                if !path_matches_sha512(&final_path, &artifact.sha512)? {
+                    return Err(StateError::InvalidRollback(
+                        "committed rollback destination ownership cannot be proven".to_string(),
+                    ));
+                }
+                remove_file_matching_sha512(
+                    &entry.path(),
+                    backup_digest,
+                    MANAGED_ARTIFACT_MAX_BYTES,
+                )?;
+                continue;
+            }
+            if !previous
+                .integrity
+                .sha512
+                .eq_ignore_ascii_case(backup_digest)
+            {
+                return Err(StateError::InvalidRollback(
+                    "rollback restore backup does not match current state".to_string(),
+                ));
+            }
+            if path_exists(&final_path)? {
+                if path_matches_sha512(&final_path, &previous.integrity.sha512)? {
+                    remove_file_matching_sha512(
+                        &entry.path(),
+                        backup_digest,
+                        MANAGED_ARTIFACT_MAX_BYTES,
+                    )?;
+                    continue;
+                }
+                if !path_matches_sha512(&final_path, &artifact.sha512)? {
+                    return Err(StateError::InvalidRollback(
+                        "rollback restore destination ownership cannot be proven".to_string(),
+                    ));
+                }
+                remove_file_matching_sha512(
+                    &final_path,
+                    &artifact.sha512,
+                    MANAGED_ARTIFACT_MAX_BYTES,
+                )?;
+            }
+            fs::rename(entry.path(), final_path)?;
+            continue;
+        }
         let source = rollback_files_dir_path(instance_mods_dir).join(&artifact.stored_filename);
         if bounded_regular_files_match(&entry.path(), &source)? {
-            remove_owned_file(&entry.path())?;
+            remove_file_matching_sha512(
+                &entry.path(),
+                &artifact.sha512,
+                MANAGED_ARTIFACT_MAX_BYTES,
+            )?;
         }
     }
     Ok(())
+}
+
+fn path_matches_sha512(path: &Path, expected_sha512: &str) -> Result<bool, StateError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    if metadata.len() > MANAGED_ARTIFACT_MAX_BYTES {
+        return Ok(false);
+    }
+    let digest = bounded_file_sha512(path, metadata.len())?;
+    Ok(!digest.is_empty() && hex::encode(digest).eq_ignore_ascii_case(expected_sha512))
 }
 
 fn bounded_regular_files_match(left: &Path, right: &Path) -> Result<bool, StateError> {
@@ -940,7 +1753,32 @@ fn bounded_regular_files_match(left: &Path, right: &Path) -> Result<bool, StateE
 }
 
 fn bounded_file_sha512(path: &Path, expected_bytes: u64) -> Result<Vec<u8>, StateError> {
+    Ok(admit_bounded_file_sha512(path, expected_bytes)?.0)
+}
+
+fn admit_bounded_file_sha512(
+    path: &Path,
+    expected_bytes: u64,
+) -> Result<(Vec<u8>, std::fs::Metadata), StateError> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.file_type().is_file()
+        || before.len() != expected_bytes
+        || expected_bytes > MANAGED_ARTIFACT_MAX_BYTES
+    {
+        return Ok((Vec::new(), before));
+    }
     let mut file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    let after = fs::symlink_metadata(path)?;
+    if !opened.is_file()
+        || !after.file_type().is_file()
+        || !same_file_identity(&before, &opened)
+        || !same_file_identity(&opened, &after)
+        || opened.len() != expected_bytes
+        || after.len() != expected_bytes
+    {
+        return Ok((Vec::new(), opened));
+    }
     let mut hasher = Sha512::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut total = 0_u64;
@@ -951,14 +1789,21 @@ fn bounded_file_sha512(path: &Path, expected_bytes: u64) -> Result<Vec<u8>, Stat
         }
         total = total.saturating_add(read as u64);
         if total > expected_bytes || total > MANAGED_ARTIFACT_MAX_BYTES {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), opened));
         }
         hasher.update(&buffer[..read]);
     }
     if total != expected_bytes {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), opened));
     }
-    Ok(hasher.finalize().to_vec())
+    let admitted = fs::symlink_metadata(path)?;
+    if !admitted.file_type().is_file()
+        || !same_file_identity(&opened, &admitted)
+        || admitted.len() != expected_bytes
+    {
+        return Ok((Vec::new(), opened));
+    }
+    Ok((hasher.finalize().to_vec(), opened))
 }
 
 fn regular_rollback_artifact_bytes(path: &Path, stored_filename: &str) -> Result<u64, StateError> {
@@ -988,7 +1833,90 @@ fn stage_rollback_restore_targets(targets: &[RollbackRestoreTarget]) -> Result<(
             cleanup_created_rollback_artifacts(&staged)?;
             return Err(error);
         }
+        let metadata = fs::symlink_metadata(&target.temp_path)?;
+        let digest = bounded_file_sha512(&target.temp_path, metadata.len())?;
+        if digest.is_empty() || !hex::encode(digest).eq_ignore_ascii_case(&target.restored_sha512) {
+            cleanup_created_rollback_artifacts(&staged)?;
+            remove_owned_file(&target.temp_path)?;
+            return Err(StateError::InvalidIntegrity {
+                filename: target.filename.clone(),
+                reason: "staged rollback bytes do not match the recorded ownership digest"
+                    .to_string(),
+            });
+        }
         staged.push(target.temp_path.as_path());
+    }
+    Ok(())
+}
+
+fn publish_rollback_restore_target(target: &RollbackRestoreTarget) -> Result<(), StateError> {
+    if let Some(previous_sha512) = target.previous_sha512.as_deref() {
+        if !path_matches_sha512(&target.final_path, previous_sha512)? {
+            return Err(StateError::InvalidIntegrity {
+                filename: target.filename.clone(),
+                reason: "rollback target changed before publication".to_string(),
+            });
+        }
+        reserve_backup_exclusive(
+            &target.final_path,
+            &target.backup_path,
+            StatePublicationPhase::Backup,
+            Some(previous_sha512),
+        )?;
+        let backup_metadata = fs::symlink_metadata(&target.backup_path)?;
+        let backup_digest = bounded_file_sha512(&target.backup_path, backup_metadata.len())?;
+        if backup_digest.is_empty()
+            || !hex::encode(backup_digest).eq_ignore_ascii_case(previous_sha512)
+        {
+            return match fs::rename(&target.backup_path, &target.final_path) {
+                Ok(()) => Err(StateError::InvalidIntegrity {
+                    filename: target.filename.clone(),
+                    reason: "rollback target changed during publication".to_string(),
+                }),
+                Err(error) => Err(StateError::Read(error)),
+            };
+        }
+    }
+    if let Err(error) = fs::rename(&target.temp_path, &target.final_path) {
+        if path_exists(&target.backup_path)? && !path_exists(&target.final_path)? {
+            fs::rename(&target.backup_path, &target.final_path)?;
+        }
+        return Err(StateError::Read(error));
+    }
+    Ok(())
+}
+
+fn cleanup_rollback_restore_backups(targets: &[RollbackRestoreTarget]) -> Result<(), StateError> {
+    for target in targets {
+        if path_exists(&target.backup_path)? {
+            remove_owned_file(&target.backup_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn compensate_rollback_restore_targets(
+    targets: &[RollbackRestoreTarget],
+) -> Result<(), StateError> {
+    for target in targets.iter().rev() {
+        if path_exists(&target.backup_path)? {
+            if path_exists(&target.final_path)? {
+                if !path_matches_sha512(&target.final_path, &target.restored_sha512)? {
+                    return Err(StateError::InvalidRollback(
+                        "rollback compensation destination ownership cannot be proven".to_string(),
+                    ));
+                }
+                remove_owned_file(&target.final_path)?;
+            }
+            fs::rename(&target.backup_path, &target.final_path)?;
+        } else if target.previous_sha512.is_none() && path_exists(&target.final_path)? {
+            if !path_matches_sha512(&target.final_path, &target.restored_sha512)? {
+                return Err(StateError::InvalidRollback(
+                    "rollback compensation created target ownership cannot be proven".to_string(),
+                ));
+            }
+            remove_owned_file(&target.final_path)?;
+        }
     }
     Ok(())
 }
@@ -1037,27 +1965,123 @@ fn copy_regular_file_exclusive(source_path: &Path, target_path: &Path) -> Result
 }
 
 fn remove_owned_file(path: &Path) -> Result<(), StateError> {
+    remove_admitted_regular_file(path).map_err(StateError::Read)
+}
+
+fn remove_file_matching_sha512(
+    path: &Path,
+    expected_sha512: &str,
+    max_bytes: u64,
+) -> Result<(), StateError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= max_bytes => metadata,
+        Ok(_) => {
+            return Err(StateError::InvalidState(
+                "managed cleanup target is not a bounded regular file".to_string(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    let (digest, admitted) = admit_bounded_file_sha512(path, metadata.len())?;
+    if digest.is_empty() || !hex::encode(digest).eq_ignore_ascii_case(expected_sha512) {
+        return Err(StateError::InvalidState(
+            "managed cleanup target bytes changed after admission".to_string(),
+        ));
+    }
+    let current = fs::symlink_metadata(path)?;
+    if !current.file_type().is_file()
+        || !same_file_identity(&admitted, &current)
+        || current.len() != metadata.len()
+    {
+        return Err(StateError::InvalidState(
+            "managed cleanup target identity changed after digest admission".to_string(),
+        ));
+    }
+    fs::remove_file(path).map_err(StateError::Read)
+}
+
+fn remove_admitted_regular_file(path: &Path) -> Result<(), std::io::Error> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "managed cleanup target is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    let after = fs::symlink_metadata(path)?;
+    if !opened.is_file()
+        || !after.file_type().is_file()
+        || !same_file_identity(&before, &opened)
+        || !same_file_identity(&opened, &after)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed cleanup target identity changed during admission",
+        ));
+    }
+    drop(file);
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(StateError::Read(error)),
+        Err(error) => Err(error),
     }
 }
 
 fn cleanup_rollback_restore_targets(targets: &[RollbackRestoreTarget]) -> Result<(), StateError> {
     for target in targets {
-        match fs::remove_file(&target.temp_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(StateError::Read(error)),
-        }
+        remove_owned_file(&target.temp_path)?;
     }
     Ok(())
 }
 
 fn validate_state(state: &CompositionState) -> Result<(), StateError> {
+    validate_state_token("composition id", &state.composition_id)?;
+    if state.installed_at.trim() != state.installed_at
+        || state.installed_at.is_empty()
+        || state.installed_at.chars().count() > STATE_TIMESTAMP_MAX_CHARS
+    {
+        return Err(StateError::InvalidState(
+            "performance state timestamp is invalid".to_string(),
+        ));
+    }
+    if state.failure_count < 0 {
+        return Err(StateError::InvalidState(
+            "performance state failure count is invalid".to_string(),
+        ));
+    }
+    if state.last_failure.chars().count() > STATE_FAILURE_MAX_CHARS {
+        return Err(StateError::InvalidState(
+            "performance state failure evidence exceeds the limit".to_string(),
+        ));
+    }
+    if state.installed_mods.len() > STATE_MAX_INSTALLED_MODS {
+        return Err(StateError::InvalidState(
+            "performance state installed artifact count exceeds the limit".to_string(),
+        ));
+    }
+    let mut project_ids = HashSet::new();
+    let mut filenames = HashSet::new();
     for installed in &state.installed_mods {
         validate_managed_filename(&installed.filename)?;
+        validate_state_token("managed project id", &installed.project_id)?;
+        validate_state_token("managed version id", &installed.version_id)?;
+        if !project_ids.insert(installed.project_id.to_ascii_lowercase()) {
+            return Err(StateError::InvalidState(
+                "performance state contains duplicate or case-colliding project ids".to_string(),
+            ));
+        }
+        if !filenames.insert(installed.filename.to_ascii_lowercase()) {
+            return Err(StateError::InvalidState(
+                "performance state contains duplicate or case-colliding filenames".to_string(),
+            ));
+        }
         if installed.ownership_class != OwnershipClass::CompositionManaged {
             return Err(StateError::InvalidOwnership {
                 filename: installed.filename.clone(),
@@ -1068,12 +2092,34 @@ fn validate_state(state: &CompositionState) -> Result<(), StateError> {
             });
         }
         validate_sha512_integrity(&installed.filename, &installed.integrity.sha512)?;
-        if installed.integrity.sha512_verified && installed.integrity.sha512.is_empty() {
+        if installed.integrity.sha512.is_empty() {
             return Err(StateError::InvalidIntegrity {
                 filename: installed.filename.clone(),
-                reason: "verified SHA-512 metadata requires a recorded SHA-512".to_string(),
+                reason: "managed artifacts require a locally computed SHA-512 ownership digest"
+                    .to_string(),
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_persisted_state(snapshot: &PersistedCompositionState) -> Result<(), StateError> {
+    if snapshot.schema_version != STATE_SCHEMA_VERSION {
+        return Err(StateError::InvalidState(format!(
+            "unsupported performance state schema version {}",
+            snapshot.schema_version
+        )));
+    }
+    validate_state(&snapshot.state)
+}
+
+fn validate_state_token(label: &str, value: &str) -> Result<(), StateError> {
+    if value.trim() != value
+        || value.is_empty()
+        || value.chars().count() > STATE_TOKEN_MAX_CHARS
+        || value.chars().any(char::is_control)
+    {
+        return Err(StateError::InvalidState(format!("{label} is invalid")));
     }
     Ok(())
 }
@@ -1111,6 +2157,7 @@ fn validate_managed_filename(filename: &str) -> Result<(), StateError> {
         || trimmed.contains('/')
         || trimmed.contains('\\')
         || trimmed.contains('\0')
+        || trimmed.len() > STATE_FILENAME_MAX_BYTES
     {
         return Err(StateError::InvalidFilename(filename.to_string()));
     }
@@ -1122,50 +2169,6 @@ fn validate_managed_filename(filename: &str) -> Result<(), StateError> {
         return Err(StateError::InvalidFilename(filename.to_string()));
     }
     Ok(())
-}
-
-fn cleanup_unreferenced_rollback_artifacts(
-    instance_mods_dir: &Path,
-    snapshots: &[RollbackSnapshotRecord],
-) -> Result<(), StateError> {
-    let files_dir = rollback_files_dir_path(instance_mods_dir);
-    let keep: HashSet<&str> = snapshots
-        .iter()
-        .flat_map(|record| record.snapshot.artifacts.iter())
-        .map(|artifact| artifact.stored_filename.as_str())
-        .collect();
-    let entries = match fs::read_dir(files_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(StateError::Read(error)),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if !file_type.is_file() {
-            return Err(StateError::InvalidRollback(
-                "rollback files contain a non-regular entry".to_string(),
-            ));
-        }
-        let filename = entry.file_name();
-        let Some(filename) = filename.to_str() else {
-            continue;
-        };
-        if !keep.contains(filename) && is_canonical_rollback_artifact_filename(filename) {
-            fs::remove_file(entry.path())?;
-        }
-    }
-    Ok(())
-}
-
-fn is_canonical_rollback_artifact_filename(filename: &str) -> bool {
-    let Some(stem) = filename.strip_suffix(".bin") else {
-        return false;
-    };
-    let Some((snapshot_id, index)) = stem.rsplit_once('-') else {
-        return false;
-    };
-    index.parse::<usize>().is_ok() && validate_rollback_snapshot_id(snapshot_id).is_ok()
 }
 
 fn cleanup_proven_history_temps(instance_mods_dir: &Path) -> Result<(), StateError> {
@@ -1234,9 +2237,15 @@ fn cleanup_abandoned_snapshot_artifacts(
                 "rollback candidate artifact identity is invalid".to_string(),
             ));
         }
-        remove_owned_file(
-            &rollback_files_dir_path(instance_mods_dir).join(&artifact.stored_filename),
-        )?;
+        let path = rollback_files_dir_path(instance_mods_dir).join(&artifact.stored_filename);
+        if path_exists(&path)? {
+            if !path_matches_sha512(&path, &artifact.sha512)? {
+                return Err(StateError::InvalidRollback(
+                    "abandoned rollback artifact ownership cannot be proven".to_string(),
+                ));
+            }
+            remove_file_matching_sha512(&path, &artifact.sha512, MANAGED_ARTIFACT_MAX_BYTES)?;
+        }
     }
     Ok(())
 }
@@ -1282,6 +2291,7 @@ fn read_bounded_regular_metadata_file(path: &Path) -> Result<Vec<u8>, StateError
     let after = fs::symlink_metadata(path)?;
     if !opened.is_file()
         || !after.file_type().is_file()
+        || !same_file_identity(&metadata, &opened)
         || !same_file_identity(&opened, &after)
         || opened.len() != metadata.len()
         || after.len() != metadata.len()
@@ -1328,20 +2338,90 @@ fn read_rollback_snapshot_file(path: &Path) -> Result<RollbackSnapshot, StateErr
 }
 
 fn write_rollback_snapshot(path: &Path, snapshot: &RollbackSnapshot) -> Result<(), StateError> {
-    let data = serde_json::to_string_pretty(snapshot)?;
+    let data = serde_json::to_vec_pretty(snapshot)?;
+    if data.len() as u64 > ROLLBACK_METADATA_MAX_BYTES {
+        return Err(StateError::InvalidRollback(
+            "rollback metadata exceeds the byte budget".to_string(),
+        ));
+    }
+    reconcile_rollback_metadata_publication(path)?;
     let temp_path = path.with_extension("json.tmp");
     let mut temp = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp_path)?;
-    if let Err(error) = temp.write_all(data.as_bytes()).and_then(|()| temp.flush()) {
+    if let Err(error) = temp.write_all(&data).and_then(|()| temp.sync_all()) {
         drop(temp);
         remove_owned_file(&temp_path)?;
         return Err(StateError::Read(error));
     }
     drop(temp);
-    replace_file_atomic(&temp_path, path)?;
+    publish_rollback_metadata(&temp_path, path)
+}
+
+fn rollback_metadata_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.previous.tmp")
+}
+
+fn reconcile_rollback_metadata_publication(path: &Path) -> Result<(), StateError> {
+    let backup = rollback_metadata_backup_path(path);
+    let current = match fs::symlink_metadata(path) {
+        Ok(_) => Some(admitted_rollback_file_sha512(path)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    let previous = match fs::symlink_metadata(&backup) {
+        Ok(_) => Some(admitted_rollback_file_sha512(&backup)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    match (current, previous) {
+        (Some(_), Some(previous_sha512)) => {
+            remove_file_matching_sha512(&backup, &previous_sha512, ROLLBACK_METADATA_MAX_BYTES)
+        }
+        (None, Some(_)) => fs::rename(backup, path).map_err(StateError::Read),
+        _ => Ok(()),
+    }
+}
+
+fn publish_rollback_metadata(temp_path: &Path, path: &Path) -> Result<(), StateError> {
+    let backup = rollback_metadata_backup_path(path);
+    let backup_sha512 = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let admitted_sha512 = admitted_rollback_file_sha512(path)?;
+            reserve_backup_exclusive(
+                path,
+                &backup,
+                StatePublicationPhase::Backup,
+                Some(&admitted_sha512),
+            )?;
+            Some(admitted_sha512)
+        }
+        Ok(_) => {
+            return Err(StateError::InvalidRollback(
+                "rollback metadata destination is not a regular file".to_string(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    if let Err(error) = fs::rename(temp_path, path) {
+        if path_exists(&backup)? && !path_exists(path)? {
+            fs::rename(&backup, path)?;
+        }
+        return Err(StateError::Read(error));
+    }
+    if let Some(backup_sha512) = backup_sha512 {
+        remove_file_matching_sha512(&backup, &backup_sha512, ROLLBACK_METADATA_MAX_BYTES)?;
+    }
     Ok(())
+}
+
+fn admitted_rollback_file_sha512(path: &Path) -> Result<String, StateError> {
+    let data = read_bounded_regular_metadata_file(path)?;
+    let snapshot = serde_json::from_slice::<RollbackSnapshot>(&data)?;
+    validate_rollback_snapshot(&snapshot)?;
+    Ok(hex::encode(Sha512::digest(data)))
 }
 
 fn stage_new_rollback_snapshot(
@@ -1468,33 +2548,47 @@ fn prune_rollback_history(instance_mods_dir: &Path) -> Result<(), StateError> {
             keep.insert(record.snapshot.id.clone());
         }
     }
-    let history_dir = rollback_history_dir_path(instance_mods_dir);
-    let entries = match fs::read_dir(history_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(StateError::Read(error)),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if !file_type.is_file() {
-            return Err(StateError::InvalidRollback(
-                "rollback history contains a non-regular entry".to_string(),
-            ));
-        }
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+    for record in snapshots.iter().filter(|record| !record.latest) {
+        if keep.contains(&record.snapshot.id) {
             continue;
         }
-        let Some(snapshot_id) = path.file_stem().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if keep.contains(snapshot_id) {
-            continue;
+        let cleanup = stage_pruned_snapshot_artifacts(instance_mods_dir, &record.snapshot)?;
+        remove_owned_file(&rollback_history_file_path(
+            instance_mods_dir,
+            &record.snapshot.id,
+        ))?;
+        for path in cleanup {
+            remove_owned_file(&path)?;
         }
-        fs::remove_file(path)?;
     }
     Ok(())
+}
+
+fn stage_pruned_snapshot_artifacts(
+    instance_mods_dir: &Path,
+    snapshot: &RollbackSnapshot,
+) -> Result<Vec<PathBuf>, StateError> {
+    let mut cleanup_paths = Vec::new();
+    for artifact in &snapshot.artifacts {
+        let path = rollback_files_dir_path(instance_mods_dir).join(&artifact.stored_filename);
+        if !path_exists(&path)? {
+            continue;
+        }
+        if !path_matches_sha512(&path, &artifact.sha512)? {
+            return Err(StateError::InvalidRollback(
+                "pruned rollback artifact ownership cannot be proven".to_string(),
+            ));
+        }
+        let cleanup = PathBuf::from(format!("{}.prune-{}.tmp", path.display(), artifact.sha512));
+        reserve_backup_exclusive(
+            &path,
+            &cleanup,
+            StatePublicationPhase::Cleanup,
+            Some(&artifact.sha512),
+        )?;
+        cleanup_paths.push(cleanup);
+    }
+    Ok(cleanup_paths)
 }
 
 fn rollback_snapshot_record_bytes(
@@ -1541,27 +2635,6 @@ fn rollback_snapshot_record_bytes(
         })?;
     }
     Ok(total)
-}
-
-fn replace_file_atomic(temp_path: &Path, final_path: &Path) -> Result<(), std::io::Error> {
-    if fs::rename(temp_path, final_path).is_ok() {
-        return Ok(());
-    }
-
-    if final_path.exists() {
-        fs::remove_file(final_path)?;
-    }
-
-    match fs::rename(temp_path, final_path) {
-        Ok(()) => Ok(()),
-        Err(error) => match fs::remove_file(temp_path) {
-            Ok(()) => Err(error),
-            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
-                Err(error)
-            }
-            Err(cleanup_error) => Err(cleanup_error),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -1680,7 +2753,10 @@ mod tests {
         assert_eq!(artifact.project_id, "sodium");
         assert_eq!(artifact.version_id, "version");
         assert_eq!(artifact.ownership_class, OwnershipClass::CompositionManaged);
-        assert!(!artifact.sha512_present);
+        assert_eq!(
+            artifact.sha512,
+            test_mod("sodium", "managed-a.jar").integrity.sha512
+        );
         assert!(!artifact.sha512_verified);
         assert_eq!(
             fs::read(rollback_files_dir_path(&root).join(&artifact.stored_filename))
@@ -1787,8 +2863,8 @@ mod tests {
     }
 
     #[test]
-    fn rollback_snapshot_retries_orphan_cleanup_before_successor() {
-        let root = test_root("snapshot-orphan-cleanup-retry");
+    fn rollback_snapshot_preserves_unproven_orphan_artifact() {
+        let root = test_root("snapshot-unproven-orphan");
         ensure_rollback_internal_roots(&root).expect("create rollback roots");
         let orphan = rollback_files_dir_path(&root).join("rb-orphan-0.bin");
         fs::write(&orphan, b"partial-candidate").expect("write orphan candidate");
@@ -1798,9 +2874,12 @@ mod tests {
             &root,
             &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
         )
-        .expect("successor should settle orphan cleanup first");
+        .expect("unproven orphan should not block bounded successor storage");
 
-        assert!(!orphan.exists());
+        assert_eq!(
+            fs::read(&orphan).expect("read preserved orphan"),
+            b"partial-candidate"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1936,7 +3015,7 @@ mod tests {
     #[test]
     fn rollback_refuses_to_claim_untracked_matching_target() {
         let root = test_root("restore-untracked-matching-target");
-        fs::write(root.join("managed-a.jar"), b"snapshot-managed").expect("write managed a");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed a");
         let snapshot = save_rollback_snapshot(
             &root,
             &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
@@ -1949,7 +3028,7 @@ mod tests {
         assert!(matches!(error, StateError::InvalidRollback(_)));
         assert_eq!(
             fs::read(root.join("managed-a.jar")).expect("read target"),
-            b"snapshot-managed"
+            b"managed-a"
         );
         assert!(load_state(&root).expect("load state").is_none());
 
@@ -1959,7 +3038,7 @@ mod tests {
     #[test]
     fn rollback_refuses_to_overwrite_untracked_existing_target() {
         let root = test_root("restore-untracked-existing-target");
-        fs::write(root.join("managed-a.jar"), b"snapshot-managed").expect("write managed a");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed a");
         let snapshot = save_rollback_snapshot(
             &root,
             &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
@@ -1986,7 +3065,7 @@ mod tests {
     #[test]
     fn rollback_rejects_corrupt_current_state_before_mutation() {
         let root = test_root("restore-corrupt-current-state");
-        fs::write(root.join("managed-a.jar"), b"snapshot-managed").expect("write managed a");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed a");
         let snapshot = save_rollback_snapshot(
             &root,
             &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
@@ -1995,7 +3074,7 @@ mod tests {
         fs::write(root.join("managed-a.jar"), b"user-replacement").expect("replace target");
         fs::write(
             lock_file_path(&root),
-            serde_json::to_vec(&serde_json::json!({
+            serde_json::to_vec(&state_fixture(serde_json::json!({
                 "composition_id": "core-current",
                 "tier": "core",
                 "installed_mods": [{
@@ -2009,7 +3088,7 @@ mod tests {
                 "installed_at": "2026-05-30T00:00:00Z",
                 "failure_count": 0,
                 "last_failure": ""
-            }))
+            })))
             .expect("serialize current state"),
         )
         .expect("write corrupt current state");
@@ -2068,7 +3147,7 @@ mod tests {
     #[test]
     fn rollback_does_not_touch_user_owned_rollback_tmp_collision() {
         let root = test_root("restore-temp-collision");
-        fs::write(root.join("managed-a.jar"), b"snapshot-managed").expect("write managed a");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed a");
         let snapshot = save_rollback_snapshot(
             &root,
             &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
@@ -2084,7 +3163,7 @@ mod tests {
         assert_eq!(restored.composition_id, "core-a");
         assert_eq!(
             fs::read(root.join("managed-a.jar")).expect("read restored"),
-            b"snapshot-managed"
+            b"managed-a"
         );
         assert_eq!(
             fs::read(user_temp_path).expect("read user temp"),
@@ -2136,7 +3215,7 @@ mod tests {
     #[tokio::test]
     async fn async_rollback_refuses_to_overwrite_untracked_existing_target() {
         let root = test_root("async-restore-untracked-existing-target");
-        fs::write(root.join("managed-a.jar"), b"snapshot-managed").expect("write managed a");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed a");
         let snapshot = save_rollback_snapshot(
             &root,
             &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
@@ -2214,7 +3293,7 @@ mod tests {
         let root = test_root("invalid-ownership-shape");
         fs::write(
             lock_file_path(&root),
-            serde_json::to_vec(&serde_json::json!({
+            serde_json::to_vec(&state_fixture(serde_json::json!({
                 "composition_id": "core",
                 "tier": "core",
                 "installed_mods": [{
@@ -2227,7 +3306,7 @@ mod tests {
                 "installed_at": "2026-05-30T00:00:00Z",
                 "failure_count": 0,
                 "last_failure": ""
-            }))
+            })))
             .expect("serialize state"),
         )
         .expect("write missing ownership state");
@@ -2238,7 +3317,7 @@ mod tests {
 
         fs::write(
             lock_file_path(&root),
-            serde_json::to_vec(&serde_json::json!({
+            serde_json::to_vec(&state_fixture(serde_json::json!({
                 "composition_id": "core",
                 "tier": "core",
                 "installed_mods": [{
@@ -2252,7 +3331,7 @@ mod tests {
                 "installed_at": "2026-05-30T00:00:00Z",
                 "failure_count": 0,
                 "last_failure": ""
-            }))
+            })))
             .expect("serialize state"),
         )
         .expect("write unknown ownership state");
@@ -2269,7 +3348,7 @@ mod tests {
         let root = test_root("invalid-source-integrity-shape");
         fs::write(
             lock_file_path(&root),
-            serde_json::to_vec(&serde_json::json!({
+            serde_json::to_vec(&state_fixture(serde_json::json!({
                 "composition_id": "core",
                 "tier": "core",
                 "installed_mods": [{
@@ -2281,7 +3360,7 @@ mod tests {
                 "installed_at": "2026-05-30T00:00:00Z",
                 "failure_count": 0,
                 "last_failure": ""
-            }))
+            })))
             .expect("serialize state"),
         )
         .expect("write missing source state");
@@ -2292,7 +3371,7 @@ mod tests {
 
         fs::write(
             lock_file_path(&root),
-            serde_json::to_vec(&serde_json::json!({
+            serde_json::to_vec(&state_fixture(serde_json::json!({
                 "composition_id": "core",
                 "tier": "core",
                 "installed_mods": [{
@@ -2306,7 +3385,7 @@ mod tests {
                 "installed_at": "2026-05-30T00:00:00Z",
                 "failure_count": 0,
                 "last_failure": ""
-            }))
+            })))
             .expect("serialize state"),
         )
         .expect("write unknown source state");
@@ -2317,7 +3396,7 @@ mod tests {
 
         fs::write(
             lock_file_path(&root),
-            serde_json::to_vec(&serde_json::json!({
+            serde_json::to_vec(&state_fixture(serde_json::json!({
                 "composition_id": "core",
                 "tier": "core",
                 "installed_mods": [{
@@ -2331,7 +3410,7 @@ mod tests {
                 "installed_at": "2026-05-30T00:00:00Z",
                 "failure_count": 0,
                 "last_failure": ""
-            }))
+            })))
             .expect("serialize state"),
         )
         .expect("write unknown integrity field state");
@@ -2348,12 +3427,12 @@ mod tests {
         let root = test_root("missing-failure-metadata");
         fs::write(
             lock_file_path(&root),
-            serde_json::to_vec(&serde_json::json!({
+            serde_json::to_vec(&state_fixture(serde_json::json!({
                 "composition_id": "core",
                 "tier": "core",
                 "installed_mods": [],
                 "installed_at": "2026-05-30T00:00:00Z"
-            }))
+            })))
             .expect("serialize state"),
         )
         .expect("write state without failure metadata");
@@ -2371,7 +3450,7 @@ mod tests {
         let root = test_root("unknown-top-level-state");
         fs::write(
             lock_file_path(&root),
-            serde_json::to_vec(&serde_json::json!({
+            serde_json::to_vec(&state_fixture(serde_json::json!({
                 "composition_id": "core",
                 "tier": "core",
                 "installed_mods": [],
@@ -2379,7 +3458,7 @@ mod tests {
                 "failure_count": 0,
                 "last_failure": "",
                 "unexpected_state": true
-            }))
+            })))
             .expect("serialize state"),
         )
         .expect("write state with unknown field");
@@ -2422,7 +3501,7 @@ mod tests {
         let root = test_root("invalid-integrity");
         fs::write(
             lock_file_path(&root),
-            serde_json::to_vec(&serde_json::json!({
+            serde_json::to_vec(&state_fixture(serde_json::json!({
                 "composition_id": "core",
                 "tier": "core",
                 "installed_mods": [{
@@ -2436,7 +3515,7 @@ mod tests {
                 "installed_at": "2026-05-30T00:00:00Z",
                 "failure_count": 0,
                 "last_failure": ""
-            }))
+            })))
             .expect("serialize state"),
         )
         .expect("write invalid integrity state");
@@ -2452,7 +3531,7 @@ mod tests {
         let root = test_root("malformed-sha512");
         fs::write(
             lock_file_path(&root),
-            serde_json::to_vec(&serde_json::json!({
+            serde_json::to_vec(&state_fixture(serde_json::json!({
                 "composition_id": "core",
                 "tier": "core",
                 "installed_mods": [{
@@ -2466,7 +3545,7 @@ mod tests {
                 "installed_at": "2026-05-30T00:00:00Z",
                 "failure_count": 0,
                 "last_failure": ""
-            }))
+            })))
             .expect("serialize state"),
         )
         .expect("write malformed integrity state");
@@ -2482,7 +3561,7 @@ mod tests {
         let root = test_root("user-managed-state");
         fs::write(
             lock_file_path(&root),
-            serde_json::to_vec(&serde_json::json!({
+            serde_json::to_vec(&state_fixture(serde_json::json!({
                 "composition_id": "core",
                 "tier": "core",
                 "installed_mods": [{
@@ -2496,7 +3575,7 @@ mod tests {
                 "installed_at": "2026-05-30T00:00:00Z",
                 "failure_count": 0,
                 "last_failure": ""
-            }))
+            })))
             .expect("serialize state"),
         )
         .expect("write user-managed state");
@@ -2504,6 +3583,117 @@ mod tests {
         let error = load_state(&root).expect_err("user-managed tracked state should fail");
 
         assert!(matches!(error, StateError::InvalidOwnership { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_state_rejects_unversioned_state_without_rewriting_bytes() {
+        let root = test_root("unversioned-state");
+        let bytes =
+            serde_json::to_vec(&test_state("core", Vec::new())).expect("serialize legacy state");
+        fs::write(lock_file_path(&root), &bytes).expect("write legacy state");
+
+        assert!(matches!(load_state(&root), Err(StateError::Parse(_))));
+        assert_eq!(
+            fs::read(lock_file_path(&root)).expect("read legacy state"),
+            bytes
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_state_rejects_case_colliding_artifact_identities() {
+        let root = test_root("case-colliding-state");
+        let mut first = test_mod("Sodium", "sodium.jar");
+        let mut second = test_mod("sodium", "SODIUM.JAR");
+        first.integrity.sha512 = hex::encode(Sha512::digest(b"first"));
+        second.integrity.sha512 = hex::encode(Sha512::digest(b"second"));
+
+        assert!(matches!(
+            save_state(&root, &test_state("core", vec![first, second])),
+            Err(StateError::InvalidState(_))
+        ));
+        assert!(!lock_file_path(&root).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_state_rejects_oversized_and_nonregular_destinations_without_rewrite() {
+        let oversized_root = test_root("oversized-state");
+        let oversized_path = lock_file_path(&oversized_root);
+        let oversized = fs::File::create(&oversized_path).expect("create oversized state");
+        oversized
+            .set_len(STATE_MAX_BYTES + 1)
+            .expect("extend oversized state");
+        drop(oversized);
+        assert!(matches!(
+            load_state(&oversized_root),
+            Err(StateError::InvalidState(_))
+        ));
+        assert_eq!(
+            fs::symlink_metadata(&oversized_path)
+                .expect("oversized metadata")
+                .len(),
+            STATE_MAX_BYTES + 1
+        );
+
+        let directory_root = test_root("directory-state");
+        fs::create_dir(lock_file_path(&directory_root)).expect("create state directory");
+        assert!(matches!(
+            load_state(&directory_root),
+            Err(StateError::InvalidState(_))
+        ));
+        assert!(lock_file_path(&directory_root).is_dir());
+
+        let _ = fs::remove_dir_all(oversized_root);
+        let _ = fs::remove_dir_all(directory_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_state_rejects_symlink_destination_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("symlink-state");
+        let outside = root.join("outside.json");
+        let bytes = serde_json::to_vec(&PersistedCompositionState {
+            schema_version: STATE_SCHEMA_VERSION,
+            state: test_state("core", Vec::new()),
+        })
+        .expect("serialize outside state");
+        fs::write(&outside, &bytes).expect("write outside state");
+        symlink(&outside, lock_file_path(&root)).expect("link state destination");
+
+        assert!(matches!(
+            load_state(&root),
+            Err(StateError::InvalidState(_))
+        ));
+        assert_eq!(fs::read(outside).expect("outside state remains"), bytes);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removal_reconciliation_preserves_user_replacement_and_exact_backup() {
+        let root = test_root("removal-user-replacement");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed artifact");
+        let installed = test_mod("sodium", "managed-a.jar");
+        save_state(&root, &test_state("core-a", vec![installed.clone()]))
+            .expect("save managed state");
+        let backup = stage_managed_artifact_removal(&root, &installed)
+            .expect("stage managed artifact removal");
+        fs::write(root.join("managed-a.jar"), b"user-replacement").expect("write user replacement");
+
+        let error = load_state(&root).expect_err("conflicting replacement must block recovery");
+
+        assert!(matches!(error, StateError::InvalidIntegrity { .. }));
+        assert_eq!(
+            fs::read(root.join("managed-a.jar")).expect("read user replacement"),
+            b"user-replacement"
+        );
+        assert_eq!(
+            fs::read(backup).expect("read retained managed backup"),
+            b"managed-a"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2518,7 +3708,18 @@ mod tests {
         }
     }
 
+    fn state_fixture(state: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": STATE_SCHEMA_VERSION,
+            "state": state,
+        })
+    }
+
     fn test_mod(project_id: &str, filename: &str) -> InstalledMod {
+        let bytes = filename
+            .strip_suffix(".jar")
+            .unwrap_or("managed")
+            .as_bytes();
         InstalledMod {
             project_id: project_id.to_string(),
             version_id: "version".to_string(),
@@ -2528,7 +3729,7 @@ mod tests {
                 provider: ManagedArtifactProvider::Modrinth,
             },
             integrity: ManagedArtifactIntegrity {
-                sha512: String::new(),
+                sha512: hex::encode(Sha512::digest(bytes)),
                 sha512_verified: false,
             },
         }

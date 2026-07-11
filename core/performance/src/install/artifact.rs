@@ -49,11 +49,21 @@ impl PerformanceManager {
             }));
         }
         let final_path = instance_mods_dir.join(&filename);
-        let was_previously_tracked = state_tracks_filename(previous_state, &filename);
+        let previously_tracked = tracked_artifact(previous_state, &filename);
+        let was_previously_tracked = previously_tracked.is_some();
         let temp_path = managed_artifact_temp_path(&final_path, managed_mod);
-        reconcile_managed_replace_backups(&final_path, was_previously_tracked).await?;
+        reconcile_managed_replace_backups(
+            &final_path,
+            previously_tracked.map(|installed| installed.integrity.sha512.as_str()),
+        )
+        .await?;
 
         if tokio::fs::try_exists(&final_path).await? {
+            if let Some(previous) = previously_tracked
+                && !file_matches_sha512(&final_path, &previous.integrity.sha512, None).await?
+            {
+                return Err(InstallError::ManagedArtifactTargetExists(filename));
+            }
             if !expected_sha.trim().is_empty()
                 && let Ok(true) = file_matches_sha512(&final_path, &expected_sha, file.size).await
             {
@@ -76,11 +86,18 @@ impl PerformanceManager {
             .modrinth
             .download_file_to_path(&file.url, &expected_sha, file.size, &temp_path)
             .await?;
+        let ownership_sha512 = download.sha512().to_string();
         if tokio::fs::try_exists(&final_path).await? && !was_previously_tracked {
             download.cleanup().await?;
             return Err(InstallError::ManagedArtifactTargetExists(filename));
         }
-        promote_file_async(download, &final_path, &filename, was_previously_tracked).await?;
+        promote_file_async(
+            download,
+            &final_path,
+            &filename,
+            previously_tracked.map(|installed| installed.integrity.sha512.as_str()),
+        )
+        .await?;
 
         Ok(InstalledMod {
             project_id: managed_mod.project_id.clone(),
@@ -89,9 +106,9 @@ impl PerformanceManager {
             ownership_class: OwnershipClass::CompositionManaged,
             source: modrinth_source(),
             integrity: if expected_sha.trim().is_empty() {
-                unverified_sha512_integrity(expected_sha)
+                unverified_sha512_integrity(ownership_sha512)
             } else {
-                verified_sha512_integrity(expected_sha)
+                verified_sha512_integrity(ownership_sha512)
             },
         })
     }
@@ -341,20 +358,20 @@ async fn bounded_regular_file_sha512(path: &Path) -> Result<(String, u64), std::
 }
 
 #[cfg(unix)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+pub(super) fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 #[cfg(windows)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+pub(super) fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     left.volume_serial_number() == right.volume_serial_number()
         && left.file_index() == right.file_index()
 }
 
 #[cfg(not(any(unix, windows)))]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+pub(super) fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
@@ -380,12 +397,15 @@ fn sanitize_mod_filename(name: &str) -> Result<String, InstallError> {
     Ok(base.to_string())
 }
 
-fn state_tracks_filename(state: Option<&CompositionState>, filename: &str) -> bool {
-    state.is_some_and(|state| {
+fn tracked_artifact<'a>(
+    state: Option<&'a CompositionState>,
+    filename: &str,
+) -> Option<&'a InstalledMod> {
+    state.and_then(|state| {
         state
             .installed_mods
             .iter()
-            .any(|installed| installed.filename == filename)
+            .find(|installed| installed.filename == filename)
     })
 }
 

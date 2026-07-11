@@ -1,12 +1,13 @@
 use super::fallback::{empty_state, severe_install_failure};
 use super::manager::PerformanceManager;
 use super::model::InstallError;
+use super::promotion::{reconcile_managed_replace_backups, settle_managed_replace_backup};
 use crate::state::{
     RollbackSnapshotSummary, list_rollback_snapshots_async, load_rollback_snapshot,
     load_rollback_snapshot_async, load_rollback_snapshot_by_id_async, load_state,
-    managed_artifact_path, remove_state, restore_rollback_snapshot,
+    remove_managed_artifact, remove_state, restore_rollback_snapshot,
     restore_rollback_snapshot_async, save_rollback_snapshot, save_rollback_snapshot_async,
-    save_state,
+    save_state, settle_managed_artifact_removal, stage_managed_artifact_removal,
 };
 use crate::types::{CompositionPlan, CompositionState, InstalledMod, PerformanceMode};
 use std::fs;
@@ -27,7 +28,6 @@ impl PerformanceManager {
 
         fs::create_dir_all(instance_mods_dir)?;
         let previous_state = load_state(instance_mods_dir)?;
-        let snapshot_available = previous_state.is_some();
         if let Some(previous_state) = previous_state.as_ref() {
             save_rollback_snapshot_async(instance_mods_dir, previous_state).await?;
         }
@@ -40,7 +40,7 @@ impl PerformanceManager {
             self.restore_after_error_async(
                 instance_mods_dir,
                 self.remove_stale_managed(instance_mods_dir, previous_state.as_ref(), attempt_plan),
-                snapshot_available,
+                previous_state.as_ref(),
             )
             .await?;
 
@@ -64,7 +64,7 @@ impl PerformanceManager {
                 self.restore_after_error_async(
                     instance_mods_dir,
                     self.remove_attempt_mods_not_in_plan(instance_mods_dir, &state, next_plan),
-                    snapshot_available,
+                    previous_state.as_ref(),
                 )
                 .await?;
                 abandoned_states.push(state);
@@ -79,19 +79,21 @@ impl PerformanceManager {
         self.restore_after_error_async(
             instance_mods_dir,
             save_state(instance_mods_dir, &state).map_err(InstallError::State),
-            snapshot_available,
+            previous_state.as_ref(),
         )
         .await?;
+        self.settle_replaced_managed(instance_mods_dir, previous_state.as_ref(), &state)
+            .await?;
         self.restore_after_error_async(
             instance_mods_dir,
             self.remove_superseded_managed(instance_mods_dir, previous_state.as_ref(), &state),
-            snapshot_available,
+            previous_state.as_ref(),
         )
         .await?;
         self.restore_after_error_async(
             instance_mods_dir,
             self.remove_abandoned_attempt_mods(instance_mods_dir, &abandoned_states, &state),
-            snapshot_available,
+            previous_state.as_ref(),
         )
         .await?;
         Ok(state)
@@ -155,12 +157,7 @@ impl PerformanceManager {
             if keep.contains(&installed.project_id.to_lowercase()) {
                 continue;
             }
-            let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
-            if let Err(error) = fs::remove_file(path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(InstallError::Io(error));
-            }
+            remove_managed_artifact(instance_mods_dir, installed)?;
         }
 
         Ok(())
@@ -190,12 +187,7 @@ impl PerformanceManager {
             if previous.filename.is_empty() || previous.filename == installed.filename {
                 continue;
             }
-            let path = managed_artifact_path(instance_mods_dir, &previous.filename)?;
-            if let Err(error) = fs::remove_file(path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(InstallError::Io(error));
-            }
+            remove_managed_artifact(instance_mods_dir, previous)?;
         }
 
         Ok(())
@@ -217,12 +209,7 @@ impl PerformanceManager {
             if keep.contains(&installed.project_id.to_lowercase()) {
                 continue;
             }
-            let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
-            if let Err(error) = fs::remove_file(path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(InstallError::Io(error));
-            }
+            remove_managed_artifact(instance_mods_dir, installed)?;
         }
 
         Ok(())
@@ -245,12 +232,7 @@ impl PerformanceManager {
                 if keep.contains(&installed.filename) {
                     continue;
                 }
-                let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
-                if let Err(error) = fs::remove_file(path)
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    return Err(InstallError::Io(error));
-                }
+                remove_managed_artifact(instance_mods_dir, installed)?;
             }
         }
 
@@ -261,23 +243,68 @@ impl PerformanceManager {
         &self,
         instance_mods_dir: &Path,
         result: Result<T, InstallError>,
-        snapshot_available: bool,
+        previous_state: Option<&CompositionState>,
     ) -> Result<T, InstallError> {
         match result {
             Ok(value) => Ok(value),
             Err(error) => {
-                if snapshot_available
+                self.reconcile_replaced_managed(instance_mods_dir, previous_state)
+                    .await?;
+                if previous_state.is_some()
                     && let Err(rollback_error) =
                         self.rollback_managed_async(instance_mods_dir).await
                 {
-                    warn!(
-                        "failed to restore performance rollback snapshot after error: {}",
-                        rollback_error
-                    );
+                    return Err(rollback_error);
                 }
                 Err(error)
             }
         }
+    }
+
+    async fn reconcile_replaced_managed(
+        &self,
+        instance_mods_dir: &Path,
+        previous_state: Option<&CompositionState>,
+    ) -> Result<(), InstallError> {
+        for installed in previous_state
+            .into_iter()
+            .flat_map(|state| state.installed_mods.iter())
+        {
+            reconcile_managed_replace_backups(
+                &instance_mods_dir.join(&installed.filename),
+                Some(&installed.integrity.sha512),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn settle_replaced_managed(
+        &self,
+        instance_mods_dir: &Path,
+        previous_state: Option<&CompositionState>,
+        current_state: &CompositionState,
+    ) -> Result<(), InstallError> {
+        let previous_by_filename: std::collections::HashMap<&str, &InstalledMod> = previous_state
+            .into_iter()
+            .flat_map(|state| state.installed_mods.iter())
+            .map(|installed| (installed.filename.as_str(), installed))
+            .collect();
+        for installed in &current_state.installed_mods {
+            let Some(previous) = previous_by_filename.get(installed.filename.as_str()) else {
+                continue;
+            };
+            if previous.integrity.sha512 == installed.integrity.sha512 {
+                continue;
+            }
+            settle_managed_replace_backup(
+                &instance_mods_dir.join(&installed.filename),
+                &previous.integrity.sha512,
+                &installed.integrity.sha512,
+            )
+            .await?;
+        }
+        Ok(())
     }
 }
 
@@ -288,23 +315,17 @@ fn remove_managed_transaction(instance_mods_dir: &Path) -> Result<(), InstallErr
     save_rollback_snapshot(instance_mods_dir, &state)?;
     let result = (|| -> Result<(), InstallError> {
         for installed in &state.installed_mods {
-            let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
-            if let Err(error) = fs::remove_file(path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(InstallError::Io(error));
-            }
+            stage_managed_artifact_removal(instance_mods_dir, installed)?;
         }
         remove_state(instance_mods_dir)?;
+        for installed in &state.installed_mods {
+            settle_managed_artifact_removal(instance_mods_dir, installed)?;
+        }
         Ok(())
     })();
     if let Err(error) = result {
-        if let Err(rollback_error) = rollback_managed_transaction(instance_mods_dir) {
-            warn!(
-                "failed to restore performance rollback snapshot after error: {}",
-                rollback_error
-            );
-        }
+        load_state(instance_mods_dir)?;
+        rollback_managed_transaction(instance_mods_dir)?;
         return Err(error);
     }
     Ok(())

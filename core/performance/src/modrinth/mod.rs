@@ -181,7 +181,7 @@ impl ModrinthClient {
                     "managed download temp creation task stopped",
                 ))
             })??;
-        let (output, owned_temp) = created.into_parts();
+        let (output, owned_temp) = created.into_parts()?;
         let mut output = tokio::fs::File::from_std(output);
         let result = async {
             let mut hasher = Sha512::new();
@@ -220,13 +220,15 @@ impl ModrinthClient {
                 actual,
             });
         }
-        Ok(owned_temp)
+        Ok(owned_temp.with_sha512(actual))
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct ManagedDownloadTemp {
     path: std::path::PathBuf,
+    sha512: String,
+    identity: std::fs::Metadata,
     armed: bool,
 }
 
@@ -235,11 +237,38 @@ impl ManagedDownloadTemp {
         &self.path
     }
 
+    pub(crate) fn sha512(&self) -> &str {
+        &self.sha512
+    }
+
+    pub(crate) fn owns_metadata(&self, metadata: &std::fs::Metadata) -> bool {
+        metadata.file_type().is_file() && same_file_identity(metadata, &self.identity)
+    }
+
+    fn with_sha512(mut self, sha512: String) -> Self {
+        self.sha512 = sha512;
+        self
+    }
+
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 
     pub(crate) async fn cleanup(mut self) -> Result<(), io::Error> {
+        let current = match tokio::fs::symlink_metadata(&self.path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.disarm();
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if !current.file_type().is_file() || !same_file_identity(&current, &self.identity) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed download temp identity changed before cleanup",
+            ));
+        }
         match tokio::fs::remove_file(&self.path).await {
             Ok(()) => {
                 self.disarm();
@@ -257,6 +286,7 @@ impl ManagedDownloadTemp {
 struct CreatedDownloadTemp {
     file: Option<std::fs::File>,
     path: std::path::PathBuf,
+    identity: std::fs::Metadata,
     armed: bool,
 }
 
@@ -266,24 +296,29 @@ impl CreatedDownloadTemp {
             .write(true)
             .create_new(true)
             .open(&path)?;
+        let identity = file.metadata()?;
         Ok(Self {
             file: Some(file),
             path,
+            identity,
             armed: true,
         })
     }
 
-    fn into_parts(mut self) -> (std::fs::File, ManagedDownloadTemp) {
+    fn into_parts(mut self) -> Result<(std::fs::File, ManagedDownloadTemp), io::Error> {
         let file = self
             .file
             .take()
             .expect("created download temp owns its file");
+        let identity = file.metadata()?;
         self.armed = false;
         let guard = ManagedDownloadTemp {
             path: self.path.clone(),
+            sha512: String::new(),
+            identity,
             armed: true,
         };
-        (file, guard)
+        Ok((file, guard))
     }
 }
 
@@ -291,6 +326,9 @@ impl Drop for CreatedDownloadTemp {
     fn drop(&mut self) {
         drop(self.file.take());
         if self.armed
+            && std::fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+                metadata.file_type().is_file() && same_file_identity(&metadata, &self.identity)
+            })
             && let Err(error) = std::fs::remove_file(&self.path)
             && error.kind() != io::ErrorKind::NotFound
         {
@@ -301,13 +339,36 @@ impl Drop for CreatedDownloadTemp {
 
 impl Drop for ManagedDownloadTemp {
     fn drop(&mut self) {
-        if self.armed
-            && let Err(error) = std::fs::remove_file(&self.path)
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            tracing::warn!("managed download temp cleanup failed");
+        if self.armed {
+            let removable = std::fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+                metadata.file_type().is_file() && same_file_identity(&metadata, &self.identity)
+            });
+            if removable
+                && let Err(error) = std::fs::remove_file(&self.path)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!("managed download temp cleanup failed");
+            }
         }
     }
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index() == right.file_index()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 fn modrinth_http_client() -> Client {

@@ -1,4 +1,17 @@
 use super::*;
+use sha2::{Digest, Sha512};
+
+fn sha512(bytes: &[u8]) -> String {
+    hex::encode(Sha512::digest(bytes))
+}
+
+fn persisted_state_bytes(state: &impl serde::Serialize) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "state": state,
+    }))
+    .expect("serialize persisted state")
+}
 
 #[tokio::test]
 async fn plan_missing_game_version_returns_json_error() {
@@ -374,7 +387,7 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
                 ownership_class: axial_performance::OwnershipClass::CompositionManaged,
                 source: test_modrinth_source(),
                 integrity: axial_performance::ManagedArtifactIntegrity {
-                    sha512: valid_sha512(),
+                    sha512: sha512(b"managed"),
                     sha512_verified: true,
                 },
             }],
@@ -409,7 +422,7 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
     assert!(value.get("managed_artifacts").is_some());
     assert!(value.to_string().contains("managed.jar"));
     assert!(!value.to_string().contains(&mods_dir.display().to_string()));
-    assert!(!value.to_string().contains(&valid_sha512()));
+    assert!(!value.to_string().contains(&sha512(b"managed")));
     assert_eq!(response.proof.health, bundle_health_token(response.health));
     assert_eq!(
         response.proof.target.ownership,
@@ -480,7 +493,7 @@ async fn health_response_bounds_public_composition_identifiers() {
                 ownership_class: axial_performance::OwnershipClass::CompositionManaged,
                 source: test_modrinth_source(),
                 integrity: axial_performance::ManagedArtifactIntegrity {
-                    sha512: valid_sha512(),
+                    sha512: sha512(b"managed"),
                     sha512_verified: true,
                 },
             }],
@@ -545,7 +558,7 @@ async fn health_response_exposes_degraded_and_fallback_guardian_view_models_and_
             ownership_class: axial_performance::OwnershipClass::CompositionManaged,
             source: test_modrinth_source(),
             integrity: axial_performance::ManagedArtifactIntegrity {
-                sha512: valid_sha512(),
+                sha512: sha512(b"managed"),
                 sha512_verified: true,
             },
         }],
@@ -760,7 +773,7 @@ async fn health_invalidates_user_managed_artifact_in_tracked_state() {
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(
         mods_dir.join(".axial-lock.json"),
-        serde_json::to_vec(&serde_json::json!({
+        persisted_state_bytes(&serde_json::json!({
             "composition_id": "core",
             "tier": "core",
             "installed_mods": [{
@@ -774,8 +787,7 @@ async fn health_invalidates_user_managed_artifact_in_tracked_state() {
             "installed_at": "2026-05-30T00:00:00Z",
             "failure_count": 0,
             "last_failure": ""
-        }))
-        .expect("serialize state"),
+        })),
     )
     .expect("write state");
 

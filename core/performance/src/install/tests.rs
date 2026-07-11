@@ -103,6 +103,10 @@ async fn ensure_installed_writes_composition_managed_ownership() {
         ManagedArtifactProvider::Modrinth
     );
     assert!(!state.installed_mods[0].integrity.sha512_verified);
+    assert_eq!(
+        state.installed_mods[0].integrity.sha512,
+        hex::encode(sha2::Sha512::digest(b"managed-jar"))
+    );
     assert!(root.join("sodium.jar").is_file());
     let loaded = load_state(&root)
         .expect("load state")
@@ -116,6 +120,10 @@ async fn ensure_installed_writes_composition_managed_ownership() {
         ManagedArtifactProvider::Modrinth
     );
     assert!(!loaded.installed_mods[0].integrity.sha512_verified);
+    assert_eq!(
+        loaded.installed_mods[0].integrity.sha512,
+        state.installed_mods[0].integrity.sha512
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -768,7 +776,7 @@ async fn tracked_overwrite_rejection_cleans_owned_download_temp() {
         .await
         .expect("download owned managed temp");
 
-    promote_file_async(download, &final_path, "sodium.jar", true)
+    promote_file_async(download, &final_path, "sodium.jar", Some(""))
         .await
         .expect_err("tracked directory destination should reject overwrite");
 
@@ -1161,19 +1169,25 @@ async fn remove_rejects_non_composition_owned_tracked_state_without_deleting_fil
     fs::write(
         root.join(".axial-lock.json"),
         serde_json::to_vec(&serde_json::json!({
-            "composition_id": "core",
-            "tier": "core",
-            "installed_mods": [{
-                "project_id": "sodium",
-                "version_id": "version",
-                "filename": "user.jar",
-                "ownership_class": "user_managed",
-                "source": { "provider": "modrinth" },
-                "integrity": { "sha512": "", "sha512_verified": false }
-            }],
-            "installed_at": "2026-05-30T00:00:00Z",
-            "failure_count": 0,
-            "last_failure": ""
+            "schema_version": 1,
+            "state": {
+                "composition_id": "core",
+                "tier": "core",
+                "installed_mods": [{
+                    "project_id": "sodium",
+                    "version_id": "version",
+                    "filename": "user.jar",
+                    "ownership_class": "user_managed",
+                    "source": { "provider": "modrinth" },
+                    "integrity": {
+                        "sha512": hex::encode(sha2::Sha512::digest(b"user")),
+                        "sha512_verified": false
+                    }
+                }],
+                "installed_at": "2026-05-30T00:00:00Z",
+                "failure_count": 0,
+                "last_failure": ""
+            }
         }))
         .expect("serialize state"),
     )
@@ -1393,6 +1407,11 @@ fn test_state(composition_id: &str, installed_mods: Vec<InstalledMod>) -> Compos
 }
 
 fn test_mod(project_id: &str, filename: &str) -> InstalledMod {
+    let bytes: &[u8] = match filename {
+        "sodium.jar" => b"old-managed-sodium",
+        "managed.jar" => b"managed-v1",
+        _ => b"managed",
+    };
     InstalledMod {
         project_id: project_id.to_string(),
         version_id: "version".to_string(),
@@ -1400,7 +1419,7 @@ fn test_mod(project_id: &str, filename: &str) -> InstalledMod {
         ownership_class: OwnershipClass::CompositionManaged,
         source: modrinth_source(),
         integrity: ManagedArtifactIntegrity {
-            sha512: String::new(),
+            sha512: hex::encode(sha2::Sha512::digest(bytes)),
             sha512_verified: false,
         },
     }

@@ -594,7 +594,3 @@ fn test_modrinth_source() -> axial_performance::ManagedArtifactSource {
         provider: axial_performance::ManagedArtifactProvider::Modrinth,
     }
 }
-
-fn valid_sha512() -> String {
-    "a".repeat(128)
-}

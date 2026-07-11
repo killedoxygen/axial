@@ -1,4 +1,19 @@
 use super::*;
+use sha2::{Digest, Sha512};
+
+fn persisted_state_bytes(state: &impl serde::Serialize) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "state": state,
+    }))
+    .expect("serialize persisted state")
+}
+
+fn test_installed_mod_for_bytes(project_id: &str, filename: &str, bytes: &[u8]) -> InstalledMod {
+    let mut installed = test_installed_mod(project_id, filename);
+    installed.integrity.sha512 = hex::encode(Sha512::digest(bytes));
+    installed
+}
 
 #[tokio::test]
 async fn install_missing_instance_id_returns_json_error() {
@@ -135,7 +150,7 @@ async fn install_custom_mode_removes_only_managed_artifacts() {
     fs::write(mods_dir.join("user.jar"), b"user").expect("write user mod");
     fs::write(
         mods_dir.join(".axial-lock.json"),
-        serde_json::to_vec(&axial_performance::CompositionState {
+        persisted_state_bytes(&axial_performance::CompositionState {
             composition_id: "core".to_string(),
             tier: CompositionTier::Core,
             installed_mods: vec![axial_performance::InstalledMod {
@@ -145,15 +160,14 @@ async fn install_custom_mode_removes_only_managed_artifacts() {
                 ownership_class: axial_performance::OwnershipClass::CompositionManaged,
                 source: test_modrinth_source(),
                 integrity: axial_performance::ManagedArtifactIntegrity {
-                    sha512: String::new(),
+                    sha512: hex::encode(Sha512::digest(b"managed")),
                     sha512_verified: false,
                 },
             }],
             installed_at: "2026-05-30T00:00:00Z".to_string(),
             failure_count: 0,
             last_failure: String::new(),
-        })
-        .expect("serialize state"),
+        }),
     )
     .expect("write state");
 
@@ -248,7 +262,7 @@ async fn install_remove_rejects_invalid_ownership_without_deleting_files() {
     fs::write(mods_dir.join("user.jar"), b"user").expect("write user file");
     fs::write(
         mods_dir.join(".axial-lock.json"),
-        serde_json::to_vec(&serde_json::json!({
+        persisted_state_bytes(&serde_json::json!({
             "composition_id": "core",
             "tier": "core",
             "installed_mods": [{
@@ -262,8 +276,7 @@ async fn install_remove_rejects_invalid_ownership_without_deleting_files() {
             "installed_at": "2026-05-30T00:00:00Z",
             "failure_count": 0,
             "last_failure": ""
-        }))
-        .expect("serialize state"),
+        })),
     )
     .expect("write invalid state");
 
@@ -309,7 +322,7 @@ async fn install_remove_rejects_invalid_integrity_without_deleting_files() {
     fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed file");
     fs::write(
         mods_dir.join(".axial-lock.json"),
-        serde_json::to_vec(&serde_json::json!({
+        persisted_state_bytes(&serde_json::json!({
             "composition_id": "core",
             "tier": "core",
             "installed_mods": [{
@@ -323,8 +336,7 @@ async fn install_remove_rejects_invalid_integrity_without_deleting_files() {
             "installed_at": "2026-05-30T00:00:00Z",
             "failure_count": 0,
             "last_failure": ""
-        }))
-        .expect("serialize state"),
+        })),
     )
     .expect("write invalid state");
 
@@ -400,7 +412,11 @@ async fn rollback_list_route_returns_snapshot_metadata() {
         &mods_dir,
         &test_composition_state(
             "core-a",
-            vec![test_installed_mod("sodium", "managed-a.jar")],
+            vec![test_installed_mod_for_bytes(
+                "sodium",
+                "managed-a.jar",
+                b"managed-a",
+            )],
         ),
     )
     .expect("save first snapshot");
@@ -408,7 +424,11 @@ async fn rollback_list_route_returns_snapshot_metadata() {
         &mods_dir,
         &test_composition_state(
             "core-b",
-            vec![test_installed_mod("lithium", "managed-b.jar")],
+            vec![test_installed_mod_for_bytes(
+                "lithium",
+                "managed-b.jar",
+                b"managed-b",
+            )],
         ),
     )
     .expect("save second snapshot");
@@ -467,7 +487,11 @@ async fn rollback_list_route_bounds_public_snapshot_descriptors() {
         &mods_dir,
         &test_composition_state(
             raw_composition_id,
-            vec![test_installed_mod("sodium", "managed.jar")],
+            vec![test_installed_mod_for_bytes(
+                "sodium",
+                "managed.jar",
+                b"managed",
+            )],
         ),
     )
     .expect("save snapshot");
@@ -526,7 +550,11 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
         &mods_dir,
         &test_composition_state(
             "core-a",
-            vec![test_installed_mod("sodium", "managed-a.jar")],
+            vec![test_installed_mod_for_bytes(
+                "sodium",
+                "managed-a.jar",
+                b"managed-a",
+            )],
         ),
     )
     .expect("save older snapshot");
@@ -536,7 +564,11 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
         &mods_dir,
         &test_composition_state(
             "core-b",
-            vec![test_installed_mod("lithium", "managed-b.jar")],
+            vec![test_installed_mod_for_bytes(
+                "lithium",
+                "managed-b.jar",
+                b"managed-b",
+            )],
         ),
     )
     .expect("save current state");
@@ -544,7 +576,11 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
         &mods_dir,
         &test_composition_state(
             "core-b",
-            vec![test_installed_mod("lithium", "managed-b.jar")],
+            vec![test_installed_mod_for_bytes(
+                "lithium",
+                "managed-b.jar",
+                b"managed-b",
+            )],
         ),
     )
     .expect("save newer snapshot");
@@ -574,7 +610,7 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
             filename: "managed-a.jar".to_string(),
             ownership_class: axial_performance::OwnershipClass::CompositionManaged,
             source_provider: axial_performance::ManagedArtifactProvider::Modrinth,
-            sha512_present: false,
+            sha512_present: true,
             sha512_verified: false,
         }]
     );
@@ -653,7 +689,11 @@ async fn rollback_rejects_untracked_same_name_target_without_overwriting() {
         &mods_dir,
         &test_composition_state(
             "core-a",
-            vec![test_installed_mod("sodium", "managed-a.jar")],
+            vec![test_installed_mod_for_bytes(
+                "sodium",
+                "managed-a.jar",
+                b"snapshot-managed",
+            )],
         ),
     )
     .expect("save snapshot");
