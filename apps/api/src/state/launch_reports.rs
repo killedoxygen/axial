@@ -2893,11 +2893,16 @@ mod tests {
         let root = test_root("persist-list");
         let paths = test_paths(&root);
         let mut first = test_record("first");
+        first.state = LaunchState::Exited;
         first.pid = Some(11);
+        first.exit_code = Some(1);
         first.failure = Some(LaunchFailure {
-            class: LaunchFailureClass::StartupStalled,
-            detail: Some("no startup activity observed".to_string()),
+            class: LaunchFailureClass::ModAttributedCrash,
+            detail: Some("crash attributed to Example Machines".to_string()),
         });
+        first.outcome = Some(LaunchSessionOutcome::from_reason(
+            LaunchSessionExitReason::StartupFailed,
+        ));
         first.crash_evidence = axial_launcher::parse_crash_evidence(
             axial_launcher::CrashArtifactKind::MinecraftCrashReport,
             b"Description: Mod loading error\njava.lang.IllegalStateException: failed\nSuspected Mods: Example Machines (examplemachines) version 3.2.1\nJVM Flags: -Duser.home=/home/alice -Dtoken=raw-secret-token",
@@ -2923,7 +2928,7 @@ mod tests {
         assert_eq!(first_proof.schema_version, LAUNCH_PROOF_SCHEMA_VERSION);
         assert_eq!(
             first_proof.failure_class.as_deref(),
-            Some("startup_stalled")
+            Some("mod_attributed_crash")
         );
         assert_eq!(first_proof.pid, Some(11));
         assert_eq!(first_proof.boot_duration_ms, None);
