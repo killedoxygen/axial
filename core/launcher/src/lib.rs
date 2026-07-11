@@ -25,9 +25,8 @@ pub use crash::{
 pub use failure::{classify_launch_failure, classify_startup_failure_text};
 pub use guardian::{
     GuardianDecision, GuardianIntervention, GuardianInterventionKind, GuardianMode,
-    GuardianSummary, LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB,
-    LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB, LaunchCpuLoadWarningFacts, LaunchGuardianContext,
-    LaunchResourceWarningFacts, OverrideOrigin,
+    GuardianSummary, LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB, LaunchGuardianContext,
+    OverrideOrigin,
 };
 pub use healing::{HealingEvent, HealingEventKind};
 pub use jvm::{

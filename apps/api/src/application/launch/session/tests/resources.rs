@@ -1,3 +1,6 @@
+use super::super::resources::{
+    active_launch_cpu_pressure, measured_cpu_load_pressure, measured_cpu_load_threshold_x100,
+};
 use super::*;
 
 #[test]
@@ -92,4 +95,50 @@ fn cpu_load_conversion_is_instant_and_optional() {
     assert_eq!(load_to_x100(f64::NAN), None);
     assert_eq!(load_to_x100(f64::INFINITY), None);
     assert_eq!(load_to_x100(-0.1), None);
+}
+
+#[test]
+fn cpu_concurrency_pressure_preserves_thread_tier_thresholds() {
+    assert!(!active_launch_cpu_pressure(Some(4), 0));
+    assert!(active_launch_cpu_pressure(Some(4), 1));
+
+    assert!(!active_launch_cpu_pressure(Some(8), 1));
+    assert!(active_launch_cpu_pressure(Some(8), 2));
+
+    assert!(!active_launch_cpu_pressure(Some(16), 3));
+    assert!(active_launch_cpu_pressure(Some(16), 4));
+}
+
+#[test]
+fn measured_cpu_pressure_uses_most_recent_sample_and_thread_tier_thresholds() {
+    assert_eq!(measured_cpu_load_threshold_x100(4), 300);
+    assert_eq!(measured_cpu_load_threshold_x100(8), 680);
+    assert_eq!(measured_cpu_load_threshold_x100(16), 1520);
+
+    let loads = |one, five, fifteen| LaunchCpuLoadEvidence {
+        host_cpu_load_1m_x100: one,
+        host_cpu_load_5m_x100: five,
+        host_cpu_load_15m_x100: fifteen,
+    };
+
+    assert!(!measured_cpu_load_pressure(
+        Some(4),
+        loads(Some(299), Some(300), Some(300)),
+    ));
+    assert!(measured_cpu_load_pressure(
+        Some(4),
+        loads(None, Some(300), Some(299)),
+    ));
+    assert!(measured_cpu_load_pressure(
+        Some(4),
+        loads(None, None, Some(300)),
+    ));
+    assert!(measured_cpu_load_pressure(
+        Some(8),
+        loads(Some(680), None, None),
+    ));
+    assert!(measured_cpu_load_pressure(
+        Some(16),
+        loads(Some(1520), None, None),
+    ));
 }

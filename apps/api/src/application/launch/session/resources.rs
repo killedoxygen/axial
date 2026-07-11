@@ -1,12 +1,11 @@
 use super::LaunchPreflightResourceBudget;
 use crate::guardian::GuardianPreflightResourceSignals;
 use crate::state::launch_reports::LaunchProofResourceBudget;
-use axial_launcher::{
-    LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB, LaunchCpuLoadWarningFacts,
-    LaunchResourceWarningFacts,
-};
+use axial_launcher::{LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB};
 use std::path::Path;
 use sysinfo::{Disks, ProcessRefreshKind, ProcessesToUpdate, System, get_current_pid};
+
+const LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB: i32 = 2048;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct LaunchMemoryEvidence {
@@ -43,7 +42,7 @@ pub(super) fn preflight_resource_signals(
     GuardianPreflightResourceSignals {
         memory_clamped: raw_min_memory_mb > max_memory_mb,
         low_memory_allocation: max_memory_mb > 0
-            && max_memory_mb < axial_launcher::LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB,
+            && max_memory_mb < LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB,
         memory_pressure: resource_budget.memory_pressure,
         cpu_pressure: resource_budget.cpu_pressure,
         install_pressure: resource_budget.install_pressure,
@@ -150,22 +149,6 @@ pub(super) fn capture_resource_budget_snapshot(
 ) -> LaunchProofResourceBudget {
     // Captured before launch work starts so Guardian and proof records use the same pressure view.
     let requested_memory_mb = positive_i32(requested_allocation_mb);
-    let warning_facts = LaunchResourceWarningFacts {
-        host_total_memory_mb: memory_evidence.host_total_memory_mb,
-        host_cpu_threads,
-        cpu_load: LaunchCpuLoadWarningFacts {
-            host_cpu_load_1m_x100: cpu_load_evidence.host_cpu_load_1m_x100,
-            host_cpu_load_5m_x100: cpu_load_evidence.host_cpu_load_5m_x100,
-            host_cpu_load_15m_x100: cpu_load_evidence.host_cpu_load_15m_x100,
-        },
-        active_session_count: active.session_count,
-        active_install_count: active.install_count,
-        active_memory_allocation_mb: active.memory_allocation_mb,
-        requested_memory_mb,
-        launch_disk_available_mb: disk_evidence.launch_disk_available_mb,
-        memory_headroom_mb: LAUNCH_MEMORY_HEADROOM_MB,
-        launch_disk_headroom_mb: LAUNCH_DISK_HEADROOM_MB,
-    };
     LaunchProofResourceBudget {
         host_total_memory_mb: memory_evidence.host_total_memory_mb,
         host_available_memory_mb: memory_evidence.host_available_memory_mb,
@@ -185,13 +168,85 @@ pub(super) fn capture_resource_budget_snapshot(
             requested_memory_mb,
         ),
         memory_headroom_mb: LAUNCH_MEMORY_HEADROOM_MB,
-        memory_pressure: warning_facts.memory_pressure(),
-        cpu_pressure: warning_facts.cpu_pressure(),
-        install_pressure: warning_facts.install_pressure(),
+        memory_pressure: memory_pressure(
+            memory_evidence.host_total_memory_mb,
+            active.memory_allocation_mb,
+            requested_memory_mb,
+        ),
+        cpu_pressure: active_launch_cpu_pressure(host_cpu_threads, active.session_count)
+            || measured_cpu_load_pressure(host_cpu_threads, cpu_load_evidence),
+        install_pressure: active.install_count > 0,
         launch_disk_available_mb: disk_evidence.launch_disk_available_mb,
         launch_disk_headroom_mb: LAUNCH_DISK_HEADROOM_MB,
-        disk_pressure: warning_facts.disk_pressure(),
+        disk_pressure: disk_evidence
+            .launch_disk_available_mb
+            .is_some_and(|available_mb| available_mb < LAUNCH_DISK_HEADROOM_MB),
     }
+}
+
+fn memory_pressure(
+    total_memory_mb: Option<u64>,
+    active_allocation_mb: u64,
+    requested_allocation_mb: Option<i32>,
+) -> bool {
+    let Some(total_memory_mb) = total_memory_mb else {
+        return false;
+    };
+    let Some(requested_allocation_mb) =
+        requested_allocation_mb.and_then(|value| u64::try_from(value).ok())
+    else {
+        return false;
+    };
+    let remaining_mb = total_memory_mb
+        .saturating_sub(active_allocation_mb.saturating_add(requested_allocation_mb));
+    remaining_mb < LAUNCH_MEMORY_HEADROOM_MB
+}
+
+pub(super) fn active_launch_cpu_pressure(
+    cpu_threads: Option<usize>,
+    active_launch_count: usize,
+) -> bool {
+    let Some(cpu_threads) = cpu_threads.filter(|value| *value > 0) else {
+        return false;
+    };
+    let queued_launch_count = active_launch_count.saturating_add(1);
+    if cpu_threads <= 4 {
+        active_launch_count >= 1
+    } else if cpu_threads <= 8 {
+        queued_launch_count >= 3
+    } else {
+        queued_launch_count >= 5
+    }
+}
+
+pub(super) fn measured_cpu_load_pressure(
+    cpu_threads: Option<usize>,
+    cpu_load: LaunchCpuLoadEvidence,
+) -> bool {
+    let Some(cpu_threads) = cpu_threads.filter(|value| *value > 0) else {
+        return false;
+    };
+    let Some(load_x100) = cpu_load
+        .host_cpu_load_1m_x100
+        .or(cpu_load.host_cpu_load_5m_x100)
+        .or(cpu_load.host_cpu_load_15m_x100)
+    else {
+        return false;
+    };
+    load_x100 >= measured_cpu_load_threshold_x100(cpu_threads)
+}
+
+pub(super) fn measured_cpu_load_threshold_x100(cpu_threads: usize) -> u64 {
+    let headroom_percent = if cpu_threads <= 4 {
+        75_u64
+    } else if cpu_threads <= 8 {
+        85
+    } else {
+        95
+    };
+    u64::try_from(cpu_threads)
+        .unwrap_or(u64::MAX / 100)
+        .saturating_mul(headroom_percent)
 }
 
 fn estimated_remaining_memory_mb(
