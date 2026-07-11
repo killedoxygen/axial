@@ -7,8 +7,8 @@ use axial_api::application::launch::public_launch_status_json;
 use axial_api::application::{
     public_loader_install_progress_json, public_vanilla_install_progress_json,
 };
-use axial_api::state::{AppState, LaunchEvent, LaunchSessionRecord, LaunchStatusEvent};
-use axial_launcher::{LaunchState, launch_notice_from_values};
+use axial_api::state::{AppState, LaunchEvent};
+use axial_launcher::{is_terminal_state, snapshot_status};
 use serde::Serialize;
 use std::fs;
 use std::future::Future;
@@ -842,62 +842,6 @@ pub async fn start_launch_events(
     });
 
     Ok(())
-}
-
-fn snapshot_status(record: &LaunchSessionRecord) -> LaunchStatusEvent {
-    LaunchStatusEvent {
-        state: launch_state_name(record.state).to_string(),
-        benchmark: record.benchmark.clone(),
-        pid: record.pid,
-        exit_code: record.exit_code,
-        failure_class: record
-            .failure
-            .as_ref()
-            .map(|failure| failure.class.as_str().to_string()),
-        failure_detail: record
-            .failure
-            .as_ref()
-            .and_then(|failure| failure.detail.clone()),
-        crash_evidence: record.crash_evidence.clone(),
-        healing: record.healing.clone(),
-        guardian: record.guardian.clone(),
-        outcome: record.outcome.clone(),
-        notice: launch_notice_from_values(
-            record.guardian.as_ref(),
-            record.healing.as_ref(),
-            record.outcome.as_ref(),
-            record
-                .failure
-                .as_ref()
-                .and_then(|failure| failure.detail.as_deref()),
-            None,
-        ),
-        evidence: Vec::new(),
-        stages: record.stages.clone(),
-    }
-}
-
-fn is_terminal_state(state: LaunchState) -> bool {
-    matches!(state, LaunchState::Failed | LaunchState::Exited)
-}
-
-fn launch_state_name(state: LaunchState) -> &'static str {
-    match state {
-        LaunchState::Idle => "idle",
-        LaunchState::Queued => "queued",
-        LaunchState::Planning => "planning",
-        LaunchState::Validating => "validating",
-        LaunchState::EnsuringRuntime => "ensuring_runtime",
-        LaunchState::DownloadingRuntime => "downloading_runtime",
-        LaunchState::Preparing => "preparing",
-        LaunchState::Prewarming => "prewarming",
-        LaunchState::Starting => "starting",
-        LaunchState::Monitoring => "monitoring",
-        LaunchState::Running => "running",
-        LaunchState::Degraded => "degraded",
-        LaunchState::Failed => "failed",
-        LaunchState::Exited => "exited",
-    }
 }
 
 #[cfg(test)]
