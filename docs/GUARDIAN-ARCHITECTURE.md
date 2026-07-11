@@ -102,7 +102,7 @@ Guardian decisions follow the same shape even when a domain has only partial wor
    Lower systems emit structured facts with source, phase, ownership, target, evidence fields, and sensitivity.
 
 2. Diagnosis
-   Guardian maps facts into diagnoses with domain, diagnosis id, confidence, severity, ownership, and public reason templates.
+   Guardian evaluates an ordered declarative rule table once per rule. Each matching rule emits at most one diagnosis with domain, diagnosis id, confidence, severity, ownership, and a public reason template. Facts in the same rule family fuse into distinct source fact ids and deterministically deduplicated real targets; ownership resolves conservatively to the least-trusted supporting owner. Diagnosis order follows the earliest matching input fact, with rule order as the tie-breaker.
 
 3. Risk and action pressure
    Guardian combines severity, confidence, blast radius, reversibility, ownership, user intent, operation phase, mode, and failure memory into an action decision.

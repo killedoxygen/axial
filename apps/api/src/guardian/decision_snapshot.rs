@@ -15,7 +15,6 @@ const SNAPSHOT_FIXTURE: &str = include_str!(concat!(
     "/tests/fixtures/guardian/guardian-decision-snapshot-v1.json"
 ));
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_DECISION_SNAPSHOT";
-const LEGACY_GRAPH_NODE_COUNT: usize = 34;
 const FACT_SOURCE_COUNT: usize = 69;
 const DIAGNOSIS_COUNT: usize = 46;
 const FACT_SOURCE_PHASE_COUNT: usize = 272;
@@ -200,33 +199,6 @@ fn checked_in_guardian_decision_snapshot_is_byte_stable_and_complete() {
     assert_eq!(fixture, replayed);
     let pretty = serde_json::to_string_pretty(&replayed).expect("serialize decision snapshot");
     assert_eq!(format!("{pretty}\n"), SNAPSHOT_FIXTURE);
-}
-
-#[test]
-fn legacy_graph_inventory_matches_committed_decision_corpus() {
-    let fixture = serde_json::from_str::<GuardianDecisionSnapshot>(SNAPSHOT_FIXTURE)
-        .expect("strict Guardian decision snapshot fixture");
-    let mut committed = fixture
-        .source_cases
-        .iter()
-        .filter_map(|source| match &source.input {
-            SourceInput::Fact { fact_id, .. } => {
-                Some((fact_id.as_str(), source.allowed_phases.clone()))
-            }
-            SourceInput::Empty => None,
-        })
-        .collect::<Vec<_>>();
-    committed.sort_by_key(|(fact_id, _)| *fact_id);
-
-    let mut graph = legacy_graph_source_corpus();
-    graph.sort_by_key(|(fact_id, _)| *fact_id);
-
-    assert_eq!(
-        super::inference_graph::diagnosis_graph_nodes().len(),
-        LEGACY_GRAPH_NODE_COUNT
-    );
-    assert_eq!(graph.len(), FACT_SOURCE_COUNT);
-    assert_eq!(graph, committed);
 }
 
 #[test]
@@ -446,20 +418,6 @@ fn policy_profile_id(modes: &[ModePolicyRow]) -> String {
     let bytes = serde_json::to_vec(modes).expect("serialize policy profile content");
     let digest = Sha256::digest(bytes);
     format!("profile-{}", hex::encode(&digest[..8]))
-}
-
-// This adapter exists only to prove the legacy graph matches the committed corpus.
-// Delete it with `inference_graph.rs`; snapshot replay above must stay fixture-driven.
-fn legacy_graph_source_corpus() -> Vec<(&'static str, Vec<OperationPhase>)> {
-    super::inference_graph::diagnosis_graph_nodes()
-        .iter()
-        .flat_map(|node| {
-            node.required_facts
-                .iter()
-                .flat_map(|requirement| requirement.source_fact_ids().iter().copied())
-                .map(|fact_id| (fact_id.as_str(), node.phase_allowed.to_vec()))
-        })
-        .collect()
 }
 
 fn target_kind_for_domain(domain: GuardianDomain) -> TargetKind {

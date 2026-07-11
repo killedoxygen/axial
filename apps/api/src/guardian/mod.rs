@@ -23,13 +23,13 @@ pub mod state_evidence;
 mod decision_snapshot;
 mod diagnosis;
 mod facts;
-mod inference_graph;
 #[cfg(test)]
 mod launch_decision_snapshot;
 mod model;
 #[cfg(test)]
 mod preflight_decision_snapshot;
 mod repair_terminal;
+mod rules;
 
 #[cfg(test)]
 mod tests;

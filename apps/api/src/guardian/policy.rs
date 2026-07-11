@@ -1,7 +1,7 @@
-use super::inference_graph::{
-    ActionEligibility, DestructiveMutationRisk, DiagnosisGraphPolicyInput, JournalRequirement,
+use super::rules::{
+    ActionEligibility, DestructiveMutationRisk, DiagnosisRule, JournalRequirement,
     OwnershipRequirement, RedactionRequirement, RetryLoopSensitivity, UserIntentSensitivity,
-    graph_policy_input_for_diagnosis,
+    rule_for_diagnosis,
 };
 use super::{
     ActionPlanPrerequisite, Diagnosis, GuardianAction, GuardianActionKind, GuardianActionPlan,
@@ -69,7 +69,6 @@ enum CandidateRejection {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PolicyReasoningInput {
-    graph: Option<DiagnosisGraphPolicyInput>,
     action: GuardianActionKind,
     ownership: OwnershipClass,
     ownership_requirement: OwnershipRequirement,
@@ -219,28 +218,29 @@ fn policy_reasoning_input(
     diagnosis: &Diagnosis,
     action: GuardianActionKind,
 ) -> PolicyReasoningInput {
-    let graph = graph_policy_input_for_diagnosis(diagnosis);
-    let eligibility = graph.map(|input| input.action_eligibility);
+    let eligibility = applicable_rule(diagnosis).map(|rule| rule.eligibility);
     PolicyReasoningInput {
-        graph,
         action,
         ownership: diagnosis.ownership,
         ownership_requirement: ownership_requirement(eligibility),
-        resolved_severity: graph
-            .map(|input| input.resolved_severity)
-            .unwrap_or(diagnosis.severity),
-        resolved_confidence: graph
-            .map(|input| input.resolved_confidence)
-            .unwrap_or(diagnosis.confidence),
-        impact_scalar: graph
-            .map(|input| input.impact_scalar)
-            .unwrap_or_else(|| diagnosis.impact.scalar_severity()),
+        resolved_severity: diagnosis.severity,
+        resolved_confidence: diagnosis.confidence,
+        impact_scalar: diagnosis.impact.scalar_severity(),
         public_redaction_required: action_requires_public_redaction(eligibility),
         journal_required: action_requires_journal(action, eligibility),
         destructive_mutation: action_is_destructive_mutation(action, eligibility),
         retry_loop_sensitive: action_is_retry_loop_sensitive(action, eligibility),
         user_intent_sensitive: action_is_user_intent_sensitive(eligibility),
     }
+}
+
+fn applicable_rule(diagnosis: &Diagnosis) -> Option<&'static DiagnosisRule> {
+    rule_for_diagnosis(diagnosis.id).filter(|rule| {
+        diagnosis
+            .fact_ids
+            .iter()
+            .any(|fact_id| rule.source_fact_ids.contains(fact_id))
+    })
 }
 
 fn select_policy_action(
@@ -710,12 +710,10 @@ fn is_managed_mutation_action(action: GuardianActionKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardianPolicyContext, action_safety_score, decide_guardian_policy,
+        GuardianPolicyContext, action_safety_score, applicable_rule, decide_guardian_policy,
         decision_pressure_score, policy_reasoning_input,
     };
-    use crate::guardian::inference_graph::{
-        JournalRequirement, OwnershipRequirement, RetryLoopSensitivity, UserIntentSensitivity,
-    };
+    use crate::guardian::rules::OwnershipRequirement;
     use crate::guardian::{
         Diagnosis, DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence,
         GuardianDomain, GuardianFact, GuardianFactId, GuardianImpactVector, GuardianMode,
@@ -825,6 +823,25 @@ mod tests {
         );
 
         assert_eq!(decision.kind, GuardianActionKind::AskUser);
+    }
+
+    #[test]
+    fn manual_launch_diagnosis_uses_rule_metadata_only_for_rule_source_evidence() {
+        let mut manual = diagnosis(
+            DiagnosisId::JvmArgUnsupported,
+            GuardianSeverity::Blocking,
+            GuardianConfidence::Confirmed,
+            OwnershipClass::UserOwned,
+            vec![GuardianActionKind::Strip, GuardianActionKind::Block],
+        );
+        manual.fact_ids = vec![GuardianFactId::JvmArgUnsupported];
+        assert!(applicable_rule(&manual).is_none());
+
+        manual.fact_ids = vec![GuardianFactId::JvmArgUnlockOrderInvalid];
+        assert_eq!(
+            applicable_rule(&manual).map(|rule| rule.id),
+            Some(DiagnosisId::JvmArgUnsupported)
+        );
     }
 
     #[test]
@@ -1069,8 +1086,8 @@ mod tests {
     }
 
     #[test]
-    fn policy_reasoning_consumes_graph_evaluation_and_eligibility_inputs() {
-        let diagnosis = graph_backed_diagnosis(
+    fn policy_reasoning_consumes_rule_eligibility_inputs() {
+        let diagnosis = rule_diagnosis(
             GuardianFactId::JvmArgsParseFailed,
             GuardianDomain::Jvm,
             OperationPhase::Validating,
@@ -1078,23 +1095,10 @@ mod tests {
         );
 
         let reasoning = policy_reasoning_input(&diagnosis, GuardianActionKind::Strip);
-        let graph = reasoning.graph.expect("graph policy input");
 
-        assert_eq!(graph.resolved_severity, diagnosis.severity);
-        assert_eq!(graph.resolved_confidence, diagnosis.confidence);
-        assert_close(graph.impact_scalar, diagnosis.impact.scalar_severity());
-        assert_eq!(
-            graph.action_eligibility.journal_requirement,
-            JournalRequirement::RequiredForAttemptAction
-        );
-        assert_eq!(
-            graph.action_eligibility.retry_loop_sensitivity,
-            RetryLoopSensitivity::OneAttemptOverride
-        );
-        assert_eq!(
-            graph.action_eligibility.user_intent_sensitivity,
-            UserIntentSensitivity::ExplicitTechnicalIntent
-        );
+        assert_eq!(reasoning.resolved_severity, diagnosis.severity);
+        assert_eq!(reasoning.resolved_confidence, diagnosis.confidence);
+        assert_close(reasoning.impact_scalar, diagnosis.impact.scalar_severity());
         assert_eq!(
             reasoning.ownership_requirement,
             OwnershipRequirement::Classified
@@ -1110,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_policy_reasoning_truth_table_covers_hard_constraint_inputs() {
+    fn rule_policy_reasoning_truth_table_covers_hard_constraint_inputs() {
         struct Case {
             fact_id: GuardianFactId,
             domain: GuardianDomain,
@@ -1188,15 +1192,9 @@ mod tests {
         ];
 
         for case in cases {
-            let diagnosis =
-                graph_backed_diagnosis(case.fact_id, case.domain, case.phase, case.ownership);
+            let diagnosis = rule_diagnosis(case.fact_id, case.domain, case.phase, case.ownership);
             let reasoning = policy_reasoning_input(&diagnosis, case.action);
 
-            assert!(
-                reasoning.graph.is_some(),
-                "{} should be graph-backed",
-                case.fact_id.as_str()
-            );
             assert_eq!(
                 reasoning.ownership_requirement,
                 case.ownership_requirement,
@@ -1247,7 +1245,7 @@ mod tests {
         }
     }
 
-    fn graph_backed_diagnosis(
+    fn rule_diagnosis(
         fact_id: GuardianFactId,
         domain: GuardianDomain,
         phase: OperationPhase,
@@ -1275,7 +1273,7 @@ mod tests {
         diagnoses
             .into_iter()
             .next()
-            .expect("graph diagnosis should exist")
+            .expect("rule diagnosis should exist")
     }
 
     fn diagnosis(

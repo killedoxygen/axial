@@ -1,7 +1,7 @@
-use super::inference_graph::{
-    ActionEligibility, AffectedTargetStrategy, DestructiveMutationRisk, JournalRequirement,
+use super::rules::{
+    ActionEligibility, DIAGNOSIS_RULES, DestructiveMutationRisk, JournalRequirement,
     OwnershipRequirement, RedactionRequirement, RetryLoopSensitivity, UserIntentSensitivity,
-    diagnosis_graph_nodes, diagnosis_node_for_fact,
+    rule_for_diagnosis,
 };
 use super::{
     ActionPlanPrerequisite, Diagnosis, DiagnosisId, FactReliability, GuardianAction,
@@ -352,460 +352,8 @@ fn managed_runtime_readiness_fact_maps_to_recoverable_diagnosis() {
 }
 
 #[test]
-fn diagnosis_inference_graph_declares_evidence_slots_and_target_strategy() {
-    let fact = GuardianFact {
-        operation_id: None,
-        id: GuardianFactId::JvmArgsParseFailed,
-        domain: GuardianDomain::Jvm,
-        phase: OperationPhase::Validating,
-        reliability: FactReliability::ExactClassifier,
-        severity: None,
-        confidence: None,
-        ownership: OwnershipClass::UserOwned,
-        target: Some(target(
-            "explicit_jvm_args",
-            TargetKind::Config,
-            OwnershipClass::UserOwned,
-        )),
-        fields: Vec::new(),
-    };
-
-    let node = diagnosis_node_for_fact(&fact).expect("graph node");
-
-    assert_eq!(node.diagnosis_id(&fact), DiagnosisId::JvmArgsMalformed);
-    assert!(diagnosis_graph_nodes().iter().any(|node| {
-        node.required_facts
-            .iter()
-            .any(|required| required.matches_fact_id(GuardianFactId::JvmArgsParseFailed))
-    }));
-    assert!(node.supporting_facts.iter().any(|support| {
-        support.fact_id == GuardianFactId::JvmArgsParseFailed && support.weight > 0.0
-    }));
-    assert!(
-        node.contradicting_facts
-            .iter()
-            .any(|fact| fact.fact_id == GuardianFactId::BootMarkerObserved)
-    );
-    assert!(node.phase_allowed.contains(&OperationPhase::Validating));
-    assert_eq!(
-        node.target_strategy,
-        AffectedTargetStrategy::FactTargetOrGuardianFallback
-    );
-    assert_eq!(
-        node.eligibility.ownership_requirement,
-        OwnershipRequirement::Classified
-    );
-    assert_eq!(
-        node.eligibility.journal_requirement,
-        JournalRequirement::RequiredForAttemptAction
-    );
-    assert_eq!(
-        node.eligibility.redaction_requirement,
-        RedactionRequirement::PublicOutcome
-    );
-    assert_eq!(
-        node.eligibility.retry_loop_sensitivity,
-        RetryLoopSensitivity::OneAttemptOverride
-    );
-    assert_eq!(
-        node.eligibility.destructive_mutation_risk,
-        DestructiveMutationRisk::None
-    );
-    assert_eq!(
-        node.eligibility.user_intent_sensitivity,
-        UserIntentSensitivity::ExplicitTechnicalIntent
-    );
-    assert_eq!(
-        node.candidate_actions,
-        &[
-            GuardianActionKind::Strip,
-            GuardianActionKind::AskUser,
-            GuardianActionKind::Block
-        ]
-    );
-    assert_eq!(node.public_reason_template(&fact), "jvm_args_malformed");
-
-    let evaluation = node.evaluate(
-        std::slice::from_ref(&fact),
-        &fact,
-        OperationPhase::Validating,
-    );
-    assert_eq!(evaluation.action_eligibility, node.eligibility);
-}
-
-#[test]
-fn graph_evaluation_truth_table_covers_scoring_inputs_without_output_drift() {
-    let provider_fact = guardian_graph_fact(
-        GuardianFactId::DownloadProviderUnavailable,
-        GuardianDomain::Download,
-        OperationPhase::Downloading,
-        FactReliability::DirectStructured,
-        OwnershipClass::ExternalProviderDerived,
-    );
-    let interrupted_fact = guardian_graph_fact(
-        GuardianFactId::DownloadInterrupted,
-        GuardianDomain::Download,
-        OperationPhase::Downloading,
-        FactReliability::HeuristicClassifier,
-        OwnershipClass::ExternalProviderDerived,
-    );
-    let download_node = diagnosis_node_for_fact(&provider_fact).expect("download node");
-
-    let accumulated = download_node.evaluate(
-        &[provider_fact.clone(), interrupted_fact],
-        &provider_fact,
-        OperationPhase::Downloading,
-    );
-
-    assert!(accumulated.required_fact_satisfied);
-    assert!(accumulated.phase_compatible);
-    assert_eq!(accumulated.direct_fact_count, 2);
-    assert_close(accumulated.support_score, 0.888);
-    assert_close(accumulated.contradiction_score, 0.0);
-    assert_close(accumulated.evidence_confidence_score, 0.988);
-    assert_eq!(accumulated.resolved_severity, GuardianSeverity::Blocking);
-    assert_eq!(accumulated.resolved_confidence, GuardianConfidence::Medium);
-    assert_eq!(
-        diagnose_facts(
-            std::slice::from_ref(&provider_fact),
-            OperationPhase::Downloading,
-        )[0]
-        .confidence,
-        GuardianConfidence::Medium
-    );
-
-    let jvm_fact = guardian_graph_fact(
-        GuardianFactId::JvmArgsParseFailed,
-        GuardianDomain::Jvm,
-        OperationPhase::Validating,
-        FactReliability::ExactClassifier,
-        OwnershipClass::UserOwned,
-    );
-    let boot_fact = guardian_graph_fact(
-        GuardianFactId::BootMarkerObserved,
-        GuardianDomain::Session,
-        OperationPhase::Running,
-        FactReliability::ProcessLifecycle,
-        OwnershipClass::LauncherManaged,
-    );
-    let jvm_node = diagnosis_node_for_fact(&jvm_fact).expect("jvm node");
-    let contradicted = jvm_node.evaluate(
-        &[jvm_fact.clone(), boot_fact],
-        &jvm_fact,
-        OperationPhase::Validating,
-    );
-
-    assert!(contradicted.required_fact_satisfied);
-    assert_close(contradicted.support_score, 0.80);
-    assert_close(contradicted.contradiction_score, 0.6175);
-    assert_close(contradicted.evidence_confidence_score, 0.2825);
-    assert!(contradicted.selected_for_diagnosis());
-    assert_eq!(
-        contradicted.resolved_confidence,
-        GuardianConfidence::Confirmed
-    );
-
-    let phase_matched = download_node.evaluate(
-        std::slice::from_ref(&provider_fact),
-        &provider_fact,
-        OperationPhase::Downloading,
-    );
-    let phase_mismatched = download_node.evaluate(
-        std::slice::from_ref(&provider_fact),
-        &provider_fact,
-        OperationPhase::Running,
-    );
-
-    assert!(phase_matched.phase_compatible);
-    assert!(!phase_mismatched.phase_compatible);
-    assert_close(phase_matched.evidence_confidence_score, 0.90);
-    assert_close(phase_mismatched.evidence_confidence_score, 0.60);
-
-    let marker_fact = guardian_graph_fact(
-        GuardianFactId::ManagedRuntimeMissing,
-        GuardianDomain::Runtime,
-        OperationPhase::Validating,
-        FactReliability::ExpectedMarkerAbsence,
-        OwnershipClass::LauncherManaged,
-    );
-    let marker_node = diagnosis_node_for_fact(&marker_fact).expect("runtime marker node");
-    let weak_direct = marker_node.evaluate(
-        std::slice::from_ref(&marker_fact),
-        &marker_fact,
-        OperationPhase::Validating,
-    );
-
-    assert!(weak_direct.required_fact_satisfied);
-    assert_close(weak_direct.support_score, 0.2625);
-    assert_close(weak_direct.evidence_confidence_score, 0.3625);
-    assert!(weak_direct.selected_for_diagnosis());
-    assert_eq!(
-        diagnose_facts(&[marker_fact], OperationPhase::Validating)[0]
-            .id
-            .as_str(),
-        "managed_runtime_missing"
-    );
-}
-
-#[test]
-fn graph_evaluation_prioritizes_impact_scalar_and_unknown_fallback_threshold() {
-    let unsafe_artifact_fact = guardian_graph_fact(
-        GuardianFactId::PrimitiveRefused,
-        GuardianDomain::Filesystem,
-        OperationPhase::Installing,
-        FactReliability::DirectStructured,
-        OwnershipClass::Unknown,
-    );
-    let performance_fallback_fact = guardian_graph_fact(
-        GuardianFactId::PerformanceHealthFallback,
-        GuardianDomain::Performance,
-        OperationPhase::Planning,
-        FactReliability::DirectStructured,
-        OwnershipClass::CompositionManaged,
-    );
-    let unsafe_artifact = diagnosis_node_for_fact(&unsafe_artifact_fact)
-        .expect("unsafe artifact node")
-        .evaluate(
-            std::slice::from_ref(&unsafe_artifact_fact),
-            &unsafe_artifact_fact,
-            OperationPhase::Installing,
-        );
-    let performance_fallback = diagnosis_node_for_fact(&performance_fallback_fact)
-        .expect("performance fallback node")
-        .evaluate(
-            std::slice::from_ref(&performance_fallback_fact),
-            &performance_fallback_fact,
-            OperationPhase::Planning,
-        );
-
-    assert_close(unsafe_artifact.impact_scalar, 0.95);
-    assert_close(performance_fallback.impact_scalar, 0.27);
-    assert!(unsafe_artifact.impact_scalar > performance_fallback.impact_scalar);
-    assert_eq!(
-        unsafe_artifact.resolved_severity,
-        GuardianSeverity::Blocking
-    );
-    assert_eq!(
-        performance_fallback.resolved_severity,
-        GuardianSeverity::Warning
-    );
-
-    let unknown_fact = guardian_graph_fact(
-        GuardianFactId::NoStructuredFact(OperationPhase::Downloading),
-        GuardianDomain::Unknown,
-        OperationPhase::Downloading,
-        FactReliability::HeuristicClassifier,
-        OwnershipClass::ExternalProviderDerived,
-    );
-    let download_node = diagnosis_graph_nodes()
-        .iter()
-        .find(|node| {
-            node.required_facts.iter().any(|required| {
-                required.matches_fact_id(GuardianFactId::DownloadProviderUnavailable)
-                    || required.matches_fact_id(GuardianFactId::DownloadInterrupted)
-            })
-        })
-        .expect("download graph node");
-    let below_threshold = download_node.evaluate(
-        std::slice::from_ref(&unknown_fact),
-        &unknown_fact,
-        OperationPhase::Downloading,
-    );
-
-    assert!(!below_threshold.required_fact_satisfied);
-    assert_close(below_threshold.support_score, 0.0);
-    assert_close(below_threshold.evidence_confidence_score, 0.0);
-    assert!(!below_threshold.selected_for_diagnosis());
-
-    let diagnoses = diagnose_facts(&[unknown_fact], OperationPhase::Downloading);
-
-    assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id.as_str(), "unknown_failure_downloading");
-    assert_eq!(diagnoses[0].confidence, GuardianConfidence::Low);
-}
-
-#[test]
-fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
-    struct Case {
-        fact_id: GuardianFactId,
-        domain: GuardianDomain,
-        phase: OperationPhase,
-        ownership: OwnershipClass,
-        expected: ActionEligibility,
-    }
-
-    let cases = [
-        Case {
-            fact_id: GuardianFactId::JavaOverrideMissing,
-            domain: GuardianDomain::Runtime,
-            phase: OperationPhase::Validating,
-            ownership: OwnershipClass::UserOwned,
-            expected: ActionEligibility {
-                ownership_requirement: OwnershipRequirement::Classified,
-                journal_requirement: JournalRequirement::RequiredForAttemptAction,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::OneAttemptOverride,
-                destructive_mutation_risk: DestructiveMutationRisk::None,
-                user_intent_sensitivity: UserIntentSensitivity::ExplicitTechnicalIntent,
-            },
-        },
-        Case {
-            fact_id: GuardianFactId::ManagedRuntimeReadyMarkerMissing,
-            domain: GuardianDomain::Runtime,
-            phase: OperationPhase::Preparing,
-            ownership: OwnershipClass::LauncherManaged,
-            expected: ActionEligibility {
-                ownership_requirement: OwnershipRequirement::LauncherManaged,
-                journal_requirement: JournalRequirement::RequiredForManagedMutation,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::RepairAttempt,
-                destructive_mutation_risk: DestructiveMutationRisk::ManagedMutation,
-                user_intent_sensitivity: UserIntentSensitivity::None,
-            },
-        },
-        Case {
-            fact_id: GuardianFactId::ArtifactChecksumMismatch,
-            domain: GuardianDomain::Install,
-            phase: OperationPhase::Downloading,
-            ownership: OwnershipClass::LauncherManaged,
-            expected: ActionEligibility {
-                ownership_requirement: OwnershipRequirement::LauncherManaged,
-                journal_requirement: JournalRequirement::RequiredForManagedMutation,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::RepairAttempt,
-                destructive_mutation_risk: DestructiveMutationRisk::ManagedMutation,
-                user_intent_sensitivity: UserIntentSensitivity::None,
-            },
-        },
-        Case {
-            fact_id: GuardianFactId::DownloadProviderUnavailable,
-            domain: GuardianDomain::Download,
-            phase: OperationPhase::Downloading,
-            ownership: OwnershipClass::ExternalProviderDerived,
-            expected: ActionEligibility {
-                ownership_requirement: OwnershipRequirement::Classified,
-                journal_requirement: JournalRequirement::RequiredForAttemptAction,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::ProviderRetry,
-                destructive_mutation_risk: DestructiveMutationRisk::None,
-                user_intent_sensitivity: UserIntentSensitivity::None,
-            },
-        },
-        Case {
-            fact_id: GuardianFactId::PrimitiveRefused,
-            domain: GuardianDomain::Filesystem,
-            phase: OperationPhase::Installing,
-            ownership: OwnershipClass::Unknown,
-            expected: ActionEligibility {
-                ownership_requirement: OwnershipRequirement::UserOrUnknownProtected,
-                journal_requirement: JournalRequirement::None,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::None,
-                destructive_mutation_risk: DestructiveMutationRisk::UserOrUnknownProtected,
-                user_intent_sensitivity: UserIntentSensitivity::UserDataBoundary,
-            },
-        },
-        Case {
-            fact_id: GuardianFactId::PerformanceHealthInvalid,
-            domain: GuardianDomain::Performance,
-            phase: OperationPhase::Planning,
-            ownership: OwnershipClass::CompositionManaged,
-            expected: ActionEligibility {
-                ownership_requirement: OwnershipRequirement::CompositionManaged,
-                journal_requirement: JournalRequirement::None,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::None,
-                destructive_mutation_risk: DestructiveMutationRisk::None,
-                user_intent_sensitivity: UserIntentSensitivity::PerformanceComposition,
-            },
-        },
-        Case {
-            fact_id: GuardianFactId::PerformanceRepeatedFailureMemory,
-            domain: GuardianDomain::Performance,
-            phase: OperationPhase::Planning,
-            ownership: OwnershipClass::CompositionManaged,
-            expected: ActionEligibility {
-                ownership_requirement: OwnershipRequirement::CompositionManaged,
-                journal_requirement: JournalRequirement::None,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::RepeatedFailureMemory,
-                destructive_mutation_risk: DestructiveMutationRisk::None,
-                user_intent_sensitivity: UserIntentSensitivity::PerformanceComposition,
-            },
-        },
-        Case {
-            fact_id: GuardianFactId::PerformanceUserOwnedConflict,
-            domain: GuardianDomain::Performance,
-            phase: OperationPhase::Planning,
-            ownership: OwnershipClass::UserOwned,
-            expected: ActionEligibility {
-                ownership_requirement: OwnershipRequirement::UserOrUnknownProtected,
-                journal_requirement: JournalRequirement::None,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::None,
-                destructive_mutation_risk: DestructiveMutationRisk::UserOrUnknownProtected,
-                user_intent_sensitivity: UserIntentSensitivity::UserDataBoundary,
-            },
-        },
-        Case {
-            fact_id: GuardianFactId::ExitCodeZero,
-            domain: GuardianDomain::Session,
-            phase: OperationPhase::Running,
-            ownership: OwnershipClass::LauncherManaged,
-            expected: ActionEligibility {
-                ownership_requirement: OwnershipRequirement::None,
-                journal_requirement: JournalRequirement::None,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::None,
-                destructive_mutation_risk: DestructiveMutationRisk::None,
-                user_intent_sensitivity: UserIntentSensitivity::None,
-            },
-        },
-        Case {
-            fact_id: GuardianFactId::PersistedStateSchemaInvalid,
-            domain: GuardianDomain::State,
-            phase: OperationPhase::Startup,
-            ownership: OwnershipClass::LauncherManaged,
-            expected: ActionEligibility {
-                ownership_requirement: OwnershipRequirement::None,
-                journal_requirement: JournalRequirement::None,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::None,
-                destructive_mutation_risk: DestructiveMutationRisk::None,
-                user_intent_sensitivity: UserIntentSensitivity::None,
-            },
-        },
-    ];
-
-    for case in cases {
-        let fact = guardian_graph_fact(
-            case.fact_id,
-            case.domain,
-            case.phase,
-            FactReliability::DirectStructured,
-            case.ownership,
-        );
-        let node = diagnosis_node_for_fact(&fact)
-            .unwrap_or_else(|| panic!("missing graph node for {}", case.fact_id.as_str()));
-        let evaluation = node.evaluate(std::slice::from_ref(&fact), &fact, case.phase);
-
-        assert_eq!(node.eligibility, case.expected, "{}", case.fact_id.as_str());
-        assert_eq!(
-            evaluation.action_eligibility,
-            case.expected,
-            "{}",
-            case.fact_id.as_str()
-        );
-    }
-
-    assert!(diagnosis_graph_nodes().iter().all(|node| {
-        node.eligibility.redaction_requirement == RedactionRequirement::PublicOutcome
-    }));
-}
-
-#[test]
-fn graph_action_eligibility_stays_internal_to_public_diagnosis_output() {
-    let fact = guardian_graph_fact(
+fn rule_action_eligibility_stays_internal_to_public_diagnosis_output() {
+    let fact = guardian_test_fact(
         GuardianFactId::JvmArgsParseFailed,
         GuardianDomain::Jvm,
         OperationPhase::Validating,
@@ -829,6 +377,501 @@ fn graph_action_eligibility_stays_internal_to_public_diagnosis_output() {
             GuardianActionKind::Block
         ]
     );
+}
+
+#[test]
+fn declarative_rules_cover_exactly_the_frozen_fact_corpus() {
+    let mut diagnosis_ids = std::collections::HashSet::new();
+    let mut source_fact_ids = std::collections::HashSet::new();
+
+    assert_eq!(DIAGNOSIS_RULES.len(), 46);
+    for rule in DIAGNOSIS_RULES {
+        assert!(diagnosis_ids.insert(rule.id), "duplicate rule {}", rule.id);
+        assert!(!rule.source_fact_ids.is_empty(), "{}", rule.id);
+        assert_eq!(
+            rule.eligibility.redaction_requirement,
+            RedactionRequirement::PublicOutcome,
+            "{}",
+            rule.id
+        );
+        for fact_id in rule.source_fact_ids {
+            assert!(
+                source_fact_ids.insert(*fact_id),
+                "duplicate rule source {}",
+                fact_id.as_str()
+            );
+        }
+        assert_eq!(rule_for_diagnosis(rule.id), Some(rule));
+    }
+    assert_eq!(source_fact_ids.len(), 69);
+}
+
+#[test]
+fn rule_action_eligibility_covers_each_policy_constraint_family() {
+    let cases = [
+        (
+            DiagnosisId::JavaOverrideUnavailable,
+            ActionEligibility {
+                ownership_requirement: OwnershipRequirement::Classified,
+                journal_requirement: JournalRequirement::RequiredForAttemptAction,
+                redaction_requirement: RedactionRequirement::PublicOutcome,
+                retry_loop_sensitivity: RetryLoopSensitivity::OneAttemptOverride,
+                destructive_mutation_risk: DestructiveMutationRisk::None,
+                user_intent_sensitivity: UserIntentSensitivity::ExplicitTechnicalIntent,
+            },
+        ),
+        (
+            DiagnosisId::ManagedRuntimeCorrupt,
+            ActionEligibility {
+                ownership_requirement: OwnershipRequirement::LauncherManaged,
+                journal_requirement: JournalRequirement::RequiredForManagedMutation,
+                redaction_requirement: RedactionRequirement::PublicOutcome,
+                retry_loop_sensitivity: RetryLoopSensitivity::RepairAttempt,
+                destructive_mutation_risk: DestructiveMutationRisk::ManagedMutation,
+                user_intent_sensitivity: UserIntentSensitivity::None,
+            },
+        ),
+        (
+            DiagnosisId::LauncherManagedArtifactCorrupt,
+            ActionEligibility {
+                ownership_requirement: OwnershipRequirement::LauncherManaged,
+                journal_requirement: JournalRequirement::RequiredForManagedMutation,
+                redaction_requirement: RedactionRequirement::PublicOutcome,
+                retry_loop_sensitivity: RetryLoopSensitivity::RepairAttempt,
+                destructive_mutation_risk: DestructiveMutationRisk::ManagedMutation,
+                user_intent_sensitivity: UserIntentSensitivity::None,
+            },
+        ),
+        (
+            DiagnosisId::DownloadUnavailable,
+            ActionEligibility {
+                ownership_requirement: OwnershipRequirement::Classified,
+                journal_requirement: JournalRequirement::RequiredForAttemptAction,
+                redaction_requirement: RedactionRequirement::PublicOutcome,
+                retry_loop_sensitivity: RetryLoopSensitivity::ProviderRetry,
+                destructive_mutation_risk: DestructiveMutationRisk::None,
+                user_intent_sensitivity: UserIntentSensitivity::None,
+            },
+        ),
+        (
+            DiagnosisId::ArtifactOwnershipUnsafe,
+            ActionEligibility {
+                ownership_requirement: OwnershipRequirement::UserOrUnknownProtected,
+                journal_requirement: JournalRequirement::None,
+                redaction_requirement: RedactionRequirement::PublicOutcome,
+                retry_loop_sensitivity: RetryLoopSensitivity::None,
+                destructive_mutation_risk: DestructiveMutationRisk::UserOrUnknownProtected,
+                user_intent_sensitivity: UserIntentSensitivity::UserDataBoundary,
+            },
+        ),
+        (
+            DiagnosisId::PerformanceHealthInvalid,
+            ActionEligibility {
+                ownership_requirement: OwnershipRequirement::CompositionManaged,
+                journal_requirement: JournalRequirement::None,
+                redaction_requirement: RedactionRequirement::PublicOutcome,
+                retry_loop_sensitivity: RetryLoopSensitivity::None,
+                destructive_mutation_risk: DestructiveMutationRisk::None,
+                user_intent_sensitivity: UserIntentSensitivity::PerformanceComposition,
+            },
+        ),
+        (
+            DiagnosisId::PerformanceRepeatedFailureMemory,
+            ActionEligibility {
+                ownership_requirement: OwnershipRequirement::CompositionManaged,
+                journal_requirement: JournalRequirement::None,
+                redaction_requirement: RedactionRequirement::PublicOutcome,
+                retry_loop_sensitivity: RetryLoopSensitivity::RepeatedFailureMemory,
+                destructive_mutation_risk: DestructiveMutationRisk::None,
+                user_intent_sensitivity: UserIntentSensitivity::PerformanceComposition,
+            },
+        ),
+        (
+            DiagnosisId::PerformanceUserOwnedConflict,
+            ActionEligibility {
+                ownership_requirement: OwnershipRequirement::UserOrUnknownProtected,
+                journal_requirement: JournalRequirement::None,
+                redaction_requirement: RedactionRequirement::PublicOutcome,
+                retry_loop_sensitivity: RetryLoopSensitivity::None,
+                destructive_mutation_risk: DestructiveMutationRisk::UserOrUnknownProtected,
+                user_intent_sensitivity: UserIntentSensitivity::UserDataBoundary,
+            },
+        ),
+        (
+            DiagnosisId::ProcessLifecycleObserved,
+            ActionEligibility {
+                ownership_requirement: OwnershipRequirement::None,
+                journal_requirement: JournalRequirement::None,
+                redaction_requirement: RedactionRequirement::PublicOutcome,
+                retry_loop_sensitivity: RetryLoopSensitivity::None,
+                destructive_mutation_risk: DestructiveMutationRisk::None,
+                user_intent_sensitivity: UserIntentSensitivity::None,
+            },
+        ),
+        (
+            DiagnosisId::PersistedStateSchemaInvalid,
+            ActionEligibility {
+                ownership_requirement: OwnershipRequirement::None,
+                journal_requirement: JournalRequirement::None,
+                redaction_requirement: RedactionRequirement::PublicOutcome,
+                retry_loop_sensitivity: RetryLoopSensitivity::None,
+                destructive_mutation_risk: DestructiveMutationRisk::None,
+                user_intent_sensitivity: UserIntentSensitivity::None,
+            },
+        ),
+    ];
+
+    for (diagnosis_id, expected) in cases {
+        assert_eq!(
+            rule_for_diagnosis(diagnosis_id)
+                .expect("diagnosis rule")
+                .eligibility,
+            expected,
+            "{diagnosis_id}"
+        );
+    }
+}
+
+#[test]
+fn nine_multi_fact_rule_families_emit_once_with_declared_support_order() {
+    let families: &[(DiagnosisId, &[GuardianFactId])] = &[
+        (
+            DiagnosisId::JavaOverrideUnavailable,
+            &[
+                GuardianFactId::JavaOverrideEmpty,
+                GuardianFactId::JavaOverrideMissing,
+                GuardianFactId::JavaOverrideUndefinedSentinel,
+            ],
+        ),
+        (
+            DiagnosisId::ManagedRuntimeCorrupt,
+            &[
+                GuardianFactId::ManagedRuntimeReadyMarkerMissing,
+                GuardianFactId::ManagedRuntimeCorrupt,
+            ],
+        ),
+        (
+            DiagnosisId::JvmArgUnsupported,
+            &[
+                GuardianFactId::JvmArgUnsupportedGc,
+                GuardianFactId::JvmArgUnlockOrderInvalid,
+            ],
+        ),
+        (
+            DiagnosisId::JvmArgUnsafeOverride,
+            &[
+                GuardianFactId::JvmArgReservedLauncherFlag,
+                GuardianFactId::JvmArgMemoryConflict,
+                GuardianFactId::JvmArgUnsafeClasspathOverride,
+                GuardianFactId::JvmArgUnsafeNativePathOverride,
+                GuardianFactId::JvmArgAgentOverride,
+            ],
+        ),
+        (
+            DiagnosisId::LauncherManagedArtifactCorrupt,
+            &[
+                GuardianFactId::ArtifactChecksumMismatch,
+                GuardianFactId::ArtifactSizeMismatch,
+                GuardianFactId::ManagedFileCorrupt,
+                GuardianFactId::ArtifactMissing,
+            ],
+        ),
+        (
+            DiagnosisId::DownloadUnavailable,
+            &[
+                GuardianFactId::DownloadProviderUnavailable,
+                GuardianFactId::DownloadInterrupted,
+            ],
+        ),
+        (
+            DiagnosisId::ArtifactOwnershipUnsafe,
+            &[
+                GuardianFactId::OwnershipUnknown,
+                GuardianFactId::PrimitiveRefused,
+            ],
+        ),
+        (
+            DiagnosisId::PerformanceFallbackSelected,
+            &[
+                GuardianFactId::PerformanceFallbackSelected,
+                GuardianFactId::PerformanceHealthFallback,
+            ],
+        ),
+        (
+            DiagnosisId::ProcessLifecycleObserved,
+            &[
+                GuardianFactId::ProcessSpawned,
+                GuardianFactId::LauncherStopRequested,
+                GuardianFactId::WatchdogKilledProcess,
+                GuardianFactId::ExitCodeZero,
+                GuardianFactId::ExitCodeNonzero,
+                GuardianFactId::ExitCodeUnknown,
+                GuardianFactId::BootMarkerObserved,
+                GuardianFactId::ProcessExited,
+                GuardianFactId::ProcessExitedBeforeBoot,
+                GuardianFactId::ProcessExitedAfterBoot,
+            ],
+        ),
+    ];
+
+    for (diagnosis_id, source_fact_ids) in families {
+        let facts = source_fact_ids
+            .iter()
+            .rev()
+            .map(|fact_id| {
+                guardian_test_fact(
+                    *fact_id,
+                    GuardianDomain::Runtime,
+                    OperationPhase::Failed,
+                    FactReliability::DirectStructured,
+                    OwnershipClass::LauncherManaged,
+                )
+            })
+            .collect::<Vec<_>>();
+        let diagnoses = diagnose_facts(&facts, OperationPhase::Failed);
+        let diagnosis = diagnoses
+            .iter()
+            .find(|diagnosis| diagnosis.id == *diagnosis_id)
+            .unwrap_or_else(|| panic!("missing fused diagnosis {diagnosis_id}"));
+
+        assert_eq!(
+            diagnoses
+                .iter()
+                .filter(|diagnosis| diagnosis.id == *diagnosis_id)
+                .count(),
+            1
+        );
+        assert_eq!(diagnosis.fact_ids, *source_fact_ids);
+    }
+}
+
+#[test]
+fn fused_rules_fold_ownership_and_fact_values_independent_of_input_order() {
+    let mut defaulted = guardian_test_fact(
+        GuardianFactId::PerformanceFallbackSelected,
+        GuardianDomain::Performance,
+        OperationPhase::Planning,
+        FactReliability::DirectStructured,
+        OwnershipClass::ExternalProviderDerived,
+    );
+    defaulted.severity = None;
+    defaulted.confidence = None;
+    let mut lower = guardian_test_fact(
+        GuardianFactId::PerformanceHealthFallback,
+        GuardianDomain::Performance,
+        OperationPhase::Planning,
+        FactReliability::DirectStructured,
+        OwnershipClass::UserOwned,
+    );
+    lower.severity = Some(GuardianSeverity::Info);
+    lower.confidence = Some(GuardianConfidence::Low);
+
+    for facts in [
+        vec![defaulted.clone(), lower.clone()],
+        vec![lower.clone(), defaulted.clone()],
+    ] {
+        let diagnosis = diagnose_facts(&facts, OperationPhase::Planning)
+            .into_iter()
+            .find(|diagnosis| diagnosis.id == DiagnosisId::PerformanceFallbackSelected)
+            .expect("performance fallback diagnosis");
+        assert_eq!(diagnosis.severity, GuardianSeverity::Warning);
+        assert_eq!(diagnosis.confidence, GuardianConfidence::High);
+        assert_eq!(diagnosis.ownership, OwnershipClass::UserOwned);
+        assert_eq!(
+            diagnosis.fact_ids,
+            vec![
+                GuardianFactId::PerformanceFallbackSelected,
+                GuardianFactId::PerformanceHealthFallback,
+            ]
+        );
+    }
+}
+
+#[test]
+fn duplicate_source_instances_keep_distinct_real_targets_without_fake_fallbacks() {
+    let mut first = guardian_test_fact(
+        GuardianFactId::DownloadInterrupted,
+        GuardianDomain::Download,
+        OperationPhase::Downloading,
+        FactReliability::DirectStructured,
+        OwnershipClass::ExternalProviderDerived,
+    );
+    first.target = Some(target(
+        "z-source",
+        TargetKind::NetworkResource,
+        OwnershipClass::ExternalProviderDerived,
+    ));
+    let mut second = first.clone();
+    second.target = Some(target(
+        "a-source",
+        TargetKind::NetworkResource,
+        OwnershipClass::ExternalProviderDerived,
+    ));
+    let mut without_target = first.clone();
+    without_target.target = None;
+
+    let diagnosis = diagnose_facts(
+        &[first, without_target, second],
+        OperationPhase::Downloading,
+    )
+    .remove(0);
+
+    assert_eq!(
+        diagnosis.fact_ids,
+        vec![GuardianFactId::DownloadInterrupted]
+    );
+    assert_eq!(
+        diagnosis
+            .affected_targets
+            .iter()
+            .map(|target| target.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a-source", "z-source"]
+    );
+}
+
+#[test]
+fn conservative_ownership_join_covers_every_pair_and_input_permutation() {
+    let ownerships = [
+        OwnershipClass::LauncherManaged,
+        OwnershipClass::CompositionManaged,
+        OwnershipClass::ExternalProviderDerived,
+        OwnershipClass::UserOwned,
+        OwnershipClass::Unknown,
+    ];
+
+    for (left_rank, left) in ownerships.into_iter().enumerate() {
+        for (right_rank, right) in ownerships.into_iter().enumerate() {
+            let expected = ownerships[left_rank.max(right_rank)];
+            let left_fact = guardian_test_fact(
+                GuardianFactId::DownloadInterrupted,
+                GuardianDomain::Download,
+                OperationPhase::Downloading,
+                FactReliability::DirectStructured,
+                left,
+            );
+            let right_fact = guardian_test_fact(
+                GuardianFactId::DownloadInterrupted,
+                GuardianDomain::Download,
+                OperationPhase::Downloading,
+                FactReliability::DirectStructured,
+                right,
+            );
+
+            for facts in [
+                vec![left_fact.clone(), right_fact.clone()],
+                vec![right_fact.clone(), left_fact.clone()],
+            ] {
+                assert_eq!(
+                    diagnose_facts(&facts, OperationPhase::Downloading)[0].ownership,
+                    expected,
+                    "{left:?} + {right:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn targetless_fused_rule_emits_one_resolved_fallback() {
+    let mut provider = guardian_test_fact(
+        GuardianFactId::DownloadProviderUnavailable,
+        GuardianDomain::Download,
+        OperationPhase::Downloading,
+        FactReliability::DirectStructured,
+        OwnershipClass::ExternalProviderDerived,
+    );
+    provider.target = None;
+    let mut interrupted = guardian_test_fact(
+        GuardianFactId::DownloadInterrupted,
+        GuardianDomain::Download,
+        OperationPhase::Downloading,
+        FactReliability::DirectStructured,
+        OwnershipClass::UserOwned,
+    );
+    interrupted.target = None;
+
+    let diagnosis = diagnose_facts(&[interrupted, provider], OperationPhase::Downloading).remove(0);
+
+    assert_eq!(diagnosis.id, DiagnosisId::DownloadUnavailable);
+    assert_eq!(diagnosis.ownership, OwnershipClass::UserOwned);
+    assert_eq!(diagnosis.affected_targets.len(), 1);
+    assert_eq!(
+        diagnosis.affected_targets[0].kind,
+        TargetKind::NetworkResource
+    );
+    assert_eq!(
+        diagnosis.affected_targets[0].ownership,
+        OwnershipClass::UserOwned
+    );
+    assert_eq!(
+        diagnosis.affected_targets[0].id,
+        "guardian-download-downloading"
+    );
+}
+
+#[test]
+fn diagnosis_order_follows_first_matching_input_then_rule_order() {
+    let jvm = guardian_test_fact(
+        GuardianFactId::JvmArgsParseFailed,
+        GuardianDomain::Jvm,
+        OperationPhase::Preparing,
+        FactReliability::ExactClassifier,
+        OwnershipClass::UserOwned,
+    );
+    let resource = guardian_test_fact(
+        GuardianFactId::LaunchMemoryAllocationLow,
+        GuardianDomain::Launch,
+        OperationPhase::Preparing,
+        FactReliability::DirectStructured,
+        OwnershipClass::LauncherManaged,
+    );
+
+    for (facts, expected) in [
+        (
+            vec![jvm.clone(), resource.clone()],
+            vec![
+                DiagnosisId::JvmArgsMalformed,
+                DiagnosisId::LaunchMemoryAllocationLow,
+            ],
+        ),
+        (
+            vec![resource.clone(), jvm.clone()],
+            vec![
+                DiagnosisId::LaunchMemoryAllocationLow,
+                DiagnosisId::JvmArgsMalformed,
+            ],
+        ),
+    ] {
+        assert_eq!(
+            diagnose_facts(&facts, OperationPhase::Preparing)
+                .iter()
+                .map(|diagnosis| diagnosis.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn every_rule_source_matches_outside_the_retired_phase_lists() {
+    for rule in DIAGNOSIS_RULES {
+        for fact_id in rule.source_fact_ids {
+            let fact = guardian_test_fact(
+                *fact_id,
+                GuardianDomain::Unknown,
+                OperationPhase::RollingBack,
+                FactReliability::UserReported,
+                OwnershipClass::Unknown,
+            );
+            assert_eq!(
+                diagnose_facts(&[fact], OperationPhase::RollingBack)[0].id,
+                rule.id,
+                "{}",
+                fact_id.as_str()
+            );
+        }
+    }
 }
 
 #[test]
@@ -1012,7 +1055,7 @@ fn exit_code_fact_maps_zero_and_nonzero_without_exit_classification() {
 
 #[test]
 fn unknown_facts_produce_low_confidence_unknown_diagnosis() {
-    let fact = guardian_graph_fact(
+    let fact = guardian_test_fact(
         GuardianFactId::NoStructuredFact(OperationPhase::Launching),
         GuardianDomain::Unknown,
         OperationPhase::Launching,
@@ -1239,7 +1282,7 @@ fn impact_vector_uses_priority_weighting() {
     assert!((vector.scalar_severity() - 0.72).abs() < f32::EPSILON);
 }
 
-fn guardian_graph_fact(
+fn guardian_test_fact(
     id: GuardianFactId,
     domain: GuardianDomain,
     phase: OperationPhase,
@@ -1258,13 +1301,6 @@ fn guardian_graph_fact(
         target: Some(target(id.as_str(), TargetKind::Config, ownership)),
         fields: Vec::new(),
     }
-}
-
-fn assert_close(actual: f32, expected: f32) {
-    assert!(
-        (actual - expected).abs() < 0.0001,
-        "expected {expected}, got {actual}"
-    );
 }
 
 fn target(id: &str, kind: TargetKind, ownership: OwnershipClass) -> TargetDescriptor {
