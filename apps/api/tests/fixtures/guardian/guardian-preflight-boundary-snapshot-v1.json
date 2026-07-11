@@ -1,0 +1,907 @@
+{
+  "schema": "axial.guardian.preflight_boundary_snapshot.v1",
+  "cases": [
+    {
+      "id": "fallback--java_major_mismatch",
+      "family": "fallback",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "java_major_mismatch"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "java_runtime_major_mismatch"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Fallback",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Fallback",
+      "directives": [
+        "UseManagedJavaForAttempt"
+      ]
+    },
+    {
+      "id": "fallback--java_override_missing",
+      "family": "fallback",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "java_override_missing"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "java_override_unavailable"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Fallback",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Fallback",
+      "directives": [
+        "UseManagedJavaForAttempt"
+      ]
+    },
+    {
+      "id": "fallback--java_override_undefined_sentinel",
+      "family": "fallback",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "java_override_undefined_sentinel"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "java_override_unavailable"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Fallback",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Fallback",
+      "directives": [
+        "UseManagedJavaForAttempt"
+      ]
+    },
+    {
+      "id": "fallback--java_probe_failed",
+      "family": "fallback",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "java_probe_failed"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "java_probe_failed"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Fallback",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Fallback",
+      "directives": [
+        "UseManagedJavaForAttempt"
+      ]
+    },
+    {
+      "id": "fallback--java_update_too_old",
+      "family": "fallback",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "java_update_too_old"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "java_runtime_update_too_old"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Fallback",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Fallback",
+      "directives": [
+        "UseManagedJavaForAttempt"
+      ]
+    },
+    {
+      "id": "precedence--client-jar-missing-block",
+      "family": "precedence",
+      "input": {
+        "mode": "Managed",
+        "launchable": false,
+        "direct_fact_ids": [],
+        "readiness_fact_ids": [
+          "client_jar_missing"
+        ],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "client_jar_missing"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Block",
+      "directives": []
+    },
+    {
+      "id": "precedence--disabled-jvm-args-block",
+      "family": "precedence",
+      "input": {
+        "mode": "Disabled",
+        "launchable": true,
+        "direct_fact_ids": [
+          "jvm_args_parse_failed"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": true
+      },
+      "diagnosis_ids": [
+        "jvm_args_malformed"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Block",
+      "directives": []
+    },
+    {
+      "id": "precedence--empty-record-only-permitted",
+      "family": "precedence",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "unknown_failure_validating"
+      ],
+      "kernel_decision": {
+        "decision_kind": "RecordOnly",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "RecordOnly",
+      "directives": []
+    },
+    {
+      "id": "precedence--java-override-custom-ask-user",
+      "family": "precedence",
+      "input": {
+        "mode": "Custom",
+        "launchable": true,
+        "direct_fact_ids": [
+          "java_override_missing"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": true
+      },
+      "diagnosis_ids": [
+        "java_override_unavailable"
+      ],
+      "kernel_decision": {
+        "decision_kind": "AskUser",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "AskUser",
+      "directives": []
+    },
+    {
+      "id": "precedence--jvm-args-custom-warning-over-ask-user",
+      "family": "precedence",
+      "input": {
+        "mode": "Custom",
+        "launchable": true,
+        "direct_fact_ids": [
+          "jvm_args_parse_failed"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": true
+      },
+      "diagnosis_ids": [
+        "jvm_args_malformed"
+      ],
+      "kernel_decision": {
+        "decision_kind": "AskUser",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    },
+    {
+      "id": "precedence--managed-runtime-missing-readiness-block-over-record-only",
+      "family": "precedence",
+      "input": {
+        "mode": "Managed",
+        "launchable": false,
+        "direct_fact_ids": [
+          "managed_runtime_missing"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "managed_runtime_missing"
+      ],
+      "kernel_decision": {
+        "decision_kind": "RecordOnly",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Block",
+      "directives": []
+    },
+    {
+      "id": "precedence--readiness-flag-block",
+      "family": "precedence",
+      "input": {
+        "mode": "Managed",
+        "launchable": false,
+        "direct_fact_ids": [],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "unknown_failure_validating"
+      ],
+      "kernel_decision": {
+        "decision_kind": "RecordOnly",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Block",
+      "directives": []
+    },
+    {
+      "id": "precedence--readiness-over-strip",
+      "family": "precedence",
+      "input": {
+        "mode": "Managed",
+        "launchable": false,
+        "direct_fact_ids": [
+          "jvm_args_parse_failed"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": true
+      },
+      "diagnosis_ids": [
+        "jvm_args_malformed"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Block",
+      "directives": []
+    },
+    {
+      "id": "precedence--strip-over-resource-warning",
+      "family": "precedence",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "jvm_args_parse_failed"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [
+          "memory_pressure"
+        ],
+        "override_signals": [],
+        "explicit_user_intent": true
+      },
+      "diagnosis_ids": [
+        "jvm_args_malformed",
+        "launch_resource_memory_pressure"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Strip",
+      "directives": [
+        "StripExplicitJvmArgsForAttempt"
+      ]
+    },
+    {
+      "id": "strip--jvm_arg_agent_override",
+      "family": "strip",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "jvm_arg_agent_override"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "jvm_arg_unsafe_override"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Strip",
+      "directives": [
+        "StripExplicitJvmArgsForAttempt"
+      ]
+    },
+    {
+      "id": "strip--jvm_arg_memory_conflict",
+      "family": "strip",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "jvm_arg_memory_conflict"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "jvm_arg_unsafe_override"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Strip",
+      "directives": [
+        "StripExplicitJvmArgsForAttempt"
+      ]
+    },
+    {
+      "id": "strip--jvm_arg_reserved_launcher_flag",
+      "family": "strip",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "jvm_arg_reserved_launcher_flag"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "jvm_arg_unsafe_override"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Strip",
+      "directives": [
+        "StripExplicitJvmArgsForAttempt"
+      ]
+    },
+    {
+      "id": "strip--jvm_arg_unlock_order_invalid",
+      "family": "strip",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "jvm_arg_unlock_order_invalid"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "jvm_arg_unsupported"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Strip",
+      "directives": [
+        "StripExplicitJvmArgsForAttempt"
+      ]
+    },
+    {
+      "id": "strip--jvm_arg_unsafe_classpath_override",
+      "family": "strip",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "jvm_arg_unsafe_classpath_override"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "jvm_arg_unsafe_override"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Strip",
+      "directives": [
+        "StripExplicitJvmArgsForAttempt"
+      ]
+    },
+    {
+      "id": "strip--jvm_arg_unsafe_native_path_override",
+      "family": "strip",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "jvm_arg_unsafe_native_path_override"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "jvm_arg_unsafe_override"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Strip",
+      "directives": [
+        "StripExplicitJvmArgsForAttempt"
+      ]
+    },
+    {
+      "id": "strip--jvm_arg_unsupported_gc",
+      "family": "strip",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "jvm_arg_unsupported_gc"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "jvm_arg_unsupported"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Strip",
+      "directives": [
+        "StripExplicitJvmArgsForAttempt"
+      ]
+    },
+    {
+      "id": "strip--jvm_args_parse_failed",
+      "family": "strip",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "jvm_args_parse_failed"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "jvm_args_malformed"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Strip",
+      "directives": [
+        "StripExplicitJvmArgsForAttempt"
+      ]
+    },
+    {
+      "id": "warning--custom_java_override_present",
+      "family": "warning",
+      "input": {
+        "mode": "Custom",
+        "launchable": true,
+        "direct_fact_ids": [],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [
+          "java"
+        ],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "custom_java_override_present"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Warn",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    },
+    {
+      "id": "warning--custom_jvm_args_present",
+      "family": "warning",
+      "input": {
+        "mode": "Custom",
+        "launchable": true,
+        "direct_fact_ids": [],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [
+          "jvm_args"
+        ],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "custom_jvm_args_present"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Warn",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    },
+    {
+      "id": "warning--custom_jvm_preset_present",
+      "family": "warning",
+      "input": {
+        "mode": "Custom",
+        "launchable": true,
+        "direct_fact_ids": [],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [
+          "jvm_preset"
+        ],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "custom_jvm_preset_present"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Warn",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    },
+    {
+      "id": "warning--java_override_empty",
+      "family": "warning",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "java_override_empty"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "java_override_unavailable"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Fallback",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    },
+    {
+      "id": "warning--launch_memory_allocation_low",
+      "family": "warning",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [],
+        "readiness_fact_ids": [],
+        "resource_signals": [
+          "low_memory_allocation"
+        ],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "launch_memory_allocation_low"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Warn",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    },
+    {
+      "id": "warning--launch_memory_min_clamped",
+      "family": "warning",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [],
+        "readiness_fact_ids": [],
+        "resource_signals": [
+          "memory_clamped"
+        ],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "launch_memory_min_clamped"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Warn",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    },
+    {
+      "id": "warning--launch_resource_cpu_pressure",
+      "family": "warning",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [],
+        "readiness_fact_ids": [],
+        "resource_signals": [
+          "cpu_pressure"
+        ],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "launch_resource_cpu_pressure"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Warn",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    },
+    {
+      "id": "warning--launch_resource_disk_pressure",
+      "family": "warning",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [],
+        "readiness_fact_ids": [],
+        "resource_signals": [
+          "disk_pressure"
+        ],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "launch_resource_disk_pressure"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Warn",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    },
+    {
+      "id": "warning--launch_resource_install_pressure",
+      "family": "warning",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [],
+        "readiness_fact_ids": [],
+        "resource_signals": [
+          "install_pressure"
+        ],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "launch_resource_install_pressure"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Warn",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    },
+    {
+      "id": "warning--launch_resource_memory_pressure",
+      "family": "warning",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [],
+        "readiness_fact_ids": [],
+        "resource_signals": [
+          "memory_pressure"
+        ],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "launch_resource_memory_pressure"
+      ],
+      "kernel_decision": {
+        "decision_kind": "Warn",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    },
+    {
+      "id": "warning--recent_repair_failed",
+      "family": "warning",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "recent_repair_failed"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "unknown_failure_validating"
+      ],
+      "kernel_decision": {
+        "decision_kind": "RecordOnly",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    },
+    {
+      "id": "warning--recent_startup_failure",
+      "family": "warning",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "recent_startup_failure"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "unknown_failure_validating"
+      ],
+      "kernel_decision": {
+        "decision_kind": "RecordOnly",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    },
+    {
+      "id": "warning--repair_suppressed_until",
+      "family": "warning",
+      "input": {
+        "mode": "Managed",
+        "launchable": true,
+        "direct_fact_ids": [
+          "repair_suppressed_until"
+        ],
+        "readiness_fact_ids": [],
+        "resource_signals": [],
+        "override_signals": [],
+        "explicit_user_intent": false
+      },
+      "diagnosis_ids": [
+        "unknown_failure_validating"
+      ],
+      "kernel_decision": {
+        "decision_kind": "RecordOnly",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "effective_decision": "Warn",
+      "directives": []
+    }
+  ]
+}

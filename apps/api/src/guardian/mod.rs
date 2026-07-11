@@ -27,6 +27,8 @@ mod inference_graph;
 #[cfg(test)]
 mod launch_decision_snapshot;
 mod model;
+#[cfg(test)]
+mod preflight_decision_snapshot;
 mod repair_terminal;
 
 #[cfg(test)]

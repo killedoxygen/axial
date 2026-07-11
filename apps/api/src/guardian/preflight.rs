@@ -1127,29 +1127,6 @@ mod tests {
     }
 
     #[test]
-    fn java_override_unavailable_directs_managed_java_for_managed_attempt() {
-        let fact = fact(
-            GuardianFactId::JavaOverrideMissing,
-            GuardianDomain::Runtime,
-            GuardianSeverity::Blocking,
-            OwnershipClass::UserOwned,
-            TargetKind::Config,
-            "explicit_java_override",
-        );
-
-        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
-            explicit_user_intent: true,
-            ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[fact])
-        });
-
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Fallback);
-        assert_eq!(
-            outcome.directives,
-            vec![GuardianPreflightDirective::UseManagedJavaForAttempt]
-        );
-    }
-
-    #[test]
     fn malformed_jvm_args_strip_in_managed_preflight_but_block_when_disabled() {
         let fact = fact(
             GuardianFactId::JvmArgsParseFailed,

@@ -594,10 +594,7 @@ fn boundary_decision_projection(
     decision: &GuardianDecision,
     safety_case: &SafetyCase,
 ) -> PolicyDecisionCell {
-    let [diagnosis] = safety_case.diagnoses.as_slice() else {
-        panic!("boundary decision must have one diagnosis")
-    };
-    decision_projection(decision, diagnosis, safety_case.mode)
+    decision_projection(decision, safety_case)
 }
 
 impl From<&GuardianLaunchRecoveryDirective> for DirectiveProjection {

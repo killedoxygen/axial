@@ -358,7 +358,7 @@ fn policy_matrix(
                 .iter()
                 .map(|context| {
                     let decision = decide_guardian_policy(&safety_case, context.policy_context());
-                    decision_projection(&decision, diagnosis, mode)
+                    decision_projection(&decision, &safety_case)
                 })
                 .collect();
             ModePolicyRow { mode, contexts }
@@ -368,24 +368,24 @@ fn policy_matrix(
 
 pub(super) fn decision_projection(
     decision: &super::GuardianDecision,
-    diagnosis: &Diagnosis,
-    mode: GuardianMode,
+    safety_case: &SafetyCase,
 ) -> PolicyDecisionCell {
     PolicyDecisionCell {
         decision_kind: decision.kind,
         plan_present: decision.action_plan.is_some(),
-        plan_integrity: decision_plan_integrity(decision, diagnosis, mode),
+        plan_integrity: decision_plan_integrity(decision, safety_case),
     }
 }
 
-fn decision_plan_integrity(
-    decision: &super::GuardianDecision,
-    diagnosis: &Diagnosis,
-    mode: GuardianMode,
-) -> bool {
-    if decision.operation_id.is_some()
-        || decision.mode != mode
-        || decision.diagnoses.as_slice() != [diagnosis.id]
+fn decision_plan_integrity(decision: &super::GuardianDecision, safety_case: &SafetyCase) -> bool {
+    if decision.operation_id != safety_case.operation_id
+        || decision.mode != safety_case.mode
+        || decision.diagnoses
+            != safety_case
+                .diagnoses
+                .iter()
+                .map(|diagnosis| diagnosis.id)
+                .collect::<Vec<_>>()
     {
         return false;
     }
@@ -395,16 +395,19 @@ fn decision_plan_integrity(
     let [action] = plan.actions.as_slice() else {
         return false;
     };
+    let prerequisite_matches = safety_case.diagnoses.iter().any(|diagnosis| {
+        plan.prerequisite.diagnosis_id == diagnosis.id
+            && plan.prerequisite.ownership == diagnosis.ownership
+            && plan.prerequisite.confidence == diagnosis.confidence
+            && plan.prerequisite.affected_targets == diagnosis.affected_targets
+            && plan.prerequisite.candidate_actions == diagnosis.candidate_actions
+    });
 
     plan.owner == StabilizationSystem::Guardian
-        && plan.prerequisite.diagnosis_id == diagnosis.id
-        && plan.prerequisite.ownership == diagnosis.ownership
-        && plan.prerequisite.confidence == diagnosis.confidence
-        && plan.prerequisite.affected_targets == diagnosis.affected_targets
-        && plan.prerequisite.candidate_actions == diagnosis.candidate_actions
+        && prerequisite_matches
         && action.kind == decision.kind
-        && action.reason == diagnosis.id
-        && action.target.as_ref() == diagnosis.affected_targets.first()
+        && action.reason == plan.prerequisite.diagnosis_id
+        && action.target.as_ref() == plan.prerequisite.affected_targets.first()
 }
 
 fn insert_policy_profile(
