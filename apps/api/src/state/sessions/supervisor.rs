@@ -4,7 +4,8 @@ use super::{
 };
 use crate::execution::crash::{CrashArtifactCollectionRequest, collect_crash_evidence};
 use axial_launcher::{
-    LaunchSessionExitReason, LaunchSessionOutcome, LaunchState, LaunchStatusEvent,
+    LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome, LaunchState,
+    LaunchStatusEvent, classify_launch_failure,
 };
 use std::future::Future;
 use std::io;
@@ -783,7 +784,7 @@ async fn settle_process_exit(
     let should_collect_crash = should_collect_crash_artifact(
         requested_cause,
         output_processor_error.is_some(),
-        exit_context.observed_failure.is_some(),
+        !exit_context.observed_failures.is_empty(),
         status.as_ref().map_or(true, |status| !status.success()),
     );
     let crash_evidence = if should_collect_crash {
@@ -808,7 +809,7 @@ async fn settle_process_exit(
     } else {
         None
     };
-    let (exit_code, failure_class, failure_detail, evidence) = if let Some(error) =
+    let (exit_code, force_unknown, failure_detail, evidence) = if let Some(error) =
         output_processor_error
     {
         trace_output_processor_error(&error);
@@ -818,7 +819,7 @@ async fn settle_process_exit(
         };
         (
             exit_code,
-            Some("unknown".to_string()),
+            true,
             Some("launch output processing failed".to_string()),
             process_observation_stage_evidence(session_id, ProcessObservation::Exited),
         )
@@ -836,23 +837,29 @@ async fn settle_process_exit(
                     .unwrap_or_else(|| {
                         process_observation_stage_evidence(session_id, ProcessObservation::Exited)
                     });
-                (
-                    exit_code,
-                    exit_context
-                        .observed_failure
-                        .map(|failure| failure.as_str().to_string()),
-                    None,
-                    evidence,
-                )
+                (exit_code, false, None, evidence)
             }
             Err(error) => (
                 Some(-1),
-                Some("unknown".to_string()),
+                true,
                 Some(error.to_string()),
                 process_observation_stage_evidence(session_id, ProcessObservation::Exited),
             ),
         }
     };
+    let fused_failure = classify_launch_failure(
+        &exit_context.observed_failures,
+        exit_code,
+        crash_evidence.as_ref(),
+    );
+    let failure_class = if requested_cause == Some(ProcessTerminalCause::UserStop) {
+        None
+    } else if force_unknown {
+        Some(LaunchFailureClass::Unknown)
+    } else {
+        fused_failure
+    }
+    .map(|failure| failure.as_str().to_string());
     store
         .emit_status_for_attempt(
             session_id,
@@ -881,10 +888,10 @@ async fn settle_process_exit(
 fn should_collect_crash_artifact(
     requested_cause: Option<ProcessTerminalCause>,
     output_processor_failed: bool,
-    observed_failure: bool,
+    observed_failures: bool,
     process_failed: bool,
 ) -> bool {
-    requested_cause.is_none() && (output_processor_failed || observed_failure || process_failed)
+    requested_cause.is_none() && (output_processor_failed || observed_failures || process_failed)
 }
 
 async fn settle_watchdog_exit(
@@ -1058,6 +1065,66 @@ mod tests {
         assert_eq!(preserved.exit_code, record.exit_code);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settlement_forces_unknown_for_output_processor_and_wait_failures() {
+        for (suffix, output_error, status) in [
+            (
+                "output",
+                Some(
+                    tokio::spawn(async { panic!("processor failure") })
+                        .await
+                        .expect_err("processor join error"),
+                ),
+                Ok(Command::new("sh")
+                    .arg("-c")
+                    .arg("exit 1")
+                    .status()
+                    .await
+                    .expect("exit status")),
+            ),
+            ("wait", None, Err(io::Error::other("wait failure"))),
+        ] {
+            let store = SessionStore::new();
+            let session_id = format!("forced-unknown-{suffix}");
+            let mut record = test_record(&session_id);
+            record.state = LaunchState::Starting;
+            store.insert(record).await.expect("insert session");
+            let attempt = store
+                .current_process_attempt(&session_id)
+                .await
+                .expect("attempt");
+            store
+                .emit_log(
+                    &session_id,
+                    "stderr",
+                    "Unrecognized VM option '-XX:+UseZGC'",
+                )
+                .await;
+
+            settle_process_exit(
+                &store,
+                &session_id,
+                &attempt,
+                status,
+                None,
+                output_error,
+                now_ms(),
+            )
+            .await;
+
+            assert_eq!(
+                store
+                    .get(&session_id)
+                    .await
+                    .expect("terminal session")
+                    .failure
+                    .map(|failure| failure.class),
+                Some(LaunchFailureClass::Unknown)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn output_drain_waits_until_an_inflight_failure_line_is_committed() {
         let store = Arc::new(SessionStore::new());
@@ -1094,7 +1161,7 @@ mod tests {
         let drain = tokio::spawn(pumps.drain());
         tokio::task::yield_now().await;
         assert!(!drain.is_finished());
-        assert_eq!(store.observed_failure(session_id).await, None);
+        assert!(store.observed_failures(session_id).await.is_empty());
         release.notify_one();
         drain
             .await
@@ -1105,8 +1172,8 @@ mod tests {
             store
                 .process_exit_context(session_id, &attempt, now_ms())
                 .await
-                .and_then(|context| context.observed_failure),
-            Some(LaunchFailureClass::JvmUnsupportedOption)
+                .map(|context| context.observed_failures),
+            Some(vec![LaunchFailureClass::JvmUnsupportedOption])
         );
     }
 

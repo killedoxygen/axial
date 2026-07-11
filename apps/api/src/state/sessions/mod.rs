@@ -54,12 +54,18 @@ struct SessionEntry {
     process: Option<supervisor::ProcessControlHandle>,
     record: LaunchSessionRecord,
     events: broadcast::Sender<LaunchEvent>,
-    observed_failure: Option<ObservedFailureSignal>,
+    observed_failures: ObservedFailureSignals,
     crash_artifact_game_dir: Option<PathBuf>,
     log_count: usize,
     stop_requested: bool,
     retention_holds: usize,
     terminal_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ObservedFailureSignals {
+    // Uniqueness bounds this vector to the closed LaunchFailureClass vocabulary.
+    entries: Vec<ObservedFailureSignal>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,10 +74,27 @@ struct ObservedFailureSignal {
     observed_at_ms: u64,
 }
 
-impl ObservedFailureSignal {
-    fn fresh_for_exit(self, exit_observed_at_ms: u64) -> Option<LaunchFailureClass> {
-        let age_ms = exit_observed_at_ms.saturating_sub(self.observed_at_ms);
-        (age_ms <= axial_launcher::CRASH_ARTIFACT_EXIT_CORRELATION_WINDOW_MS).then_some(self.class)
+impl ObservedFailureSignals {
+    fn observe(&mut self, class: LaunchFailureClass, observed_at_ms: u64) {
+        if let Some(signal) = self.entries.iter_mut().find(|signal| signal.class == class) {
+            signal.observed_at_ms = signal.observed_at_ms.max(observed_at_ms);
+            return;
+        }
+        self.entries.push(ObservedFailureSignal {
+            class,
+            observed_at_ms,
+        });
+    }
+
+    fn fresh_for_exit(&self, exit_observed_at_ms: u64) -> Vec<LaunchFailureClass> {
+        self.entries
+            .iter()
+            .filter(|signal| {
+                exit_observed_at_ms.saturating_sub(signal.observed_at_ms)
+                    <= axial_launcher::CRASH_ARTIFACT_EXIT_CORRELATION_WINDOW_MS
+            })
+            .map(|signal| signal.class)
+            .collect()
     }
 }
 
@@ -90,7 +113,7 @@ struct RawLogLine {
 
 pub(super) struct ProcessExitContext {
     pub(super) record: LaunchSessionRecord,
-    pub(super) observed_failure: Option<LaunchFailureClass>,
+    pub(super) observed_failures: Vec<LaunchFailureClass>,
     pub(super) crash_artifact_game_dir: Option<PathBuf>,
 }
 
@@ -561,7 +584,7 @@ impl SessionStore {
                 process: None,
                 record,
                 events,
-                observed_failure: None,
+                observed_failures: ObservedFailureSignals::default(),
                 crash_artifact_game_dir: None,
                 log_count: 0,
                 stop_requested: false,
@@ -597,9 +620,7 @@ impl SessionStore {
             .filter(|entry| attempt_scopes_match(&entry.attempt, attempt))?;
         Some(ProcessExitContext {
             record: entry.record.clone(),
-            observed_failure: entry
-                .observed_failure
-                .and_then(|signal| signal.fresh_for_exit(exit_observed_at_ms)),
+            observed_failures: entry.observed_failures.fresh_for_exit(exit_observed_at_ms),
             crash_artifact_game_dir: entry.crash_artifact_game_dir.clone(),
         })
     }
@@ -976,7 +997,7 @@ impl SessionStore {
             BootPromotionGate::Stale | BootPromotionGate::Resolve => unreachable!(),
         };
         observe_log(entry);
-        entry.observed_failure = None;
+        entry.observed_failures = ObservedFailureSignals::default();
         record_priority_promotion(entry, promotion, promotion_error);
         complete_boot(entry, prepared.observed_at_ms);
         let mut status = LaunchStatusEvent {
@@ -1161,7 +1182,7 @@ impl SessionStore {
             process: Some(process.clone()),
             record: stored_record,
             events,
-            observed_failure: None,
+            observed_failures: ObservedFailureSignals::default(),
             crash_artifact_game_dir,
             log_count: 0,
             stop_requested: false,
@@ -1397,12 +1418,20 @@ impl SessionStore {
     }
 
     #[cfg(test)]
-    pub async fn observed_failure(&self, session_id: &str) -> Option<LaunchFailureClass> {
+    pub async fn observed_failures(&self, session_id: &str) -> Vec<LaunchFailureClass> {
         self.sessions
             .read()
             .await
             .get(session_id)
-            .and_then(|entry| entry.observed_failure.map(|signal| signal.class))
+            .map(|entry| {
+                entry
+                    .observed_failures
+                    .entries
+                    .iter()
+                    .map(|signal| signal.class)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -1768,10 +1797,9 @@ fn observe_log(entry: &mut SessionEntry) {
 
 fn publish_prepared_log(entry: &mut SessionEntry, prepared: PreparedLogLine) {
     if let Some(failure_class) = prepared.failure_class {
-        entry.observed_failure = Some(ObservedFailureSignal {
-            class: failure_class,
-            observed_at_ms: prepared.observed_at_ms,
-        });
+        entry
+            .observed_failures
+            .observe(failure_class, prepared.observed_at_ms);
     }
     let _ = entry.events.send(LaunchEvent::Log(prepared.event));
 }
@@ -3064,10 +3092,9 @@ mod tests {
             let mut sessions = store.sessions.write().await;
             let entry = sessions.get_mut(session_id).expect("session entry");
             entry.stop_requested = true;
-            entry.observed_failure = Some(ObservedFailureSignal {
-                class: LaunchFailureClass::JvmUnsupportedOption,
-                observed_at_ms: now_ms(),
-            });
+            entry
+                .observed_failures
+                .observe(LaunchFailureClass::JvmUnsupportedOption, now_ms());
             entry.log_count = 7;
             entry.terminal_sequence = Some(11);
             entry.record.state = LaunchState::Exited;
@@ -3094,7 +3121,7 @@ mod tests {
             let sessions = store.sessions.read().await;
             let entry = sessions.get(session_id).expect("reused session entry");
             assert!(!entry.stop_requested);
-            assert_eq!(entry.observed_failure, None);
+            assert_eq!(entry.observed_failures, ObservedFailureSignals::default());
             assert_eq!(entry.log_count, 0);
             assert_eq!(entry.terminal_sequence, None);
             assert_eq!(entry.record.state, LaunchState::Starting);
@@ -3414,8 +3441,8 @@ mod tests {
         assert!(status_json.contains("execution_process_exit_code"));
         assert_public_session_payload_excludes_sensitive_content(&status_json);
         assert_eq!(
-            store.observed_failure(session_id).await,
-            Some(LaunchFailureClass::JvmUnsupportedOption)
+            store.observed_failures(session_id).await,
+            vec![LaunchFailureClass::JvmUnsupportedOption]
         );
 
         let stored = store.get(session_id).await.expect("stored record");
@@ -3536,10 +3563,8 @@ mod tests {
             sessions
                 .get_mut(session_id)
                 .expect("session entry")
-                .observed_failure = Some(ObservedFailureSignal {
-                class: LaunchFailureClass::ClasspathModuleConflict,
-                observed_at_ms: now_ms(),
-            });
+                .observed_failures
+                .observe(LaunchFailureClass::ClasspathModuleConflict, now_ms());
         }
         let mut receiver = store.subscribe(session_id).await.expect("subscribe");
         let preparation_ran = AtomicBool::new(false);
@@ -3585,8 +3610,8 @@ mod tests {
         assert_eq!(log.source, "game");
         assert_eq!(log.text, crate::observability::PUBLIC_LOG_LINE_REDACTED);
         assert_eq!(
-            store.observed_failure(session_id).await,
-            Some(LaunchFailureClass::JvmUnsupportedOption)
+            store.observed_failures(session_id).await,
+            vec![LaunchFailureClass::JvmUnsupportedOption]
         );
         let stored = store.get(session_id).await.expect("stored record");
         assert!(stored.priority.and_then(|value| value.promotion).is_some());
@@ -3744,8 +3769,13 @@ mod tests {
         assert_eq!(entry.record.priority, None);
         assert_eq!(entry.log_count, 0);
         assert_eq!(
-            entry.observed_failure.map(|signal| signal.class),
-            Some(LaunchFailureClass::JvmUnsupportedOption)
+            entry
+                .observed_failures
+                .entries
+                .iter()
+                .map(|signal| signal.class)
+                .collect::<Vec<_>>(),
+            vec![LaunchFailureClass::JvmUnsupportedOption]
         );
         drop(sessions);
         assert!(receiver.try_recv().is_err());
@@ -3780,7 +3810,7 @@ mod tests {
         assert_eq!(stored.state, LaunchState::Starting);
         assert_eq!(stored.boot_completed_at_ms, None);
         assert_eq!(stored.exit_code, None);
-        assert_eq!(store.observed_failure(session_id).await, None);
+        assert!(store.observed_failures(session_id).await.is_empty());
         assert!(receiver.try_recv().is_err());
     }
 
@@ -4038,8 +4068,8 @@ mod tests {
             store
                 .process_exit_context(session_id, &attempt, exit_observed_at_ms)
                 .await
-                .and_then(|context| context.observed_failure),
-            Some(LaunchFailureClass::JvmUnsupportedOption)
+                .map(|context| context.observed_failures),
+            Some(vec![LaunchFailureClass::JvmUnsupportedOption])
         );
         set_failure_observed_at(
             &store,
@@ -4051,9 +4081,103 @@ mod tests {
             store
                 .process_exit_context(session_id, &attempt, exit_observed_at_ms)
                 .await
-                .and_then(|context| context.observed_failure),
-            None
+                .map(|context| context.observed_failures),
+            Some(Vec::new())
         );
+        set_failure_observed_at(&store, session_id, exit_observed_at_ms + 1).await;
+        assert_eq!(
+            store
+                .process_exit_context(session_id, &attempt, exit_observed_at_ms)
+                .await
+                .map(|context| context.observed_failures),
+            Some(vec![LaunchFailureClass::JvmUnsupportedOption])
+        );
+    }
+
+    #[test]
+    fn observed_failure_candidates_are_unique_and_refresh_per_class() {
+        let mut observed = ObservedFailureSignals::default();
+        observed.observe(LaunchFailureClass::MissingDependency, 10);
+        observed.observe(LaunchFailureClass::JvmUnsupportedOption, 20);
+        observed.observe(LaunchFailureClass::MissingDependency, 30);
+
+        assert_eq!(observed.entries.len(), 2);
+        assert_eq!(
+            observed.fresh_for_exit(30),
+            vec![
+                LaunchFailureClass::MissingDependency,
+                LaunchFailureClass::JvmUnsupportedOption,
+            ]
+        );
+        assert_eq!(
+            observed
+                .entries
+                .iter()
+                .find(|signal| signal.class == LaunchFailureClass::MissingDependency)
+                .map(|signal| signal.observed_at_ms),
+            Some(30)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_failure_fusion_is_log_order_independent_and_clean_exit_has_no_class() {
+        for (index, script, expected) in [
+            (
+                0,
+                "printf '%s\\n' 'net.minecraftforge.fml.common.MissingModsException: missing' 'Unrecognized VM option -XX:+UseZGC' >&2; exit 1",
+                Some(LaunchFailureClass::JvmUnsupportedOption),
+            ),
+            (
+                1,
+                "printf '%s\\n' 'Unrecognized VM option -XX:+UseZGC' 'net.minecraftforge.fml.common.MissingModsException: missing' >&2; exit 1",
+                Some(LaunchFailureClass::JvmUnsupportedOption),
+            ),
+            (
+                2,
+                "printf '%s\\n' 'Unrecognized VM option -XX:+UseZGC' >&2; exit 0",
+                None,
+            ),
+        ] {
+            let store = Arc::new(SessionStore::new());
+            let session_id = format!("terminal-fusion-{index}");
+            let mut record = test_record(&session_id);
+            record.state = LaunchState::Starting;
+            store.insert(record.clone()).await.expect("insert session");
+            let mut events = store.subscribe(&session_id).await.expect("subscribe");
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(script);
+            store
+                .start_process(record, command)
+                .await
+                .expect("start process");
+
+            let status = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let LaunchEvent::Status(status) =
+                        events.recv().await.expect("terminal event")
+                        && status.state == "exited"
+                    {
+                        break status;
+                    }
+                }
+            })
+            .await
+            .expect("terminal deadline");
+            assert_eq!(
+                status.failure_class.as_deref(),
+                expected.map(LaunchFailureClass::as_str)
+            );
+            assert_eq!(
+                store
+                    .get(&session_id)
+                    .await
+                    .expect("stored session")
+                    .failure
+                    .map(|failure| failure.class),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
@@ -4126,8 +4250,8 @@ mod tests {
             .emit_log(session_id, "stderr", "Unrecognized VM option '-XX:+UseZGC'")
             .await;
         assert_eq!(
-            store.observed_failure(session_id).await,
-            Some(LaunchFailureClass::JvmUnsupportedOption)
+            store.observed_failures(session_id).await,
+            vec![LaunchFailureClass::JvmUnsupportedOption]
         );
 
         store
@@ -4137,7 +4261,7 @@ mod tests {
                 "[Render thread/INFO]: LWJGL Version: 3.3.3",
             )
             .await;
-        assert_eq!(store.observed_failure(session_id).await, None);
+        assert!(store.observed_failures(session_id).await.is_empty());
 
         store
             .emit_status(
@@ -5029,22 +5153,23 @@ mod tests {
         {
             let mut sessions = store.sessions.write().await;
             let entry = sessions.get_mut(session_id).expect("session entry");
-            entry.observed_failure = Some(ObservedFailureSignal {
-                class: LaunchFailureClass::JvmUnsupportedOption,
-                observed_at_ms: now_ms()
+            entry.observed_failures.observe(
+                LaunchFailureClass::JvmUnsupportedOption,
+                now_ms()
                     .saturating_sub(axial_launcher::CRASH_ARTIFACT_EXIT_CORRELATION_WINDOW_MS + 1),
-            });
+            );
         }
 
         assert_eq!(
-            store.observed_failure(session_id).await,
-            Some(LaunchFailureClass::JvmUnsupportedOption)
+            store.observed_failures(session_id).await,
+            vec![LaunchFailureClass::JvmUnsupportedOption]
         );
-        let exit_failure = store
+        let exit_failures = store
             .process_exit_context(session_id, &attempt, now_ms())
             .await
-            .and_then(|context| context.observed_failure);
-        assert_eq!(exit_failure, None);
+            .map(|context| context.observed_failures)
+            .unwrap_or_default();
+        assert!(exit_failures.is_empty());
 
         let mut receiver = store.subscribe(session_id).await.expect("subscribe");
         store
@@ -5055,8 +5180,7 @@ mod tests {
                     benchmark: None,
                     pid: None,
                     exit_code: Some(0),
-                    failure_class: exit_failure
-                        .map(|failure_class| failure_class.as_str().to_string()),
+                    failure_class: None,
                     failure_detail: None,
                     crash_evidence: None,
                     healing: None,
@@ -5653,16 +5777,12 @@ mod tests {
     }
 
     async fn set_failure_observed_at(store: &SessionStore, session_id: &str, observed_at_ms: u64) {
-        store
-            .sessions
-            .write()
-            .await
-            .get_mut(session_id)
-            .expect("session entry")
-            .observed_failure = Some(ObservedFailureSignal {
-            class: LaunchFailureClass::JvmUnsupportedOption,
-            observed_at_ms,
-        });
+        let mut sessions = store.sessions.write().await;
+        let entry = sessions.get_mut(session_id).expect("session entry");
+        entry.observed_failures = ObservedFailureSignals::default();
+        entry
+            .observed_failures
+            .observe(LaunchFailureClass::JvmUnsupportedOption, observed_at_ms);
     }
 
     async fn mark_stop_requested(store: &SessionStore, session_id: &str) {
