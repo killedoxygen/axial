@@ -1,5 +1,5 @@
 use super::LaunchRequestError;
-use super::proof::persist_launch_proof_with_context;
+use super::proof::persist_launch_proof_with_context_owned as persist_launch_proof_with_context;
 use super::status::{serialize_guardian, serialize_healing};
 use crate::observability::{
     RedactionAudience, sanitize_evidence_token, sanitize_public_diagnostic_text,
@@ -19,6 +19,7 @@ const ROSETTA_REQUIRED_LAUNCH_MESSAGE_SUFFIX: &str = " needs Rosetta 2 on this M
 
 pub(super) async fn fail_launch(
     state: &AppState,
+    producer: &crate::state::ProducerLease,
     session_id: &str,
     proof_context: Option<&LaunchProofContext>,
     failure_class: LaunchFailureClass,
@@ -28,6 +29,7 @@ pub(super) async fn fail_launch(
 ) -> LaunchRequestError {
     fail_launch_with_outcome(
         state,
+        producer,
         session_id,
         proof_context,
         failure_class,
@@ -41,6 +43,7 @@ pub(super) async fn fail_launch(
 
 pub(super) async fn fail_launch_for_journal(
     state: &AppState,
+    producer: &crate::state::ProducerLease,
     session_id: &str,
     message: &str,
     healing: Option<axial_launcher::LaunchHealingSummary>,
@@ -60,7 +63,7 @@ pub(super) async fn fail_launch_for_journal(
         },
     )
     .await;
-    persist_launch_proof_with_context(state, session_id, None, "failed", None).await;
+    persist_launch_proof_with_context(state, producer, session_id, None, "failed", None).await;
     LaunchRequestError {
         message: public_message,
         healing,
@@ -71,6 +74,7 @@ pub(super) async fn fail_launch_for_journal(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn fail_launch_with_outcome(
     state: &AppState,
+    producer: &crate::state::ProducerLease,
     session_id: &str,
     proof_context: Option<&LaunchProofContext>,
     failure_class: LaunchFailureClass,
@@ -94,7 +98,8 @@ pub(super) async fn fail_launch_with_outcome(
         },
     )
     .await;
-    persist_launch_proof_with_context(state, session_id, None, "failed", proof_context).await;
+    persist_launch_proof_with_context(state, producer, session_id, None, "failed", proof_context)
+        .await;
     LaunchRequestError {
         message: public_message,
         healing,
@@ -232,9 +237,11 @@ mod tests {
             .await
             .expect("subscribe");
         let unsafe_message = "prepare failed for /home/alice/.axial/instances/secret java.exe --accessToken raw-secret-token -Xmx8192M -Dtoken=raw provider_payload=provider-secret account_id=account-secret username=SecretPlayer\nnext command fragment C:\\Users\\Alice\\AppData\\java.exe eyJheader123456789.abcdEFGH12345678.ijklMNOP12345678";
+        let producer = state.try_claim_producer().expect("claim failure producer");
 
         let error = fail_launch(
             &state,
+            &producer,
             session_id,
             None,
             LaunchFailureClass::Unknown,
@@ -298,8 +305,10 @@ mod tests {
             .expect("insert session");
 
         let expected = LaunchSessionOutcome::from_reason(LaunchSessionExitReason::SpawnFailed);
+        let producer = state.try_claim_producer().expect("claim failure producer");
         let _ = fail_launch_with_outcome(
             &state,
+            &producer,
             session_id,
             None,
             LaunchFailureClass::Unknown,

@@ -102,8 +102,12 @@ pub(crate) struct BenchmarkSuiteDriverResumeSummary {
 }
 
 pub(crate) fn spawn_restart_interrupted_benchmark_suite_drivers(state: &AppState) -> bool {
+    let Ok(producer) = state.try_claim_producer() else {
+        return false;
+    };
     let state = state.clone();
-    tokio::spawn(async move {
+    let reconciliation_owner = producer.claim_child();
+    producer.spawn(async move {
         let cleanup_issues = state.benchmark_suites().retry_terminal_retention().await;
         if !cleanup_issues.is_empty() {
             tracing::warn!(
@@ -111,7 +115,8 @@ pub(crate) fn spawn_restart_interrupted_benchmark_suite_drivers(state: &AppState
                 "benchmark suite startup retention cleanup is pending"
             );
         }
-        match resume_restart_interrupted_benchmark_suite_drivers(state).await {
+        match resume_restart_interrupted_benchmark_suite_drivers(state, reconciliation_owner).await
+        {
             Ok(summary) if summary.pending > 0 => tracing::info!(
                 pending = summary.pending,
                 resumed = summary.resumed,
@@ -130,6 +135,7 @@ pub(crate) fn spawn_restart_interrupted_benchmark_suite_drivers(state: &AppState
 
 pub(crate) async fn resume_restart_interrupted_benchmark_suite_drivers(
     state: AppState,
+    producer: crate::state::ProducerLease,
 ) -> Result<BenchmarkSuiteDriverResumeSummary, BenchmarkSuiteDriverStoreError> {
     // Application failures are recorded per driver; persistence failures abort reconciliation.
     let pending = state
@@ -188,6 +194,7 @@ pub(crate) async fn resume_restart_interrupted_benchmark_suite_drivers(
             .record_restart_resume_started(&status.id)
             .await?;
         spawn_benchmark_suite_driver_loop(
+            &producer,
             state.clone(),
             started.status.id,
             prepared.request,
@@ -315,37 +322,52 @@ impl BenchmarkLaunchRequest {
 pub(crate) async fn launch_benchmark(
     state: AppState,
     payload: BenchmarkLaunchRequest,
+    producer: crate::state::ProducerLease,
 ) -> Result<serde_json::Value, LaunchApplicationError> {
     let input = payload.into_launch_input()?;
-    let mut prepared = super::prepare_launch_session(&state, input.launch).await?;
-    let benchmark = crate::state::launch_reports::LaunchBenchmarkMetadata::new(
-        Some(prepared.task.intent.session_id.as_str()),
-        input.profile.as_deref(),
-        input.run_type.as_deref(),
-        input.benchmark_mode.as_deref(),
-    );
-    let benchmark_response = super::launch_benchmark_status_payload(&benchmark);
-    prepared.task.benchmark = Some(benchmark.clone());
-    let launched = super::launch_session(state.clone(), prepared.task)
-        .await
-        .map_err(super::launch_request_error_response)?;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let launch_owner = producer.claim_child();
+    producer.spawn(async move {
+        let result = async {
+            let mut prepared =
+                super::prepare_launch_session_owned(&state, input.launch, &launch_owner).await?;
+            let benchmark = crate::state::launch_reports::LaunchBenchmarkMetadata::new(
+                Some(prepared.task.intent.session_id.as_str()),
+                input.profile.as_deref(),
+                input.run_type.as_deref(),
+                input.benchmark_mode.as_deref(),
+            );
+            let benchmark_response = super::launch_benchmark_status_payload(&benchmark);
+            prepared.task.benchmark = Some(benchmark.clone());
+            let launched = super::launch_session(state.clone(), prepared.task, launch_owner)
+                .await
+                .map_err(super::launch_request_error_response)?;
 
-    let mut response = super::launch_success_response_payload(&launched);
-    response["benchmark"] = benchmark_response;
-    Ok(response)
+            let mut response = super::launch_success_response_payload(&launched);
+            response["benchmark"] = benchmark_response;
+            Ok(response)
+        }
+        .await;
+        let _ = result_tx.send(result);
+    });
+    result_rx
+        .await
+        .unwrap_or_else(|_| Err(benchmark_suite_storage_error_response()))
 }
 
 pub(crate) async fn launch_benchmark_suite(
     state: AppState,
     payload: BenchmarkLaunchRequest,
+    producer: crate::state::ProducerLease,
 ) -> Result<serde_json::Value, LaunchApplicationError> {
     let input = payload.into_suite_launch_input()?;
-    launch_benchmark_suite_run(state, input).await
+    launch_benchmark_suite_run(state, input, producer).await
 }
 
 pub(crate) async fn tick_benchmark_suite(
     state: AppState,
     payload: BenchmarkLaunchRequest,
+    producer: crate::state::ProducerLease,
 ) -> Result<serde_json::Value, LaunchApplicationError> {
     let input = payload.into_suite_plan_input_with_manifest(Some(state.benchmark_suites()))?;
     match benchmark_suite_driver_decision(state.sessions().as_ref(), input).await? {
@@ -364,7 +386,7 @@ pub(crate) async fn tick_benchmark_suite(
             "suite": suite,
         })),
         BenchmarkSuiteDriverDecision::Launch(input) => {
-            let mut payload = launch_benchmark_suite_run(state, input).await?;
+            let mut payload = launch_benchmark_suite_run(state, input, producer).await?;
             payload["driver"] = json!({ "state": "launched_next" });
             Ok(payload)
         }
@@ -374,6 +396,7 @@ pub(crate) async fn tick_benchmark_suite(
 pub(crate) async fn start_benchmark_suite_driver(
     state: AppState,
     payload: BenchmarkLaunchRequest,
+    producer: crate::state::ProducerLease,
 ) -> Result<serde_json::Value, LaunchApplicationError> {
     let interval_ms = clamp_benchmark_suite_driver_interval_ms(payload.interval_ms);
     let input = payload
@@ -390,6 +413,7 @@ pub(crate) async fn start_benchmark_suite_driver(
     driver_payload.run_index = None;
 
     start_owned_benchmark_suite_driver(
+        producer,
         state,
         input.suite_id,
         input.mode,
@@ -485,9 +509,11 @@ struct PreparedBenchmarkSuiteDriverResume {
 pub(crate) async fn resume_benchmark_suite_driver(
     state: AppState,
     id: String,
+    producer: crate::state::ProducerLease,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
     let prepared = prepare_benchmark_suite_driver_resume(&state, &id).await?;
     start_owned_benchmark_suite_driver(
+        producer,
         state,
         prepared.suite_id,
         prepared.mode,
@@ -565,6 +591,7 @@ async fn prepare_benchmark_suite_driver_resume(
 }
 
 async fn start_owned_benchmark_suite_driver(
+    producer: crate::state::ProducerLease,
     state: AppState,
     suite_id: String,
     mode: String,
@@ -574,7 +601,8 @@ async fn start_owned_benchmark_suite_driver(
     resumed_from: Option<String>,
 ) -> Result<serde_json::Value, LaunchApplicationError> {
     let (ownership_tx, ownership_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    let driver_owner = producer.claim_child();
+    producer.spawn(async move {
         let started = match state
             .benchmark_suite_drivers()
             .start(suite_id, mode, interval_ms, summary)
@@ -604,6 +632,7 @@ async fn start_owned_benchmark_suite_driver(
         let _ = ownership_tx.send(Ok(response));
         tokio::task::yield_now().await;
         own_benchmark_suite_driver_loop(
+            driver_owner,
             state,
             started.status.id,
             request,
@@ -625,8 +654,9 @@ async fn start_owned_benchmark_suite_driver(
 pub(crate) async fn launch_benchmark_suite_run(
     state: AppState,
     input: BenchmarkSuiteLaunchInput,
+    producer: crate::state::ProducerLease,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    launch_benchmark_suite_run_owned(state, input)
+    launch_benchmark_suite_run_owned(state, input, producer)
         .await
         .map(|launched| launched.payload)
 }
@@ -634,6 +664,7 @@ pub(crate) async fn launch_benchmark_suite_run(
 async fn launch_benchmark_suite_run_owned(
     state: AppState,
     input: BenchmarkSuiteLaunchInput,
+    producer: crate::state::ProducerLease,
 ) -> Result<BenchmarkSuiteOwnedLaunch, (StatusCode, Json<serde_json::Value>)> {
     let BenchmarkSuiteLaunchInput {
         launch,
@@ -666,8 +697,10 @@ async fn launch_benchmark_suite_run_owned(
     let benchmark_response = super::launch_benchmark_status_payload(&benchmark);
     let suite_response = benchmark_suite_status_payload(&suite_id, &mode, run_index, &plan);
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    let launch_owner = producer.claim_child();
+    producer.spawn(async move {
         own_benchmark_suite_launch(
+            launch_owner,
             state,
             OwnedBenchmarkSuiteLaunchInput {
                 launch,
@@ -697,6 +730,7 @@ struct OwnedBenchmarkSuiteLaunchInput {
 }
 
 async fn own_benchmark_suite_launch(
+    producer: crate::state::ProducerLease,
     state: AppState,
     input: OwnedBenchmarkSuiteLaunchInput,
     result_tx: tokio::sync::oneshot::Sender<
@@ -711,7 +745,7 @@ async fn own_benchmark_suite_launch(
         benchmark_response,
         suite_response,
     } = input;
-    let mut prepared = match super::prepare_launch_session(&state, launch).await {
+    let mut prepared = match super::prepare_launch_session_owned(&state, launch, &producer).await {
         Ok(prepared) => prepared,
         Err(error) => {
             let _ = result_tx.send(Err(error));
@@ -732,6 +766,7 @@ async fn own_benchmark_suite_launch(
         tracing::warn!("prepared benchmark suite session disappeared before reservation");
         finish_benchmark_suite_reservation_failure(
             &state,
+            &producer,
             &prepared.task,
             benchmark,
             BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE,
@@ -746,6 +781,7 @@ async fn own_benchmark_suite_launch(
         tracing::warn!("prepared benchmark suite session could not be observed");
         finish_benchmark_suite_reservation_failure(
             &state,
+            &producer,
             &prepared.task,
             benchmark,
             BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE,
@@ -781,6 +817,7 @@ async fn own_benchmark_suite_launch(
             let failure = BenchmarkSuiteReservationFailure::from_store_error(&error);
             finish_benchmark_suite_reservation_failure(
                 &state,
+                &producer,
                 &prepared.task,
                 benchmark,
                 failure.message,
@@ -797,6 +834,7 @@ async fn own_benchmark_suite_launch(
         }) => {
             finish_benchmark_suite_reservation_failure(
                 &state,
+                &producer,
                 &prepared.task,
                 benchmark,
                 BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE,
@@ -820,7 +858,8 @@ async fn own_benchmark_suite_launch(
             return;
         }
     }
-    let launched = match super::launch_session(state.clone(), prepared.task).await {
+    let launch_owner = producer.claim_child();
+    let launched = match super::launch_session(state.clone(), prepared.task, launch_owner).await {
         Ok(launched) => launched,
         Err(error) => {
             let _ = result_tx.send(Err(super::launch_request_error_response(error)));
@@ -840,6 +879,7 @@ async fn own_benchmark_suite_launch(
 
 async fn finish_benchmark_suite_reservation_failure(
     state: &AppState,
+    producer: &crate::state::ProducerLease,
     task: &super::LaunchSessionTask,
     benchmark: crate::state::launch_reports::LaunchBenchmarkMetadata,
     message: &'static str,
@@ -888,6 +928,7 @@ async fn finish_benchmark_suite_reservation_failure(
         .with_resource_budget(task.resource_budget.clone());
     super::runner::persist_launch_proof_for_reservation_failure(
         state,
+        producer,
         session_id,
         Some(task.launched_at.as_str()),
         &proof_context,
@@ -1517,18 +1558,29 @@ pub(crate) async fn benchmark_suite_driver_decision(
 }
 
 pub(crate) fn spawn_benchmark_suite_driver_loop(
+    producer: &crate::state::ProducerLease,
     state: AppState,
     driver_id: String,
     request: BenchmarkLaunchRequest,
     interval_ms: u64,
     effect_owner: crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverEffectOwner,
 ) {
-    tokio::spawn(async move {
-        own_benchmark_suite_driver_loop(state, driver_id, request, interval_ms, effect_owner).await;
+    let driver_owner = producer.claim_child();
+    producer.spawn_child(async move {
+        own_benchmark_suite_driver_loop(
+            driver_owner,
+            state,
+            driver_id,
+            request,
+            interval_ms,
+            effect_owner,
+        )
+        .await;
     });
 }
 
 async fn own_benchmark_suite_driver_loop(
+    producer: crate::state::ProducerLease,
     state: AppState,
     driver_id: String,
     request: BenchmarkLaunchRequest,
@@ -1536,8 +1588,21 @@ async fn own_benchmark_suite_driver_loop(
     effect_owner: crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverEffectOwner,
 ) {
     let stop_rx = effect_owner.stop_receiver();
-    match run_benchmark_suite_driver_loop(state, driver_id, request, interval_ms, stop_rx).await {
-        Ok(()) | Err(BenchmarkSuiteDriverStoreError::TerminalDriver) => {}
+    let shutdown = state.subscribe_shutdown();
+    match run_benchmark_suite_driver_loop(
+        &producer,
+        state,
+        driver_id,
+        request,
+        interval_ms,
+        stop_rx,
+        shutdown,
+    )
+    .await
+    {
+        Ok(())
+        | Err(BenchmarkSuiteDriverStoreError::TerminalDriver)
+        | Err(BenchmarkSuiteDriverStoreError::ShuttingDown) => {}
         Err(error) => tracing::warn!(
             error_class = error.class(),
             "benchmark suite driver persistence failed"
@@ -1547,15 +1612,17 @@ async fn own_benchmark_suite_driver_loop(
 }
 
 pub(crate) async fn run_benchmark_suite_driver_loop(
+    producer: &crate::state::ProducerLease,
     state: AppState,
     driver_id: String,
     request: BenchmarkLaunchRequest,
     interval_ms: u64,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), BenchmarkSuiteDriverStoreError> {
     // Stop requests are observed between launches so an in-flight benchmark can finish cleanly.
     loop {
-        if *stop_rx.borrow() {
+        if *stop_rx.borrow() || *shutdown.borrow() {
             break;
         }
 
@@ -1565,6 +1632,9 @@ pub(crate) async fn run_benchmark_suite_driver_loop(
         {
             Ok(input) => input,
             Err(error) => {
+                if *shutdown.borrow() {
+                    break;
+                }
                 state
                     .benchmark_suite_drivers()
                     .record_failed(&driver_id, &benchmark_suite_api_error_message(&error))
@@ -1591,10 +1661,12 @@ pub(crate) async fn run_benchmark_suite_driver_loop(
                 break;
             }
             Ok(BenchmarkSuiteDriverDecision::Launch(input)) => {
-                if *stop_rx.borrow() {
+                if *stop_rx.borrow() || *shutdown.borrow() {
                     break;
                 }
-                match launch_benchmark_suite_run_owned(state.clone(), input).await {
+                match launch_benchmark_suite_run_owned(state.clone(), input, producer.claim_child())
+                    .await
+                {
                     Ok(launched) => {
                         let session_id = launched
                             .payload
@@ -1612,6 +1684,9 @@ pub(crate) async fn run_benchmark_suite_driver_loop(
                             .await?;
                     }
                     Err(error) => {
+                        if *shutdown.borrow() {
+                            break;
+                        }
                         state
                             .benchmark_suite_drivers()
                             .record_failed(&driver_id, &benchmark_suite_api_error_message(&error))
@@ -1621,6 +1696,9 @@ pub(crate) async fn run_benchmark_suite_driver_loop(
                 }
             }
             Err(error) => {
+                if *shutdown.borrow() {
+                    break;
+                }
                 state
                     .benchmark_suite_drivers()
                     .record_failed(&driver_id, &benchmark_suite_api_error_message(&error))
@@ -1632,6 +1710,11 @@ pub(crate) async fn run_benchmark_suite_driver_loop(
         tokio::select! {
             changed = stop_rx.changed() => {
                 if changed.is_err() || *stop_rx.borrow() {
+                    break;
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
             }
@@ -1703,6 +1786,16 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn startup_driver_resume_is_not_admitted_after_quiescence() {
+        let fixture = BenchmarkFixture::new("startup-resume-after-quiescence");
+        fixture.state.quiesce().await.expect("quiesce state");
+
+        assert!(!spawn_restart_interrupted_benchmark_suite_drivers(
+            &fixture.state
+        ));
+    }
 
     struct FailingReservationBackend {
         attempts: AtomicUsize,
@@ -1887,8 +1980,13 @@ mod tests {
         let suite_response =
             benchmark_suite_status_payload(&suite_id, "development", selected_run_index, &plan);
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let producer = fixture
+            .state
+            .try_claim_producer()
+            .expect("claim benchmark owner");
 
         own_benchmark_suite_launch(
+            producer,
             fixture.state.clone(),
             OwnedBenchmarkSuiteLaunchInput {
                 launch: super::super::LaunchRequest {
@@ -1997,6 +2095,7 @@ mod tests {
         let plan = performance::benchmark_suite_plan("development").expect("development plan");
         let suite_id = crate::state::benchmark_suites::derive_suite_id(&instance_id, "development");
         let state = fixture.state.clone();
+        let producer = state.try_claim_producer().expect("claim suite producer");
         let waiter = tokio::spawn(launch_benchmark_suite_run(
             state.clone(),
             BenchmarkSuiteLaunchInput {
@@ -2012,6 +2111,7 @@ mod tests {
                 requested_run_index: None,
                 plan,
             },
+            producer,
         ));
 
         backend.wait_for_attempt(1).await;
@@ -2115,6 +2215,7 @@ mod tests {
         fixture.state = fixture.state.clone().with_benchmark_suites(suite_store);
         let suite_id = crate::state::benchmark_suites::derive_suite_id(&instance_id, "development");
         let state = fixture.state.clone();
+        let producer = state.try_claim_producer().expect("claim suite producer");
         let waiter = tokio::spawn(launch_benchmark_suite_run(
             state.clone(),
             BenchmarkSuiteLaunchInput {
@@ -2130,6 +2231,7 @@ mod tests {
                 requested_run_index: None,
                 plan: performance::benchmark_suite_plan("development").expect("development plan"),
             },
+            producer,
         ));
 
         backend.wait_for_attempt().await;
@@ -2283,7 +2385,9 @@ mod tests {
         let state = fixture.state.clone();
         let suite_id =
             crate::state::benchmark_suites::derive_suite_id("missing-instance", "development");
+        let producer = state.try_claim_producer().expect("claim driver producer");
         let mut waiter = Box::pin(start_owned_benchmark_suite_driver(
+            producer,
             state.clone(),
             suite_id.clone(),
             "development".to_string(),

@@ -467,10 +467,12 @@ mod tests {
             &self,
             texture_key: &str,
         ) -> Result<Json<SkinApplyResponse>, (StatusCode, Json<serde_json::Value>)> {
+            let request = self.state.try_admit_request().expect("admit skin request");
             handle_apply_saved_skin(
                 &self.state,
                 texture_key.to_string(),
                 ApplySavedSkinQuery { defer: Some(true) },
+                request.producer_handoff(),
             )
             .await
         }

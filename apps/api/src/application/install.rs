@@ -21,7 +21,6 @@ use crate::observability::{
         TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
     },
 };
-use crate::state::AppState;
 use crate::state::contracts::{OperationId, OperationJournalEntry};
 use crate::state::{
     ActiveQueuedInstallEntry, InstallInitializationStatus, InstallQueueEnqueueOutcome,
@@ -29,6 +28,7 @@ use crate::state::{
     OperationJournalReconciliation, OperationJournalStore, OperationJournalStoreError,
     QueuedInstallEntry, operation_journal_plan_is_visible,
 };
+use crate::state::{AppState, ProducerLease, RequestProducerHandoff};
 use axial_minecraft::{
     DownloadError, DownloadProgress, Downloader, LoaderComponentId,
     download::{ExecutionDownloadFact, SelectedDownloadArtifactDescriptor},
@@ -62,6 +62,7 @@ struct InstallInitializationReservation {
     journals: Arc<OperationJournalStore>,
     install_id: Option<String>,
     operation_id: OperationId,
+    cleanup_owner: Option<ProducerLease>,
 }
 
 impl InstallInitializationReservation {
@@ -70,12 +71,14 @@ impl InstallInitializationReservation {
         journals: Arc<OperationJournalStore>,
         install_id: String,
         operation_id: OperationId,
+        cleanup_owner: ProducerLease,
     ) -> Self {
         Self {
             store,
             journals,
             install_id: Some(install_id),
             operation_id,
+            cleanup_owner: Some(cleanup_owner),
         }
     }
 
@@ -92,7 +95,11 @@ impl Drop for InstallInitializationReservation {
         let store = self.store.clone();
         let journals = self.journals.clone();
         let operation_id = self.operation_id.clone();
-        tokio::spawn(async move {
+        let cleanup_owner = self
+            .cleanup_owner
+            .take()
+            .expect("install initialization cleanup owner remains available");
+        cleanup_owner.spawn(async move {
             let _ = store.mark_initialization_reconciling(&install_id).await;
             let _ = operation::record_install_operation_initialization_cancelled(
                 &journals,
@@ -130,21 +137,23 @@ pub(super) async fn reconcile_install_journal_transition(
     }
 }
 
-async fn begin_install_journal_with_detached_reconciliation(
+async fn begin_install_journal_with_owned_reconciliation(
     store: Arc<InstallStore>,
     journals: Arc<OperationJournalStore>,
     install_id: String,
     operation_id: OperationId,
     version_id: String,
+    producer: &ProducerLease,
 ) -> Result<InstallInitializationReservation, ()> {
     let reservation = InstallInitializationReservation::new(
         store,
         journals.clone(),
         install_id,
         operation_id.clone(),
+        producer.claim_child(),
     );
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    producer.claim_child().spawn(async move {
         match begin_install_operation_journal(&journals, &operation_id, &version_id).await {
             Ok(()) => {
                 let _ = result_tx.send(Ok(reservation));
@@ -195,9 +204,32 @@ async fn begin_install_journal_with_detached_reconciliation(
     result_rx.await.unwrap_or(Err(()))
 }
 
+#[cfg(test)]
+async fn begin_install_journal_with_detached_reconciliation(
+    store: Arc<InstallStore>,
+    journals: Arc<OperationJournalStore>,
+    install_id: String,
+    operation_id: OperationId,
+    version_id: String,
+) -> Result<InstallInitializationReservation, ()> {
+    let lifecycle = crate::state::AppLifecycle::new();
+    let producer = lifecycle
+        .try_claim_producer()
+        .expect("claim test install reconciliation");
+    begin_install_journal_with_owned_reconciliation(
+        store,
+        journals,
+        install_id,
+        operation_id,
+        version_id,
+        &producer,
+    )
+    .await
+}
+
 pub type InstallApplicationError = (StatusCode, Json<serde_json::Value>);
 
-use loader::start_loader_install;
+use loader::start_loader_install_owned;
 #[cfg(test)]
 use loader::{
     base_install_failed_progress, loader_error_progress, loader_install_done_progress,
@@ -237,9 +269,10 @@ pub use repair::{
 };
 pub use stream::{install_events_stream, loader_install_events_stream};
 
-pub(crate) async fn start_install_version(
+pub(crate) async fn start_install_version_owned(
     state: &AppState,
     request: InstallVersionStartRequest,
+    producer: &ProducerLease,
 ) -> Result<InstallStartResponse, InstallApplicationError> {
     let (version_id, manifest_url) = effective_install_fields(&request);
     if version_id.is_empty() {
@@ -290,12 +323,13 @@ pub(crate) async fn start_install_version(
     );
     let store = state.installs().clone();
     let journals = state.journals().clone();
-    let reservation = begin_install_journal_with_detached_reconciliation(
+    let reservation = begin_install_journal_with_owned_reconciliation(
         store.clone(),
         journals.clone(),
         install_id.clone(),
         operation_id.clone(),
         version_id.clone(),
+        producer,
     )
     .await
     .map_err(|_| install_journal_error_response())?;
@@ -315,8 +349,10 @@ pub(crate) async fn start_install_version(
     let worker_failure_memory = failure_memory.clone();
     let worker_operation_id = operation_id_task.clone();
     let worker_telemetry = telemetry.clone();
-    InstallStore::spawn_tracked_worker_with_interrupt_handler(
+    let progress_owner = producer.claim_child();
+    InstallStore::spawn_tracked_worker_with_interrupt_handler_owned(
         store,
+        producer.claim_child(),
         install_id_task,
         interrupted_install_progress(),
         async move {
@@ -329,7 +365,7 @@ pub(crate) async fn start_install_version(
                 let journals = worker_journals.clone();
                 let operation_id = worker_operation_id.clone();
                 let journal_failed = journal_failed.clone();
-                tokio::spawn(async move {
+                progress_owner.spawn_joinable(async move {
                     let mut coalescer = InstallProgressCoalescer::default();
                     let mut last_journal_phase = None;
                     while let Some(progress) = progress_rx.recv().await {
@@ -499,6 +535,17 @@ pub(crate) async fn start_install_version(
         operation_id: staging.result.operation_id.unwrap_or(operation_id),
         view_model: InstallProgressViewModel::starting(),
     })
+}
+
+#[cfg(test)]
+pub(crate) async fn start_install_version(
+    state: &AppState,
+    request: InstallVersionStartRequest,
+) -> Result<InstallStartResponse, InstallApplicationError> {
+    let producer = state
+        .try_claim_producer()
+        .expect("claim test install producer");
+    start_install_version_owned(state, request, &producer).await
 }
 
 pub(super) async fn record_install_failure_outcome_and_repair(
@@ -759,27 +806,42 @@ pub async fn install_status(
     })
 }
 
-pub async fn install_queue_status(
+pub(crate) async fn install_queue_status_owned(
     state: &AppState,
+    handoff: RequestProducerHandoff,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    let started_install = maybe_start_next_queued_install(state).await?;
-    let response = install_queue_state_response(state, None, started_install.clone()).await;
-    spawn_install_queue_monitor_for_started(state.clone(), started_install.as_ref());
+    let started = maybe_start_next_queued_install(state, handoff).await?;
+    let started_install = started.as_ref().map(|(started, _)| started.clone());
+    let response = install_queue_state_response(state, None, started_install).await;
+    spawn_install_queue_monitor_for_started(state.clone(), started);
     Ok(response)
 }
 
-pub async fn enqueue_install(
+pub(crate) async fn enqueue_install_owned(
     state: &AppState,
     request: InstallQueueRequest,
+    handoff: RequestProducerHandoff,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    enqueue_install_with_placement(state, request, InstallQueuePlacement::Back).await
+    enqueue_install_with_placement(state, request, InstallQueuePlacement::Back, handoff).await
 }
 
-pub async fn retry_install(
+#[cfg(test)]
+pub(crate) async fn enqueue_install(
     state: &AppState,
     request: InstallQueueRequest,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    enqueue_install_with_placement(state, request, InstallQueuePlacement::Front).await
+    let admitted = state
+        .try_admit_request()
+        .expect("admit test install request");
+    enqueue_install_owned(state, request, admitted.producer_handoff()).await
+}
+
+pub(crate) async fn retry_install_owned(
+    state: &AppState,
+    request: InstallQueueRequest,
+    handoff: RequestProducerHandoff,
+) -> Result<InstallQueueStateResponse, InstallApplicationError> {
+    enqueue_install_with_placement(state, request, InstallQueuePlacement::Front, handoff).await
 }
 
 pub async fn remove_queued_install(
@@ -812,6 +874,7 @@ async fn enqueue_install_with_placement(
     state: &AppState,
     request: InstallQueueRequest,
     placement: InstallQueuePlacement,
+    handoff: RequestProducerHandoff,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
     let spec = install_queue_spec_from_request(state, request).await?;
     let queue_id = generate_install_id("install-queue");
@@ -820,9 +883,10 @@ async fn enqueue_install_with_placement(
         .enqueue_queued_install(queue_id, spec.clone(), placement)
         .await;
     let notice = Some(install_queue_notice_for_outcome(&outcome, &spec, placement));
-    let started_install = maybe_start_next_queued_install(state).await?;
-    let response = install_queue_state_response(state, notice, started_install.clone()).await;
-    spawn_install_queue_monitor_for_started(state.clone(), started_install.as_ref());
+    let started = maybe_start_next_queued_install(state, handoff).await?;
+    let started_install = started.as_ref().map(|(started, _)| started.clone());
+    let response = install_queue_state_response(state, notice, started_install).await;
+    spawn_install_queue_monitor_for_started(state.clone(), started);
     Ok(response)
 }
 
@@ -896,11 +960,46 @@ async fn install_queue_spec_from_request(
 
 async fn maybe_start_next_queued_install(
     state: &AppState,
+    handoff: RequestProducerHandoff,
+) -> Result<Option<(InstallStartResponse, ProducerLease)>, InstallApplicationError> {
+    let Some(entry) = state.installs().reserve_next_queued_install().await else {
+        return Ok(None);
+    };
+    let producer = match handoff.try_claim() {
+        Ok(producer) => producer,
+        Err(_) => {
+            state
+                .installs()
+                .release_active_queued_install_to_front(&entry.queue_id)
+                .await;
+            return Err(install_shutdown_error_response());
+        }
+    };
+    let started = match start_queued_install(state, &entry.spec, &producer).await {
+        Ok(started) => started,
+        Err(error) => {
+            state
+                .installs()
+                .discard_active_queued_install(&entry.queue_id)
+                .await;
+            return Err(error);
+        }
+    };
+    state
+        .installs()
+        .mark_queued_install_started(&entry.queue_id, started.install_id.clone())
+        .await;
+    Ok(Some((started, producer)))
+}
+
+async fn maybe_start_next_queued_install_owned(
+    state: &AppState,
+    producer: &ProducerLease,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError> {
     let Some(entry) = state.installs().reserve_next_queued_install().await else {
         return Ok(None);
     };
-    let started = match start_queued_install(state, &entry.spec).await {
+    let started = match start_queued_install(state, &entry.spec, producer).await {
         Ok(started) => started,
         Err(error) => {
             state
@@ -920,18 +1019,20 @@ async fn maybe_start_next_queued_install(
 async fn start_queued_install(
     state: &AppState,
     spec: &InstallQueueSpec,
+    producer: &ProducerLease,
 ) -> Result<InstallStartResponse, InstallApplicationError> {
     match spec {
         InstallQueueSpec::Vanilla {
             version_id,
             manifest_url,
         } => {
-            start_install_version(
+            start_install_version_owned(
                 state,
                 InstallVersionStartRequest {
                     version_id: version_id.clone(),
                     manifest_url: manifest_url.clone(),
                 },
+                producer,
             )
             .await
         }
@@ -940,39 +1041,71 @@ async fn start_queued_install(
             build_id,
             ..
         } => {
-            start_loader_install(
+            start_loader_install_owned(
                 state,
                 LoaderInstallStartRequest {
                     component_id: *component_id,
                     build_id: build_id.clone(),
                 },
+                producer,
             )
             .await
         }
     }
 }
 
-fn spawn_install_queue_monitor(state: AppState, install_id: String) {
-    tokio::spawn(async move {
-        wait_for_install_terminal(&state, &install_id).await;
-        invalidate_create_view_installed_scan();
-        state
-            .installs()
-            .clear_active_queued_install(&install_id)
-            .await;
-        if let Ok(Some(started_install)) = maybe_start_next_queued_install(&state).await {
-            spawn_install_queue_monitor(state.clone(), started_install.install_id);
+fn spawn_install_queue_monitor_owned(state: AppState, install_id: String, producer: ProducerLease) {
+    let successor_owner = producer.claim_child();
+    producer.spawn(async move {
+        let mut install_id = install_id;
+        let mut shutdown = state.subscribe_shutdown();
+        loop {
+            wait_for_install_terminal(&state, &install_id).await;
+            invalidate_create_view_installed_scan();
+            state
+                .installs()
+                .clear_active_queued_install(&install_id)
+                .await;
+            if *shutdown.borrow_and_update() {
+                return;
+            }
+            let Ok(successor) = successor_owner.try_claim_successor() else {
+                return;
+            };
+            let Ok(Some(started_install)) =
+                maybe_start_next_queued_install_owned(&state, &successor).await
+            else {
+                return;
+            };
+            install_id = started_install.install_id;
         }
     });
 }
 
 fn spawn_install_queue_monitor_for_started(
     state: AppState,
-    started_install: Option<&InstallStartResponse>,
+    started: Option<(InstallStartResponse, ProducerLease)>,
 ) {
-    if let Some(started_install) = started_install {
-        spawn_install_queue_monitor(state, started_install.install_id.clone());
+    if let Some((started_install, producer)) = started {
+        spawn_install_queue_monitor_owned(state, started_install.install_id, producer);
     }
+}
+
+#[cfg(test)]
+fn spawn_install_queue_monitor(state: AppState, install_id: String) {
+    let producer = state
+        .try_claim_producer()
+        .expect("claim test install monitor");
+    spawn_install_queue_monitor_owned(state, install_id, producer);
+}
+
+fn install_shutdown_error_response() -> InstallApplicationError {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "Installs are unavailable while the application is shutting down."
+        })),
+    )
 }
 
 async fn wait_for_install_terminal(state: &AppState, install_id: &str) {

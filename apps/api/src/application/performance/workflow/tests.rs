@@ -83,7 +83,8 @@ async fn handle_rules_refresh(
     Json<crate::application::PerformanceRulesStatusResponse>,
     (StatusCode, Json<serde_json::Value>),
 > {
-    crate::application::refresh_performance_rules(&state)
+    let request = state.try_admit_request().expect("admit refresh request");
+    crate::application::refresh_performance_rules(&state, request.producer_handoff())
         .await
         .map(Json)
         .map_err(crate::application::refresh_performance_rules_error_response)
@@ -114,7 +115,10 @@ async fn handle_install(
     State(state): State<AppState>,
     Json(payload): Json<InstallRequest>,
 ) -> Result<Json<PerformanceInstallResponse>, (StatusCode, Json<serde_json::Value>)> {
-    performance_install(state, payload).await.map(Json)
+    let request = state.try_admit_request().expect("admit install request");
+    performance_install(state, payload, request.producer_handoff())
+        .await
+        .map(Json)
 }
 
 async fn handle_operation_status(

@@ -8,6 +8,8 @@ use std::{
 use tokio::sync::{Notify, RwLock, broadcast};
 use tokio::task::JoinHandle;
 
+use crate::state::ProducerLease;
+
 struct InstallEntry {
     key: Option<InstallKey>,
     started_at_ms: u64,
@@ -420,6 +422,36 @@ impl InstallStore {
         })
     }
 
+    pub(crate) fn spawn_tracked_worker_with_interrupt_handler_owned<F, H, HFut>(
+        store: Arc<Self>,
+        producer: ProducerLease,
+        install_id: String,
+        interrupted_progress: DownloadProgress,
+        worker: F,
+        on_interrupted: H,
+    ) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+        H: FnOnce(DownloadProgress) -> HFut + Send + 'static,
+        HFut: Future<Output = bool> + Send + 'static,
+    {
+        let worker = producer.claim_child().spawn_joinable(worker);
+        producer.spawn_joinable(async move {
+            let _ = worker.await;
+            if !store.reserve_terminal_if_active(&install_id).await {
+                return;
+            }
+            if on_interrupted(interrupted_progress.clone()).await {
+                let _ = store
+                    .finish_reserved(&install_id, interrupted_progress)
+                    .await;
+            } else {
+                store.cancel_reserved_terminal(&install_id).await;
+            }
+        })
+    }
+
+    #[cfg(test)]
     pub fn spawn_tracked_worker<F>(
         store: Arc<Self>,
         install_id: String,
@@ -429,8 +461,13 @@ impl InstallStore {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        Self::spawn_tracked_worker_with_interrupt_handler(
+        let lifecycle = crate::state::AppLifecycle::new();
+        let producer = lifecycle
+            .try_claim_producer()
+            .expect("claim test install worker");
+        Self::spawn_tracked_worker_with_interrupt_handler_owned(
             store,
+            producer,
             install_id,
             interrupted_progress,
             worker,
@@ -438,6 +475,7 @@ impl InstallStore {
         )
     }
 
+    #[cfg(test)]
     pub fn spawn_tracked_worker_with_interrupt_handler<F, H, HFut>(
         store: Arc<Self>,
         install_id: String,
@@ -450,19 +488,18 @@ impl InstallStore {
         H: FnOnce(DownloadProgress) -> HFut + Send + 'static,
         HFut: Future<Output = bool> + Send + 'static,
     {
-        tokio::spawn(async move {
-            let _ = tokio::spawn(worker).await;
-            if !store.reserve_terminal_if_active(&install_id).await {
-                return;
-            }
-            if on_interrupted(interrupted_progress.clone()).await {
-                let _ = store
-                    .finish_reserved(&install_id, interrupted_progress)
-                    .await;
-            } else {
-                store.cancel_reserved_terminal(&install_id).await;
-            }
-        })
+        let lifecycle = crate::state::AppLifecycle::new();
+        let producer = lifecycle
+            .try_claim_producer()
+            .expect("claim test install worker");
+        Self::spawn_tracked_worker_with_interrupt_handler_owned(
+            store,
+            producer,
+            install_id,
+            interrupted_progress,
+            worker,
+            on_interrupted,
+        )
     }
 
     pub async fn snapshot(&self, install_id: &str) -> Option<InstallSnapshot> {

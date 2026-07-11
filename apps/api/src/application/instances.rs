@@ -3,9 +3,11 @@ mod create_cache;
 mod create_policy;
 mod resources;
 
+#[cfg(test)]
+pub(crate) use create::handle_create_instance;
 pub(crate) use create::{
     CreateInstanceRequest, CreateInstanceResponse, CreateInstanceViewResponse,
-    CreateLoaderBuildsViewResponse, handle_create_instance, handle_create_instance_view,
+    CreateLoaderBuildsViewResponse, handle_create_instance_owned, handle_create_instance_view,
     handle_create_loader_builds_view,
 };
 pub(crate) use create_cache::{

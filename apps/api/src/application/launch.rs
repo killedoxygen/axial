@@ -41,14 +41,25 @@ pub(crate) use runner::launch_session;
 pub use runner::{
     LaunchRequestError, LaunchSuccess, sanitize_live_launch_failure_message, trace_launch_event,
 };
+#[cfg(test)]
+use session::prepare_launch_session;
 pub use session::{
     LaunchPreflightMemory, LaunchPreflightOverride, LaunchPreflightOverrides,
     LaunchPreflightResourceBudget, LaunchPreflightResponse, LaunchRequest,
     prepare_launch_preflight,
 };
-pub(crate) use session::{LaunchSessionTask, prepare_launch_session};
+pub(crate) use session::{LaunchSessionTask, prepare_launch_session_owned};
 
 pub type LaunchApplicationError = (StatusCode, Json<Value>);
+
+pub(crate) fn launch_shutdown_error_response(
+    _error: crate::state::LifecycleAdmissionError,
+) -> LaunchApplicationError {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "application shutdown is in progress" })),
+    )
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LaunchInstanceStaging {

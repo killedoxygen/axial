@@ -69,16 +69,17 @@ pub use install::{
     InstallApplicationError, InstallGuardianRepairSummary, InstallProgressStepViewModel,
     InstallProgressViewModel, InstallQueueRequest, InstallQueueStateResponse, InstallStartResponse,
     InstallStatusResponse, InstallVersionStaging, InstallVersionStartRequest, LoaderBuildsRequest,
-    LoaderInstallStartRequest, begin_install_operation_journal, enqueue_install,
-    install_events_stream, install_guardian_repair_summary_from_journal, install_operation_id,
-    install_queue_status, install_status, loader_builds, loader_components, loader_error_response,
-    loader_game_versions, loader_install_events_stream, loader_install_progress_view_model,
+    LoaderInstallStartRequest, begin_install_operation_journal, install_events_stream,
+    install_guardian_repair_summary_from_journal, install_operation_id, install_status,
+    loader_builds, loader_components, loader_error_response, loader_game_versions,
+    loader_install_events_stream, loader_install_progress_view_model,
     public_loader_install_progress_json, public_vanilla_install_progress_json,
     record_install_operation_guardian_evidence, record_install_operation_guardian_repair_outcome,
     record_install_operation_interrupted, record_install_operation_progress, remove_queued_install,
-    repair_install_artifact_corruption_with_guardian, retry_install, sanitize_install_progress,
+    repair_install_artifact_corruption_with_guardian, sanitize_install_progress,
     stage_install_version_command, vanilla_install_progress_view_model,
 };
+pub(crate) use install::{enqueue_install_owned, install_queue_status_owned, retry_install_owned};
 pub use java::{JavaRuntimesResponse, java_runtimes};
 pub use launch::{
     LaunchBoundaryStaging, LaunchBoundaryStagingRequest, LaunchInstanceStaging,
@@ -100,11 +101,13 @@ pub use performance::{
     PerformanceOperationStatusResponse, PerformancePlanRequest, PerformancePlanResponse,
     PerformanceRollbackListRequest, PerformanceRollbackListResponse,
     PerformanceRulesStatusResponse, PerformanceRuntimeDisplay, RefreshPerformanceRulesError,
-    SystemResourceResponse, performance_health, performance_install,
-    performance_instance_operation, performance_operation_status, performance_plan,
-    performance_plan_summary_view_model, performance_rollback_list, performance_rules_status,
-    refresh_performance_rules, refresh_performance_rules_error_response,
-    spawn_pending_performance_operations, system_resource_status,
+    SystemResourceResponse, performance_health, performance_instance_operation,
+    performance_operation_status, performance_plan, performance_plan_summary_view_model,
+    performance_rollback_list, performance_rules_status, refresh_performance_rules_error_response,
+    system_resource_status,
+};
+pub(crate) use performance::{
+    performance_install, refresh_performance_rules, spawn_pending_performance_operations,
 };
 pub use setup::{
     SetupBrowseResponse, SetupDefaultsResponse, SetupLibraryResponse, SetupPathRequest,

@@ -1,12 +1,12 @@
 use crate::application::{
-    InstallQueueRequest, InstallQueueStateResponse, InstallStatusResponse, enqueue_install,
-    install_events_stream, install_queue_status, install_status, remove_queued_install,
-    retry_install,
+    InstallQueueRequest, InstallQueueStateResponse, InstallStatusResponse, enqueue_install_owned,
+    install_events_stream, install_queue_status_owned, install_status, remove_queued_install,
+    retry_install_owned,
 };
-use crate::state::AppState;
+use crate::state::{AppState, RequestProducerHandoff};
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::{delete, get, post},
 };
@@ -40,9 +40,10 @@ pub fn router() -> Router<AppState> {
 
 async fn handle_install(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Json(payload): Json<InstallRequest>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    enqueue_install(
+    enqueue_install_owned(
         &state,
         InstallQueueRequest {
             kind: "vanilla".to_string(),
@@ -51,6 +52,7 @@ async fn handle_install(
             component_id: String::new(),
             build_id: String::new(),
         },
+        handoff,
     )
     .await
     .map(Json)
@@ -65,22 +67,29 @@ async fn handle_install_status(
 
 async fn handle_install_queue_status(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    install_queue_status(&state).await.map(Json)
+    install_queue_status_owned(&state, handoff).await.map(Json)
 }
 
 async fn handle_install_queue_enqueue(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Json(payload): Json<InstallQueueRequest>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    enqueue_install(&state, payload).await.map(Json)
+    enqueue_install_owned(&state, payload, handoff)
+        .await
+        .map(Json)
 }
 
 async fn handle_install_queue_retry(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Json(payload): Json<InstallQueueRequest>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    retry_install(&state, payload).await.map(Json)
+    retry_install_owned(&state, payload, handoff)
+        .await
+        .map(Json)
 }
 
 async fn handle_install_queue_remove(
@@ -394,10 +403,15 @@ mod tests {
         }
 
         async fn request_json(&self, method: Method, uri: &str) -> (StatusCode, Value) {
+            let request_lease = self
+                .state
+                .try_admit_request()
+                .expect("admit route install request");
             let response = router()
                 .with_state(self.state.clone())
                 .oneshot(
                     Request::builder()
+                        .extension(request_lease.producer_handoff())
                         .method(method)
                         .uri(uri)
                         .body(Body::empty())
@@ -419,10 +433,15 @@ mod tests {
             uri: &str,
             payload: Value,
         ) -> (StatusCode, Value) {
+            let request_lease = self
+                .state
+                .try_admit_request()
+                .expect("admit route install request");
             let response = router()
                 .with_state(self.state.clone())
                 .oneshot(
                     Request::builder()
+                        .extension(request_lease.producer_handoff())
                         .method(method)
                         .uri(uri)
                         .header("content-type", "application/json")

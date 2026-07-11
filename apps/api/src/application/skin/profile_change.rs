@@ -1,5 +1,5 @@
 use crate::state::skins::SavedSkinRecord;
-use crate::state::{AppState, AuthLoginMinecraftAccount};
+use crate::state::{AppState, AuthLoginMinecraftAccount, ProducerLease, RequestProducerHandoff};
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -80,9 +80,10 @@ pub(crate) async fn handle_apply_saved_skin(
     state: &AppState,
     texture_key: String,
     query: ApplySavedSkinQuery,
+    handoff: RequestProducerHandoff,
 ) -> Result<Json<SkinApplyResponse>, ApiError> {
     if query.defer.unwrap_or(false) {
-        return queue_saved_skin_apply(state, texture_key).await;
+        return queue_saved_skin_apply(state, texture_key, handoff).await;
     }
 
     handle_apply_saved_skin_with_client(
@@ -373,6 +374,7 @@ async fn apply_saved_skin_for_account_with_clients(
 async fn queue_saved_skin_apply(
     state: &AppState,
     texture_key: String,
+    handoff: RequestProducerHandoff,
 ) -> Result<Json<SkinApplyResponse>, ApiError> {
     let texture_key = validate_texture_key(&texture_key)?;
     let account = active_ready_minecraft_account_for_skin_apply(state).await?;
@@ -384,12 +386,19 @@ async fn queue_saved_skin_apply(
         return Err(json_error(StatusCode::NOT_FOUND, "saved skin not found"));
     }
 
+    let producer = handoff.try_claim().map_err(|_| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Skin changes are unavailable while the application is shutting down",
+        )
+    })?;
     set_pending_saved_skin_apply(
         state.clone(),
         PendingSkinApplyChange {
             login_id: account.login_id,
             texture_key: texture_key.clone(),
         },
+        producer,
     )
     .await;
 
@@ -534,26 +543,63 @@ async fn flush_pending_saved_skin_applies_for_active_account_with_clients(
     .await
 }
 
-async fn set_pending_saved_skin_apply(state: AppState, change: PendingSkinApplyChange) {
+async fn set_pending_saved_skin_apply(
+    state: AppState,
+    change: PendingSkinApplyChange,
+    producer: ProducerLease,
+) {
     let schedule = insert_pending_saved_skin_apply(change).await;
-    schedule_pending_saved_skin_apply_flush(state, schedule.login_id, schedule.generation);
+    schedule_pending_saved_skin_apply_flush(
+        state,
+        schedule.login_id,
+        schedule.generation,
+        producer,
+    );
 }
 
-fn schedule_pending_saved_skin_apply_flush(state: AppState, login_id: String, generation: u64) {
-    tokio::spawn(async move {
-        tokio::time::sleep(SKIN_CHANGE_DEBOUNCE).await;
-        if let Err(error) = flush_pending_saved_skin_applies_with_clients(
-            &state,
-            PendingSkinApplyFilter::Generation {
-                login_id,
-                generation,
-            },
-            MinecraftSkinUploadClient::default(),
-            MinecraftCapeSyncClient::default(),
-            MinecraftSkinTextureClient::default(),
-        )
-        .await
-        {
+fn schedule_pending_saved_skin_apply_flush(
+    state: AppState,
+    login_id: String,
+    generation: u64,
+    producer: ProducerLease,
+) {
+    let retry_owner = producer.claim_child();
+    producer.spawn(async move {
+        let mut shutdown = state.subscribe_shutdown();
+        let allow_retry = if *shutdown.borrow_and_update() {
+            false
+        } else {
+            tokio::select! {
+                _ = tokio::time::sleep(SKIN_CHANGE_DEBOUNCE) => true,
+                changed = shutdown.changed() => changed.is_err() || !*shutdown.borrow_and_update(),
+            }
+        };
+        let filter = PendingSkinApplyFilter::Generation {
+            login_id,
+            generation,
+        };
+        let result = if allow_retry {
+            flush_pending_saved_skin_applies_with_clients_owned(
+                &state,
+                filter,
+                MinecraftSkinUploadClient::default(),
+                MinecraftCapeSyncClient::default(),
+                MinecraftSkinTextureClient::default(),
+                retry_owner,
+            )
+            .await
+        } else {
+            drop(retry_owner);
+            flush_pending_saved_skin_applies_with_clients(
+                &state,
+                filter,
+                MinecraftSkinUploadClient::default(),
+                MinecraftCapeSyncClient::default(),
+                MinecraftSkinTextureClient::default(),
+            )
+            .await
+        };
+        if let Err(error) = result {
             tracing::warn!(
                 "failed to flush pending Minecraft skin change: {}",
                 bounded_error_message(&error)
@@ -568,6 +614,44 @@ pub(super) async fn flush_pending_saved_skin_applies_with_clients(
     skin_client: MinecraftSkinUploadClient,
     cape_client: MinecraftCapeSyncClient,
     texture_client: MinecraftSkinTextureClient,
+) -> Result<usize, ApiError> {
+    flush_pending_saved_skin_applies_with_clients_inner(
+        state,
+        filter,
+        skin_client,
+        cape_client,
+        texture_client,
+        None,
+    )
+    .await
+}
+
+async fn flush_pending_saved_skin_applies_with_clients_owned(
+    state: &AppState,
+    filter: PendingSkinApplyFilter,
+    skin_client: MinecraftSkinUploadClient,
+    cape_client: MinecraftCapeSyncClient,
+    texture_client: MinecraftSkinTextureClient,
+    retry_owner: ProducerLease,
+) -> Result<usize, ApiError> {
+    flush_pending_saved_skin_applies_with_clients_inner(
+        state,
+        filter,
+        skin_client,
+        cape_client,
+        texture_client,
+        Some(retry_owner),
+    )
+    .await
+}
+
+async fn flush_pending_saved_skin_applies_with_clients_inner(
+    state: &AppState,
+    filter: PendingSkinApplyFilter,
+    skin_client: MinecraftSkinUploadClient,
+    cape_client: MinecraftCapeSyncClient,
+    texture_client: MinecraftSkinTextureClient,
+    retry_owner: Option<ProducerLease>,
 ) -> Result<usize, ApiError> {
     let _guard = pending_saved_skin_apply_flush_guard().await;
     let Some(entry) = take_pending_saved_skin_apply(&filter).await else {
@@ -588,11 +672,14 @@ pub(super) async fn flush_pending_saved_skin_applies_with_clients(
         Ok(_) => Ok(1),
         Err(error) => {
             let schedule = restore_pending_saved_skin_apply(entry).await;
-            schedule_pending_saved_skin_apply_flush(
-                state.clone(),
-                schedule.login_id,
-                schedule.generation,
-            );
+            if let Some(retry_owner) = retry_owner {
+                schedule_pending_saved_skin_apply_flush(
+                    state.clone(),
+                    schedule.login_id,
+                    schedule.generation,
+                    retry_owner,
+                );
+            }
             Err(error)
         }
     }

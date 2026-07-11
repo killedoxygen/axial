@@ -2,7 +2,7 @@ use super::{
     BASE_INSTALL_FAILED_MESSAGE, INSTALL_REPAIR_RESUME_MAX_DEPTH, InstallApplicationError,
     InstallProgressCoalescer, InstallProgressViewModel, InstallStartResponse,
     LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
-    begin_install_journal_with_detached_reconciliation, emit_install_failed,
+    begin_install_journal_with_owned_reconciliation, emit_install_failed,
     finish_install_progress_task, generate_install_id, install_journal_error_response,
     install_operation_id, operation::install_progress_with_terminal_error,
     record_and_emit_install_progress, record_install_failure_outcome_and_repair,
@@ -18,7 +18,7 @@ use crate::dto::loaders::{
 use crate::guardian::GuardianArtifactRepairStatus;
 use crate::install_runtime::prewarm_version_runtime;
 use crate::state::InstallInitializationStatus;
-use crate::state::{AppState, InstallStore};
+use crate::state::{AppState, InstallStore, ProducerLease};
 use axial_minecraft::{
     DownloadProgress, LoaderComponentId, LoaderError, LoaderProviderFailureKind, fetch_builds,
     fetch_components, fetch_supported_versions, install_build, resolve_build_record,
@@ -31,9 +31,10 @@ use tokio::sync::mpsc;
 const LOADER_INSTALL_SCOPE: &str = "loader";
 const VANILLA_INSTALL_SCOPE: &str = "vanilla";
 
-pub async fn start_loader_install(
+pub(super) async fn start_loader_install_owned(
     state: &AppState,
     request: LoaderInstallStartRequest,
+    producer: &ProducerLease,
 ) -> Result<InstallStartResponse, InstallApplicationError> {
     let build_id = request.build_id.trim().to_string();
     if build_id.is_empty() {
@@ -97,12 +98,13 @@ pub async fn start_loader_install(
     );
     let store = state.installs().clone();
     let journals = state.journals().clone();
-    let reservation = begin_install_journal_with_detached_reconciliation(
+    let reservation = begin_install_journal_with_owned_reconciliation(
         store.clone(),
         journals.clone(),
         install_id.clone(),
         operation_id.clone(),
         target_version_id.clone(),
+        producer,
     )
     .await
     .map_err(|_| install_journal_error_response())?;
@@ -121,8 +123,10 @@ pub async fn start_loader_install(
     let worker_operation_id = operation_id_task.clone();
     let worker_failure_memory = state.failure_memory().clone();
     let worker_telemetry = telemetry.clone();
-    InstallStore::spawn_tracked_worker_with_interrupt_handler(
+    let progress_owner = producer.claim_child();
+    InstallStore::spawn_tracked_worker_with_interrupt_handler_owned(
         store,
+        producer.claim_child(),
         install_id_task,
         interrupted_loader_install_progress(),
         async move {
@@ -134,7 +138,7 @@ pub async fn start_loader_install(
                 let journals = worker_journals.clone();
                 let operation_id = worker_operation_id.clone();
                 let journal_failed = journal_failed.clone();
-                tokio::spawn(async move {
+                progress_owner.spawn_joinable(async move {
                     let mut coalescer = InstallProgressCoalescer::default();
                     let mut last_journal_phase = None;
                     while let Some(progress) = progress_rx.recv().await {

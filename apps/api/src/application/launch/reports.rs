@@ -1,4 +1,4 @@
-use super::runner::persist_launch_proof;
+use super::runner::persist_launch_proof_owned;
 use super::trace_launch_event;
 use crate::observability::{
     RedactionAudience, sanitize_public_diagnostic_text, sanitize_public_json_value,
@@ -550,6 +550,7 @@ fn public_payload(value: serde_json::Value) -> serde_json::Value {
 pub(crate) async fn stop_launch_session(
     state: &AppState,
     id: &str,
+    producer: &crate::state::ProducerLease,
 ) -> Result<serde_json::Value, super::LaunchApplicationError> {
     let stop = state
         .sessions()
@@ -575,7 +576,14 @@ pub(crate) async fn stop_launch_session(
         stages: Vec::new(),
     })
     .await;
-    persist_launch_proof(state, id, record.launched_at.as_deref(), "stopped").await;
+    persist_launch_proof_owned(
+        state,
+        producer,
+        id,
+        record.launched_at.as_deref(),
+        "stopped",
+    )
+    .await;
     stop.release().await;
 
     Ok(json!({ "status": "killed" }))
@@ -623,7 +631,8 @@ mod tests {
             .release_terminal_retention_hold(session_id)
             .await;
 
-        let error = stop_launch_session(&state, session_id)
+        let producer = state.try_claim_producer().expect("claim stop producer");
+        let error = stop_launch_session(&state, session_id, &producer)
             .await
             .expect_err("missing child should fail stop");
         assert_eq!(error.0, StatusCode::NOT_FOUND);

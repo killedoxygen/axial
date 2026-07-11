@@ -2,6 +2,7 @@ use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_p
 use axial_config::{AppConfig, ConfigStore, FEATURE_FLAGS};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock,
@@ -664,10 +665,51 @@ impl TelemetryHub {
     }
 }
 
-pub async fn run_telemetry_flush_loop(hub: Arc<TelemetryHub>) {
+pub async fn run_telemetry_flush_loop(
+    hub: Arc<TelemetryHub>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    run_telemetry_flush_loop_with(
+        move || {
+            let hub = hub.clone();
+            async move {
+                hub.flush_once().await;
+            }
+        },
+        TELEMETRY_FLUSH_INTERVAL,
+        shutdown,
+    )
+    .await;
+}
+
+async fn run_telemetry_flush_loop_with<F, Fut>(
+    mut flush: F,
+    interval: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
     loop {
-        tokio::time::sleep(TELEMETRY_FLUSH_INTERVAL).await;
-        hub.flush_once().await;
+        if wait_for_telemetry_shutdown(&mut shutdown, interval).await {
+            return;
+        }
+        flush().await;
+    }
+}
+
+async fn wait_for_telemetry_shutdown(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    delay: Duration,
+) -> bool {
+    if *shutdown.borrow_and_update() {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => *shutdown.borrow_and_update(),
+        changed = shutdown.changed() => {
+            changed.is_err() || *shutdown.borrow_and_update()
+        }
     }
 }
 
@@ -940,6 +982,37 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_flush_loop_finishes_inflight_flush_before_shutdown() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut entered_tx = Some(entered_tx);
+        let mut release_rx = Some(release_rx);
+        let task = tokio::spawn(run_telemetry_flush_loop_with(
+            move || {
+                let entered_tx = entered_tx.take().expect("single flush entry");
+                let release_rx = release_rx.take().expect("single flush release");
+                async move {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                }
+            },
+            Duration::from_secs(30),
+            shutdown_rx,
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        entered_rx.await.expect("telemetry flush entered");
+        shutdown_tx.send_replace(true);
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+
+        release_tx.send(()).expect("release telemetry flush");
+        task.await.expect("telemetry flush loop stops");
     }
 
     #[test]

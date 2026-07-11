@@ -2,29 +2,57 @@ use super::trace_launch_event;
 use crate::state::AppState;
 use crate::state::launch_reports::LaunchProofContext;
 
+pub(in crate::application::launch) async fn persist_launch_proof_owned(
+    state: &AppState,
+    producer: &crate::state::ProducerLease,
+    session_id: &str,
+    launched_at: Option<&str>,
+    outcome: &str,
+) {
+    persist_launch_proof_with_context_owned(
+        state,
+        producer,
+        session_id,
+        launched_at,
+        outcome,
+        None,
+    )
+    .await;
+}
+
+pub(super) async fn persist_launch_proof_with_context_owned(
+    state: &AppState,
+    producer: &crate::state::ProducerLease,
+    session_id: &str,
+    launched_at: Option<&str>,
+    outcome: &str,
+    proof_context: Option<&LaunchProofContext>,
+) {
+    let completed_rx = spawn_launch_proof_owner(
+        state,
+        producer,
+        session_id,
+        launched_at,
+        outcome,
+        proof_context,
+    );
+    let _ = completed_rx.await;
+}
+
+#[cfg(test)]
 pub(in crate::application::launch) async fn persist_launch_proof(
     state: &AppState,
     session_id: &str,
     launched_at: Option<&str>,
     outcome: &str,
 ) {
-    persist_launch_proof_with_context(state, session_id, launched_at, outcome, None).await;
-}
-
-pub(super) async fn persist_launch_proof_with_context(
-    state: &AppState,
-    session_id: &str,
-    launched_at: Option<&str>,
-    outcome: &str,
-    proof_context: Option<&LaunchProofContext>,
-) {
-    let completed_rx =
-        spawn_launch_proof_owner(state, session_id, launched_at, outcome, proof_context);
-    let _ = completed_rx.await;
+    let producer = state.try_claim_producer().expect("claim proof producer");
+    persist_launch_proof_owned(state, &producer, session_id, launched_at, outcome).await;
 }
 
 fn spawn_launch_proof_owner(
     state: &AppState,
+    producer: &crate::state::ProducerLease,
     session_id: &str,
     launched_at: Option<&str>,
     outcome: &str,
@@ -36,7 +64,7 @@ fn spawn_launch_proof_owner(
     let outcome = outcome.to_string();
     let proof_context = proof_context.cloned();
     let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    producer.spawn_child(async move {
         own_launch_proof_and_benchmark_outcome(
             state,
             session_id,
@@ -195,8 +223,9 @@ mod tests {
             .await
             .expect("persist benchmark suite run");
 
+        let producer = state.try_claim_producer().expect("claim proof owner");
         drop(spawn_launch_proof_owner(
-            &state, session_id, None, "running", None,
+            &state, &producer, session_id, None, "running", None,
         ));
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {

@@ -3,10 +3,10 @@ use crate::application::{
     PerformanceInstallResponse, PerformanceInstanceOperationResponse, PerformancePlanRequest,
     PerformancePlanResponse, PerformanceRollbackListRequest, PerformanceRollbackListResponse,
 };
-use crate::state::AppState;
+use crate::state::{AppState, RequestProducerHandoff};
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -41,10 +41,6 @@ struct InstallRequest {
     queued: Option<bool>,
 }
 
-pub(crate) fn spawn_pending_performance_operations(state: &AppState) -> bool {
-    application::spawn_pending_performance_operations(state)
-}
-
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/performance/status", get(handle_status))
@@ -75,9 +71,10 @@ async fn handle_status(
 
 async fn handle_rules_refresh(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
 ) -> Result<Json<application::PerformanceRulesStatusResponse>, (StatusCode, Json<serde_json::Value>)>
 {
-    application::refresh_performance_rules(&state)
+    application::refresh_performance_rules(&state, handoff)
         .await
         .map(Json)
         .map_err(application::refresh_performance_rules_error_response)
@@ -130,6 +127,7 @@ async fn handle_rollback_list(
 
 async fn handle_install(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Json(payload): Json<InstallRequest>,
 ) -> Result<Json<PerformanceInstallResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::performance_install(
@@ -143,6 +141,7 @@ async fn handle_install(
             rollback_id: payload.rollback_id,
             queued: payload.queued,
         },
+        handoff,
     )
     .await
     .map(Json)
@@ -260,6 +259,29 @@ mod tests {
         assert_eq!(payload["operation"]["payload"]["mode"], "redacted");
         assert_eq!(payload["operation"]["payload"]["rollback_id"], "redacted");
         assert_no_performance_route_sensitive_fragments(&payload);
+    }
+
+    #[tokio::test]
+    async fn rules_refresh_receives_request_handoff_from_production_middleware() {
+        let fixture = RoutePerformanceFixture::new("rules-refresh-request-handoff");
+        let response = crate::routes::router(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/performance/rules/refresh")
+                    .body(Body::empty())
+                    .expect("refresh request"),
+            )
+            .await
+            .expect("refresh response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        drop(response);
+        fixture
+            .state
+            .quiesce()
+            .await
+            .expect("refresh producer settles before quiescence");
     }
 
     struct RoutePerformanceFixture {

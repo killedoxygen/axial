@@ -1,4 +1,4 @@
-use crate::state::AppState;
+use crate::state::{AppState, RequestProducerHandoff};
 use axial_performance::BundleHealth;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
@@ -15,24 +15,33 @@ use axial_performance::{CompositionTier, InstallError, PerformanceMode};
 use mutation::{PERFORMANCE_INSTALL_INTERNAL_ERROR, performance_install_error};
 pub use mutation::{PerformanceRollbackListResponse, performance_rollback_list};
 
+pub(crate) use operations::spawn_pending_performance_operations;
 #[cfg(test)]
 use operations::{
     PERFORMANCE_JOURNAL_ERROR, PerformanceInstallAction, PerformanceOperationExecutionError,
     begin_performance_operation_journal, performance_journal_is_terminal,
     record_performance_effect_started, record_performance_terminal_intent,
-    resume_pending_performance_operations, retry_performance_status_correction,
-    retry_performance_status_transition, run_queued_performance_operation,
-    terminalize_mismatched_performance_operation,
+    retry_performance_status_correction, retry_performance_status_transition,
+    run_queued_performance_operation, terminalize_mismatched_performance_operation,
 };
 pub use operations::{
     PerformanceInstanceOperationResponse, PerformanceOperationStatusResponse,
     performance_instance_operation, performance_operation_status,
-    spawn_pending_performance_operations,
 };
 use operations::{
     PerformanceOperation, execute_synchronous_performance_operation, install_action,
     queue_performance_operation,
 };
+
+#[cfg(test)]
+async fn resume_pending_performance_operations(state: AppState) -> usize {
+    let producer = state
+        .try_claim_producer()
+        .expect("claim test performance resume producer");
+    let child_owner = producer.claim_child();
+    let shutdown = state.subscribe_shutdown();
+    operations::resume_pending_performance_operations_owned(state, &child_owner, shutdown).await
+}
 #[cfg(test)]
 use plan_health::{
     PERFORMANCE_DATA_INTERNAL_ERROR, PERFORMANCE_STATE_PARSE_WARNING, bundle_health_token,
@@ -75,9 +84,10 @@ pub struct PerformanceInstallResponse {
     pub warnings: Vec<String>,
 }
 
-pub async fn performance_install(
+pub(crate) async fn performance_install(
     state: AppState,
     payload: PerformanceInstallRequest,
+    handoff: RequestProducerHandoff,
 ) -> Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)> {
     let instance_id = required_value(payload.instance_id.as_deref(), "instance_id is required")?;
     let instance = state.instances().get(&instance_id).ok_or_else(|| {
@@ -99,10 +109,10 @@ pub async fn performance_install(
     };
 
     if payload.queued.unwrap_or(false) {
-        return queue_performance_operation(state, operation).await;
+        return queue_performance_operation(state, operation, handoff).await;
     }
 
-    execute_synchronous_performance_operation(state, operation).await
+    execute_synchronous_performance_operation(state, operation, handoff).await
 }
 
 fn required_value(

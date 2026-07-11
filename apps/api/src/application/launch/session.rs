@@ -46,7 +46,9 @@ use resources::{
 };
 #[cfg(test)]
 use resources::{LaunchCpuLoadEvidence, LaunchDiskEvidence, LaunchMemoryEvidence, load_to_x100};
+#[cfg(test)]
 use runtime_repair::maybe_repair_managed_runtime_before_launch;
+use runtime_repair::maybe_repair_managed_runtime_before_launch_owned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -146,17 +148,30 @@ pub struct LaunchPreflightResourceBudget {
     pub disk_pressure: bool,
 }
 
-pub(crate) async fn prepare_launch_session(
+pub(crate) async fn prepare_launch_session_owned(
+    state: &AppState,
+    payload: LaunchRequest,
+    producer: &crate::state::ProducerLease,
+) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
+    prepare_launch_session_with_auth_refresh(state, payload, None, producer).await
+}
+
+#[cfg(test)]
+pub(super) async fn prepare_launch_session(
     state: &AppState,
     payload: LaunchRequest,
 ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
-    prepare_launch_session_with_auth_refresh(state, payload, None).await
+    let producer = state
+        .try_claim_producer()
+        .map_err(super::launch_shutdown_error_response)?;
+    prepare_launch_session_owned(state, payload, &producer).await
 }
 
 async fn prepare_launch_session_with_auth_refresh(
     state: &AppState,
     payload: LaunchRequest,
     auth_refresh: Option<LaunchAuthRefreshOptions>,
+    producer: &crate::state::ProducerLease,
 ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
     let started_at = Instant::now();
     let library_dir = state.library_dir().ok_or_else(|| {
@@ -210,8 +225,9 @@ async fn prepare_launch_session_with_auth_refresh(
     .await;
     let preflight_elapsed = preflight_started_at.elapsed();
     let repair_started_at = Instant::now();
-    preflight = maybe_repair_managed_runtime_before_launch(
+    preflight = maybe_repair_managed_runtime_before_launch_owned(
         state,
+        producer,
         preflight,
         &instance,
         &library_dir,

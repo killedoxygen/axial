@@ -776,6 +776,86 @@ async fn queue_monitor_advances_only_after_terminal_progress_and_discards_start_
 }
 
 #[tokio::test]
+async fn queue_monitor_does_not_start_successor_while_requests_are_draining() {
+    let root = temp_root("install-queue-monitor-request-drain");
+    let state = build_test_state(&root);
+    state
+        .installs()
+        .insert_or_existing_active(
+            "draining-active-install".to_string(),
+            "1.21.5".to_string(),
+            String::new(),
+        )
+        .await;
+    state
+        .installs()
+        .enqueue_queued_install(
+            "draining-active-queue".to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string(), String::new()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let reserved = state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .expect("active queue reservation");
+    assert_eq!(reserved.queue_id, "draining-active-queue");
+    assert!(
+        state
+            .installs()
+            .mark_queued_install_started(
+                "draining-active-queue",
+                "draining-active-install".to_string(),
+            )
+            .await
+    );
+    state
+        .installs()
+        .enqueue_queued_install(
+            "draining-pending-queue".to_string(),
+            InstallQueueSpec::vanilla("1.21.6".to_string(), String::new()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+
+    let request = state.try_admit_request().expect("hold draining request");
+    spawn_install_queue_monitor(state.clone(), "draining-active-install".to_string());
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while state.lifecycle_phase() != crate::state::AppLifecyclePhase::DrainingRequests {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request drain begins");
+
+    state
+        .installs()
+        .emit("draining-active-install", failed_progress())
+        .await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while state.installs().queue_snapshot().await.active.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("active queue clears");
+    let snapshot = state.installs().queue_snapshot().await;
+    assert_eq!(snapshot.pending.len(), 1);
+    assert_eq!(snapshot.pending[0].queue_id, "draining-pending-queue");
+    assert_eq!(state.installs().active_install_count().await, 0);
+
+    drop(request);
+    quiesce
+        .await
+        .expect("quiesce task")
+        .expect("quiesce completes");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn install_status_exposes_backend_authored_guardian_repair_summary() {
     let root = temp_root("install-status-guardian-repair");
     let state = build_test_state(&root);

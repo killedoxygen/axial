@@ -8,6 +8,7 @@ pub mod failure_memory;
 mod installs;
 mod journals;
 pub(crate) mod launch_reports;
+mod lifecycle;
 pub mod ownership;
 pub mod performance_operations;
 pub mod presence;
@@ -50,6 +51,12 @@ pub(crate) use journals::{
     operation_journal_plan_is_visible, operation_journal_terminal_is_visible,
 };
 pub use journals::{OperationJournalStore, OperationJournalStoreError};
+#[cfg(test)]
+pub(crate) use lifecycle::AppLifecyclePhase;
+pub(crate) use lifecycle::{
+    AppLifecycle, LifecycleAdmissionError, LifecycleQuiesceError, ProducerLease, RequestLease,
+    RequestProducerHandoff,
+};
 pub(crate) use remote_flags::{
     RemoteFlagRefreshOutcome, RemoteFlagStore, ResolvedFlagSource, resolve_flag,
 };
@@ -76,6 +83,7 @@ pub struct AppState {
     telemetry: Arc<TelemetryHub>,
     remote_flags: Arc<RemoteFlagStore>,
     launch_reports: Arc<launch_reports::LaunchReportStore>,
+    lifecycle: AppLifecycle,
     startup_warnings: Arc<Vec<String>>,
     config_changes: Arc<broadcast::Sender<()>>,
     library_dir: Arc<RwLock<Option<String>>>,
@@ -252,6 +260,7 @@ impl AppState {
             telemetry,
             remote_flags,
             launch_reports,
+            lifecycle: AppLifecycle::new(),
             startup_warnings: Arc::new(bound_startup_warnings(init.startup_warnings)),
             config_changes: Arc::new(config_changes),
             library_dir: Arc::new(RwLock::new(if library_dir.is_empty() {
@@ -339,6 +348,27 @@ impl AppState {
 
     pub(crate) fn launch_reports(&self) -> &Arc<launch_reports::LaunchReportStore> {
         &self.launch_reports
+    }
+
+    pub(crate) fn try_admit_request(&self) -> Result<RequestLease, LifecycleAdmissionError> {
+        self.lifecycle.try_admit_request()
+    }
+
+    pub(crate) fn try_claim_producer(&self) -> Result<ProducerLease, LifecycleAdmissionError> {
+        self.lifecycle.try_claim_producer()
+    }
+
+    pub(crate) fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.lifecycle.subscribe_shutdown()
+    }
+
+    pub(crate) async fn quiesce(&self) -> Result<(), LifecycleQuiesceError> {
+        self.lifecycle.quiesce().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lifecycle_phase(&self) -> AppLifecyclePhase {
+        self.lifecycle.phase()
     }
 
     pub(crate) fn remote_flags_active_for(&self, config: &AppConfig) -> bool {

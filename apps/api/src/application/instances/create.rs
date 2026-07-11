@@ -21,7 +21,7 @@ use crate::application::version::{
 };
 use crate::application::{
     CommandResult, CommandResultCarriers, CreateInstancePayload, InstallQueueRequest,
-    InstallQueueStateResponse, enqueue_install, loader_error_response,
+    InstallQueueStateResponse, enqueue_install_owned, loader_error_response,
 };
 use crate::guardian::{
     GuardianJvmPresetOption, GuardianJvmPresetResolution, guardian_jvm_preset_options,
@@ -29,6 +29,7 @@ use crate::guardian::{
 };
 use crate::observability::telemetry::TelemetryEvent;
 use crate::state::AppState;
+use crate::state::RequestProducerHandoff;
 use crate::state::contracts::{CommandKind, OperationId, OperationStatus};
 use axial_config::{EnrichedInstance, Instance};
 use axial_launcher::{
@@ -433,9 +434,10 @@ fn normalize_create_view_source(source_id: Option<&str>) -> Option<String> {
     Some(component_id.as_str().to_string())
 }
 
-pub(crate) async fn handle_create_instance(
+pub(crate) async fn handle_create_instance_owned(
     state: &AppState,
     payload: CreateInstanceRequest,
+    handoff: RequestProducerHandoff,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
     let selection = resolve_create_selection(state, &payload).await?;
     let preset = normalize_create_jvm_preset(payload.jvm_preset_id.as_deref());
@@ -452,8 +454,13 @@ pub(crate) async fn handle_create_instance(
             return Err(error);
         }
     };
-    let install_queue =
-        queue_create_install_or_rollback(state, &created_instance_id, install_request).await?;
+    let install_queue = queue_create_install_or_rollback_owned(
+        state,
+        &created_instance_id,
+        install_request,
+        handoff,
+    )
+    .await?;
     let enriched = enrich_instance_for_state(state, instance);
     state
         .telemetry()
@@ -805,26 +812,54 @@ fn create_install_queue_request_if_needed(
 async fn queue_create_install_request(
     state: &AppState,
     request: Option<InstallQueueRequest>,
+    handoff: RequestProducerHandoff,
 ) -> Result<Option<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
     let Some(request) = request else {
         return Ok(None);
     };
 
-    enqueue_install(state, request).await.map(Some)
+    enqueue_install_owned(state, request, handoff)
+        .await
+        .map(Some)
 }
 
-pub(super) async fn queue_create_install_or_rollback(
+pub(super) async fn queue_create_install_or_rollback_owned(
     state: &AppState,
     instance_id: &str,
     request: Option<InstallQueueRequest>,
+    handoff: RequestProducerHandoff,
 ) -> Result<Option<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    match queue_create_install_request(state, request).await {
+    match queue_create_install_request(state, request, handoff).await {
         Ok(install_queue) => Ok(install_queue),
         Err(error) => {
             rollback_created_instance(state, instance_id);
             Err(error)
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn handle_create_instance(
+    state: &AppState,
+    payload: CreateInstanceRequest,
+) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
+    let request = state
+        .try_admit_request()
+        .expect("admit test create request");
+    handle_create_instance_owned(state, payload, request.producer_handoff()).await
+}
+
+#[cfg(test)]
+pub(super) async fn queue_create_install_or_rollback(
+    state: &AppState,
+    instance_id: &str,
+    request: Option<InstallQueueRequest>,
+) -> Result<Option<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let admitted = state
+        .try_admit_request()
+        .expect("admit test create request");
+    queue_create_install_or_rollback_owned(state, instance_id, request, admitted.producer_handoff())
+        .await
 }
 
 fn version_is_launch_ready_or_user_blocked(

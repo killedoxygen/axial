@@ -282,6 +282,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "hex",
+ "http-body-util",
  "include_dir",
  "keyring",
  "p256",

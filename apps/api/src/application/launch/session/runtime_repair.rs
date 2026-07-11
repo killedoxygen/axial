@@ -59,8 +59,9 @@ impl Drop for RuntimeRepairRequestGuard {
     }
 }
 
-pub(super) async fn maybe_repair_managed_runtime_before_launch(
+pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
     state: &AppState,
+    producer: &crate::state::ProducerLease,
     mut preflight: LaunchPreflightFacts,
     instance: &Instance,
     library_dir: &Path,
@@ -127,7 +128,7 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch(
     let terminal_failure_task = terminal_failure.clone();
     let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    producer.spawn_child(async move {
         let result = match ManagedRuntimeRoot::from_app_paths(
             state_task.config().paths(),
             &runtime_root_path,
@@ -243,6 +244,34 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch(
         }
         GuardianRepairStatus::NotNeeded => Ok(preflight),
     }
+}
+
+#[cfg(test)]
+pub(super) async fn maybe_repair_managed_runtime_before_launch(
+    state: &AppState,
+    preflight: LaunchPreflightFacts,
+    instance: &Instance,
+    library_dir: &Path,
+    game_dir: &Path,
+    requested_max_memory_mb: Option<i32>,
+    requested_min_memory_mb: Option<i32>,
+) -> Result<LaunchPreflightFacts, OperationJournalStoreError> {
+    let producer = state.try_claim_producer().map_err(|_| {
+        OperationJournalStoreError::Persistence(std::io::Error::other(
+            "application shutdown is in progress",
+        ))
+    })?;
+    maybe_repair_managed_runtime_before_launch_owned(
+        state,
+        &producer,
+        preflight,
+        instance,
+        library_dir,
+        game_dir,
+        requested_max_memory_mb,
+        requested_min_memory_mb,
+    )
+    .await
 }
 
 struct ManagedRuntimeRepairCandidate {

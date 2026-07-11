@@ -12,6 +12,7 @@ base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 include_dir.workspace = true
+http-body-util.workspace = true
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 p256.workspace = true
 png.workspace = true

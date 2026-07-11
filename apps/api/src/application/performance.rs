@@ -17,7 +17,7 @@ use crate::observability::{
     sanitize_evidence_token,
 };
 use crate::state::{
-    AppState, OperationJournalReconciliation, OperationJournalStoreError,
+    AppState, OperationJournalReconciliation, OperationJournalStoreError, RequestProducerHandoff,
     contracts::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
         OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
@@ -98,10 +98,10 @@ pub use workflow::{
     PerformanceManagedArtifactSummary, PerformanceMemoryDisplay, PerformanceModeDisplay,
     PerformanceOperationStatusResponse, PerformancePlanRequest, PerformancePlanResponse,
     PerformanceRollbackListRequest, PerformanceRollbackListResponse, PerformanceRuntimeDisplay,
-    performance_health, performance_install, performance_instance_operation,
-    performance_operation_status, performance_plan, performance_rollback_list,
-    spawn_pending_performance_operations,
+    performance_health, performance_instance_operation, performance_operation_status,
+    performance_plan, performance_rollback_list,
 };
+pub(crate) use workflow::{performance_install, spawn_pending_performance_operations};
 
 #[derive(Debug, Serialize)]
 pub struct PerformanceRulesStatusResponse {
@@ -413,9 +413,13 @@ pub fn performance_rules_status(state: &AppState) -> PerformanceRulesStatusRespo
     performance_rules_status_response(state, state.performance().rules_status())
 }
 
-pub async fn refresh_performance_rules(
+pub(crate) async fn refresh_performance_rules(
     state: &AppState,
+    handoff: RequestProducerHandoff,
 ) -> Result<PerformanceRulesStatusResponse, RefreshPerformanceRulesError> {
+    let producer = handoff
+        .try_claim()
+        .map_err(|_| RefreshPerformanceRulesError::ShuttingDown)?;
     let state = state.clone();
     let abandoned = Arc::new(AtomicBool::new(false));
     let request_guard = RulesRefreshRequestGuard::new(abandoned.clone());
@@ -423,7 +427,7 @@ pub async fn refresh_performance_rules(
     let terminal_failure_task = terminal_failure.clone();
     let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    producer.spawn(async move {
         let result = handle_refresh_performance_rules(
             &state,
             ApplicationCommand::new(CommandKind::RefreshPerformanceRules),
@@ -494,6 +498,12 @@ pub fn refresh_performance_rules_error_response(
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "performance remote rules url is not configured"
+            })),
+        ),
+        RefreshPerformanceRulesError::ShuttingDown => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "performance operations are shutting down"
             })),
         ),
         _error => (
@@ -992,6 +1002,8 @@ fn refresh_rules_targets() -> Vec<TargetDescriptor> {
 pub enum RefreshPerformanceRulesError {
     #[error("performance remote rules url is not configured")]
     Unconfigured,
+    #[error("performance operations are shutting down")]
+    ShuttingDown,
     #[error("unsupported application command for performance rules refresh: {actual:?}")]
     UnsupportedCommand { actual: CommandKind },
     #[error(transparent)]

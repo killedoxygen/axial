@@ -1,12 +1,12 @@
 use crate::application::{
-    InstallQueueRequest, InstallQueueStateResponse, LoaderBuildsRequest, enqueue_install,
+    InstallQueueRequest, InstallQueueStateResponse, LoaderBuildsRequest, enqueue_install_owned,
     loader_builds, loader_components, loader_game_versions, loader_install_events_stream,
 };
-use crate::state::AppState;
+use crate::state::{AppState, RequestProducerHandoff};
 use axial_minecraft::LoaderComponentId;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -76,9 +76,10 @@ async fn handle_loader_game_versions(
 
 async fn handle_loader_install(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Json(payload): Json<LoaderInstallRequest>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    enqueue_install(
+    enqueue_install_owned(
         &state,
         InstallQueueRequest {
             kind: "loader".to_string(),
@@ -87,6 +88,7 @@ async fn handle_loader_install(
             component_id: payload.component_id,
             build_id: payload.build_id,
         },
+        handoff,
     )
     .await
     .map(Json)

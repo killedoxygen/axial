@@ -1,10 +1,10 @@
 mod stream;
 
 use crate::application::launch as launch_app;
-use crate::state::AppState;
+use crate::state::{AppState, RequestProducerHandoff};
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -80,19 +80,28 @@ async fn handle_launch_preflight(
 
 async fn handle_launch(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Json(payload): Json<launch_app::LaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    let prepared = launch_app::prepare_launch_session(&state, payload).await?;
+    let producer = handoff
+        .try_claim()
+        .map_err(launch_app::launch_shutdown_error_response)?;
+    let prepared = launch_app::prepare_launch_session_owned(&state, payload, &producer).await?;
     let response = launch_app::launch_prepared_response_payload(&prepared.task);
-    spawn_launch_session(state, prepared.task);
+    spawn_launch_session(state, prepared.task, producer);
 
     Ok(Json(response))
 }
 
-fn spawn_launch_session(state: AppState, task: launch_app::LaunchSessionTask) {
+fn spawn_launch_session(
+    state: AppState,
+    task: launch_app::LaunchSessionTask,
+    producer: crate::state::ProducerLease,
+) {
     let session_id = task.intent.session_id.clone();
-    tokio::spawn(async move {
-        if let Err(error) = launch_app::launch_session(state, task).await {
+    let launch_owner = producer.claim_child();
+    producer.spawn(async move {
+        if let Err(error) = launch_app::launch_session(state, task, launch_owner).await {
             tracing::warn!(
                 session_id,
                 error = %error.message,
@@ -104,34 +113,52 @@ fn spawn_launch_session(state: AppState, task: launch_app::LaunchSessionTask) {
 
 async fn handle_benchmark_launch(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Json(payload): Json<launch_app::BenchmarkLaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    launch_app::launch_benchmark(state, payload).await.map(Json)
+    let producer = handoff
+        .try_claim()
+        .map_err(launch_app::launch_shutdown_error_response)?;
+    launch_app::launch_benchmark(state, payload, producer)
+        .await
+        .map(Json)
 }
 
 async fn handle_benchmark_suite_launch(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Json(payload): Json<launch_app::BenchmarkLaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    launch_app::launch_benchmark_suite(state, payload)
+    let producer = handoff
+        .try_claim()
+        .map_err(launch_app::launch_shutdown_error_response)?;
+    launch_app::launch_benchmark_suite(state, payload, producer)
         .await
         .map(Json)
 }
 
 async fn handle_benchmark_suite_tick(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Json(payload): Json<launch_app::BenchmarkLaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    launch_app::tick_benchmark_suite(state, payload)
+    let producer = handoff
+        .try_claim()
+        .map_err(launch_app::launch_shutdown_error_response)?;
+    launch_app::tick_benchmark_suite(state, payload, producer)
         .await
         .map(Json)
 }
 
 async fn handle_benchmark_suite_driver_start(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Json(payload): Json<launch_app::BenchmarkLaunchRequest>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    launch_app::start_benchmark_suite_driver(state, payload)
+    let producer = handoff
+        .try_claim()
+        .map_err(launch_app::launch_shutdown_error_response)?;
+    launch_app::start_benchmark_suite_driver(state, payload, producer)
         .await
         .map(Json)
 }
@@ -164,9 +191,13 @@ async fn handle_benchmark_suite_driver_stop(
 
 async fn handle_benchmark_suite_driver_resume(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    launch_app::resume_benchmark_suite_driver(state, id)
+    let producer = handoff
+        .try_claim()
+        .map_err(launch_app::launch_shutdown_error_response)?;
+    launch_app::resume_benchmark_suite_driver(state, id, producer)
         .await
         .map(Json)
 }
@@ -239,9 +270,15 @@ async fn handle_launch_status(
 
 async fn handle_launch_kill(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    launch_app::stop_launch_session(&state, &id).await.map(Json)
+    let producer = handoff
+        .try_claim()
+        .map_err(launch_app::launch_shutdown_error_response)?;
+    launch_app::stop_launch_session(&state, &id, &producer)
+        .await
+        .map(Json)
 }
 
 #[cfg(test)]

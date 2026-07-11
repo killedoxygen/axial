@@ -1,9 +1,9 @@
 use crate::application::skin as application_skin;
-use crate::state::AppState;
+use crate::state::{AppState, RequestProducerHandoff};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::IntoResponse,
     routing::{delete, get, post, put},
 };
@@ -189,10 +189,11 @@ async fn handle_saved_skin_file(
 
 async fn handle_apply_saved_skin(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Path(texture_key): Path<String>,
     Query(query): Query<application_skin::ApplySavedSkinQuery>,
 ) -> impl IntoResponse {
-    application_skin::handle_apply_saved_skin(&state, texture_key, query).await
+    application_skin::handle_apply_saved_skin(&state, texture_key, query, handoff).await
 }
 
 async fn handle_flush_saved_skin_applies(State(state): State<AppState>) -> impl IntoResponse {

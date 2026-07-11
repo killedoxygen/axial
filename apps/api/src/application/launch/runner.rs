@@ -36,7 +36,7 @@ use axial_minecraft::paths::assets_dir;
 use failure::{fail_launch, fail_launch_for_journal, fail_launch_with_outcome};
 use metadata::persist_launch_metadata;
 use prewarm::{format_prewarm_run_summary, prewarm_launch_plan};
-use proof::persist_launch_proof_with_context;
+use proof::persist_launch_proof_with_context_owned as persist_launch_proof_with_context;
 use recovery::{
     apply_prepare_recovery_directive, apply_startup_recovery_directive,
     block_guardian_for_suppressed_launch_recovery, block_guardian_with_user_outcome,
@@ -51,16 +51,18 @@ use status::{emit_status, launch_state_for_preparation_event, serialize_guardian
 use tokio::process::Command;
 
 pub use failure::sanitize_live_launch_failure_message;
-pub(in crate::application::launch) use proof::persist_launch_proof;
+pub(in crate::application::launch) use proof::persist_launch_proof_owned;
 
 pub(super) async fn persist_launch_proof_for_reservation_failure(
     state: &AppState,
+    producer: &crate::state::ProducerLease,
     session_id: &str,
     launched_at: Option<&str>,
     proof_context: &LaunchProofContext,
 ) {
     persist_launch_proof_with_context(
         state,
+        producer,
         session_id,
         launched_at,
         "failed",
@@ -98,11 +100,12 @@ enum LaunchTerminalizationDisposition {
 pub(crate) async fn launch_session(
     state: AppState,
     task: super::session::LaunchSessionTask,
+    producer: crate::state::ProducerLease,
 ) -> Result<LaunchSuccess, LaunchRequestError> {
     let session_id = task.intent.session_id.clone();
     let sessions = state.sessions().clone();
-    let result = launch_session_inner(state.clone(), task).await;
-    match terminalize_unhandled_launch_error(&state, &session_id, result).await {
+    let result = launch_session_inner(state.clone(), task, &producer).await;
+    match terminalize_unhandled_launch_error(&state, &producer, &session_id, result).await {
         LaunchTerminalizationDisposition::Complete(result) => {
             sessions.release_terminal_retention_hold(&session_id).await;
             result
@@ -114,6 +117,7 @@ pub(crate) async fn launch_session(
 
 async fn terminalize_unhandled_launch_error(
     state: &AppState,
+    producer: &crate::state::ProducerLease,
     session_id: &str,
     result: Result<LaunchSuccess, LaunchRequestError>,
 ) -> LaunchTerminalizationDisposition {
@@ -141,7 +145,8 @@ async fn terminalize_unhandled_launch_error(
         .await
     {
         LaunchFailureTermination::Ready(lease) => {
-            let terminal_error = finalize_unhandled_launch_error(state, session_id, error).await;
+            let terminal_error =
+                finalize_unhandled_launch_error(state, producer, session_id, error).await;
             lease.release().await;
             LaunchTerminalizationDisposition::Settled(Err(terminal_error))
         }
@@ -150,11 +155,13 @@ async fn terminalize_unhandled_launch_error(
             let deferred_state = state.clone();
             let deferred_session_id = session_id.to_string();
             let deferred_error = error.clone();
-            tokio::spawn(async move {
+            let deferred_producer = producer.claim_child();
+            producer.spawn_child(async move {
                 match pending.wait_for_settlement().await {
                     Ok(lease) => {
                         let _ = finalize_unhandled_launch_error(
                             &deferred_state,
+                            &deferred_producer,
                             &deferred_session_id,
                             deferred_error,
                         )
@@ -177,6 +184,7 @@ async fn terminalize_unhandled_launch_error(
 
 async fn finalize_unhandled_launch_error(
     state: &AppState,
+    producer: &crate::state::ProducerLease,
     session_id: &str,
     error: LaunchRequestError,
 ) -> LaunchRequestError {
@@ -185,6 +193,7 @@ async fn finalize_unhandled_launch_error(
     ));
     fail_launch_for_journal(
         state,
+        producer,
         session_id,
         &error.message,
         error.healing,
@@ -203,6 +212,7 @@ fn trace_unconfirmed_launch_failure_termination(error_class: LaunchFailureTermin
 async fn launch_session_inner(
     state: AppState,
     task: super::session::LaunchSessionTask,
+    producer: &crate::state::ProducerLease,
 ) -> Result<LaunchSuccess, LaunchRequestError> {
     let super::session::LaunchSessionTask {
         application,
@@ -271,7 +281,9 @@ async fn launch_session_inner(
         let preparation_status_state = state.clone();
         let preparation_status_session_id = session_id.clone();
         let preparation_status_guardian = guardian.clone();
-        let preparation_status_task = tokio::spawn(async move {
+        let (preparation_status_done_tx, preparation_status_done_rx) =
+            tokio::sync::oneshot::channel();
+        producer.spawn_child(async move {
             while let Some(event) = preparation_event_rx.recv().await {
                 emit_status(
                     &preparation_status_state,
@@ -284,13 +296,14 @@ async fn launch_session_inner(
                 )
                 .await;
             }
+            let _ = preparation_status_done_tx.send(());
         });
         let prepared_result = prepare_launch_attempt_with_events(&intent, &attempt, move |event| {
             let _ = preparation_event_sender.send(event);
         })
         .await;
         drop(preparation_event_tx);
-        let _ = preparation_status_task.await;
+        let _ = preparation_status_done_rx.await;
 
         let prepared = match prepared_result {
             Ok(prepared) => prepared,
@@ -333,6 +346,7 @@ async fn launch_session_inner(
                             emit_pending_launch_failure(&state, &mut launch_completion_pending);
                             return Err(fail_rejected_launch_recovery_plan(
                                 &state,
+                                producer,
                                 &session_id,
                                 Some(&proof_context),
                                 failure_class,
@@ -366,6 +380,7 @@ async fn launch_session_inner(
                         emit_pending_launch_failure(&state, &mut launch_completion_pending);
                         return Err(fail_launch(
                             &state,
+                            producer,
                             &session_id,
                             Some(&proof_context),
                             failure_class,
@@ -391,6 +406,7 @@ async fn launch_session_inner(
                 emit_pending_launch_failure(&state, &mut launch_completion_pending);
                 return Err(fail_launch(
                     &state,
+                    producer,
                     &session_id,
                     Some(&proof_context),
                     failure_class,
@@ -502,6 +518,7 @@ async fn launch_session_inner(
                 emit_pending_launch_failure(&state, &mut launch_completion_pending);
                 return Err(fail_launch(
                     &state,
+                    producer,
                     &session_id,
                     Some(&proof_context),
                     LaunchFailureClass::Unknown,
@@ -531,6 +548,7 @@ async fn launch_session_inner(
             emit_pending_launch_failure(&state, &mut launch_completion_pending);
             return Err(fail_launch(
                 &state,
+                producer,
                 &session_id,
                 Some(&proof_context),
                 LaunchFailureClass::Unknown,
@@ -639,6 +657,7 @@ async fn launch_session_inner(
                 trace_launch_event(&session_id, &format!("spawn failed: {error}"));
                 return Err(fail_launch_with_outcome(
                     &state,
+                    producer,
                     &session_id,
                     Some(&proof_context),
                     LaunchFailureClass::Unknown,
@@ -696,6 +715,7 @@ async fn launch_session_inner(
                 .await;
                 persist_launch_proof_with_context(
                     &state,
+                    producer,
                     &session_id,
                     Some(launched_at.as_str()),
                     "running",
@@ -794,6 +814,7 @@ async fn launch_session_inner(
                             );
                             return Err(fail_rejected_launch_recovery_plan(
                                 &state,
+                                producer,
                                 &session_id,
                                 Some(&proof_context),
                                 failure_class,
@@ -833,6 +854,7 @@ async fn launch_session_inner(
                         );
                         return Err(fail_launch(
                             &state,
+                            producer,
                             &session_id,
                             Some(&proof_context),
                             failure_class,
@@ -864,6 +886,7 @@ async fn launch_session_inner(
                 );
                 return Err(fail_launch(
                     &state,
+                    producer,
                     &session_id,
                     Some(&proof_context),
                     failure_class,
@@ -889,6 +912,7 @@ fn guardian_journal_error(_error: OperationJournalStoreError) -> LaunchRequestEr
 
 async fn fail_rejected_launch_recovery_plan(
     state: &AppState,
+    producer: &crate::state::ProducerLease,
     session_id: &str,
     proof_context: Option<&LaunchProofContext>,
     failure_class: LaunchFailureClass,
@@ -899,6 +923,7 @@ async fn fail_rejected_launch_recovery_plan(
     block_guardian_with_user_outcome(guardian, user_outcome);
     fail_launch(
         state,
+        producer,
         session_id,
         proof_context,
         failure_class,
@@ -1037,6 +1062,7 @@ mod tests {
 
         let error = fail_rejected_launch_recovery_plan(
             &state,
+            &state.try_claim_producer().expect("claim failure producer"),
             session_id,
             None,
             LaunchFailureClass::Unknown,
@@ -1075,12 +1101,15 @@ mod tests {
             .expect("insert session");
         let error = guardian_journal_error(OperationJournalStoreError::MissingOperation);
 
-        let result = match terminalize_unhandled_launch_error(&state, session_id, Err(error)).await
-        {
-            LaunchTerminalizationDisposition::Complete(result)
-            | LaunchTerminalizationDisposition::Retained(result)
-            | LaunchTerminalizationDisposition::Settled(result) => result,
-        };
+        let producer = state.try_claim_producer().expect("claim terminal producer");
+        let result =
+            match terminalize_unhandled_launch_error(&state, &producer, session_id, Err(error))
+                .await
+            {
+                LaunchTerminalizationDisposition::Complete(result)
+                | LaunchTerminalizationDisposition::Retained(result)
+                | LaunchTerminalizationDisposition::Settled(result) => result,
+            };
 
         assert!(result.is_err());
         let record = state
@@ -1117,12 +1146,15 @@ mod tests {
         let error = guardian_journal_error(OperationJournalStoreError::MissingOperation);
         let expected_message = error.message.clone();
 
-        let result = match terminalize_unhandled_launch_error(&state, session_id, Err(error)).await
-        {
-            LaunchTerminalizationDisposition::Complete(result)
-            | LaunchTerminalizationDisposition::Retained(result)
-            | LaunchTerminalizationDisposition::Settled(result) => result,
-        };
+        let producer = state.try_claim_producer().expect("claim terminal producer");
+        let result =
+            match terminalize_unhandled_launch_error(&state, &producer, session_id, Err(error))
+                .await
+            {
+                LaunchTerminalizationDisposition::Complete(result)
+                | LaunchTerminalizationDisposition::Retained(result)
+                | LaunchTerminalizationDisposition::Settled(result) => result,
+            };
 
         assert!(result.is_err());
         let record = state
@@ -1193,12 +1225,15 @@ mod tests {
         let error = guardian_journal_error(OperationJournalStoreError::MissingOperation);
         let expected_message = error.message.clone();
 
-        let result = match terminalize_unhandled_launch_error(&state, session_id, Err(error)).await
-        {
-            LaunchTerminalizationDisposition::Complete(result)
-            | LaunchTerminalizationDisposition::Retained(result)
-            | LaunchTerminalizationDisposition::Settled(result) => result,
-        };
+        let producer = state.try_claim_producer().expect("claim terminal producer");
+        let result =
+            match terminalize_unhandled_launch_error(&state, &producer, session_id, Err(error))
+                .await
+            {
+                LaunchTerminalizationDisposition::Complete(result)
+                | LaunchTerminalizationDisposition::Retained(result)
+                | LaunchTerminalizationDisposition::Settled(result) => result,
+            };
 
         let returned_error = match result {
             Ok(_) => panic!("journal error must remain public"),

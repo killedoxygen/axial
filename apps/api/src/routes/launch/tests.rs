@@ -1826,8 +1826,10 @@ async fn launch_route_online_auth_unready_returns_backend_notice_without_session
     fixture.configure_library();
     fixture.set_launch_auth_mode("online");
     let instance_id = fixture.add_instance("Online Auth", "1.21.1");
+    let request_lease = fixture.state.try_admit_request().expect("admit request");
 
     let response = router()
+        .layer(Extension(request_lease.producer_handoff()))
         .with_state(fixture.state.clone())
         .oneshot(
             Request::builder()
@@ -1902,8 +1904,10 @@ async fn launch_route_returns_bounded_503_without_spawning_after_shutdown_reject
         .terminate_all()
         .await
         .expect("latch session shutdown");
+    let request_lease = fixture.state.try_admit_request().expect("admit request");
 
     let response = router()
+        .layer(Extension(request_lease.producer_handoff()))
         .with_state(fixture.state.clone())
         .oneshot(
             Request::builder()
@@ -2574,6 +2578,7 @@ async fn benchmark_suite_driver_resume_missing_id_returns_404() {
     let error = resume_benchmark_suite_driver(
         fixture.state.clone(),
         "benchmark-suite-driver-0000000000000001".to_string(),
+        fixture.state.try_claim_producer().expect("claim producer"),
     )
     .await
     .expect_err("missing driver should 404");
@@ -2603,9 +2608,13 @@ async fn benchmark_suite_driver_resume_rejects_non_terminal_driver() {
         .await
         .expect("driver starts");
 
-    let error = resume_benchmark_suite_driver(fixture.state.clone(), started.status.id)
-        .await
-        .expect_err("non-terminal driver should conflict");
+    let error = resume_benchmark_suite_driver(
+        fixture.state.clone(),
+        started.status.id,
+        fixture.state.try_claim_producer().expect("claim producer"),
+    )
+    .await
+    .expect_err("non-terminal driver should conflict");
 
     assert_eq!(error.0, StatusCode::CONFLICT);
     assert_eq!(
@@ -2624,9 +2633,13 @@ async fn benchmark_suite_driver_resume_missing_manifest_returns_404() {
         .stopped_driver(&suite_id, "development", 30_000)
         .await;
 
-    let error = resume_benchmark_suite_driver(fixture.state.clone(), stopped.id)
-        .await
-        .expect_err("missing suite manifest should 404");
+    let error = resume_benchmark_suite_driver(
+        fixture.state.clone(),
+        stopped.id,
+        fixture.state.try_claim_producer().expect("claim producer"),
+    )
+    .await
+    .expect_err("missing suite manifest should 404");
 
     assert_eq!(error.0, StatusCode::NOT_FOUND);
     assert_eq!(
@@ -2646,9 +2659,13 @@ async fn benchmark_suite_driver_resume_complete_manifest_conflicts() {
         .stopped_driver(&suite_id, "development", 30_000)
         .await;
 
-    let error = resume_benchmark_suite_driver(fixture.state.clone(), stopped.id)
-        .await
-        .expect_err("complete suite manifest should conflict");
+    let error = resume_benchmark_suite_driver(
+        fixture.state.clone(),
+        stopped.id,
+        fixture.state.try_claim_producer().expect("claim producer"),
+    )
+    .await
+    .expect_err("complete suite manifest should conflict");
 
     assert_eq!(error.0, StatusCode::CONFLICT);
     assert_eq!(
@@ -2674,9 +2691,13 @@ async fn benchmark_suite_driver_resume_starts_fresh_driver_from_terminal_record(
         .stopped_driver(&suite_id, "development", 45_000)
         .await;
 
-    let payload = resume_benchmark_suite_driver(fixture.state.clone(), stopped.id.clone())
-        .await
-        .expect("terminal driver should resume");
+    let payload = resume_benchmark_suite_driver(
+        fixture.state.clone(),
+        stopped.id.clone(),
+        fixture.state.try_claim_producer().expect("claim producer"),
+    )
+    .await
+    .expect("terminal driver should resume");
     let resumed_id = payload["driver"]["id"].as_str().expect("new driver id");
 
     assert_eq!(payload["status"], serde_json::json!("scheduled"));
@@ -2721,9 +2742,12 @@ async fn benchmark_suite_driver_startup_resume_starts_fresh_driver_from_restart_
         .await
         .expect("insert session");
 
-    let summary = resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone())
-        .await
-        .expect("restart driver reconciliation");
+    let summary = resume_restart_interrupted_benchmark_suite_drivers(
+        reloaded.state.clone(),
+        reloaded.state.try_claim_producer().expect("claim producer"),
+    )
+    .await
+    .expect("restart driver reconciliation");
 
     assert_eq!(
         summary,
@@ -2778,9 +2802,12 @@ async fn benchmark_suite_driver_startup_resume_missing_manifest_fails_boundedly(
         .await;
     let reloaded = fixture.reload().await;
 
-    let summary = resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone())
-        .await
-        .expect("restart driver reconciliation");
+    let summary = resume_restart_interrupted_benchmark_suite_drivers(
+        reloaded.state.clone(),
+        reloaded.state.try_claim_producer().expect("claim producer"),
+    )
+    .await
+    .expect("restart driver reconciliation");
 
     assert_eq!(
         summary,
@@ -2815,9 +2842,12 @@ async fn benchmark_suite_driver_startup_resume_complete_manifest_fails_boundedly
         .await;
     let reloaded = fixture.reload().await;
 
-    let summary = resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone())
-        .await
-        .expect("restart driver reconciliation");
+    let summary = resume_restart_interrupted_benchmark_suite_drivers(
+        reloaded.state.clone(),
+        reloaded.state.try_claim_producer().expect("claim producer"),
+    )
+    .await
+    .expect("restart driver reconciliation");
 
     assert_eq!(
         summary,

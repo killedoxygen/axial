@@ -56,13 +56,17 @@ pub fn spawn_performance_rules_refresh(state: &AppState) -> bool {
     if !performance.remote_refresh_enabled() {
         return false;
     }
+    let Ok(producer) = state.try_claim_producer() else {
+        return false;
+    };
+    let shutdown = state.subscribe_shutdown();
 
     let interval = configured_performance_rules_refresh_interval();
     tracing::info!(
         interval_seconds = interval.as_secs(),
         "performance rules periodic refresh scheduled"
     );
-    tokio::spawn(run_performance_rules_refresh_loop(
+    producer.spawn(run_periodic_refresh_loop(
         move || {
             let performance = performance.clone();
             async move {
@@ -70,6 +74,7 @@ pub fn spawn_performance_rules_refresh(state: &AppState) -> bool {
             }
         },
         interval,
+        shutdown,
     ));
 
     true
@@ -79,13 +84,17 @@ pub fn spawn_remote_flags_refresh(state: &AppState) -> bool {
     if !state.telemetry().export_configured() {
         return false;
     }
+    let Ok(producer) = state.try_claim_producer() else {
+        return false;
+    };
+    let shutdown = state.subscribe_shutdown();
 
     let state = state.clone();
     tracing::info!(
         interval_seconds = REMOTE_FLAGS_REFRESH_INTERVAL.as_secs(),
         "remote feature flags periodic refresh scheduled"
     );
-    tokio::spawn(run_remote_flags_refresh_loop(
+    producer.spawn(run_periodic_refresh_loop(
         move || {
             let state = state.clone();
             async move {
@@ -93,6 +102,7 @@ pub fn spawn_remote_flags_refresh(state: &AppState) -> bool {
             }
         },
         REMOTE_FLAGS_REFRESH_INTERVAL,
+        shutdown,
     ));
 
     true
@@ -107,31 +117,44 @@ pub fn spawn_telemetry_export(state: &AppState) -> bool {
     if !state.telemetry().export_configured() {
         return false;
     }
+    let Ok(producer) = state.try_claim_producer() else {
+        return false;
+    };
 
     let telemetry = state.telemetry().clone();
-    tokio::spawn(run_telemetry_flush_loop(telemetry));
+    let shutdown = state.subscribe_shutdown();
+    producer.spawn(run_telemetry_flush_loop(telemetry, shutdown));
     true
 }
 
-async fn run_performance_rules_refresh_loop<F, Fut>(mut refresh: F, interval: Duration)
-where
+async fn run_periodic_refresh_loop<F, Fut>(
+    mut refresh: F,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) where
     F: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
         refresh().await;
-        tokio::time::sleep(interval).await;
+        if wait_for_shutdown(&mut shutdown, interval).await {
+            return;
+        }
     }
 }
 
-async fn run_remote_flags_refresh_loop<F, Fut>(mut refresh: F, interval: Duration)
-where
-    F: FnMut() -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
-{
-    loop {
-        refresh().await;
-        tokio::time::sleep(interval).await;
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bool {
+    if *shutdown.borrow_and_update() {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => *shutdown.borrow_and_update(),
+        changed = shutdown.changed() => {
+            changed.is_err() || *shutdown.borrow_and_update()
+        }
     }
 }
 
@@ -194,7 +217,11 @@ fn parse_performance_rules_refresh_interval(value: Option<&str>) -> Duration {
 }
 
 pub fn spawn_performance_operations_resume(state: &AppState) -> bool {
-    crate::routes::spawn_pending_performance_operations(state)
+    let Ok(producer) = state.try_claim_producer() else {
+        return false;
+    };
+    crate::application::spawn_pending_performance_operations(state, producer);
+    true
 }
 
 pub fn spawn_benchmark_suite_drivers_resume(state: &AppState) -> bool {
@@ -439,13 +466,42 @@ mod tests {
             Some("http://127.0.0.1:9/rules.json".to_string()),
         );
         assert!(spawn_performance_rules_refresh(&configured_state));
+        configured_state
+            .quiesce()
+            .await
+            .expect("configured state quiesces");
         let _ = fs::remove_dir_all(&configured_root);
+    }
+
+    #[tokio::test]
+    async fn performance_resume_root_is_rejected_once_request_drain_begins() {
+        let root = axial_api_test_support::test_root("performance-resume-draining");
+        let state = build_test_state(&root, None);
+        let request = state.try_admit_request().expect("admit held request");
+        let shutdown_state = state.clone();
+        let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.lifecycle_phase() != crate::state::AppLifecyclePhase::DrainingRequests {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request drain begins");
+
+        assert!(!spawn_performance_operations_resume(&state));
+        drop(request);
+        quiesce
+            .await
+            .expect("quiesce task")
+            .expect("quiesce completes");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test(start_paused = true)]
     async fn performance_rules_refresh_loop_runs_initially_and_after_interval() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run_performance_rules_refresh_loop(
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_periodic_refresh_loop(
             move || {
                 let tx = tx.clone();
                 async move {
@@ -453,6 +509,7 @@ mod tests {
                 }
             },
             Duration::from_secs(60),
+            shutdown_rx,
         ));
 
         rx.recv().await.expect("initial refresh tick");
@@ -464,7 +521,52 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(1)).await;
         rx.recv().await.expect("periodic refresh tick");
-        task.abort();
+        shutdown_tx.send_replace(true);
+        task.await.expect("periodic refresh loop stops");
+    }
+
+    #[tokio::test]
+    async fn quiesce_waits_for_inflight_periodic_refresh_then_stops_the_loop() {
+        let root = axial_api_test_support::test_root("app-refresh-quiesce");
+        let state = build_test_state(&root, None);
+        let producer = state.try_claim_producer().expect("claim periodic producer");
+        let shutdown = state.subscribe_shutdown();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut entered_tx = Some(entered_tx);
+        let mut release_rx = Some(release_rx);
+        producer.spawn(run_periodic_refresh_loop(
+            move || {
+                let entered_tx = entered_tx.take().expect("single refresh entry");
+                let release_rx = release_rx.take().expect("single refresh release");
+                async move {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                }
+            },
+            Duration::from_secs(60),
+            shutdown,
+        ));
+        entered_rx.await.expect("periodic refresh entered");
+
+        let shutdown_state = state.clone();
+        let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.lifecycle_phase() != crate::state::AppLifecyclePhase::QuiescingProducers {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("producer quiescence begins");
+        assert!(!quiesce.is_finished());
+
+        release_tx.send(()).expect("release periodic refresh");
+        tokio::time::timeout(Duration::from_secs(1), quiesce)
+            .await
+            .expect("quiesce completion deadline")
+            .expect("quiesce task")
+            .expect("quiesce completes");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

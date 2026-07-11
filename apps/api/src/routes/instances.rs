@@ -6,12 +6,12 @@ use crate::{
         InstanceScreenshotInfo, InstanceWorldInfo, OpenFolderQuery, RenameScreenshotRequest,
         RenameWorldRequest, UpdateModRequest, WorldBackupResponse,
     },
-    state::AppState,
+    state::{AppState, RequestProducerHandoff},
 };
 use axial_config::EnrichedInstance;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::Response,
     routing::{get, post, put},
@@ -127,9 +127,10 @@ async fn handle_create_loader_builds_view(
 
 async fn handle_create_instance(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Json(payload): Json<CreateInstanceRequest>,
 ) -> Result<Json<CreateInstanceResponse>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_create_instance(&state, payload)
+    instances::handle_create_instance_owned(&state, payload, handoff)
         .await
         .map(Json)
 }
@@ -471,7 +472,14 @@ mod tests {
             uri: &str,
             payload: Option<Value>,
         ) -> (StatusCode, Value) {
-            let mut request = Request::builder().method(method).uri(uri);
+            let request_lease = self
+                .state
+                .try_admit_request()
+                .expect("admit route instance request");
+            let mut request = Request::builder()
+                .extension(request_lease.producer_handoff())
+                .method(method)
+                .uri(uri);
             let body = if let Some(payload) = payload {
                 request = request.header(header::CONTENT_TYPE, "application/json");
                 Body::from(serde_json::to_vec(&payload).expect("serialize request"))

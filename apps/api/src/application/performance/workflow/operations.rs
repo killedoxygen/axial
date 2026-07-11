@@ -17,7 +17,9 @@ use crate::state::performance_operations::{
     PerformanceOperationPayload, PerformanceOperationStartError, PerformanceOperationStatus,
     PerformanceOperationStoreError, normalized_operation_timestamp, sanitize_operation_error,
 };
-use crate::state::{AppState, DownloadProgress, OperationJournalStoreError};
+use crate::state::{
+    AppState, DownloadProgress, OperationJournalStoreError, ProducerLease, RequestProducerHandoff,
+};
 use axum::{Json, http::StatusCode};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -36,6 +38,15 @@ const PERFORMANCE_RETRY_INITIAL_DELAY_MS: u64 = 20;
 const PERFORMANCE_RETRY_MAX_DELAY_MS: u64 = 1_000;
 
 pub(super) type PerformanceApplicationError = (StatusCode, Json<serde_json::Value>);
+
+fn performance_shutdown_error() -> PerformanceApplicationError {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "performance operations are shutting down"
+        })),
+    )
+}
 
 #[derive(Debug)]
 pub(super) enum PerformanceOperationExecutionError {
@@ -353,10 +364,13 @@ pub(super) enum PerformanceInstallAction {
     Rollback,
 }
 
-pub fn spawn_pending_performance_operations(state: &AppState) -> bool {
+pub(crate) fn spawn_pending_performance_operations(state: &AppState, producer: ProducerLease) {
     let state = state.clone();
-    tokio::spawn(async move {
-        let resumed = resume_pending_performance_operations(state).await;
+    let child_owner = producer.claim_child();
+    let shutdown = state.subscribe_shutdown();
+    producer.spawn(async move {
+        let resumed =
+            resume_pending_performance_operations_owned(state, &child_owner, shutdown).await;
         if resumed > 0 {
             tracing::info!(
                 resumed,
@@ -364,7 +378,6 @@ pub fn spawn_pending_performance_operations(state: &AppState) -> bool {
             );
         }
     });
-    true
 }
 
 pub async fn performance_operation_status(
@@ -406,10 +419,14 @@ pub async fn performance_instance_operation(
 pub(super) async fn queue_performance_operation(
     state: AppState,
     operation: PerformanceOperation,
+    handoff: RequestProducerHandoff,
 ) -> Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)> {
     let journal_identity = durable_performance_operation_identity(&state, &operation);
     let (ownership_tx, ownership_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    let producer = handoff
+        .try_claim()
+        .map_err(|_| performance_shutdown_error())?;
+    producer.spawn(async move {
         let mut operation = operation;
         let status = match state
             .performance_operations()
@@ -490,12 +507,16 @@ pub(super) async fn queue_performance_operation(
 pub(super) async fn execute_synchronous_performance_operation(
     state: AppState,
     mut operation: PerformanceOperation,
+    handoff: RequestProducerHandoff,
 ) -> Result<PerformanceInstallResponse, PerformanceApplicationError> {
     let journal_identity = durable_performance_operation_identity(&state, &operation);
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
     let (failure_signal, failure_rx) = PerformancePersistenceFailureSignal::new();
     operation.persistence_failure = Some(failure_signal);
-    tokio::spawn(async move {
+    let producer = handoff
+        .try_claim()
+        .map_err(|_| performance_shutdown_error())?;
+    producer.spawn(async move {
         let mut operation = operation;
         let status = match state
             .performance_operations()
@@ -580,10 +601,17 @@ async fn reconcile_failed_performance_start(
     }
 }
 
-pub(super) async fn resume_pending_performance_operations(state: AppState) -> usize {
+pub(super) async fn resume_pending_performance_operations_owned(
+    state: AppState,
+    producer: &ProducerLease,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> usize {
     let mut resumed = 0usize;
     reconcile_orphaned_performance_journals(&state).await;
     loop {
+        if *shutdown.borrow_and_update() {
+            break;
+        }
         let pending = state
             .performance_operations()
             .take_pending_resumable_operations()
@@ -591,9 +619,11 @@ pub(super) async fn resume_pending_performance_operations(state: AppState) -> us
         if pending.is_empty() {
             break;
         }
-        resumed = resumed.saturating_add(pending.len());
-
         for status in pending {
+            if *shutdown.borrow_and_update() {
+                return resumed;
+            }
+            resumed = resumed.saturating_add(1);
             let install_id = status.id.clone();
             state.installs().insert(install_id.clone()).await;
             let store = state.installs().clone();
@@ -601,7 +631,7 @@ pub(super) async fn resume_pending_performance_operations(state: AppState) -> us
                 prepare_resumed_performance_operation(&state, &status, &store).await
             {
                 let state_task = state.clone();
-                tokio::spawn(async move {
+                producer.spawn_child(async move {
                     run_queued_performance_operation(state_task, operation, store, install_id)
                         .await;
                 });

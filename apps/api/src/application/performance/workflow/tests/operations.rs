@@ -965,6 +965,16 @@ async fn aborted_queued_request_does_not_cancel_owned_start_or_worker() {
             .expect_err("request task is cancelled at start gate")
             .is_cancelled()
     );
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while state.lifecycle_phase() != crate::state::AppLifecyclePhase::QuiescingProducers {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("performance producer quiescence begins");
+    assert!(!quiesce.is_finished());
     status_backend.release();
 
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -995,6 +1005,10 @@ async fn aborted_queued_request_does_not_cancel_owned_start_or_worker() {
             .expect("terminal journal")
             .status
     ));
+    quiesce
+        .await
+        .expect("quiesce task")
+        .expect("owned performance worker settles before quiescence");
     let _ = fs::remove_dir_all(root);
 }
 
