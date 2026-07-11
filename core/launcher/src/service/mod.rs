@@ -5,7 +5,7 @@ mod validation;
 
 use crate::build::LaunchAuthContext;
 use crate::build::VanillaLaunchPlan;
-use crate::guardian::{GuardianIntervention, LaunchGuardianContext};
+use crate::guardian::LaunchGuardianContext;
 use crate::healing::HealingEvent;
 use crate::runtime::RuntimeSelection;
 use crate::types::LaunchFailureClass;
@@ -85,7 +85,6 @@ pub struct PreparedLaunchAttempt {
     pub effective_preset: String,
     pub plan: VanillaLaunchPlan,
     pub healing: Option<LaunchHealingSummary>,
-    pub guardian_interventions: Vec<GuardianIntervention>,
     pub metrics: LaunchPreparationMetrics,
 }
 

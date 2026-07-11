@@ -146,19 +146,6 @@ impl GuardianSummary {
         prepend_unique_detail(&mut self.details, Some(reason.into()));
     }
 
-    pub fn block_with_message_reason_and_guidance(
-        &mut self,
-        message: impl Into<String>,
-        reason: impl Into<String>,
-        guidance: Vec<String>,
-    ) {
-        self.block_with_reason_and_guidance(reason, guidance);
-        let message = message.into();
-        if !message.trim().is_empty() {
-            self.message = Some(message.trim().to_string());
-        }
-    }
-
     pub fn warn_with_guidance(&mut self, guidance: Vec<String>) {
         self.decision = GuardianDecision::Warned;
         for detail in guidance {

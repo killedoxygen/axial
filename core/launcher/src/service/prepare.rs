@@ -103,7 +103,6 @@ where
     let target_version_id = launch_target_version_id(intent, &version);
     let loader = intent.loader.trim();
     let is_modded = intent.is_modded || !version.inherits_from.trim().is_empty();
-    let guardian_interventions = Vec::new();
     let mut effective_preset = if let Some(preset_override) = attempt.preset_override.clone() {
         preset_override
     } else {
@@ -221,7 +220,6 @@ where
         effective_preset,
         plan,
         healing,
-        guardian_interventions,
         metrics: LaunchPreparationMetrics {
             version_ms,
             runtime_ms,
@@ -624,7 +622,6 @@ mod tests {
                 .expect("core preparation preserves explicit Custom preset intent");
 
         assert_eq!(prepared.effective_preset, crate::jvm::PRESET_SMOOTH);
-        assert!(prepared.guardian_interventions.is_empty());
         assert!(
             prepared
                 .plan
