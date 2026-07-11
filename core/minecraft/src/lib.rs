@@ -59,8 +59,9 @@ pub use runtime::{
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 pub use version::{
-    VersionScanIssue, VersionScanIssueKind, VersionScanReport, VersionScanState, scan_versions,
-    scan_versions_report,
+    VersionScanDependencyStamp, VersionScanIssue, VersionScanIssueKind, VersionScanReport,
+    VersionScanSnapshot, VersionScanState, scan_versions, scan_versions_report,
+    scan_versions_snapshot,
 };
 pub use version_meta::{
     MinecraftVersionMeta, ReleaseReference, analyze_minecraft_version, apply_version_analysis,

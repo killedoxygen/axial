@@ -1,8 +1,8 @@
 use crate::application::{self, VersionsResponse};
-use crate::state::AppState;
+use crate::state::{AppState, RequestProducerHandoff};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Extension, State},
     http::StatusCode,
     response::sse::{Event, Sse},
     routing::get,
@@ -18,17 +18,27 @@ pub fn router() -> Router<AppState> {
 
 async fn handle_versions(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
 ) -> Result<Json<VersionsResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::installed_versions(&state).await.map(Json)
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
+    application::installed_versions(&state, &producer)
+        .await
+        .map(Json)
 }
 
 async fn handle_version_watch(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
 ) -> Result<
     Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
     (StatusCode, Json<serde_json::Value>),
 > {
-    application::installed_versions(&state).await?;
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
+    application::installed_versions(&state, &producer).await?;
 
     let stream = async_stream::stream! {
         let mut ticker = interval(Duration::from_secs(5));
@@ -36,7 +46,7 @@ async fn handle_version_watch(
 
         loop {
             ticker.tick().await;
-            let payload = application::installed_versions_event_payload(&state).await;
+            let payload = application::installed_versions_event_payload(&state, &producer).await;
             if payload != last_payload {
                 last_payload = payload.clone();
                 yield Ok(Event::default().event("versions_changed").data(payload));

@@ -10,10 +10,7 @@ pub(crate) use create::{
     CreateLoaderBuildsViewResponse, handle_create_instance_owned, handle_create_instance_view,
     handle_create_loader_builds_view,
 };
-pub(crate) use create_cache::{
-    invalidate_create_view_cache, invalidate_create_view_installed_scan,
-    invalidate_create_view_source,
-};
+pub(crate) use create_cache::{invalidate_create_view_cache, invalidate_create_view_source};
 
 #[cfg(test)]
 use create::{CreateSelection, resolve_loader_create_selection_from_build_catalog};
@@ -44,10 +41,10 @@ use crate::application::timing::{
 };
 use crate::application::version::{
     InstalledVersionsScan, VERSION_SCAN_DEGRADED_MESSAGE, VersionScanViewModel,
-    scan_installed_versions,
+    installed_versions_scan, scan_installed_versions,
 };
 use crate::guardian::normalize_create_jvm_preset;
-use crate::state::AppState;
+use crate::state::{AppState, ProducerLease};
 use axial_config::{EnrichedInstance, InstanceStoreError, LaunchActionState};
 use axial_launcher::{
     GuardianMode, LaunchReadiness, LaunchReadinessReasonId, LaunchReadinessRequest,
@@ -127,14 +124,18 @@ pub(crate) struct InstancesResponse {
     pub scan_state: VersionScanViewModel,
 }
 
-pub(crate) async fn handle_list_instances(state: &AppState) -> InstancesResponse {
+pub(crate) async fn handle_list_instances(
+    state: &AppState,
+    producer: &ProducerLease,
+) -> InstancesResponse {
     let started_at = Instant::now();
     let scan_started_at = Instant::now();
-    let scan = scan_current_versions(state);
+    let (scan, scan_source, refresh_count, library_dir) =
+        indexed_current_versions(state, producer).await;
     let scan_elapsed = scan_started_at.elapsed();
 
     let enrich_started_at = Instant::now();
-    let instances = enrich_instances_for_state(state, &scan);
+    let instances = enrich_instances_for_state(state, &scan, library_dir.as_deref());
     let enrich_elapsed = enrich_started_at.elapsed();
 
     trace_instances_list(InstancesListTiming {
@@ -144,6 +145,8 @@ pub(crate) async fn handle_list_instances(state: &AppState) -> InstancesResponse
         version_count: scan.versions.len(),
         instance_count: instances.len(),
         degraded: scan.is_degraded(),
+        scan_source,
+        refresh_count,
     });
 
     InstancesResponse {
@@ -153,21 +156,43 @@ pub(crate) async fn handle_list_instances(state: &AppState) -> InstancesResponse
     }
 }
 
+async fn indexed_current_versions(
+    state: &AppState,
+    producer: &ProducerLease,
+) -> (InstalledVersionsScan, &'static str, u32, Option<PathBuf>) {
+    let Some(lookup) = state.installed_versions_snapshot(producer).await else {
+        return (unconfigured_versions_scan(), "unconfigured", 0, None);
+    };
+    let source = lookup.source.as_str();
+    let refresh_count = lookup.refresh_count;
+    let library_dir = lookup.library_dir().to_path_buf();
+    (
+        installed_versions_scan(&lookup.snapshot),
+        source,
+        refresh_count,
+        Some(library_dir),
+    )
+}
+
+fn unconfigured_versions_scan() -> InstalledVersionsScan {
+    InstalledVersionsScan {
+        versions: Vec::new(),
+        view_model: VersionScanViewModel {
+            state_id: "library_unconfigured".to_string(),
+            label: "Library is not configured".to_string(),
+            degraded: false,
+            detail: None,
+        },
+    }
+}
+
 pub(super) fn scan_current_versions(state: &AppState) -> InstalledVersionsScan {
     state
         .library_dir()
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .map(|path| scan_installed_versions(&path))
-        .unwrap_or_else(|| InstalledVersionsScan {
-            versions: Vec::new(),
-            view_model: VersionScanViewModel {
-                state_id: "library_unconfigured".to_string(),
-                label: "Library is not configured".to_string(),
-                degraded: false,
-                detail: None,
-            },
-        })
+        .unwrap_or_else(unconfigured_versions_scan)
 }
 
 fn enrich_instance_for_state(
@@ -175,18 +200,29 @@ fn enrich_instance_for_state(
     instance: axial_config::Instance,
 ) -> EnrichedInstance {
     let scan = scan_current_versions(state);
-    enrich_instance_for_scan(state, instance, &scan)
+    let library_dir = state.library_dir().map(PathBuf::from);
+    enrich_instance_for_scan(state, instance, &scan, library_dir.as_deref())
+}
+
+async fn enrich_instance_for_state_indexed(
+    state: &AppState,
+    producer: &ProducerLease,
+    instance: axial_config::Instance,
+) -> EnrichedInstance {
+    let (scan, _, _, library_dir) = indexed_current_versions(state, producer).await;
+    enrich_instance_for_scan(state, instance, &scan, library_dir.as_deref())
 }
 
 fn enrich_instances_for_state(
     state: &AppState,
     scan: &InstalledVersionsScan,
+    library_dir: Option<&std::path::Path>,
 ) -> Vec<EnrichedInstance> {
     state
         .instances()
         .list()
         .into_iter()
-        .map(|instance| enrich_instance_for_scan(state, instance, scan))
+        .map(|instance| enrich_instance_for_scan(state, instance, scan, library_dir))
         .collect()
 }
 
@@ -194,6 +230,7 @@ fn enrich_instance_for_scan(
     state: &AppState,
     instance: axial_config::Instance,
     scan: &InstalledVersionsScan,
+    library_dir: Option<&std::path::Path>,
 ) -> EnrichedInstance {
     let version = scan
         .versions
@@ -207,13 +244,13 @@ fn enrich_instance_for_scan(
         return enriched;
     }
 
-    let Some(library_dir) = state.library_dir().map(PathBuf::from) else {
+    let Some(library_dir) = library_dir else {
         return enriched;
     };
     let config = state.config().current();
     let readiness_started_at = Instant::now();
     let readiness = inspect_launch_readiness_summary(&LaunchReadinessRequest {
-        library_dir,
+        library_dir: library_dir.to_path_buf(),
         requested_java: selected_java_override(&instance, &config),
         version_id: instance.version_id.clone(),
         guardian_mode: GuardianMode::from_config(&config.guardian_mode),
@@ -320,12 +357,13 @@ fn readiness_is_user_blocked(readiness: &LaunchReadiness) -> bool {
 
 pub(crate) async fn handle_get_instance(
     state: &AppState,
+    producer: &ProducerLease,
     id: &str,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
     let instance = state.instances().get(id);
 
     match instance {
-        Some(instance) => Ok(enrich_instance_for_state(state, instance)),
+        Some(instance) => Ok(enrich_instance_for_state_indexed(state, producer, instance).await),
         None => Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "instance not found" })),
@@ -340,19 +378,20 @@ pub(crate) struct DuplicateInstanceRequest {
 
 pub(crate) async fn handle_duplicate_instance(
     state: &AppState,
+    producer: &ProducerLease,
     id: &str,
     payload: Option<DuplicateInstanceRequest>,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
     let payload = payload.unwrap_or_default();
-    state
+    let instance = state
         .duplicate_instance(
             id.to_string(),
             payload.name,
             state.library_dir().map(PathBuf::from),
         )
         .await
-        .map(|instance| enrich_instance_for_state(state, instance))
-        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Duplicate, error))
+        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Duplicate, error))?;
+    Ok(enrich_instance_for_state_indexed(state, producer, instance).await)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -374,11 +413,12 @@ pub(crate) struct InstancePatch {
 
 pub(crate) async fn handle_update_instance(
     state: &AppState,
+    producer: &ProducerLease,
     id: &str,
     patch: InstancePatch,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
     let id = id.to_string();
-    state
+    let instance = state
         .mutate_instances(move |registry| {
             let Some(index) = registry.instances.iter().position(|stored| stored.id == id) else {
                 return Err(InstanceStoreError::Persistence(std::io::Error::new(
@@ -446,8 +486,8 @@ pub(crate) async fn handle_update_instance(
             Ok(instance)
         })
         .await
-        .map(|instance| enrich_instance_for_state(state, instance))
-        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Update, error))
+        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Update, error))?;
+    Ok(enrich_instance_for_state_indexed(state, producer, instance).await)
 }
 
 fn redact_runtime_overrides(mut instance: EnrichedInstance) -> EnrichedInstance {

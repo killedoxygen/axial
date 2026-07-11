@@ -98,31 +98,58 @@ pub fn router() -> Router<AppState> {
 
 async fn handle_list_instances(
     State(state): State<AppState>,
-) -> Json<instances::InstancesResponse> {
-    Json(instances::handle_list_instances(&state).await)
+    Extension(handoff): Extension<RequestProducerHandoff>,
+) -> Result<Json<instances::InstancesResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
+    Ok(Json(
+        instances::handle_list_instances(&state, &producer).await,
+    ))
 }
 
 async fn handle_get_instance(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
 ) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_get_instance(&state, &id).await.map(Json)
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
+    instances::handle_get_instance(&state, &producer, &id)
+        .await
+        .map(Json)
 }
 
 async fn handle_create_instance_view(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Query(query): Query<CreateInstanceViewQuery>,
-) -> Json<CreateInstanceViewResponse> {
-    Json(instances::handle_create_instance_view(&state, query.source.as_deref()).await)
+) -> Result<Json<CreateInstanceViewResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
+    Ok(Json(
+        instances::handle_create_instance_view(&state, &producer, query.source.as_deref()).await,
+    ))
 }
 
 async fn handle_create_loader_builds_view(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Query(query): Query<CreateLoaderBuildsViewQuery>,
 ) -> Result<Json<CreateLoaderBuildsViewResponse>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_create_loader_builds_view(&state, &query.source, &query.minecraft_version)
-        .await
-        .map(Json)
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
+    instances::handle_create_loader_builds_view(
+        &state,
+        &producer,
+        &query.source,
+        &query.minecraft_version,
+    )
+    .await
+    .map(Json)
 }
 
 async fn handle_create_instance(
@@ -137,20 +164,33 @@ async fn handle_create_instance(
 
 async fn handle_duplicate_instance(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
     payload: Option<Json<DuplicateInstanceRequest>>,
 ) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_duplicate_instance(&state, &id, payload.map(|Json(payload)| payload))
-        .await
-        .map(Json)
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
+    instances::handle_duplicate_instance(
+        &state,
+        &producer,
+        &id,
+        payload.map(|Json(payload)| payload),
+    )
+    .await
+    .map(Json)
 }
 
 async fn handle_update_instance(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
     Json(patch): Json<InstancePatch>,
 ) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_update_instance(&state, &id, patch)
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
+    instances::handle_update_instance(&state, &producer, &id, patch)
         .await
         .map(Json)
 }

@@ -1,5 +1,7 @@
 use super::*;
-use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
+use crate::state::{
+    AppState, AppStateInit, InstallStore, ProducerLease, RequestLease, SessionStore,
+};
 use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
 use axial_minecraft::VersionEntry;
@@ -968,6 +970,7 @@ async fn update_instance_allows_unchanged_name_and_maps_name_collision_to_confli
 
     let updated = handle_update_instance(
         &fixture.state,
+        &fixture.producer,
         &alpha.id,
         InstancePatch {
             name: Some(alpha.name.clone()),
@@ -983,6 +986,7 @@ async fn update_instance_allows_unchanged_name_and_maps_name_collision_to_confli
 
     let (status, Json(body)) = handle_update_instance(
         &fixture.state,
+        &fixture.producer,
         &alpha.id,
         InstancePatch {
             name: Some(beta.name.clone()),
@@ -1019,6 +1023,7 @@ async fn update_instance_unknown_jvm_preset_resets_to_auto_without_echoing_raw_v
 
     let updated = handle_update_instance(
         &fixture.state,
+        &fixture.producer,
         &instance.id,
         InstancePatch {
             jvm_preset: Some(r"C:\Users\Alice\java.exe --accessToken raw-secret-token".to_string()),
@@ -1060,6 +1065,7 @@ async fn update_instance_response_redacts_java_path_and_jvm_args() {
     let raw_args = "-Dtoken=raw-secret-token -javaagent:C:\\Users\\Alice\\agent.jar";
     let updated = handle_update_instance(
         &fixture.state,
+        &fixture.producer,
         &instance.id,
         InstancePatch {
             java_path: Some(raw_java.to_string()),
@@ -1114,13 +1120,14 @@ async fn public_instance_responses_redact_stored_runtime_overrides() {
         .replace_for_test(instance.clone())
         .expect("store runtime overrides");
 
-    let listed = handle_list_instances(&fixture.state).await;
-    let fetched = handle_get_instance(&fixture.state, &instance.id)
+    let listed = handle_list_instances(&fixture.state, &fixture.producer).await;
+    let fetched = handle_get_instance(&fixture.state, &fixture.producer, &instance.id)
         .await
         .expect("get instance");
-    let duplicated = handle_duplicate_instance(&fixture.state, &instance.id, None)
-        .await
-        .expect("duplicate instance");
+    let duplicated =
+        handle_duplicate_instance(&fixture.state, &fixture.producer, &instance.id, None)
+            .await
+            .expect("duplicate instance");
 
     assert_eq!(listed.instances[0].instance.java_path, "");
     assert_eq!(listed.instances[0].instance.extra_jvm_args, "");
@@ -1180,7 +1187,7 @@ async fn instance_crud_handlers_create_list_get_update_and_delete() {
     assert_eq!(created.icon, "grass");
     assert_eq!(created.accent, "#5aa469");
 
-    let listed = handle_list_instances(&fixture.state).await;
+    let listed = handle_list_instances(&fixture.state, &fixture.producer).await;
     assert_eq!(listed.last_instance_id, None);
     assert_eq!(listed.instances.len(), 1);
     assert_eq!(listed.instances[0].instance.id, created.id);
@@ -1196,13 +1203,14 @@ async fn instance_crud_handlers_create_list_get_update_and_delete() {
         axial_config::LaunchPrimaryAction::Install
     );
 
-    let fetched = handle_get_instance(&fixture.state, &created.id)
+    let fetched = handle_get_instance(&fixture.state, &fixture.producer, &created.id)
         .await
         .expect("get instance");
-    assert_eq!(fetched, created.instance.clone());
+    assert_eq!(fetched.instance, created.instance.instance);
 
     let updated = handle_update_instance(
         &fixture.state,
+        &fixture.producer,
         &created.id,
         InstancePatch {
             name: Some("Skyblock".to_string()),
@@ -1356,7 +1364,7 @@ async fn degraded_version_scan_blocks_instances_and_create_queue_checks() {
         .expect("write malformed version json");
     add_test_instance(&fixture, "Malformed", "1.21.1");
 
-    let listed = handle_list_instances(&fixture.state).await;
+    let listed = handle_list_instances(&fixture.state, &fixture.producer).await;
 
     assert!(listed.scan_state.degraded);
     assert_eq!(listed.scan_state.state_id, "degraded");
@@ -1370,7 +1378,7 @@ async fn degraded_version_scan_blocks_instances_and_create_queue_checks() {
         crate::application::version::VERSION_SCAN_DEGRADED_MESSAGE
     );
 
-    let create_view = handle_create_instance_view(&fixture.state, None).await;
+    let create_view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
     assert!(create_view.versions.is_empty());
     assert!(create_view.notices.iter().any(|notice| {
         notice.state_id == "library_scan_degraded"
@@ -1403,6 +1411,7 @@ async fn update_instance_rejects_raw_bad_version_id_change() {
 
     let (status, Json(body)) = handle_update_instance(
         &fixture.state,
+        &fixture.producer,
         &instance.id,
         InstancePatch {
             version_id: Some("bad-version".to_string()),
@@ -1875,7 +1884,7 @@ async fn create_instance_view_returns_backend_authored_version_rows() {
     }
     write_fabric_loader_build_cache(&library_dir, "1.21.1", "0.16.14");
 
-    let view = handle_create_instance_view(&fixture.state, None).await;
+    let view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
 
     let vanilla = view
         .versions
@@ -1892,6 +1901,7 @@ async fn create_instance_view_returns_backend_authored_version_rows() {
 
     let view = handle_create_instance_view(
         &fixture.state,
+        &fixture.producer,
         Some(axial_minecraft::LoaderComponentId::Fabric.as_str()),
     )
     .await;
@@ -1948,6 +1958,7 @@ async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is
 
     let view = handle_create_instance_view(
         &fixture.state,
+        &fixture.producer,
         Some(axial_minecraft::LoaderComponentId::Fabric.as_str()),
     )
     .await;
@@ -1968,7 +1979,7 @@ async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is
 }
 
 #[tokio::test]
-async fn create_instance_view_reuses_installed_scan_until_invalidated() {
+async fn create_instance_view_refreshes_when_versions_root_metadata_changes() {
     super::create_cache::reset_create_view_cache_for_tests();
     let fixture = TestFixture::new("create-view-installed-scan-cache");
     let library_dir = fixture.root.join("library");
@@ -1977,31 +1988,33 @@ async fn create_instance_view_reuses_installed_scan_until_invalidated() {
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["1.21.1"]);
 
-    let view = handle_create_instance_view(&fixture.state, None).await;
+    let view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
     let row = view
         .versions
         .iter()
         .find(|row| row.source_id == "vanilla" && row.minecraft_version_id == "1.21.1")
         .expect("vanilla row");
     assert_eq!(row.download_state, "none");
+    assert_eq!(fixture.state.installed_versions_walk_count(), 1);
 
     write_installed_vanilla_version(&library_dir, "1.21.1");
-    let cached_view = handle_create_instance_view(&fixture.state, None).await;
-    let cached_row = cached_view
-        .versions
-        .iter()
-        .find(|row| row.source_id == "vanilla" && row.minecraft_version_id == "1.21.1")
-        .expect("cached vanilla row");
-    assert_eq!(cached_row.download_state, "none");
-
-    invalidate_create_view_installed_scan();
-    let refreshed_view = handle_create_instance_view(&fixture.state, None).await;
+    let refreshed_view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
     let refreshed_row = refreshed_view
         .versions
         .iter()
         .find(|row| row.source_id == "vanilla" && row.minecraft_version_id == "1.21.1")
         .expect("refreshed vanilla row");
     assert_eq!(refreshed_row.download_state, "full");
+    assert_eq!(fixture.state.installed_versions_walk_count(), 2);
+
+    let cached_view = handle_create_instance_view(&fixture.state, &fixture.producer, None).await;
+    let cached_row = cached_view
+        .versions
+        .iter()
+        .find(|row| row.source_id == "vanilla" && row.minecraft_version_id == "1.21.1")
+        .expect("cached vanilla row");
+    assert_eq!(cached_row.download_state, "full");
+    assert_eq!(fixture.state.installed_versions_walk_count(), 2);
 }
 
 #[tokio::test]
@@ -2034,7 +2047,12 @@ async fn create_instance_view_tags_beta_only_loader_version_rows_without_blockin
         (axial_minecraft::LoaderComponentId::Forge, "1.7.10_pre4"),
         (axial_minecraft::LoaderComponentId::NeoForge, "26.2"),
     ] {
-        let view = handle_create_instance_view(&fixture.state, Some(component_id.as_str())).await;
+        let view = handle_create_instance_view(
+            &fixture.state,
+            &fixture.producer,
+            Some(component_id.as_str()),
+        )
+        .await;
 
         let row = view
             .versions
@@ -2093,7 +2111,12 @@ async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
         axial_minecraft::LoaderComponentId::Fabric,
         axial_minecraft::LoaderComponentId::Quilt,
     ] {
-        let view = handle_create_instance_view(&fixture.state, Some(component_id.as_str())).await;
+        let view = handle_create_instance_view(
+            &fixture.state,
+            &fixture.producer,
+            Some(component_id.as_str()),
+        )
+        .await;
         let row = view
             .versions
             .iter()
@@ -2144,6 +2167,7 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
 
     let view = handle_create_instance_view(
         &fixture.state,
+        &fixture.producer,
         Some(axial_minecraft::LoaderComponentId::Quilt.as_str()),
     )
     .await;
@@ -2201,6 +2225,7 @@ async fn create_instance_view_tags_quilt_java25_without_cached_builds() {
 
     let view = handle_create_instance_view(
         &fixture.state,
+        &fixture.producer,
         Some(axial_minecraft::LoaderComponentId::Quilt.as_str()),
     )
     .await;
@@ -2248,6 +2273,7 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
 
     let view = handle_create_instance_view(
         &fixture.state,
+        &fixture.producer,
         Some(axial_minecraft::LoaderComponentId::Quilt.as_str()),
     )
     .await;
@@ -2415,6 +2441,7 @@ async fn duplicate_instance_existing_name_maps_to_conflict_json_error() {
 
     let (status, Json(body)) = handle_duplicate_instance(
         &fixture.state,
+        &fixture.producer,
         &source.id,
         Some(DuplicateInstanceRequest {
             name: Some("Existing".to_string()),
@@ -2478,7 +2505,7 @@ async fn open_instance_folder_rejects_traversal_subfolder_without_creating_escap
 async fn missing_instance_crud_handlers_return_not_found_json_error() {
     let fixture = TestFixture::new("missing-crud");
 
-    let (status, Json(body)) = handle_get_instance(&fixture.state, "missing")
+    let (status, Json(body)) = handle_get_instance(&fixture.state, &fixture.producer, "missing")
         .await
         .expect_err("missing get should fail");
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -2486,6 +2513,7 @@ async fn missing_instance_crud_handlers_return_not_found_json_error() {
 
     let (status, Json(body)) = handle_update_instance(
         &fixture.state,
+        &fixture.producer,
         "missing",
         InstancePatch {
             name: Some("Nope".to_string()),
@@ -2630,6 +2658,8 @@ fn assert_instance_folder_error_response_is_bounded(
 
 struct TestFixture {
     state: AppState,
+    _request: RequestLease,
+    producer: ProducerLease,
     root: PathBuf,
 }
 
@@ -3082,7 +3112,7 @@ fn add_test_instance(
 }
 
 async fn listed_instance(fixture: &TestFixture, instance_id: &str) -> EnrichedInstance {
-    handle_list_instances(&fixture.state)
+    handle_list_instances(&fixture.state, &fixture.producer)
         .await
         .instances
         .into_iter()
@@ -3163,7 +3193,18 @@ impl TestFixture {
             frontend_dir: root.join("frontend"),
         });
 
-        Self { state, root }
+        let request = state.try_admit_request().expect("admit fixture request");
+        let producer = request
+            .producer_handoff()
+            .try_claim()
+            .expect("claim fixture producer");
+
+        Self {
+            state,
+            _request: request,
+            producer,
+            root,
+        }
     }
 
     fn configure_create_manifest(&self, version_ids: &[&str]) -> PathBuf {

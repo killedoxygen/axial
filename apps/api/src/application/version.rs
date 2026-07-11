@@ -1,4 +1,4 @@
-use crate::{application::instances::invalidate_create_view_installed_scan, state::AppState};
+use crate::state::{AppState, InstalledVersionsSnapshot, ProducerLease};
 use axial_minecraft::{
     LifecycleMeta, MinecraftVersionMeta, VersionEntry, VersionScanReport, VersionScanState,
     VersionSubjectKind, analyze_minecraft_version, enrich_version_entries,
@@ -87,11 +87,16 @@ pub struct VersionInfoResponse {
     pub shared_data: Vec<SharedDataInfo>,
 }
 
-pub async fn installed_versions(
+pub(crate) async fn installed_versions(
     state: &AppState,
+    producer: &ProducerLease,
 ) -> Result<VersionsResponse, (StatusCode, Json<serde_json::Value>)> {
-    let mc_dir = version_library_dir(state)?;
-    let mut scan = scan_installed_versions(&mc_dir);
+    let snapshot = state
+        .installed_versions_snapshot(producer)
+        .await
+        .ok_or_else(version_library_not_configured_response)?;
+    let mc_dir = snapshot.library_dir().to_path_buf();
+    let mut scan = installed_versions_scan(&snapshot.snapshot);
     enrich_versions_from_cached_manifest(&mc_dir, &mut scan.versions).await;
 
     Ok(VersionsResponse {
@@ -100,8 +105,11 @@ pub async fn installed_versions(
     })
 }
 
-pub async fn installed_versions_event_payload(state: &AppState) -> String {
-    match installed_versions(state).await {
+pub(crate) async fn installed_versions_event_payload(
+    state: &AppState,
+    producer: &ProducerLease,
+) -> String {
+    match installed_versions(state, producer).await {
         Ok(response) => {
             serde_json::to_string(&response).unwrap_or_else(|_| "{\"versions\":[]}".to_string())
         }
@@ -109,19 +117,26 @@ pub async fn installed_versions_event_payload(state: &AppState) -> String {
     }
 }
 
-pub async fn catalog(
+pub(crate) async fn catalog(
     state: &AppState,
+    producer: &ProducerLease,
 ) -> Result<CatalogResponse, (StatusCode, Json<serde_json::Value>)> {
-    let mc_dir = version_library_dir(state)?;
+    let snapshot = state
+        .installed_versions_snapshot(producer)
+        .await
+        .ok_or_else(version_library_not_configured_response)?;
+    let mc_dir = snapshot.library_dir().to_path_buf();
     let manifest = fetch_version_manifest_cached(&mc_dir)
         .await
         .map_err(catalog_fetch_error_response)?;
 
-    let installed: HashSet<String> = scan_installed_versions(&mc_dir)
+    let installed: HashSet<String> = snapshot
+        .snapshot
+        .report()
         .versions
-        .into_iter()
+        .iter()
         .filter(|version| version.launchable)
-        .map(|version| version.id)
+        .map(|version| version.id.clone())
         .collect();
 
     let releases = manifest_release_references(&manifest);
@@ -155,11 +170,16 @@ pub async fn catalog(
     })
 }
 
-pub async fn version_info(
+pub(crate) async fn version_info(
     state: &AppState,
+    producer: &ProducerLease,
     version_id: &str,
 ) -> Result<VersionInfoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let mc_dir = version_library_dir(state)?;
+    let snapshot = state
+        .installed_versions_snapshot(producer)
+        .await
+        .ok_or_else(version_library_not_configured_response)?;
+    let mc_dir = snapshot.library_dir().to_path_buf();
     if !valid_version_id(version_id) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -175,7 +195,7 @@ pub async fn version_info(
         ));
     }
 
-    let scan = scan_installed_versions(&mc_dir);
+    let scan = installed_versions_scan(&snapshot.snapshot);
     if scan.is_degraded() {
         return Err(version_scan_degraded_response());
     }
@@ -226,12 +246,17 @@ pub struct DeleteVersionRequest {
     pub cascade_dependents: bool,
 }
 
-pub async fn delete_version(
+pub(crate) async fn delete_version(
     state: &AppState,
+    producer: &ProducerLease,
     version_id: &str,
     payload: DeleteVersionRequest,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    let mc_dir = version_library_dir(state)?;
+    let snapshot = state
+        .installed_versions_snapshot(producer)
+        .await
+        .ok_or_else(version_library_not_configured_response)?;
+    let mc_dir = snapshot.library_dir().to_path_buf();
     if !valid_version_id(version_id) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -249,7 +274,7 @@ pub async fn delete_version(
 
     let mut to_delete = vec![version_id.to_string()];
     if payload.cascade_dependents {
-        let scan = scan_installed_versions(&mc_dir);
+        let scan = installed_versions_scan(&snapshot.snapshot);
         if scan.is_degraded() {
             return Err(version_scan_degraded_response());
         }
@@ -278,15 +303,13 @@ pub async fn delete_version(
     let mut deleted = Vec::new();
     if payload.cascade_dependents {
         for id in to_delete.iter().filter(|id| id.as_str() != version_id) {
-            fs::remove_dir_all(versions_dir(&mc_dir).join(id))
-                .map_err(version_delete_error_response)?;
+            remove_version_dir(state, versions_dir(&mc_dir).join(id))?;
             deleted.push(id.clone());
         }
     }
 
-    fs::remove_dir_all(&version_dir).map_err(version_delete_error_response)?;
+    remove_version_dir(state, version_dir)?;
     deleted.push(version_id.to_string());
-    invalidate_create_view_installed_scan();
 
     let affected_instances = state
         .instances()
@@ -311,6 +334,32 @@ fn version_library_dir(state: &AppState) -> Result<PathBuf, (StatusCode, Json<se
         ));
     };
     Ok(PathBuf::from(mc_dir))
+}
+
+fn version_library_not_configured_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::PRECONDITION_FAILED,
+        Json(serde_json::json!({ "error": "Axial library is not configured" })),
+    )
+}
+
+fn remove_version_dir(
+    state: &AppState,
+    path: PathBuf,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let result = fs::remove_dir_all(path).map_err(version_delete_error_response);
+    state.invalidate_installed_versions();
+    result
+}
+
+pub(crate) fn installed_versions_scan(
+    snapshot: &InstalledVersionsSnapshot,
+) -> InstalledVersionsScan {
+    let report = snapshot.report();
+    InstalledVersionsScan {
+        view_model: version_scan_view_model(report),
+        versions: report.versions.clone(),
+    }
 }
 
 pub(crate) fn scan_installed_versions(mc_dir: &FsPath) -> InstalledVersionsScan {

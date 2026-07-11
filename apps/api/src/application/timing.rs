@@ -12,6 +12,8 @@ pub(crate) struct InstancesListTiming {
     pub version_count: usize,
     pub instance_count: usize,
     pub degraded: bool,
+    pub scan_source: &'static str,
+    pub refresh_count: u32,
 }
 
 pub(crate) fn trace_instances_list(timing: InstancesListTiming) {
@@ -24,6 +26,8 @@ pub(crate) fn trace_instances_list(timing: InstancesListTiming) {
         version_count = timing.version_count,
         instance_count = timing.instance_count,
         degraded = timing.degraded,
+        installed_versions_source = timing.scan_source,
+        installed_versions_refresh_count = timing.refresh_count,
         "instances list timing"
     );
 }
@@ -36,7 +40,8 @@ pub(crate) struct CreateViewTiming<'a> {
     pub policy: Duration,
     pub version_count: usize,
     pub source_cache_hit: bool,
-    pub scan_cache_hit: bool,
+    pub scan_source: &'static str,
+    pub refresh_count: u32,
 }
 
 pub(crate) fn trace_create_view(timing: CreateViewTiming<'_>) {
@@ -50,7 +55,8 @@ pub(crate) fn trace_create_view(timing: CreateViewTiming<'_>) {
         policy_ms = ms(timing.policy),
         version_count = timing.version_count,
         source_cache_hit = timing.source_cache_hit,
-        scan_cache_hit = timing.scan_cache_hit,
+        installed_versions_source = timing.scan_source,
+        installed_versions_refresh_count = timing.refresh_count,
         "create view timing"
     );
 }

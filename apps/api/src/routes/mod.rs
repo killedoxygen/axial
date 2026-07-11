@@ -19,7 +19,7 @@ mod update;
 mod version_info;
 mod versions;
 
-use crate::state::{AppState, RequestLease};
+use crate::state::{AppState, LifecycleAdmissionError, RequestLease};
 use axum::{
     Json, Router,
     body::Body,
@@ -88,6 +88,15 @@ fn hold_request_lease(mut response: Response, lease: RequestLease) -> Response {
         frame
     }));
     response
+}
+
+pub(super) fn producer_claim_error_response(
+    _error: LifecycleAdmissionError,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": "application shutdown is in progress" })),
+    )
 }
 
 fn local_cors_layer() -> CorsLayer {

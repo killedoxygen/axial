@@ -1,5 +1,4 @@
 use super::create::CreateStaticVersionRow;
-use crate::application::version::InstalledVersionsScan;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -8,7 +7,6 @@ use std::{
 };
 
 const CREATE_SOURCE_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
-const INSTALLED_SCAN_CACHE_TTL: Duration = Duration::from_secs(30);
 
 static CREATE_VIEW_CACHE: LazyLock<Mutex<CreateViewCache>> =
     LazyLock::new(|| Mutex::new(CreateViewCache::default()));
@@ -25,16 +23,9 @@ struct CreateSourceCacheEntry {
     cached_at: Instant,
 }
 
-#[derive(Clone, Debug)]
-struct InstalledScanCacheEntry {
-    scan: InstalledVersionsScan,
-    cached_at: Instant,
-}
-
 #[derive(Default)]
 struct CreateViewCache {
     source_rows: HashMap<CreateSourceCacheKey, CreateSourceCacheEntry>,
-    installed_scans: HashMap<PathBuf, InstalledScanCacheEntry>,
 }
 
 pub(super) fn cached_source_rows(
@@ -73,33 +64,9 @@ pub(super) fn store_source_rows(
     );
 }
 
-pub(super) fn cached_installed_scan(library_dir: &Path) -> Option<InstalledVersionsScan> {
-    let mut cache = CREATE_VIEW_CACHE.lock().ok()?;
-    cache.prune_expired();
-    cache
-        .installed_scans
-        .get(library_dir)
-        .map(|entry| entry.scan.clone())
-}
-
-pub(super) fn store_installed_scan(library_dir: &Path, scan: InstalledVersionsScan) {
-    let Ok(mut cache) = CREATE_VIEW_CACHE.lock() else {
-        return;
-    };
-    cache.prune_expired();
-    cache.installed_scans.insert(
-        library_dir.to_path_buf(),
-        InstalledScanCacheEntry {
-            scan,
-            cached_at: Instant::now(),
-        },
-    );
-}
-
 pub(crate) fn invalidate_create_view_cache() {
     if let Ok(mut cache) = CREATE_VIEW_CACHE.lock() {
         cache.source_rows.clear();
-        cache.installed_scans.clear();
     }
 }
 
@@ -109,12 +76,6 @@ pub(crate) fn invalidate_create_view_source(library_dir: &Path, source_id: &str)
             library_dir: library_dir.to_path_buf(),
             source_id: source_id.to_string(),
         });
-    }
-}
-
-pub(crate) fn invalidate_create_view_installed_scan() {
-    if let Ok(mut cache) = CREATE_VIEW_CACHE.lock() {
-        cache.installed_scans.clear();
     }
 }
 
@@ -128,7 +89,5 @@ impl CreateViewCache {
         let now = Instant::now();
         self.source_rows
             .retain(|_, entry| now.duration_since(entry.cached_at) <= CREATE_SOURCE_CACHE_TTL);
-        self.installed_scans
-            .retain(|_, entry| now.duration_since(entry.cached_at) <= INSTALLED_SCAN_CACHE_TTL);
     }
 }

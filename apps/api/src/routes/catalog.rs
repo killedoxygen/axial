@@ -1,6 +1,11 @@
 use crate::application::{self, CatalogResponse};
-use crate::state::AppState;
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use crate::state::{AppState, RequestProducerHandoff};
+use axum::{
+    Json, Router,
+    extract::{Extension, State},
+    http::StatusCode,
+    routing::get,
+};
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/api/v1/catalog", get(handle_catalog))
@@ -8,6 +13,10 @@ pub fn router() -> Router<AppState> {
 
 async fn handle_catalog(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
 ) -> Result<Json<CatalogResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::catalog(&state).await.map(Json)
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
+    application::catalog(&state, &producer).await.map(Json)
 }

@@ -1,9 +1,6 @@
 use super::{
     InstanceWriteOperation,
-    create_cache::{
-        cached_installed_scan, cached_source_rows, invalidate_create_view_source,
-        store_installed_scan, store_source_rows,
-    },
+    create_cache::{cached_source_rows, invalidate_create_view_source, store_source_rows},
     create_policy::{
         LoaderBuildSelectionError, evaluate_create_view_loader_version_policies,
         loader_build_is_known_incompatible_default, loader_build_is_unstable_default,
@@ -16,7 +13,7 @@ use super::{
 use crate::application::install::InstallQueueInstallItemViewModel;
 use crate::application::timing::{CreateViewTiming, trace_create_view};
 use crate::application::version::{
-    VERSION_SCAN_DEGRADED_MESSAGE, scan_installed_versions, version_scan_degraded_response,
+    VERSION_SCAN_DEGRADED_MESSAGE, installed_versions_scan, version_scan_degraded_response,
 };
 use crate::application::{
     CommandResult, CommandResultCarriers, CreateInstancePayload, InstallQueueRequest,
@@ -27,9 +24,9 @@ use crate::guardian::{
     normalize_create_jvm_preset,
 };
 use crate::observability::telemetry::TelemetryEvent;
-use crate::state::RequestProducerHandoff;
 use crate::state::contracts::{CommandKind, OperationId, OperationStatus};
 use crate::state::{AppState, new_instance};
+use crate::state::{ProducerLease, RequestProducerHandoff};
 use axial_config::{EnrichedInstance, Instance, generate_instance_id};
 use axial_launcher::{
     GuardianMode, LaunchReadinessReasonId, LaunchReadinessRequest, LaunchReadinessSeverity,
@@ -212,7 +209,8 @@ struct CreateVersionRowsResult {
     catalog_elapsed: Duration,
     policy_elapsed: Duration,
     source_cache_hit: bool,
-    scan_cache_hit: bool,
+    scan_source: &'static str,
+    refresh_count: u32,
 }
 
 impl CreateVersionRowsResult {
@@ -223,7 +221,8 @@ impl CreateVersionRowsResult {
             catalog_elapsed: Duration::ZERO,
             policy_elapsed: Duration::ZERO,
             source_cache_hit: false,
-            scan_cache_hit: false,
+            scan_source: "none",
+            refresh_count: 0,
         }
     }
 }
@@ -284,6 +283,7 @@ impl Deref for CreateInstanceResponse {
 
 pub(crate) async fn handle_create_instance_view(
     state: &AppState,
+    producer: &ProducerLease,
     source_id: Option<&str>,
 ) -> CreateInstanceViewResponse {
     let started_at = Instant::now();
@@ -300,7 +300,8 @@ pub(crate) async fn handle_create_instance_view(
         });
     }
     let requested_source = normalize_create_view_source(source_id);
-    let row_result = create_version_rows(state, requested_source.as_deref(), &mut notices).await;
+    let row_result =
+        create_version_rows(state, producer, requested_source.as_deref(), &mut notices).await;
     let versions = row_result.rows;
     let unavailable_sources = unavailable_source_ids(&notices);
     trace_create_view(CreateViewTiming {
@@ -311,7 +312,8 @@ pub(crate) async fn handle_create_instance_view(
         policy: row_result.policy_elapsed,
         version_count: versions.len(),
         source_cache_hit: row_result.source_cache_hit,
-        scan_cache_hit: row_result.scan_cache_hit,
+        scan_source: row_result.scan_source,
+        refresh_count: row_result.refresh_count,
     });
 
     CreateInstanceViewResponse {
@@ -343,6 +345,7 @@ fn create_optimize_option() -> CreateOptimizeOptionViewModel {
 
 pub(crate) async fn handle_create_loader_builds_view(
     state: &AppState,
+    producer: &ProducerLease,
     source_id: &str,
     minecraft_version: &str,
 ) -> Result<CreateLoaderBuildsViewResponse, (StatusCode, Json<serde_json::Value>)> {
@@ -356,14 +359,15 @@ pub(crate) async fn handle_create_loader_builds_view(
     if minecraft_version.is_empty() {
         return Err(bad_create_request("minecraft_version is required"));
     }
-    let library_dir = state
-        .library_dir()
-        .map(PathBuf::from)
+    let installed_lookup = state
+        .installed_versions_snapshot(producer)
+        .await
         .ok_or_else(library_not_configured_response)?;
+    let library_dir = installed_lookup.library_dir().to_path_buf();
     let (builds, catalog) = fetch_builds(library_dir.as_path(), component_id, minecraft_version)
         .await
         .map_err(loader_error_response)?;
-    let installed_scan = scan_current_versions(state);
+    let installed_scan = installed_versions_scan(&installed_lookup.snapshot);
     if installed_scan.is_degraded() {
         return Err(version_scan_degraded_response());
     }
@@ -996,16 +1000,25 @@ fn create_channel_options() -> Vec<CreateInstanceSourceOptionViewModel> {
 
 async fn create_version_rows(
     state: &AppState,
+    producer: &ProducerLease,
     source_id: Option<&str>,
     notices: &mut Vec<CreateInstanceNoticeViewModel>,
 ) -> CreateVersionRowsResult {
-    let Some(library_dir) = state.library_dir().map(PathBuf::from) else {
+    let scan_started = Instant::now();
+    let Some(installed_lookup) = state.installed_versions_snapshot(producer).await else {
         return CreateVersionRowsResult::empty();
     };
-
-    let scan_started = Instant::now();
-    let (installed_scan, scan_cache_hit) = create_view_installed_scan(&library_dir);
+    let library_dir = installed_lookup.library_dir().to_path_buf();
+    let scan_source = installed_lookup.source.as_str();
+    let refresh_count = installed_lookup.refresh_count;
+    let installed_scan = installed_versions_scan(&installed_lookup.snapshot);
     let scan_elapsed = scan_started.elapsed();
+    let scan_baseline = || CreateVersionRowsResult {
+        scan_elapsed,
+        scan_source,
+        refresh_count,
+        ..CreateVersionRowsResult::empty()
+    };
     if installed_scan.is_degraded() {
         notices.push(CreateInstanceNoticeViewModel {
             state_id: "library_scan_degraded".to_string(),
@@ -1013,11 +1026,7 @@ async fn create_version_rows(
             message: "Installed versions are unavailable".to_string(),
             detail: Some(VERSION_SCAN_DEGRADED_MESSAGE.to_string()),
         });
-        return CreateVersionRowsResult {
-            scan_elapsed,
-            scan_cache_hit,
-            ..CreateVersionRowsResult::empty()
-        };
+        return CreateVersionRowsResult { ..scan_baseline() };
     }
 
     let installed_versions = installed_scan.versions;
@@ -1034,10 +1043,8 @@ async fn create_version_rows(
                 &loader_build_installed,
                 &loader_installed,
             ),
-            scan_elapsed,
             source_cache_hit: true,
-            scan_cache_hit,
-            ..CreateVersionRowsResult::empty()
+            ..scan_baseline()
         };
     }
 
@@ -1059,11 +1066,9 @@ async fn create_version_rows(
                     detail: Some("Check your connection and try again.".to_string()),
                 });
                 return CreateVersionRowsResult {
-                    scan_elapsed,
                     catalog_elapsed,
                     policy_elapsed,
-                    scan_cache_hit,
-                    ..CreateVersionRowsResult::empty()
+                    ..scan_baseline()
                 };
             }
         };
@@ -1096,11 +1101,9 @@ async fn create_version_rows(
                 &loader_build_installed,
                 &loader_installed,
             ),
-            scan_elapsed,
             catalog_elapsed,
             policy_elapsed,
-            scan_cache_hit,
-            ..CreateVersionRowsResult::empty()
+            ..scan_baseline()
         };
     }
 
@@ -1145,11 +1148,9 @@ async fn create_version_rows(
                     detail: Some("Check your connection and try again.".to_string()),
                 });
                 return CreateVersionRowsResult {
-                    scan_elapsed,
                     catalog_elapsed,
                     policy_elapsed,
-                    scan_cache_hit,
-                    ..CreateVersionRowsResult::empty()
+                    ..scan_baseline()
                 };
             }
         }
@@ -1163,11 +1164,9 @@ async fn create_version_rows(
             &loader_build_installed,
             &loader_installed,
         ),
-        scan_elapsed,
         catalog_elapsed,
         policy_elapsed,
-        scan_cache_hit,
-        ..CreateVersionRowsResult::empty()
+        ..scan_baseline()
     }
 }
 
@@ -1195,17 +1194,6 @@ fn store_cacheable_source_rows(
 
 fn source_rows_are_cacheable(rows: &[CreateStaticVersionRow]) -> bool {
     rows.iter().all(|row| !row.fresh_catalog_required)
-}
-
-fn create_view_installed_scan(
-    library_dir: &Path,
-) -> (crate::application::version::InstalledVersionsScan, bool) {
-    if let Some(scan) = cached_installed_scan(library_dir) {
-        return (scan, true);
-    }
-    let scan = scan_installed_versions(library_dir);
-    store_installed_scan(library_dir, scan.clone());
-    (scan, false)
 }
 
 #[allow(clippy::too_many_arguments)]

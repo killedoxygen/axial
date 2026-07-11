@@ -33,6 +33,7 @@ pub async fn setup_init(state: &AppState) -> Result<SetupLibraryResponse, ApiErr
         })
         .await
         .map_err(setup_config_error)?;
+    state.invalidate_installed_versions();
     invalidate_create_view_cache();
 
     Ok(SetupLibraryResponse {

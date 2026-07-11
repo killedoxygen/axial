@@ -13,7 +13,6 @@ mod repair;
 mod stream;
 
 use super::InstallVersionCommand;
-use crate::application::instances::invalidate_create_view_installed_scan;
 use crate::guardian::{GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus};
 use crate::observability::{
     operation_journal_proof_record,
@@ -1061,7 +1060,7 @@ fn spawn_install_queue_monitor_owned(state: AppState, install_id: String, produc
         let mut shutdown = state.subscribe_shutdown();
         loop {
             wait_for_install_terminal(&state, &install_id).await;
-            invalidate_create_view_installed_scan();
+            state.invalidate_installed_versions();
             state
                 .installs()
                 .clear_active_queued_install(&install_id)

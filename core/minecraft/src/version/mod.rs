@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::time::SystemTime;
 
 const LOADER_METADATA_FILE: &str = ".axial-loader.json";
 
@@ -17,6 +18,225 @@ pub struct VersionScanReport {
     pub versions: Vec<VersionEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<VersionScanIssue>,
+}
+
+pub struct VersionScanSnapshot {
+    pub report: VersionScanReport,
+    dependencies: VersionScanDependencyStamp,
+}
+
+impl VersionScanSnapshot {
+    pub fn dependencies(&self) -> &VersionScanDependencyStamp {
+        &self.dependencies
+    }
+}
+
+#[derive(Clone)]
+pub struct VersionScanDependencyStamp {
+    observations: Vec<DependencyObservation>,
+    revalidatable: bool,
+}
+
+impl VersionScanDependencyStamp {
+    pub fn is_revalidated(&self) -> bool {
+        self.revalidatable
+            && self
+                .observations
+                .iter()
+                .all(DependencyObservation::is_revalidated)
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct DependencyObservation {
+    path: std::path::PathBuf,
+    link: DependencyMetadata,
+    target: Option<DependencyMetadata>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DependencyMetadata {
+    Missing,
+    Present {
+        kind: DependencyKind,
+        modified: SystemTime,
+        len: u64,
+        readonly: bool,
+        mode: u32,
+    },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DependencyKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Default)]
+struct DependencyTracker {
+    observations: Vec<DependencyObservation>,
+    revalidatable: bool,
+}
+
+impl DependencyTracker {
+    fn new() -> Self {
+        Self {
+            observations: Vec::new(),
+            revalidatable: true,
+        }
+    }
+
+    fn begin(&mut self, path: &Path) -> Option<DependencyObservation> {
+        let observation = DependencyObservation::capture(path);
+        if observation.is_none() {
+            self.revalidatable = false;
+        }
+        observation
+    }
+
+    fn finish(&mut self, path: &Path, before: Option<DependencyObservation>) {
+        let after = DependencyObservation::capture(path);
+        match (before, after) {
+            (Some(before), Some(after)) if before == after => self.observations.push(after),
+            (Some(before), Some(after)) => {
+                self.revalidatable = false;
+                self.observations.extend([before, after]);
+            }
+            (Some(before), None) => {
+                self.revalidatable = false;
+                self.observations.push(before);
+            }
+            (None, Some(after)) => {
+                self.revalidatable = false;
+                self.observations.push(after);
+            }
+            (None, None) => self.revalidatable = false,
+        }
+    }
+
+    fn read_to_string(&mut self, path: &Path) -> io::Result<String> {
+        let before = self.begin(path);
+        let result = fs::read_to_string(path);
+        self.finish(path, before);
+        result
+    }
+
+    fn read(&mut self, path: &Path) -> io::Result<Vec<u8>> {
+        let before = self.begin(path);
+        let result = fs::read(path);
+        self.finish(path, before);
+        result
+    }
+
+    fn is_dir(&mut self, path: &Path) -> bool {
+        self.observe_kind(path) == Some(DependencyKind::Directory)
+    }
+
+    fn is_file(&mut self, path: &Path) -> bool {
+        self.observe_kind(path) == Some(DependencyKind::File)
+    }
+
+    fn exists(&mut self, path: &Path) -> bool {
+        self.observe_kind(path).is_some()
+    }
+
+    fn mark_unrevalidatable(&mut self) {
+        self.revalidatable = false;
+    }
+
+    fn observe_kind(&mut self, path: &Path) -> Option<DependencyKind> {
+        match DependencyObservation::capture(path) {
+            Some(observation) => {
+                let kind = observation.effective_kind();
+                self.observations.push(observation);
+                kind
+            }
+            None => {
+                self.revalidatable = false;
+                None
+            }
+        }
+    }
+
+    fn into_stamp(self) -> VersionScanDependencyStamp {
+        VersionScanDependencyStamp {
+            observations: self.observations,
+            revalidatable: self.revalidatable,
+        }
+    }
+}
+
+impl DependencyObservation {
+    fn capture(path: &Path) -> Option<Self> {
+        let link = capture_dependency_metadata(path, false)?;
+        let target = if matches!(
+            link,
+            DependencyMetadata::Present {
+                kind: DependencyKind::Symlink,
+                ..
+            }
+        ) {
+            Some(capture_dependency_metadata(path, true)?)
+        } else {
+            None
+        };
+        Some(Self {
+            path: path.to_path_buf(),
+            link,
+            target,
+        })
+    }
+
+    fn is_revalidated(&self) -> bool {
+        Self::capture(&self.path).is_some_and(|current| current == *self)
+    }
+
+    fn effective_kind(&self) -> Option<DependencyKind> {
+        match self.target.unwrap_or(self.link) {
+            DependencyMetadata::Missing => None,
+            DependencyMetadata::Present { kind, .. } => Some(kind),
+        }
+    }
+}
+
+fn capture_dependency_metadata(path: &Path, follow: bool) -> Option<DependencyMetadata> {
+    let result = if follow {
+        fs::metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    };
+    match result {
+        Ok(metadata) => Some(DependencyMetadata::Present {
+            kind: if !follow && metadata.file_type().is_symlink() {
+                DependencyKind::Symlink
+            } else if metadata.is_file() {
+                DependencyKind::File
+            } else if metadata.is_dir() {
+                DependencyKind::Directory
+            } else {
+                DependencyKind::Other
+            },
+            modified: metadata.modified().ok()?,
+            len: metadata.len(),
+            readonly: metadata.permissions().readonly(),
+            mode: dependency_mode(&metadata),
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(DependencyMetadata::Missing),
+        Err(_) => None,
+    }
+}
+
+#[cfg(unix)]
+fn dependency_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn dependency_mode(_metadata: &fs::Metadata) -> u32 {
+    0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,25 +306,39 @@ pub fn scan_versions(mc_dir: &Path) -> io::Result<Vec<VersionEntry>> {
 }
 
 pub fn scan_versions_report(mc_dir: &Path) -> io::Result<VersionScanReport> {
+    scan_versions_snapshot(mc_dir).map(|snapshot| snapshot.report)
+}
+
+pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> {
     let versions_dir = versions_dir(mc_dir);
+    let mut dependencies = DependencyTracker::new();
+    let versions_root_before = dependencies.begin(&versions_dir);
     let entries = match fs::read_dir(&versions_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(VersionScanReport {
-                state: VersionScanState::Empty,
-                versions: Vec::new(),
-                issues: Vec::new(),
-            });
+            dependencies.finish(&versions_dir, versions_root_before);
+            return Ok(finish_scan_snapshot(
+                VersionScanReport {
+                    state: VersionScanState::Empty,
+                    versions: Vec::new(),
+                    issues: Vec::new(),
+                },
+                dependencies,
+            ));
         }
         Err(_) => {
-            return Ok(VersionScanReport {
-                state: VersionScanState::Degraded,
-                versions: Vec::new(),
-                issues: vec![version_scan_issue(
-                    VersionScanIssueKind::VersionsDirectoryUnreadable,
-                    None,
-                )],
-            });
+            dependencies.finish(&versions_dir, versions_root_before);
+            return Ok(finish_scan_snapshot(
+                VersionScanReport {
+                    state: VersionScanState::Degraded,
+                    versions: Vec::new(),
+                    issues: vec![version_scan_issue(
+                        VersionScanIssueKind::VersionsDirectoryUnreadable,
+                        None,
+                    )],
+                },
+                dependencies,
+            ));
         }
     };
     let mut stubs = HashMap::new();
@@ -115,6 +349,7 @@ pub fn scan_versions_report(mc_dir: &Path) -> io::Result<VersionScanReport> {
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => {
+                dependencies.mark_unrevalidatable();
                 issues.push(version_scan_issue(
                     VersionScanIssueKind::VersionDirectoryEntryUnreadable,
                     None,
@@ -122,20 +357,22 @@ pub fn scan_versions_report(mc_dir: &Path) -> io::Result<VersionScanReport> {
                 continue;
             }
         };
-        if !entry.path().is_dir() {
+        let entry_path = entry.path();
+        let is_dir = dependencies.is_dir(&entry_path);
+        if !is_dir {
             continue;
         }
         let id = entry.file_name().to_string_lossy().to_string();
-        let json_path = entry.path().join(format!("{id}.json"));
-        let data = match fs::read_to_string(&json_path) {
+        let json_path = entry_path.join(format!("{id}.json"));
+        let data_result = dependencies.read_to_string(&json_path);
+        let data = match data_result {
             Ok(data) => data,
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    && entry.path().join(".incomplete").exists() =>
-            {
-                continue;
-            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let incomplete_marker = entry_path.join(".incomplete");
+                let incomplete = dependencies.exists(&incomplete_marker);
+                if incomplete {
+                    continue;
+                }
                 issues.push(version_scan_issue(
                     VersionScanIssueKind::VersionJsonMissing,
                     Some(id),
@@ -160,7 +397,7 @@ pub fn scan_versions_report(mc_dir: &Path) -> io::Result<VersionScanReport> {
                 continue;
             }
         };
-        match read_installed_loader_metadata(&entry.path()) {
+        match read_installed_loader_metadata(&entry_path, &mut dependencies) {
             LoaderMetadataScan::Ready(metadata) => {
                 loader_metadata.insert(id.clone(), metadata);
             }
@@ -185,7 +422,8 @@ pub fn scan_versions_report(mc_dir: &Path) -> io::Result<VersionScanReport> {
         let incomplete_marker = versions_dir.join(id).join(".incomplete");
 
         let resolved_java = resolve_java_version(id, &stubs, &loader_metadata);
-        let (launchable, status, status_detail, needs_install) = if incomplete_marker.exists() {
+        let incomplete = dependencies.exists(&incomplete_marker);
+        let (launchable, status, status_detail, needs_install) = if incomplete {
             (
                 false,
                 "incomplete".to_string(),
@@ -193,7 +431,8 @@ pub fn scan_versions_report(mc_dir: &Path) -> io::Result<VersionScanReport> {
                 id.clone(),
             )
         } else if effective_parent.is_empty() {
-            if jar_path.is_file() {
+            let jar_ready = dependencies.is_file(&jar_path);
+            if jar_ready {
                 (true, "ready".to_string(), String::new(), String::new())
             } else {
                 (
@@ -211,31 +450,38 @@ pub fn scan_versions_report(mc_dir: &Path) -> io::Result<VersionScanReport> {
                 .join(&effective_parent)
                 .join(format!("{}.jar", effective_parent));
             let child_has_client_artifact = stub.downloads.client.is_some();
-            if !parent_json.is_file() {
+            let parent_json_ready = dependencies.is_file(&parent_json);
+            if !parent_json_ready {
                 (
                     false,
                     "incomplete".to_string(),
                     format!("Base version {} needs to be installed", effective_parent),
                     effective_parent.clone(),
                 )
-            } else if child_has_client_artifact && !jar_path.is_file() {
-                (
-                    false,
-                    "incomplete".to_string(),
-                    "Game files not fully downloaded".to_string(),
-                    id.clone(),
-                )
-            } else if jar_path.is_file() {
-                (true, "ready".to_string(), String::new(), String::new())
-            } else if !parent_jar.is_file() {
-                (
-                    false,
-                    "incomplete".to_string(),
-                    format!("Base version {} needs to be downloaded", effective_parent),
-                    effective_parent.clone(),
-                )
             } else {
-                (true, "ready".to_string(), String::new(), String::new())
+                let jar_ready = dependencies.is_file(&jar_path);
+                if child_has_client_artifact && !jar_ready {
+                    (
+                        false,
+                        "incomplete".to_string(),
+                        "Game files not fully downloaded".to_string(),
+                        id.clone(),
+                    )
+                } else if jar_ready {
+                    (true, "ready".to_string(), String::new(), String::new())
+                } else {
+                    let parent_jar_ready = dependencies.is_file(&parent_jar);
+                    if !parent_jar_ready {
+                        (
+                            false,
+                            "incomplete".to_string(),
+                            format!("Base version {} needs to be downloaded", effective_parent),
+                            effective_parent.clone(),
+                        )
+                    } else {
+                        (true, "ready".to_string(), String::new(), String::new())
+                    }
+                }
             }
         };
 
@@ -282,11 +528,25 @@ pub fn scan_versions_report(mc_dir: &Path) -> io::Result<VersionScanReport> {
     } else {
         VersionScanState::Ready
     };
-    Ok(VersionScanReport {
-        state,
-        versions,
-        issues,
-    })
+    dependencies.finish(&versions_dir, versions_root_before);
+    Ok(finish_scan_snapshot(
+        VersionScanReport {
+            state,
+            versions,
+            issues,
+        },
+        dependencies,
+    ))
+}
+
+fn finish_scan_snapshot(
+    report: VersionScanReport,
+    dependencies: DependencyTracker,
+) -> VersionScanSnapshot {
+    VersionScanSnapshot {
+        report,
+        dependencies: dependencies.into_stamp(),
+    }
 }
 
 fn resolve_java_version(
@@ -355,8 +615,13 @@ enum LoaderMetadataScan {
     Malformed,
 }
 
-fn read_installed_loader_metadata(version_dir: &Path) -> LoaderMetadataScan {
-    let data = match fs::read(version_dir.join(LOADER_METADATA_FILE)) {
+fn read_installed_loader_metadata(
+    version_dir: &Path,
+    dependencies: &mut DependencyTracker,
+) -> LoaderMetadataScan {
+    let path = version_dir.join(LOADER_METADATA_FILE);
+    let result = dependencies.read(&path);
+    let data = match result {
         Ok(data) => data,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return LoaderMetadataScan::Missing;

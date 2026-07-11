@@ -6,6 +6,7 @@ pub mod benchmark_suites;
 mod config;
 pub mod contracts;
 pub mod failure_memory;
+mod installed_versions;
 mod installs;
 mod instance_lifecycle;
 mod instance_registry;
@@ -53,6 +54,7 @@ pub use auth_logins::{
 };
 pub use config::AppConfigStore;
 pub use failure_memory::GuardianFailureMemoryStore;
+pub(crate) use installed_versions::{InstalledVersionsLookup, InstalledVersionsSnapshot};
 pub(crate) use installs::InstallInitializationStatus;
 pub use installs::{
     ActiveQueuedInstallEntry, InstallProgressRecord, InstallQueueEnqueueOutcome,
@@ -100,6 +102,7 @@ pub struct AppState {
     installs: Arc<InstallStore>,
     failure_memory: Arc<GuardianFailureMemoryStore>,
     journals: Arc<OperationJournalStore>,
+    installed_versions: Arc<installed_versions::InstalledVersionsIndex>,
     java_probe_failures: Arc<JavaProbeFailureCache>,
     sessions: Arc<SessionStore>,
     skins: Arc<skins::SavedSkinStore>,
@@ -295,6 +298,7 @@ impl AppState {
             installs: init.installs,
             failure_memory,
             journals,
+            installed_versions: Arc::new(installed_versions::InstalledVersionsIndex::default()),
             java_probe_failures: Arc::new(JavaProbeFailureCache::default()),
             sessions: init.sessions,
             skins,
@@ -374,6 +378,23 @@ impl AppState {
 
     pub fn journals(&self) -> &Arc<OperationJournalStore> {
         &self.journals
+    }
+
+    pub(crate) async fn installed_versions_snapshot(
+        &self,
+        producer: &ProducerLease,
+    ) -> Option<InstalledVersionsLookup> {
+        let library_dir = self.library_dir().map(PathBuf::from)?;
+        Some(self.installed_versions.lookup(library_dir, producer).await)
+    }
+
+    pub(crate) fn invalidate_installed_versions(&self) {
+        self.installed_versions.invalidate();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn installed_versions_walk_count(&self) -> usize {
+        self.installed_versions.walk_count()
     }
 
     pub(crate) fn java_probe_failures(&self) -> &Arc<JavaProbeFailureCache> {

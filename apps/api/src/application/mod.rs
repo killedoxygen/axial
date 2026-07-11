@@ -115,8 +115,10 @@ pub use telemetry::{FrontendErrorReportRequest, report_frontend_error};
 pub use update::{UpdateResponse, update_status};
 pub use version::{
     CatalogEntry, CatalogResponse, DeleteVersionRequest, SharedDataInfo, VersionInfoResponse,
-    VersionsResponse, WorldInfo, catalog, delete_version, installed_versions,
-    installed_versions_event_payload, open_version_folder, version_info,
+    VersionsResponse, WorldInfo, open_version_folder,
+};
+pub(crate) use version::{
+    catalog, delete_version, installed_versions, installed_versions_event_payload, version_info,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
