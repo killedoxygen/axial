@@ -784,7 +784,6 @@ async fn settle_process_exit(
     let should_collect_crash = should_collect_crash_artifact(
         requested_cause,
         output_processor_error.is_some(),
-        !exit_context.observed_failures.is_empty(),
         status.as_ref().map_or(true, |status| !status.success()),
     );
     let crash_evidence = if should_collect_crash {
@@ -888,10 +887,9 @@ async fn settle_process_exit(
 fn should_collect_crash_artifact(
     requested_cause: Option<ProcessTerminalCause>,
     output_processor_failed: bool,
-    observed_failures: bool,
     process_failed: bool,
 ) -> bool {
-    requested_cause.is_none() && (output_processor_failed || observed_failures || process_failed)
+    requested_cause.is_none() && (output_processor_failed || process_failed)
 }
 
 async fn settle_watchdog_exit(
@@ -993,7 +991,10 @@ where
 mod tests {
     use super::super::test_record;
     use super::*;
-    use axial_launcher::{LaunchFailure, LaunchFailureClass, LaunchSessionOutcome};
+    use axial_launcher::{
+        LaunchEvent, LaunchFailure, LaunchFailureClass, LaunchSessionOutcome,
+        LaunchSessionOutcomeKind,
+    };
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
@@ -1001,24 +1002,88 @@ mod tests {
 
     #[test]
     fn crash_collection_is_limited_to_natural_failure_candidates() {
-        assert!(should_collect_crash_artifact(None, false, false, true));
-        assert!(should_collect_crash_artifact(None, true, false, false));
-        assert!(should_collect_crash_artifact(None, false, true, false));
-        assert!(!should_collect_crash_artifact(None, false, false, false));
-        for cause in [
-            ProcessTerminalCause::UserStop,
-            ProcessTerminalCause::StartupWatchdog,
-            ProcessTerminalCause::LaunchFailure,
-            ProcessTerminalCause::Replacement,
-            ProcessTerminalCause::Shutdown,
+        for requested_cause in [
+            None,
+            Some(ProcessTerminalCause::UserStop),
+            Some(ProcessTerminalCause::StartupWatchdog),
+            Some(ProcessTerminalCause::LaunchFailure),
+            Some(ProcessTerminalCause::Replacement),
+            Some(ProcessTerminalCause::Shutdown),
         ] {
-            assert!(!should_collect_crash_artifact(
-                Some(cause),
-                true,
-                true,
-                true
-            ));
+            for output_processor_failed in [false, true] {
+                for process_failed in [false, true] {
+                    assert_eq!(
+                        should_collect_crash_artifact(
+                            requested_cause,
+                            output_processor_failed,
+                            process_failed,
+                        ),
+                        requested_cause.is_none() && (output_processor_failed || process_failed),
+                        "cause={requested_cause:?}, output={output_processor_failed}, process={process_failed}",
+                    );
+                }
+            }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_exit_with_fresh_failure_log_does_not_attach_crash_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-clean-exit-evidence-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let reports = root.join("crash-reports");
+        std::fs::create_dir_all(&reports).expect("create crash report directory");
+
+        let store = Arc::new(SessionStore::new());
+        let session_id = "clean-exit-with-fresh-failure-log";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Starting;
+        store.insert(record.clone()).await.expect("insert session");
+        let mut events = store.subscribe(session_id).await.expect("subscribe");
+        let mut command = Command::new("sh");
+        command
+            .current_dir(&root)
+            .arg("-c")
+            .arg(
+                "printf '%s\\n' '[Render thread/INFO]: LWJGL Version: 3.3.3' >&2; printf '%s\\n' 'Description: Rendering game' 'java.lang.OutOfMemoryError: Java heap space' > crash-reports/crash-clean.txt; printf '%s\\n' 'Unrecognized VM option -XX:+UseZGC' >&2; exit 0",
+            );
+        store
+            .start_process(record, command)
+            .await
+            .expect("start process");
+
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let LaunchEvent::Status(status) = events.recv().await.expect("session event")
+                    && status.state == "exited"
+                {
+                    break status;
+                }
+            }
+        })
+        .await
+        .expect("terminal deadline");
+
+        assert_eq!(status.exit_code, Some(0));
+        assert_eq!(status.failure_class, None);
+        assert_eq!(status.crash_evidence, None);
+        assert!(reports.join("crash-clean.txt").is_file());
+        assert_eq!(
+            store.observed_failures(session_id).await,
+            vec![LaunchFailureClass::JvmUnsupportedOption]
+        );
+        let stored = store.get(session_id).await.expect("stored session");
+        assert!(stored.boot_completed_at_ms.is_some());
+        assert_eq!(stored.failure, None);
+        assert_eq!(stored.crash_evidence, None);
+        let outcome = stored.outcome.expect("clean session outcome");
+        assert_eq!(outcome.kind, LaunchSessionOutcomeKind::Clean);
+        assert_eq!(outcome.reason, LaunchSessionExitReason::ExternalUserClosed);
+
+        std::fs::remove_dir_all(root).expect("remove crash report directory");
     }
 
     #[cfg(unix)]
