@@ -41,7 +41,7 @@ use crate::application::timing::{
 };
 use crate::application::version::{
     InstalledVersionsScan, VERSION_SCAN_DEGRADED_MESSAGE, VersionScanViewModel,
-    installed_versions_scan, scan_installed_versions,
+    installed_versions_scan,
 };
 use crate::guardian::normalize_create_jvm_preset;
 use crate::state::{AppState, ProducerLease};
@@ -186,24 +186,6 @@ fn unconfigured_versions_scan() -> InstalledVersionsScan {
     }
 }
 
-pub(super) fn scan_current_versions(state: &AppState) -> InstalledVersionsScan {
-    state
-        .library_dir()
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .map(|path| scan_installed_versions(&path))
-        .unwrap_or_else(unconfigured_versions_scan)
-}
-
-fn enrich_instance_for_state(
-    state: &AppState,
-    instance: axial_config::Instance,
-) -> EnrichedInstance {
-    let scan = scan_current_versions(state);
-    let library_dir = state.library_dir().map(PathBuf::from);
-    enrich_instance_for_scan(state, instance, &scan, library_dir.as_deref())
-}
-
 async fn enrich_instance_for_state_indexed(
     state: &AppState,
     producer: &ProducerLease,
@@ -226,7 +208,7 @@ fn enrich_instances_for_state(
         .collect()
 }
 
-fn enrich_instance_for_scan(
+pub(super) fn enrich_instance_for_scan(
     state: &AppState,
     instance: axial_config::Instance,
     scan: &InstalledVersionsScan,

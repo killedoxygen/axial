@@ -2382,6 +2382,64 @@ async fn create_instance_installed_vanilla_selection_does_not_queue_install() {
 }
 
 #[tokio::test]
+async fn create_instance_vanilla_reuses_one_request_snapshot_without_warm_walks() {
+    let fixture = TestFixture::new("create-vanilla-shared-version-snapshot");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+
+    for name in ["Cold vanilla", "Warm vanilla"] {
+        let created = handle_create_instance(
+            &fixture.state,
+            CreateInstanceRequest {
+                name: name.to_string(),
+                selection_id: "vanilla|1.21.1".to_string(),
+                ..CreateInstanceRequest::default()
+            },
+        )
+        .await
+        .expect("create installed vanilla instance");
+
+        assert!(created.launchable);
+        assert!(created.install_queue.is_none());
+        assert_eq!(fixture.state.installed_versions_walk_count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn create_instance_loader_reuses_one_request_snapshot_without_warm_walks() {
+    let fixture = TestFixture::new("create-loader-shared-version-snapshot");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    write_installed_loader_version(
+        &library_dir,
+        axial_minecraft::LoaderComponentId::Fabric,
+        "1.21.1",
+        "0.16.14",
+    );
+    let build_id = write_fabric_loader_build_cache(&library_dir, "1.21.1", "0.16.14");
+
+    for name in ["Cold loader", "Warm loader"] {
+        let created = handle_create_instance(
+            &fixture.state,
+            CreateInstanceRequest {
+                name: name.to_string(),
+                selection_id: format!(
+                    "loader_build|{}|{build_id}",
+                    axial_minecraft::LoaderComponentId::Fabric.as_str()
+                ),
+                ..CreateInstanceRequest::default()
+            },
+        )
+        .await
+        .expect("create installed loader instance");
+
+        assert!(created.launchable);
+        assert!(created.install_queue.is_none());
+        assert_eq!(fixture.state.installed_versions_walk_count(), 1);
+    }
+}
+
+#[tokio::test]
 async fn create_instance_loader_selection_resolves_cached_build_and_queues_backend_install() {
     let fixture = TestFixture::new("create-loader-queue");
     let library_dir = fixture.root.join("library");

@@ -99,13 +99,13 @@ pub use performance::{
     PerformanceOperationStatusResponse, PerformancePlanRequest, PerformancePlanResponse,
     PerformanceRollbackListRequest, PerformanceRollbackListResponse,
     PerformanceRulesStatusResponse, PerformanceRuntimeDisplay, RefreshPerformanceRulesError,
-    SystemResourceResponse, performance_health, performance_instance_operation,
-    performance_operation_status, performance_plan, performance_plan_summary_view_model,
-    performance_rollback_list, performance_rules_status, refresh_performance_rules_error_response,
-    system_resource_status,
+    SystemResourceResponse, performance_instance_operation, performance_operation_status,
+    performance_plan, performance_plan_summary_view_model, performance_rollback_list,
+    performance_rules_status, refresh_performance_rules_error_response, system_resource_status,
 };
 pub(crate) use performance::{
-    performance_install, refresh_performance_rules, spawn_pending_performance_operations,
+    performance_health, performance_install, refresh_performance_rules,
+    spawn_pending_performance_operations,
 };
 pub use setup::{SetupLibraryResponse, SetupStatusResponse, onboarding_complete, setup_init};
 pub(crate) use skin::flush_pending_saved_skin_applies_for_launch;

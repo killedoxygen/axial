@@ -99,13 +99,18 @@ async fn handle_plan(
 
 async fn handle_health(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Query(query): Query<HealthQuery>,
 ) -> Result<Json<PerformanceHealthResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
     application::performance_health(
         &state,
         PerformanceHealthRequest {
             instance_id: query.instance_id,
         },
+        &producer,
     )
     .await
     .map(Json)

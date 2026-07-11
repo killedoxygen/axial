@@ -18,7 +18,8 @@ use crate::state::performance_operations::{
     PerformanceOperationStoreError, normalized_operation_timestamp, sanitize_operation_error,
 };
 use crate::state::{
-    AppState, DownloadProgress, OperationJournalStoreError, ProducerLease, RequestProducerHandoff,
+    AppState, DownloadProgress, InstalledVersionsSnapshot, OperationJournalStoreError,
+    ProducerLease, RequestProducerHandoff,
 };
 use axum::{Json, http::StatusCode};
 use serde::Serialize;
@@ -317,7 +318,7 @@ pub struct PerformanceOperationProgressViewModel {
     pub done: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct PerformanceOperation {
     pub(super) instance_id: String,
     pub(super) game_version: Option<String>,
@@ -327,6 +328,7 @@ pub(super) struct PerformanceOperation {
     pub(super) rollback_id: Option<String>,
     pub(super) status_operation_id: Option<String>,
     pub(super) persistence_failure: Option<PerformancePersistenceFailureSignal>,
+    pub(super) installed_versions: Option<InstalledVersionsSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -418,13 +420,15 @@ pub async fn performance_instance_operation(
 
 pub(super) async fn queue_performance_operation(
     state: AppState,
-    operation: PerformanceOperation,
+    mut operation: PerformanceOperation,
     handoff: RequestProducerHandoff,
 ) -> Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)> {
     let (ownership_tx, ownership_rx) = tokio::sync::oneshot::channel();
     let producer = handoff
         .try_claim()
         .map_err(|_| performance_shutdown_error())?;
+    operation.installed_versions =
+        stage_performance_installed_versions(&state, &operation, &producer).await;
     producer.spawn(async move {
         let mut operation = operation;
         let journal_identity = durable_performance_operation_identity(&state, &operation).await;
@@ -515,6 +519,8 @@ pub(super) async fn execute_synchronous_performance_operation(
     let producer = handoff
         .try_claim()
         .map_err(|_| performance_shutdown_error())?;
+    operation.installed_versions =
+        stage_performance_installed_versions(&state, &operation, &producer).await;
     producer.spawn(async move {
         let mut operation = operation;
         let journal_identity = durable_performance_operation_identity(&state, &operation).await;
@@ -627,9 +633,11 @@ pub(super) async fn resume_pending_performance_operations_owned(
             let install_id = status.id.clone();
             state.installs().insert(install_id.clone()).await;
             let store = state.installs().clone();
-            if let Some(operation) =
+            if let Some(mut operation) =
                 prepare_resumed_performance_operation(&state, &status, &store).await
             {
+                operation.installed_versions =
+                    stage_performance_installed_versions(&state, &operation, producer).await;
                 let state_task = state.clone();
                 producer.spawn_child(async move {
                     run_queued_performance_operation(state_task, operation, store, install_id)
@@ -640,6 +648,20 @@ pub(super) async fn resume_pending_performance_operations_owned(
     }
 
     resumed
+}
+
+pub(super) async fn stage_performance_installed_versions(
+    state: &AppState,
+    operation: &PerformanceOperation,
+    producer: &ProducerLease,
+) -> Option<InstalledVersionsSnapshot> {
+    if !matches!(operation.action, PerformanceInstallAction::Install) {
+        return None;
+    }
+    state
+        .installed_versions_snapshot(producer)
+        .await
+        .map(|lookup| lookup.snapshot)
 }
 
 async fn reconcile_orphaned_performance_journals(state: &AppState) {
@@ -2461,6 +2483,7 @@ fn operation_from_status(
         rollback_id: status.payload.rollback_id.clone(),
         status_operation_id: Some(status.id.clone()),
         persistence_failure: None,
+        installed_versions: None,
     })
 }
 

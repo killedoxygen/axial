@@ -10,7 +10,7 @@ use crate::application::timing::{
     LaunchPreflightFactTiming, LaunchPreflightResponseTiming, LaunchSessionTiming,
     trace_launch_preflight_facts, trace_launch_preflight_response, trace_launch_session,
 };
-use crate::application::version::{VERSION_SCAN_DEGRADED_MESSAGE, scan_installed_versions};
+use crate::application::version::VERSION_SCAN_DEGRADED_MESSAGE;
 use crate::application::{
     LaunchBoundaryStaging, LaunchBoundaryStagingRequest, LaunchInstanceCommand,
     LaunchInstanceStaging, flush_pending_saved_skin_applies_for_launch, stage_launch_boundary,
@@ -32,7 +32,7 @@ use axial_launcher::{
     LaunchReadiness, LaunchReadinessReason, LaunchReadinessReasonId, LaunchReadinessRequest,
     LaunchReadinessSeverity, LaunchState, inspect_launch_readiness, launch_notice,
 };
-use axial_minecraft::JavaRuntimeProbeReceipt;
+use axial_minecraft::{JavaRuntimeProbeReceipt, VersionScanState};
 use axum::{Json, http::StatusCode};
 use overrides::{
     inspect_explicit_java_override, inspect_explicit_jvm_args, preflight_override_signals,
@@ -515,10 +515,32 @@ async fn build_launch_preflight_facts(
     let memory_evidence = capture_launch_memory_evidence();
     let memory_elapsed = memory_started_at.elapsed();
     let scan_started_at = Instant::now();
-    let installed_versions = scan_installed_versions(library_dir);
+    let installed_versions = state.installed_versions_snapshot(producer).await;
     let scan_elapsed = scan_started_at.elapsed();
-    let version_scan_degraded = installed_versions.is_degraded();
-    let version_records = installed_versions.versions;
+    let report_matches_launch_root = installed_versions
+        .as_ref()
+        .is_some_and(|lookup| lookup.library_dir() == library_dir);
+    let scan_source = if report_matches_launch_root {
+        installed_versions
+            .as_ref()
+            .map(|lookup| lookup.source.as_str())
+            .unwrap_or("unavailable")
+    } else {
+        "unavailable"
+    };
+    let refresh_count = installed_versions
+        .as_ref()
+        .map(|lookup| lookup.refresh_count)
+        .unwrap_or_default();
+    let version_report = installed_versions
+        .as_ref()
+        .filter(|_| report_matches_launch_root)
+        .map(|lookup| lookup.snapshot.report());
+    let version_scan_degraded =
+        version_report.is_none_or(|report| report.state == VersionScanState::Degraded);
+    let version_records = version_report
+        .map(|report| report.versions.as_slice())
+        .unwrap_or_default();
     let version_record = version_records
         .iter()
         .find(|version| version.id == instance.version_id);
@@ -681,6 +703,8 @@ async fn build_launch_preflight_facts(
         guardian_decision: guardian_outcome.user_outcome.decision,
         java_probe_count,
         java_probe_source: java_probe_source.as_str(),
+        installed_versions_source: scan_source,
+        installed_versions_refresh_count: refresh_count,
     });
 
     LaunchPreflightFacts {

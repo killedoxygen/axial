@@ -8,8 +8,10 @@ use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass as StateOwnershipClass, RollbackState,
     StabilizationSystem, TargetDescriptor, TargetKind,
 };
-use crate::state::{AppState, ManagedInspectionError, ManagedInstanceAdmissionError};
-use axial_minecraft::scan_versions;
+use crate::state::{
+    AppState, InstalledVersionsSnapshot, ManagedInspectionError, ManagedInstanceAdmissionError,
+    ProducerLease,
+};
 use axial_performance::{
     BundleHealth, CompositionPlan, CompositionTier, InstallError, ManagedArtifactProvider,
     ManagedMutationError, OwnershipClass, PerformanceMode, ResolutionRequest, StateError,
@@ -17,7 +19,6 @@ use axial_performance::{
 };
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 const PERFORMANCE_MANAGED_ARTIFACT_SUMMARY_LIMIT: usize = 50;
 const PERFORMANCE_GUARDIAN_FACT_LIMIT: usize = 16;
@@ -145,9 +146,10 @@ pub async fn performance_plan(
     })
 }
 
-pub async fn performance_health(
+pub(crate) async fn performance_health(
     state: &AppState,
     query: PerformanceHealthRequest,
+    producer: &ProducerLease,
 ) -> Result<PerformanceHealthResponse, (StatusCode, Json<serde_json::Value>)> {
     let instance_id = required_value(
         query.instance_id.as_deref(),
@@ -160,7 +162,11 @@ pub async fn performance_health(
         )
     })?;
     let mode = resolve_instance_mode(state, &instance, None)?;
-    let display = performance_instance_display(state, &instance, mode);
+    let installed_versions = state
+        .installed_versions_snapshot(producer)
+        .await
+        .map(|lookup| lookup.snapshot);
+    let display = performance_instance_display(state, &instance, mode, installed_versions.as_ref());
 
     if !matches!(mode, PerformanceMode::Managed) {
         return Ok(disabled_health_response(mode, display));
@@ -177,7 +183,8 @@ pub async fn performance_health(
         return Err(managed_inspection_error(error));
     }
 
-    let (game_version, loader) = resolve_instance_version_target(state, &instance, None, None)?;
+    let (game_version, loader) =
+        resolve_instance_version_target(installed_versions.as_ref(), &instance, None, None)?;
     let resolved = state
         .resolve_managed_instance(
             &instance.id,
@@ -374,11 +381,12 @@ fn performance_instance_display(
     state: &AppState,
     instance: &axial_config::Instance,
     mode: PerformanceMode,
+    installed_versions: Option<&InstalledVersionsSnapshot>,
 ) -> PerformanceInstanceDisplay {
     let config = state.config().current();
     let min_gb = memory_gb(instance.min_memory_mb, config.min_memory_mb, 1024);
     let max_gb = memory_gb(instance.max_memory_mb, config.max_memory_mb, 4096);
-    let java_major = instance_java_major(state, &instance.version_id);
+    let java_major = instance_java_major(installed_versions, &instance.version_id);
     let mode_source = if parse_mode(&instance.performance_mode).is_some() {
         ("instance", "Per instance")
     } else {
@@ -406,18 +414,19 @@ fn performance_instance_display(
     }
 }
 
-fn instance_java_major(state: &AppState, version_id: &str) -> Option<i32> {
-    state
-        .library_dir()
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .and_then(|path| scan_versions(&path).ok())
-        .and_then(|versions| {
-            versions
-                .into_iter()
+fn instance_java_major(
+    installed_versions: Option<&InstalledVersionsSnapshot>,
+    version_id: &str,
+) -> Option<i32> {
+    installed_versions
+        .and_then(|snapshot| {
+            snapshot
+                .report()
+                .versions
+                .iter()
                 .find(|version| version.id == version_id)
-                .and_then(|version| (version.java_major > 0).then_some(version.java_major))
         })
+        .and_then(|version| (version.java_major > 0).then_some(version.java_major))
 }
 
 fn memory_gb(instance_mb: i32, config_mb: i32, fallback_mb: i32) -> f32 {
@@ -611,7 +620,7 @@ fn managed_inspection_error(
 }
 
 pub(super) fn resolve_instance_version_target(
-    state: &AppState,
+    installed_versions: Option<&InstalledVersionsSnapshot>,
     instance: &axial_config::Instance,
     game_version_override: Option<&str>,
     loader_override: Option<&str>,
@@ -624,21 +633,15 @@ pub(super) fn resolve_instance_version_target(
         return Ok((game_version, loader));
     }
 
-    let library_dir = state.library_dir().ok_or_else(|| {
+    let installed_versions = installed_versions.ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
             Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
-    let versions = scan_versions(&std::path::PathBuf::from(library_dir)).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "Could not scan installed versions. Check the library folder and try again."
-            })),
-        )
-    })?;
-    let version = versions
+    let version = installed_versions
+        .report()
+        .versions
         .iter()
         .find(|version| version.id == instance.version_id)
         .ok_or_else(|| {

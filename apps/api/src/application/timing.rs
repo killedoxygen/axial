@@ -61,6 +61,28 @@ pub(crate) fn trace_create_view(timing: CreateViewTiming<'_>) {
     );
 }
 
+pub(crate) struct CreateInstanceTiming {
+    pub total: Duration,
+    pub version_count: usize,
+    pub scan_source: &'static str,
+    pub refresh_count: u32,
+    pub queued_install: bool,
+}
+
+pub(crate) fn trace_create_instance(timing: CreateInstanceTiming) {
+    tracing::debug!(
+        target: "axial::timing",
+        route = "/api/v1/instances",
+        operation = "create",
+        total_ms = ms(timing.total),
+        version_count = timing.version_count,
+        installed_versions_source = timing.scan_source,
+        installed_versions_refresh_count = timing.refresh_count,
+        queued_install = timing.queued_install,
+        "create instance timing"
+    );
+}
+
 pub(crate) fn trace_slow_instance_readiness(
     instance_id: &str,
     version_id: &str,
@@ -131,6 +153,8 @@ pub(crate) struct LaunchPreflightFactTiming<'a> {
     pub guardian_decision: GuardianDecisionKind,
     pub java_probe_count: u8,
     pub java_probe_source: &'a str,
+    pub installed_versions_source: &'a str,
+    pub installed_versions_refresh_count: u32,
 }
 
 pub(crate) fn trace_launch_preflight_facts(timing: LaunchPreflightFactTiming<'_>) {
@@ -153,6 +177,8 @@ pub(crate) fn trace_launch_preflight_facts(timing: LaunchPreflightFactTiming<'_>
         guardian_decision = ?timing.guardian_decision,
         java_probe_count = timing.java_probe_count,
         java_probe_source = timing.java_probe_source,
+        installed_versions_source = timing.installed_versions_source,
+        installed_versions_refresh_count = timing.installed_versions_refresh_count,
         "launch preflight fact timing"
     );
 }

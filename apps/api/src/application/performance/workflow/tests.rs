@@ -177,7 +177,12 @@ async fn handle_health(
     State(state): State<AppState>,
     Query(query): Query<HealthQuery>,
 ) -> Result<Json<PerformanceHealthResponse>, (StatusCode, Json<serde_json::Value>)> {
-    performance_health(&state, query).await.map(Json)
+    let request = state.try_admit_request().expect("admit health request");
+    let producer = request
+        .producer_handoff()
+        .try_claim()
+        .expect("claim health producer");
+    performance_health(&state, query, &producer).await.map(Json)
 }
 
 async fn handle_rollback_list(

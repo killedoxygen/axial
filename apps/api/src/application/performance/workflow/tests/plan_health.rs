@@ -412,11 +412,13 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
     let Json(response) = handle_health(
         State(fixture.state.clone()),
         Query(HealthQuery {
-            instance_id: Some(instance_id),
+            instance_id: Some(instance_id.clone()),
         }),
     )
     .await
     .expect("managed health should serialize");
+
+    assert_eq!(fixture.state.installed_versions_walk_count(), 1);
 
     assert!(response.active);
     assert_eq!(response.installed_count, 1);
@@ -481,6 +483,17 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
     assert!(response.display.runtime.detected);
     assert_eq!(response.display.mode.mode, "managed");
     assert_eq!(response.display.mode.source, "global");
+
+    let Json(warm_response) = handle_health(
+        State(fixture.state.clone()),
+        Query(HealthQuery {
+            instance_id: Some(instance_id),
+        }),
+    )
+    .await
+    .expect("warm managed health should serialize");
+    assert_eq!(warm_response.display.runtime.label, "Java 21");
+    assert_eq!(fixture.state.installed_versions_walk_count(), 1);
 }
 
 #[tokio::test]

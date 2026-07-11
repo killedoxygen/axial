@@ -98,10 +98,12 @@ pub use workflow::{
     PerformanceManagedArtifactSummary, PerformanceMemoryDisplay, PerformanceModeDisplay,
     PerformanceOperationStatusResponse, PerformancePlanRequest, PerformancePlanResponse,
     PerformanceRollbackListRequest, PerformanceRollbackListResponse, PerformanceRuntimeDisplay,
-    performance_health, performance_instance_operation, performance_operation_status,
-    performance_plan, performance_rollback_list,
+    performance_instance_operation, performance_operation_status, performance_plan,
+    performance_rollback_list,
 };
-pub(crate) use workflow::{performance_install, spawn_pending_performance_operations};
+pub(crate) use workflow::{
+    performance_health, performance_install, spawn_pending_performance_operations,
+};
 
 #[derive(Debug, Serialize)]
 pub struct PerformanceRulesStatusResponse {

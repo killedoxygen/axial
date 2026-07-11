@@ -22,7 +22,8 @@ use operations::{
     begin_performance_operation_journal, performance_journal_is_terminal,
     record_performance_effect_started, record_performance_terminal_intent,
     retry_performance_status_correction, retry_performance_status_transition,
-    run_queued_performance_operation, terminalize_mismatched_performance_operation,
+    run_queued_performance_operation, stage_performance_installed_versions,
+    terminalize_mismatched_performance_operation,
 };
 pub use operations::{
     PerformanceInstanceOperationResponse, PerformanceOperationStatusResponse,
@@ -42,13 +43,16 @@ async fn resume_pending_performance_operations(state: AppState) -> usize {
     let shutdown = state.subscribe_shutdown();
     operations::resume_pending_performance_operations_owned(state, &child_owner, shutdown).await
 }
+pub(crate) use plan_health::performance_health;
 #[cfg(test)]
-use plan_health::{PERFORMANCE_DATA_INTERNAL_ERROR, bundle_health_token, internal_error};
+use plan_health::{
+    PERFORMANCE_DATA_INTERNAL_ERROR, bundle_health_token, internal_error,
+    resolve_instance_version_target,
+};
 pub use plan_health::{
     PerformanceHealthRequest, PerformanceHealthResponse, PerformanceInstanceDisplay,
     PerformanceManagedArtifactSummary, PerformanceMemoryDisplay, PerformanceModeDisplay,
-    PerformancePlanRequest, PerformancePlanResponse, PerformanceRuntimeDisplay, performance_health,
-    performance_plan,
+    PerformancePlanRequest, PerformancePlanResponse, PerformanceRuntimeDisplay, performance_plan,
 };
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +107,7 @@ pub(crate) async fn performance_install(
         rollback_id: payload.rollback_id.clone(),
         status_operation_id: None,
         persistence_failure: None,
+        installed_versions: None,
     };
 
     if payload.queued.unwrap_or(false) {

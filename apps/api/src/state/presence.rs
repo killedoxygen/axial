@@ -2,9 +2,7 @@ use super::AppState;
 use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
 use axial_config::{AppConfig, Instance};
 use axial_launcher::{LaunchSessionRecord, LaunchState};
-use axial_minecraft::{VersionEntry, scan_versions};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use axial_minecraft::VersionEntry;
 
 const PRESENCE_TEXT_MAX_CHARS: usize = 128;
 
@@ -46,35 +44,31 @@ pub async fn build_presence_snapshot(state: &AppState) -> PresenceSnapshot {
             .cmp(&active_sort_key(left))
             .then_with(|| right.session_id.0.cmp(&left.session_id.0))
     });
-    let versions = if active.len() == 1 {
-        installed_version_index(state)
+    let installed_versions = if active.len() == 1 {
+        match state.try_claim_producer() {
+            Ok(producer) => state.installed_versions_snapshot(&producer).await,
+            Err(_) => None,
+        }
     } else {
-        HashMap::new()
+        None
     };
+    let versions = installed_versions
+        .as_ref()
+        .map(|lookup| lookup.snapshot.report().versions.as_slice())
+        .unwrap_or_default();
 
     PresenceSnapshot {
         enabled: true,
-        activity: presence_activity(&config, &active, &versions, |instance_id| {
+        activity: presence_activity(&config, &active, versions, |instance_id| {
             state.instances().get(instance_id)
         }),
     }
 }
 
-fn installed_version_index(state: &AppState) -> HashMap<String, VersionEntry> {
-    let Some(library_dir) = state.library_dir() else {
-        return HashMap::new();
-    };
-    scan_versions(&PathBuf::from(library_dir))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|entry| (entry.id.clone(), entry))
-        .collect()
-}
-
 fn presence_activity(
     config: &AppConfig,
     active: &[LaunchSessionRecord],
-    versions: &HashMap<String, VersionEntry>,
+    versions: &[VersionEntry],
     instance_by_id: impl Fn(&str) -> Option<Instance>,
 ) -> PresenceActivity {
     if active.is_empty() {
@@ -106,7 +100,9 @@ fn presence_activity(
 
     let record = &active[0];
     let instance = instance_by_id(&record.instance_id);
-    let version = versions.get(&record.version_id);
+    let version = versions
+        .iter()
+        .find(|version| version.id == record.version_id);
     let summary = version_summary(version, instance.as_ref(), config);
     let playing = is_playing(record.state);
     PresenceActivity {
@@ -292,11 +288,16 @@ fn sanitize_presence_text(raw: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axial_config::{AppConfig, Instance};
+    use crate::state::{AppStateInit, InstallStore, SessionStore};
+    use axial_config::{
+        AppConfig, AppPaths, ConfigStore, Instance, InstanceRegistrySnapshot, InstanceStore,
+    };
     use axial_launcher::{LaunchSessionRecord, SessionId};
     use axial_minecraft::{
         MinecraftVersionMeta, VersionEntry, VersionLoaderAttachment, VersionSubjectKind,
     };
+    use axial_performance::PerformanceManager;
+    use std::{fs, path::PathBuf, sync::Arc};
 
     fn config() -> AppConfig {
         AppConfig::default()
@@ -398,7 +399,7 @@ mod tests {
 
     #[test]
     fn idle_presence_is_public_and_generic() {
-        let activity = presence_activity(&config(), &[], &HashMap::new(), |_| None);
+        let activity = presence_activity(&config(), &[], &[], |_| None);
 
         assert_eq!(activity.kind, PresenceActivityKind::Idle);
         assert_eq!(activity.details, "Minecraft launcher");
@@ -407,11 +408,7 @@ mod tests {
 
     #[test]
     fn single_running_session_uses_normalized_loader_and_performance_context() {
-        let mut versions = HashMap::new();
-        versions.insert(
-            "fabric-loader-0.16.10-1.21.1".to_string(),
-            version("fabric-loader-0.16.10-1.21.1", Some("Fabric")),
-        );
+        let versions = vec![version("fabric-loader-0.16.10-1.21.1", Some("Fabric"))];
         let active = vec![record(
             "session",
             "instance",
@@ -434,7 +431,7 @@ mod tests {
             record("second", "b", "1.20.1", LaunchState::Starting),
         ];
 
-        let activity = presence_activity(&config(), &active, &HashMap::new(), |_| None);
+        let activity = presence_activity(&config(), &active, &[], |_| None);
 
         assert_eq!(activity.kind, PresenceActivityKind::Multi);
         assert_eq!(activity.details, "Multiple Minecraft sessions");
@@ -444,8 +441,7 @@ mod tests {
 
     #[test]
     fn custom_local_version_names_fall_back_to_generic_summary() {
-        let mut versions = HashMap::new();
-        versions.insert("private-pack".to_string(), private_version("private-pack"));
+        let versions = vec![private_version("private-pack")];
         let active = vec![record(
             "session",
             "instance",
@@ -459,6 +455,96 @@ mod tests {
         assert!(!activity.state.contains("Private"));
     }
 
+    #[tokio::test]
+    async fn repeated_single_session_snapshots_reuse_redacted_installed_version_report() {
+        let root = test_root("shared-installed-versions");
+        let paths = test_paths(&root);
+        let private_version_id = "private-access-token-pack";
+        let version_dir = paths.library_dir.join("versions").join(private_version_id);
+        fs::create_dir_all(&version_dir).expect("create installed version directory");
+        fs::write(
+            version_dir.join(format!("{private_version_id}.json")),
+            serde_json::json!({
+                "id": private_version_id,
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "libraries": []
+            })
+            .to_string(),
+        )
+        .expect("write installed version metadata");
+        fs::write(
+            version_dir.join(format!("{private_version_id}.jar")),
+            b"client",
+        )
+        .expect("write installed version jar");
+        let config = Arc::new(
+            ConfigStore::from_config(
+                paths.clone(),
+                AppConfig {
+                    library_dir: paths.library_dir.to_string_lossy().into_owned(),
+                    discord_rpc_enabled: true,
+                    ..AppConfig::default()
+                },
+            )
+            .expect("create config"),
+        );
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                .expect("create instances"),
+        );
+        let state = AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("create performance manager"),
+            ),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        });
+        let instance = state
+            .instances()
+            .insert_for_test("Alice access_token profile", private_version_id)
+            .expect("insert private instance");
+        state
+            .sessions()
+            .insert(record(
+                "presence-session",
+                &instance.id,
+                private_version_id,
+                LaunchState::Running,
+            ))
+            .await
+            .expect("insert active session");
+
+        let first = build_presence_snapshot(&state).await;
+        let second = build_presence_snapshot(&state).await;
+
+        assert_eq!(first, second);
+        assert_eq!(state.installed_versions_walk_count(), 1);
+        assert_eq!(second.activity.state, "Custom version - Managed");
+        let public_text = format!("{} {}", second.activity.details, second.activity.state);
+        let root_text = root.to_string_lossy();
+        for private_fragment in [
+            private_version_id,
+            "Alice",
+            "access_token",
+            root_text.as_ref(),
+        ] {
+            assert!(
+                !public_text.contains(private_fragment),
+                "private presence fragment was exposed"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn suspicious_presence_text_falls_back() {
         assert_eq!(
@@ -469,5 +555,28 @@ mod tests {
             sanitize_presence_text("/home/alice/.minecraft/access_token", "Minecraft"),
             "Minecraft"
         );
+    }
+
+    fn test_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "axial-presence-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ))
+    }
+
+    fn test_paths(root: &std::path::Path) -> AppPaths {
+        let config_dir = root.join("config");
+        AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: root.join("instances"),
+            music_dir: root.join("music"),
+            library_dir: root.join("library"),
+            config_dir,
+        }
     }
 }

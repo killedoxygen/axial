@@ -8,10 +8,12 @@ use super::{
         preferred_loader_build, select_preferred_loader_build,
         stale_loader_version_catalog_message,
     },
-    enrich_instance_for_state, instance_write_error_response, scan_current_versions,
+    enrich_instance_for_scan, instance_write_error_response,
 };
 use crate::application::install::InstallQueueInstallItemViewModel;
-use crate::application::timing::{CreateViewTiming, trace_create_view};
+use crate::application::timing::{
+    CreateInstanceTiming, CreateViewTiming, trace_create_instance, trace_create_view,
+};
 use crate::application::version::{
     VERSION_SCAN_DEGRADED_MESSAGE, installed_versions_scan, version_scan_degraded_response,
 };
@@ -25,8 +27,9 @@ use crate::guardian::{
 };
 use crate::observability::telemetry::TelemetryEvent;
 use crate::state::contracts::{CommandKind, OperationId, OperationStatus};
-use crate::state::{AppState, new_instance};
-use crate::state::{ProducerLease, RequestProducerHandoff};
+use crate::state::{
+    AppState, InstalledVersionsLookup, ProducerLease, RequestProducerHandoff, new_instance,
+};
 use axial_config::{EnrichedInstance, Instance, generate_instance_id};
 use axial_launcher::{
     GuardianMode, LaunchReadinessReasonId, LaunchReadinessRequest, LaunchReadinessSeverity,
@@ -43,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     ops::Deref,
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -440,10 +443,28 @@ pub(crate) async fn handle_create_instance_owned(
     payload: CreateInstanceRequest,
     handoff: RequestProducerHandoff,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
-    let selection = resolve_create_selection(state, &payload).await?;
+    let started_at = Instant::now();
+    let producer = handoff
+        .try_claim()
+        .map_err(create_shutdown_error_response)?;
+    let installed_lookup = state
+        .installed_versions_snapshot(&producer)
+        .await
+        .ok_or_else(library_not_configured_response)?;
+    let installed_scan = installed_versions_scan(&installed_lookup.snapshot);
+    if installed_scan.is_degraded() {
+        return Err(version_scan_degraded_response());
+    }
+    let selection =
+        resolve_create_selection(&installed_lookup, &installed_scan.versions, &payload).await?;
     let preset = normalize_create_jvm_preset(payload.jvm_preset_id.as_deref());
-    let mc_dir = state.library_dir().map(PathBuf::from);
-    let install_request = create_install_queue_request_if_needed(state, &selection)?;
+    let mc_dir = Some(installed_lookup.library_dir().to_path_buf());
+    let install_request = create_install_queue_request_if_needed(
+        state,
+        &installed_lookup,
+        &installed_scan,
+        &selection,
+    )?;
     let queued_install_request = install_request.clone();
     let instance = build_created_instance(&payload, &selection, &preset)?;
     let instance = state
@@ -458,7 +479,12 @@ pub(crate) async fn handle_create_instance_owned(
         handoff,
     )
     .await?;
-    let enriched = enrich_instance_for_state(state, instance);
+    let enriched = enrich_instance_for_scan(
+        state,
+        instance,
+        &installed_scan,
+        Some(installed_lookup.library_dir()),
+    );
     state
         .telemetry()
         .emit(TelemetryEvent::instance_created(Some(
@@ -468,6 +494,13 @@ pub(crate) async fn handle_create_instance_owned(
         queued_install_request
             .as_ref()
             .and_then(|request| create_queued_install_summary(response, request))
+    });
+    trace_create_instance(CreateInstanceTiming {
+        total: started_at.elapsed(),
+        version_count: installed_scan.versions.len(),
+        scan_source: installed_lookup.source.as_str(),
+        refresh_count: installed_lookup.refresh_count,
+        queued_install: queued_install.is_some(),
     });
 
     Ok(create_instance_response(
@@ -525,7 +558,8 @@ impl CreateSelection {
 }
 
 async fn resolve_create_selection(
-    state: &AppState,
+    installed_lookup: &InstalledVersionsLookup,
+    installed_versions: &[VersionEntry],
     payload: &CreateInstanceRequest,
 ) -> Result<CreateSelection, (StatusCode, Json<serde_json::Value>)> {
     let selection_id = payload.selection_id.trim();
@@ -536,7 +570,7 @@ async fn resolve_create_selection(
     let mut parts = selection_id.splitn(3, '|');
     match (parts.next(), parts.next(), parts.next()) {
         (Some("vanilla"), Some(version_id), None) if !version_id.trim().is_empty() => {
-            resolve_vanilla_create_selection(state, version_id.trim()).await
+            resolve_vanilla_create_selection(installed_lookup, version_id.trim()).await
         }
         (Some("loader_version"), Some(component_id), Some(minecraft_version))
             if !minecraft_version.trim().is_empty() =>
@@ -547,8 +581,13 @@ async fn resolve_create_selection(
                     Json(serde_json::json!({ "error": "unknown loader component" })),
                 )
             })?;
-            resolve_loader_version_create_selection(state, component_id, minecraft_version.trim())
-                .await
+            resolve_loader_create_selection(
+                installed_lookup,
+                installed_versions,
+                component_id,
+                LoaderCreateRequest::PreferredForMinecraft(minecraft_version.trim()),
+            )
+            .await
         }
         (Some("loader_build"), Some(component_id), Some(build_id))
             if !build_id.trim().is_empty() =>
@@ -559,29 +598,61 @@ async fn resolve_create_selection(
                     Json(serde_json::json!({ "error": "unknown loader component" })),
                 )
             })?;
-            resolve_loader_create_selection(state, component_id, build_id.trim()).await
+            resolve_loader_create_selection(
+                installed_lookup,
+                installed_versions,
+                component_id,
+                LoaderCreateRequest::ExactBuild(build_id.trim()),
+            )
+            .await
         }
         _ => Err(bad_create_request("invalid create selection")),
     }
 }
 
-async fn resolve_loader_version_create_selection(
-    state: &AppState,
+enum LoaderCreateRequest<'a> {
+    PreferredForMinecraft(&'a str),
+    ExactBuild(&'a str),
+}
+
+async fn resolve_loader_create_selection(
+    installed_lookup: &InstalledVersionsLookup,
+    installed_versions: &[VersionEntry],
     component_id: LoaderComponentId,
-    minecraft_version: &str,
+    request: LoaderCreateRequest<'_>,
 ) -> Result<CreateSelection, (StatusCode, Json<serde_json::Value>)> {
-    let library_dir = state
-        .library_dir()
-        .ok_or_else(library_not_configured_response)?;
-    let library_dir = PathBuf::from(library_dir);
-    let (builds, catalog) = fetch_builds(library_dir.as_path(), component_id, minecraft_version)
+    let (minecraft_version, exact_build_id) = match request {
+        LoaderCreateRequest::PreferredForMinecraft(minecraft_version) => {
+            (minecraft_version.to_string(), None)
+        }
+        LoaderCreateRequest::ExactBuild(build_id) => {
+            let Some((parsed_component_id, minecraft_version, _loader_version)) =
+                parse_build_id(build_id)
+            else {
+                return Err(bad_create_request("invalid create selection"));
+            };
+            if parsed_component_id != component_id {
+                return Err(bad_create_request("invalid create selection"));
+            }
+            (minecraft_version, Some(build_id))
+        }
+    };
+    let library_dir = installed_lookup.library_dir();
+    let (builds, catalog) = fetch_builds(library_dir, component_id, &minecraft_version)
         .await
         .map_err(loader_error_response)?;
-    invalidate_create_view_source(library_dir.as_path(), component_id.as_str());
-    let installed_scan = scan_current_versions(state);
-    if installed_scan.is_degraded() {
-        return Err(version_scan_degraded_response());
+    invalidate_create_view_source(library_dir, component_id.as_str());
+
+    if let Some(build_id) = exact_build_id {
+        return resolve_loader_create_selection_from_build_catalog(
+            component_id,
+            build_id,
+            builds,
+            &catalog,
+            installed_versions,
+        );
     }
+
     let build = select_preferred_loader_build(component_id, builds).map_err(|error| match error {
         LoaderBuildSelectionError::NoBuildAvailable => (
             StatusCode::NOT_FOUND,
@@ -596,7 +667,7 @@ async fn resolve_loader_version_create_selection(
     if loader_build_is_known_incompatible_default(&build) {
         return Err(no_compatible_stable_loader_response(component_id));
     }
-    let exact_installed = exact_loader_build_is_installed(&installed_scan.versions, &build);
+    let exact_installed = exact_loader_build_is_installed(installed_versions, &build);
     if loader_catalog_is_stale(&catalog) && !exact_installed {
         return Err(stale_loader_catalog_response());
     }
@@ -606,40 +677,6 @@ async fn resolve_loader_version_create_selection(
         build_id: build.build_id,
         target_version_id: build.version_id,
     })
-}
-
-async fn resolve_loader_create_selection(
-    state: &AppState,
-    component_id: LoaderComponentId,
-    build_id: &str,
-) -> Result<CreateSelection, (StatusCode, Json<serde_json::Value>)> {
-    let Some((parsed_component_id, minecraft_version, _loader_version)) = parse_build_id(build_id)
-    else {
-        return Err(bad_create_request("invalid create selection"));
-    };
-    if parsed_component_id != component_id {
-        return Err(bad_create_request("invalid create selection"));
-    }
-
-    let library_dir = state
-        .library_dir()
-        .ok_or_else(library_not_configured_response)?;
-    let library_dir = PathBuf::from(library_dir);
-    let (builds, catalog) = fetch_builds(library_dir.as_path(), component_id, &minecraft_version)
-        .await
-        .map_err(loader_error_response)?;
-    invalidate_create_view_source(library_dir.as_path(), component_id.as_str());
-    let installed_scan = scan_current_versions(state);
-    if installed_scan.is_degraded() {
-        return Err(version_scan_degraded_response());
-    }
-    resolve_loader_create_selection_from_build_catalog(
-        component_id,
-        build_id,
-        builds,
-        &catalog,
-        &installed_scan.versions,
-    )
 }
 
 pub(super) fn resolve_loader_create_selection_from_build_catalog(
@@ -674,14 +711,10 @@ pub(super) fn resolve_loader_create_selection_from_build_catalog(
 }
 
 async fn resolve_vanilla_create_selection(
-    state: &AppState,
+    installed_lookup: &InstalledVersionsLookup,
     version_id: &str,
 ) -> Result<CreateSelection, (StatusCode, Json<serde_json::Value>)> {
-    let library_dir = state
-        .library_dir()
-        .ok_or_else(library_not_configured_response)?;
-    let library_dir = PathBuf::from(library_dir);
-    let manifest = fetch_version_manifest_cached(&library_dir)
+    let manifest = fetch_version_manifest_cached(installed_lookup.library_dir())
         .await
         .map_err(|_| minecraft_versions_unavailable_response())?;
     let Some(version) = manifest
@@ -740,12 +773,19 @@ fn build_created_instance(
 
 fn create_install_queue_request_if_needed(
     state: &AppState,
+    installed_lookup: &InstalledVersionsLookup,
+    installed_scan: &crate::application::version::InstalledVersionsScan,
     selection: &CreateSelection,
 ) -> Result<Option<InstallQueueRequest>, (StatusCode, Json<serde_json::Value>)> {
     let Some(request) = selection.install_queue_request() else {
         return Ok(None);
     };
-    if version_is_launch_ready_or_user_blocked(state, selection.target_version_id())? {
+    if version_is_launch_ready_or_user_blocked(
+        state,
+        installed_lookup,
+        installed_scan,
+        selection.target_version_id(),
+    )? {
         return Ok(None);
     }
 
@@ -811,18 +851,16 @@ pub(super) async fn queue_create_install_or_rollback(
 
 fn version_is_launch_ready_or_user_blocked(
     state: &AppState,
+    installed_lookup: &InstalledVersionsLookup,
+    installed_scan: &crate::application::version::InstalledVersionsScan,
     version_id: &str,
 ) -> Result<bool, (StatusCode, Json<serde_json::Value>)> {
-    let scan = scan_current_versions(state);
-    if scan.is_degraded() {
+    if installed_scan.is_degraded() {
         return Err(version_scan_degraded_response());
     }
-    let Some(library_dir) = state.library_dir().map(PathBuf::from) else {
-        return Ok(false);
-    };
     let config = state.config().current();
     let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-        library_dir,
+        library_dir: installed_lookup.library_dir().to_path_buf(),
         requested_java: config.java_path_override.trim().to_string(),
         version_id: version_id.to_string(),
         guardian_mode: GuardianMode::from_config(&config.guardian_mode),
@@ -835,6 +873,15 @@ fn version_is_launch_ready_or_user_blocked(
         .iter()
         .filter(|reason| reason.severity == LaunchReadinessSeverity::Blocking)
         .all(|reason| reason.id == LaunchReadinessReasonId::JavaOverrideMissing))
+}
+
+fn create_shutdown_error_response(
+    _error: crate::state::LifecycleAdmissionError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": "application shutdown is in progress" })),
+    )
 }
 
 async fn rollback_created_instance(

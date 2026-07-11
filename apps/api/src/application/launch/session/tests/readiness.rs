@@ -54,6 +54,51 @@ async fn launch_preflight_readiness_reports_missing_version_json() {
 }
 
 #[tokio::test]
+async fn launch_preflight_rejects_installed_report_from_changed_library_root() {
+    let fixture = TestFixture::new("preflight-library-root-switch");
+    fixture.write_ready_install("1.21.1");
+    let instance_id = fixture.add_instance("Survival", "1.21.1");
+    let instance = fixture
+        .state
+        .instances()
+        .get(&instance_id)
+        .expect("instance");
+    let config = fixture.state.config().current();
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let changed_library = fixture.root.join("changed-library");
+    fs::create_dir_all(changed_library.join("versions")).expect("create changed library");
+    fixture
+        .state
+        .set_library_dir_for_test(changed_library.to_string_lossy().into_owned());
+    let producer = fixture
+        .state
+        .try_claim_producer()
+        .expect("claim preflight producer");
+
+    let preflight = build_launch_preflight_facts(
+        &fixture.state,
+        &producer,
+        LaunchPreflightBuild {
+            instance: &instance,
+            config: &config,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
+        None,
+    )
+    .await;
+
+    assert!(!preflight.readiness.launchable);
+    assert!(preflight.readiness.reasons.iter().any(|reason| {
+        reason.id == LaunchReadinessReasonId::InstalledVersionsDegraded
+            && reason.message == VERSION_SCAN_DEGRADED_MESSAGE
+    }));
+    assert_eq!(fixture.state.installed_versions_walk_count(), 1);
+}
+
+#[tokio::test]
 async fn launch_preflight_readiness_reports_missing_client_jar() {
     let fixture = TestFixture::new("preflight-readiness-missing-client-jar");
     let component = "axial-test-runtime-missing-client";
@@ -328,13 +373,14 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
         .expect("instance");
     let config = fixture.state.config().current();
     let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let producer = fixture
+        .state
+        .try_claim_producer()
+        .expect("claim runtime repair producer");
 
     let preflight = build_launch_preflight_facts(
         &fixture.state,
-        &fixture
-            .state
-            .try_claim_producer()
-            .expect("claim preflight producer"),
+        &producer,
         LaunchPreflightBuild {
             instance: &instance,
             config: &config,
@@ -351,11 +397,8 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
         "missing managed runtime readiness reason: {:?}",
         preflight.readiness.reasons
     );
+    assert_eq!(fixture.state.installed_versions_walk_count(), 1);
 
-    let producer = fixture
-        .state
-        .try_claim_producer()
-        .expect("claim runtime repair producer");
     let repaired = maybe_repair_managed_runtime_before_launch_owned(
         &fixture.state,
         &producer,
@@ -371,6 +414,7 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
     .await
     .expect("persist managed-runtime repair journal");
 
+    assert_eq!(fixture.state.installed_versions_walk_count(), 1);
     assert!(runtime_root.join(".axial-ready").is_file());
     assert_eq!(
         repaired.guardian_summary.decision,

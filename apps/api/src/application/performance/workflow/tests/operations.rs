@@ -2,6 +2,113 @@ use super::*;
 use crate::state::OperationJournalStoreError;
 
 #[tokio::test]
+async fn install_target_staging_refreshes_once_cold_and_zero_times_warm() {
+    let fixture = TestFixture::new("performance-target-staging-version-index");
+    let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+    fixture.write_fabric_version("1.20.4-fabric", "1.20.4");
+    let instance = fixture
+        .state
+        .instances()
+        .get(&instance_id)
+        .expect("instance exists");
+    let operation = PerformanceOperation {
+        instance_id,
+        game_version: None,
+        loader: None,
+        mode: None,
+        action: PerformanceInstallAction::Install,
+        rollback_id: None,
+        status_operation_id: None,
+        persistence_failure: None,
+        installed_versions: None,
+    };
+    let request = fixture
+        .state
+        .try_admit_request()
+        .expect("admit staging request");
+    let producer = request
+        .producer_handoff()
+        .try_claim()
+        .expect("claim staging producer");
+
+    let cold = stage_performance_installed_versions(&fixture.state, &operation, &producer)
+        .await
+        .expect("configured library snapshot");
+    assert_eq!(fixture.state.installed_versions_walk_count(), 1);
+    assert_eq!(
+        resolve_instance_version_target(Some(&cold), &instance, None, None)
+            .expect("resolve target from staged snapshot"),
+        ("1.20.4".to_string(), "fabric".to_string())
+    );
+
+    let warm = stage_performance_installed_versions(&fixture.state, &operation, &producer)
+        .await
+        .expect("warm configured library snapshot");
+    assert_eq!(fixture.state.installed_versions_walk_count(), 1);
+    assert_eq!(
+        resolve_instance_version_target(Some(&warm), &instance, None, None)
+            .expect("resolve target from warm staged snapshot"),
+        ("1.20.4".to_string(), "fabric".to_string())
+    );
+}
+
+#[tokio::test]
+async fn degraded_install_target_snapshot_preserves_metadata_unavailable_error() {
+    let fixture = TestFixture::new("performance-target-staging-degraded");
+    let instance_id = fixture.add_instance("Managed", "broken-version");
+    let version_dir = fixture
+        .root
+        .join("library")
+        .join("versions")
+        .join("broken-version");
+    fs::create_dir_all(&version_dir).expect("create malformed version directory");
+    fs::write(version_dir.join("broken-version.json"), "{not json")
+        .expect("write malformed version metadata");
+    let instance = fixture
+        .state
+        .instances()
+        .get(&instance_id)
+        .expect("instance exists");
+    let operation = PerformanceOperation {
+        instance_id,
+        game_version: None,
+        loader: None,
+        mode: None,
+        action: PerformanceInstallAction::Install,
+        rollback_id: None,
+        status_operation_id: None,
+        persistence_failure: None,
+        installed_versions: None,
+    };
+    let request = fixture
+        .state
+        .try_admit_request()
+        .expect("admit degraded staging request");
+    let producer = request
+        .producer_handoff()
+        .try_claim()
+        .expect("claim degraded staging producer");
+    let snapshot = stage_performance_installed_versions(&fixture.state, &operation, &producer)
+        .await
+        .expect("configured degraded snapshot");
+
+    assert_eq!(
+        snapshot.report().state,
+        axial_minecraft::VersionScanState::Degraded
+    );
+    let (status, Json(body)) =
+        resolve_instance_version_target(Some(&snapshot), &instance, None, None)
+            .expect_err("malformed installed version metadata remains unavailable");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": "instance version metadata is unavailable; install the version before resolving performance files"
+        })
+    );
+}
+
+#[tokio::test]
 async fn queued_remove_returns_install_id_and_complete_progress() {
     let fixture = TestFixture::new("queued-remove");
     let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
@@ -340,6 +447,7 @@ async fn pre_effect_status_acceptance_failure_does_not_run_filesystem_effect() {
                 rollback_id: None,
                 status_operation_id: Some(status.id.clone()),
                 persistence_failure: None,
+                installed_versions: None,
             },
             state.installs().clone(),
             status.id.clone(),
@@ -708,6 +816,7 @@ async fn pre_effect_journal_acceptance_failure_exits_without_retry_or_filesystem
                 rollback_id: None,
                 status_operation_id: Some(status.id.clone()),
                 persistence_failure: None,
+                installed_versions: None,
             },
             state.installs().clone(),
             status.id.clone(),

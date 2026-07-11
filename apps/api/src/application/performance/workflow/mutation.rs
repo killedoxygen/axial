@@ -131,7 +131,7 @@ pub(super) async fn execute_performance_operation(
     }
 
     let (game_version, loader) = resolve_instance_version_target(
-        state,
+        operation.installed_versions.as_ref(),
         &instance,
         operation.game_version.as_deref(),
         operation.loader.as_deref(),
@@ -196,7 +196,7 @@ pub(super) async fn performance_operation_journal_identity(
     }
 
     let (game_version, loader) = resolve_instance_version_target(
-        state,
+        operation.installed_versions.as_ref(),
         &instance,
         operation.game_version.as_deref(),
         operation.loader.as_deref(),

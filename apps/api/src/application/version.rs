@@ -2,7 +2,7 @@ use crate::state::{AppState, InstalledVersionsSnapshot, ProducerLease};
 use axial_minecraft::{
     LifecycleMeta, MinecraftVersionMeta, VersionEntry, VersionScanReport, VersionScanState,
     VersionSubjectKind, analyze_minecraft_version, enrich_version_entries,
-    fetch_version_manifest_cached, manifest_release_references, scan_versions_report, versions_dir,
+    fetch_version_manifest_cached, manifest_release_references, versions_dir,
 };
 use axum::{Json, http::StatusCode};
 use serde::Deserialize;
@@ -362,18 +362,6 @@ pub(crate) fn installed_versions_scan(
     }
 }
 
-pub(crate) fn scan_installed_versions(mc_dir: &FsPath) -> InstalledVersionsScan {
-    let report = scan_versions_report(mc_dir).unwrap_or_else(|_| VersionScanReport {
-        state: VersionScanState::Degraded,
-        versions: Vec::new(),
-        issues: Vec::new(),
-    });
-    InstalledVersionsScan {
-        view_model: version_scan_view_model(&report),
-        versions: report.versions,
-    }
-}
-
 pub(crate) fn version_scan_degraded_response() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::PRECONDITION_FAILED,
@@ -446,16 +434,6 @@ fn catalog_fetch_error_response(
         StatusCode::BAD_GATEWAY,
         Json(serde_json::json!({
             "error": "Could not load the Minecraft catalog. Check your connection and try again."
-        })),
-    )
-}
-
-#[cfg(test)]
-fn scan_versions_error_response(_error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({
-            "error": "Could not scan installed versions. Check the library folder and try again."
         })),
     )
 }
@@ -543,7 +521,6 @@ fn open_path(path: &FsPath) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, io};
 
     fn public_error_json(
         mapper: fn(std::io::Error) -> (StatusCode, Json<serde_json::Value>),
@@ -662,65 +639,20 @@ mod tests {
     }
 
     #[test]
-    fn scan_versions_error_response_hides_unix_path_fragments() {
-        let (status, Json(body)) = scan_versions_error_response(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "permission denied reading /home/alice/Axial Library/versions",
-        ));
-
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            body.get("error").and_then(serde_json::Value::as_str),
-            Some("Could not scan installed versions. Check the library folder and try again.")
-        );
-        let body = body.to_string();
-        assert!(!body.contains("/home/alice"));
-        assert!(!body.contains("Axial Library"));
-    }
-
-    #[test]
-    fn scan_versions_error_response_hides_windows_path_fragments() {
-        let (status, Json(body)) = scan_versions_error_response(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            r"permission denied reading C:\Users\Alice\AppData\Roaming\Axial\versions",
-        ));
-
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            body.get("error").and_then(serde_json::Value::as_str),
-            Some("Could not scan installed versions. Check the library folder and try again.")
-        );
-        let body = body.to_string();
-        assert!(!body.contains(r"C:\Users\Alice"));
-        assert!(!body.contains("AppData"));
-    }
-
-    #[test]
     fn installed_version_scan_view_model_marks_malformed_library_as_degraded() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-api-version-scan-degraded-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|value| value.as_nanos())
-                .unwrap_or_default()
-        ));
-        let version_dir = root.join("versions").join("1.21.1");
-        fs::create_dir_all(&version_dir).expect("create version dir");
-        fs::write(version_dir.join("1.21.1.json"), "{not valid json")
-            .expect("write malformed version json");
+        let report = VersionScanReport {
+            state: VersionScanState::Degraded,
+            versions: Vec::new(),
+            issues: Vec::new(),
+        };
+        let view_model = version_scan_view_model(&report);
 
-        let scan = scan_installed_versions(&root);
-
-        assert!(scan.is_degraded());
-        assert_eq!(scan.view_model.state_id, "degraded");
+        assert!(view_model.degraded);
+        assert_eq!(view_model.state_id, "degraded");
         assert_eq!(
-            scan.view_model.detail.as_deref(),
+            view_model.detail.as_deref(),
             Some(VERSION_SCAN_DEGRADED_MESSAGE)
         );
-        assert!(scan.versions.is_empty());
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
