@@ -28,14 +28,13 @@ use crate::state::{
     operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
     operation_journal_terminal_is_visible,
 };
-use chrono::{DateTime, Duration, FixedOffset};
+use chrono::{DateTime, Duration};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration as StdDuration;
 use tracing::warn;
 
-const ARTIFACT_REPAIR_MAX_ATTEMPTS: u32 = 1;
 const DEFAULT_ARTIFACT_REPAIR_SUPPRESSION_MINUTES: i64 = 15;
 const ARTIFACT_JOURNAL_RETRY_INITIAL_DELAY: StdDuration = StdDuration::from_millis(20);
 const ARTIFACT_JOURNAL_RETRY_MAX_DELAY: StdDuration = StdDuration::from_secs(1);
@@ -141,11 +140,9 @@ pub async fn execute_guardian_artifact_repair(
         request.mode,
         None,
     );
-    if let Some(suppression_until) = request
-        .failure_memory
-        .get(&memory_key)
-        .and_then(|entry| artifact_repair_suppression_until(&entry, request.observed_at))
-    {
+    if let Some(suppression_until) = request.failure_memory.get(&memory_key).and_then(|entry| {
+        super::repair_terminal::active_repair_suppression_until(&entry, request.observed_at)
+    }) {
         return finish_artifact_repair(
             &request,
             operation_id,
@@ -355,64 +352,73 @@ async fn finish_artifact_repair(
                 None,
             ),
         };
-    let journal_error = match journal {
-        ArtifactTerminalJournal::Create(outcome) => {
-            create_terminal_journal_reconciled(
-                request.journals,
-                &operation_id,
-                request.plan,
-                OperationStatus::Blocked,
-                outcome,
-                OperationStepResult::Skipped,
-                facts.clone(),
-            )
-            .await?
-        }
-        ArtifactTerminalJournal::Record(step_id, rollback, failure_point) => {
-            let step_result = if failure_point.is_some() {
-                OperationStepResult::Failed
-            } else {
-                OperationStepResult::Completed
-            };
-            record_artifact_terminal_reconciled(
-                request.journals,
-                &operation_id,
-                repair_step(
-                    step_id,
-                    step_result,
-                    Some(request.plan.target.clone()),
-                    facts.clone(),
-                    rollback,
-                ),
-                failure_point,
-            )
-            .await?
+    let journal_operation_id = operation_id.clone();
+    let journal_facts = facts.clone();
+    let complete_journal = async move {
+        match journal {
+            ArtifactTerminalJournal::Create(outcome) => {
+                create_terminal_journal_reconciled(
+                    request.journals,
+                    &journal_operation_id,
+                    request.plan,
+                    OperationStatus::Blocked,
+                    outcome,
+                    OperationStepResult::Skipped,
+                    journal_facts,
+                )
+                .await
+            }
+            ArtifactTerminalJournal::Record(step_id, rollback, failure_point) => {
+                let step_result = if failure_point.is_some() {
+                    OperationStepResult::Failed
+                } else {
+                    OperationStepResult::Completed
+                };
+                record_artifact_terminal_reconciled(
+                    request.journals,
+                    &journal_operation_id,
+                    repair_step(
+                        step_id,
+                        step_result,
+                        Some(request.plan.target.clone()),
+                        journal_facts,
+                        rollback,
+                    ),
+                    failure_point,
+                )
+                .await
+            }
         }
     };
-    if let Some(error) = journal_error {
-        return Err(error);
-    }
-    record_artifact_repair_memory(
-        request.failure_memory,
-        &request.plan.diagnosis_id,
-        request.mode,
-        &request.plan.target,
-        memory_outcome,
-        request.observed_at,
-        suppression_until.as_deref(),
-        matches!(
-            status,
-            GuardianArtifactRepairStatus::Repaired | GuardianArtifactRepairStatus::Failed
-        ),
-        quarantined,
-    );
-    Ok(artifact_repair_outcome(
-        operation_id,
-        request.plan.diagnosis_id.clone(),
-        status,
-        facts,
-        summary,
-    ))
+    super::repair_terminal::complete_repair_terminal(
+        complete_journal,
+        || {
+            record_artifact_repair_memory(
+                request.failure_memory,
+                &request.plan.diagnosis_id,
+                request.mode,
+                &request.plan.target,
+                memory_outcome,
+                request.observed_at,
+                suppression_until.as_deref(),
+                matches!(
+                    status,
+                    GuardianArtifactRepairStatus::Repaired | GuardianArtifactRepairStatus::Failed
+                ),
+                quarantined,
+            );
+        },
+        || {
+            artifact_repair_outcome(
+                operation_id,
+                request.plan.diagnosis_id.clone(),
+                status,
+                facts,
+                summary,
+            )
+        },
+    )
+    .await
 }
 
 fn validate_artifact_repair_request<'a>(
@@ -890,34 +896,6 @@ fn record_artifact_repair_memory(
             "failed to record Guardian artifact-repair failure memory"
         );
     }
-}
-
-fn suppression_active(entry: &GuardianFailureMemoryEntry, now: &str) -> bool {
-    let Some(suppression_until) = entry.suppression_until.as_deref() else {
-        return false;
-    };
-    let Ok(suppression_until) = DateTime::parse_from_rfc3339(suppression_until) else {
-        return false;
-    };
-    let Ok(now) = DateTime::<FixedOffset>::parse_from_rfc3339(now) else {
-        return false;
-    };
-    suppression_until > now
-}
-
-fn artifact_repair_suppression_until(
-    entry: &GuardianFailureMemoryEntry,
-    now: &str,
-) -> Option<String> {
-    if suppression_active(entry, now) {
-        return entry.suppression_until.clone();
-    }
-    if entry.repair_attempt_count >= ARTIFACT_REPAIR_MAX_ATTEMPTS
-        && entry.suppression_until.is_none()
-    {
-        return default_suppression_until(now);
-    }
-    None
 }
 
 fn default_suppression_until(observed_at: &str) -> Option<String> {
@@ -1431,8 +1409,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_artifact_attempt_limit_suppresses_once_with_new_cooldown() {
-        let root = test_root("legacy-attempt-limit");
+    async fn historical_artifact_attempt_without_cooldown_allows_safe_retry() {
+        let root = test_root("historical-attempt-without-cooldown");
         fs::create_dir_all(&root).expect("root");
         let destination = root.join("bad.jar");
         fs::write(&destination, b"corrupt").expect("corrupt artifact");
@@ -1470,14 +1448,14 @@ mod tests {
         ))
         .await;
 
-        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Suppressed);
-        assert_eq!(fs::read(&destination).expect("original"), b"corrupt");
-        assert_eq!(server.request_count(), 0);
+        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
+        assert_eq!(fs::read(&destination).expect("replacement"), replacement);
+        assert_eq!(server.request_count(), 1);
         let memory = stores.failure_memory.list();
-        assert_eq!(memory[0].repair_attempt_count, 1);
+        assert_eq!(memory[0].repair_attempt_count, 2);
         assert_eq!(
             memory[0].last_action_outcome,
-            Some(FailureMemoryActionOutcome::Suppressed)
+            Some(FailureMemoryActionOutcome::Repaired)
         );
         assert!(memory[0].suppression_until.is_some());
 

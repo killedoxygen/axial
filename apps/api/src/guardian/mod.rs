@@ -23,6 +23,7 @@ mod diagnosis;
 mod facts;
 mod inference_graph;
 mod model;
+mod repair_terminal;
 
 #[cfg(test)]
 mod tests;

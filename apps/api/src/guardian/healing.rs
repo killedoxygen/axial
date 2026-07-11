@@ -22,14 +22,13 @@ use crate::state::{
     operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
     operation_journal_terminal_is_visible,
 };
-use chrono::{DateTime, Duration, FixedOffset};
+use chrono::{DateTime, Duration};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 use tracing::warn;
 
 const READY_MARKER_REPAIR_STEP: &str = "recreate_managed_runtime_ready_marker";
-const READY_MARKER_REPAIR_MAX_ATTEMPTS: u32 = 1;
 const DEFAULT_REPAIR_SUPPRESSION_MINUTES: i64 = 15;
 const RUNTIME_JOURNAL_RETRY_INITIAL_DELAY: StdDuration = StdDuration::from_millis(20);
 const RUNTIME_JOURNAL_RETRY_MAX_DELAY: StdDuration = StdDuration::from_secs(1);
@@ -188,11 +187,9 @@ pub async fn execute_managed_runtime_ready_marker_repair(
         request.mode,
         None,
     );
-    if let Some(suppression_until) = request
-        .failure_memory
-        .get(&memory_key)
-        .and_then(|entry| runtime_repair_suppression_until(&entry, request.observed_at))
-    {
+    if let Some(suppression_until) = request.failure_memory.get(&memory_key).and_then(|entry| {
+        super::repair_terminal::active_repair_suppression_until(&entry, request.observed_at)
+    }) {
         return finish_runtime_repair(
             &terminal_context,
             operation_id,
@@ -328,61 +325,68 @@ async fn finish_runtime_repair(
                 true,
             ),
         };
-    let journal_error = match journal {
-        RuntimeTerminalJournal::Create(outcome) => {
-            create_terminal_journal_reconciled(
-                context.journals,
-                &operation_id,
-                context.diagnosis_id,
-                context.target,
-                OperationStatus::Blocked,
-                outcome,
-                OperationStepResult::Skipped,
-                facts.clone(),
-            )
-            .await?
-        }
-        RuntimeTerminalJournal::Record(step_result, failure_point) => {
-            record_runtime_terminal_reconciled(
-                context.journals,
-                &operation_id,
-                repair_step(step_result, Some(context.target.clone()), facts.clone()),
-                failure_point,
-                context.terminal_failure,
-            )
-            .await?
+    let journal_operation_id = operation_id.clone();
+    let journal_facts = facts.clone();
+    let complete_journal = async move {
+        match journal {
+            RuntimeTerminalJournal::Create(outcome) => {
+                create_terminal_journal_reconciled(
+                    context.journals,
+                    &journal_operation_id,
+                    context.diagnosis_id,
+                    context.target,
+                    OperationStatus::Blocked,
+                    outcome,
+                    OperationStepResult::Skipped,
+                    journal_facts,
+                )
+                .await
+            }
+            RuntimeTerminalJournal::Record(step_result, failure_point) => {
+                record_runtime_terminal_reconciled(
+                    context.journals,
+                    &journal_operation_id,
+                    repair_step(step_result, Some(context.target.clone()), journal_facts),
+                    failure_point,
+                    context.terminal_failure,
+                )
+                .await
+            }
         }
     };
-    if let Some(error) = journal_error {
-        return Err(error);
-    }
-    if let Some(action) = action {
-        let memory_outcome = match status {
-            GuardianRepairStatus::Repaired => FailureMemoryActionOutcome::Repaired,
-            GuardianRepairStatus::Blocked => FailureMemoryActionOutcome::Blocked,
-            GuardianRepairStatus::Failed => FailureMemoryActionOutcome::Failed,
-            GuardianRepairStatus::Suppressed => FailureMemoryActionOutcome::Suppressed,
-        };
-        record_repair_memory(
-            context.failure_memory,
-            context.diagnosis_id,
-            context.mode,
-            context.target,
-            action,
-            memory_outcome,
-            context.observed_at,
-            suppression_until.as_deref(),
-            repair_attempt,
-        );
-    }
-    Ok(repair_outcome(
-        operation_id,
-        Some(context.diagnosis_id.clone()),
-        action,
-        status,
-        facts,
-        summary,
-    ))
+    super::repair_terminal::complete_repair_terminal(
+        complete_journal,
+        || {
+            let memory_outcome = match status {
+                GuardianRepairStatus::Repaired => FailureMemoryActionOutcome::Repaired,
+                GuardianRepairStatus::Blocked => FailureMemoryActionOutcome::Blocked,
+                GuardianRepairStatus::Failed => FailureMemoryActionOutcome::Failed,
+                GuardianRepairStatus::Suppressed => FailureMemoryActionOutcome::Suppressed,
+            };
+            record_repair_memory(
+                context.failure_memory,
+                context.diagnosis_id,
+                context.mode,
+                context.target,
+                action,
+                memory_outcome,
+                context.observed_at,
+                suppression_until.as_deref(),
+                repair_attempt,
+            );
+        },
+        || {
+            repair_outcome(
+                operation_id,
+                Some(context.diagnosis_id.clone()),
+                action,
+                status,
+                facts,
+                summary,
+            )
+        },
+    )
+    .await
 }
 
 fn planned_runtime_journal(
@@ -690,21 +694,32 @@ fn record_repair_memory(
     diagnosis_id: &DiagnosisId,
     mode: GuardianMode,
     target: &TargetDescriptor,
-    action: GuardianActionKind,
+    action: Option<GuardianActionKind>,
     outcome: FailureMemoryActionOutcome,
     observed_at: &str,
     suppression_until: Option<&str>,
     repair_attempt: bool,
 ) {
-    let mut entry = GuardianFailureMemoryEntry::observed(
+    let observation = GuardianFailureMemoryEntry::observed(
         diagnosis_id.clone(),
         GuardianDomain::Runtime,
         target.clone(),
         mode,
         None,
         observed_at,
-    )
-    .with_action(action, outcome);
+    );
+    let mut entry = match action {
+        Some(action) => observation.with_action(action, outcome),
+        None => failure_memory
+            .get(&observation.key)
+            .map(|mut existing| {
+                existing.last_observed_at = observation.last_observed_at.clone();
+                existing.occurrence_count = 1;
+                existing.repair_attempt_count = 0;
+                existing
+            })
+            .unwrap_or(observation),
+    };
     if repair_attempt {
         entry = entry.with_repair_attempt();
     }
@@ -717,34 +732,6 @@ fn record_repair_memory(
             "failed to record Guardian managed-runtime repair failure memory"
         );
     }
-}
-
-fn suppression_active(entry: &GuardianFailureMemoryEntry, now: &str) -> bool {
-    let Some(suppression_until) = entry.suppression_until.as_deref() else {
-        return false;
-    };
-    let Ok(suppression_until) = DateTime::parse_from_rfc3339(suppression_until) else {
-        return false;
-    };
-    let Ok(now) = DateTime::<FixedOffset>::parse_from_rfc3339(now) else {
-        return false;
-    };
-    suppression_until > now
-}
-
-fn runtime_repair_suppression_until(
-    entry: &GuardianFailureMemoryEntry,
-    now: &str,
-) -> Option<String> {
-    if suppression_active(entry, now) {
-        return entry.suppression_until.clone();
-    }
-    if entry.repair_attempt_count >= READY_MARKER_REPAIR_MAX_ATTEMPTS
-        && entry.suppression_until.is_none()
-    {
-        return default_suppression_until(now);
-    }
-    None
 }
 
 fn fact_ids(facts: &[ExecutionFact]) -> Vec<String> {
@@ -1131,6 +1118,7 @@ mod tests {
         assert_eq!(journal.status, OperationStatus::Succeeded);
         assert_eq!(journal.outcome, Some(OperationOutcome::Succeeded));
         assert!(!stores.journals.has_retry_candidate());
+        assert!(stores.failure_memory.list().is_empty());
 
         let later_operation_id = OperationId::new("managed-runtime-later-mutation");
         super::create_terminal_journal(
@@ -1307,6 +1295,100 @@ mod tests {
         cleanup(&root);
     }
 
+    #[tokio::test]
+    async fn missing_runtime_repair_task_records_complete_blocked_terminal() {
+        let root = test_root("missing-repair-task");
+        let paths = test_paths(&root);
+        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+        let java_executable = write_fake_java(&runtime_root);
+        write_runtime_manifest_proof(&runtime_root, &java_executable);
+        let stores = stores();
+        let decision = repair_decision(OwnershipClass::LauncherManaged);
+        let mut plan = repair_plan(&decision);
+        plan.tasks.clear();
+
+        let outcome = execute_managed_runtime_ready_marker_repair(request(
+            &plan,
+            decision.operation_id.clone(),
+            decision.mode,
+            &paths,
+            &runtime_root,
+            &java_executable,
+            &stores,
+            "2026-06-15T10:00:00Z",
+            None,
+        ))
+        .await
+        .expect("persist blocked runtime repair terminal");
+
+        assert_eq!(outcome.status, GuardianRepairStatus::Blocked);
+        assert_eq!(outcome.action, None);
+        assert!(!runtime_root.join(".axial-ready").exists());
+        let journal = stores.journals.get(&outcome.operation_id).expect("journal");
+        assert_eq!(journal.status, OperationStatus::Blocked);
+        assert_eq!(journal.outcome, Some(OperationOutcome::Blocked));
+        let memory = stores.failure_memory.list();
+        assert_eq!(memory.len(), 1);
+        assert_eq!(memory[0].last_action_kind, None);
+        assert_eq!(memory[0].last_action_outcome, None);
+        assert_eq!(memory[0].repair_attempt_count, 0);
+        assert_eq!(memory[0].suppression_until, None);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn actionless_runtime_observation_preserves_existing_loop_control() {
+        let stores = stores();
+        let decision = repair_decision(OwnershipClass::LauncherManaged);
+        let target = decision_target(&decision);
+        let diagnosis_id = DiagnosisId::new("managed_runtime_corrupt");
+        stores
+            .failure_memory
+            .record(
+                GuardianFailureMemoryEntry::observed(
+                    diagnosis_id.clone(),
+                    crate::guardian::GuardianDomain::Runtime,
+                    target.clone(),
+                    GuardianMode::Managed,
+                    None,
+                    "2026-06-15T09:00:00Z",
+                )
+                .with_action(
+                    GuardianActionKind::Repair,
+                    FailureMemoryActionOutcome::Failed,
+                )
+                .with_repair_attempt()
+                .with_suppression_until("2026-06-15T10:30:00Z"),
+            )
+            .expect("existing loop control");
+
+        super::record_repair_memory(
+            &stores.failure_memory,
+            &diagnosis_id,
+            GuardianMode::Managed,
+            &target,
+            None,
+            FailureMemoryActionOutcome::Blocked,
+            "2026-06-15T10:00:00Z",
+            None,
+            false,
+        );
+
+        let memory = stores.failure_memory.list();
+        assert_eq!(memory[0].occurrence_count, 2);
+        assert_eq!(memory[0].repair_attempt_count, 1);
+        assert_eq!(memory[0].last_action_kind, Some(GuardianActionKind::Repair));
+        assert_eq!(
+            memory[0].last_action_outcome,
+            Some(FailureMemoryActionOutcome::Failed)
+        );
+        assert_eq!(
+            memory[0].suppression_until.as_deref(),
+            Some("2026-06-15T10:30:00Z")
+        );
+    }
+
     #[test]
     fn malformed_or_non_repair_policy_is_blocked_before_execution() {
         let root = test_root("malformed-policy");
@@ -1360,8 +1442,8 @@ mod tests {
     }
 
     #[test]
-    fn repair_attempt_limit_suppresses_without_active_cooldown() {
-        let root = test_root("attempt-limit");
+    fn historical_runtime_attempt_without_cooldown_allows_safe_retry() {
+        let root = test_root("historical-attempt-without-cooldown");
         let paths = test_paths(&root);
         let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
         let java_executable = write_fake_java(&runtime_root);
@@ -1399,13 +1481,13 @@ mod tests {
             None,
         );
 
-        assert_eq!(outcome.status, GuardianRepairStatus::Suppressed);
-        assert!(!runtime_root.join(".axial-ready").exists());
+        assert_eq!(outcome.status, GuardianRepairStatus::Repaired);
+        assert!(runtime_root.join(".axial-ready").exists());
         let memory = stores.failure_memory.list();
-        assert_eq!(memory[0].repair_attempt_count, 1);
+        assert_eq!(memory[0].repair_attempt_count, 2);
         assert_eq!(
             memory[0].last_action_outcome,
-            Some(FailureMemoryActionOutcome::Suppressed)
+            Some(FailureMemoryActionOutcome::Repaired)
         );
         assert!(memory[0].suppression_until.is_some());
         cleanup(&root);
