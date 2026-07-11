@@ -12,9 +12,8 @@ use crate::application::timing::{
 };
 use crate::application::version::VERSION_SCAN_DEGRADED_MESSAGE;
 use crate::application::{
-    LaunchBoundaryStaging, LaunchBoundaryStagingRequest, LaunchInstanceCommand,
-    LaunchInstanceStaging, flush_pending_saved_skin_applies_for_launch, stage_launch_boundary,
-    stage_launch_instance_command,
+    LaunchInstanceCommand, LaunchInstanceStaging, flush_pending_saved_skin_applies_for_launch,
+    launch_preflight_stage_evidence, stage_launch_instance_command,
 };
 use crate::guardian::{
     GuardianDecisionKind as ApiGuardianDecisionKind, GuardianFact,
@@ -32,7 +31,8 @@ use axial_config::{AppConfig, Instance};
 use axial_launcher::{
     GuardianDecision, GuardianMode, GuardianSummary, LaunchGuardianContext, LaunchIntent,
     LaunchReadiness, LaunchReadinessReason, LaunchReadinessReasonId, LaunchReadinessRequest,
-    LaunchReadinessSeverity, LaunchState, inspect_launch_readiness, launch_notice,
+    LaunchReadinessSeverity, LaunchStageEvidence, LaunchState, inspect_launch_readiness,
+    launch_notice,
 };
 use axial_minecraft::{JavaRuntimeProbeReceipt, VersionScanState};
 use axum::{Json, http::StatusCode};
@@ -70,7 +70,7 @@ pub struct LaunchRequest {
 
 pub(crate) struct LaunchSessionTask {
     pub application: LaunchInstanceStaging,
-    pub boundary: LaunchBoundaryStaging,
+    pub preflight_stage_evidence: Vec<LaunchStageEvidence>,
     pub instance: Instance,
     pub intent: LaunchIntent,
     pub guardian: GuardianSummary,
@@ -99,7 +99,7 @@ struct LaunchPreflightFacts {
     guardian_summary: GuardianSummary,
     guardian_outcome: GuardianPreflightOutcome,
     guardian_facts: Vec<GuardianFact>,
-    boundary: LaunchBoundaryStaging,
+    preflight_stage_evidence: Vec<LaunchStageEvidence>,
     readiness: LaunchReadiness,
     resource_budget: LaunchProofResourceBudget,
     java_probe_receipt: Option<JavaRuntimeProbeReceipt>,
@@ -370,7 +370,7 @@ async fn prepare_launch_session_with_auth_refresh(
     Ok(PreparedLaunch {
         task: LaunchSessionTask {
             application,
-            boundary: preflight.boundary,
+            preflight_stage_evidence: preflight.preflight_stage_evidence,
             instance: instance.clone(),
             intent,
             guardian: preflight.guardian_summary,
@@ -748,12 +748,6 @@ async fn build_launch_preflight_facts_with_memory_capture(
     let readiness_facts = readiness_guardian_facts(&readiness);
     guardian_facts.extend(readiness_facts.iter().cloned());
     let guardian_started_at = Instant::now();
-    let boundary = stage_launch_boundary(LaunchBoundaryStagingRequest::new(
-        application_guardian_mode(guardian.mode),
-        OperationPhase::Validating,
-        &guardian_facts,
-        &performance_mode,
-    ));
     let guardian_outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
         operation_id: None,
         mode: application_guardian_mode(guardian.mode),
@@ -764,6 +758,8 @@ async fn build_launch_preflight_facts_with_memory_capture(
         overrides: preflight_override_signals(&guardian),
         explicit_user_intent: guardian.has_risky_overrides(),
     });
+    let preflight_stage_evidence =
+        launch_preflight_stage_evidence(&guardian_outcome, &performance_mode);
     apply_guardian_preflight_interventions(
         &guardian_outcome,
         &mut requested_java,
@@ -810,7 +806,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
         guardian_summary,
         guardian_outcome,
         guardian_facts,
-        boundary,
+        preflight_stage_evidence,
         readiness,
         resource_budget,
         java_probe_receipt,

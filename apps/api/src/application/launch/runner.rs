@@ -6,7 +6,7 @@ mod recovery;
 mod spawn;
 mod status;
 
-use crate::application::{launch_application_stage_evidence, launch_boundary_stage_evidence};
+use crate::application::launch_application_stage_evidence;
 use crate::execution::launch::{
     LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
 };
@@ -506,7 +506,7 @@ async fn launch_session_inner_with_control(
 ) -> Result<LaunchSuccess, LaunchRequestError> {
     let super::session::LaunchSessionTask {
         application,
-        boundary,
+        preflight_stage_evidence,
         mut instance,
         intent,
         mut guardian,
@@ -520,15 +520,8 @@ async fn launch_session_inner_with_control(
         &session_id,
         &format!("application command staged: {:?}", application.command.kind),
     );
-    trace_launch_event(
-        &session_id,
-        &format!(
-            "application launch boundary staged: safety={:?} performance_mode={}",
-            boundary.guardian_decision.kind, boundary.performance_mode
-        ),
-    );
     let mut initial_evidence = launch_application_stage_evidence(&application);
-    initial_evidence.extend(launch_boundary_stage_evidence(&boundary));
+    initial_evidence.extend(preflight_stage_evidence);
     state
         .sessions()
         .record_stage_evidence(&session_id, initial_evidence)
@@ -2940,13 +2933,14 @@ mod tests {
                 },
                 Some(session_id.to_string()),
             ),
-            boundary: crate::application::stage_launch_boundary(
-                crate::application::LaunchBoundaryStagingRequest::new(
-                    crate::guardian::GuardianMode::Managed,
-                    OperationPhase::Validating,
-                    &[],
-                    "managed",
+            preflight_stage_evidence: crate::application::launch_preflight_stage_evidence(
+                &crate::guardian::guardian_preflight_outcome(
+                    crate::guardian::GuardianPreflightOutcomeRequest::new(
+                        crate::guardian::GuardianMode::Managed,
+                        &[],
+                    ),
                 ),
+                "managed",
             ),
             instance: Instance {
                 id: "instance".to_string(),

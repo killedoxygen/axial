@@ -883,7 +883,7 @@ async fn finish_benchmark_suite_reservation_failure(
 ) {
     let session_id = task.intent.session_id.as_str();
     let mut initial_evidence = super::launch_application_stage_evidence(&task.application);
-    initial_evidence.extend(super::launch_boundary_stage_evidence(&task.boundary));
+    initial_evidence.extend(task.preflight_stage_evidence.clone());
     state
         .sessions()
         .record_stage_evidence(session_id, initial_evidence)

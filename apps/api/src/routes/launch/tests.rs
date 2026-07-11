@@ -4254,13 +4254,14 @@ fn test_launch_session_task() -> launch_app::LaunchSessionTask {
             },
             Some("session-queued".to_string()),
         ),
-        boundary: crate::application::stage_launch_boundary(
-            crate::application::LaunchBoundaryStagingRequest::new(
-                crate::guardian::GuardianMode::Managed,
-                crate::state::contracts::OperationPhase::Validating,
-                &[],
-                "managed",
+        preflight_stage_evidence: crate::application::launch_preflight_stage_evidence(
+            &crate::guardian::guardian_preflight_outcome(
+                crate::guardian::GuardianPreflightOutcomeRequest::new(
+                    crate::guardian::GuardianMode::Managed,
+                    &[],
+                ),
             ),
+            "managed",
         ),
         instance: Instance {
             id: "instance-queued".to_string(),

@@ -8,12 +8,9 @@ use super::{
     ApplicationCommand, ApplicationCommandRequest, CommandResult, CommandResultCarriers,
     LaunchInstanceCommand, LaunchInstancePayload, SessionCommandCarrier,
 };
-use crate::guardian::{
-    GuardianDecision, GuardianDecisionKind, GuardianFact, GuardianMode, GuardianPolicyContext,
-    SafetyCase, SafetyOutcome, build_safety_case, decide_guardian_policy,
-};
+use crate::guardian::GuardianPreflightOutcome;
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
-use crate::state::contracts::{CommandKind, OperationId, OperationPhase, OperationStatus};
+use crate::state::contracts::{CommandKind, OperationStatus};
 use axial_launcher::{LaunchStageEvidence, launch_notice};
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
@@ -67,40 +64,6 @@ pub struct LaunchInstanceStaging {
     pub result: CommandResult<LaunchInstancePayload>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LaunchBoundaryStaging {
-    pub safety_case: SafetyCase,
-    pub guardian_decision: GuardianDecision,
-    pub safety: SafetyOutcome,
-    pub performance_mode: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct LaunchBoundaryStagingRequest<'a> {
-    pub operation_id: Option<OperationId>,
-    pub guardian_mode: GuardianMode,
-    pub phase: OperationPhase,
-    pub guardian_facts: &'a [GuardianFact],
-    pub performance_mode: &'a str,
-}
-
-impl<'a> LaunchBoundaryStagingRequest<'a> {
-    pub fn new(
-        guardian_mode: GuardianMode,
-        phase: OperationPhase,
-        guardian_facts: &'a [GuardianFact],
-        performance_mode: &'a str,
-    ) -> Self {
-        Self {
-            operation_id: None,
-            guardian_mode,
-            phase,
-            guardian_facts,
-            performance_mode,
-        }
-    }
-}
-
 pub fn stage_launch_instance_command(
     request: LaunchInstanceCommand,
     session_id: Option<String>,
@@ -130,28 +93,6 @@ pub fn stage_launch_instance_command(
     LaunchInstanceStaging { command, result }
 }
 
-pub fn stage_launch_boundary(request: LaunchBoundaryStagingRequest<'_>) -> LaunchBoundaryStaging {
-    let safety_case = build_safety_case(
-        request.operation_id,
-        request.guardian_mode,
-        request.phase,
-        request.guardian_facts,
-    );
-    let guardian_decision =
-        decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
-    let safety = launch_boundary_safety_outcome(&guardian_decision, &safety_case);
-    let performance_mode =
-        sanitize_evidence_token(request.performance_mode, RedactionAudience::UserVisible, 64)
-            .unwrap_or_else(|| "unknown".to_string());
-
-    LaunchBoundaryStaging {
-        safety_case,
-        guardian_decision,
-        safety,
-        performance_mode,
-    }
-}
-
 pub fn launch_application_stage_evidence(
     staging: &LaunchInstanceStaging,
 ) -> Vec<LaunchStageEvidence> {
@@ -176,23 +117,29 @@ pub fn launch_application_stage_evidence(
     )]
 }
 
-pub fn launch_boundary_stage_evidence(staging: &LaunchBoundaryStaging) -> Vec<LaunchStageEvidence> {
+pub(crate) fn launch_preflight_stage_evidence(
+    outcome: &GuardianPreflightOutcome,
+    performance_mode: &str,
+) -> Vec<LaunchStageEvidence> {
+    let performance_mode =
+        sanitize_evidence_token(performance_mode, RedactionAudience::UserVisible, 64)
+            .unwrap_or_else(|| "unknown".to_string());
     vec![
         launch_stage_evidence(
             "guardian_launch_safety_decision",
             "guardian",
             "Guardian recorded the launch safety decision.",
             vec![
-                format!("mode:{:?}", staging.guardian_decision.mode),
-                format!("decision:{:?}", staging.guardian_decision.kind),
-                format!("diagnoses:{}", staging.safety_case.diagnoses.len()),
+                format!("mode:{:?}", outcome.guardian_decision.mode),
+                format!("decision:{:?}", outcome.guardian_decision.kind),
+                format!("diagnoses:{}", outcome.safety_case.diagnoses.len()),
             ],
         ),
         launch_stage_evidence(
             "performance_launch_plan_input",
             "performance",
             "Performance launch inputs were recorded.",
-            vec![format!("mode:{}", staging.performance_mode)],
+            vec![format!("mode:{performance_mode}")],
         ),
     ]
 }
@@ -286,33 +233,6 @@ pub fn launch_request_error_status(error: &LaunchRequestError) -> StatusCode {
     }
 }
 
-fn launch_boundary_safety_outcome(
-    decision: &GuardianDecision,
-    safety_case: &SafetyCase,
-) -> SafetyOutcome {
-    SafetyOutcome {
-        decision: decision.kind,
-        summary: launch_boundary_safety_summary(decision.kind).to_string(),
-        detail: safety_case
-            .diagnoses
-            .first()
-            .map(|diagnosis| diagnosis.public_reason_template.clone()),
-        diagnoses: decision.diagnoses.clone(),
-    }
-}
-
-fn launch_boundary_safety_summary(decision: GuardianDecisionKind) -> &'static str {
-    match decision {
-        GuardianDecisionKind::Allow | GuardianDecisionKind::RecordOnly => {
-            "Launch safety checks are recorded."
-        }
-        GuardianDecisionKind::Warn => "Launch safety checks produced warnings.",
-        GuardianDecisionKind::Block => "Launch safety checks blocked the command.",
-        GuardianDecisionKind::AskUser => "Launch safety checks require user confirmation.",
-        _ => "Launch safety checks selected a guarded action.",
-    }
-}
-
 fn launch_stage_evidence(
     id: &str,
     system: &str,
@@ -339,13 +259,14 @@ fn launch_stage_evidence(
 mod tests {
     use super::stage_launch_instance_command;
     use crate::application::LaunchInstanceCommand;
+    use crate::execution::ExecutionFactKind;
     use crate::execution::runtime::runtime_fact;
     use crate::guardian::guardian_fact_from_execution;
     use crate::state::contracts::{
         CommandKind, OperationPhase, OperationStatus, OwnershipClass, StabilizationSystem,
         TargetDescriptor, TargetKind,
     };
-    use crate::{application::LaunchBoundaryStagingRequest, execution::ExecutionFactKind};
+    use axial_launcher::LaunchStageEvidence;
 
     #[test]
     fn launch_staging_builds_application_command_and_session_carrier() {
@@ -382,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_boundary_staging_authors_safety_case_and_sanitized_performance_mode() {
+    fn launch_preflight_stage_evidence_has_exact_shape_and_redacts_performance_mode() {
         let target = TargetDescriptor::new(
             StabilizationSystem::Execution,
             TargetKind::Runtime,
@@ -398,39 +319,37 @@ mod tests {
         let guardian_fact =
             guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
 
-        let staging = super::stage_launch_boundary(LaunchBoundaryStagingRequest::new(
-            crate::guardian::GuardianMode::Managed,
-            OperationPhase::Validating,
-            &[guardian_fact],
-            "managed C:\\Users\\Alice",
-        ));
-
-        assert_eq!(staging.safety_case.diagnoses.len(), 1);
-        assert_eq!(
-            staging.guardian_decision.kind,
-            crate::guardian::GuardianDecisionKind::Fallback
+        let outcome = crate::guardian::guardian_preflight_outcome(
+            crate::guardian::GuardianPreflightOutcomeRequest::new(
+                crate::guardian::GuardianMode::Managed,
+                &[guardian_fact],
+            ),
         );
+        let evidence =
+            super::launch_preflight_stage_evidence(&outcome, r"managed C:\Users\Alice -Xmx8192M");
         assert_eq!(
-            staging.safety.diagnoses[0].as_str(),
-            "java_override_unavailable"
+            evidence,
+            vec![
+                LaunchStageEvidence {
+                    id: "guardian_launch_safety_decision".to_string(),
+                    system: "guardian".to_string(),
+                    summary: "Guardian recorded the launch safety decision.".to_string(),
+                    details: vec![
+                        "mode:Managed".to_string(),
+                        "decision:Fallback".to_string(),
+                        "diagnoses:1".to_string(),
+                    ],
+                },
+                LaunchStageEvidence {
+                    id: "performance_launch_plan_input".to_string(),
+                    system: "performance".to_string(),
+                    summary: "Performance launch inputs were recorded.".to_string(),
+                    details: vec!["mode:unknown".to_string()],
+                },
+            ]
         );
-        assert_eq!(staging.performance_mode, "unknown");
-    }
-
-    #[test]
-    fn launch_stage_evidence_redacts_boundary_inputs() {
-        let staging = super::stage_launch_boundary(LaunchBoundaryStagingRequest::new(
-            crate::guardian::GuardianMode::Managed,
-            OperationPhase::Validating,
-            &[],
-            r"managed C:\Users\Alice -Xmx8192M",
-        ));
-        let evidence = super::launch_boundary_stage_evidence(&staging);
         let encoded = serde_json::to_string(&evidence).expect("stage evidence json");
 
-        assert!(encoded.contains("guardian_launch_safety_decision"));
-        assert!(encoded.contains("performance_launch_plan_input"));
-        assert!(encoded.contains("mode:unknown"));
         assert!(!encoded.contains("Alice"));
         assert!(!encoded.contains("-Xmx"));
         assert!(!encoded.contains("Users"));

@@ -84,11 +84,19 @@ async fn prepare_launch_session_ensures_instance_layout_before_building_intent()
             .and_then(|session| session.state.as_deref()),
         Some("queued")
     );
+    assert_eq!(prepared.task.preflight_stage_evidence.len(), 2);
     assert_eq!(
-        prepared.task.boundary.guardian_decision.mode,
-        crate::guardian::GuardianMode::Managed
+        prepared.task.preflight_stage_evidence[0].id,
+        "guardian_launch_safety_decision"
     );
-    assert_eq!(prepared.task.boundary.performance_mode, "managed");
+    assert_eq!(
+        prepared.task.preflight_stage_evidence[0].details[0],
+        "mode:Managed"
+    );
+    assert_eq!(
+        prepared.task.preflight_stage_evidence[1].details,
+        ["mode:managed"]
+    );
     assert_eq!(prepared.task.intent.game_dir, Some(game_dir.clone()));
     assert_eq!(prepared.task.intent.auth.player_name, "Player");
     assert_eq!(

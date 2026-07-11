@@ -3,15 +3,14 @@ use super::{
     LaunchPreflightBuild, LaunchPreflightFacts, application_guardian_mode,
     build_launch_preflight_facts,
 };
-use crate::application::launch::policy;
-use crate::application::{LaunchBoundaryStagingRequest, stage_launch_boundary};
 use crate::execution::runtime::{
     ManagedRuntimeRoot, ManagedRuntimeVerificationRequest, verify_managed_runtime,
 };
 use crate::guardian::{
     GuardianDecisionKind as ApiGuardianDecisionKind, GuardianManagedRuntimeRepairRequest,
-    GuardianPreflightOutcome, GuardianRepairPlanningContext, GuardianRepairStatus,
-    GuardianUserOutcome, execute_managed_runtime_ready_marker_repair, guardian_fact_from_execution,
+    GuardianPreflightOutcome, GuardianPreflightOutcomeRequest, GuardianRepairPlanningContext,
+    GuardianRepairStatus, GuardianUserOutcome, execute_managed_runtime_ready_marker_repair,
+    guardian_fact_from_execution, guardian_preflight_outcome,
     plan_managed_runtime_ready_marker_repair, runtime_repair_user_outcome,
 };
 use crate::logging::timestamp_utc;
@@ -110,15 +109,12 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
         .iter()
         .map(|fact| guardian_fact_from_execution(fact, OperationPhase::Validating))
         .collect::<Vec<_>>();
-    let performance_mode = policy::selected_performance_mode(launch.instance, &preflight.config);
-    let repair_boundary = stage_launch_boundary(LaunchBoundaryStagingRequest::new(
+    let repair_outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest::new(
         application_guardian_mode(preflight.guardian.mode),
-        OperationPhase::Validating,
         &guardian_facts,
-        &performance_mode,
     ));
     let Ok(repair_plan) = plan_managed_runtime_ready_marker_repair(
-        &repair_boundary.guardian_decision,
+        &repair_outcome.guardian_decision,
         GuardianRepairPlanningContext::current_operation(),
     ) else {
         return Ok(preflight);
@@ -127,8 +123,8 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
     let state_task = state.clone();
     let runtime_root_path = candidate.runtime_root.clone();
     let java_executable = candidate.java_executable.clone();
-    let operation_id = repair_boundary.guardian_decision.operation_id.clone();
-    let mode = repair_boundary.guardian_decision.mode;
+    let operation_id = repair_outcome.guardian_decision.operation_id.clone();
+    let mode = repair_outcome.guardian_decision.mode;
     let abandoned = Arc::new(AtomicBool::new(false));
     let request_guard = RuntimeRepairRequestGuard::new(abandoned.clone());
     let terminal_failure = Arc::new(tokio::sync::Notify::new());
