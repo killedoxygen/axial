@@ -1,6 +1,3 @@
-use super::inference_graph::{
-    DiagnosisGraphNode, DomainTemplate, FactRequirement, diagnosis_graph_nodes,
-};
 use super::{
     Diagnosis, DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence,
     GuardianDomain, GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext,
@@ -18,18 +15,19 @@ const SNAPSHOT_FIXTURE: &str = include_str!(concat!(
     "/tests/fixtures/guardian/guardian-decision-snapshot-v1.json"
 ));
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_DECISION_SNAPSHOT";
-const GRAPH_NODE_COUNT: usize = 34;
-const GRAPH_SOURCE_COUNT: usize = 69;
-const GRAPH_DIAGNOSIS_COUNT: usize = 46;
-const GRAPH_SOURCE_PHASE_COUNT: usize = 272;
+const LEGACY_GRAPH_NODE_COUNT: usize = 34;
+const FACT_SOURCE_COUNT: usize = 69;
+const DIAGNOSIS_COUNT: usize = 46;
+const FACT_SOURCE_PHASE_COUNT: usize = 272;
 const UNKNOWN_SOURCE_COUNT: usize = 12;
 const CONTEXT_COUNT: usize = 16;
-const GRAPH_OWNERSHIP_COUNT: usize = 5;
+const FACT_SOURCE_OWNERSHIP_COUNT: usize = 5;
 const MODE_COUNT: usize = 3;
 const POLICY_CELLS_PER_ROOT: usize = CONTEXT_COUNT * MODE_COUNT;
-const POLICY_ROOT_COUNT: usize = GRAPH_SOURCE_COUNT * GRAPH_OWNERSHIP_COUNT + UNKNOWN_SOURCE_COUNT;
+const POLICY_ROOT_COUNT: usize =
+    FACT_SOURCE_COUNT * FACT_SOURCE_OWNERSHIP_COUNT + UNKNOWN_SOURCE_COUNT;
 const RAW_DIAGNOSIS_CASE_COUNT: usize =
-    GRAPH_SOURCE_PHASE_COUNT * GRAPH_OWNERSHIP_COUNT + UNKNOWN_SOURCE_COUNT;
+    FACT_SOURCE_PHASE_COUNT * FACT_SOURCE_OWNERSHIP_COUNT + UNKNOWN_SOURCE_COUNT;
 const RAW_POLICY_EVALUATION_COUNT: usize = RAW_DIAGNOSIS_CASE_COUNT * POLICY_CELLS_PER_ROOT;
 const COMPRESSED_POLICY_CELL_COUNT: usize = POLICY_ROOT_COUNT * POLICY_CELLS_PER_ROOT;
 
@@ -38,12 +36,30 @@ const MODES: [GuardianMode; MODE_COUNT] = [
     GuardianMode::Custom,
     GuardianMode::Disabled,
 ];
-const OWNERSHIPS: [OwnershipClass; GRAPH_OWNERSHIP_COUNT] = [
+const OWNERSHIPS: [OwnershipClass; FACT_SOURCE_OWNERSHIP_COUNT] = [
     OwnershipClass::LauncherManaged,
     OwnershipClass::CompositionManaged,
     OwnershipClass::UserOwned,
     OwnershipClass::ExternalProviderDerived,
     OwnershipClass::Unknown,
+];
+const CONTEXT_IDS: [&str; CONTEXT_COUNT] = [
+    "j0-s0-r0-u0",
+    "j1-s0-r0-u0",
+    "j0-s1-r0-u0",
+    "j1-s1-r0-u0",
+    "j0-s0-r1-u0",
+    "j1-s0-r1-u0",
+    "j0-s1-r1-u0",
+    "j1-s1-r1-u0",
+    "j0-s0-r0-u1",
+    "j1-s0-r0-u1",
+    "j0-s1-r0-u1",
+    "j1-s1-r0-u1",
+    "j0-s0-r1-u1",
+    "j1-s0-r1-u1",
+    "j0-s1-r1-u1",
+    "j1-s1-r1-u1",
 ];
 const PHASES: [OperationPhase; UNKNOWN_SOURCE_COUNT] = [
     OperationPhase::Startup,
@@ -178,12 +194,39 @@ pub(super) struct PolicyDecisionCell {
 fn checked_in_guardian_decision_snapshot_is_byte_stable_and_complete() {
     let fixture = serde_json::from_str::<GuardianDecisionSnapshot>(SNAPSHOT_FIXTURE)
         .expect("strict Guardian decision snapshot fixture");
-    let generated = build_snapshot();
-
     assert_snapshot_coverage(&fixture);
-    assert_eq!(fixture, generated);
-    let pretty = serde_json::to_string_pretty(&generated).expect("serialize decision snapshot");
+    let replayed = replay_snapshot(&fixture);
+
+    assert_eq!(fixture, replayed);
+    let pretty = serde_json::to_string_pretty(&replayed).expect("serialize decision snapshot");
     assert_eq!(format!("{pretty}\n"), SNAPSHOT_FIXTURE);
+}
+
+#[test]
+fn legacy_graph_inventory_matches_committed_decision_corpus() {
+    let fixture = serde_json::from_str::<GuardianDecisionSnapshot>(SNAPSHOT_FIXTURE)
+        .expect("strict Guardian decision snapshot fixture");
+    let mut committed = fixture
+        .source_cases
+        .iter()
+        .filter_map(|source| match &source.input {
+            SourceInput::Fact { fact_id, .. } => {
+                Some((fact_id.as_str(), source.allowed_phases.clone()))
+            }
+            SourceInput::Empty => None,
+        })
+        .collect::<Vec<_>>();
+    committed.sort_by_key(|(fact_id, _)| *fact_id);
+
+    let mut graph = legacy_graph_source_corpus();
+    graph.sort_by_key(|(fact_id, _)| *fact_id);
+
+    assert_eq!(
+        super::inference_graph::diagnosis_graph_nodes().len(),
+        LEGACY_GRAPH_NODE_COUNT
+    );
+    assert_eq!(graph.len(), FACT_SOURCE_COUNT);
+    assert_eq!(graph, committed);
 }
 
 #[test]
@@ -194,29 +237,25 @@ fn regenerate_guardian_decision_snapshot_fixture() {
         Ok("1"),
         "set {REGENERATE_ENV}=1 to regenerate the Guardian decision snapshot"
     );
-    let fixture = serde_json::to_string_pretty(&build_snapshot())
+    let committed = serde_json::from_str::<GuardianDecisionSnapshot>(SNAPSHOT_FIXTURE)
+        .expect("strict Guardian decision snapshot fixture");
+    assert_snapshot_coverage(&committed);
+    let replayed = replay_snapshot(&committed);
+    assert_snapshot_coverage(&replayed);
+    let fixture = serde_json::to_string_pretty(&replayed)
         .expect("serialize regenerated Guardian decision snapshot");
     std::fs::write(snapshot_fixture_path(), format!("{fixture}\n"))
         .expect("write regenerated Guardian decision snapshot");
 }
 
-fn build_snapshot() -> GuardianDecisionSnapshot {
-    let contexts = policy_contexts();
+fn replay_snapshot(committed: &GuardianDecisionSnapshot) -> GuardianDecisionSnapshot {
+    let contexts = committed.contexts.clone();
     let mut matrices = BTreeMap::<String, Vec<ModePolicyRow>>::new();
-    let mut source_cases = Vec::new();
-
-    assert_eq!(diagnosis_graph_nodes().len(), GRAPH_NODE_COUNT);
-    for node in diagnosis_graph_nodes() {
-        for fact_id in graph_source_fact_ids(node) {
-            source_cases.push(graph_source_case(node, fact_id, &contexts, &mut matrices));
-        }
-    }
-    assert_eq!(source_cases.len(), GRAPH_SOURCE_COUNT);
-
-    for phase in PHASES {
-        source_cases.push(unknown_source_case(phase, &contexts, &mut matrices));
-    }
-    source_cases.sort_by(|left, right| left.id.cmp(&right.id));
+    let source_cases = committed
+        .source_cases
+        .iter()
+        .map(|source| replay_source_case(source, &contexts, &mut matrices))
+        .collect();
 
     let policy_profiles = matrices
         .into_iter()
@@ -224,44 +263,48 @@ fn build_snapshot() -> GuardianDecisionSnapshot {
         .collect();
 
     GuardianDecisionSnapshot {
-        schema: SnapshotSchema::V1,
+        schema: committed.schema,
         contexts,
         source_cases,
         policy_profiles,
     }
 }
 
-fn graph_source_case(
-    node: &DiagnosisGraphNode,
-    fact_id: GuardianFactId,
+fn replay_source_case(
+    committed: &SourceCase,
     contexts: &[PolicyContextCoordinate],
     matrices: &mut BTreeMap<String, Vec<ModePolicyRow>>,
 ) -> SourceCase {
-    assert!(!node.phase_allowed.is_empty(), "{}", fact_id.as_str());
-    let input = graph_source_input(node, fact_id);
     let mut expected_projection = None;
-    let mut ownership_profiles = Vec::with_capacity(OWNERSHIPS.len());
+    let mut ownership_profiles = Vec::with_capacity(committed.ownership_profiles.len());
 
-    for ownership in OWNERSHIPS {
+    for committed_profile in &committed.ownership_profiles {
+        let ownership = committed_profile.ownership;
         let mut expected_matrix = None;
-        for phase in node.phase_allowed {
-            let diagnosis = graph_source_diagnosis(&input, *phase, ownership);
+        for phase in &committed.allowed_phases {
+            let diagnosis = replay_source_diagnosis(&committed.input, *phase, ownership);
+            assert_eq!(diagnosis.phase, *phase, "{} at {phase:?}", committed.id);
+            assert_eq!(
+                diagnosis.ownership, ownership,
+                "{} at {phase:?}",
+                committed.id
+            );
             let projection = DiagnosisProjection::from(&diagnosis);
             if let Some(expected) = &expected_projection {
-                assert_eq!(expected, &projection, "{} at {phase:?}", fact_id.as_str());
+                assert_eq!(expected, &projection, "{} at {phase:?}", committed.id);
             } else {
                 expected_projection = Some(projection);
             }
 
             let matrix = policy_matrix(&diagnosis, contexts);
             if let Some(expected) = &expected_matrix {
-                assert_eq!(expected, &matrix, "{} at {phase:?}", fact_id.as_str());
+                assert_eq!(expected, &matrix, "{} at {phase:?}", committed.id);
             } else {
                 expected_matrix = Some(matrix);
             }
         }
 
-        let matrix = expected_matrix.expect("graph source has an allowed phase");
+        let matrix = expected_matrix.expect("snapshot source has an allowed phase");
         let policy_profile = insert_policy_profile(matrices, matrix);
         ownership_profiles.push(OwnershipProfileRef {
             ownership,
@@ -269,76 +312,52 @@ fn graph_source_case(
         });
     }
 
-    let diagnosis = expected_projection.expect("graph source has a diagnosis");
+    let diagnosis = expected_projection.expect("snapshot source has a diagnosis");
     SourceCase {
-        id: format!("{}--{}", diagnosis.id.as_str(), fact_id.as_str()),
-        input,
-        allowed_phases: node.phase_allowed.to_vec(),
+        id: committed.id.clone(),
+        input: committed.input.clone(),
+        allowed_phases: committed.allowed_phases.clone(),
         diagnosis,
         ownership_profiles,
     }
 }
 
-fn unknown_source_case(
-    phase: OperationPhase,
-    contexts: &[PolicyContextCoordinate],
-    matrices: &mut BTreeMap<String, Vec<ModePolicyRow>>,
-) -> SourceCase {
-    let mut diagnoses = diagnose_facts(&[], phase);
-    assert_eq!(diagnoses.len(), 1);
-    let diagnosis = diagnoses.pop().expect("empty facts produce one diagnosis");
-    assert_eq!(diagnosis.ownership, OwnershipClass::Unknown);
-    assert_eq!(diagnosis.id, DiagnosisId::UnknownFailure(phase));
-
-    let policy_profile = insert_policy_profile(matrices, policy_matrix(&diagnosis, contexts));
-    SourceCase {
-        id: format!("{}--empty", diagnosis.id.as_str()),
-        input: SourceInput::Empty,
-        allowed_phases: vec![phase],
-        diagnosis: DiagnosisProjection::from(&diagnosis),
-        ownership_profiles: vec![OwnershipProfileRef {
-            ownership: OwnershipClass::Unknown,
-            policy_profile,
-        }],
-    }
-}
-
-fn graph_source_diagnosis(
+fn replay_source_diagnosis(
     input: &SourceInput,
     phase: OperationPhase,
     ownership: OwnershipClass,
 ) -> Diagnosis {
-    let SourceInput::Fact {
-        fact_id,
-        domain,
-        reliability,
-        severity,
-        confidence,
-        ..
-    } = input
-    else {
-        panic!("graph source must be a fact")
-    };
-    let fact = GuardianFact {
-        operation_id: None,
-        id: *fact_id,
-        domain: *domain,
-        phase,
-        reliability: *reliability,
-        severity: *severity,
-        confidence: *confidence,
-        ownership,
-        target: Some(TargetDescriptor::new(
-            StabilizationSystem::Guardian,
-            target_kind_for_domain(*domain),
-            "guardian_decision_snapshot",
+    let facts = match input {
+        SourceInput::Fact {
+            fact_id,
+            domain,
+            reliability,
+            severity,
+            confidence,
+        } => vec![GuardianFact {
+            operation_id: None,
+            id: *fact_id,
+            domain: *domain,
+            phase,
+            reliability: *reliability,
+            severity: *severity,
+            confidence: *confidence,
             ownership,
-        )),
-        fields: Vec::new(),
+            target: Some(TargetDescriptor::new(
+                StabilizationSystem::Guardian,
+                target_kind_for_domain(*domain),
+                "guardian_decision_snapshot",
+                ownership,
+            )),
+            fields: Vec::new(),
+        }],
+        SourceInput::Empty => Vec::new(),
     };
-    let mut diagnoses = diagnose_facts(&[fact], phase);
-    assert_eq!(diagnoses.len(), 1, "{} at {phase:?}", fact_id.as_str());
-    diagnoses.pop().expect("graph fact produces one diagnosis")
+    let mut diagnoses = diagnose_facts(&facts, phase);
+    assert_eq!(diagnoses.len(), 1, "snapshot source at {phase:?}");
+    diagnoses
+        .pop()
+        .expect("snapshot source produces one diagnosis")
 }
 
 fn policy_matrix(
@@ -429,167 +448,18 @@ fn policy_profile_id(modes: &[ModePolicyRow]) -> String {
     format!("profile-{}", hex::encode(&digest[..8]))
 }
 
-fn policy_contexts() -> Vec<PolicyContextCoordinate> {
-    (0_u8..CONTEXT_COUNT as u8)
-        .map(|bits| {
-            let journal_available = bits & 0b0001 != 0;
-            let suppression_active = bits & 0b0010 != 0;
-            let public_redaction_ready = bits & 0b0100 != 0;
-            let explicit_user_intent = bits & 0b1000 != 0;
-            PolicyContextCoordinate {
-                id: format!(
-                    "j{}-s{}-r{}-u{}",
-                    u8::from(journal_available),
-                    u8::from(suppression_active),
-                    u8::from(public_redaction_ready),
-                    u8::from(explicit_user_intent)
-                ),
-                journal_available,
-                suppression_active,
-                public_redaction_ready,
-                explicit_user_intent,
-            }
+// This adapter exists only to prove the legacy graph matches the committed corpus.
+// Delete it with `inference_graph.rs`; snapshot replay above must stay fixture-driven.
+fn legacy_graph_source_corpus() -> Vec<(&'static str, Vec<OperationPhase>)> {
+    super::inference_graph::diagnosis_graph_nodes()
+        .iter()
+        .flat_map(|node| {
+            node.required_facts
+                .iter()
+                .flat_map(|requirement| requirement.source_fact_ids().iter().copied())
+                .map(|fact_id| (fact_id.as_str(), node.phase_allowed.to_vec()))
         })
         .collect()
-}
-
-fn graph_source_fact_ids(node: &DiagnosisGraphNode) -> Vec<GuardianFactId> {
-    node.required_facts
-        .iter()
-        .flat_map(|requirement| requirement.source_fact_ids().iter().copied())
-        .collect()
-}
-
-fn graph_source_input(node: &DiagnosisGraphNode, fact_id: GuardianFactId) -> SourceInput {
-    let (severity, confidence) = producer_fact_overrides(fact_id);
-    SourceInput::Fact {
-        fact_id,
-        domain: producer_fact_domain(node, fact_id),
-        reliability: producer_fact_reliability(fact_id),
-        severity,
-        confidence,
-    }
-}
-
-fn producer_fact_domain(node: &DiagnosisGraphNode, fact_id: GuardianFactId) -> GuardianDomain {
-    match fact_id {
-        GuardianFactId::LaunchMemoryMinClamped | GuardianFactId::LaunchMemoryAllocationLow => {
-            GuardianDomain::Launch
-        }
-        GuardianFactId::LaunchResourceMemoryPressure
-        | GuardianFactId::LaunchResourceCpuPressure
-        | GuardianFactId::LaunchResourceInstallPressure => GuardianDomain::Performance,
-        GuardianFactId::LaunchResourceDiskPressure => GuardianDomain::Filesystem,
-        GuardianFactId::CustomJavaOverridePresent => GuardianDomain::Runtime,
-        GuardianFactId::CustomJvmPresetPresent | GuardianFactId::CustomJvmArgsPresent => {
-            GuardianDomain::Jvm
-        }
-        GuardianFactId::LauncherManagedArtifactSignatureCorruption => GuardianDomain::Download,
-        GuardianFactId::ArtifactChecksumMismatch
-        | GuardianFactId::ArtifactSizeMismatch
-        | GuardianFactId::ArtifactMissing => GuardianDomain::Library,
-        GuardianFactId::ManagedFileCorrupt => GuardianDomain::Unknown,
-        GuardianFactId::ProviderDataInvalid => GuardianDomain::Network,
-        GuardianFactId::PrimitiveRefused | GuardianFactId::OwnershipUnknown => {
-            GuardianDomain::Unknown
-        }
-        _ => match node.domain {
-            DomainTemplate::Static(domain) => domain,
-            DomainTemplate::FactDomain => {
-                panic!("missing producer domain for {}", fact_id.as_str())
-            }
-        },
-    }
-}
-
-fn producer_fact_reliability(fact_id: GuardianFactId) -> FactReliability {
-    match fact_id {
-        GuardianFactId::JavaProbeFailed
-        | GuardianFactId::JavaMajorMismatch
-        | GuardianFactId::JavaUpdateTooOld
-        | GuardianFactId::ManagedRuntimeRosettaRequired
-        | GuardianFactId::ManagedRuntimeUnavailableForPlatform
-        | GuardianFactId::ArtifactChecksumMismatch
-        | GuardianFactId::ArtifactSizeMismatch => FactReliability::ValidatedProbe,
-        GuardianFactId::JavaOverrideEmpty
-        | GuardianFactId::JavaOverrideUndefinedSentinel
-        | GuardianFactId::JvmArgsParseFailed
-        | GuardianFactId::JvmArgReservedLauncherFlag
-        | GuardianFactId::JvmArgMemoryConflict
-        | GuardianFactId::JvmArgUnsupportedGc
-        | GuardianFactId::JvmArgUnlockOrderInvalid
-        | GuardianFactId::JvmArgUnsafeClasspathOverride
-        | GuardianFactId::JvmArgUnsafeNativePathOverride
-        | GuardianFactId::JvmArgAgentOverride
-        | GuardianFactId::LauncherManagedArtifactSignatureCorruption => {
-            FactReliability::ExactClassifier
-        }
-        GuardianFactId::JavaOverrideMissing
-        | GuardianFactId::ManagedRuntimeMissing
-        | GuardianFactId::ManagedRuntimeReadyMarkerMissing
-        | GuardianFactId::VersionJsonMissing
-        | GuardianFactId::ParentVersionMissing
-        | GuardianFactId::ClientJarMissing
-        | GuardianFactId::LibrariesMissing
-        | GuardianFactId::AssetIndexMissing => FactReliability::ExpectedMarkerAbsence,
-        id if FactRequirement::ProcessLifecycle
-            .source_fact_ids()
-            .contains(&id) =>
-        {
-            FactReliability::ProcessLifecycle
-        }
-        _ => FactReliability::DirectStructured,
-    }
-}
-
-fn producer_fact_overrides(
-    fact_id: GuardianFactId,
-) -> (Option<GuardianSeverity>, Option<GuardianConfidence>) {
-    match fact_id {
-        GuardianFactId::ManagedRuntimeMissing => (
-            Some(GuardianSeverity::Recoverable),
-            Some(GuardianConfidence::Confirmed),
-        ),
-        GuardianFactId::VersionJsonMissing
-        | GuardianFactId::ParentVersionMissing
-        | GuardianFactId::IncompleteInstall
-        | GuardianFactId::ClientJarMissing
-        | GuardianFactId::LibrariesMissing
-        | GuardianFactId::AssetIndexMissing => (
-            Some(GuardianSeverity::Blocking),
-            Some(GuardianConfidence::Confirmed),
-        ),
-        GuardianFactId::LaunchMemoryMinClamped
-        | GuardianFactId::LaunchMemoryAllocationLow
-        | GuardianFactId::LaunchResourceMemoryPressure
-        | GuardianFactId::LaunchResourceCpuPressure
-        | GuardianFactId::LaunchResourceInstallPressure
-        | GuardianFactId::LaunchResourceDiskPressure
-        | GuardianFactId::CustomJavaOverridePresent
-        | GuardianFactId::CustomJvmPresetPresent
-        | GuardianFactId::CustomJvmArgsPresent
-        | GuardianFactId::PerformanceFallbackSelected
-        | GuardianFactId::PerformanceHealthFallback => (
-            Some(GuardianSeverity::Warning),
-            Some(GuardianConfidence::High),
-        ),
-        GuardianFactId::PerformanceRulesInvalid => (
-            Some(GuardianSeverity::Degraded),
-            Some(GuardianConfidence::Confirmed),
-        ),
-        GuardianFactId::PerformanceHealthDegraded
-        | GuardianFactId::PerformanceRepeatedFailureMemory => (
-            Some(GuardianSeverity::Degraded),
-            Some(GuardianConfidence::High),
-        ),
-        GuardianFactId::PerformanceHealthInvalid | GuardianFactId::PerformanceUserOwnedConflict => {
-            (
-                Some(GuardianSeverity::Blocking),
-                Some(GuardianConfidence::Confirmed),
-            )
-        }
-        _ => (None, None),
-    }
 }
 
 fn target_kind_for_domain(domain: GuardianDomain) -> TargetKind {
@@ -609,10 +479,10 @@ fn target_kind_for_domain(domain: GuardianDomain) -> TargetKind {
 }
 
 fn assert_snapshot_coverage(snapshot: &GuardianDecisionSnapshot) {
-    assert_eq!(snapshot.contexts, policy_contexts());
+    assert_context_coverage(&snapshot.contexts);
     assert_eq!(
         snapshot.source_cases.len(),
-        GRAPH_SOURCE_COUNT + UNKNOWN_SOURCE_COUNT
+        FACT_SOURCE_COUNT + UNKNOWN_SOURCE_COUNT
     );
     assert_eq!(RAW_DIAGNOSIS_CASE_COUNT, 1_372);
     assert_eq!(RAW_POLICY_EVALUATION_COUNT, 65_856);
@@ -625,20 +495,36 @@ fn assert_snapshot_coverage(snapshot: &GuardianDecisionSnapshot) {
     );
 
     let mut case_ids = HashSet::new();
-    let mut graph_diagnosis_ids = HashSet::new();
-    let mut graph_sources = 0;
+    let mut diagnosis_ids = HashSet::new();
+    let mut fact_ids = HashSet::new();
+    let mut fact_sources = 0;
     let mut unknown_sources = 0;
-    let mut graph_source_phases = 0;
+    let mut fact_source_phases = 0;
+    let mut unknown_phases = HashSet::new();
     let mut raw_diagnosis_cases = 0;
     for case in &snapshot.source_cases {
         assert!(case_ids.insert(case.id.as_str()), "duplicate {}", case.id);
         assert!(!case.allowed_phases.is_empty(), "{}", case.id);
+        assert_eq!(
+            case.allowed_phases
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len(),
+            case.allowed_phases.len(),
+            "duplicate allowed phase in {}",
+            case.id
+        );
         match case.input {
             SourceInput::Fact { fact_id, .. } => {
-                graph_sources += 1;
-                graph_source_phases += case.allowed_phases.len();
+                fact_sources += 1;
+                fact_source_phases += case.allowed_phases.len();
                 raw_diagnosis_cases += case.allowed_phases.len() * case.ownership_profiles.len();
-                graph_diagnosis_ids.insert(case.diagnosis.id);
+                assert!(
+                    fact_ids.insert(fact_id),
+                    "duplicate fact source {fact_id:?}"
+                );
+                diagnosis_ids.insert(case.diagnosis.id);
                 assert_eq!(case.diagnosis.fact_ids, vec![fact_id], "{}", case.id);
                 assert_eq!(
                     case.ownership_profiles
@@ -654,6 +540,7 @@ fn assert_snapshot_coverage(snapshot: &GuardianDecisionSnapshot) {
                 unknown_sources += 1;
                 raw_diagnosis_cases += 1;
                 assert_eq!(case.allowed_phases.len(), 1, "{}", case.id);
+                assert!(unknown_phases.insert(case.allowed_phases[0]), "{}", case.id);
                 assert_eq!(case.ownership_profiles.len(), 1, "{}", case.id);
                 assert_eq!(
                     case.ownership_profiles[0].ownership,
@@ -664,11 +551,12 @@ fn assert_snapshot_coverage(snapshot: &GuardianDecisionSnapshot) {
             }
         }
     }
-    assert_eq!(graph_sources, GRAPH_SOURCE_COUNT);
-    assert_eq!(graph_source_phases, GRAPH_SOURCE_PHASE_COUNT);
+    assert_eq!(fact_sources, FACT_SOURCE_COUNT);
+    assert_eq!(fact_source_phases, FACT_SOURCE_PHASE_COUNT);
     assert_eq!(unknown_sources, UNKNOWN_SOURCE_COUNT);
+    assert_eq!(unknown_phases, PHASES.into_iter().collect());
     assert_eq!(raw_diagnosis_cases, RAW_DIAGNOSIS_CASE_COUNT);
-    assert_eq!(graph_diagnosis_ids.len(), GRAPH_DIAGNOSIS_COUNT);
+    assert_eq!(diagnosis_ids.len(), DIAGNOSIS_COUNT);
 
     let profile_ids = snapshot
         .policy_profiles
@@ -708,16 +596,29 @@ fn assert_snapshot_coverage(snapshot: &GuardianDecisionSnapshot) {
     }
     assert!(saw_planned_block);
     assert!(saw_unplanned_block);
-    for source in &snapshot.source_cases {
-        for profile in &source.ownership_profiles {
-            assert!(
-                profile_ids.contains(profile.policy_profile.as_str()),
-                "{} references {}",
-                source.id,
-                profile.policy_profile
-            );
-        }
+    let referenced_profile_ids = snapshot
+        .source_cases
+        .iter()
+        .flat_map(|source| &source.ownership_profiles)
+        .map(|profile| profile.policy_profile.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(referenced_profile_ids, profile_ids);
+}
+
+fn assert_context_coverage(contexts: &[PolicyContextCoordinate]) {
+    assert_eq!(contexts.len(), CONTEXT_COUNT);
+    let mut ids = HashSet::new();
+    let mut coordinates = HashSet::new();
+    for context in contexts {
+        let bits = u8::from(context.journal_available)
+            | (u8::from(context.suppression_active) << 1)
+            | (u8::from(context.public_redaction_ready) << 2)
+            | (u8::from(context.explicit_user_intent) << 3);
+        assert_eq!(context.id, CONTEXT_IDS[usize::from(bits)]);
+        assert!(ids.insert(context.id.as_str()), "duplicate context id");
+        assert!(coordinates.insert(bits), "duplicate policy context");
     }
+    assert_eq!(coordinates, (0_u8..CONTEXT_COUNT as u8).collect());
 }
 
 fn snapshot_fixture_path() -> std::path::PathBuf {
