@@ -6,9 +6,8 @@ use super::inference_graph::{
 use super::{
     ActionPlanPrerequisite, Diagnosis, FactReliability, GuardianAction, GuardianActionKind,
     GuardianActionPlan, GuardianConfidence, GuardianDomain, GuardianFact, GuardianFactId,
-    GuardianMode, GuardianObservation, GuardianSeverity, GuardianSeverity::Repairable,
-    build_safety_case, diagnose_facts, guardian_fact_from_execution,
-    guardian_fact_from_observation,
+    GuardianMode, GuardianSeverity, GuardianSeverity::Repairable, build_safety_case,
+    diagnose_facts, guardian_fact_from_execution,
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{EvidenceField, EvidenceSensitivity};
@@ -210,34 +209,6 @@ fn launch_readiness_fact_maps_to_blocking_install_diagnosis() {
         vec![GuardianActionKind::Block]
     );
     assert_eq!(diagnoses[0].affected_targets[0].kind, TargetKind::Version);
-}
-
-#[test]
-fn persisted_state_observation_maps_to_state_warning_diagnosis() {
-    let fact = guardian_fact_from_observation(
-        GuardianObservation::PersistedStateSchemaInvalid,
-        OperationPhase::Startup,
-        Some(target(
-            "persisted-state-load",
-            TargetKind::Config,
-            OwnershipClass::LauncherManaged,
-        )),
-    );
-
-    let diagnoses = diagnose_facts(std::slice::from_ref(&fact), OperationPhase::Startup);
-
-    assert_eq!(fact.id.as_str(), "persisted_state_schema_invalid");
-    assert_eq!(fact.domain, GuardianDomain::State);
-    assert_eq!(fact.reliability, FactReliability::DirectStructured);
-    assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id.as_str(), "persisted_state_schema_invalid");
-    assert_eq!(diagnoses[0].domain, GuardianDomain::State);
-    assert_eq!(diagnoses[0].severity, GuardianSeverity::Warning);
-    assert_eq!(diagnoses[0].confidence, GuardianConfidence::Confirmed);
-    assert_eq!(
-        diagnoses[0].candidate_actions,
-        vec![GuardianActionKind::Warn, GuardianActionKind::RecordOnly]
-    );
 }
 
 #[test]
@@ -764,14 +735,12 @@ fn graph_evaluation_prioritizes_impact_scalar_and_unknown_fallback_threshold() {
         GuardianSeverity::Warning
     );
 
-    let unknown_fact = guardian_fact_from_observation(
-        GuardianObservation::Unknown("provider_payload_changed".to_string()),
+    let unknown_fact = guardian_graph_fact(
+        "provider_payload_changed",
+        GuardianDomain::Unknown,
         OperationPhase::Downloading,
-        Some(target(
-            "download-provider",
-            TargetKind::NetworkResource,
-            OwnershipClass::ExternalProviderDerived,
-        )),
+        FactReliability::HeuristicClassifier,
+        OwnershipClass::ExternalProviderDerived,
     );
     let download_node = diagnosis_graph_nodes()
         .iter()
@@ -1186,14 +1155,12 @@ fn exit_code_fact_maps_zero_and_nonzero_without_exit_classification() {
 
 #[test]
 fn unknown_facts_produce_low_confidence_unknown_diagnosis() {
-    let fact = guardian_fact_from_observation(
-        GuardianObservation::Unknown("unexpected_signal".to_string()),
+    let fact = guardian_graph_fact(
+        "unexpected_signal",
+        GuardianDomain::Unknown,
         OperationPhase::Launching,
-        Some(target(
-            "unknown",
-            TargetKind::Session,
-            OwnershipClass::Unknown,
-        )),
+        FactReliability::HeuristicClassifier,
+        OwnershipClass::Unknown,
     );
 
     let diagnoses = diagnose_facts(&[fact], OperationPhase::Launching);
@@ -1374,15 +1341,17 @@ fn guardian_fact_redaction_drops_raw_paths_jvm_args_and_tokens() {
 
 #[test]
 fn safety_case_carries_diagnosis_and_hard_constraints() {
-    let fact = guardian_fact_from_observation(
-        GuardianObservation::JavaMajorMismatch,
-        OperationPhase::Preparing,
-        Some(target(
+    let execution_fact = ExecutionFact {
+        operation_id: None,
+        kind: ExecutionFactKind::RuntimeWrongMajor,
+        target: Some(target(
             "runtime",
             TargetKind::Runtime,
             OwnershipClass::LauncherManaged,
         )),
-    );
+        fields: Vec::new(),
+    };
+    let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Preparing);
 
     let safety_case = build_safety_case(
         None,

@@ -1,4 +1,4 @@
-use super::{FactReliability, GuardianDomain, GuardianFact, GuardianFactId, GuardianObservation};
+use super::{FactReliability, GuardianDomain, GuardianFact, GuardianFactId};
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{EvidenceField, RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{OperationPhase, OwnershipClass, TargetDescriptor};
@@ -21,31 +21,6 @@ pub fn guardian_fact_from_execution(fact: &ExecutionFact, phase: OperationPhase)
         ownership,
         target,
         fields: public_safe_fields(&fact.fields),
-    }
-}
-
-pub fn guardian_fact_from_observation(
-    observation: GuardianObservation,
-    phase: OperationPhase,
-    target: Option<TargetDescriptor>,
-) -> GuardianFact {
-    let (id, domain, reliability) = observation_fact_shape(&observation);
-    let target = target.as_ref().map(public_safe_target);
-    let ownership = target
-        .as_ref()
-        .map(|target| target.ownership)
-        .unwrap_or(OwnershipClass::Unknown);
-    GuardianFact {
-        operation_id: None,
-        id,
-        domain,
-        phase,
-        reliability,
-        severity: None,
-        confidence: None,
-        ownership,
-        target,
-        fields: Vec::new(),
     }
 }
 
@@ -133,40 +108,6 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
     )
 }
 
-fn observation_fact_shape(
-    observation: &GuardianObservation,
-) -> (GuardianFactId, GuardianDomain, FactReliability) {
-    let id = match observation {
-        GuardianObservation::JavaOverrideEmpty => "java_override_empty",
-        GuardianObservation::JavaOverrideUndefinedSentinel => "java_override_undefined_sentinel",
-        GuardianObservation::JavaOverrideMissing => "java_override_missing",
-        GuardianObservation::JavaProbeFailed => "java_probe_failed",
-        GuardianObservation::JavaMajorMismatch => "java_major_mismatch",
-        GuardianObservation::JvmArgsParseFailed => "jvm_args_parse_failed",
-        GuardianObservation::JvmArgReservedLauncherFlag => "jvm_arg_reserved_launcher_flag",
-        GuardianObservation::JvmArgMemoryConflict => "jvm_arg_memory_conflict",
-        GuardianObservation::JvmArgUnsupportedGc => "jvm_arg_unsupported_gc",
-        GuardianObservation::JvmArgUnlockOrderInvalid => "jvm_arg_unlock_order_invalid",
-        GuardianObservation::JvmArgUnsafeClasspathOverride => "jvm_arg_unsafe_classpath_override",
-        GuardianObservation::JvmArgUnsafeNativePathOverride => {
-            "jvm_arg_unsafe_native_path_override"
-        }
-        GuardianObservation::JvmArgAgentOverride => "jvm_arg_agent_override",
-        GuardianObservation::RawJvmArgsPresent => "raw_jvm_args_present",
-        GuardianObservation::ProcessExitedBeforeBoot => "process_exited_before_boot",
-        GuardianObservation::ProcessExitedAfterBoot => "process_exited_after_boot",
-        GuardianObservation::BootMarkerObserved => "boot_marker_observed",
-        GuardianObservation::LauncherStopRequested => "launcher_stop_requested",
-        GuardianObservation::PersistedStateSchemaInvalid => "persisted_state_schema_invalid",
-        GuardianObservation::Unknown(value) => value.as_str(),
-    };
-    (
-        GuardianFactId::new(sanitize_fact_id(id)),
-        domain_for_fact_id(id),
-        reliability_for_observation(observation),
-    )
-}
-
 fn public_safe_target(target: &TargetDescriptor) -> TargetDescriptor {
     TargetDescriptor::new(
         target.system,
@@ -238,31 +179,6 @@ fn reliability_for_execution_fact(kind: ExecutionFactKind) -> FactReliability {
     }
 }
 
-fn reliability_for_observation(observation: &GuardianObservation) -> FactReliability {
-    match observation {
-        GuardianObservation::BootMarkerObserved
-        | GuardianObservation::LauncherStopRequested
-        | GuardianObservation::ProcessExitedBeforeBoot
-        | GuardianObservation::ProcessExitedAfterBoot => FactReliability::ProcessLifecycle,
-        GuardianObservation::JavaProbeFailed | GuardianObservation::JavaMajorMismatch => {
-            FactReliability::ValidatedProbe
-        }
-        GuardianObservation::JvmArgsParseFailed
-        | GuardianObservation::JvmArgReservedLauncherFlag
-        | GuardianObservation::JvmArgMemoryConflict
-        | GuardianObservation::JvmArgUnsupportedGc
-        | GuardianObservation::JvmArgUnlockOrderInvalid
-        | GuardianObservation::JvmArgUnsafeClasspathOverride
-        | GuardianObservation::JvmArgUnsafeNativePathOverride
-        | GuardianObservation::JvmArgAgentOverride => FactReliability::ExactClassifier,
-        GuardianObservation::RawJvmArgsPresent | GuardianObservation::Unknown(_) => {
-            FactReliability::HeuristicClassifier
-        }
-        GuardianObservation::PersistedStateSchemaInvalid => FactReliability::DirectStructured,
-        _ => FactReliability::DirectStructured,
-    }
-}
-
 fn domain_for_fact_id(id: &str) -> GuardianDomain {
     if id.starts_with("java_") || id.starts_with("managed_runtime") {
         GuardianDomain::Runtime
@@ -306,9 +222,4 @@ fn domain_for_fact_id(id: &str) -> GuardianDomain {
     } else {
         GuardianDomain::Unknown
     }
-}
-
-fn sanitize_fact_id(id: &str) -> String {
-    sanitize_evidence_token(id, RedactionAudience::UserVisible, 96)
-        .unwrap_or_else(|| "unknown_fact".to_string())
 }

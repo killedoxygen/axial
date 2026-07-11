@@ -823,8 +823,7 @@ mod tests {
     use crate::guardian::{
         Diagnosis, DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence,
         GuardianDecisionKind, GuardianDomain, GuardianFact, GuardianFactId, GuardianImpactVector,
-        GuardianMode, GuardianObservation, GuardianSeverity, SafetyCase, diagnose_facts,
-        guardian_fact_from_observation,
+        GuardianMode, GuardianSeverity, SafetyCase, diagnose_facts,
     };
     use crate::state::contracts::{
         OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
@@ -976,11 +975,24 @@ mod tests {
             id: r"C:\Users\Alice\.minecraft\java.exe --accessToken secret -Xmx8192M".to_string(),
             ownership: OwnershipClass::Unknown,
         };
-        let fact = guardian_fact_from_observation(
-            GuardianObservation::Unknown("unexpected_native_exit_signal".to_string()),
-            OperationPhase::Launching,
-            Some(raw_target),
-        );
+        let ownership = raw_target.ownership;
+        let fact = GuardianFact {
+            operation_id: None,
+            id: GuardianFactId::new("unexpected_native_exit_signal"),
+            domain: GuardianDomain::Unknown,
+            phase: OperationPhase::Launching,
+            reliability: FactReliability::HeuristicClassifier,
+            severity: None,
+            confidence: None,
+            ownership,
+            target: Some(TargetDescriptor::new(
+                raw_target.system,
+                raw_target.kind,
+                raw_target.id,
+                ownership,
+            )),
+            fields: Vec::new(),
+        };
         let diagnoses = diagnose_facts(&[fact], OperationPhase::Launching);
         let diagnosis = diagnoses
             .first()

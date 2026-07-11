@@ -1,7 +1,7 @@
 use super::{
-    DiagnosisId, GuardianDecisionKind, GuardianMode, GuardianObservation, GuardianPolicyContext,
-    GuardianUserOutcome, build_safety_case, decide_guardian_policy, guardian_fact_from_observation,
-    persisted_state_load_user_outcome,
+    DiagnosisId, FactReliability, GuardianDecisionKind, GuardianDomain, GuardianFact,
+    GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianUserOutcome, build_safety_case,
+    decide_guardian_policy, persisted_state_load_user_outcome,
 };
 use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
@@ -27,11 +27,7 @@ pub fn persisted_state_load_guardian_outcome(
         "persisted-state-load",
         OwnershipClass::LauncherManaged,
     );
-    let fact = guardian_fact_from_observation(
-        GuardianObservation::PersistedStateSchemaInvalid,
-        OperationPhase::Startup,
-        Some(target),
-    );
+    let fact = persisted_state_load_fact(target);
     let safety_case = build_safety_case(
         None,
         GuardianMode::Managed,
@@ -46,6 +42,21 @@ pub fn persisted_state_load_guardian_outcome(
         diagnosis_id: diagnosis_id.clone(),
         user_outcome: persisted_state_load_user_outcome(decision.kind, diagnosis_id.as_str()),
     })
+}
+
+fn persisted_state_load_fact(target: TargetDescriptor) -> GuardianFact {
+    GuardianFact {
+        operation_id: None,
+        id: GuardianFactId::new("persisted_state_schema_invalid"),
+        domain: GuardianDomain::State,
+        phase: OperationPhase::Startup,
+        reliability: FactReliability::DirectStructured,
+        severity: None,
+        confidence: None,
+        ownership: target.ownership,
+        target: Some(target),
+        fields: Vec::new(),
+    }
 }
 
 #[cfg(test)]

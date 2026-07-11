@@ -33,12 +33,11 @@ pub use artifact_descriptor::{
     MAX_MINECRAFT_REPAIR_ARTIFACT_BYTES,
 };
 pub use artifact_repair::{
-    GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest, GuardianArtifactRepairSource,
-    GuardianArtifactRepairStatus, execute_guardian_artifact_repair,
-    execute_guardian_missing_artifact_repair,
+    GuardianArtifactRepairMutation, GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest,
+    GuardianArtifactRepairSource, GuardianArtifactRepairStatus, execute_guardian_artifact_repair,
 };
 pub use diagnosis::{build_safety_case, diagnose_facts};
-pub use facts::{guardian_fact_from_execution, guardian_fact_from_observation};
+pub use facts::guardian_fact_from_execution;
 pub use healing::{
     GuardianManagedRuntimeRepairRequest, GuardianRepairOutcome, GuardianRepairStatus,
     execute_managed_runtime_ready_marker_repair,
@@ -82,8 +81,8 @@ pub use model::{
     ActionPlanPrerequisite, Diagnosis, DiagnosisId, FactReliability, GuardianAction,
     GuardianActionKind, GuardianActionPlan, GuardianConfidence, GuardianCoreError,
     GuardianDecision, GuardianDecisionKind, GuardianDomain, GuardianFact, GuardianFactId,
-    GuardianHardConstraint, GuardianImpactVector, GuardianMode, GuardianObservation,
-    GuardianSeverity, SafetyCase, SafetyOutcome,
+    GuardianHardConstraint, GuardianImpactVector, GuardianMode, GuardianSeverity, SafetyCase,
+    SafetyOutcome,
 };
 pub use outcome::{
     GuardianUserOutcome, install_artifact_repair_user_outcome,

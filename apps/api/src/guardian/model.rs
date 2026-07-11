@@ -50,30 +50,6 @@ pub enum FactReliability {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum GuardianObservation {
-    JavaOverrideEmpty,
-    JavaOverrideUndefinedSentinel,
-    JavaOverrideMissing,
-    JavaProbeFailed,
-    JavaMajorMismatch,
-    JvmArgsParseFailed,
-    JvmArgReservedLauncherFlag,
-    JvmArgMemoryConflict,
-    JvmArgUnsupportedGc,
-    JvmArgUnlockOrderInvalid,
-    JvmArgUnsafeClasspathOverride,
-    JvmArgUnsafeNativePathOverride,
-    JvmArgAgentOverride,
-    RawJvmArgsPresent,
-    ProcessExitedBeforeBoot,
-    ProcessExitedAfterBoot,
-    BootMarkerObserved,
-    LauncherStopRequested,
-    PersistedStateSchemaInvalid,
-    Unknown(String),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosisId(pub String);
 
 impl DiagnosisId {

@@ -4,12 +4,11 @@ use super::{
     reconcile_install_journal_transition,
 };
 use crate::guardian::{
-    GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest, GuardianArtifactRepairStatus,
-    GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactRepairPlanKind,
-    GuardianMinecraftArtifactRepairDescriptor, GuardianMode, execute_guardian_artifact_repair,
-    execute_guardian_missing_artifact_repair,
-    install_artifact_failure_from_minecraft_download_fact, install_artifact_repair_user_outcome,
-    plan_install_artifact_failure_repair,
+    GuardianArtifactRepairMutation, GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest,
+    GuardianArtifactRepairStatus, GuardianInstallArtifactFailureEvidence,
+    GuardianInstallArtifactRepairPlanKind, GuardianMinecraftArtifactRepairDescriptor, GuardianMode,
+    execute_guardian_artifact_repair, install_artifact_failure_from_minecraft_download_fact,
+    install_artifact_repair_user_outcome, plan_install_artifact_failure_repair,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
@@ -155,15 +154,14 @@ pub async fn repair_install_artifact_corruption_with_guardian(
         failure_memory,
         mode: GuardianMode::Managed,
         observed_at,
+        mutation: if destination_missing {
+            GuardianArtifactRepairMutation::DownloadMissing
+        } else {
+            GuardianArtifactRepairMutation::QuarantineExisting
+        },
     };
 
-    if destination_missing {
-        execute_guardian_missing_artifact_repair(request)
-            .await
-            .map(Some)
-    } else {
-        execute_guardian_artifact_repair(request).await.map(Some)
-    }
+    execute_guardian_artifact_repair(request).await.map(Some)
 }
 
 fn guardian_artifact_repair_status_id(status: GuardianArtifactRepairStatus) -> &'static str {
