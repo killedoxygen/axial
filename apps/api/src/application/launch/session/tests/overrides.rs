@@ -52,6 +52,157 @@ async fn direct_launch_receipt_keeps_preparation_retries_to_one_probe_spawn() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[ignore = "controlled wall-time evidence; run explicitly with --nocapture"]
+async fn measure_override_preflight_receipt_wall_time() {
+    const WARMUP_PAIRS: usize = 1;
+    const TRIAL_PAIRS: usize = 6;
+
+    for warmup in 0..WARMUP_PAIRS {
+        run_override_preflight_measurement(OverridePreflightMeasurement::Baseline, warmup).await;
+        run_override_preflight_measurement(OverridePreflightMeasurement::Current, warmup).await;
+    }
+
+    let mut baseline = Vec::with_capacity(TRIAL_PAIRS);
+    let mut current = Vec::with_capacity(TRIAL_PAIRS);
+    for trial in 0..TRIAL_PAIRS {
+        let order = if trial % 2 == 0 {
+            [
+                OverridePreflightMeasurement::Baseline,
+                OverridePreflightMeasurement::Current,
+            ]
+        } else {
+            [
+                OverridePreflightMeasurement::Current,
+                OverridePreflightMeasurement::Baseline,
+            ]
+        };
+        for measurement in order {
+            let elapsed = run_override_preflight_measurement(measurement, trial).await;
+            eprintln!(
+                "override_preflight_wall_time trial={trial} shape={} elapsed_ms={:.3}",
+                measurement.label(),
+                elapsed.as_secs_f64() * 1_000.0
+            );
+            match measurement {
+                OverridePreflightMeasurement::Baseline => baseline.push(elapsed),
+                OverridePreflightMeasurement::Current => current.push(elapsed),
+            }
+        }
+    }
+
+    eprintln!(
+        "override_preflight_wall_time median shape=baseline elapsed_ms={:.3} trials={TRIAL_PAIRS}",
+        median_duration(&baseline).as_secs_f64() * 1_000.0
+    );
+    eprintln!(
+        "override_preflight_wall_time median shape=current elapsed_ms={:.3} trials={TRIAL_PAIRS}",
+        median_duration(&current).as_secs_f64() * 1_000.0
+    );
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum OverridePreflightMeasurement {
+    Baseline,
+    Current,
+}
+
+#[cfg(unix)]
+impl OverridePreflightMeasurement {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Current => "current",
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn run_override_preflight_measurement(
+    measurement: OverridePreflightMeasurement,
+    trial: usize,
+) -> std::time::Duration {
+    let fixture = TestFixture::new(&format!(
+        "override-preflight-measurement-{}-{trial}",
+        measurement.label()
+    ));
+    fixture.set_guardian_mode("custom");
+    fixture.write_ready_install("1.21.1");
+    let instance_id = fixture.add_instance("Survival", "1.21.1");
+    let (java_path, count_file) = write_slow_counted_probe_java(&fixture, "java21");
+    fixture.update_instance(&instance_id, |instance| {
+        instance.java_path = java_path;
+    });
+
+    let started_at = std::time::Instant::now();
+    let prepared = prepare_launch_session(
+        &fixture.state,
+        LaunchRequest {
+            instance_id,
+            username: None,
+            max_memory_mb: None,
+            min_memory_mb: None,
+            client_started_at_ms: None,
+        },
+    )
+    .await
+    .expect("prepare measured launch session");
+    assert_eq!(read_probe_count(&count_file), 1);
+
+    let receipt = match measurement {
+        OverridePreflightMeasurement::Baseline => None,
+        OverridePreflightMeasurement::Current => Some(
+            prepared
+                .task
+                .java_probe_receipt
+                .as_ref()
+                .expect("measured flow-local receipt"),
+        ),
+    };
+    let core_prepared = axial_launcher::prepare_launch_attempt_with_events(
+        &prepared.task.intent,
+        &axial_launcher::service::AttemptOverrides::default(),
+        receipt,
+        |_| {},
+    )
+    .await
+    .expect("measured core launch preparation");
+    let elapsed = started_at.elapsed();
+
+    match measurement {
+        OverridePreflightMeasurement::Baseline => {
+            assert_eq!(core_prepared.metrics.java_probe_count, 1);
+            assert_eq!(core_prepared.metrics.java_probe_source, "fresh");
+            assert_eq!(read_probe_count(&count_file), 2);
+        }
+        OverridePreflightMeasurement::Current => {
+            assert_eq!(core_prepared.metrics.java_probe_count, 0);
+            assert_eq!(core_prepared.metrics.java_probe_source, "receipt");
+            assert_eq!(read_probe_count(&count_file), 1);
+        }
+    }
+
+    drop(core_prepared);
+    drop(prepared);
+    drop(fixture);
+    elapsed
+}
+
+#[cfg(unix)]
+fn median_duration(samples: &[std::time::Duration]) -> std::time::Duration {
+    assert!(!samples.is_empty(), "median requires at least one sample");
+    let mut ordered = samples.to_vec();
+    ordered.sort_unstable();
+    let middle = ordered.len() / 2;
+    if ordered.len().is_multiple_of(2) {
+        (ordered[middle - 1] + ordered[middle]) / 2
+    } else {
+        ordered[middle]
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn standalone_preflight_does_not_cache_success_for_later_launch() {
     let fixture = TestFixture::new("standalone-java-success-not-cached");
     fixture.set_guardian_mode("custom");
@@ -903,6 +1054,20 @@ fn write_probe_java(
 
 #[cfg(unix)]
 fn write_counted_probe_java(fixture: &TestFixture, name: &str) -> (String, PathBuf) {
+    write_counted_probe_java_with_delay(fixture, name, None)
+}
+
+#[cfg(unix)]
+fn write_slow_counted_probe_java(fixture: &TestFixture, name: &str) -> (String, PathBuf) {
+    write_counted_probe_java_with_delay(fixture, name, Some("0.15"))
+}
+
+#[cfg(unix)]
+fn write_counted_probe_java_with_delay(
+    fixture: &TestFixture,
+    name: &str,
+    delay_seconds: Option<&str>,
+) -> (String, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
 
     let bin_dir = fixture.root.join(name).join("bin");
@@ -913,9 +1078,12 @@ fn write_counted_probe_java(fixture: &TestFixture, name: &str) -> (String, PathB
     fs::write(
         &java_path,
         format!(
-            "#!/bin/sh\ncount=$(cat '{}')\necho $((count + 1)) > '{}'\necho 'openjdk version \"21.0.3\"' >&2\n",
+            "#!/bin/sh\ncount=$(cat '{}')\necho $((count + 1)) > '{}'\n{}echo 'openjdk version \"21.0.3\"' >&2\n",
             count_file.display(),
-            count_file.display()
+            count_file.display(),
+            delay_seconds
+                .map(|seconds| format!("sleep {seconds}\n"))
+                .unwrap_or_default()
         ),
     )
     .expect("counted fake java script");
