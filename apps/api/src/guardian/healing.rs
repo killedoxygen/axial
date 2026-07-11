@@ -708,25 +708,19 @@ fn record_repair_memory(
         None,
         observed_at,
     );
-    let mut entry = match action {
-        Some(action) => observation.with_action(action, outcome),
-        None => failure_memory
-            .get(&observation.key)
-            .map(|mut existing| {
-                existing.last_observed_at = observation.last_observed_at.clone();
-                existing.occurrence_count = 1;
-                existing.repair_attempt_count = 0;
-                existing
-            })
-            .unwrap_or(observation),
+    let result = if let Some(action) = action {
+        let mut entry = observation.with_action(action, outcome);
+        if repair_attempt {
+            entry = entry.with_repair_attempt();
+        }
+        if let Some(suppression_until) = suppression_until {
+            entry = entry.with_suppression_until(suppression_until);
+        }
+        failure_memory.record(entry)
+    } else {
+        failure_memory.record_observation_preserving_loop_control(observation)
     };
-    if repair_attempt {
-        entry = entry.with_repair_attempt();
-    }
-    if let Some(suppression_until) = suppression_until {
-        entry = entry.with_suppression_until(suppression_until);
-    }
-    if let Err(error) = failure_memory.record(entry) {
+    if let Err(error) = result {
         warn!(
             error_kind = error.class(),
             "failed to record Guardian managed-runtime repair failure memory"

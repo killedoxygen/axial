@@ -536,10 +536,29 @@ impl GuardianFailureMemoryStore {
     /// Success means the revision is owned by the persistence coordinator. Call
     /// [`Self::flush`] when the physical write must be observed before continuing.
     pub fn record(&self, entry: GuardianFailureMemoryEntry) -> Result<(), FailureMemoryStoreError> {
+        self.record_with(entry, apply_record)
+    }
+
+    /// Records an actionless observation without clearing current loop-control state.
+    pub(crate) fn record_observation_preserving_loop_control(
+        &self,
+        observation: GuardianFailureMemoryEntry,
+    ) -> Result<(), FailureMemoryStoreError> {
+        self.record_with(observation, apply_observation_preserving_loop_control)
+    }
+
+    fn record_with(
+        &self,
+        entry: GuardianFailureMemoryEntry,
+        apply: impl FnOnce(
+            &mut BTreeMap<String, GuardianFailureMemoryEntry>,
+            GuardianFailureMemoryEntry,
+        ),
+    ) -> Result<(), FailureMemoryStoreError> {
         let mut records = self.records.write().expect(FAILURE_MEMORY_LOCK_INVARIANT);
         entry.validate()?;
         let mut candidate = records.clone();
-        apply_record(&mut candidate, entry);
+        apply(&mut candidate, entry);
         prune_records(&mut candidate, self.max_entries);
         let snapshot = FailureMemorySnapshot::new(candidate.values().cloned().collect())?;
         if let Some(persistence) = &self.persistence {
@@ -679,6 +698,22 @@ fn apply_record(
     }
 }
 
+fn apply_observation_preserving_loop_control(
+    records: &mut BTreeMap<String, GuardianFailureMemoryEntry>,
+    observation: GuardianFailureMemoryEntry,
+) {
+    let key = observation.key.as_str().to_string();
+    let Some(existing) = records.get_mut(&key) else {
+        records.insert(key, observation);
+        return;
+    };
+
+    existing.last_observed_at = observation.last_observed_at;
+    existing.occurrence_count = existing
+        .occurrence_count
+        .saturating_add(observation.occurrence_count.max(1));
+}
+
 fn safe_optional_fragment(value: &str, fallback: &str) -> Option<String> {
     let value = sanitize_target_id(value, fallback);
     (!value.is_empty() && value != fallback).then_some(value)
@@ -739,6 +774,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
     use std::time::Duration;
 
     struct CountingFileBackend {
@@ -985,6 +1021,60 @@ mod tests {
         let stored_repair = store.get(&repair_key).expect("stored repair");
         assert_eq!(stored_repair.occurrence_count, 2);
         assert_eq!(stored_repair.repair_attempt_count, 2);
+    }
+
+    #[test]
+    fn concurrent_actionless_observation_cannot_revert_newer_loop_control() {
+        let store = Arc::new(GuardianFailureMemoryStore::new());
+        let newer_action = retry_entry("2026-06-15T10:01:00Z")
+            .with_action(
+                GuardianActionKind::Repair,
+                FailureMemoryActionOutcome::Repaired,
+            )
+            .with_repair_attempt()
+            .with_suppression_until("2026-06-15T11:00:00Z");
+        let key = newer_action.key.clone();
+        let stale_observation = GuardianFailureMemoryEntry::observed(
+            newer_action.diagnosis_id.clone(),
+            newer_action.domain,
+            newer_action.target.clone(),
+            newer_action.mode,
+            newer_action.user_intent_hash.as_deref(),
+            "2026-06-15T10:02:00Z",
+        );
+        let (action_recorded, await_action) = std::sync::mpsc::sync_channel(0);
+
+        let action_store = Arc::clone(&store);
+        let action_thread = thread::spawn(move || {
+            action_store
+                .record(newer_action)
+                .expect("record newer action");
+            action_recorded.send(()).expect("signal newer action");
+        });
+        let observation_store = Arc::clone(&store);
+        let observation_thread = thread::spawn(move || {
+            await_action.recv().expect("await newer action");
+            observation_store
+                .record_observation_preserving_loop_control(stale_observation)
+                .expect("record stale actionless observation");
+        });
+
+        action_thread.join().expect("newer action thread");
+        observation_thread
+            .join()
+            .expect("actionless observation thread");
+        let stored = store.get(&key).expect("stored memory");
+        assert_eq!(stored.occurrence_count, 2);
+        assert_eq!(stored.repair_attempt_count, 1);
+        assert_eq!(stored.last_action_kind, Some(GuardianActionKind::Repair));
+        assert_eq!(
+            stored.last_action_outcome,
+            Some(FailureMemoryActionOutcome::Repaired)
+        );
+        assert_eq!(
+            stored.suppression_until.as_deref(),
+            Some("2026-06-15T11:00:00Z")
+        );
     }
 
     #[test]
