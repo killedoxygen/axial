@@ -35,7 +35,7 @@ pub fn persisted_state_load_guardian_outcome(
         std::slice::from_ref(&fact),
     );
     let decision = decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
-    let diagnosis_id = safety_case.diagnoses.first()?.id;
+    let diagnosis_id = safety_case.diagnoses.first()?.id();
 
     Some(GuardianStateLoadOutcome {
         decision: decision.kind,

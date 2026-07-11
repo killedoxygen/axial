@@ -87,7 +87,7 @@ pub struct GuardianPreflightOverrideSignals {
     pub explicit_jvm_args: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct GuardianPreflightOutcome {
     pub safety_case: SafetyCase,
     pub guardian_decision: GuardianDecision,
@@ -240,14 +240,14 @@ fn preflight_directives(
         && safety_case
             .diagnoses
             .iter()
-            .any(|diagnosis| java_fallback_diagnosis(diagnosis.id))
+            .any(|diagnosis| java_fallback_diagnosis(diagnosis.id()))
     {
         directives.push(GuardianPreflightDirective::UseManagedJavaForAttempt);
     }
     if decision == GuardianActionKind::Strip
         && safety_case.diagnoses.iter().any(|diagnosis| {
             matches!(
-                diagnosis.id,
+                diagnosis.id(),
                 DiagnosisId::JvmArgsMalformed
                     | DiagnosisId::JvmArgUnsupported
                     | DiagnosisId::JvmArgUnsafeOverride
@@ -357,10 +357,10 @@ fn preflight_copy(
         push_historical_launch_copy(facts, &mut details, &mut guidance);
     }
     for diagnosis in &safety_case.diagnoses {
-        if let Some(detail) = detail_for_diagnosis(diagnosis.id, decision) {
+        if let Some(detail) = detail_for_diagnosis(diagnosis.id(), decision) {
             push_unique_public(&mut details, detail, MAX_PREFLIGHT_DETAILS);
         }
-        if let Some(value) = guidance_for_diagnosis(diagnosis.id, decision) {
+        if let Some(value) = guidance_for_diagnosis(diagnosis.id(), decision) {
             push_unique_public(&mut guidance, value, MAX_PREFLIGHT_GUIDANCE);
         }
     }

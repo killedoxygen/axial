@@ -364,7 +364,7 @@ pub const ROUTE_BOUNDARY_PROBES: &[RouteBoundaryProbe] = &[
         responsibility: RouteForbiddenResponsibility::SafetyPolicy,
         forbidden_markers: &[
             "decide_guardian_policy(",
-            "diagnose_facts(",
+            "diagnose(",
             "GuardianActionPlan::new",
             "SafetyCase::new",
             "GuardianDecision { kind:",
@@ -706,6 +706,50 @@ mod tests {
         assert!(
             violations.is_empty(),
             "managed composition authority bypasses:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn guardian_diagnosis_authority_has_no_legacy_symbols() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("api crate must live under apps/ in the repository");
+        let guardian_root = repo_root.join("apps/api/src/guardian");
+        let mut sources = Vec::new();
+        collect_rust_sources(&guardian_root, &mut sources);
+        sources.sort();
+
+        let mut violations = Vec::new();
+        for path in sources {
+            if is_test_source(&path) {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(repo_root)
+                .expect("Guardian source must be inside the repository")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source = fs::read_to_string(&path).expect("read Guardian source");
+            let production = without_trailing_test_module(&source);
+
+            for marker in [
+                concat!("diagnose_", "facts"),
+                concat!("Diagnosis", "Data"),
+                concat!("Guardian", "ImpactVector"),
+                concat!("decision_", "pressure_score"),
+                concat!("action_", "safety_score"),
+            ] {
+                if production.contains(marker) {
+                    violations.push(format!("{relative}: {marker}"));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "Guardian diagnosis authority regressions:\n{}",
             violations.join("\n")
         );
     }

@@ -467,11 +467,11 @@ mod tests {
         let diagnosis = safety_case
             .diagnoses
             .iter()
-            .find(|diagnosis| diagnosis.id.as_str() == "launcher_managed_artifact_corrupt")
+            .find(|diagnosis| diagnosis.id().as_str() == "launcher_managed_artifact_corrupt")
             .expect("corruption diagnosis");
         assert!(
             diagnosis
-                .candidate_actions
+                .candidate_actions()
                 .contains(&GuardianActionKind::Repair)
         );
     }
@@ -578,7 +578,7 @@ mod tests {
                 safety_case
                     .diagnoses
                     .iter()
-                    .any(|diagnosis| diagnosis.id.as_str() == diagnosis_id),
+                    .any(|diagnosis| diagnosis.id().as_str() == diagnosis_id),
                 "missing diagnosis {diagnosis_id} for {kind:?}: {:?}",
                 safety_case.diagnoses
             );

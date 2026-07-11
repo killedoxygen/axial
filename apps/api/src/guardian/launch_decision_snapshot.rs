@@ -153,14 +153,14 @@ struct DiagnosisProjection {
 impl From<&Diagnosis> for DiagnosisProjection {
     fn from(diagnosis: &Diagnosis) -> Self {
         Self {
-            id: diagnosis.id,
-            domain: diagnosis.domain,
-            severity: diagnosis.severity,
-            confidence: diagnosis.confidence,
-            ownership: diagnosis.ownership,
-            fact_ids: diagnosis.fact_ids.clone(),
-            candidate_actions: diagnosis.candidate_actions.clone(),
-            public_reason_template: diagnosis.public_reason_template.clone(),
+            id: diagnosis.id(),
+            domain: diagnosis.domain(),
+            severity: diagnosis.severity(),
+            confidence: diagnosis.confidence(),
+            ownership: diagnosis.ownership(),
+            fact_ids: diagnosis.fact_ids().to_vec(),
+            candidate_actions: diagnosis.candidate_actions().to_vec(),
+            public_reason_template: diagnosis.public_reason_template().to_string(),
         }
     }
 }

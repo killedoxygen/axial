@@ -1,15 +1,96 @@
-use super::rules::{DIAGNOSIS_RULES, DiagnosisRule};
+use super::rules::{
+    ActionEligibility, DIAGNOSIS_RULES, DecisionPriorityBand, DiagnosisRule, UNKNOWN_ELIGIBILITY,
+};
 use super::{
-    Diagnosis, DiagnosisId, GuardianActionKind, GuardianConfidence, GuardianDomain, GuardianFact,
-    GuardianFactId, GuardianImpactVector, GuardianMode, GuardianSeverity, SafetyCase,
+    ActionPlanPrerequisite, DiagnosisId, GuardianActionKind, GuardianConfidence, GuardianDomain,
+    GuardianFact, GuardianFactId, GuardianMode, GuardianSeverity, SafetyCase,
 };
 use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
+use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-pub fn diagnose_facts(facts: &[GuardianFact], phase: OperationPhase) -> Vec<Diagnosis> {
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Diagnosis {
+    id: DiagnosisId,
+    domain: GuardianDomain,
+    severity: GuardianSeverity,
+    confidence: GuardianConfidence,
+    ownership: OwnershipClass,
+    phase: OperationPhase,
+    fact_ids: Vec<GuardianFactId>,
+    affected_targets: Vec<TargetDescriptor>,
+    candidate_actions: Vec<GuardianActionKind>,
+    public_reason_template: String,
+    #[serde(skip)]
+    eligibility: ActionEligibility,
+    #[serde(skip)]
+    priority: DecisionPriorityBand,
+}
+
+impl Diagnosis {
+    pub fn id(&self) -> DiagnosisId {
+        self.id
+    }
+
+    pub fn domain(&self) -> GuardianDomain {
+        self.domain
+    }
+
+    pub fn severity(&self) -> GuardianSeverity {
+        self.severity
+    }
+
+    pub fn confidence(&self) -> GuardianConfidence {
+        self.confidence
+    }
+
+    pub fn ownership(&self) -> OwnershipClass {
+        self.ownership
+    }
+
+    pub fn phase(&self) -> OperationPhase {
+        self.phase
+    }
+
+    pub fn fact_ids(&self) -> &[GuardianFactId] {
+        &self.fact_ids
+    }
+
+    pub fn affected_targets(&self) -> &[TargetDescriptor] {
+        &self.affected_targets
+    }
+
+    pub fn candidate_actions(&self) -> &[GuardianActionKind] {
+        &self.candidate_actions
+    }
+
+    pub fn public_reason_template(&self) -> &str {
+        &self.public_reason_template
+    }
+
+    pub(super) fn eligibility(&self) -> ActionEligibility {
+        self.eligibility
+    }
+
+    pub(super) fn priority(&self) -> DecisionPriorityBand {
+        self.priority
+    }
+
+    pub fn action_prerequisite(&self) -> ActionPlanPrerequisite {
+        ActionPlanPrerequisite {
+            diagnosis_id: self.id,
+            ownership: self.ownership,
+            confidence: self.confidence,
+            affected_targets: self.affected_targets.clone(),
+            candidate_actions: self.candidate_actions.clone(),
+        }
+    }
+}
+
+pub fn diagnose(facts: &[GuardianFact], phase: OperationPhase) -> Vec<Diagnosis> {
     let mut diagnoses = DIAGNOSIS_RULES
         .iter()
         .enumerate()
@@ -38,7 +119,7 @@ pub fn build_safety_case(
         operation_id,
         mode,
         phase,
-        diagnoses: diagnose_facts(facts, phase),
+        diagnoses: diagnose(facts, phase),
     }
 }
 
@@ -47,28 +128,43 @@ fn diagnosis_for_rule(
     facts: &[GuardianFact],
     phase: OperationPhase,
 ) -> Option<(usize, Diagnosis)> {
-    let first_fact_index = facts.iter().position(|fact| rule.matches(fact))?;
+    if !rule.matches(facts, phase) {
+        return None;
+    }
+    let first_fact_index = facts
+        .iter()
+        .position(|fact| rule.trigger_matches(fact, phase))?;
     let supporting_facts = rule
-        .source_fact_ids
+        .trigger_fact_ids
+        .iter()
+        .flat_map(|fact_id| {
+            facts
+                .iter()
+                .filter(move |fact| fact.id == *fact_id && rule.trigger_matches(fact, phase))
+        })
+        .collect::<Vec<_>>();
+    let ownership = conservative_ownership(&supporting_facts);
+    let resolved = rule.resolve(&supporting_facts, facts, phase);
+    let evidence_facts = resolved
+        .evidence_fact_ids
         .iter()
         .flat_map(|fact_id| facts.iter().filter(move |fact| fact.id == *fact_id))
         .collect::<Vec<_>>();
-    let ownership = conservative_ownership(&supporting_facts);
 
     Some((
         first_fact_index,
         Diagnosis {
             id: rule.id,
             domain: rule.domain(&supporting_facts),
-            severity: rule.severity(&supporting_facts),
-            confidence: rule.confidence(&supporting_facts),
+            severity: resolved.severity,
+            confidence: resolved.confidence,
             ownership,
             phase,
-            fact_ids: rule
-                .source_fact_ids
+            fact_ids: resolved
+                .evidence_fact_ids
                 .iter()
                 .copied()
-                .filter(|fact_id| supporting_facts.iter().any(|fact| fact.id == *fact_id))
+                .filter(|fact_id| evidence_facts.iter().any(|fact| fact.id == *fact_id))
                 .collect(),
             affected_targets: affected_targets_for_rule(
                 &supporting_facts,
@@ -76,17 +172,22 @@ fn diagnosis_for_rule(
                 ownership,
                 phase,
             ),
-            impact: rule.impact(),
-            candidate_actions: rule.candidate_actions.to_vec(),
+            candidate_actions: resolved.candidate_actions.to_vec(),
             public_reason_template: rule.public_reason_template.to_string(),
+            eligibility: rule.eligibility,
+            priority: resolved.priority,
         },
     ))
 }
 
 fn unknown_diagnosis(facts: &[GuardianFact], phase: OperationPhase) -> Diagnosis {
-    let ownership = conservative_ownership(&facts.iter().collect::<Vec<_>>());
+    let evidence_facts = facts
+        .iter()
+        .filter(|fact| !is_condition_fact(fact.id))
+        .collect::<Vec<_>>();
+    let ownership = conservative_ownership(&evidence_facts);
     let mut affected_targets =
-        distinct_sorted_targets(facts.iter().filter_map(|fact| fact.target.clone()));
+        distinct_sorted_targets(evidence_facts.iter().filter_map(|fact| fact.target.clone()));
     if affected_targets.is_empty() {
         affected_targets.push(fallback_target(GuardianDomain::Unknown, ownership, phase));
     }
@@ -97,15 +198,16 @@ fn unknown_diagnosis(facts: &[GuardianFact], phase: OperationPhase) -> Diagnosis
         confidence: GuardianConfidence::Low,
         ownership,
         phase,
-        fact_ids: supporting_fact_ids(facts, phase),
+        fact_ids: supporting_fact_ids(&evidence_facts, phase),
         affected_targets,
-        impact: GuardianImpactVector::record_only(),
         candidate_actions: vec![
             GuardianActionKind::RecordOnly,
             GuardianActionKind::Warn,
             GuardianActionKind::AskUser,
         ],
         public_reason_template: "unknown_failure".to_string(),
+        eligibility: UNKNOWN_ELIGIBILITY,
+        priority: DecisionPriorityBand::UnknownLow,
     }
 }
 
@@ -127,7 +229,7 @@ fn affected_targets_for_rule(
     }
 }
 
-fn supporting_fact_ids(facts: &[GuardianFact], phase: OperationPhase) -> Vec<GuardianFactId> {
+fn supporting_fact_ids(facts: &[&GuardianFact], phase: OperationPhase) -> Vec<GuardianFactId> {
     let mut seen = HashSet::new();
     let mut fact_ids = facts
         .iter()
@@ -138,6 +240,16 @@ fn supporting_fact_ids(facts: &[GuardianFact], phase: OperationPhase) -> Vec<Gua
         fact_ids.push(GuardianFactId::NoStructuredFact(phase));
     }
     fact_ids
+}
+
+fn is_condition_fact(id: GuardianFactId) -> bool {
+    matches!(
+        id,
+        GuardianFactId::LaunchFailureClassified
+            | GuardianFactId::LaunchRuntimeFallbackAvailable
+            | GuardianFactId::LaunchJvmStripAvailable
+            | GuardianFactId::LaunchJvmPresetDowngradeAvailable
+    )
 }
 
 fn distinct_sorted_targets(

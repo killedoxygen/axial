@@ -362,7 +362,7 @@ mod tests {
     };
     use crate::guardian::{
         GuardianActionKind, GuardianConfidence, GuardianDomain, GuardianFactId, GuardianMode,
-        GuardianPolicyContext, GuardianSeverity, diagnose_facts,
+        GuardianPolicyContext, GuardianSeverity, diagnose,
     };
     use crate::state::contracts::{
         OperationPhase, OwnershipClass, RollbackState, StabilizationSystem, TargetDescriptor,
@@ -451,22 +451,22 @@ mod tests {
         };
 
         let facts = performance_plan_guardian_facts(&plan, OperationPhase::Planning);
-        let diagnoses = diagnose_facts(&facts, OperationPhase::Planning);
+        let diagnoses = diagnose(&facts, OperationPhase::Planning);
 
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].id.as_str(), "performance_fallback_selected");
         assert_eq!(diagnoses.len(), 1);
-        assert_eq!(diagnoses[0].id.as_str(), "performance_fallback_selected");
-        assert_eq!(diagnoses[0].severity, GuardianSeverity::Warning);
-        assert_eq!(diagnoses[0].confidence, GuardianConfidence::High);
+        assert_eq!(diagnoses[0].id().as_str(), "performance_fallback_selected");
+        assert_eq!(diagnoses[0].severity(), GuardianSeverity::Warning);
+        assert_eq!(diagnoses[0].confidence(), GuardianConfidence::High);
         assert!(
             diagnoses[0]
-                .candidate_actions
+                .candidate_actions()
                 .contains(&GuardianActionKind::RecordOnly)
         );
         assert!(
             !diagnoses[0]
-                .candidate_actions
+                .candidate_actions()
                 .contains(&GuardianActionKind::Fallback)
         );
     }
@@ -485,9 +485,12 @@ mod tests {
         assert_eq!(fact.id.as_str(), "performance_user_owned_conflict");
         assert_eq!(fact.ownership, OwnershipClass::UserOwned);
         assert_eq!(fact.severity, Some(GuardianSeverity::Blocking));
-        let diagnoses = diagnose_facts(&[fact], OperationPhase::Validating);
-        assert_eq!(diagnoses[0].id.as_str(), "performance_user_owned_conflict");
-        assert_eq!(diagnoses[0].ownership, OwnershipClass::UserOwned);
+        let diagnoses = diagnose(&[fact], OperationPhase::Validating);
+        assert_eq!(
+            diagnoses[0].id().as_str(),
+            "performance_user_owned_conflict"
+        );
+        assert_eq!(diagnoses[0].ownership(), OwnershipClass::UserOwned);
     }
 
     #[test]

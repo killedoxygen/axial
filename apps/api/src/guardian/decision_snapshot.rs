@@ -1,7 +1,7 @@
 use super::{
     Diagnosis, DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence,
     GuardianDomain, GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext,
-    GuardianSeverity, SafetyCase, decide_guardian_policy, diagnose_facts,
+    GuardianSeverity, SafetyCase, decide_guardian_policy, diagnose,
 };
 use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
@@ -149,13 +149,13 @@ struct DiagnosisProjection {
 impl From<&Diagnosis> for DiagnosisProjection {
     fn from(diagnosis: &Diagnosis) -> Self {
         Self {
-            id: diagnosis.id,
-            domain: diagnosis.domain,
-            severity: diagnosis.severity,
-            confidence: diagnosis.confidence,
-            fact_ids: diagnosis.fact_ids.clone(),
-            candidate_actions: diagnosis.candidate_actions.clone(),
-            public_reason_template: diagnosis.public_reason_template.clone(),
+            id: diagnosis.id(),
+            domain: diagnosis.domain(),
+            severity: diagnosis.severity(),
+            confidence: diagnosis.confidence(),
+            fact_ids: diagnosis.fact_ids().to_vec(),
+            candidate_actions: diagnosis.candidate_actions().to_vec(),
+            public_reason_template: diagnosis.public_reason_template().to_string(),
         }
     }
 }
@@ -255,9 +255,10 @@ fn replay_source_case(
         let mut expected_matrix = None;
         for phase in &committed.allowed_phases {
             let diagnosis = replay_source_diagnosis(&committed.input, *phase, ownership);
-            assert_eq!(diagnosis.phase, *phase, "{} at {phase:?}", committed.id);
+            assert_eq!(diagnosis.phase(), *phase, "{} at {phase:?}", committed.id);
             assert_eq!(
-                diagnosis.ownership, ownership,
+                diagnosis.ownership(),
+                ownership,
                 "{} at {phase:?}",
                 committed.id
             );
@@ -325,7 +326,7 @@ fn replay_source_diagnosis(
         }],
         SourceInput::Empty => Vec::new(),
     };
-    let mut diagnoses = diagnose_facts(&facts, phase);
+    let mut diagnoses = diagnose(&facts, phase);
     assert_eq!(diagnoses.len(), 1, "snapshot source at {phase:?}");
     diagnoses
         .pop()
@@ -342,7 +343,7 @@ fn policy_matrix(
             let safety_case = SafetyCase {
                 operation_id: None,
                 mode,
-                phase: diagnosis.phase,
+                phase: diagnosis.phase(),
                 diagnoses: vec![diagnosis.clone()],
             };
             let contexts = contexts
@@ -375,7 +376,7 @@ fn decision_plan_integrity(decision: &super::GuardianDecision, safety_case: &Saf
             != safety_case
                 .diagnoses
                 .iter()
-                .map(|diagnosis| diagnosis.id)
+                .map(|diagnosis| diagnosis.id())
                 .collect::<Vec<_>>()
     {
         return false;
@@ -387,11 +388,11 @@ fn decision_plan_integrity(decision: &super::GuardianDecision, safety_case: &Saf
         return false;
     };
     let prerequisite_matches = safety_case.diagnoses.iter().any(|diagnosis| {
-        plan.prerequisite.diagnosis_id == diagnosis.id
-            && plan.prerequisite.ownership == diagnosis.ownership
-            && plan.prerequisite.confidence == diagnosis.confidence
-            && plan.prerequisite.affected_targets == diagnosis.affected_targets
-            && plan.prerequisite.candidate_actions == diagnosis.candidate_actions
+        plan.prerequisite.diagnosis_id == diagnosis.id()
+            && plan.prerequisite.ownership == diagnosis.ownership()
+            && plan.prerequisite.confidence == diagnosis.confidence()
+            && plan.prerequisite.affected_targets == diagnosis.affected_targets()
+            && plan.prerequisite.candidate_actions == diagnosis.candidate_actions()
     });
 
     plan.owner == StabilizationSystem::Guardian

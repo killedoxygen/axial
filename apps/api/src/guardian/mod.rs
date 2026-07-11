@@ -39,7 +39,7 @@ pub use artifact_repair::{
     GuardianArtifactRepairMutation, GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest,
     GuardianArtifactRepairSource, GuardianArtifactRepairStatus, execute_guardian_artifact_repair,
 };
-pub use diagnosis::{build_safety_case, diagnose_facts};
+pub use diagnosis::{Diagnosis, build_safety_case, diagnose};
 pub use facts::guardian_fact_from_execution;
 pub use healing::{
     GuardianManagedRuntimeRepairRequest, GuardianRepairOutcome, GuardianRepairStatus,
@@ -80,10 +80,9 @@ pub use launch_recovery::{
     record_launch_recovery_attempt, record_launch_recovery_failure, record_launch_recovery_success,
 };
 pub use model::{
-    ActionPlanPrerequisite, Diagnosis, DiagnosisId, FactReliability, GuardianAction,
-    GuardianActionKind, GuardianActionPlan, GuardianConfidence, GuardianCoreError,
-    GuardianDecision, GuardianDomain, GuardianFact, GuardianFactId, GuardianImpactVector,
-    GuardianMode, GuardianSeverity, SafetyCase, SafetyOutcome,
+    ActionPlanPrerequisite, DiagnosisId, FactReliability, GuardianAction, GuardianActionKind,
+    GuardianActionPlan, GuardianConfidence, GuardianDecision, GuardianDomain, GuardianFact,
+    GuardianFactId, GuardianMode, GuardianSeverity, SafetyCase, SafetyOutcome,
 };
 pub use outcome::{
     GuardianUserOutcome, install_artifact_repair_user_outcome, install_failure_user_outcome,
@@ -98,9 +97,7 @@ pub use performance::{
     performance_plan_guardian_facts, performance_rules_guardian_facts,
     performance_state_error_guardian_fact, plan_performance_supervision,
 };
-pub use policy::{
-    GuardianPolicyContext, action_safety_score, decide_guardian_policy, decision_pressure_score,
-};
+pub use policy::{GuardianPolicyContext, decide_guardian_policy};
 pub use preflight::{
     GuardianPreflightDirective, GuardianPreflightOutcome, GuardianPreflightOutcomeRequest,
     GuardianPreflightOverrideSignals, GuardianPreflightReadiness, GuardianPreflightResourceSignals,

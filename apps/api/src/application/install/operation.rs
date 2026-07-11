@@ -9,7 +9,7 @@ use crate::application::{
 };
 use crate::guardian::{
     DiagnosisId, GuardianActionKind, GuardianInstallArtifactFailureEvidence,
-    GuardianInstallArtifactFailureKind, GuardianMode, GuardianPolicyContext, diagnose_facts,
+    GuardianInstallArtifactFailureKind, GuardianMode, GuardianPolicyContext, diagnose,
     install_artifact_failure_from_minecraft_download_fact, install_artifact_failure_guardian_fact,
     install_artifact_failure_guardian_outcome_with_context, install_artifact_failure_safety_case,
 };
@@ -350,9 +350,9 @@ pub async fn record_install_operation_guardian_evidence(
         .iter()
         .map(|fact| format!("guardian_fact:{}", fact.id.as_str()))
         .collect::<Vec<_>>();
-    let diagnosis_ids = diagnose_facts(&guardian_facts, OperationPhase::Downloading)
+    let diagnosis_ids = diagnose(&guardian_facts, OperationPhase::Downloading)
         .into_iter()
-        .map(|diagnosis| diagnosis.id)
+        .map(|diagnosis| diagnosis.id())
         .collect::<Vec<_>>();
     record_guardian_evidence_with_reconciliation(journals, operation_id, fact_ids, diagnosis_ids)
         .await
@@ -1378,11 +1378,11 @@ fn provider_failure_memory_entry(
     let diagnosis = safety_case
         .diagnoses
         .iter()
-        .find(|diagnosis| diagnosis.id == DiagnosisId::DownloadUnavailable)?;
-    let target = diagnosis.affected_targets.first()?;
+        .find(|diagnosis| diagnosis.id() == DiagnosisId::DownloadUnavailable)?;
+    let target = diagnosis.affected_targets().first()?;
     let key = FailureMemoryKey::for_observation(
-        diagnosis.domain,
-        &diagnosis.id,
+        diagnosis.domain(),
+        &diagnosis.id(),
         target,
         mode,
         Some(PROVIDER_FAILURE_MEMORY_SOURCE),
@@ -1413,11 +1413,11 @@ fn record_provider_failure_memory_if_needed(
     let Some(diagnosis) = safety_case
         .diagnoses
         .iter()
-        .find(|diagnosis| diagnosis.id == outcome.diagnosis_id)
+        .find(|diagnosis| diagnosis.id() == outcome.diagnosis_id)
     else {
         return;
     };
-    let Some(target) = diagnosis.affected_targets.first().cloned() else {
+    let Some(target) = diagnosis.affected_targets().first().cloned() else {
         return;
     };
     let suppression_until = provider_failure_suppression_until(observed_at);
@@ -1428,8 +1428,8 @@ fn record_provider_failure_memory_if_needed(
         _ => return,
     };
     let entry = GuardianFailureMemoryEntry::observed(
-        diagnosis.id,
-        diagnosis.domain,
+        diagnosis.id(),
+        diagnosis.domain(),
         target,
         mode,
         Some(PROVIDER_FAILURE_MEMORY_SOURCE),

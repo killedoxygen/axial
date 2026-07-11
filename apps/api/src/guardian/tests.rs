@@ -4,10 +4,10 @@ use super::rules::{
     rule_for_diagnosis,
 };
 use super::{
-    ActionPlanPrerequisite, Diagnosis, DiagnosisId, FactReliability, GuardianAction,
-    GuardianActionKind, GuardianActionPlan, GuardianConfidence, GuardianDecision, GuardianDomain,
-    GuardianFact, GuardianFactId, GuardianMode, GuardianSeverity, GuardianSeverity::Repairable,
-    build_safety_case, diagnose_facts, guardian_fact_from_execution,
+    DiagnosisId, FactReliability, GuardianAction, GuardianActionKind, GuardianActionPlan,
+    GuardianConfidence, GuardianDecision, GuardianDomain, GuardianFact, GuardianFactId,
+    GuardianMode, GuardianSeverity, GuardianSeverity::Repairable, build_safety_case, diagnose,
+    guardian_fact_from_execution,
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{EvidenceField, EvidenceSensitivity};
@@ -138,23 +138,21 @@ fn execution_runtime_fact_maps_to_confirmed_runtime_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Preparing);
-    let diagnoses = diagnose_facts(&[fact], OperationPhase::Preparing);
+    let diagnoses = diagnose(&[fact], OperationPhase::Preparing);
 
     assert_eq!(diagnoses.len(), 1);
     let diagnosis = &diagnoses[0];
-    assert_eq!(diagnosis.id.as_str(), "managed_runtime_corrupt");
-    assert_eq!(diagnosis.domain, GuardianDomain::Runtime);
-    assert_eq!(diagnosis.severity, Repairable);
-    assert_eq!(diagnosis.confidence, GuardianConfidence::Confirmed);
-    assert_eq!(diagnosis.ownership, OwnershipClass::LauncherManaged);
+    assert_eq!(diagnosis.id().as_str(), "managed_runtime_corrupt");
+    assert_eq!(diagnosis.domain(), GuardianDomain::Runtime);
+    assert_eq!(diagnosis.severity(), Repairable);
+    assert_eq!(diagnosis.confidence(), GuardianConfidence::Confirmed);
+    assert_eq!(diagnosis.ownership(), OwnershipClass::LauncherManaged);
     assert!(
         diagnosis
-            .candidate_actions
+            .candidate_actions()
             .contains(&GuardianActionKind::Repair)
     );
-    let prerequisite = diagnosis
-        .action_prerequisite()
-        .expect("action prerequisite");
+    let prerequisite = diagnosis.action_prerequisite();
     assert_eq!(prerequisite.ownership, OwnershipClass::LauncherManaged);
     assert_eq!(prerequisite.confidence, GuardianConfidence::Confirmed);
 }
@@ -178,18 +176,18 @@ fn execution_java_override_sentinel_maps_to_unavailable_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
-    let diagnoses = diagnose_facts(std::slice::from_ref(&fact), OperationPhase::Validating);
+    let diagnoses = diagnose(std::slice::from_ref(&fact), OperationPhase::Validating);
 
     assert_eq!(fact.id.as_str(), "java_override_undefined_sentinel");
     assert_eq!(fact.domain, GuardianDomain::Runtime);
     assert_eq!(fact.reliability, FactReliability::ExactClassifier);
     assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id.as_str(), "java_override_unavailable");
-    assert_eq!(diagnoses[0].severity, GuardianSeverity::Blocking);
-    assert_eq!(diagnoses[0].ownership, OwnershipClass::UserOwned);
+    assert_eq!(diagnoses[0].id().as_str(), "java_override_unavailable");
+    assert_eq!(diagnoses[0].severity(), GuardianSeverity::Blocking);
+    assert_eq!(diagnoses[0].ownership(), OwnershipClass::UserOwned);
     assert!(
         diagnoses[0]
-            .candidate_actions
+            .candidate_actions()
             .contains(&GuardianActionKind::Fallback)
     );
 }
@@ -212,17 +210,17 @@ fn execution_java_update_fact_maps_to_update_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
-    let diagnoses = diagnose_facts(std::slice::from_ref(&fact), OperationPhase::Validating);
+    let diagnoses = diagnose(std::slice::from_ref(&fact), OperationPhase::Validating);
 
     assert_eq!(fact.id.as_str(), "java_update_too_old");
     assert_eq!(fact.domain, GuardianDomain::Runtime);
     assert_eq!(fact.reliability, FactReliability::ValidatedProbe);
     assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id.as_str(), "java_runtime_update_too_old");
-    assert_eq!(diagnoses[0].severity, GuardianSeverity::Blocking);
+    assert_eq!(diagnoses[0].id().as_str(), "java_runtime_update_too_old");
+    assert_eq!(diagnoses[0].severity(), GuardianSeverity::Blocking);
     assert!(
         diagnoses[0]
-            .candidate_actions
+            .candidate_actions()
             .contains(&GuardianActionKind::Fallback)
     );
 }
@@ -246,13 +244,13 @@ fn execution_launch_command_fact_maps_to_launch_domain() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Preparing);
-    let diagnoses = diagnose_facts(std::slice::from_ref(&fact), OperationPhase::Preparing);
+    let diagnoses = diagnose(std::slice::from_ref(&fact), OperationPhase::Preparing);
 
     assert_eq!(fact.id.as_str(), "launch_command_prepared");
     assert_eq!(fact.domain, GuardianDomain::Launch);
     assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id.as_str(), "launch_command_prepared");
-    assert_eq!(diagnoses[0].severity, GuardianSeverity::Info);
+    assert_eq!(diagnoses[0].id().as_str(), "launch_command_prepared");
+    assert_eq!(diagnoses[0].severity(), GuardianSeverity::Info);
 }
 
 #[test]
@@ -274,14 +272,14 @@ fn execution_launch_command_invalid_fact_maps_to_blocking_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Preparing);
-    let diagnoses = diagnose_facts(&[fact], OperationPhase::Preparing);
+    let diagnoses = diagnose(&[fact], OperationPhase::Preparing);
 
     assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id.as_str(), "launch_command_invalid");
-    assert_eq!(diagnoses[0].severity, GuardianSeverity::Blocking);
+    assert_eq!(diagnoses[0].id().as_str(), "launch_command_invalid");
+    assert_eq!(diagnoses[0].severity(), GuardianSeverity::Blocking);
     assert!(
         diagnoses[0]
-            .candidate_actions
+            .candidate_actions()
             .contains(&GuardianActionKind::Block)
     );
 }
@@ -305,18 +303,18 @@ fn launch_readiness_fact_maps_to_blocking_install_diagnosis() {
         fields: Vec::new(),
     };
 
-    let diagnoses = diagnose_facts(&[fact], OperationPhase::Validating);
+    let diagnoses = diagnose(&[fact], OperationPhase::Validating);
 
     assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id.as_str(), "install_incomplete");
-    assert_eq!(diagnoses[0].domain, GuardianDomain::Install);
-    assert_eq!(diagnoses[0].severity, GuardianSeverity::Blocking);
-    assert_eq!(diagnoses[0].confidence, GuardianConfidence::Confirmed);
+    assert_eq!(diagnoses[0].id().as_str(), "install_incomplete");
+    assert_eq!(diagnoses[0].domain(), GuardianDomain::Install);
+    assert_eq!(diagnoses[0].severity(), GuardianSeverity::Blocking);
+    assert_eq!(diagnoses[0].confidence(), GuardianConfidence::Confirmed);
     assert_eq!(
-        diagnoses[0].candidate_actions,
+        diagnoses[0].candidate_actions(),
         vec![GuardianActionKind::Block]
     );
-    assert_eq!(diagnoses[0].affected_targets[0].kind, TargetKind::Version);
+    assert_eq!(diagnoses[0].affected_targets()[0].kind, TargetKind::Version);
 }
 
 #[test]
@@ -338,17 +336,17 @@ fn managed_runtime_readiness_fact_maps_to_recoverable_diagnosis() {
         fields: Vec::new(),
     };
 
-    let diagnoses = diagnose_facts(&[fact], OperationPhase::Validating);
+    let diagnoses = diagnose(&[fact], OperationPhase::Validating);
 
     assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id.as_str(), "managed_runtime_missing");
-    assert_eq!(diagnoses[0].domain, GuardianDomain::Runtime);
-    assert_eq!(diagnoses[0].severity, GuardianSeverity::Recoverable);
+    assert_eq!(diagnoses[0].id().as_str(), "managed_runtime_missing");
+    assert_eq!(diagnoses[0].domain(), GuardianDomain::Runtime);
+    assert_eq!(diagnoses[0].severity(), GuardianSeverity::Recoverable);
     assert_eq!(
-        diagnoses[0].candidate_actions,
+        diagnoses[0].candidate_actions(),
         vec![GuardianActionKind::RecordOnly]
     );
-    assert_eq!(diagnoses[0].affected_targets[0].kind, TargetKind::Runtime);
+    assert_eq!(diagnoses[0].affected_targets()[0].kind, TargetKind::Runtime);
 }
 
 #[test]
@@ -361,16 +359,16 @@ fn rule_action_eligibility_stays_internal_to_public_diagnosis_output() {
         OwnershipClass::UserOwned,
     );
 
-    let diagnoses = diagnose_facts(&[fact], OperationPhase::Validating);
+    let diagnoses = diagnose(&[fact], OperationPhase::Validating);
     let encoded = serde_json::to_string(&diagnoses[0]).expect("diagnosis json");
 
     assert!(!encoded.contains("action_eligibility"));
     assert!(!encoded.contains("journal_requirement"));
     assert!(!encoded.contains("destructive_mutation_risk"));
-    assert_eq!(diagnoses[0].id.as_str(), "jvm_args_malformed");
-    assert_eq!(diagnoses[0].confidence, GuardianConfidence::Confirmed);
+    assert_eq!(diagnoses[0].id().as_str(), "jvm_args_malformed");
+    assert_eq!(diagnoses[0].confidence(), GuardianConfidence::Confirmed);
     assert_eq!(
-        diagnoses[0].candidate_actions,
+        diagnoses[0].candidate_actions(),
         vec![
             GuardianActionKind::Strip,
             GuardianActionKind::AskUser,
@@ -380,30 +378,39 @@ fn rule_action_eligibility_stays_internal_to_public_diagnosis_output() {
 }
 
 #[test]
-fn declarative_rules_cover_exactly_the_frozen_fact_corpus() {
+fn declarative_rules_have_unique_ids_and_keep_conditions_out_of_evidence() {
     let mut diagnosis_ids = std::collections::HashSet::new();
-    let mut source_fact_ids = std::collections::HashSet::new();
+    let conditions = [
+        GuardianFactId::LaunchFailureClassified,
+        GuardianFactId::LaunchRuntimeFallbackAvailable,
+        GuardianFactId::LaunchJvmStripAvailable,
+        GuardianFactId::LaunchJvmPresetDowngradeAvailable,
+    ];
 
-    assert_eq!(DIAGNOSIS_RULES.len(), 46);
+    assert_eq!(DIAGNOSIS_RULES.len(), 58);
     for rule in DIAGNOSIS_RULES {
         assert!(diagnosis_ids.insert(rule.id), "duplicate rule {}", rule.id);
-        assert!(!rule.source_fact_ids.is_empty(), "{}", rule.id);
+        assert!(!rule.trigger_fact_ids.is_empty(), "{}", rule.id);
+        assert!(!rule.evidence_fact_ids.is_empty(), "{}", rule.id);
         assert_eq!(
             rule.eligibility.redaction_requirement,
             RedactionRequirement::PublicOutcome,
             "{}",
             rule.id
         );
-        for fact_id in rule.source_fact_ids {
+        for condition in conditions {
+            assert!(!rule.trigger_fact_ids.contains(&condition), "{}", rule.id);
+            assert!(!rule.evidence_fact_ids.contains(&condition), "{}", rule.id);
             assert!(
-                source_fact_ids.insert(*fact_id),
-                "duplicate rule source {}",
-                fact_id.as_str()
+                rule.clauses.iter().all(|clause| clause
+                    .evidence_fact_ids
+                    .is_none_or(|evidence| !evidence.contains(&condition))),
+                "{}",
+                rule.id
             );
         }
         assert_eq!(rule_for_diagnosis(rule.id), Some(rule));
     }
-    assert_eq!(source_fact_ids.len(), 69);
 }
 
 #[test]
@@ -614,8 +621,8 @@ fn nine_multi_fact_rule_families_emit_once_with_declared_support_order() {
         ),
     ];
 
-    for (diagnosis_id, source_fact_ids) in families {
-        let facts = source_fact_ids
+    for (diagnosis_id, expected_fact_ids) in families {
+        let facts = expected_fact_ids
             .iter()
             .rev()
             .map(|fact_id| {
@@ -628,20 +635,20 @@ fn nine_multi_fact_rule_families_emit_once_with_declared_support_order() {
                 )
             })
             .collect::<Vec<_>>();
-        let diagnoses = diagnose_facts(&facts, OperationPhase::Failed);
+        let diagnoses = diagnose(&facts, OperationPhase::Failed);
         let diagnosis = diagnoses
             .iter()
-            .find(|diagnosis| diagnosis.id == *diagnosis_id)
+            .find(|diagnosis| diagnosis.id() == *diagnosis_id)
             .unwrap_or_else(|| panic!("missing fused diagnosis {diagnosis_id}"));
 
         assert_eq!(
             diagnoses
                 .iter()
-                .filter(|diagnosis| diagnosis.id == *diagnosis_id)
+                .filter(|diagnosis| diagnosis.id() == *diagnosis_id)
                 .count(),
             1
         );
-        assert_eq!(diagnosis.fact_ids, *source_fact_ids);
+        assert_eq!(diagnosis.fact_ids(), *expected_fact_ids);
     }
 }
 
@@ -670,15 +677,15 @@ fn fused_rules_fold_ownership_and_fact_values_independent_of_input_order() {
         vec![defaulted.clone(), lower.clone()],
         vec![lower.clone(), defaulted.clone()],
     ] {
-        let diagnosis = diagnose_facts(&facts, OperationPhase::Planning)
+        let diagnosis = diagnose(&facts, OperationPhase::Planning)
             .into_iter()
-            .find(|diagnosis| diagnosis.id == DiagnosisId::PerformanceFallbackSelected)
+            .find(|diagnosis| diagnosis.id() == DiagnosisId::PerformanceFallbackSelected)
             .expect("performance fallback diagnosis");
-        assert_eq!(diagnosis.severity, GuardianSeverity::Warning);
-        assert_eq!(diagnosis.confidence, GuardianConfidence::High);
-        assert_eq!(diagnosis.ownership, OwnershipClass::UserOwned);
+        assert_eq!(diagnosis.severity(), GuardianSeverity::Warning);
+        assert_eq!(diagnosis.confidence(), GuardianConfidence::High);
+        assert_eq!(diagnosis.ownership(), OwnershipClass::UserOwned);
         assert_eq!(
-            diagnosis.fact_ids,
+            diagnosis.fact_ids(),
             vec![
                 GuardianFactId::PerformanceFallbackSelected,
                 GuardianFactId::PerformanceHealthFallback,
@@ -710,19 +717,19 @@ fn duplicate_source_instances_keep_distinct_real_targets_without_fake_fallbacks(
     let mut without_target = first.clone();
     without_target.target = None;
 
-    let diagnosis = diagnose_facts(
+    let diagnosis = diagnose(
         &[first, without_target, second],
         OperationPhase::Downloading,
     )
     .remove(0);
 
     assert_eq!(
-        diagnosis.fact_ids,
+        diagnosis.fact_ids(),
         vec![GuardianFactId::DownloadInterrupted]
     );
     assert_eq!(
         diagnosis
-            .affected_targets
+            .affected_targets()
             .iter()
             .map(|target| target.id.as_str())
             .collect::<Vec<_>>(),
@@ -763,7 +770,7 @@ fn conservative_ownership_join_covers_every_pair_and_input_permutation() {
                 vec![right_fact.clone(), left_fact.clone()],
             ] {
                 assert_eq!(
-                    diagnose_facts(&facts, OperationPhase::Downloading)[0].ownership,
+                    diagnose(&facts, OperationPhase::Downloading)[0].ownership(),
                     expected,
                     "{left:?} + {right:?}"
                 );
@@ -791,21 +798,21 @@ fn targetless_fused_rule_emits_one_resolved_fallback() {
     );
     interrupted.target = None;
 
-    let diagnosis = diagnose_facts(&[interrupted, provider], OperationPhase::Downloading).remove(0);
+    let diagnosis = diagnose(&[interrupted, provider], OperationPhase::Downloading).remove(0);
 
-    assert_eq!(diagnosis.id, DiagnosisId::DownloadUnavailable);
-    assert_eq!(diagnosis.ownership, OwnershipClass::UserOwned);
-    assert_eq!(diagnosis.affected_targets.len(), 1);
+    assert_eq!(diagnosis.id(), DiagnosisId::DownloadUnavailable);
+    assert_eq!(diagnosis.ownership(), OwnershipClass::UserOwned);
+    assert_eq!(diagnosis.affected_targets().len(), 1);
     assert_eq!(
-        diagnosis.affected_targets[0].kind,
+        diagnosis.affected_targets()[0].kind,
         TargetKind::NetworkResource
     );
     assert_eq!(
-        diagnosis.affected_targets[0].ownership,
+        diagnosis.affected_targets()[0].ownership,
         OwnershipClass::UserOwned
     );
     assert_eq!(
-        diagnosis.affected_targets[0].id,
+        diagnosis.affected_targets()[0].id,
         "guardian-download-downloading"
     );
 }
@@ -844,9 +851,9 @@ fn diagnosis_order_follows_first_matching_input_then_rule_order() {
         ),
     ] {
         assert_eq!(
-            diagnose_facts(&facts, OperationPhase::Preparing)
+            diagnose(&facts, OperationPhase::Preparing)
                 .iter()
-                .map(|diagnosis| diagnosis.id)
+                .map(|diagnosis| diagnosis.id())
                 .collect::<Vec<_>>(),
             expected
         );
@@ -854,9 +861,12 @@ fn diagnosis_order_follows_first_matching_input_then_rule_order() {
 }
 
 #[test]
-fn every_rule_source_matches_outside_the_retired_phase_lists() {
+fn phase_agnostic_rule_triggers_match_in_rollback() {
     for rule in DIAGNOSIS_RULES {
-        for fact_id in rule.source_fact_ids {
+        if !rule.active_phases.is_empty() || !rule.required_conditions.is_empty() {
+            continue;
+        }
+        for fact_id in rule.trigger_fact_ids {
             let fact = guardian_test_fact(
                 *fact_id,
                 GuardianDomain::Unknown,
@@ -864,9 +874,10 @@ fn every_rule_source_matches_outside_the_retired_phase_lists() {
                 FactReliability::UserReported,
                 OwnershipClass::Unknown,
             );
-            assert_eq!(
-                diagnose_facts(&[fact], OperationPhase::RollingBack)[0].id,
-                rule.id,
+            assert!(
+                diagnose(&[fact], OperationPhase::RollingBack)
+                    .iter()
+                    .any(|diagnosis| diagnosis.id() == rule.id),
                 "{}",
                 fact_id.as_str()
             );
@@ -893,19 +904,19 @@ fn execution_jvm_parse_fact_maps_to_malformed_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
-    let diagnoses = diagnose_facts(std::slice::from_ref(&fact), OperationPhase::Validating);
+    let diagnoses = diagnose(std::slice::from_ref(&fact), OperationPhase::Validating);
 
     assert_eq!(fact.id.as_str(), "jvm_args_parse_failed");
     assert_eq!(fact.domain, GuardianDomain::Jvm);
     assert_eq!(fact.reliability, FactReliability::ExactClassifier);
     assert!(fact.fields.is_empty());
     assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id.as_str(), "jvm_args_malformed");
-    assert_eq!(diagnoses[0].severity, GuardianSeverity::Blocking);
-    assert_eq!(diagnoses[0].confidence, GuardianConfidence::Confirmed);
+    assert_eq!(diagnoses[0].id().as_str(), "jvm_args_malformed");
+    assert_eq!(diagnoses[0].severity(), GuardianSeverity::Blocking);
+    assert_eq!(diagnoses[0].confidence(), GuardianConfidence::Confirmed);
     assert!(
         diagnoses[0]
-            .candidate_actions
+            .candidate_actions()
             .contains(&GuardianActionKind::Strip)
     );
 }
@@ -929,15 +940,15 @@ fn execution_jvm_unsafe_fact_maps_to_unsafe_override_diagnosis() {
     };
 
     let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
-    let diagnoses = diagnose_facts(&[fact], OperationPhase::Validating);
+    let diagnoses = diagnose(&[fact], OperationPhase::Validating);
 
     assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id.as_str(), "jvm_arg_unsafe_override");
-    assert_eq!(diagnoses[0].domain, GuardianDomain::Jvm);
-    assert_eq!(diagnoses[0].ownership, OwnershipClass::UserOwned);
+    assert_eq!(diagnoses[0].id().as_str(), "jvm_arg_unsafe_override");
+    assert_eq!(diagnoses[0].domain(), GuardianDomain::Jvm);
+    assert_eq!(diagnoses[0].ownership(), OwnershipClass::UserOwned);
     assert!(
         diagnoses[0]
-            .candidate_actions
+            .candidate_actions()
             .contains(&GuardianActionKind::AskUser)
     );
 }
@@ -1044,13 +1055,333 @@ fn exit_code_fact_maps_zero_and_nonzero_without_exit_classification() {
             OperationPhase::Running,
         );
         assert_eq!(fact.id.as_str(), expected);
-        let diagnoses = diagnose_facts(&[fact], OperationPhase::Running);
-        assert_eq!(diagnoses[0].id.as_str(), "process_lifecycle_observed");
+        let diagnoses = diagnose(&[fact], OperationPhase::Running);
+        assert_eq!(diagnoses[0].id().as_str(), "process_lifecycle_observed");
         assert_eq!(
-            diagnoses[0].candidate_actions,
+            diagnoses[0].candidate_actions(),
             vec![GuardianActionKind::RecordOnly]
         );
     }
+}
+
+#[test]
+fn unclassified_exit_context_stays_out_of_shared_rule_evidence() {
+    let cases = [
+        (
+            GuardianFactId::JavaMajorMismatch,
+            GuardianDomain::Runtime,
+            DiagnosisId::JavaRuntimeMajorMismatch,
+        ),
+        (
+            GuardianFactId::JvmArgUnsupportedGc,
+            GuardianDomain::Jvm,
+            DiagnosisId::JvmArgUnsupported,
+        ),
+        (
+            GuardianFactId::LauncherManagedArtifactSignatureCorruption,
+            GuardianDomain::Download,
+            DiagnosisId::LauncherManagedArtifactSignatureCorrupt,
+        ),
+    ];
+
+    for (cause_id, domain, expected_id) in cases {
+        let process = guardian_test_fact(
+            GuardianFactId::ProcessExitedBeforeBoot,
+            GuardianDomain::Session,
+            OperationPhase::Launching,
+            FactReliability::DirectStructured,
+            OwnershipClass::LauncherManaged,
+        );
+        let cause = guardian_test_fact(
+            cause_id,
+            domain,
+            OperationPhase::Launching,
+            FactReliability::ExactClassifier,
+            OwnershipClass::LauncherManaged,
+        );
+
+        let diagnoses = diagnose(&[process, cause], OperationPhase::Launching);
+        let cause_diagnosis = diagnoses
+            .iter()
+            .find(|diagnosis| diagnosis.id() == expected_id)
+            .expect("shared cause diagnosis");
+        let lifecycle = diagnoses
+            .iter()
+            .find(|diagnosis| diagnosis.id() == DiagnosisId::ProcessLifecycleObserved)
+            .expect("independent lifecycle diagnosis");
+
+        assert_eq!(cause_diagnosis.fact_ids(), &[cause_id]);
+        assert_eq!(
+            lifecycle.fact_ids(),
+            &[GuardianFactId::ProcessExitedBeforeBoot]
+        );
+    }
+}
+
+#[test]
+fn launch_conditions_are_phase_bound_and_incomplete_classification_blocks() {
+    for (cause_id, domain, generic_action, diagnosis_id) in [
+        (
+            GuardianFactId::JavaMajorMismatch,
+            GuardianDomain::Runtime,
+            GuardianActionKind::Fallback,
+            DiagnosisId::JavaRuntimeMajorMismatch,
+        ),
+        (
+            GuardianFactId::JvmArgUnsupportedGc,
+            GuardianDomain::Jvm,
+            GuardianActionKind::Strip,
+            DiagnosisId::JvmArgUnsupported,
+        ),
+    ] {
+        let cause = guardian_test_fact(
+            cause_id,
+            domain,
+            OperationPhase::Launching,
+            FactReliability::ExactClassifier,
+            OwnershipClass::LauncherManaged,
+        );
+        let wrong_phase_classified = guardian_test_fact(
+            GuardianFactId::LaunchFailureClassified,
+            GuardianDomain::Launch,
+            OperationPhase::Preparing,
+            FactReliability::DirectStructured,
+            OwnershipClass::UserOwned,
+        );
+        let wrong_phase_available = guardian_test_fact(
+            GuardianFactId::LaunchRuntimeFallbackAvailable,
+            GuardianDomain::Launch,
+            OperationPhase::Preparing,
+            FactReliability::DirectStructured,
+            OwnershipClass::UserOwned,
+        );
+
+        let unclassified = diagnose(
+            &[cause.clone(), wrong_phase_classified, wrong_phase_available],
+            OperationPhase::Launching,
+        );
+        let unclassified = unclassified
+            .iter()
+            .find(|diagnosis| diagnosis.id() == diagnosis_id)
+            .expect("unclassified shared diagnosis");
+        assert!(unclassified.candidate_actions().contains(&generic_action));
+        assert_eq!(unclassified.fact_ids(), &[cause_id]);
+
+        let classified = guardian_test_fact(
+            GuardianFactId::LaunchFailureClassified,
+            GuardianDomain::Launch,
+            OperationPhase::Launching,
+            FactReliability::DirectStructured,
+            OwnershipClass::UserOwned,
+        );
+        let classified = diagnose(&[cause, classified], OperationPhase::Launching);
+        let classified = classified
+            .iter()
+            .find(|diagnosis| diagnosis.id() == diagnosis_id)
+            .expect("classified shared diagnosis");
+        assert_eq!(classified.confidence(), GuardianConfidence::High);
+        assert_eq!(classified.candidate_actions(), &[GuardianActionKind::Block]);
+        assert_eq!(classified.fact_ids(), &[cause_id]);
+    }
+
+    let signature = guardian_test_fact(
+        GuardianFactId::LauncherManagedArtifactSignatureCorruption,
+        GuardianDomain::Download,
+        OperationPhase::Preparing,
+        FactReliability::ExactClassifier,
+        OwnershipClass::LauncherManaged,
+    );
+    let wrong_phase_classified = guardian_test_fact(
+        GuardianFactId::LaunchFailureClassified,
+        GuardianDomain::Launch,
+        OperationPhase::Launching,
+        FactReliability::DirectStructured,
+        OwnershipClass::Unknown,
+    );
+    assert!(
+        diagnose(
+            &[signature, wrong_phase_classified],
+            OperationPhase::Preparing
+        )
+        .iter()
+        .any(|diagnosis| diagnosis.id() == DiagnosisId::LauncherManagedArtifactSignatureCorrupt)
+    );
+
+    let stale_java = guardian_test_fact(
+        GuardianFactId::JavaMajorMismatch,
+        GuardianDomain::Runtime,
+        OperationPhase::Preparing,
+        FactReliability::ExactClassifier,
+        OwnershipClass::LauncherManaged,
+    );
+    let current_classified = guardian_test_fact(
+        GuardianFactId::LaunchFailureClassified,
+        GuardianDomain::Launch,
+        OperationPhase::Launching,
+        FactReliability::DirectStructured,
+        OwnershipClass::LauncherManaged,
+    );
+    let current_process = guardian_test_fact(
+        GuardianFactId::ProcessExitedBeforeBoot,
+        GuardianDomain::Session,
+        OperationPhase::Launching,
+        FactReliability::DirectStructured,
+        OwnershipClass::LauncherManaged,
+    );
+    let current_fallback = guardian_test_fact(
+        GuardianFactId::LaunchRuntimeFallbackAvailable,
+        GuardianDomain::Launch,
+        OperationPhase::Launching,
+        FactReliability::DirectStructured,
+        OwnershipClass::LauncherManaged,
+    );
+    let diagnoses = diagnose(
+        &[
+            stale_java,
+            current_classified.clone(),
+            current_process,
+            current_fallback,
+        ],
+        OperationPhase::Launching,
+    );
+    let java = diagnoses
+        .iter()
+        .find(|diagnosis| diagnosis.id() == DiagnosisId::JavaRuntimeMajorMismatch)
+        .expect("stale generic Java diagnosis");
+    assert_eq!(java.confidence(), GuardianConfidence::Confirmed);
+    assert!(
+        java.candidate_actions()
+            .contains(&GuardianActionKind::Fallback)
+    );
+    assert_eq!(java.fact_ids(), &[GuardianFactId::JavaMajorMismatch]);
+
+    let stale_signature = guardian_test_fact(
+        GuardianFactId::LauncherManagedArtifactSignatureCorruption,
+        GuardianDomain::Download,
+        OperationPhase::Validating,
+        FactReliability::ExactClassifier,
+        OwnershipClass::LauncherManaged,
+    );
+    let preparing_classified = guardian_test_fact(
+        GuardianFactId::LaunchFailureClassified,
+        GuardianDomain::Launch,
+        OperationPhase::Preparing,
+        FactReliability::DirectStructured,
+        OwnershipClass::LauncherManaged,
+    );
+    assert!(
+        diagnose(
+            &[stale_signature, preparing_classified],
+            OperationPhase::Preparing
+        )
+        .iter()
+        .any(|diagnosis| diagnosis.id() == DiagnosisId::LauncherManagedArtifactSignatureCorrupt)
+    );
+
+    let wrong_phase_stall = guardian_test_fact(
+        GuardianFactId::StartupWindowExpired,
+        GuardianDomain::Startup,
+        OperationPhase::Preparing,
+        FactReliability::ExactClassifier,
+        OwnershipClass::LauncherManaged,
+    );
+    let launching_classified = guardian_test_fact(
+        GuardianFactId::LaunchFailureClassified,
+        GuardianDomain::Launch,
+        OperationPhase::Launching,
+        FactReliability::DirectStructured,
+        OwnershipClass::LauncherManaged,
+    );
+    assert!(
+        diagnose(
+            &[wrong_phase_stall, launching_classified],
+            OperationPhase::Launching
+        )
+        .iter()
+        .all(|diagnosis| diagnosis.id() != DiagnosisId::StartupStalled)
+    );
+}
+
+#[test]
+fn classified_startup_context_does_not_contaminate_diagnosis_properties() {
+    let cause = guardian_test_fact(
+        GuardianFactId::OutOfMemory,
+        GuardianDomain::Startup,
+        OperationPhase::Launching,
+        FactReliability::ExactClassifier,
+        OwnershipClass::LauncherManaged,
+    );
+    let process = guardian_test_fact(
+        GuardianFactId::ProcessExitedBeforeBoot,
+        GuardianDomain::Session,
+        OperationPhase::Launching,
+        FactReliability::DirectStructured,
+        OwnershipClass::Unknown,
+    );
+    let classified = guardian_test_fact(
+        GuardianFactId::LaunchFailureClassified,
+        GuardianDomain::Launch,
+        OperationPhase::Launching,
+        FactReliability::DirectStructured,
+        OwnershipClass::UserOwned,
+    );
+
+    let diagnoses = diagnose(&[cause, process, classified], OperationPhase::Launching);
+
+    assert_eq!(
+        diagnoses
+            .iter()
+            .map(|diagnosis| diagnosis.id())
+            .collect::<Vec<_>>(),
+        vec![DiagnosisId::OutOfMemory]
+    );
+    let diagnosis = &diagnoses[0];
+    assert_eq!(diagnosis.ownership(), OwnershipClass::LauncherManaged);
+    assert_eq!(
+        diagnosis.fact_ids(),
+        &[
+            GuardianFactId::ProcessExitedBeforeBoot,
+            GuardianFactId::OutOfMemory,
+        ]
+    );
+    assert_eq!(diagnosis.affected_targets().len(), 1);
+    assert_eq!(diagnosis.affected_targets()[0].id, "out_of_memory");
+}
+
+#[test]
+fn condition_only_input_falls_back_without_public_condition_evidence() {
+    let facts = [
+        GuardianFactId::LaunchFailureClassified,
+        GuardianFactId::LaunchRuntimeFallbackAvailable,
+        GuardianFactId::LaunchJvmStripAvailable,
+        GuardianFactId::LaunchJvmPresetDowngradeAvailable,
+    ]
+    .map(|id| {
+        guardian_test_fact(
+            id,
+            GuardianDomain::Launch,
+            OperationPhase::Preparing,
+            FactReliability::DirectStructured,
+            OwnershipClass::UserOwned,
+        )
+    });
+
+    let diagnoses = diagnose(&facts, OperationPhase::Preparing);
+
+    assert_eq!(diagnoses.len(), 1);
+    assert_eq!(
+        diagnoses[0].id(),
+        DiagnosisId::UnknownFailure(OperationPhase::Preparing)
+    );
+    assert_eq!(diagnoses[0].ownership(), OwnershipClass::Unknown);
+    assert_eq!(
+        diagnoses[0].fact_ids(),
+        &[GuardianFactId::NoStructuredFact(OperationPhase::Preparing)]
+    );
+    assert_eq!(
+        diagnoses[0].affected_targets()[0].id,
+        "guardian-unknown-preparing"
+    );
 }
 
 #[test]
@@ -1063,52 +1394,17 @@ fn unknown_facts_produce_low_confidence_unknown_diagnosis() {
         OwnershipClass::Unknown,
     );
 
-    let diagnoses = diagnose_facts(&[fact], OperationPhase::Launching);
+    let diagnoses = diagnose(&[fact], OperationPhase::Launching);
 
     assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id.as_str(), "unknown_failure_launching");
-    assert_eq!(diagnoses[0].domain, GuardianDomain::Unknown);
-    assert_eq!(diagnoses[0].confidence, GuardianConfidence::Low);
+    assert_eq!(diagnoses[0].id().as_str(), "unknown_failure_launching");
+    assert_eq!(diagnoses[0].domain(), GuardianDomain::Unknown);
+    assert_eq!(diagnoses[0].confidence(), GuardianConfidence::Low);
     assert!(
         diagnoses[0]
-            .candidate_actions
+            .candidate_actions()
             .contains(&GuardianActionKind::RecordOnly)
     );
-}
-
-#[test]
-fn action_prerequisite_requires_target_and_candidate_action() {
-    let mut diagnosis = Diagnosis {
-        id: super::DiagnosisId::InstallIncomplete,
-        domain: GuardianDomain::Unknown,
-        severity: GuardianSeverity::Warning,
-        confidence: GuardianConfidence::Low,
-        ownership: OwnershipClass::Unknown,
-        phase: OperationPhase::Launching,
-        fact_ids: vec![GuardianFactId::NoStructuredFact(OperationPhase::Launching)],
-        affected_targets: Vec::new(),
-        impact: Default::default(),
-        candidate_actions: vec![GuardianActionKind::RecordOnly],
-        public_reason_template: "unknown".to_string(),
-    };
-    assert!(diagnosis.action_prerequisite().is_err());
-
-    diagnosis.affected_targets.push(target(
-        "target",
-        TargetKind::Session,
-        OwnershipClass::LauncherManaged,
-    ));
-    diagnosis.candidate_actions.clear();
-    assert!(diagnosis.action_prerequisite().is_err());
-
-    diagnosis
-        .candidate_actions
-        .push(GuardianActionKind::RecordOnly);
-    let prerequisite: ActionPlanPrerequisite = diagnosis
-        .action_prerequisite()
-        .expect("complete prerequisite");
-    assert_eq!(prerequisite.confidence, GuardianConfidence::Low);
-    assert_eq!(prerequisite.ownership, OwnershipClass::Unknown);
 }
 
 #[test]
@@ -1118,29 +1414,30 @@ fn action_plan_representation_carries_prerequisite_metadata() {
         TargetKind::Runtime,
         OwnershipClass::LauncherManaged,
     );
-    let diagnosis = Diagnosis {
-        id: super::DiagnosisId::ManagedRuntimeCorrupt,
+    let fact = GuardianFact {
+        operation_id: None,
+        id: GuardianFactId::ManagedRuntimeCorrupt,
         domain: GuardianDomain::Runtime,
-        severity: GuardianSeverity::Repairable,
-        confidence: GuardianConfidence::Confirmed,
-        ownership: OwnershipClass::LauncherManaged,
         phase: OperationPhase::Preparing,
-        fact_ids: vec![GuardianFactId::ManagedRuntimeCorrupt],
-        affected_targets: vec![target.clone()],
-        impact: Default::default(),
-        candidate_actions: vec![GuardianActionKind::Repair],
-        public_reason_template: "managed_runtime_needs_repair".to_string(),
+        reliability: FactReliability::DirectStructured,
+        severity: None,
+        confidence: None,
+        ownership: OwnershipClass::LauncherManaged,
+        target: Some(target.clone()),
+        fields: Vec::new(),
     };
-    let prerequisite = diagnosis
-        .action_prerequisite()
-        .expect("complete prerequisite");
+    let diagnosis = diagnose(&[fact], OperationPhase::Preparing)
+        .into_iter()
+        .next()
+        .expect("managed runtime diagnosis");
+    let prerequisite = diagnosis.action_prerequisite();
     let plan = GuardianActionPlan::new(
         StabilizationSystem::Guardian,
         prerequisite,
         vec![GuardianAction {
             kind: GuardianActionKind::Repair,
             target: Some(target),
-            reason: diagnosis.id,
+            reason: diagnosis.id(),
         }],
     );
 
@@ -1164,12 +1461,12 @@ fn targetless_fact_receives_guardian_fallback_target() {
         OperationPhase::Preparing,
     );
 
-    let diagnoses = diagnose_facts(&[fact], OperationPhase::Preparing);
+    let diagnoses = diagnose(&[fact], OperationPhase::Preparing);
 
     assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id.as_str(), "java_probe_failed");
+    assert_eq!(diagnoses[0].id().as_str(), "java_probe_failed");
     assert_eq!(
-        diagnoses[0].affected_targets[0],
+        diagnoses[0].affected_targets()[0],
         TargetDescriptor::new(
             StabilizationSystem::Guardian,
             TargetKind::Runtime,
@@ -1177,23 +1474,21 @@ fn targetless_fact_receives_guardian_fallback_target() {
             OwnershipClass::Unknown,
         )
     );
-    diagnoses[0]
-        .action_prerequisite()
-        .expect("fallback target makes prerequisite representable");
+    diagnoses[0].action_prerequisite();
 }
 
 #[test]
 fn empty_fact_set_unknown_diagnosis_has_fallback_target() {
-    let diagnoses = diagnose_facts(&[], OperationPhase::Launching);
+    let diagnoses = diagnose(&[], OperationPhase::Launching);
 
     assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id.as_str(), "unknown_failure_launching");
+    assert_eq!(diagnoses[0].id().as_str(), "unknown_failure_launching");
     assert_eq!(
-        diagnoses[0].fact_ids,
+        diagnoses[0].fact_ids(),
         vec![GuardianFactId::NoStructuredFact(OperationPhase::Launching)]
     );
     assert_eq!(
-        diagnoses[0].affected_targets[0],
+        diagnoses[0].affected_targets()[0],
         TargetDescriptor::new(
             StabilizationSystem::Guardian,
             TargetKind::Config,
@@ -1262,24 +1557,9 @@ fn safety_case_carries_diagnosis() {
 
     assert_eq!(safety_case.diagnoses.len(), 1);
     assert_eq!(
-        safety_case.diagnoses[0].id.as_str(),
+        safety_case.diagnoses[0].id().as_str(),
         "java_runtime_major_mismatch"
     );
-}
-
-#[test]
-fn impact_vector_uses_priority_weighting() {
-    let vector = super::GuardianImpactVector {
-        privacy_risk: 0.0,
-        data_loss_risk: 0.0,
-        launchability_impact: 0.8,
-        state_corruption_impact: 0.4,
-        user_intent_impact: 0.2,
-        performance_impact: 1.0,
-        host_stability_impact: 0.3,
-    };
-
-    assert!((vector.scalar_severity() - 0.72).abs() < f32::EPSILON);
 }
 
 fn guardian_test_fact(

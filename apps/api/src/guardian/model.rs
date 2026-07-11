@@ -1,3 +1,4 @@
+use super::diagnosis::Diagnosis;
 use crate::observability::EvidenceField;
 use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor,
@@ -69,12 +70,16 @@ pub enum GuardianFactId {
     JvmPresetCompatibilityAdjusted,
     LaunchCommandInvalid,
     LaunchCommandPrepared,
+    LaunchFailureClassified,
+    LaunchJvmPresetDowngradeAvailable,
+    LaunchJvmStripAvailable,
     LaunchMemoryAllocationLow,
     LaunchMemoryMinClamped,
     LaunchResourceCpuPressure,
     LaunchResourceDiskPressure,
     LaunchResourceInstallPressure,
     LaunchResourceMemoryPressure,
+    LaunchRuntimeFallbackAvailable,
     LauncherManagedArtifactSignatureCorruption,
     LauncherStopRequested,
     LibrariesMissing,
@@ -120,7 +125,7 @@ pub enum GuardianFactId {
 }
 
 impl GuardianFactId {
-    pub const ALL: [Self; 115] = [
+    pub const ALL: [Self; 119] = [
         Self::AgentHookFailed,
         Self::AgentUnavailable,
         Self::ArtifactChecksumMismatch,
@@ -177,12 +182,16 @@ impl GuardianFactId {
         Self::JvmPresetCompatibilityAdjusted,
         Self::LaunchCommandInvalid,
         Self::LaunchCommandPrepared,
+        Self::LaunchFailureClassified,
+        Self::LaunchJvmPresetDowngradeAvailable,
+        Self::LaunchJvmStripAvailable,
         Self::LaunchMemoryAllocationLow,
         Self::LaunchMemoryMinClamped,
         Self::LaunchResourceCpuPressure,
         Self::LaunchResourceDiskPressure,
         Self::LaunchResourceInstallPressure,
         Self::LaunchResourceMemoryPressure,
+        Self::LaunchRuntimeFallbackAvailable,
         Self::LauncherManagedArtifactSignatureCorruption,
         Self::LauncherStopRequested,
         Self::LibrariesMissing,
@@ -296,12 +305,16 @@ impl GuardianFactId {
             Self::JvmPresetCompatibilityAdjusted => "jvm_preset_compatibility_adjusted",
             Self::LaunchCommandInvalid => "launch_command_invalid",
             Self::LaunchCommandPrepared => "launch_command_prepared",
+            Self::LaunchFailureClassified => "launch_failure_classified",
+            Self::LaunchJvmPresetDowngradeAvailable => "launch_jvm_preset_downgrade_available",
+            Self::LaunchJvmStripAvailable => "launch_jvm_strip_available",
             Self::LaunchMemoryAllocationLow => "launch_memory_allocation_low",
             Self::LaunchMemoryMinClamped => "launch_memory_min_clamped",
             Self::LaunchResourceCpuPressure => "launch_resource_cpu_pressure",
             Self::LaunchResourceDiskPressure => "launch_resource_disk_pressure",
             Self::LaunchResourceInstallPressure => "launch_resource_install_pressure",
             Self::LaunchResourceMemoryPressure => "launch_resource_memory_pressure",
+            Self::LaunchRuntimeFallbackAvailable => "launch_runtime_fallback_available",
             Self::LauncherManagedArtifactSignatureCorruption => {
                 "launcher_managed_artifact_signature_corruption"
             }
@@ -689,39 +702,6 @@ impl std::fmt::Display for DiagnosisId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Diagnosis {
-    pub id: DiagnosisId,
-    pub domain: GuardianDomain,
-    pub severity: GuardianSeverity,
-    pub confidence: GuardianConfidence,
-    pub ownership: OwnershipClass,
-    pub phase: OperationPhase,
-    pub fact_ids: Vec<GuardianFactId>,
-    pub affected_targets: Vec<TargetDescriptor>,
-    pub impact: GuardianImpactVector,
-    pub candidate_actions: Vec<GuardianActionKind>,
-    pub public_reason_template: String,
-}
-
-impl Diagnosis {
-    pub fn action_prerequisite(&self) -> Result<ActionPlanPrerequisite, GuardianCoreError> {
-        if self.affected_targets.is_empty() {
-            return Err(GuardianCoreError::MissingAffectedTarget);
-        }
-        if self.candidate_actions.is_empty() {
-            return Err(GuardianCoreError::MissingCandidateAction);
-        }
-        Ok(ActionPlanPrerequisite {
-            diagnosis_id: self.id,
-            ownership: self.ownership,
-            confidence: self.confidence,
-            affected_targets: self.affected_targets.clone(),
-            candidate_actions: self.candidate_actions.clone(),
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum GuardianDomain {
     Config,
@@ -761,52 +741,7 @@ pub enum GuardianConfidence {
     Certain,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct GuardianImpactVector {
-    pub privacy_risk: f32,
-    pub data_loss_risk: f32,
-    pub launchability_impact: f32,
-    pub state_corruption_impact: f32,
-    pub user_intent_impact: f32,
-    pub performance_impact: f32,
-    pub host_stability_impact: f32,
-}
-
-impl GuardianImpactVector {
-    pub fn scalar_severity(self) -> f32 {
-        self.privacy_risk
-            .max(self.data_loss_risk)
-            .max(self.launchability_impact * 0.90)
-            .max(self.state_corruption_impact * 0.85)
-            .max(self.user_intent_impact * 0.70)
-            .max(self.host_stability_impact * 0.65)
-            .max(self.performance_impact * 0.45)
-    }
-
-    pub(crate) fn launch_blocking() -> Self {
-        Self {
-            launchability_impact: 0.95,
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn repairable_corruption() -> Self {
-        Self {
-            launchability_impact: 0.80,
-            state_corruption_impact: 0.85,
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn record_only() -> Self {
-        Self {
-            launchability_impact: 0.15,
-            ..Self::default()
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SafetyCase {
     pub operation_id: Option<OperationId>,
     pub mode: GuardianMode,
@@ -881,10 +816,4 @@ pub struct SafetyOutcome {
     pub summary: String,
     pub detail: Option<String>,
     pub diagnoses: Vec<DiagnosisId>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GuardianCoreError {
-    MissingAffectedTarget,
-    MissingCandidateAction,
 }

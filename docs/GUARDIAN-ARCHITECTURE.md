@@ -104,11 +104,11 @@ Guardian decisions follow the same shape even when a domain has only partial wor
 2. Diagnosis
    Guardian evaluates an ordered declarative rule table once per rule. Each matching rule emits at most one diagnosis with domain, diagnosis id, confidence, severity, ownership, and a public reason template. Facts in the same rule family fuse into distinct source fact ids and deterministically deduplicated real targets; ownership resolves conservatively to the least-trusted supporting owner. Diagnosis order follows the earliest matching input fact, with rule order as the tie-breaker.
 
-3. Risk and action pressure
-   Guardian combines severity, confidence, blast radius, reversibility, ownership, user intent, operation phase, mode, and failure memory into an action decision.
+3. Rule priority and eligibility
+   Each resolved rule carries a closed typed priority band and total action-eligibility metadata. Priority bands preserve the declared cross-family ordering for records, degraded state, repairable corruption, launch blockers, ownership boundaries, and critical failures; stable rule order breaks equal-band ties. Phase-matched condition facts may select a rule clause, but they do not become diagnosis evidence, targets, or ownership inputs.
 
 4. Action selection
-   Guardian chooses allow, warn, intervene, repair, retry, degrade, rollback, suppress, ask, or block. Unsupported or unsafe actions become bounded warnings/blocks instead of improvised mutation.
+   Guardian evaluates the strongest diagnosis's declared candidate actions against mode, ownership, redaction, journaling, user-intent, and failure-memory constraints. Unsupported or unsafe actions become bounded warnings, questions, records, or blocks instead of improvised mutation.
 
 5. Plan and ownership gates
    Any mutating plan must have launcher-managed or composition-managed ownership, an operation journal, a rollback/quarantine/postcondition story where applicable, redaction-ready public output, and loop-control checks.

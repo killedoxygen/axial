@@ -1,8 +1,8 @@
 use super::{
-    Diagnosis, DiagnosisId, GuardianActionKind, GuardianConfidence, GuardianDecision,
-    GuardianDomain, GuardianFactId, GuardianImpactVector, GuardianLaunchRecoveryDirective,
-    GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind, GuardianMode, GuardianPolicyContext,
-    GuardianSeverity, GuardianUserOutcome, SafetyCase, decide_guardian_policy,
+    FactReliability, GuardianActionKind, GuardianDecision, GuardianDomain, GuardianFact,
+    GuardianFactId, GuardianLaunchRecoveryDirective, GuardianLaunchRecoveryEffect,
+    GuardianLaunchRecoveryKind, GuardianMode, GuardianPolicyContext, GuardianUserOutcome,
+    SafetyCase, build_safety_case, decide_guardian_policy,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_text};
 use crate::state::contracts::{
@@ -27,7 +27,7 @@ pub struct GuardianPrepareFailureRequest<'a> {
     pub raw_jvm_args_intervention_applied: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct GuardianLaunchFailureOutcome {
     pub failure_class: LaunchFailureClass,
     pub safety_case: SafetyCase,
@@ -69,8 +69,8 @@ pub struct GuardianStartupFailureRequest<'a> {
 pub fn guardian_prepare_failure_outcome(
     request: GuardianPrepareFailureRequest<'_>,
 ) -> GuardianLaunchFailureOutcome {
-    let diagnosis = prepare_failure_diagnosis(&request);
-    let safety_case = safety_case(request.mode, OperationPhase::Preparing, diagnosis);
+    let facts = prepare_failure_facts(&request);
+    let safety_case = build_safety_case(None, request.mode, OperationPhase::Preparing, &facts);
     let guardian_decision = decide_guardian_policy(
         &safety_case,
         policy_context(request_has_explicit_prepare_intent(&request)),
@@ -109,28 +109,14 @@ fn evaluate_preset_adjustment(
     } else {
         OwnershipClass::LauncherManaged
     };
-    let diagnosis = Diagnosis {
-        id: DiagnosisId::JvmPresetAdjusted,
-        domain: GuardianDomain::Jvm,
-        severity: GuardianSeverity::Recoverable,
-        confidence: GuardianConfidence::Confirmed,
+    let facts = [launch_fact(
+        GuardianFactId::JvmPresetCompatibilityAdjusted,
+        GuardianDomain::Jvm,
+        OperationPhase::Preparing,
         ownership,
-        phase: OperationPhase::Preparing,
-        fact_ids: vec![GuardianFactId::JvmPresetCompatibilityAdjusted],
-        affected_targets: vec![target(GuardianDomain::Jvm, "jvm_preset", ownership)],
-        impact: GuardianImpactVector {
-            launchability_impact: 0.65,
-            user_intent_impact: 0.45,
-            ..GuardianImpactVector::default()
-        },
-        candidate_actions: vec![
-            GuardianActionKind::Downgrade,
-            GuardianActionKind::AskUser,
-            GuardianActionKind::Block,
-        ],
-        public_reason_template: "jvm_preset_adjusted".to_string(),
-    };
-    let safety_case = safety_case(request.mode, OperationPhase::Preparing, diagnosis);
+        "jvm_preset",
+    )];
+    let safety_case = build_safety_case(None, request.mode, OperationPhase::Preparing, &facts);
     let decision = decide_guardian_policy(
         &safety_case,
         policy_context(request.explicit_jvm_preset_present),
@@ -176,14 +162,14 @@ pub fn guardian_startup_failure_outcome(
     request: GuardianStartupFailureRequest<'_>,
 ) -> GuardianLaunchFailureOutcome {
     let failure_class = startup_failure_class(request.observation);
-    let recovery_template = startup_recovery_template(&request, failure_class);
-    let diagnosis = startup_failure_diagnosis(&request, failure_class, recovery_template.as_ref());
-    let safety_case = safety_case(request.mode, OperationPhase::Launching, diagnosis);
+    let recovery_options = startup_recovery_options(&request, failure_class);
+    let facts = startup_failure_facts(&request, failure_class, &recovery_options);
+    let safety_case = build_safety_case(None, request.mode, OperationPhase::Launching, &facts);
     let guardian_decision = decide_guardian_policy(
         &safety_case,
         policy_context(request_has_explicit_startup_intent(&request)),
     );
-    let directive = startup_failure_directive(recovery_template, &guardian_decision);
+    let directive = startup_failure_directive(recovery_options, &guardian_decision);
     let user_outcome = startup_failure_user_outcome(
         &request,
         failure_class,
@@ -340,193 +326,187 @@ pub fn conservative_launch_recovery_preset(version_id: &str, runtime_major: u32)
     }
 }
 
-fn prepare_failure_diagnosis(request: &GuardianPrepareFailureRequest<'_>) -> Diagnosis {
-    match request.failure_class {
-        LaunchFailureClass::JavaRuntimeMismatch => Diagnosis {
-            id: DiagnosisId::JavaRuntimeMajorMismatch,
-            domain: GuardianDomain::Runtime,
-            severity: GuardianSeverity::Blocking,
-            confidence: GuardianConfidence::Confirmed,
-            ownership: java_override_ownership(request.explicit_java_override_present),
-            phase: OperationPhase::Preparing,
-            fact_ids: vec![GuardianFactId::JavaMajorMismatch],
-            affected_targets: vec![target(
-                GuardianDomain::Runtime,
-                "explicit_java_override",
-                java_override_ownership(request.explicit_java_override_present),
-            )],
-            impact: GuardianImpactVector::launch_blocking(),
-            candidate_actions: prepare_java_candidate_actions(request),
-            public_reason_template: "java_runtime_major_mismatch".to_string(),
-        },
+fn prepare_failure_facts(request: &GuardianPrepareFailureRequest<'_>) -> Vec<GuardianFact> {
+    let (domain, ownership, target_id) = match request.failure_class {
+        LaunchFailureClass::JavaRuntimeMismatch => (
+            GuardianDomain::Runtime,
+            java_override_ownership(request.explicit_java_override_present),
+            "explicit_java_override",
+        ),
         LaunchFailureClass::JvmUnsupportedOption
         | LaunchFailureClass::JvmExperimentalUnlock
-        | LaunchFailureClass::JvmOptionOrdering => Diagnosis {
-            id: DiagnosisId::JvmArgUnsupported,
-            domain: GuardianDomain::Jvm,
-            severity: GuardianSeverity::Blocking,
-            confidence: GuardianConfidence::Confirmed,
-            ownership: jvm_override_ownership(request.explicit_jvm_args_present),
-            phase: OperationPhase::Preparing,
-            fact_ids: vec![failure_class_fact_id(request.failure_class)],
-            affected_targets: vec![target(
-                GuardianDomain::Jvm,
-                "explicit_jvm_args",
-                jvm_override_ownership(request.explicit_jvm_args_present),
-            )],
-            impact: GuardianImpactVector::launch_blocking(),
-            candidate_actions: prepare_jvm_candidate_actions(request),
-            public_reason_template: "jvm_arg_unsupported".to_string(),
-        },
-        failure_class => blocking_launch_diagnosis(
-            DiagnosisId::LaunchPrepareFailed,
-            OperationPhase::Preparing,
-            failure_class,
+        | LaunchFailureClass::JvmOptionOrdering => (
+            GuardianDomain::Jvm,
+            jvm_override_ownership(request.explicit_jvm_args_present),
+            "explicit_jvm_args",
+        ),
+        _ => (
+            GuardianDomain::Launch,
+            OwnershipClass::LauncherManaged,
             "launch_prepare_failed",
         ),
+    };
+    let mut facts = vec![
+        launch_fact(
+            failure_class_fact_id(request.failure_class),
+            domain,
+            OperationPhase::Preparing,
+            ownership,
+            target_id,
+        ),
+        condition_fact(
+            GuardianFactId::LaunchFailureClassified,
+            OperationPhase::Preparing,
+        ),
+    ];
+    if request.failure_class == LaunchFailureClass::JavaRuntimeMismatch
+        && request.requested_java_present
+        && request.explicit_java_override_present
+        && !request.runtime_intervention_applied
+    {
+        facts.push(condition_fact(
+            GuardianFactId::LaunchRuntimeFallbackAvailable,
+            OperationPhase::Preparing,
+        ));
+    }
+    if matches!(
+        request.failure_class,
+        LaunchFailureClass::JvmUnsupportedOption
+            | LaunchFailureClass::JvmExperimentalUnlock
+            | LaunchFailureClass::JvmOptionOrdering
+    ) && request.explicit_jvm_args_present
+        && !request.raw_jvm_args_intervention_applied
+    {
+        facts.push(condition_fact(
+            GuardianFactId::LaunchJvmStripAvailable,
+            OperationPhase::Preparing,
+        ));
+    }
+    facts
+}
+
+fn startup_failure_facts(
+    request: &GuardianStartupFailureRequest<'_>,
+    failure_class: LaunchFailureClass,
+    recovery_options: &StartupRecoveryOptions,
+) -> Vec<GuardianFact> {
+    let (domain, ownership, target_id) = match failure_class {
+        LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering => (
+            GuardianDomain::Jvm,
+            jvm_startup_ownership(request),
+            "startup_jvm_settings",
+        ),
+        LaunchFailureClass::JavaRuntimeMismatch => (
+            GuardianDomain::Runtime,
+            java_override_ownership(request.explicit_java_override_present),
+            "startup_java_runtime",
+        ),
+        LaunchFailureClass::OutOfMemory
+        | LaunchFailureClass::GraphicsDriverCrash
+        | LaunchFailureClass::MissingDependency
+        | LaunchFailureClass::ModTransformationFailure
+        | LaunchFailureClass::ModAttributedCrash => (
+            GuardianDomain::Startup,
+            OwnershipClass::UserOwned,
+            "instance_crash",
+        ),
+        LaunchFailureClass::LauncherManagedArtifactSignature => (
+            GuardianDomain::Download,
+            OwnershipClass::LauncherManaged,
+            "launcher_managed_jars",
+        ),
+        _ => (
+            GuardianDomain::Startup,
+            OwnershipClass::LauncherManaged,
+            "startup_monitoring",
+        ),
+    };
+
+    let mut facts = Vec::new();
+    if matches!(
+        request.observation,
+        GuardianStartupFailureObservation::Exited { .. }
+    ) {
+        facts.push(GuardianFact {
+            operation_id: None,
+            id: GuardianFactId::ProcessExitedBeforeBoot,
+            domain: GuardianDomain::Session,
+            phase: OperationPhase::Launching,
+            reliability: FactReliability::ProcessLifecycle,
+            severity: None,
+            confidence: None,
+            ownership: OwnershipClass::LauncherManaged,
+            target: None,
+            fields: Vec::new(),
+        });
+    }
+    facts.push(launch_fact(
+        failure_class_fact_id(failure_class),
+        domain,
+        OperationPhase::Launching,
+        ownership,
+        target_id,
+    ));
+    facts.push(condition_fact(
+        GuardianFactId::LaunchFailureClassified,
+        OperationPhase::Launching,
+    ));
+    if recovery_options.runtime_fallback.is_some() {
+        facts.push(condition_fact(
+            GuardianFactId::LaunchRuntimeFallbackAvailable,
+            OperationPhase::Launching,
+        ));
+    }
+    if recovery_options.jvm_preset_downgrade.is_some() {
+        facts.push(condition_fact(
+            GuardianFactId::LaunchJvmPresetDowngradeAvailable,
+            OperationPhase::Launching,
+        ));
+    }
+    if recovery_options.jvm_strip.is_some() {
+        facts.push(condition_fact(
+            GuardianFactId::LaunchJvmStripAvailable,
+            OperationPhase::Launching,
+        ));
+    }
+    facts
+}
+
+fn launch_fact(
+    id: GuardianFactId,
+    domain: GuardianDomain,
+    phase: OperationPhase,
+    ownership: OwnershipClass,
+    target_id: &str,
+) -> GuardianFact {
+    GuardianFact {
+        operation_id: None,
+        id,
+        domain,
+        phase,
+        reliability: FactReliability::ExactClassifier,
+        severity: None,
+        confidence: None,
+        ownership,
+        target: Some(target(domain, target_id, ownership)),
+        fields: Vec::new(),
     }
 }
 
-fn startup_failure_diagnosis(
-    request: &GuardianStartupFailureRequest<'_>,
-    failure_class: LaunchFailureClass,
-    recovery_template: Option<&StartupRecoveryTemplate>,
-) -> Diagnosis {
-    match request.observation {
-        GuardianStartupFailureObservation::Stalled => Diagnosis {
-            id: DiagnosisId::StartupStalled,
-            domain: GuardianDomain::Startup,
-            severity: GuardianSeverity::Blocking,
-            confidence: GuardianConfidence::High,
-            ownership: OwnershipClass::LauncherManaged,
-            phase: OperationPhase::Launching,
-            fact_ids: vec![GuardianFactId::StartupWindowExpired],
-            affected_targets: vec![target(
-                GuardianDomain::Startup,
-                "startup_monitoring",
-                OwnershipClass::LauncherManaged,
-            )],
-            impact: GuardianImpactVector {
-                launchability_impact: 0.85,
-                ..GuardianImpactVector::default()
-            },
-            candidate_actions: vec![GuardianActionKind::Block],
-            public_reason_template: "startup_stalled".to_string(),
-        },
-        GuardianStartupFailureObservation::Exited { .. } => match failure_class {
-            LaunchFailureClass::JvmUnsupportedOption
-            | LaunchFailureClass::JvmExperimentalUnlock
-            | LaunchFailureClass::JvmOptionOrdering => Diagnosis {
-                id: DiagnosisId::JvmArgUnsupported,
-                domain: GuardianDomain::Jvm,
-                severity: GuardianSeverity::Blocking,
-                confidence: GuardianConfidence::High,
-                ownership: jvm_startup_ownership(request),
-                phase: OperationPhase::Launching,
-                fact_ids: vec![
-                    GuardianFactId::ProcessExitedBeforeBoot,
-                    failure_class_fact_id(failure_class),
-                ],
-                affected_targets: vec![target(
-                    GuardianDomain::Jvm,
-                    "startup_jvm_settings",
-                    jvm_startup_ownership(request),
-                )],
-                impact: GuardianImpactVector::launch_blocking(),
-                candidate_actions: startup_jvm_candidate_actions(recovery_template),
-                public_reason_template: "jvm_arg_unsupported".to_string(),
-            },
-            LaunchFailureClass::JavaRuntimeMismatch => Diagnosis {
-                id: DiagnosisId::JavaRuntimeMajorMismatch,
-                domain: GuardianDomain::Runtime,
-                severity: GuardianSeverity::Blocking,
-                confidence: GuardianConfidence::High,
-                ownership: java_override_ownership(request.explicit_java_override_present),
-                phase: OperationPhase::Launching,
-                fact_ids: vec![
-                    GuardianFactId::ProcessExitedBeforeBoot,
-                    GuardianFactId::JavaMajorMismatch,
-                ],
-                affected_targets: vec![target(
-                    GuardianDomain::Runtime,
-                    "startup_java_runtime",
-                    java_override_ownership(request.explicit_java_override_present),
-                )],
-                impact: GuardianImpactVector::launch_blocking(),
-                candidate_actions: startup_java_candidate_actions(recovery_template),
-                public_reason_template: "java_runtime_major_mismatch".to_string(),
-            },
-            LaunchFailureClass::OutOfMemory => blocking_user_owned_startup_diagnosis(
-                DiagnosisId::OutOfMemory,
-                failure_class,
-                GuardianConfidence::High,
-            ),
-            LaunchFailureClass::GraphicsDriverCrash => blocking_user_owned_startup_diagnosis(
-                DiagnosisId::GraphicsDriverCrash,
-                failure_class,
-                GuardianConfidence::High,
-            ),
-            LaunchFailureClass::MissingDependency => blocking_user_owned_startup_diagnosis(
-                DiagnosisId::MissingDependency,
-                failure_class,
-                GuardianConfidence::High,
-            ),
-            LaunchFailureClass::ModTransformationFailure => blocking_user_owned_startup_diagnosis(
-                DiagnosisId::ModTransformationFailure,
-                failure_class,
-                GuardianConfidence::High,
-            ),
-            LaunchFailureClass::ModAttributedCrash => blocking_user_owned_startup_diagnosis(
-                DiagnosisId::ModAttributedCrash,
-                failure_class,
-                GuardianConfidence::High,
-            ),
-            LaunchFailureClass::ClasspathModuleConflict => blocking_startup_diagnosis(
-                DiagnosisId::ClasspathModuleConflict,
-                failure_class,
-                GuardianConfidence::High,
-            ),
-            LaunchFailureClass::LauncherManagedArtifactSignature => Diagnosis {
-                id: DiagnosisId::LauncherManagedArtifactSignatureCorrupt,
-                domain: GuardianDomain::Download,
-                severity: GuardianSeverity::Blocking,
-                confidence: GuardianConfidence::High,
-                ownership: OwnershipClass::LauncherManaged,
-                phase: OperationPhase::Launching,
-                fact_ids: vec![
-                    GuardianFactId::ProcessExitedBeforeBoot,
-                    failure_class_fact_id(failure_class),
-                ],
-                affected_targets: vec![target(
-                    GuardianDomain::Download,
-                    "launcher_managed_jars",
-                    OwnershipClass::LauncherManaged,
-                )],
-                impact: GuardianImpactVector::launch_blocking(),
-                candidate_actions: vec![GuardianActionKind::Block],
-                public_reason_template: "launcher_managed_artifact_signature_corrupt".to_string(),
-            },
-            LaunchFailureClass::AuthModeIncompatible => blocking_startup_diagnosis(
-                DiagnosisId::AuthModeIncompatible,
-                failure_class,
-                GuardianConfidence::High,
-            ),
-            LaunchFailureClass::LoaderBootstrapFailure => blocking_startup_diagnosis(
-                DiagnosisId::LoaderBootstrapFailure,
-                failure_class,
-                GuardianConfidence::High,
-            ),
-            LaunchFailureClass::StartupStalled => blocking_startup_diagnosis(
-                DiagnosisId::StartupStalled,
-                failure_class,
-                GuardianConfidence::High,
-            ),
-            LaunchFailureClass::Unknown => blocking_startup_diagnosis(
-                DiagnosisId::StartupFailedUnknown,
-                failure_class,
-                GuardianConfidence::Low,
-            ),
-        },
+fn condition_fact(id: GuardianFactId, phase: OperationPhase) -> GuardianFact {
+    GuardianFact {
+        operation_id: None,
+        id,
+        domain: GuardianDomain::Launch,
+        phase,
+        reliability: FactReliability::DirectStructured,
+        severity: None,
+        confidence: None,
+        ownership: OwnershipClass::Unknown,
+        target: None,
+        fields: Vec::new(),
     }
 }
 
@@ -564,38 +544,31 @@ fn prepare_failure_directive(
 }
 
 fn startup_failure_directive(
-    recovery_template: Option<StartupRecoveryTemplate>,
+    recovery_options: StartupRecoveryOptions,
     decision: &GuardianDecision,
 ) -> Option<GuardianLaunchRecoveryDirective> {
-    let template = recovery_template?;
-    let decision_matches = matches!(
-        (&template.effect, decision.kind),
-        (
-            GuardianLaunchRecoveryEffect::DowngradePreset { .. },
-            GuardianActionKind::Downgrade
-        ) | (
-            GuardianLaunchRecoveryEffect::DisableCustomGc,
-            GuardianActionKind::Strip
-        ) | (
-            GuardianLaunchRecoveryEffect::ForceManagedRuntime,
-            GuardianActionKind::Fallback
-        )
-    );
-    decision_matches.then_some(GuardianLaunchRecoveryDirective {
+    let template = match decision.kind {
+        GuardianActionKind::Fallback => recovery_options.runtime_fallback,
+        GuardianActionKind::Downgrade => recovery_options.jvm_preset_downgrade,
+        GuardianActionKind::Strip => recovery_options.jvm_strip,
+        _ => None,
+    }?;
+    Some(GuardianLaunchRecoveryDirective {
         kind: template.kind,
         effect: template.effect,
         description: template.description,
     })
 }
 
-fn startup_recovery_template(
+fn startup_recovery_options(
     request: &GuardianStartupFailureRequest<'_>,
     failure_class: LaunchFailureClass,
-) -> Option<StartupRecoveryTemplate> {
+) -> StartupRecoveryOptions {
     if request.startup_recovery_applied {
-        return None;
+        return StartupRecoveryOptions::default();
     }
 
+    let mut options = StartupRecoveryOptions::default();
     match failure_class {
         LaunchFailureClass::JvmUnsupportedOption
         | LaunchFailureClass::JvmExperimentalUnlock
@@ -607,7 +580,7 @@ fn startup_recovery_template(
                     request.runtime_major,
                 );
                 if !preset.is_empty() && preset != effective_preset {
-                    return Some(StartupRecoveryTemplate {
+                    options.jvm_preset_downgrade = Some(StartupRecoveryTemplate {
                         kind: GuardianLaunchRecoveryKind::DowngradePreset,
                         effect: GuardianLaunchRecoveryEffect::DowngradePreset {
                             preset: preset.clone(),
@@ -618,26 +591,36 @@ fn startup_recovery_template(
                     });
                 }
             }
-            (!request.disable_custom_gc).then(|| StartupRecoveryTemplate {
-                kind: GuardianLaunchRecoveryKind::DisableCustomGc,
-                effect: GuardianLaunchRecoveryEffect::DisableCustomGc,
-                description: "Automatic retry: disabled custom GC flags after startup failure"
-                    .to_string(),
-            })
+            if !request.disable_custom_gc {
+                options.jvm_strip = Some(StartupRecoveryTemplate {
+                    kind: GuardianLaunchRecoveryKind::DisableCustomGc,
+                    effect: GuardianLaunchRecoveryEffect::DisableCustomGc,
+                    description: "Automatic retry: disabled custom GC flags after startup failure"
+                        .to_string(),
+                });
+            }
         }
         LaunchFailureClass::JavaRuntimeMismatch
             if request.requested_java_present && request.explicit_java_override_present =>
         {
-            Some(StartupRecoveryTemplate {
+            options.runtime_fallback = Some(StartupRecoveryTemplate {
                 kind: GuardianLaunchRecoveryKind::SwitchManagedRuntime,
                 effect: GuardianLaunchRecoveryEffect::ForceManagedRuntime,
                 description: "Automatic retry: switched to managed Java after runtime mismatch"
                     .to_string(),
-            })
+            });
         }
-        LaunchFailureClass::OutOfMemory => None,
-        _ => None,
+        LaunchFailureClass::OutOfMemory => {}
+        _ => {}
     }
+    options
+}
+
+#[derive(Clone, Debug, Default)]
+struct StartupRecoveryOptions {
+    runtime_fallback: Option<StartupRecoveryTemplate>,
+    jvm_preset_downgrade: Option<StartupRecoveryTemplate>,
+    jvm_strip: Option<StartupRecoveryTemplate>,
 }
 
 #[derive(Clone, Debug)]
@@ -741,64 +724,6 @@ fn public_user_decision(decision: GuardianActionKind) -> GuardianActionKind {
     }
 }
 
-fn prepare_java_candidate_actions(
-    request: &GuardianPrepareFailureRequest<'_>,
-) -> Vec<GuardianActionKind> {
-    if request.requested_java_present
-        && request.explicit_java_override_present
-        && !request.runtime_intervention_applied
-    {
-        vec![
-            GuardianActionKind::Fallback,
-            GuardianActionKind::AskUser,
-            GuardianActionKind::Block,
-        ]
-    } else {
-        vec![GuardianActionKind::Block]
-    }
-}
-
-fn prepare_jvm_candidate_actions(
-    request: &GuardianPrepareFailureRequest<'_>,
-) -> Vec<GuardianActionKind> {
-    if request.explicit_jvm_args_present && !request.raw_jvm_args_intervention_applied {
-        vec![
-            GuardianActionKind::Strip,
-            GuardianActionKind::AskUser,
-            GuardianActionKind::Block,
-        ]
-    } else {
-        vec![GuardianActionKind::Block]
-    }
-}
-
-fn startup_jvm_candidate_actions(
-    recovery_template: Option<&StartupRecoveryTemplate>,
-) -> Vec<GuardianActionKind> {
-    match recovery_template.map(|template| &template.effect) {
-        Some(GuardianLaunchRecoveryEffect::DowngradePreset { .. }) => {
-            vec![GuardianActionKind::Downgrade, GuardianActionKind::Block]
-        }
-        Some(GuardianLaunchRecoveryEffect::DisableCustomGc) => {
-            vec![GuardianActionKind::Strip, GuardianActionKind::Block]
-        }
-        _ => vec![GuardianActionKind::Block],
-    }
-}
-
-fn startup_java_candidate_actions(
-    recovery_template: Option<&StartupRecoveryTemplate>,
-) -> Vec<GuardianActionKind> {
-    if matches!(
-        recovery_template.map(|template| &template.effect),
-        Some(GuardianLaunchRecoveryEffect::ForceManagedRuntime)
-    ) {
-        vec![GuardianActionKind::Fallback, GuardianActionKind::Block]
-    } else {
-        vec![GuardianActionKind::Block]
-    }
-}
-
 fn request_has_explicit_prepare_intent(request: &GuardianPrepareFailureRequest<'_>) -> bool {
     request.explicit_java_override_present || request.explicit_jvm_args_present
 }
@@ -815,97 +740,6 @@ fn policy_context(explicit_user_intent: bool) -> GuardianPolicyContext {
         context.with_explicit_user_intent()
     } else {
         context
-    }
-}
-
-fn safety_case(mode: GuardianMode, phase: OperationPhase, diagnosis: Diagnosis) -> SafetyCase {
-    SafetyCase {
-        operation_id: None,
-        mode,
-        phase,
-        diagnoses: vec![diagnosis],
-    }
-}
-
-fn blocking_launch_diagnosis(
-    id: DiagnosisId,
-    phase: OperationPhase,
-    failure_class: LaunchFailureClass,
-    target_id: &str,
-) -> Diagnosis {
-    Diagnosis {
-        id,
-        domain: GuardianDomain::Launch,
-        severity: GuardianSeverity::Blocking,
-        confidence: if failure_class == LaunchFailureClass::Unknown {
-            GuardianConfidence::Low
-        } else {
-            GuardianConfidence::High
-        },
-        ownership: OwnershipClass::LauncherManaged,
-        phase,
-        fact_ids: vec![failure_class_fact_id(failure_class)],
-        affected_targets: vec![target(
-            GuardianDomain::Launch,
-            target_id,
-            OwnershipClass::LauncherManaged,
-        )],
-        impact: GuardianImpactVector::launch_blocking(),
-        candidate_actions: vec![GuardianActionKind::Block],
-        public_reason_template: id.as_str().to_string(),
-    }
-}
-
-fn blocking_startup_diagnosis(
-    id: DiagnosisId,
-    failure_class: LaunchFailureClass,
-    confidence: GuardianConfidence,
-) -> Diagnosis {
-    blocking_startup_diagnosis_with_ownership(
-        id,
-        failure_class,
-        confidence,
-        OwnershipClass::LauncherManaged,
-        "startup_monitoring",
-    )
-}
-
-fn blocking_user_owned_startup_diagnosis(
-    id: DiagnosisId,
-    failure_class: LaunchFailureClass,
-    confidence: GuardianConfidence,
-) -> Diagnosis {
-    blocking_startup_diagnosis_with_ownership(
-        id,
-        failure_class,
-        confidence,
-        OwnershipClass::UserOwned,
-        "instance_crash",
-    )
-}
-
-fn blocking_startup_diagnosis_with_ownership(
-    id: DiagnosisId,
-    failure_class: LaunchFailureClass,
-    confidence: GuardianConfidence,
-    ownership: OwnershipClass,
-    target_id: &str,
-) -> Diagnosis {
-    Diagnosis {
-        id,
-        domain: GuardianDomain::Startup,
-        severity: GuardianSeverity::Blocking,
-        confidence,
-        ownership,
-        phase: OperationPhase::Launching,
-        fact_ids: vec![
-            GuardianFactId::ProcessExitedBeforeBoot,
-            failure_class_fact_id(failure_class),
-        ],
-        affected_targets: vec![target(GuardianDomain::Startup, target_id, ownership)],
-        impact: GuardianImpactVector::launch_blocking(),
-        candidate_actions: vec![GuardianActionKind::Block],
-        public_reason_template: id.as_str().to_string(),
     }
 }
 
@@ -1271,7 +1105,7 @@ mod tests {
 
         assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Block);
         assert_eq!(
-            outcome.safety_case.diagnoses[0].id.as_str(),
+            outcome.safety_case.diagnoses[0].id().as_str(),
             "launcher_managed_artifact_signature_corrupt"
         );
         assert!(outcome.directive.is_none());
@@ -1306,12 +1140,12 @@ mod tests {
         assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Block);
         assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
         assert_eq!(
-            outcome.safety_case.diagnoses[0].id.as_str(),
+            outcome.safety_case.diagnoses[0].id().as_str(),
             "out_of_memory"
         );
         assert!(
             outcome.safety_case.diagnoses[0]
-                .fact_ids
+                .fact_ids()
                 .contains(&GuardianFactId::OutOfMemory)
         );
         assert!(outcome.directive.is_none());
@@ -1341,7 +1175,7 @@ mod tests {
         );
 
         assert_eq!(
-            outcome.safety_case.diagnoses[0].ownership,
+            outcome.safety_case.diagnoses[0].ownership(),
             OwnershipClass::UserOwned
         );
 
@@ -1391,11 +1225,11 @@ mod tests {
             });
 
             assert_eq!(
-                outcome.safety_case.diagnoses[0].id.as_str(),
+                outcome.safety_case.diagnoses[0].id().as_str(),
                 failure_class.as_str()
             );
             assert_eq!(
-                outcome.safety_case.diagnoses[0].ownership,
+                outcome.safety_case.diagnoses[0].ownership(),
                 OwnershipClass::UserOwned
             );
             assert!(outcome.directive.is_none());

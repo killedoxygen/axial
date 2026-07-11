@@ -479,7 +479,7 @@ fn boundary_case(id: impl Into<String>, family: BoundaryFamily, spec: CaseSpec) 
             .safety_case
             .diagnoses
             .iter()
-            .map(|diagnosis| diagnosis.id)
+            .map(|diagnosis| diagnosis.id())
             .collect(),
         kernel_decision: decision_projection(&outcome.guardian_decision, &outcome.safety_case),
         effective_decision: outcome.user_outcome.decision,

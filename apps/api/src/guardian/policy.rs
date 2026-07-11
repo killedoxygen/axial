@@ -1,11 +1,10 @@
 use super::rules::{
-    ActionEligibility, DestructiveMutationRisk, DiagnosisRule, JournalRequirement,
-    OwnershipRequirement, RedactionRequirement, RetryLoopSensitivity, UserIntentSensitivity,
-    rule_for_diagnosis,
+    ActionEligibility, DestructiveMutationRisk, JournalRequirement, OwnershipRequirement,
+    RedactionRequirement, RetryLoopSensitivity, UserIntentSensitivity, rule_order,
 };
 use super::{
     ActionPlanPrerequisite, Diagnosis, GuardianAction, GuardianActionKind, GuardianActionPlan,
-    GuardianConfidence, GuardianDecision, GuardianMode, GuardianSeverity, SafetyCase,
+    GuardianDecision, GuardianMode, GuardianSeverity, SafetyCase,
 };
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor};
 
@@ -72,9 +71,6 @@ struct PolicyReasoningInput {
     action: GuardianActionKind,
     ownership: OwnershipClass,
     ownership_requirement: OwnershipRequirement,
-    resolved_severity: GuardianSeverity,
-    resolved_confidence: GuardianConfidence,
-    impact_scalar: f32,
     public_redaction_required: bool,
     journal_required: bool,
     destructive_mutation: bool,
@@ -83,11 +79,6 @@ struct PolicyReasoningInput {
 }
 
 impl PolicyReasoningInput {
-    fn pressure_score(self) -> f32 {
-        severity_score(self.resolved_severity).max(self.impact_scalar)
-            * confidence_score(self.resolved_confidence)
-    }
-
     fn public_redaction_blocked(self, context: GuardianPolicyContext) -> bool {
         self.public_redaction_required && !context.public_redaction_ready
     }
@@ -118,14 +109,6 @@ impl PolicyReasoningInput {
             || self.journal_blocked(context)
             || self.ownership_blocks_mutation()
     }
-
-    fn memory_penalty(self, context: GuardianPolicyContext) -> f32 {
-        if self.suppression_blocks(context) {
-            1.00
-        } else {
-            0.0
-        }
-    }
 }
 
 pub fn decide_guardian_policy(
@@ -135,7 +118,7 @@ pub fn decide_guardian_policy(
     let diagnoses = safety_case
         .diagnoses
         .iter()
-        .map(|diagnosis| diagnosis.id)
+        .map(|diagnosis| diagnosis.id())
         .collect::<Vec<_>>();
 
     if !context.public_redaction_ready {
@@ -184,48 +167,25 @@ pub fn decide_guardian_policy(
     }
 }
 
-pub fn decision_pressure_score(diagnosis: &Diagnosis) -> f32 {
-    policy_pressure_input(diagnosis).pressure_score()
-}
-
-pub fn action_safety_score(
-    diagnosis: &Diagnosis,
-    action: GuardianActionKind,
-    mode: GuardianMode,
-    context: GuardianPolicyContext,
-) -> f32 {
-    let reasoning = policy_reasoning_input(diagnosis, action);
-    let permission = mode_permission(mode, diagnosis, action, context, reasoning);
-    let reversibility = reversibility_score(action);
-    let ownership = ownership_risk_for_action(diagnosis.ownership, action);
-    let memory = reasoning.memory_penalty(context);
-    permission * reversibility * (1.0 - ownership) * (1.0 - memory)
-}
-
 fn strongest_diagnosis(diagnoses: &[Diagnosis]) -> Option<&Diagnosis> {
     diagnoses.iter().max_by(|left, right| {
-        decision_pressure_score(left)
-            .partial_cmp(&decision_pressure_score(right))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        left.priority().cmp(&right.priority()).then_with(|| {
+            rule_order(right.id())
+                .unwrap_or(usize::MAX)
+                .cmp(&rule_order(left.id()).unwrap_or(usize::MAX))
+        })
     })
-}
-
-fn policy_pressure_input(diagnosis: &Diagnosis) -> PolicyReasoningInput {
-    policy_reasoning_input(diagnosis, GuardianActionKind::RecordOnly)
 }
 
 fn policy_reasoning_input(
     diagnosis: &Diagnosis,
     action: GuardianActionKind,
 ) -> PolicyReasoningInput {
-    let eligibility = applicable_rule(diagnosis).map(|rule| rule.eligibility);
+    let eligibility = diagnosis.eligibility();
     PolicyReasoningInput {
         action,
-        ownership: diagnosis.ownership,
-        ownership_requirement: ownership_requirement(eligibility),
-        resolved_severity: diagnosis.severity,
-        resolved_confidence: diagnosis.confidence,
-        impact_scalar: diagnosis.impact.scalar_severity(),
+        ownership: diagnosis.ownership(),
+        ownership_requirement: eligibility.ownership_requirement,
         public_redaction_required: action_requires_public_redaction(eligibility),
         journal_required: action_requires_journal(action, eligibility),
         destructive_mutation: action_is_destructive_mutation(action, eligibility),
@@ -234,21 +194,12 @@ fn policy_reasoning_input(
     }
 }
 
-fn applicable_rule(diagnosis: &Diagnosis) -> Option<&'static DiagnosisRule> {
-    rule_for_diagnosis(diagnosis.id).filter(|rule| {
-        diagnosis
-            .fact_ids
-            .iter()
-            .any(|fact_id| rule.source_fact_ids.contains(fact_id))
-    })
-}
-
 fn select_policy_action(
     mode: GuardianMode,
     diagnosis: &Diagnosis,
     context: GuardianPolicyContext,
 ) -> Option<SelectedPolicyAction> {
-    let prerequisite = public_safe_prerequisite(diagnosis.action_prerequisite().ok()?);
+    let prerequisite = public_safe_prerequisite(diagnosis.action_prerequisite());
 
     if mode == GuardianMode::Disabled {
         return Some(SelectedPolicyAction {
@@ -259,7 +210,7 @@ fn select_policy_action(
 
     if context.suppression_active
         && diagnosis
-            .candidate_actions
+            .candidate_actions()
             .iter()
             .any(|action| policy_reasoning_input(diagnosis, *action).retry_loop_sensitive)
     {
@@ -269,9 +220,10 @@ fn select_policy_action(
         });
     }
 
-    if decision_pressure_score(diagnosis) < 0.20
+    if (diagnosis.severity() == GuardianSeverity::Info
+        || matches!(diagnosis.id(), super::DiagnosisId::UnknownFailure(_)))
         && diagnosis
-            .candidate_actions
+            .candidate_actions()
             .contains(&GuardianActionKind::RecordOnly)
     {
         return Some(SelectedPolicyAction {
@@ -282,18 +234,21 @@ fn select_policy_action(
 
     let mut saw_hard_rejection = false;
     let mut saw_suppression = false;
-    let mut candidates = diagnosis.candidate_actions.clone();
+    let mut candidates = diagnosis.candidate_actions().to_vec();
     candidates.sort_by_key(|action| action_rank(mode, *action));
 
     for action in candidates {
         match reject_candidate(mode, diagnosis, action, context) {
             None => {
-                if action_safety_score(diagnosis, action, mode, context) > 0.0 {
-                    return Some(SelectedPolicyAction {
-                        kind: action,
-                        prerequisite,
-                    });
+                if diagnosis.ownership() == OwnershipClass::Unknown
+                    && action_changes_user_intent(action)
+                {
+                    continue;
                 }
+                return Some(SelectedPolicyAction {
+                    kind: action,
+                    prerequisite,
+                });
             }
             Some(CandidateRejection::HardInvariant) => saw_hard_rejection = true,
             Some(CandidateRejection::Suppression) => saw_suppression = true,
@@ -304,17 +259,17 @@ fn select_policy_action(
     let fallback = if saw_hard_rejection || saw_suppression {
         GuardianActionKind::Block
     } else if diagnosis
-        .candidate_actions
+        .candidate_actions()
         .contains(&GuardianActionKind::AskUser)
     {
         GuardianActionKind::AskUser
     } else if diagnosis
-        .candidate_actions
+        .candidate_actions()
         .contains(&GuardianActionKind::Warn)
     {
         GuardianActionKind::Warn
     } else if diagnosis
-        .candidate_actions
+        .candidate_actions()
         .contains(&GuardianActionKind::RecordOnly)
     {
         GuardianActionKind::RecordOnly
@@ -359,14 +314,12 @@ fn disabled_mode_action(
     context: GuardianPolicyContext,
 ) -> GuardianActionKind {
     if !context.public_redaction_ready
-        || diagnosis.impact.privacy_risk > 0.0
-        || diagnosis.impact.data_loss_risk > 0.0
         || matches!(
-            diagnosis.severity,
+            diagnosis.severity(),
             GuardianSeverity::Blocking | GuardianSeverity::Critical
         )
         || diagnosis
-            .candidate_actions
+            .candidate_actions()
             .iter()
             .any(|action| hard_invariant_rejects(diagnosis, *action, context))
     {
@@ -378,17 +331,17 @@ fn disabled_mode_action(
 
 fn suppression_fallback_action(diagnosis: &Diagnosis) -> GuardianActionKind {
     if diagnosis
-        .candidate_actions
+        .candidate_actions()
         .contains(&GuardianActionKind::Block)
     {
         GuardianActionKind::Block
     } else if diagnosis
-        .candidate_actions
+        .candidate_actions()
         .contains(&GuardianActionKind::AskUser)
     {
         GuardianActionKind::AskUser
     } else if diagnosis
-        .candidate_actions
+        .candidate_actions()
         .contains(&GuardianActionKind::Warn)
     {
         GuardianActionKind::Warn
@@ -470,7 +423,7 @@ fn custom_mode_permission(
         GuardianActionKind::Repair => {
             if !reasoning.explicit_intent_blocks_automatic_change(context)
                 && matches!(
-                    diagnosis.ownership,
+                    diagnosis.ownership(),
                     OwnershipClass::LauncherManaged | OwnershipClass::CompositionManaged
                 )
             {
@@ -524,63 +477,6 @@ fn action_rank(mode: GuardianMode, action: GuardianActionKind) -> u8 {
     }
 }
 
-fn severity_score(severity: GuardianSeverity) -> f32 {
-    match severity {
-        GuardianSeverity::Info => 0.10,
-        GuardianSeverity::Warning => 0.25,
-        GuardianSeverity::Degraded => 0.45,
-        GuardianSeverity::Repairable | GuardianSeverity::Recoverable => 0.60,
-        GuardianSeverity::Blocking => 0.85,
-        GuardianSeverity::Critical => 1.00,
-    }
-}
-
-fn confidence_score(confidence: GuardianConfidence) -> f32 {
-    match confidence {
-        GuardianConfidence::Low => 0.25,
-        GuardianConfidence::Medium => 0.55,
-        GuardianConfidence::High => 0.80,
-        GuardianConfidence::Confirmed | GuardianConfidence::Certain => 1.00,
-    }
-}
-
-fn reversibility_score(action: GuardianActionKind) -> f32 {
-    match action {
-        GuardianActionKind::RecordOnly => 1.00,
-        GuardianActionKind::Allow
-        | GuardianActionKind::Warn
-        | GuardianActionKind::AskUser
-        | GuardianActionKind::Block => 0.95,
-        GuardianActionKind::Strip
-        | GuardianActionKind::Downgrade
-        | GuardianActionKind::Fallback
-        | GuardianActionKind::Retry => 0.85,
-        GuardianActionKind::Repair => 0.65,
-        GuardianActionKind::Quarantine => 0.60,
-    }
-}
-
-fn ownership_risk_for_action(ownership: OwnershipClass, action: GuardianActionKind) -> f32 {
-    if matches!(
-        action,
-        GuardianActionKind::Allow
-            | GuardianActionKind::RecordOnly
-            | GuardianActionKind::Warn
-            | GuardianActionKind::AskUser
-            | GuardianActionKind::Block
-    ) {
-        return 0.0;
-    }
-
-    match ownership {
-        OwnershipClass::LauncherManaged => 0.10,
-        OwnershipClass::CompositionManaged => 0.25,
-        OwnershipClass::ExternalProviderDerived => 0.55,
-        OwnershipClass::UserOwned => 0.90,
-        OwnershipClass::Unknown => 1.00,
-    }
-}
-
 fn requires_journal(action: GuardianActionKind) -> bool {
     matches!(
         action,
@@ -593,34 +489,19 @@ fn requires_journal(action: GuardianActionKind) -> bool {
     )
 }
 
-fn ownership_requirement(eligibility: Option<ActionEligibility>) -> OwnershipRequirement {
-    eligibility
-        .map(|eligibility| eligibility.ownership_requirement)
-        .unwrap_or(OwnershipRequirement::Classified)
+fn action_requires_public_redaction(eligibility: ActionEligibility) -> bool {
+    matches!(
+        eligibility.redaction_requirement,
+        RedactionRequirement::PublicOutcome
+    )
 }
 
-fn action_requires_public_redaction(eligibility: Option<ActionEligibility>) -> bool {
-    eligibility
-        .map(|eligibility| {
-            matches!(
-                eligibility.redaction_requirement,
-                RedactionRequirement::PublicOutcome
-            )
-        })
-        .unwrap_or(true)
-}
-
-fn action_requires_journal(
-    action: GuardianActionKind,
-    eligibility: Option<ActionEligibility>,
-) -> bool {
-    let eligibility_requires = eligibility
-        .map(|eligibility| match eligibility.journal_requirement {
-            JournalRequirement::None => false,
-            JournalRequirement::RequiredForAttemptAction => is_attempt_action(action),
-            JournalRequirement::RequiredForManagedMutation => is_managed_mutation_action(action),
-        })
-        .unwrap_or(false);
+fn action_requires_journal(action: GuardianActionKind, eligibility: ActionEligibility) -> bool {
+    let eligibility_requires = match eligibility.journal_requirement {
+        JournalRequirement::None => false,
+        JournalRequirement::RequiredForAttemptAction => is_attempt_action(action),
+        JournalRequirement::RequiredForManagedMutation => is_managed_mutation_action(action),
+    };
     eligibility_requires || requires_journal(action)
 }
 
@@ -633,15 +514,13 @@ fn is_destructive_mutation(action: GuardianActionKind) -> bool {
 
 fn action_is_destructive_mutation(
     action: GuardianActionKind,
-    eligibility: Option<ActionEligibility>,
+    eligibility: ActionEligibility,
 ) -> bool {
-    let eligibility_marks_destructive = eligibility
-        .map(|eligibility| match eligibility.destructive_mutation_risk {
-            DestructiveMutationRisk::None => false,
-            DestructiveMutationRisk::ManagedMutation
-            | DestructiveMutationRisk::UserOrUnknownProtected => is_managed_mutation_action(action),
-        })
-        .unwrap_or(false);
+    let eligibility_marks_destructive = match eligibility.destructive_mutation_risk {
+        DestructiveMutationRisk::None => false,
+        DestructiveMutationRisk::ManagedMutation
+        | DestructiveMutationRisk::UserOrUnknownProtected => is_managed_mutation_action(action),
+    };
     eligibility_marks_destructive || is_destructive_mutation(action)
 }
 
@@ -654,28 +533,22 @@ fn is_loopable_action(action: GuardianActionKind) -> bool {
 
 fn action_is_retry_loop_sensitive(
     action: GuardianActionKind,
-    eligibility: Option<ActionEligibility>,
+    eligibility: ActionEligibility,
 ) -> bool {
-    let eligibility_marks_loop_sensitive = eligibility
-        .map(|eligibility| match eligibility.retry_loop_sensitivity {
-            RetryLoopSensitivity::None | RetryLoopSensitivity::OneAttemptOverride => false,
-            RetryLoopSensitivity::RepairAttempt => action == GuardianActionKind::Repair,
-            RetryLoopSensitivity::ProviderRetry => action == GuardianActionKind::Retry,
-            RetryLoopSensitivity::RepeatedFailureMemory => is_loopable_action(action),
-        })
-        .unwrap_or(false);
+    let eligibility_marks_loop_sensitive = match eligibility.retry_loop_sensitivity {
+        RetryLoopSensitivity::None | RetryLoopSensitivity::OneAttemptOverride => false,
+        RetryLoopSensitivity::RepairAttempt => action == GuardianActionKind::Repair,
+        RetryLoopSensitivity::ProviderRetry => action == GuardianActionKind::Retry,
+        RetryLoopSensitivity::RepeatedFailureMemory => is_loopable_action(action),
+    };
     eligibility_marks_loop_sensitive || is_loopable_action(action)
 }
 
-fn action_is_user_intent_sensitive(eligibility: Option<ActionEligibility>) -> bool {
-    eligibility
-        .map(|eligibility| {
-            !matches!(
-                eligibility.user_intent_sensitivity,
-                UserIntentSensitivity::None
-            )
-        })
-        .unwrap_or(false)
+fn action_is_user_intent_sensitive(eligibility: ActionEligibility) -> bool {
+    !matches!(
+        eligibility.user_intent_sensitivity,
+        UserIntentSensitivity::None
+    )
 }
 
 fn action_changes_user_intent(action: GuardianActionKind) -> bool {
@@ -710,14 +583,13 @@ fn is_managed_mutation_action(action: GuardianActionKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardianPolicyContext, action_safety_score, applicable_rule, decide_guardian_policy,
-        decision_pressure_score, policy_reasoning_input,
+        GuardianPolicyContext, decide_guardian_policy, policy_reasoning_input, strongest_diagnosis,
     };
     use crate::guardian::rules::OwnershipRequirement;
     use crate::guardian::{
         Diagnosis, DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence,
-        GuardianDomain, GuardianFact, GuardianFactId, GuardianImpactVector, GuardianMode,
-        GuardianSeverity, SafetyCase, diagnose_facts,
+        GuardianDomain, GuardianFact, GuardianFactId, GuardianMode, GuardianSeverity, SafetyCase,
+        diagnose,
     };
     use crate::state::contracts::{
         OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
@@ -725,13 +597,249 @@ mod tests {
     use crate::state::failure_memory::{GuardianFailureMemoryEntry, GuardianFailureMemoryStore};
 
     #[test]
+    fn strongest_diagnosis_uses_typed_cross_family_precedence() {
+        struct Case {
+            facts: Vec<GuardianFact>,
+            phase: OperationPhase,
+            expected: DiagnosisId,
+        }
+
+        let fact = |id, domain, phase, ownership, severity, confidence| GuardianFact {
+            operation_id: None,
+            id,
+            domain,
+            phase,
+            reliability: FactReliability::DirectStructured,
+            severity,
+            confidence,
+            ownership,
+            target: Some(TargetDescriptor::new(
+                StabilizationSystem::Guardian,
+                target_kind_for_domain(domain),
+                id.as_str(),
+                ownership,
+            )),
+            fields: Vec::new(),
+        };
+        let condition = |id, phase| {
+            fact(
+                id,
+                GuardianDomain::Launch,
+                phase,
+                OwnershipClass::Unknown,
+                None,
+                None,
+            )
+        };
+        let corruption = |phase| {
+            fact(
+                GuardianFactId::ManagedRuntimeCorrupt,
+                GuardianDomain::Runtime,
+                phase,
+                OwnershipClass::LauncherManaged,
+                None,
+                None,
+            )
+        };
+
+        let cases = [
+            Case {
+                facts: vec![
+                    fact(
+                        GuardianFactId::UnknownLaunchFailure,
+                        GuardianDomain::Launch,
+                        OperationPhase::Preparing,
+                        OwnershipClass::LauncherManaged,
+                        None,
+                        None,
+                    ),
+                    condition(
+                        GuardianFactId::LaunchFailureClassified,
+                        OperationPhase::Preparing,
+                    ),
+                    corruption(OperationPhase::Preparing),
+                ],
+                phase: OperationPhase::Preparing,
+                expected: DiagnosisId::ManagedRuntimeCorrupt,
+            },
+            Case {
+                facts: vec![
+                    fact(
+                        GuardianFactId::OutOfMemory,
+                        GuardianDomain::Startup,
+                        OperationPhase::Launching,
+                        OwnershipClass::LauncherManaged,
+                        None,
+                        None,
+                    ),
+                    condition(
+                        GuardianFactId::LaunchFailureClassified,
+                        OperationPhase::Launching,
+                    ),
+                    condition(
+                        GuardianFactId::ProcessExitedBeforeBoot,
+                        OperationPhase::Launching,
+                    ),
+                    corruption(OperationPhase::Launching),
+                ],
+                phase: OperationPhase::Launching,
+                expected: DiagnosisId::ManagedRuntimeCorrupt,
+            },
+            Case {
+                facts: vec![
+                    fact(
+                        GuardianFactId::JavaMajorMismatch,
+                        GuardianDomain::Runtime,
+                        OperationPhase::Preparing,
+                        OwnershipClass::LauncherManaged,
+                        None,
+                        None,
+                    ),
+                    corruption(OperationPhase::Preparing),
+                ],
+                phase: OperationPhase::Preparing,
+                expected: DiagnosisId::JavaRuntimeMajorMismatch,
+            },
+            Case {
+                facts: vec![
+                    fact(
+                        GuardianFactId::OwnershipUnknown,
+                        GuardianDomain::Filesystem,
+                        OperationPhase::Preparing,
+                        OwnershipClass::Unknown,
+                        None,
+                        None,
+                    ),
+                    fact(
+                        GuardianFactId::JavaMajorMismatch,
+                        GuardianDomain::Runtime,
+                        OperationPhase::Preparing,
+                        OwnershipClass::LauncherManaged,
+                        None,
+                        None,
+                    ),
+                ],
+                phase: OperationPhase::Preparing,
+                expected: DiagnosisId::ArtifactOwnershipUnsafe,
+            },
+            Case {
+                facts: vec![
+                    fact(
+                        GuardianFactId::PerformanceRulesInvalid,
+                        GuardianDomain::Performance,
+                        OperationPhase::Planning,
+                        OwnershipClass::CompositionManaged,
+                        Some(GuardianSeverity::Degraded),
+                        Some(GuardianConfidence::Confirmed),
+                    ),
+                    fact(
+                        GuardianFactId::PerformanceHealthDegraded,
+                        GuardianDomain::Performance,
+                        OperationPhase::Planning,
+                        OwnershipClass::CompositionManaged,
+                        Some(GuardianSeverity::Degraded),
+                        Some(GuardianConfidence::High),
+                    ),
+                ],
+                phase: OperationPhase::Planning,
+                expected: DiagnosisId::PerformanceRulesInvalid,
+            },
+            Case {
+                facts: vec![
+                    fact(
+                        GuardianFactId::PerformanceRepeatedFailureMemory,
+                        GuardianDomain::Performance,
+                        OperationPhase::Planning,
+                        OwnershipClass::CompositionManaged,
+                        None,
+                        None,
+                    ),
+                    fact(
+                        GuardianFactId::PerformanceHealthDegraded,
+                        GuardianDomain::Performance,
+                        OperationPhase::Planning,
+                        OwnershipClass::CompositionManaged,
+                        None,
+                        None,
+                    ),
+                ],
+                phase: OperationPhase::Planning,
+                expected: DiagnosisId::PerformanceHealthDegraded,
+            },
+            Case {
+                facts: vec![
+                    fact(
+                        GuardianFactId::StartupWindowExpired,
+                        GuardianDomain::Startup,
+                        OperationPhase::Launching,
+                        OwnershipClass::LauncherManaged,
+                        None,
+                        None,
+                    ),
+                    condition(
+                        GuardianFactId::LaunchFailureClassified,
+                        OperationPhase::Launching,
+                    ),
+                    fact(
+                        GuardianFactId::PersistedStateSchemaInvalid,
+                        GuardianDomain::State,
+                        OperationPhase::Launching,
+                        OwnershipClass::LauncherManaged,
+                        None,
+                        None,
+                    ),
+                ],
+                phase: OperationPhase::Launching,
+                expected: DiagnosisId::PersistedStateSchemaInvalid,
+            },
+            Case {
+                facts: vec![
+                    fact(
+                        GuardianFactId::StartupWindowExpired,
+                        GuardianDomain::Startup,
+                        OperationPhase::Launching,
+                        OwnershipClass::LauncherManaged,
+                        None,
+                        None,
+                    ),
+                    condition(
+                        GuardianFactId::LaunchFailureClassified,
+                        OperationPhase::Launching,
+                    ),
+                    condition(
+                        GuardianFactId::ProcessExitedBeforeBoot,
+                        OperationPhase::Launching,
+                    ),
+                    fact(
+                        GuardianFactId::PersistedStateSchemaInvalid,
+                        GuardianDomain::State,
+                        OperationPhase::Launching,
+                        OwnershipClass::LauncherManaged,
+                        None,
+                        None,
+                    ),
+                ],
+                phase: OperationPhase::Launching,
+                expected: DiagnosisId::StartupStalled,
+            },
+        ];
+
+        for case in cases {
+            let diagnoses = diagnose(&case.facts, case.phase);
+            assert_eq!(
+                strongest_diagnosis(&diagnoses).map(|diagnosis| diagnosis.id()),
+                Some(case.expected)
+            );
+        }
+    }
+
+    #[test]
     fn managed_mode_repairs_launcher_managed_corruption() {
-        let diagnosis = diagnosis(
-            DiagnosisId::ManagedRuntimeCorrupt,
-            GuardianSeverity::Repairable,
-            GuardianConfidence::Confirmed,
+        let diagnosis = rule_diagnosis(
+            GuardianFactId::ManagedRuntimeReadyMarkerMissing,
+            GuardianDomain::Runtime,
+            OperationPhase::Preparing,
             OwnershipClass::LauncherManaged,
-            vec![GuardianActionKind::Repair, GuardianActionKind::Block],
         );
         let safety_case = safety_case(GuardianMode::Managed, diagnosis);
 
@@ -746,39 +854,28 @@ mod tests {
     }
 
     #[test]
-    fn malformed_diagnosis_blocks_without_action_plan() {
-        let mut diagnosis = diagnosis(
-            DiagnosisId::ManagedRuntimeCorrupt,
-            GuardianSeverity::Repairable,
-            GuardianConfidence::Confirmed,
-            OwnershipClass::LauncherManaged,
-            vec![GuardianActionKind::Repair],
-        );
-        diagnosis.affected_targets.clear();
-        let safety_case = safety_case(GuardianMode::Managed, diagnosis);
-
-        let decision =
-            decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
-
-        assert_eq!(decision.kind, GuardianActionKind::Block);
-        assert!(decision.action_plan.is_none());
-    }
-
-    #[test]
     fn policy_action_plan_sanitizes_prerequisite_targets() {
-        let mut diagnosis = diagnosis(
-            DiagnosisId::ManagedRuntimeCorrupt,
-            GuardianSeverity::Repairable,
-            GuardianConfidence::Confirmed,
-            OwnershipClass::LauncherManaged,
-            vec![GuardianActionKind::Repair],
-        );
-        diagnosis.affected_targets = vec![TargetDescriptor {
-            system: StabilizationSystem::Guardian,
-            kind: TargetKind::Runtime,
-            id: r"C:\Users\Alice\java.exe --accessToken secret -Xmx8192M".to_string(),
+        let fact = GuardianFact {
+            operation_id: None,
+            id: GuardianFactId::ManagedRuntimeCorrupt,
+            domain: GuardianDomain::Runtime,
+            phase: OperationPhase::Preparing,
+            reliability: FactReliability::DirectStructured,
+            severity: None,
+            confidence: None,
             ownership: OwnershipClass::LauncherManaged,
-        }];
+            target: Some(TargetDescriptor {
+                system: StabilizationSystem::Guardian,
+                kind: TargetKind::Runtime,
+                id: r"C:\Users\Alice\java.exe --accessToken secret -Xmx8192M".to_string(),
+                ownership: OwnershipClass::LauncherManaged,
+            }),
+            fields: Vec::new(),
+        };
+        let diagnosis = diagnose(&[fact], OperationPhase::Preparing)
+            .into_iter()
+            .next()
+            .expect("managed runtime diagnosis");
         let safety_case = safety_case(GuardianMode::Managed, diagnosis);
 
         let decision =
@@ -804,16 +901,11 @@ mod tests {
 
     #[test]
     fn custom_explicit_intent_asks_before_silent_mutation() {
-        let diagnosis = diagnosis(
-            DiagnosisId::JvmArgUnsupported,
-            GuardianSeverity::Blocking,
-            GuardianConfidence::Confirmed,
+        let diagnosis = rule_diagnosis(
+            GuardianFactId::JvmArgUnsupportedGc,
+            GuardianDomain::Jvm,
+            OperationPhase::Preparing,
             OwnershipClass::UserOwned,
-            vec![
-                GuardianActionKind::Strip,
-                GuardianActionKind::AskUser,
-                GuardianActionKind::Block,
-            ],
         );
         let safety_case = safety_case(GuardianMode::Custom, diagnosis);
 
@@ -826,32 +918,12 @@ mod tests {
     }
 
     #[test]
-    fn manual_launch_diagnosis_uses_rule_metadata_only_for_rule_source_evidence() {
-        let mut manual = diagnosis(
-            DiagnosisId::JvmArgUnsupported,
-            GuardianSeverity::Blocking,
-            GuardianConfidence::Confirmed,
-            OwnershipClass::UserOwned,
-            vec![GuardianActionKind::Strip, GuardianActionKind::Block],
-        );
-        manual.fact_ids = vec![GuardianFactId::JvmArgUnsupported];
-        assert!(applicable_rule(&manual).is_none());
-
-        manual.fact_ids = vec![GuardianFactId::JvmArgUnlockOrderInvalid];
-        assert_eq!(
-            applicable_rule(&manual).map(|rule| rule.id),
-            Some(DiagnosisId::JvmArgUnsupported)
-        );
-    }
-
-    #[test]
     fn disabled_mode_blocks_hard_invariant_even_when_guardian_is_disabled() {
-        let diagnosis = diagnosis(
-            DiagnosisId::ManagedRuntimeCorrupt,
-            GuardianSeverity::Repairable,
-            GuardianConfidence::Confirmed,
+        let diagnosis = rule_diagnosis(
+            GuardianFactId::ManagedRuntimeReadyMarkerMissing,
+            GuardianDomain::Runtime,
+            OperationPhase::Preparing,
             OwnershipClass::UserOwned,
-            vec![GuardianActionKind::Repair, GuardianActionKind::RecordOnly],
         );
         let safety_case = safety_case(GuardianMode::Disabled, diagnosis);
 
@@ -863,12 +935,11 @@ mod tests {
 
     #[test]
     fn disabled_mode_records_non_blocking_cases_only() {
-        let diagnosis = diagnosis(
-            DiagnosisId::CustomJavaOverridePresent,
-            GuardianSeverity::Warning,
-            GuardianConfidence::Medium,
+        let diagnosis = rule_diagnosis(
+            GuardianFactId::CustomJavaOverridePresent,
+            GuardianDomain::Runtime,
+            OperationPhase::Preparing,
             OwnershipClass::UserOwned,
-            vec![GuardianActionKind::Warn, GuardianActionKind::RecordOnly],
         );
         let safety_case = safety_case(GuardianMode::Disabled, diagnosis);
 
@@ -904,18 +975,18 @@ mod tests {
             )),
             fields: Vec::new(),
         };
-        let diagnoses = diagnose_facts(&[fact], OperationPhase::Launching);
+        let diagnoses = diagnose(&[fact], OperationPhase::Launching);
         let diagnosis = diagnoses
             .first()
             .expect("unknown diagnosis should be generated")
             .clone();
 
-        assert_eq!(diagnosis.id.as_str(), "unknown_failure_launching");
-        assert_eq!(diagnosis.domain, GuardianDomain::Unknown);
-        assert_eq!(diagnosis.confidence, GuardianConfidence::Low);
-        assert_eq!(diagnosis.ownership, OwnershipClass::Unknown);
+        assert_eq!(diagnosis.id().as_str(), "unknown_failure_launching");
+        assert_eq!(diagnosis.domain(), GuardianDomain::Unknown);
+        assert_eq!(diagnosis.confidence(), GuardianConfidence::Low);
+        assert_eq!(diagnosis.ownership(), OwnershipClass::Unknown);
         for destructive in [GuardianActionKind::Repair, GuardianActionKind::Quarantine] {
-            assert!(!diagnosis.candidate_actions.contains(&destructive));
+            assert!(!diagnosis.candidate_actions().contains(&destructive));
         }
 
         let safety_case = SafetyCase {
@@ -941,8 +1012,8 @@ mod tests {
         for observed_at in ["2026-06-16T10:00:00Z", "2026-06-16T10:01:00Z"] {
             failure_memory
                 .record(GuardianFailureMemoryEntry::observed(
-                    diagnosis.id,
-                    diagnosis.domain,
+                    diagnosis.id(),
+                    diagnosis.domain(),
                     safe_target.clone(),
                     GuardianMode::Managed,
                     None,
@@ -972,12 +1043,11 @@ mod tests {
 
     #[test]
     fn hard_invariant_blocks_unjournaled_mutation() {
-        let diagnosis = diagnosis(
-            DiagnosisId::ManagedRuntimeCorrupt,
-            GuardianSeverity::Repairable,
-            GuardianConfidence::Confirmed,
+        let diagnosis = rule_diagnosis(
+            GuardianFactId::ManagedRuntimeReadyMarkerMissing,
+            GuardianDomain::Runtime,
+            OperationPhase::Preparing,
             OwnershipClass::LauncherManaged,
-            vec![GuardianActionKind::Repair, GuardianActionKind::Block],
         );
         let safety_case = safety_case(GuardianMode::Managed, diagnosis);
 
@@ -991,12 +1061,11 @@ mod tests {
 
     #[test]
     fn unredacted_public_boundary_blocks_before_action_planning() {
-        let diagnosis = diagnosis(
-            DiagnosisId::ManagedRuntimeCorrupt,
-            GuardianSeverity::Repairable,
-            GuardianConfidence::Confirmed,
+        let diagnosis = rule_diagnosis(
+            GuardianFactId::ManagedRuntimeReadyMarkerMissing,
+            GuardianDomain::Runtime,
+            OperationPhase::Preparing,
             OwnershipClass::LauncherManaged,
-            vec![GuardianActionKind::Repair, GuardianActionKind::Block],
         );
         let safety_case = safety_case(GuardianMode::Managed, diagnosis);
 
@@ -1011,16 +1080,11 @@ mod tests {
 
     #[test]
     fn suppression_blocks_repeated_retry_loop() {
-        let diagnosis = diagnosis(
-            DiagnosisId::DownloadUnavailable,
-            GuardianSeverity::Blocking,
-            GuardianConfidence::Medium,
+        let diagnosis = rule_diagnosis(
+            GuardianFactId::DownloadProviderUnavailable,
+            GuardianDomain::Download,
+            OperationPhase::Downloading,
             OwnershipClass::ExternalProviderDerived,
-            vec![
-                GuardianActionKind::Retry,
-                GuardianActionKind::AskUser,
-                GuardianActionKind::Block,
-            ],
         );
         let safety_case = safety_case(GuardianMode::Managed, diagnosis);
 
@@ -1030,59 +1094,6 @@ mod tests {
         );
 
         assert_eq!(decision.kind, GuardianActionKind::Block);
-    }
-
-    #[test]
-    fn performance_fallback_is_preferred_over_block_when_safe() {
-        let mut diagnosis = diagnosis(
-            DiagnosisId::PerformanceFallbackSelected,
-            GuardianSeverity::Degraded,
-            GuardianConfidence::High,
-            OwnershipClass::CompositionManaged,
-            vec![GuardianActionKind::Fallback, GuardianActionKind::Block],
-        );
-        diagnosis.domain = GuardianDomain::Performance;
-        diagnosis.impact = GuardianImpactVector {
-            performance_impact: 0.80,
-            launchability_impact: 0.25,
-            ..GuardianImpactVector::default()
-        };
-        let safety_case = safety_case(GuardianMode::Managed, diagnosis);
-
-        let decision =
-            decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
-
-        assert_eq!(decision.kind, GuardianActionKind::Fallback);
-    }
-
-    #[test]
-    fn pressure_and_safety_scores_follow_method_weights() {
-        let diagnosis = diagnosis(
-            DiagnosisId::ManagedRuntimeCorrupt,
-            GuardianSeverity::Repairable,
-            GuardianConfidence::Confirmed,
-            OwnershipClass::LauncherManaged,
-            vec![GuardianActionKind::Repair],
-        );
-
-        assert!((decision_pressure_score(&diagnosis) - 0.765).abs() < 0.0001);
-        assert!(
-            action_safety_score(
-                &diagnosis,
-                GuardianActionKind::Repair,
-                GuardianMode::Managed,
-                GuardianPolicyContext::current_operation(),
-            ) > 0.0
-        );
-        assert_eq!(
-            action_safety_score(
-                &diagnosis,
-                GuardianActionKind::Repair,
-                GuardianMode::Managed,
-                GuardianPolicyContext::current_operation().with_suppression(),
-            ),
-            0.0
-        );
     }
 
     #[test]
@@ -1096,9 +1107,6 @@ mod tests {
 
         let reasoning = policy_reasoning_input(&diagnosis, GuardianActionKind::Strip);
 
-        assert_eq!(reasoning.resolved_severity, diagnosis.severity);
-        assert_eq!(reasoning.resolved_confidence, diagnosis.confidence);
-        assert_close(reasoning.impact_scalar, diagnosis.impact.scalar_severity());
         assert_eq!(
             reasoning.ownership_requirement,
             OwnershipRequirement::Classified
@@ -1268,54 +1276,12 @@ mod tests {
             )),
             fields: Vec::new(),
         };
-        let diagnoses = diagnose_facts(&[fact], phase);
+        let diagnoses = diagnose(&[fact], phase);
         assert_eq!(diagnoses.len(), 1, "{}", fact_id.as_str());
         diagnoses
             .into_iter()
             .next()
             .expect("rule diagnosis should exist")
-    }
-
-    fn diagnosis(
-        id: DiagnosisId,
-        severity: GuardianSeverity,
-        confidence: GuardianConfidence,
-        ownership: OwnershipClass,
-        candidate_actions: Vec<GuardianActionKind>,
-    ) -> Diagnosis {
-        Diagnosis {
-            id,
-            domain: GuardianDomain::Runtime,
-            severity,
-            confidence,
-            ownership,
-            phase: OperationPhase::Preparing,
-            fact_ids: vec![GuardianFactId::NoStructuredFact(OperationPhase::Preparing)],
-            affected_targets: vec![TargetDescriptor::new(
-                StabilizationSystem::Guardian,
-                TargetKind::Runtime,
-                id.as_str(),
-                ownership,
-            )],
-            impact: GuardianImpactVector {
-                launchability_impact: match severity {
-                    GuardianSeverity::Blocking | GuardianSeverity::Critical => 0.95,
-                    GuardianSeverity::Repairable | GuardianSeverity::Recoverable => 0.85,
-                    GuardianSeverity::Degraded => 0.50,
-                    GuardianSeverity::Warning => 0.25,
-                    GuardianSeverity::Info => 0.10,
-                },
-                state_corruption_impact: matches!(
-                    severity,
-                    GuardianSeverity::Repairable | GuardianSeverity::Recoverable
-                )
-                .then_some(0.85)
-                .unwrap_or(0.0),
-                ..GuardianImpactVector::default()
-            },
-            candidate_actions,
-            public_reason_template: id.to_string(),
-        }
     }
 
     fn target_kind_for_domain(domain: GuardianDomain) -> TargetKind {
@@ -1335,12 +1301,5 @@ mod tests {
             | GuardianDomain::State
             | GuardianDomain::Unknown => TargetKind::Config,
         }
-    }
-
-    fn assert_close(actual: f32, expected: f32) {
-        assert!(
-            (actual - expected).abs() < 0.0001,
-            "expected {actual} to be close to {expected}"
-        );
     }
 }
