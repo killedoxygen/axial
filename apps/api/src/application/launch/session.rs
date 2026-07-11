@@ -43,12 +43,12 @@ use readiness::readiness_guardian_facts;
 #[cfg(test)]
 use readiness::readiness_has_managed_runtime_missing;
 use resources::{
-    ActiveLaunchResourceUse, capture_launch_cpu_load_evidence, capture_launch_disk_evidence,
-    capture_launch_memory_evidence, capture_resource_budget_snapshot, host_cpu_threads,
-    preflight_resource_signals,
+    ActiveLaunchResourceUse, LaunchMemoryEvidence, capture_launch_cpu_load_evidence,
+    capture_launch_disk_evidence, capture_launch_memory_evidence, capture_resource_budget_snapshot,
+    host_cpu_threads, preflight_resource_signals,
 };
 #[cfg(test)]
-use resources::{LaunchCpuLoadEvidence, LaunchDiskEvidence, LaunchMemoryEvidence, load_to_x100};
+use resources::{LaunchCpuLoadEvidence, LaunchDiskEvidence, load_to_x100};
 use runtime_repair::{
     ManagedRuntimeRepairLaunch, maybe_repair_managed_runtime_before_launch_owned,
 };
@@ -441,6 +441,48 @@ pub async fn prepare_launch_preflight(
     state: &AppState,
     instance_id: String,
 ) -> Result<LaunchPreflightResponse, (StatusCode, Json<serde_json::Value>)> {
+    prepare_launch_preflight_with_memory_capture(state, instance_id, capture_launch_memory_evidence)
+        .await
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct LaunchPreflightMemoryProfile {
+    pub(super) host_total_memory_mb: Option<u64>,
+    pub(super) host_available_memory_mb: Option<u64>,
+    pub(super) host_used_memory_mb: Option<u64>,
+    pub(super) launcher_process_memory_mb: Option<u64>,
+}
+
+#[cfg(test)]
+impl LaunchPreflightMemoryProfile {
+    fn into_evidence(self) -> LaunchMemoryEvidence {
+        LaunchMemoryEvidence {
+            host_total_memory_mb: self.host_total_memory_mb,
+            host_available_memory_mb: self.host_available_memory_mb,
+            host_used_memory_mb: self.host_used_memory_mb,
+            launcher_process_memory_mb: self.launcher_process_memory_mb,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) async fn prepare_launch_preflight_with_memory_profile_for_test(
+    state: &AppState,
+    instance_id: String,
+    profile: LaunchPreflightMemoryProfile,
+) -> Result<LaunchPreflightResponse, (StatusCode, Json<serde_json::Value>)> {
+    prepare_launch_preflight_with_memory_capture(state, instance_id, move || {
+        profile.into_evidence()
+    })
+    .await
+}
+
+async fn prepare_launch_preflight_with_memory_capture(
+    state: &AppState,
+    instance_id: String,
+    capture_memory: impl FnOnce() -> LaunchMemoryEvidence,
+) -> Result<LaunchPreflightResponse, (StatusCode, Json<serde_json::Value>)> {
     let started_at = Instant::now();
     let producer = state
         .try_claim_producer()
@@ -461,7 +503,7 @@ pub async fn prepare_launch_preflight(
     })?;
     let game_dir = state.instances().game_dir(&instance.id);
     let config = state.config().current();
-    let facts = build_launch_preflight_facts(
+    let facts = build_launch_preflight_facts_with_memory_capture(
         state,
         &producer,
         LaunchPreflightBuild {
@@ -473,6 +515,7 @@ pub async fn prepare_launch_preflight(
             requested_min_memory_mb: None,
         },
         None,
+        capture_memory,
     )
     .await;
 
@@ -504,6 +547,23 @@ async fn build_launch_preflight_facts(
     request: LaunchPreflightBuild<'_>,
     prior_java_probe_receipt: Option<JavaRuntimeProbeReceipt>,
 ) -> LaunchPreflightFacts {
+    build_launch_preflight_facts_with_memory_capture(
+        state,
+        producer,
+        request,
+        prior_java_probe_receipt,
+        capture_launch_memory_evidence,
+    )
+    .await
+}
+
+async fn build_launch_preflight_facts_with_memory_capture(
+    state: &AppState,
+    producer: &crate::state::ProducerLease,
+    request: LaunchPreflightBuild<'_>,
+    prior_java_probe_receipt: Option<JavaRuntimeProbeReceipt>,
+    capture_memory: impl FnOnce() -> LaunchMemoryEvidence,
+) -> LaunchPreflightFacts {
     let LaunchPreflightBuild {
         instance,
         config,
@@ -515,7 +575,7 @@ async fn build_launch_preflight_facts(
     let started_at = Instant::now();
     // Preflight is read-only: no session creation, installs, or raw path exposure.
     let memory_started_at = Instant::now();
-    let memory_evidence = capture_launch_memory_evidence();
+    let memory_evidence = capture_memory();
     let memory_elapsed = memory_started_at.elapsed();
     let scan_started_at = Instant::now();
     let installed_versions = state.installed_versions_snapshot(producer).await;

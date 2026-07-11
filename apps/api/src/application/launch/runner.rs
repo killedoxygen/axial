@@ -1583,6 +1583,7 @@ mod tests {
     };
     use axial_performance::PerformanceManager;
     use std::fs;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1591,6 +1592,7 @@ mod tests {
     const TEST_TELEMETRY_INSTALL_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
     const TEST_TELEMETRY_KEY: &str = "phc_test";
     const CRASH_E2E_INSTANCE_ID: &str = "0123456789abcdef";
+    const CRASH_E2E_FABRIC_VERSION_ID: &str = "fabric-loader-0.16.10-1.21.1";
 
     #[tokio::test]
     async fn launch_loop_caps_a_prepare_directive_that_never_marks_itself_applied() {
@@ -1667,17 +1669,18 @@ mod tests {
         let paths = test_paths(&root);
         let session_id = "launch-out-of-memory-e2e";
         let java_path = write_out_of_memory_launch_fixture(&root);
+        assert_scanner_recognizes_fabric_crash_install(&root);
         let mut task = test_recovery_launch_task(session_id, &root);
         retarget_test_launch_task(&mut task, CRASH_E2E_INSTANCE_ID);
-        task.instance.java_path = java_path.clone();
+        align_fabric_crash_task(&mut task, &java_path);
         task.instance.max_memory_mb = 1024;
-        task.intent.requested_java = java_path;
         task.intent.max_memory_mb = 1024;
         let state = test_app_state_with_registered_launch_instance(&root, &task.instance);
         task.intent.game_dir = Some(state.instances().game_dir(&task.instance.id));
         task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
         let mut session = test_record(session_id);
         session.instance_id = CRASH_E2E_INSTANCE_ID.to_string();
+        session.version_id = CRASH_E2E_FABRIC_VERSION_ID.to_string();
         state
             .sessions()
             .insert(session)
@@ -1805,6 +1808,11 @@ mod tests {
         .await
         .expect("prepare next preflight after OOM crash");
         assert_eq!(preflight.status, "ready");
+        assert!(
+            preflight.readiness.launchable,
+            "Fabric OOM preflight readiness: {:?}",
+            preflight.readiness.reasons
+        );
         assert_eq!(
             preflight.guardian.decision,
             axial_launcher::GuardianDecision::Warned
@@ -1826,6 +1834,45 @@ mod tests {
             })
         );
         assert_oom_preflight_guidance(&preflight, recent_failure);
+        let low_end_preflight =
+            super::super::session::prepare_launch_preflight_with_memory_profile_for_test(
+                &state,
+                CRASH_E2E_INSTANCE_ID.to_string(),
+                super::super::session::LaunchPreflightMemoryProfile {
+                    host_total_memory_mb: Some(4096),
+                    host_available_memory_mb: Some(3072),
+                    host_used_memory_mb: Some(1024),
+                    launcher_process_memory_mb: Some(128),
+                },
+            )
+            .await
+            .expect("prepare low-end preflight after Fabric OOM crash");
+        assert!(low_end_preflight.readiness.launchable);
+        assert_eq!(low_end_preflight.memory.max_memory_mb, 1024);
+        assert_eq!(
+            low_end_preflight
+                .resource_budget
+                .estimated_remaining_memory_mb,
+            Some(3072)
+        );
+        assert!(!low_end_preflight.resource_budget.memory_pressure);
+        let low_end_failure = low_end_preflight
+            .guardian_facts
+            .iter()
+            .find(|fact| fact.id.as_str() == "recent_startup_failure")
+            .expect("low-end OOM memory fact");
+        assert_eq!(
+            guardian_fact_field(low_end_failure, "current_memory_mb"),
+            Some("1024")
+        );
+        assert_eq!(
+            guardian_fact_field(low_end_failure, "suggested_memory_mb"),
+            Some("2048")
+        );
+        assert!(low_end_preflight.guardian.guidance.iter().any(|guidance| {
+            guidance
+                == "Increase this instance's maximum memory from 1024 MB to 2048 MB before relaunching."
+        }));
         assert_eq!(state.sessions().active_session_count().await, 0);
         assert!(
             !state
@@ -1833,15 +1880,13 @@ mod tests {
                 .has_active_instance(CRASH_E2E_INSTANCE_ID)
                 .await
         );
-        assert_eq!(
-            state
-                .sessions()
-                .get(session_id)
-                .await
-                .expect("original OOM session remains")
-                .state,
-            LaunchState::Exited
-        );
+        let original_session = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("original OOM session remains");
+        assert_eq!(original_session.state, LaunchState::Exited);
+        assert_eq!(original_session.version_id, CRASH_E2E_FABRIC_VERSION_ID);
         let preflight_json = serde_json::to_string(&preflight).expect("OOM preflight json");
 
         let mut event_payloads = String::new();
@@ -1866,6 +1911,7 @@ mod tests {
             preflight_json.as_str(),
         ] {
             assert_no_out_of_memory_sensitive_decoys(payload);
+            assert!(!payload.contains(&java_path));
         }
 
         let _ = fs::remove_dir_all(root);
@@ -2046,17 +2092,19 @@ mod tests {
     #[tokio::test]
     async fn post_boot_mod_crash_settles_guardian_copy_proof_and_failure_memory() {
         let root = unique_test_dir("launch-post-boot-mod-crash-e2e");
+        let paths = test_paths(&root);
         let session_id = "launch-post-boot-mod-crash-e2e";
         let java_path = write_post_boot_mod_crash_launch_fixture(&root);
+        assert_scanner_recognizes_fabric_crash_install(&root);
         let mut task = test_recovery_launch_task(session_id, &root);
         retarget_test_launch_task(&mut task, CRASH_E2E_INSTANCE_ID);
-        task.instance.java_path = java_path.clone();
-        task.intent.requested_java = java_path;
+        align_fabric_crash_task(&mut task, &java_path);
         let state = test_app_state_with_registered_launch_instance(&root, &task.instance);
         task.intent.game_dir = Some(state.instances().game_dir(&task.instance.id));
         task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
         let mut session = test_record(session_id);
         session.instance_id = CRASH_E2E_INSTANCE_ID.to_string();
+        session.version_id = CRASH_E2E_FABRIC_VERSION_ID.to_string();
         state
             .sessions()
             .insert(session)
@@ -2080,11 +2128,21 @@ mod tests {
         .unwrap_or_else(|error| panic!("launch must reach running: {}", error.message));
         assert_eq!(launched.session_id, session_id);
 
-        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+        let (terminal, event_payloads) = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut event_payloads = String::new();
             loop {
                 match events.recv().await.expect("mod crash event") {
-                    LaunchEvent::Status(status) if status.state == "exited" => break status,
-                    _ => {}
+                    LaunchEvent::Status(status) => {
+                        event_payloads.push_str(
+                            &super::super::reports::public_launch_status_json(&status).to_string(),
+                        );
+                        if status.state == "exited" {
+                            break (status, event_payloads);
+                        }
+                    }
+                    LaunchEvent::Log(log) => event_payloads.push_str(
+                        &serde_json::to_string(&log).expect("serialize public mod crash log event"),
+                    ),
                 }
             }
         })
@@ -2153,16 +2211,22 @@ mod tests {
                 .as_str()
                 .is_some_and(|detail| detail.contains("Example Machines"))
         );
-        assert!(!status_payload.to_string().contains("/home/alice"));
         let proof_json = serde_json::to_string(&proof).expect("serialize mod crash proof");
-        for private in ["/home/alice", "raw-secret-token", "-Duser.home"] {
-            assert!(!proof_json.contains(private));
-        }
         let memory = state.failure_memory().list();
         assert_eq!(memory.len(), 1);
         assert_eq!(memory[0].diagnosis_id.as_str(), "mod_attributed_crash");
         assert_eq!(memory[0].target.id, CRASH_E2E_INSTANCE_ID);
         assert_eq!(memory[0].occurrence_count, 1);
+        state
+            .failure_memory()
+            .flush()
+            .await
+            .expect("flush mod crash failure memory");
+        let memory_json = fs::read_to_string(failure_memory_path(&paths))
+            .expect("read persisted mod crash failure memory");
+        let persisted = FailureMemorySnapshot::from_json(&memory_json)
+            .expect("strict persisted mod crash failure memory");
+        assert_eq!(persisted.entries, memory);
         let preflight = super::super::session::prepare_launch_preflight(
             &state,
             CRASH_E2E_INSTANCE_ID.to_string(),
@@ -2170,6 +2234,7 @@ mod tests {
         .await
         .expect("prepare next preflight after mod crash");
         assert_eq!(preflight.status, "ready");
+        assert!(preflight.readiness.launchable);
         assert_eq!(
             preflight.guardian.decision,
             axial_launcher::GuardianDecision::Warned
@@ -2191,6 +2256,37 @@ mod tests {
             guidance
                 == "Review recently changed mods and disable the suspected mod before relaunching."
         }));
+        let normal_preflight =
+            super::super::session::prepare_launch_preflight_with_memory_profile_for_test(
+                &state,
+                CRASH_E2E_INSTANCE_ID.to_string(),
+                super::super::session::LaunchPreflightMemoryProfile {
+                    host_total_memory_mb: Some(16_384),
+                    host_available_memory_mb: Some(12_288),
+                    host_used_memory_mb: Some(4096),
+                    launcher_process_memory_mb: Some(256),
+                },
+            )
+            .await
+            .expect("prepare normal-host preflight after Fabric mod crash");
+        assert!(normal_preflight.readiness.launchable);
+        assert_eq!(normal_preflight.memory.max_memory_mb, 4096);
+        assert_eq!(
+            normal_preflight
+                .resource_budget
+                .estimated_remaining_memory_mb,
+            Some(12_288)
+        );
+        assert!(!normal_preflight.resource_budget.memory_pressure);
+        let normal_failure = normal_preflight
+            .guardian_facts
+            .iter()
+            .find(|fact| fact.id.as_str() == "recent_startup_failure")
+            .expect("normal-host mod crash memory fact");
+        assert_eq!(
+            guardian_fact_field(normal_failure, "failure_class"),
+            Some("mod_attributed_crash")
+        );
         assert_eq!(state.sessions().active_session_count().await, 0);
         assert!(
             !state
@@ -2198,18 +2294,26 @@ mod tests {
                 .has_active_instance(CRASH_E2E_INSTANCE_ID)
                 .await
         );
-        assert_eq!(
-            state
-                .sessions()
-                .get(session_id)
-                .await
-                .expect("original mod crash session remains")
-                .state,
-            LaunchState::Exited
-        );
+        let original_session = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("original mod crash session remains");
+        assert_eq!(original_session.state, LaunchState::Exited);
+        assert_eq!(original_session.version_id, CRASH_E2E_FABRIC_VERSION_ID);
         let preflight_json = serde_json::to_string(&preflight).expect("mod preflight json");
-        for private in ["/home/alice", "raw-secret-token", "-Duser.home"] {
-            assert!(!preflight_json.contains(private));
+        let status_json = status_payload.to_string();
+        for payload in [
+            status_json.as_str(),
+            proof_json.as_str(),
+            memory_json.as_str(),
+            event_payloads.as_str(),
+            preflight_json.as_str(),
+        ] {
+            for private in ["/home/alice", "raw-secret-token", "-Duser.home"] {
+                assert!(!payload.contains(private));
+            }
+            assert!(!payload.contains(&java_path));
         }
 
         let _ = fs::remove_dir_all(root);
@@ -2902,6 +3006,47 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn align_fabric_crash_task(
+        task: &mut super::super::session::LaunchSessionTask,
+        java_path: &str,
+    ) {
+        task.instance.version_id = CRASH_E2E_FABRIC_VERSION_ID.to_string();
+        task.instance.java_path = java_path.to_string();
+        task.intent.version_id = CRASH_E2E_FABRIC_VERSION_ID.to_string();
+        task.intent.target_version_id = "1.21.1".to_string();
+        task.intent.loader = "fabric".to_string();
+        task.intent.is_modded = true;
+        task.intent.requested_java = java_path.to_string();
+    }
+
+    #[cfg(unix)]
+    fn assert_scanner_recognizes_fabric_crash_install(root: &Path) {
+        let version_report = axial_minecraft::scan_versions_report(&root.join("library"))
+            .expect("scan Fabric crash fixture");
+        assert_eq!(
+            version_report.state,
+            axial_minecraft::VersionScanState::Ready
+        );
+        let fabric_version = version_report
+            .versions
+            .iter()
+            .find(|version| version.id == CRASH_E2E_FABRIC_VERSION_ID)
+            .expect("scanner-recognized Fabric crash fixture");
+        assert!(fabric_version.installed);
+        assert!(fabric_version.launchable);
+        assert_eq!(fabric_version.inherits_from, "1.21.1");
+        let fabric_loader = fabric_version
+            .loader
+            .as_ref()
+            .expect("authoritative Fabric loader metadata");
+        assert_eq!(
+            fabric_loader.component_id,
+            axial_minecraft::LoaderComponentId::Fabric
+        );
+        assert_eq!(fabric_loader.build_id, "fabric:1.21.1:0.16.10");
+    }
+
     fn test_app_state(root: &Path) -> AppState {
         let paths = test_paths(root);
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
@@ -3107,7 +3252,9 @@ mod tests {
 
     #[cfg(unix)]
     fn write_out_of_memory_launch_fixture(root: &Path) -> String {
-        write_out_of_memory_launch_fixture_with_boot(root, false)
+        let java_path = write_out_of_memory_launch_fixture_with_boot(root, false);
+        write_fabric_crash_install(root);
+        java_path
     }
 
     #[cfg(unix)]
@@ -3117,7 +3264,7 @@ mod tests {
 
     #[cfg(unix)]
     fn write_post_boot_mod_crash_launch_fixture(root: &Path) -> String {
-        write_crashing_java_fixture(
+        let java_path = write_crashing_java_fixture(
             root,
             "mod-crash-java",
             r#"#!/bin/sh
@@ -3139,7 +3286,82 @@ CRASH
 printf '%s\n' 'java.lang.IllegalStateException: registry failed' >&2
 exit 1
 "#,
+        );
+        write_fabric_crash_install(root);
+        java_path
+    }
+
+    #[cfg(unix)]
+    fn write_fabric_crash_install(root: &Path) {
+        let version_dir = root
+            .join("library")
+            .join("versions")
+            .join(CRASH_E2E_FABRIC_VERSION_ID);
+        fs::create_dir_all(&version_dir).expect("Fabric crash fixture version directory");
+        fs::write(
+            version_dir.join(format!("{CRASH_E2E_FABRIC_VERSION_ID}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "id": CRASH_E2E_FABRIC_VERSION_ID,
+                "inheritsFrom": "1.21.1",
+                "type": "release",
+                "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+                "assetIndex": {},
+                "arguments": { "jvm": [], "game": [] },
+                "libraries": [
+                    {
+                        "name": "net.fabricmc:fabric-loader:0.16.10",
+                        "axialChecksumlessAllowed": true
+                    },
+                    {
+                        "name": "net.fabricmc:intermediary:1.21.1",
+                        "axialChecksumlessAllowed": true
+                    }
+                ]
+            }))
+            .expect("encode Fabric crash fixture version"),
         )
+        .expect("write Fabric crash fixture version");
+        fs::write(
+            version_dir.join(".axial-loader.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "component_id": "net.fabricmc.fabric-loader",
+                "component_name": "Fabric",
+                "build_id": "fabric:1.21.1:0.16.10",
+                "minecraft_version": "1.21.1",
+                "loader_version": "0.16.10"
+            }))
+            .expect("encode Fabric crash fixture metadata"),
+        )
+        .expect("write Fabric crash fixture metadata");
+
+        for relative_path in [
+            "net/fabricmc/fabric-loader/0.16.10/fabric-loader-0.16.10.jar",
+            "net/fabricmc/intermediary/1.21.1/intermediary-1.21.1.jar",
+        ] {
+            let path = root.join("library").join("libraries").join(relative_path);
+            fs::create_dir_all(path.parent().expect("Fabric library parent"))
+                .expect("Fabric library directory");
+            write_readable_test_jar(&path);
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_readable_test_jar(path: &Path) {
+        let file = fs::File::create(path).expect("create Fabric crash fixture library");
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .start_file(
+                "META-INF/guardian-fixture",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .expect("start Fabric crash fixture jar entry");
+        archive
+            .write_all(b"fixture")
+            .expect("write Fabric crash fixture jar entry");
+        archive
+            .finish()
+            .expect("finish Fabric crash fixture library");
     }
 
     #[cfg(unix)]
@@ -3266,6 +3488,16 @@ exit 1
                 .any(|guidance| guidance == &expected),
             "missing OOM next-launch guidance: {expected}"
         );
+    }
+
+    fn guardian_fact_field<'a>(
+        fact: &'a crate::guardian::GuardianFact,
+        key: &str,
+    ) -> Option<&'a str> {
+        fact.fields
+            .iter()
+            .find(|field| field.key == key)
+            .map(|field| field.value.as_str())
     }
 
     fn assert_no_out_of_memory_sensitive_decoys(payload: &str) {
