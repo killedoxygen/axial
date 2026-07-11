@@ -207,6 +207,13 @@ export async function requestNativeAppRestart(): Promise<boolean> {
   return true;
 }
 
+export async function requestNativeAppReset(): Promise<boolean> {
+  const tauri = getTauriBinding();
+  if (!tauri?.core) return false;
+  await tauri.core.invoke('app_reset');
+  return true;
+}
+
 export async function browseDirectory(defaultPath = ''): Promise<string | null> {
   const tauri = getTauriBinding();
   if (!tauri?.dialog) return null;

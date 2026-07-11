@@ -74,7 +74,7 @@ async function init(): Promise<void> {
     let setupRequired = statusRes?.setup_required === true;
     if (setupRequired) {
       try {
-        const setupRes = await api('POST', '/setup/init', { path: '' });
+        const setupRes = await api('POST', '/setup/init');
         if (setupRes?.error) throw new Error(setupRes.error);
         configRes = {
           ...configRes,

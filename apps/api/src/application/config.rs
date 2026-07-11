@@ -17,6 +17,7 @@ const CONFIG_SAVE_ERROR_MESSAGE: &str =
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigPatch {
     username: Option<String>,
     launch_auth_mode: Option<String>,
@@ -39,8 +40,6 @@ pub struct ConfigPatch {
     music_enabled: Option<bool>,
     music_volume: Option<i32>,
     music_track: Option<i32>,
-    library_dir: Option<String>,
-    library_mode: Option<String>,
 }
 
 pub fn current_config(state: &AppState) -> AppConfig {
@@ -49,7 +48,6 @@ pub fn current_config(state: &AppState) -> AppConfig {
 
 pub async fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppConfig, ApiError> {
     let sync_offline_username = patch.username.is_some();
-    let invalidate_library_cache = patch.library_dir.is_some();
     let emit_save_failure = patch.telemetry_enabled != Some(false);
 
     match state
@@ -117,20 +115,11 @@ pub async fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppCo
             if let Some(music_track) = patch.music_track {
                 latest.music_track = music_track.max(0);
             }
-            if let Some(library_dir) = patch.library_dir {
-                latest.library_dir = library_dir;
-            }
-            if let Some(library_mode) = patch.library_mode {
-                latest.library_mode = library_mode;
-            }
             Ok(())
         })
         .await
     {
         Ok(config) => {
-            if invalidate_library_cache {
-                application::instances::invalidate_create_view_cache();
-            }
             if sync_offline_username {
                 application::sync_active_offline_account_from_username(state, &config.username)
                     .await
@@ -231,6 +220,18 @@ mod tests {
 
         assert_eq!(patch.discord_rpc_enabled, Some(false));
         assert_eq!(patch.discord_rpc_onboarding_seen, Some(true));
+    }
+
+    #[test]
+    fn config_patch_rejects_library_ownership_fields() {
+        for field in ["library_dir", "library_mode"] {
+            let error = serde_json::from_value::<ConfigPatch>(serde_json::json!({
+                (field): "caller-controlled"
+            }))
+            .expect_err("library ownership fields must not cross the generic config route");
+
+            assert!(error.to_string().contains("unknown field"));
+        }
     }
 
     #[test]

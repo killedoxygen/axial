@@ -107,11 +107,7 @@ pub use performance::{
 pub(crate) use performance::{
     performance_install, refresh_performance_rules, spawn_pending_performance_operations,
 };
-pub use setup::{
-    SetupBrowseResponse, SetupDefaultsResponse, SetupLibraryResponse, SetupPathRequest,
-    SetupStatusResponse, SetupValidateResponse, onboarding_complete, setup_browse, setup_defaults,
-    setup_init, setup_set_dir, setup_validate,
-};
+pub use setup::{SetupLibraryResponse, SetupStatusResponse, onboarding_complete, setup_init};
 pub(crate) use skin::flush_pending_saved_skin_applies_for_launch;
 pub use skin::flush_pending_saved_skin_applies_for_shutdown;
 pub use status::{StatusResponse, launcher_status};

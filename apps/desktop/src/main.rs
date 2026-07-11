@@ -73,7 +73,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     spawn_remote_flags_refresh(&state);
     let close_event_state = state.clone();
     let close_event_presence = discord_presence.clone();
-    let desktop_state = state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string());
+    let desktop_state =
+        state::DesktopState::new(env!("CARGO_PKG_VERSION").to_string(), paths.clone());
+    let close_event_desktop = desktop_state.clone();
 
     let api = match spawn_background(state.clone()).await {
         Ok(api) => api,
@@ -103,6 +105,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .invoke_handler(tauri::generate_handler![
             commands::app_version,
             commands::app_restart,
+            commands::app_reset,
             commands::api_base_url,
             commands::desktop_chrome,
             commands::microsoft_sign_in,
@@ -126,16 +129,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let window = window.clone();
                 let state = close_event_state.clone();
                 let api = close_event_api.clone();
+                let desktop = close_event_desktop.clone();
                 let discord_presence = close_event_presence.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Some(error) = commands::close_blocking_error(&state, &api).await {
-                        let _ = window.emit(
-                            events::DESKTOP_CLOSE_BLOCKED,
-                            serde_json::json!({ "error": error }),
-                        );
-                        return;
-                    }
-                    if let Err(error) = commands::prepare_for_exit_with_api(&state, &api).await {
+                    if let Err(error) = commands::request_window_close(
+                        window.app_handle().clone(),
+                        state,
+                        api,
+                        desktop,
+                    )
+                    .await
+                    {
                         let _ = window.emit(
                             events::DESKTOP_CLOSE_BLOCKED,
                             serde_json::json!({ "error": error }),
@@ -146,9 +150,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         discord_presence.shutdown_blocking();
                     })
                     .await;
-                    if let Err(error) = window.destroy() {
-                        tracing::warn!("failed to destroy window after close request: {error}");
-                    }
                 });
             }
         })

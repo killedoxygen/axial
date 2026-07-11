@@ -1,7 +1,8 @@
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { api } from '../../api';
 import { ensureFlags, refreshFlags, setFlagOverride } from '../../flags';
+import { hasNativeDesktopRuntime, requestNativeAppReset } from '../../native';
 import { Button, Toggle } from '../../ui/Atoms';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
 import { navigate } from '../../ui-state';
@@ -89,6 +90,8 @@ export function AdvancedSettingsSection(): JSX.Element {
   const savedTelemetry = cfg?.telemetry_enabled === true;
   const [telemetryEnabled, setTelemetryEnabled] = useState(savedTelemetry);
   const [savingTelemetry, setSavingTelemetry] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const resetInFlight = useRef(false);
 
   useEffect(() => {
     setTelemetryEnabled(savedTelemetry);
@@ -109,6 +112,34 @@ export function AdvancedSettingsSection(): JSX.Element {
       toast(`Could not save anonymous usage stats setting: ${errMessage(err)}`, 'error');
     } finally {
       setSavingTelemetry(false);
+    }
+  };
+
+  const resetLauncher = async (): Promise<void> => {
+    if (resetInFlight.current) return;
+    resetInFlight.current = true;
+    try {
+      const { showConfirm } = await import('../../ui/Dialog');
+      const confirmed = await showConfirm(
+        'Delete startup-detected Axial launcher files and the default managed library, then restart? External libraries and your saved Microsoft system credential are preserved.',
+        {
+          destructive: true,
+          confirmText: 'Reset',
+        },
+      );
+      if (!confirmed) {
+        resetInFlight.current = false;
+        return;
+      }
+
+      setResetting(true);
+      const requested = await requestNativeAppReset();
+      if (!requested) throw new Error('desktop runtime unavailable');
+      toast('Reset complete. Restarting Axial.');
+    } catch (err) {
+      resetInFlight.current = false;
+      setResetting(false);
+      toast(`Reset could not complete: ${errMessage(err)}`, 'error');
     }
   };
 
@@ -141,6 +172,17 @@ export function AdvancedSettingsSection(): JSX.Element {
         />
       )}
       {isDev && <PerformanceLabSlot />}
+      {isDev && hasNativeDesktopRuntime() && (
+        <SettingRow
+          title="Reset launcher"
+          description="Deletes startup-detected launcher files and the default managed library. External libraries and the saved Microsoft system credential are preserved."
+          control={
+            <Button variant="danger" icon="trash" disabled={resetting} onClick={() => void resetLauncher()}>
+              {resetting ? 'Resetting…' : 'Reset'}
+            </Button>
+          }
+        />
+      )}
     </SettingsSection>
   );
 }

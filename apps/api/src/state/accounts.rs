@@ -416,21 +416,6 @@ impl LauncherAccountStore {
         Ok(true)
     }
 
-    pub async fn clear_all(&self) -> io::Result<bool> {
-        let AccountMutation {
-            guard: mutation,
-            reconciliation,
-        } = self.begin_mutation().await?;
-        let current = self.committed_candidate()?;
-        let had_accounts = !current.accounts.is_empty() || current.active_account_id.is_some();
-        if !had_accounts {
-            return Ok(reconciled_clear_all_outcome(reconciliation.as_ref()));
-        }
-        let next = empty_index();
-        self.commit(next, mutation).await?;
-        Ok(had_accounts)
-    }
-
     pub async fn retry(&self) -> io::Result<()> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
         if self
@@ -801,15 +786,6 @@ fn reconciled_remove_all_microsoft_outcome(reconciliation: Option<&AccountReconc
     };
     remove_all_microsoft_candidate(&reconciliation.before)
         .is_some_and(|candidate| candidate == reconciliation.after)
-}
-
-fn reconciled_clear_all_outcome(reconciliation: Option<&AccountReconciliation>) -> bool {
-    let Some(reconciliation) = reconciliation else {
-        return false;
-    };
-    let had_accounts = !reconciliation.before.accounts.is_empty()
-        || reconciliation.before.active_account_id.is_some();
-    had_accounts && reconciliation.after == empty_index()
 }
 
 fn load_index(path: &Path) -> io::Result<AccountIndex> {
@@ -1393,30 +1369,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identical_clear_retry_reports_committed_success_and_reloads() {
-        let (root, paths, backend, coordinator, store) = persistence_fixture("clear-retry");
-        store
-            .create_offline_account("LocalUser")
-            .await
-            .expect("create account");
-        backend.fail_next();
-        store.clear_all().await.expect_err("clear write fails");
-
-        assert!(store.clear_all().await.expect("retry clear"));
-        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
-        assert_eq!(backend.committed_indexes().len(), 2);
-        store.close().await.expect("close account store");
-        drop(store);
-
-        let reloaded =
-            LauncherAccountStore::try_load_from_paths_with_coordinator(&paths, coordinator)
-                .expect("reload cleared accounts");
-        assert!(reloaded.list().is_empty());
-        reloaded.close().await.expect("close reloaded store");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
     async fn flush_and_close_reconcile_exact_retry_before_lifecycle_transition() {
         let (root, paths, backend, coordinator, store) = persistence_fixture("lifecycle-retry");
         backend.fail_next();
@@ -1462,7 +1414,6 @@ mod tests {
                 .expect("missing remove")
                 .is_none()
         );
-        assert!(!store.clear_all().await.expect("empty clear"));
         assert!(
             !store
                 .remove_all_microsoft_accounts()

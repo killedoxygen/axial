@@ -685,11 +685,6 @@ impl InstallStore {
             entry.changed.notify_waiters();
         }
     }
-
-    pub async fn clear(&self) {
-        self.installs.write().await.clear();
-        *self.queue.write().await = InstallQueueInner::default();
-    }
 }
 
 fn new_install_entry(key: Option<InstallKey>) -> InstallEntry {
