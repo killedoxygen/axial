@@ -14,12 +14,15 @@ pub fn classify_startup_failure_text(text: &str) -> LaunchFailureClass {
     if lower.contains("must be enabled via -xx:+unlockexperimentalvmoptions") {
         return LaunchFailureClass::JvmExperimentalUnlock;
     }
-    if lower.contains("unlock option must precede") || lower.contains("must precede") {
+    if lower.contains("unlock option must precede")
+        || lower.contains("unlockexperimentalvmoptions must precede")
+        || lower.contains("unlockdiagnosticvmoptions must precede")
+    {
         return LaunchFailureClass::JvmOptionOrdering;
     }
     if lower.contains("unsupportedclassversionerror")
         || lower.contains("compiled by a more recent version of the java runtime")
-        || lower.contains("requires java")
+        || contains_requires_java_version(&lower)
     {
         return LaunchFailureClass::JavaRuntimeMismatch;
     }
@@ -94,17 +97,19 @@ fn classify_crash_evidence(evidence: &CrashEvidence) -> Option<LaunchFailureClas
     {
         return Some(LaunchFailureClass::GraphicsDriverCrash);
     }
-    if evidence
-        .exception_class
-        .as_ref()
-        .is_some_and(|class| is_missing_dependency_exception(class.as_str()))
+    if evidence.source == CrashArtifactKind::MinecraftCrashReport
+        && evidence
+            .exception_class
+            .as_ref()
+            .is_some_and(|class| is_missing_dependency_exception(class.as_str()))
     {
         return Some(LaunchFailureClass::MissingDependency);
     }
-    if evidence
-        .exception_class
-        .as_ref()
-        .is_some_and(|class| is_mod_transformation_exception(class.as_str()))
+    if evidence.source == CrashArtifactKind::MinecraftCrashReport
+        && evidence
+            .exception_class
+            .as_ref()
+            .is_some_and(|class| is_mod_transformation_exception(class.as_str()))
     {
         return Some(LaunchFailureClass::ModTransformationFailure);
     }
@@ -195,6 +200,22 @@ fn is_mod_transformation_exception(class: &str) -> bool {
 
 fn contains_out_of_memory_failure(text: &str) -> bool {
     text.lines().any(is_out_of_memory_failure_line)
+}
+
+fn contains_requires_java_version(text: &str) -> bool {
+    text.lines().any(|line| {
+        ["requires java ", "requires java version "]
+            .into_iter()
+            .any(|marker| {
+                line.find(marker).is_some_and(|index| {
+                    line[index + marker.len()..]
+                        .trim_start()
+                        .chars()
+                        .next()
+                        .is_some_and(|character| character.is_ascii_digit())
+                })
+            })
+    })
 }
 
 fn contains_artifact_signature_failure(text: &str) -> bool {
@@ -306,6 +327,14 @@ mod tests {
                 LaunchFailureClass::JavaRuntimeMismatch,
             ),
             (
+                "Mod Example requires Java 17 or later",
+                LaunchFailureClass::JavaRuntimeMismatch,
+            ),
+            (
+                "UnlockExperimentalVMOptions must precede 'UseZGC'",
+                LaunchFailureClass::JvmOptionOrdering,
+            ),
+            (
                 "Caused by: java.lang.NoClassDefFoundError: org/lwjgl/glfw/GLFW",
                 LaunchFailureClass::ClasspathModuleConflict,
             ),
@@ -331,6 +360,14 @@ mod tests {
             ),
             (
                 "[EARLYDISPLAY/]: If this message is the only thing at the bottom of your log before a crash, you probably have a driver issue.",
+                LaunchFailureClass::Unknown,
+            ),
+            (
+                "This troubleshooting guide requires Java knowledge",
+                LaunchFailureClass::Unknown,
+            ),
+            (
+                "The Example mod must precede another mod in the load order",
                 LaunchFailureClass::Unknown,
             ),
             (
@@ -651,6 +688,49 @@ mod tests {
         assert_eq!(
             classify_launch_failure(&[], Some(1), Some(&fatal)),
             Some(LaunchFailureClass::Unknown)
+        );
+    }
+
+    #[test]
+    fn typed_exception_and_native_evidence_require_their_declared_source() {
+        let mut missing = report(
+            "Description: Loading game\nnet.minecraftforge.fml.common.MissingModsException: missing",
+        );
+        missing.source = CrashArtifactKind::JvmFatalError;
+        assert_eq!(
+            classify_launch_failure(&[], Some(1), Some(&missing)),
+            Some(LaunchFailureClass::Unknown)
+        );
+
+        let mut graphics = hs_err('C', "nvoglv64");
+        graphics.source = CrashArtifactKind::MinecraftCrashReport;
+        assert_eq!(
+            classify_launch_failure(&[], Some(1), Some(&graphics)),
+            Some(LaunchFailureClass::Unknown)
+        );
+    }
+
+    #[test]
+    fn truncated_reports_keep_exact_exception_and_oom_evidence_only() {
+        let mut raw = b"Description: Loading game\nnet.minecraftforge.fml.common.MissingModsException: missing\n".to_vec();
+        raw.resize(MAX_CRASH_ARTIFACT_BYTES + 1, b'x');
+        let missing = parse_crash_evidence(CrashArtifactKind::MinecraftCrashReport, &raw)
+            .expect("truncated missing-dependency evidence");
+        assert!(missing.truncated);
+        assert_eq!(
+            classify_launch_failure(&[], Some(1), Some(&missing)),
+            Some(LaunchFailureClass::MissingDependency)
+        );
+
+        let mut raw =
+            b"Description: Rendering game\njava.lang.OutOfMemoryError: Java heap space\n".to_vec();
+        raw.resize(MAX_CRASH_ARTIFACT_BYTES + 1, b'x');
+        let oom = parse_crash_evidence(CrashArtifactKind::MinecraftCrashReport, &raw)
+            .expect("truncated out-of-memory evidence");
+        assert!(oom.truncated);
+        assert_eq!(
+            classify_launch_failure(&[], Some(1), Some(&oom)),
+            Some(LaunchFailureClass::OutOfMemory)
         );
     }
 }
