@@ -1,6 +1,6 @@
 use super::{
     Diagnosis, DiagnosisId, GuardianActionKind, GuardianConfidence, GuardianDecision,
-    GuardianDomain, GuardianImpactVector, GuardianLaunchRecoveryDirective,
+    GuardianDomain, GuardianFactId, GuardianImpactVector, GuardianLaunchRecoveryDirective,
     GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind, GuardianMode, GuardianPolicyContext,
     GuardianSeverity, GuardianUserOutcome, SafetyCase, decide_guardian_policy,
 };
@@ -109,7 +109,7 @@ pub fn guardian_prelaunch_preset_adjustment_directive(
         confidence: GuardianConfidence::Confirmed,
         ownership,
         phase: OperationPhase::Preparing,
-        fact_ids: vec!["jvm_preset_compatibility_adjusted".to_string()],
+        fact_ids: vec![GuardianFactId::JvmPresetCompatibilityAdjusted],
         affected_targets: vec![target(GuardianDomain::Jvm, "jvm_preset", ownership)],
         impact: GuardianImpactVector {
             launchability_impact: 0.65,
@@ -320,7 +320,7 @@ fn prepare_failure_diagnosis(request: &GuardianPrepareFailureRequest<'_>) -> Dia
             confidence: GuardianConfidence::Confirmed,
             ownership: java_override_ownership(request.explicit_java_override_present),
             phase: OperationPhase::Preparing,
-            fact_ids: vec!["java_major_mismatch".to_string()],
+            fact_ids: vec![GuardianFactId::JavaMajorMismatch],
             affected_targets: vec![target(
                 GuardianDomain::Runtime,
                 "explicit_java_override",
@@ -339,7 +339,7 @@ fn prepare_failure_diagnosis(request: &GuardianPrepareFailureRequest<'_>) -> Dia
             confidence: GuardianConfidence::Confirmed,
             ownership: jvm_override_ownership(request.explicit_jvm_args_present),
             phase: OperationPhase::Preparing,
-            fact_ids: vec![jvm_failure_fact_id(request.failure_class).to_string()],
+            fact_ids: vec![failure_class_fact_id(request.failure_class)],
             affected_targets: vec![target(
                 GuardianDomain::Jvm,
                 "explicit_jvm_args",
@@ -371,7 +371,7 @@ fn startup_failure_diagnosis(
             confidence: GuardianConfidence::High,
             ownership: OwnershipClass::LauncherManaged,
             phase: OperationPhase::Launching,
-            fact_ids: vec!["startup_window_expired".to_string()],
+            fact_ids: vec![GuardianFactId::StartupWindowExpired],
             affected_targets: vec![target(
                 GuardianDomain::Startup,
                 "startup_monitoring",
@@ -395,8 +395,8 @@ fn startup_failure_diagnosis(
                 ownership: jvm_startup_ownership(request),
                 phase: OperationPhase::Launching,
                 fact_ids: vec![
-                    "process_exited_before_boot".to_string(),
-                    jvm_failure_fact_id(failure_class).to_string(),
+                    GuardianFactId::ProcessExitedBeforeBoot,
+                    failure_class_fact_id(failure_class),
                 ],
                 affected_targets: vec![target(
                     GuardianDomain::Jvm,
@@ -415,8 +415,8 @@ fn startup_failure_diagnosis(
                 ownership: java_override_ownership(request.explicit_java_override_present),
                 phase: OperationPhase::Launching,
                 fact_ids: vec![
-                    "process_exited_before_boot".to_string(),
-                    "java_major_mismatch".to_string(),
+                    GuardianFactId::ProcessExitedBeforeBoot,
+                    GuardianFactId::JavaMajorMismatch,
                 ],
                 affected_targets: vec![target(
                     GuardianDomain::Runtime,
@@ -465,8 +465,8 @@ fn startup_failure_diagnosis(
                 ownership: OwnershipClass::LauncherManaged,
                 phase: OperationPhase::Launching,
                 fact_ids: vec![
-                    "process_exited_before_boot".to_string(),
-                    failure_class_fact_id(failure_class).to_string(),
+                    GuardianFactId::ProcessExitedBeforeBoot,
+                    failure_class_fact_id(failure_class),
                 ],
                 affected_targets: vec![target(
                     GuardianDomain::Download,
@@ -815,7 +815,7 @@ fn blocking_launch_diagnosis(
         },
         ownership: OwnershipClass::LauncherManaged,
         phase,
-        fact_ids: vec![failure_class_fact_id(failure_class).to_string()],
+        fact_ids: vec![failure_class_fact_id(failure_class)],
         affected_targets: vec![target(
             GuardianDomain::Launch,
             target_id,
@@ -870,8 +870,8 @@ fn blocking_startup_diagnosis_with_ownership(
         ownership,
         phase: OperationPhase::Launching,
         fact_ids: vec![
-            "process_exited_before_boot".to_string(),
-            failure_class_fact_id(failure_class).to_string(),
+            GuardianFactId::ProcessExitedBeforeBoot,
+            failure_class_fact_id(failure_class),
         ],
         affected_targets: vec![target(GuardianDomain::Startup, target_id, ownership)],
         impact: GuardianImpactVector::launch_blocking(),
@@ -947,34 +947,27 @@ fn jvm_failure_diagnosis_id(failure_class: LaunchFailureClass) -> &'static str {
     }
 }
 
-fn jvm_failure_fact_id(failure_class: LaunchFailureClass) -> &'static str {
+fn failure_class_fact_id(failure_class: LaunchFailureClass) -> GuardianFactId {
     match failure_class {
-        LaunchFailureClass::JvmOptionOrdering => "jvm_arg_unlock_order_invalid",
-        LaunchFailureClass::JvmExperimentalUnlock => "jvm_arg_experimental_unlock_missing",
-        LaunchFailureClass::JvmUnsupportedOption => "jvm_arg_unsupported",
-        _ => "jvm_failure",
-    }
-}
-
-fn failure_class_fact_id(failure_class: LaunchFailureClass) -> &'static str {
-    match failure_class {
-        LaunchFailureClass::JavaRuntimeMismatch => "java_major_mismatch",
-        LaunchFailureClass::JvmUnsupportedOption => "jvm_arg_unsupported",
-        LaunchFailureClass::JvmExperimentalUnlock => "jvm_arg_experimental_unlock_missing",
-        LaunchFailureClass::JvmOptionOrdering => "jvm_arg_unlock_order_invalid",
-        LaunchFailureClass::OutOfMemory => "out_of_memory",
-        LaunchFailureClass::GraphicsDriverCrash => "graphics_driver_crash",
-        LaunchFailureClass::MissingDependency => "missing_dependency",
-        LaunchFailureClass::ModTransformationFailure => "mod_transformation_failure",
-        LaunchFailureClass::ModAttributedCrash => "mod_attributed_crash",
-        LaunchFailureClass::ClasspathModuleConflict => "classpath_module_conflict",
-        LaunchFailureClass::LauncherManagedArtifactSignature => {
-            "launcher_managed_artifact_signature_corruption"
+        LaunchFailureClass::JavaRuntimeMismatch => GuardianFactId::JavaMajorMismatch,
+        LaunchFailureClass::JvmUnsupportedOption => GuardianFactId::JvmArgUnsupported,
+        LaunchFailureClass::JvmExperimentalUnlock => {
+            GuardianFactId::JvmArgExperimentalUnlockMissing
         }
-        LaunchFailureClass::AuthModeIncompatible => "auth_mode_incompatible",
-        LaunchFailureClass::LoaderBootstrapFailure => "loader_bootstrap_failure",
-        LaunchFailureClass::StartupStalled => "startup_window_expired",
-        LaunchFailureClass::Unknown => "unknown_launch_failure",
+        LaunchFailureClass::JvmOptionOrdering => GuardianFactId::JvmArgUnlockOrderInvalid,
+        LaunchFailureClass::OutOfMemory => GuardianFactId::OutOfMemory,
+        LaunchFailureClass::GraphicsDriverCrash => GuardianFactId::GraphicsDriverCrash,
+        LaunchFailureClass::MissingDependency => GuardianFactId::MissingDependency,
+        LaunchFailureClass::ModTransformationFailure => GuardianFactId::ModTransformationFailure,
+        LaunchFailureClass::ModAttributedCrash => GuardianFactId::ModAttributedCrash,
+        LaunchFailureClass::ClasspathModuleConflict => GuardianFactId::ClasspathModuleConflict,
+        LaunchFailureClass::LauncherManagedArtifactSignature => {
+            GuardianFactId::LauncherManagedArtifactSignatureCorruption
+        }
+        LaunchFailureClass::AuthModeIncompatible => GuardianFactId::AuthModeIncompatible,
+        LaunchFailureClass::LoaderBootstrapFailure => GuardianFactId::LoaderBootstrapFailure,
+        LaunchFailureClass::StartupStalled => GuardianFactId::StartupWindowExpired,
+        LaunchFailureClass::Unknown => GuardianFactId::UnknownLaunchFailure,
     }
 }
 
@@ -1206,7 +1199,7 @@ mod tests {
         guardian_startup_failure_outcome,
     };
     use crate::guardian::{
-        GuardianActionKind, GuardianLaunchRecoveryKind, GuardianMode,
+        GuardianActionKind, GuardianFactId, GuardianLaunchRecoveryKind, GuardianMode,
         conservative_launch_recovery_preset,
     };
     use crate::state::contracts::{OperationPhase, OwnershipClass};
@@ -1465,8 +1458,7 @@ mod tests {
         assert!(
             outcome.safety_case.diagnoses[0]
                 .fact_ids
-                .iter()
-                .any(|fact_id| fact_id == "out_of_memory")
+                .contains(&GuardianFactId::OutOfMemory)
         );
         assert!(outcome.directive.is_none());
         assert_eq!(

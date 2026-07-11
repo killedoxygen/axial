@@ -11,12 +11,12 @@ const UNKNOWN_DIAGNOSIS_THRESHOLD: f32 = 0.45;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FactRequirement {
-    Any(&'static [&'static str]),
+    Any(&'static [GuardianFactId]),
     ProcessLifecycle,
 }
 
 impl FactRequirement {
-    pub(super) fn matches_fact_id(self, fact_id: &str) -> bool {
+    pub(super) fn matches_fact_id(self, fact_id: GuardianFactId) -> bool {
         match self {
             Self::Any(fact_ids) => fact_ids.contains(&fact_id),
             Self::ProcessLifecycle => is_process_fact(fact_id),
@@ -26,12 +26,12 @@ impl FactRequirement {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct WeightedFact {
-    pub(super) fact_id: &'static str,
+    pub(super) fact_id: GuardianFactId,
     pub(super) weight: f32,
 }
 
 impl WeightedFact {
-    const fn new(fact_id: &'static str, weight: f32) -> Self {
+    const fn new(fact_id: GuardianFactId, weight: f32) -> Self {
         Self { fact_id, weight }
     }
 }
@@ -200,14 +200,16 @@ impl DiagnosisGraphNode {
     pub(super) fn matches_fact(&self, fact: &GuardianFact) -> bool {
         self.required_facts
             .iter()
-            .any(|required| required.matches_fact_id(fact.id.as_str()))
+            .any(|required| required.matches_fact_id(fact.id))
     }
 
     pub(super) fn diagnosis_id(&self, fact: &GuardianFact) -> String {
         match self.id {
             DiagnosisIdTemplate::Static(id) => id.to_string(),
             DiagnosisIdTemplate::FactId => fact.id.as_str().to_string(),
-            DiagnosisIdTemplate::Readiness => readiness_diagnosis_id(fact.id.as_str()).to_string(),
+            DiagnosisIdTemplate::Readiness => readiness_diagnosis_id(fact.id)
+                .expect("readiness graph must admit only mapped fact ids")
+                .to_string(),
         }
     }
 
@@ -249,7 +251,7 @@ impl DiagnosisGraphNode {
             },
             ImpactTemplate::Readiness => GuardianImpactVector {
                 launchability_impact: 0.95,
-                state_corruption_impact: readiness_state_corruption_impact(fact.id.as_str()),
+                state_corruption_impact: readiness_state_corruption_impact(fact.id),
                 ..GuardianImpactVector::default()
             },
             ImpactTemplate::ResourcePressure => GuardianImpactVector {
@@ -287,7 +289,7 @@ impl DiagnosisGraphNode {
             },
             ImpactTemplate::PerformanceHealth => GuardianImpactVector {
                 launchability_impact: 0.35,
-                state_corruption_impact: if fact.id.as_str() == "performance_health_invalid" {
+                state_corruption_impact: if fact.id == GuardianFactId::PerformanceHealthInvalid {
                     0.75
                 } else {
                     0.35
@@ -332,17 +334,16 @@ impl DiagnosisGraphNode {
         fact: &GuardianFact,
         phase: OperationPhase,
     ) -> DiagnosisGraphEvaluation {
-        let required_fact_satisfied = self.required_facts.iter().all(|required| {
-            facts
-                .iter()
-                .any(|fact| required.matches_fact_id(fact.id.as_str()))
-        });
+        let required_fact_satisfied = self
+            .required_facts
+            .iter()
+            .all(|required| facts.iter().any(|fact| required.matches_fact_id(fact.id)));
         let direct_fact_count = facts
             .iter()
             .filter(|fact| {
                 self.required_facts
                     .iter()
-                    .any(|required| required.matches_fact_id(fact.id.as_str()))
+                    .any(|required| required.matches_fact_id(fact.id))
             })
             .count();
         let support_score = noisy_or(self.supporting_facts, facts);
@@ -387,7 +388,7 @@ fn noisy_or(weighted_facts: &[WeightedFact], facts: &[GuardianFact]) -> f32 {
         .flat_map(|weighted_fact| {
             facts
                 .iter()
-                .filter(move |fact| fact.id.as_str() == weighted_fact.fact_id)
+                .filter(move |fact| fact.id == weighted_fact.fact_id)
                 .map(move |fact| {
                     1.0 - (weighted_fact.weight * reliability_score(fact.reliability))
                         .clamp(0.0, 1.0)
@@ -460,8 +461,8 @@ const STATE_PHASES: &[OperationPhase] = &[
 const ANY_OWNERSHIP: &[OwnershipClass] = &[];
 
 const PROCESS_CONTRADICTIONS: &[WeightedFact] = &[
-    WeightedFact::new("boot_marker_observed", 0.65),
-    WeightedFact::new("launcher_stop_requested", 0.85),
+    WeightedFact::new(GuardianFactId::BootMarkerObserved, 0.65),
+    WeightedFact::new(GuardianFactId::LauncherStopRequested, 0.85),
 ];
 const NO_CONTRADICTIONS: &[WeightedFact] = &[];
 
@@ -575,14 +576,14 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::Static("java_override_unavailable"),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
         required_facts: &[FactRequirement::Any(&[
-            "java_override_empty",
-            "java_override_missing",
-            "java_override_undefined_sentinel",
+            GuardianFactId::JavaOverrideEmpty,
+            GuardianFactId::JavaOverrideMissing,
+            GuardianFactId::JavaOverrideUndefinedSentinel,
         ])],
         supporting_facts: &[
-            WeightedFact::new("java_override_empty", 1.0),
-            WeightedFact::new("java_override_missing", 1.0),
-            WeightedFact::new("java_override_undefined_sentinel", 1.0),
+            WeightedFact::new(GuardianFactId::JavaOverrideEmpty, 1.0),
+            WeightedFact::new(GuardianFactId::JavaOverrideMissing, 1.0),
+            WeightedFact::new(GuardianFactId::JavaOverrideUndefinedSentinel, 1.0),
         ],
         contradicting_facts: PROCESS_CONTRADICTIONS,
         phase_allowed: RUNTIME_PHASES,
@@ -602,8 +603,8 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("java_probe_failed"),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
-        required_facts: &[FactRequirement::Any(&["java_probe_failed"])],
-        supporting_facts: &[WeightedFact::new("java_probe_failed", 1.0)],
+        required_facts: &[FactRequirement::Any(&[GuardianFactId::JavaProbeFailed])],
+        supporting_facts: &[WeightedFact::new(GuardianFactId::JavaProbeFailed, 1.0)],
         contradicting_facts: PROCESS_CONTRADICTIONS,
         phase_allowed: RUNTIME_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -618,8 +619,8 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("java_runtime_major_mismatch"),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
-        required_facts: &[FactRequirement::Any(&["java_major_mismatch"])],
-        supporting_facts: &[WeightedFact::new("java_major_mismatch", 1.0)],
+        required_facts: &[FactRequirement::Any(&[GuardianFactId::JavaMajorMismatch])],
+        supporting_facts: &[WeightedFact::new(GuardianFactId::JavaMajorMismatch, 1.0)],
         contradicting_facts: PROCESS_CONTRADICTIONS,
         phase_allowed: RUNTIME_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -634,8 +635,8 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("java_runtime_update_too_old"),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
-        required_facts: &[FactRequirement::Any(&["java_update_too_old"])],
-        supporting_facts: &[WeightedFact::new("java_update_too_old", 1.0)],
+        required_facts: &[FactRequirement::Any(&[GuardianFactId::JavaUpdateTooOld])],
+        supporting_facts: &[WeightedFact::new(GuardianFactId::JavaUpdateTooOld, 1.0)],
         contradicting_facts: PROCESS_CONTRADICTIONS,
         phase_allowed: RUNTIME_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -650,8 +651,13 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("managed_runtime_missing"),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
-        required_facts: &[FactRequirement::Any(&["managed_runtime_missing"])],
-        supporting_facts: &[WeightedFact::new("managed_runtime_missing", 0.75)],
+        required_facts: &[FactRequirement::Any(&[
+            GuardianFactId::ManagedRuntimeMissing,
+        ])],
+        supporting_facts: &[WeightedFact::new(
+            GuardianFactId::ManagedRuntimeMissing,
+            0.75,
+        )],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: RUNTIME_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -667,10 +673,10 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::Static("managed_runtime_unavailable_for_platform"),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
         required_facts: &[FactRequirement::Any(&[
-            "managed_runtime_unavailable_for_platform",
+            GuardianFactId::ManagedRuntimeUnavailableForPlatform,
         ])],
         supporting_facts: &[WeightedFact::new(
-            "managed_runtime_unavailable_for_platform",
+            GuardianFactId::ManagedRuntimeUnavailableForPlatform,
             1.0,
         )],
         contradicting_facts: NO_CONTRADICTIONS,
@@ -687,8 +693,13 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("managed_runtime_rosetta_required"),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
-        required_facts: &[FactRequirement::Any(&["managed_runtime_rosetta_required"])],
-        supporting_facts: &[WeightedFact::new("managed_runtime_rosetta_required", 1.0)],
+        required_facts: &[FactRequirement::Any(&[
+            GuardianFactId::ManagedRuntimeRosettaRequired,
+        ])],
+        supporting_facts: &[WeightedFact::new(
+            GuardianFactId::ManagedRuntimeRosettaRequired,
+            1.0,
+        )],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: DOWNLOAD_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -704,12 +715,12 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::Static("managed_runtime_corrupt"),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
         required_facts: &[FactRequirement::Any(&[
-            "managed_runtime_ready_marker_missing",
-            "managed_runtime_corrupt",
+            GuardianFactId::ManagedRuntimeReadyMarkerMissing,
+            GuardianFactId::ManagedRuntimeCorrupt,
         ])],
         supporting_facts: &[
-            WeightedFact::new("managed_runtime_ready_marker_missing", 1.0),
-            WeightedFact::new("managed_runtime_corrupt", 1.0),
+            WeightedFact::new(GuardianFactId::ManagedRuntimeReadyMarkerMissing, 1.0),
+            WeightedFact::new(GuardianFactId::ManagedRuntimeCorrupt, 1.0),
         ],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: RUNTIME_PHASES,
@@ -726,20 +737,20 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::Readiness,
         domain: DomainTemplate::Static(GuardianDomain::Install),
         required_facts: &[FactRequirement::Any(&[
-            "version_json_missing",
-            "parent_version_missing",
-            "incomplete_install",
-            "client_jar_missing",
-            "libraries_missing",
-            "asset_index_missing",
+            GuardianFactId::VersionJsonMissing,
+            GuardianFactId::ParentVersionMissing,
+            GuardianFactId::IncompleteInstall,
+            GuardianFactId::ClientJarMissing,
+            GuardianFactId::LibrariesMissing,
+            GuardianFactId::AssetIndexMissing,
         ])],
         supporting_facts: &[
-            WeightedFact::new("version_json_missing", 1.0),
-            WeightedFact::new("parent_version_missing", 1.0),
-            WeightedFact::new("incomplete_install", 1.0),
-            WeightedFact::new("client_jar_missing", 1.0),
-            WeightedFact::new("libraries_missing", 1.0),
-            WeightedFact::new("asset_index_missing", 1.0),
+            WeightedFact::new(GuardianFactId::VersionJsonMissing, 1.0),
+            WeightedFact::new(GuardianFactId::ParentVersionMissing, 1.0),
+            WeightedFact::new(GuardianFactId::IncompleteInstall, 1.0),
+            WeightedFact::new(GuardianFactId::ClientJarMissing, 1.0),
+            WeightedFact::new(GuardianFactId::LibrariesMissing, 1.0),
+            WeightedFact::new(GuardianFactId::AssetIndexMissing, 1.0),
         ],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: INSTALL_PHASES,
@@ -755,8 +766,10 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("launch_command_invalid"),
         domain: DomainTemplate::Static(GuardianDomain::Launch),
-        required_facts: &[FactRequirement::Any(&["launch_command_invalid"])],
-        supporting_facts: &[WeightedFact::new("launch_command_invalid", 1.0)],
+        required_facts: &[FactRequirement::Any(&[
+            GuardianFactId::LaunchCommandInvalid,
+        ])],
+        supporting_facts: &[WeightedFact::new(GuardianFactId::LaunchCommandInvalid, 1.0)],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: LAUNCH_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -771,8 +784,13 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("launch_command_prepared"),
         domain: DomainTemplate::Static(GuardianDomain::Launch),
-        required_facts: &[FactRequirement::Any(&["launch_command_prepared"])],
-        supporting_facts: &[WeightedFact::new("launch_command_prepared", 1.0)],
+        required_facts: &[FactRequirement::Any(&[
+            GuardianFactId::LaunchCommandPrepared,
+        ])],
+        supporting_facts: &[WeightedFact::new(
+            GuardianFactId::LaunchCommandPrepared,
+            1.0,
+        )],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: LAUNCH_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -788,20 +806,20 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::FactId,
         domain: DomainTemplate::FactDomain,
         required_facts: &[FactRequirement::Any(&[
-            "launch_memory_min_clamped",
-            "launch_memory_allocation_low",
-            "launch_resource_memory_pressure",
-            "launch_resource_cpu_pressure",
-            "launch_resource_install_pressure",
-            "launch_resource_disk_pressure",
+            GuardianFactId::LaunchMemoryMinClamped,
+            GuardianFactId::LaunchMemoryAllocationLow,
+            GuardianFactId::LaunchResourceMemoryPressure,
+            GuardianFactId::LaunchResourceCpuPressure,
+            GuardianFactId::LaunchResourceInstallPressure,
+            GuardianFactId::LaunchResourceDiskPressure,
         ])],
         supporting_facts: &[
-            WeightedFact::new("launch_memory_min_clamped", 0.70),
-            WeightedFact::new("launch_memory_allocation_low", 0.70),
-            WeightedFact::new("launch_resource_memory_pressure", 0.70),
-            WeightedFact::new("launch_resource_cpu_pressure", 0.70),
-            WeightedFact::new("launch_resource_install_pressure", 0.70),
-            WeightedFact::new("launch_resource_disk_pressure", 0.70),
+            WeightedFact::new(GuardianFactId::LaunchMemoryMinClamped, 0.70),
+            WeightedFact::new(GuardianFactId::LaunchMemoryAllocationLow, 0.70),
+            WeightedFact::new(GuardianFactId::LaunchResourceMemoryPressure, 0.70),
+            WeightedFact::new(GuardianFactId::LaunchResourceCpuPressure, 0.70),
+            WeightedFact::new(GuardianFactId::LaunchResourceInstallPressure, 0.70),
+            WeightedFact::new(GuardianFactId::LaunchResourceDiskPressure, 0.70),
         ],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: LAUNCH_PHASES,
@@ -818,14 +836,14 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::FactId,
         domain: DomainTemplate::FactDomain,
         required_facts: &[FactRequirement::Any(&[
-            "custom_java_override_present",
-            "custom_jvm_preset_present",
-            "custom_jvm_args_present",
+            GuardianFactId::CustomJavaOverridePresent,
+            GuardianFactId::CustomJvmPresetPresent,
+            GuardianFactId::CustomJvmArgsPresent,
         ])],
         supporting_facts: &[
-            WeightedFact::new("custom_java_override_present", 0.80),
-            WeightedFact::new("custom_jvm_preset_present", 0.80),
-            WeightedFact::new("custom_jvm_args_present", 0.80),
+            WeightedFact::new(GuardianFactId::CustomJavaOverridePresent, 0.80),
+            WeightedFact::new(GuardianFactId::CustomJvmPresetPresent, 0.80),
+            WeightedFact::new(GuardianFactId::CustomJvmArgsPresent, 0.80),
         ],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: LAUNCH_PHASES,
@@ -841,8 +859,8 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("jvm_args_empty"),
         domain: DomainTemplate::Static(GuardianDomain::Jvm),
-        required_facts: &[FactRequirement::Any(&["jvm_args_empty"])],
-        supporting_facts: &[WeightedFact::new("jvm_args_empty", 1.0)],
+        required_facts: &[FactRequirement::Any(&[GuardianFactId::JvmArgsEmpty])],
+        supporting_facts: &[WeightedFact::new(GuardianFactId::JvmArgsEmpty, 1.0)],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: JVM_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -857,8 +875,8 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("jvm_args_malformed"),
         domain: DomainTemplate::Static(GuardianDomain::Jvm),
-        required_facts: &[FactRequirement::Any(&["jvm_args_parse_failed"])],
-        supporting_facts: &[WeightedFact::new("jvm_args_parse_failed", 1.0)],
+        required_facts: &[FactRequirement::Any(&[GuardianFactId::JvmArgsParseFailed])],
+        supporting_facts: &[WeightedFact::new(GuardianFactId::JvmArgsParseFailed, 1.0)],
         contradicting_facts: PROCESS_CONTRADICTIONS,
         phase_allowed: JVM_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -878,12 +896,12 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::Static("jvm_arg_unsupported"),
         domain: DomainTemplate::Static(GuardianDomain::Jvm),
         required_facts: &[FactRequirement::Any(&[
-            "jvm_arg_unsupported_gc",
-            "jvm_arg_unlock_order_invalid",
+            GuardianFactId::JvmArgUnsupportedGc,
+            GuardianFactId::JvmArgUnlockOrderInvalid,
         ])],
         supporting_facts: &[
-            WeightedFact::new("jvm_arg_unsupported_gc", 1.0),
-            WeightedFact::new("jvm_arg_unlock_order_invalid", 1.0),
+            WeightedFact::new(GuardianFactId::JvmArgUnsupportedGc, 1.0),
+            WeightedFact::new(GuardianFactId::JvmArgUnlockOrderInvalid, 1.0),
         ],
         contradicting_facts: PROCESS_CONTRADICTIONS,
         phase_allowed: JVM_PHASES,
@@ -904,18 +922,18 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::Static("jvm_arg_unsafe_override"),
         domain: DomainTemplate::Static(GuardianDomain::Jvm),
         required_facts: &[FactRequirement::Any(&[
-            "jvm_arg_reserved_launcher_flag",
-            "jvm_arg_memory_conflict",
-            "jvm_arg_unsafe_classpath_override",
-            "jvm_arg_unsafe_native_path_override",
-            "jvm_arg_agent_override",
+            GuardianFactId::JvmArgReservedLauncherFlag,
+            GuardianFactId::JvmArgMemoryConflict,
+            GuardianFactId::JvmArgUnsafeClasspathOverride,
+            GuardianFactId::JvmArgUnsafeNativePathOverride,
+            GuardianFactId::JvmArgAgentOverride,
         ])],
         supporting_facts: &[
-            WeightedFact::new("jvm_arg_reserved_launcher_flag", 1.0),
-            WeightedFact::new("jvm_arg_memory_conflict", 1.0),
-            WeightedFact::new("jvm_arg_unsafe_classpath_override", 1.0),
-            WeightedFact::new("jvm_arg_unsafe_native_path_override", 1.0),
-            WeightedFact::new("jvm_arg_agent_override", 1.0),
+            WeightedFact::new(GuardianFactId::JvmArgReservedLauncherFlag, 1.0),
+            WeightedFact::new(GuardianFactId::JvmArgMemoryConflict, 1.0),
+            WeightedFact::new(GuardianFactId::JvmArgUnsafeClasspathOverride, 1.0),
+            WeightedFact::new(GuardianFactId::JvmArgUnsafeNativePathOverride, 1.0),
+            WeightedFact::new(GuardianFactId::JvmArgAgentOverride, 1.0),
         ],
         contradicting_facts: PROCESS_CONTRADICTIONS,
         phase_allowed: JVM_PHASES,
@@ -936,10 +954,10 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::Static("launcher_managed_artifact_signature_corrupt"),
         domain: DomainTemplate::FactDomain,
         required_facts: &[FactRequirement::Any(&[
-            "launcher_managed_artifact_signature_corruption",
+            GuardianFactId::LauncherManagedArtifactSignatureCorruption,
         ])],
         supporting_facts: &[WeightedFact::new(
-            "launcher_managed_artifact_signature_corruption",
+            GuardianFactId::LauncherManagedArtifactSignatureCorruption,
             1.0,
         )],
         contradicting_facts: NO_CONTRADICTIONS,
@@ -959,14 +977,14 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::Static("launcher_managed_artifact_corrupt"),
         domain: DomainTemplate::FactDomain,
         required_facts: &[FactRequirement::Any(&[
-            "artifact_checksum_mismatch",
-            "artifact_size_mismatch",
-            "managed_file_corrupt",
+            GuardianFactId::ArtifactChecksumMismatch,
+            GuardianFactId::ArtifactSizeMismatch,
+            GuardianFactId::ManagedFileCorrupt,
         ])],
         supporting_facts: &[
-            WeightedFact::new("artifact_checksum_mismatch", 1.0),
-            WeightedFact::new("artifact_size_mismatch", 1.0),
-            WeightedFact::new("managed_file_corrupt", 1.0),
+            WeightedFact::new(GuardianFactId::ArtifactChecksumMismatch, 1.0),
+            WeightedFact::new(GuardianFactId::ArtifactSizeMismatch, 1.0),
+            WeightedFact::new(GuardianFactId::ManagedFileCorrupt, 1.0),
         ],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: DOWNLOAD_PHASES,
@@ -986,8 +1004,8 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("launcher_managed_artifact_corrupt"),
         domain: DomainTemplate::FactDomain,
-        required_facts: &[FactRequirement::Any(&["artifact_missing"])],
-        supporting_facts: &[WeightedFact::new("artifact_missing", 0.80)],
+        required_facts: &[FactRequirement::Any(&[GuardianFactId::ArtifactMissing])],
+        supporting_facts: &[WeightedFact::new(GuardianFactId::ArtifactMissing, 0.80)],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: DOWNLOAD_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -1006,8 +1024,8 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("install_artifact_metadata_invalid"),
         domain: DomainTemplate::Static(GuardianDomain::Install),
-        required_facts: &[FactRequirement::Any(&["provider_data_invalid"])],
-        supporting_facts: &[WeightedFact::new("provider_data_invalid", 1.0)],
+        required_facts: &[FactRequirement::Any(&[GuardianFactId::ProviderDataInvalid])],
+        supporting_facts: &[WeightedFact::new(GuardianFactId::ProviderDataInvalid, 1.0)],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: INSTALL_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -1022,8 +1040,13 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("install_dependency_failed"),
         domain: DomainTemplate::Static(GuardianDomain::Install),
-        required_facts: &[FactRequirement::Any(&["install_dependency_failed"])],
-        supporting_facts: &[WeightedFact::new("install_dependency_failed", 1.0)],
+        required_facts: &[FactRequirement::Any(&[
+            GuardianFactId::InstallDependencyFailed,
+        ])],
+        supporting_facts: &[WeightedFact::new(
+            GuardianFactId::InstallDependencyFailed,
+            1.0,
+        )],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: DOWNLOAD_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -1039,12 +1062,12 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::Static("download_unavailable"),
         domain: DomainTemplate::Static(GuardianDomain::Download),
         required_facts: &[FactRequirement::Any(&[
-            "download_provider_unavailable",
-            "download_interrupted",
+            GuardianFactId::DownloadProviderUnavailable,
+            GuardianFactId::DownloadInterrupted,
         ])],
         supporting_facts: &[
-            WeightedFact::new("download_provider_unavailable", 0.80),
-            WeightedFact::new("download_interrupted", 0.80),
+            WeightedFact::new(GuardianFactId::DownloadProviderUnavailable, 0.80),
+            WeightedFact::new(GuardianFactId::DownloadInterrupted, 0.80),
         ],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: DOWNLOAD_PHASES,
@@ -1064,8 +1087,13 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("filesystem_permission_denied"),
         domain: DomainTemplate::Static(GuardianDomain::Filesystem),
-        required_facts: &[FactRequirement::Any(&["filesystem_permission_denied"])],
-        supporting_facts: &[WeightedFact::new("filesystem_permission_denied", 1.0)],
+        required_facts: &[FactRequirement::Any(&[
+            GuardianFactId::FilesystemPermissionDenied,
+        ])],
+        supporting_facts: &[WeightedFact::new(
+            GuardianFactId::FilesystemPermissionDenied,
+            1.0,
+        )],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: INSTALL_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -1080,8 +1108,8 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("temp_file_leftover"),
         domain: DomainTemplate::Static(GuardianDomain::Filesystem),
-        required_facts: &[FactRequirement::Any(&["temp_file_leftover"])],
-        supporting_facts: &[WeightedFact::new("temp_file_leftover", 1.0)],
+        required_facts: &[FactRequirement::Any(&[GuardianFactId::TempFileLeftover])],
+        supporting_facts: &[WeightedFact::new(GuardianFactId::TempFileLeftover, 1.0)],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: DOWNLOAD_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -1096,8 +1124,13 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("atomic_promotion_failed"),
         domain: DomainTemplate::Static(GuardianDomain::Filesystem),
-        required_facts: &[FactRequirement::Any(&["atomic_promotion_failed"])],
-        supporting_facts: &[WeightedFact::new("atomic_promotion_failed", 1.0)],
+        required_facts: &[FactRequirement::Any(&[
+            GuardianFactId::AtomicPromotionFailed,
+        ])],
+        supporting_facts: &[WeightedFact::new(
+            GuardianFactId::AtomicPromotionFailed,
+            1.0,
+        )],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: DOWNLOAD_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -1113,12 +1146,12 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::Static("artifact_ownership_unsafe"),
         domain: DomainTemplate::Static(GuardianDomain::Filesystem),
         required_facts: &[FactRequirement::Any(&[
-            "ownership_unknown",
-            "primitive_refused",
+            GuardianFactId::OwnershipUnknown,
+            GuardianFactId::PrimitiveRefused,
         ])],
         supporting_facts: &[
-            WeightedFact::new("ownership_unknown", 1.0),
-            WeightedFact::new("primitive_refused", 1.0),
+            WeightedFact::new(GuardianFactId::OwnershipUnknown, 1.0),
+            WeightedFact::new(GuardianFactId::PrimitiveRefused, 1.0),
         ],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: INSTALL_PHASES,
@@ -1134,8 +1167,13 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("performance_rules_invalid"),
         domain: DomainTemplate::Static(GuardianDomain::Performance),
-        required_facts: &[FactRequirement::Any(&["performance_rules_invalid"])],
-        supporting_facts: &[WeightedFact::new("performance_rules_invalid", 1.0)],
+        required_facts: &[FactRequirement::Any(&[
+            GuardianFactId::PerformanceRulesInvalid,
+        ])],
+        supporting_facts: &[WeightedFact::new(
+            GuardianFactId::PerformanceRulesInvalid,
+            1.0,
+        )],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: PERFORMANCE_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -1151,12 +1189,12 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::FactId,
         domain: DomainTemplate::Static(GuardianDomain::Performance),
         required_facts: &[FactRequirement::Any(&[
-            "performance_health_degraded",
-            "performance_health_invalid",
+            GuardianFactId::PerformanceHealthDegraded,
+            GuardianFactId::PerformanceHealthInvalid,
         ])],
         supporting_facts: &[
-            WeightedFact::new("performance_health_degraded", 0.85),
-            WeightedFact::new("performance_health_invalid", 1.0),
+            WeightedFact::new(GuardianFactId::PerformanceHealthDegraded, 0.85),
+            WeightedFact::new(GuardianFactId::PerformanceHealthInvalid, 1.0),
         ],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: PERFORMANCE_PHASES,
@@ -1173,12 +1211,12 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::Static("performance_fallback_selected"),
         domain: DomainTemplate::Static(GuardianDomain::Performance),
         required_facts: &[FactRequirement::Any(&[
-            "performance_fallback_selected",
-            "performance_health_fallback",
+            GuardianFactId::PerformanceFallbackSelected,
+            GuardianFactId::PerformanceHealthFallback,
         ])],
         supporting_facts: &[
-            WeightedFact::new("performance_fallback_selected", 0.80),
-            WeightedFact::new("performance_health_fallback", 0.80),
+            WeightedFact::new(GuardianFactId::PerformanceFallbackSelected, 0.80),
+            WeightedFact::new(GuardianFactId::PerformanceHealthFallback, 0.80),
         ],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: PERFORMANCE_PHASES,
@@ -1195,10 +1233,10 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         id: DiagnosisIdTemplate::Static("performance_repeated_failure_memory"),
         domain: DomainTemplate::Static(GuardianDomain::Performance),
         required_facts: &[FactRequirement::Any(&[
-            "performance_repeated_failure_memory",
+            GuardianFactId::PerformanceRepeatedFailureMemory,
         ])],
         supporting_facts: &[WeightedFact::new(
-            "performance_repeated_failure_memory",
+            GuardianFactId::PerformanceRepeatedFailureMemory,
             0.95,
         )],
         contradicting_facts: NO_CONTRADICTIONS,
@@ -1215,8 +1253,13 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("performance_user_owned_conflict"),
         domain: DomainTemplate::Static(GuardianDomain::Performance),
-        required_facts: &[FactRequirement::Any(&["performance_user_owned_conflict"])],
-        supporting_facts: &[WeightedFact::new("performance_user_owned_conflict", 1.0)],
+        required_facts: &[FactRequirement::Any(&[
+            GuardianFactId::PerformanceUserOwnedConflict,
+        ])],
+        supporting_facts: &[WeightedFact::new(
+            GuardianFactId::PerformanceUserOwnedConflict,
+            1.0,
+        )],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: PERFORMANCE_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -1238,16 +1281,16 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         domain: DomainTemplate::Static(GuardianDomain::Session),
         required_facts: &[FactRequirement::ProcessLifecycle],
         supporting_facts: &[
-            WeightedFact::new("process_spawned", 0.95),
-            WeightedFact::new("launcher_stop_requested", 0.95),
-            WeightedFact::new("watchdog_killed_process", 0.95),
-            WeightedFact::new("exit_code_zero", 0.95),
-            WeightedFact::new("exit_code_nonzero", 0.95),
-            WeightedFact::new("exit_code_unknown", 0.95),
-            WeightedFact::new("boot_marker_observed", 0.95),
-            WeightedFact::new("process_exited", 0.95),
-            WeightedFact::new("process_exited_before_boot", 0.95),
-            WeightedFact::new("process_exited_after_boot", 0.95),
+            WeightedFact::new(GuardianFactId::ProcessSpawned, 0.95),
+            WeightedFact::new(GuardianFactId::LauncherStopRequested, 0.95),
+            WeightedFact::new(GuardianFactId::WatchdogKilledProcess, 0.95),
+            WeightedFact::new(GuardianFactId::ExitCodeZero, 0.95),
+            WeightedFact::new(GuardianFactId::ExitCodeNonzero, 0.95),
+            WeightedFact::new(GuardianFactId::ExitCodeUnknown, 0.95),
+            WeightedFact::new(GuardianFactId::BootMarkerObserved, 0.95),
+            WeightedFact::new(GuardianFactId::ProcessExited, 0.95),
+            WeightedFact::new(GuardianFactId::ProcessExitedBeforeBoot, 0.95),
+            WeightedFact::new(GuardianFactId::ProcessExitedAfterBoot, 0.95),
         ],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: PROCESS_PHASES,
@@ -1263,8 +1306,13 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
         id: DiagnosisIdTemplate::Static("persisted_state_schema_invalid"),
         domain: DomainTemplate::Static(GuardianDomain::State),
-        required_facts: &[FactRequirement::Any(&["persisted_state_schema_invalid"])],
-        supporting_facts: &[WeightedFact::new("persisted_state_schema_invalid", 1.0)],
+        required_facts: &[FactRequirement::Any(&[
+            GuardianFactId::PersistedStateSchemaInvalid,
+        ])],
+        supporting_facts: &[WeightedFact::new(
+            GuardianFactId::PersistedStateSchemaInvalid,
+            1.0,
+        )],
         contradicting_facts: NO_CONTRADICTIONS,
         phase_allowed: STATE_PHASES,
         ownership_allowed: ANY_OWNERSHIP,
@@ -1291,7 +1339,7 @@ pub(super) fn graph_policy_input_for_diagnosis(
     diagnosis: &Diagnosis,
 ) -> Option<DiagnosisGraphPolicyInput> {
     diagnosis.fact_ids.iter().find_map(|fact_id| {
-        let fact = synthetic_fact_for_diagnosis(diagnosis, fact_id);
+        let fact = synthetic_fact_for_diagnosis(diagnosis, *fact_id);
         DIAGNOSIS_GRAPH
             .iter()
             .find(|node| {
@@ -1308,10 +1356,10 @@ pub(super) fn graph_policy_input_for_diagnosis(
     })
 }
 
-fn synthetic_fact_for_diagnosis(diagnosis: &Diagnosis, fact_id: &str) -> GuardianFact {
+fn synthetic_fact_for_diagnosis(diagnosis: &Diagnosis, fact_id: GuardianFactId) -> GuardianFact {
     GuardianFact {
         operation_id: None,
-        id: GuardianFactId::new(fact_id),
+        id: fact_id,
         domain: diagnosis.domain,
         phase: diagnosis.phase,
         reliability: FactReliability::DirectStructured,
@@ -1323,43 +1371,63 @@ fn synthetic_fact_for_diagnosis(diagnosis: &Diagnosis, fact_id: &str) -> Guardia
     }
 }
 
-fn readiness_diagnosis_id(fact_id: &str) -> &'static str {
-    match fact_id {
-        "version_json_missing" => "installed_version_metadata_missing",
-        "parent_version_missing" => "parent_version_metadata_missing",
-        "incomplete_install" => "install_incomplete",
-        "client_jar_missing" => "client_jar_missing",
-        "libraries_missing" => "libraries_missing",
-        "asset_index_missing" => "asset_index_missing",
-        "launcher_managed_artifact_signature_corruption" => {
-            "launcher_managed_artifact_signature_corrupt"
-        }
-        _ => "launch_readiness_blocking",
+const READINESS_DIAGNOSIS_IDS: &[(GuardianFactId, &str)] = &[
+    (
+        GuardianFactId::VersionJsonMissing,
+        "installed_version_metadata_missing",
+    ),
+    (
+        GuardianFactId::ParentVersionMissing,
+        "parent_version_metadata_missing",
+    ),
+    (GuardianFactId::IncompleteInstall, "install_incomplete"),
+    (GuardianFactId::ClientJarMissing, "client_jar_missing"),
+    (GuardianFactId::LibrariesMissing, "libraries_missing"),
+    (GuardianFactId::AssetIndexMissing, "asset_index_missing"),
+];
+
+fn readiness_diagnosis_id(fact_id: GuardianFactId) -> Option<&'static str> {
+    READINESS_DIAGNOSIS_IDS
+        .iter()
+        .find_map(|(candidate, diagnosis)| (*candidate == fact_id).then_some(*diagnosis))
+}
+
+fn readiness_state_corruption_impact(fact_id: GuardianFactId) -> f32 {
+    if fact_id == GuardianFactId::IncompleteInstall {
+        0.75
+    } else if [
+        GuardianFactId::VersionJsonMissing,
+        GuardianFactId::ParentVersionMissing,
+    ]
+    .contains(&fact_id)
+    {
+        0.65
+    } else if [
+        GuardianFactId::ClientJarMissing,
+        GuardianFactId::LibrariesMissing,
+        GuardianFactId::AssetIndexMissing,
+    ]
+    .contains(&fact_id)
+    {
+        0.55
+    } else {
+        0.50
     }
 }
 
-fn readiness_state_corruption_impact(fact_id: &str) -> f32 {
-    match fact_id {
-        "incomplete_install" => 0.75,
-        "version_json_missing" | "parent_version_missing" => 0.65,
-        "client_jar_missing" | "libraries_missing" | "asset_index_missing" => 0.55,
-        "launcher_managed_artifact_signature_corruption" => 0.70,
-        _ => 0.50,
-    }
-}
+const PROCESS_FACT_IDS: &[GuardianFactId] = &[
+    GuardianFactId::ProcessSpawned,
+    GuardianFactId::LauncherStopRequested,
+    GuardianFactId::WatchdogKilledProcess,
+    GuardianFactId::ExitCodeZero,
+    GuardianFactId::ExitCodeNonzero,
+    GuardianFactId::ExitCodeUnknown,
+    GuardianFactId::BootMarkerObserved,
+    GuardianFactId::ProcessExited,
+    GuardianFactId::ProcessExitedBeforeBoot,
+    GuardianFactId::ProcessExitedAfterBoot,
+];
 
-fn is_process_fact(id: &str) -> bool {
-    matches!(
-        id,
-        "process_spawned"
-            | "launcher_stop_requested"
-            | "watchdog_killed_process"
-            | "exit_code_zero"
-            | "exit_code_nonzero"
-            | "exit_code_unknown"
-            | "boot_marker_observed"
-            | "process_exited"
-            | "process_exited_before_boot"
-            | "process_exited_after_boot"
-    )
+fn is_process_fact(id: GuardianFactId) -> bool {
+    PROCESS_FACT_IDS.contains(&id)
 }

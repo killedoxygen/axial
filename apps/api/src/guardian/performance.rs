@@ -42,7 +42,7 @@ pub struct GuardianPerformanceSupervisionPlan {
     pub operation: GuardianPerformanceOperationKind,
     pub target: TargetDescriptor,
     pub decision: GuardianDecision,
-    pub fact_ids: Vec<String>,
+    pub fact_ids: Vec<GuardianFactId>,
     pub fallback_authorized: bool,
     pub rollback_authorized: bool,
     pub max_fallback_attempts: usize,
@@ -100,11 +100,7 @@ pub fn plan_performance_supervision(
         operation: request.operation,
         target: request.target,
         decision,
-        fact_ids: request
-            .facts
-            .iter()
-            .map(|fact| fact.id.as_str().to_string())
-            .collect(),
+        fact_ids: request.facts.iter().map(|fact| fact.id).collect(),
         fallback_authorized: matches!(
             request.operation,
             GuardianPerformanceOperationKind::ApplyManagedComposition
@@ -129,7 +125,7 @@ pub fn performance_rules_guardian_facts(
     }
 
     vec![performance_fact(
-        "performance_rules_invalid",
+        GuardianFactId::PerformanceRulesInvalid,
         phase,
         GuardianSeverity::Degraded,
         if status.validation == RulesValidation::Invalid {
@@ -155,7 +151,7 @@ pub fn performance_plan_guardian_facts(
     }
 
     vec![performance_fact(
-        "performance_fallback_selected",
+        GuardianFactId::PerformanceFallbackSelected,
         phase,
         GuardianSeverity::Warning,
         GuardianConfidence::High,
@@ -180,17 +176,17 @@ pub fn performance_health_guardian_facts(
     let (id, severity, confidence) = match health {
         BundleHealth::Healthy | BundleHealth::Disabled => return Vec::new(),
         BundleHealth::Degraded => (
-            "performance_health_degraded",
+            GuardianFactId::PerformanceHealthDegraded,
             GuardianSeverity::Degraded,
             GuardianConfidence::High,
         ),
         BundleHealth::Fallback => (
-            "performance_health_fallback",
+            GuardianFactId::PerformanceHealthFallback,
             GuardianSeverity::Warning,
             GuardianConfidence::High,
         ),
         BundleHealth::Invalid => (
-            "performance_health_invalid",
+            GuardianFactId::PerformanceHealthInvalid,
             GuardianSeverity::Blocking,
             GuardianConfidence::Confirmed,
         ),
@@ -226,7 +222,7 @@ pub fn performance_state_error_guardian_fact(
     };
 
     Some(performance_fact(
-        "performance_user_owned_conflict",
+        GuardianFactId::PerformanceUserOwnedConflict,
         phase,
         GuardianSeverity::Blocking,
         GuardianConfidence::Confirmed,
@@ -249,7 +245,7 @@ pub fn performance_failure_memory_guardian_fact(
     }
 
     Some(performance_fact(
-        "performance_repeated_failure_memory",
+        GuardianFactId::PerformanceRepeatedFailureMemory,
         phase,
         GuardianSeverity::Degraded,
         GuardianConfidence::High,
@@ -266,7 +262,7 @@ pub fn performance_failure_memory_guardian_fact(
 }
 
 fn performance_fact(
-    id: &str,
+    id: GuardianFactId,
     phase: OperationPhase,
     severity: GuardianSeverity,
     confidence: GuardianConfidence,
@@ -275,7 +271,7 @@ fn performance_fact(
 ) -> GuardianFact {
     GuardianFact {
         operation_id: None,
-        id: GuardianFactId::new(id),
+        id,
         domain: GuardianDomain::Performance,
         phase,
         reliability: FactReliability::DirectStructured,
@@ -365,7 +361,7 @@ mod tests {
         plan_performance_supervision,
     };
     use crate::guardian::{
-        GuardianActionKind, GuardianConfidence, GuardianDomain, GuardianMode,
+        GuardianActionKind, GuardianConfidence, GuardianDomain, GuardianFactId, GuardianMode,
         GuardianPolicyContext, GuardianSeverity, diagnose_facts,
     };
     use crate::state::contracts::{
@@ -553,7 +549,10 @@ mod tests {
         assert_eq!(supervision.decision.kind, GuardianActionKind::Warn);
         assert!(supervision.fallback_authorized);
         assert_eq!(supervision.max_fallback_attempts, 1);
-        assert_eq!(supervision.fact_ids, vec!["performance_fallback_selected"]);
+        assert_eq!(
+            supervision.fact_ids,
+            vec![GuardianFactId::PerformanceFallbackSelected]
+        );
         assert_eq!(
             supervision.public_summary,
             "guardian_supervised_performance_apply"

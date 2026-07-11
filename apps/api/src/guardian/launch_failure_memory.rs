@@ -19,9 +19,11 @@ use axial_launcher::LaunchFailureClass;
 use chrono::{DateTime, Duration, FixedOffset, SecondsFormat, Utc};
 
 const RECENT_FAILURE_WINDOW_HOURS: i64 = 24;
-pub(crate) const RECENT_STARTUP_FAILURE_FACT_ID: &str = "recent_startup_failure";
-pub(crate) const RECENT_REPAIR_FAILED_FACT_ID: &str = "recent_repair_failed";
-pub(crate) const REPAIR_SUPPRESSED_UNTIL_FACT_ID: &str = "repair_suppressed_until";
+pub(crate) const RECENT_STARTUP_FAILURE_FACT_ID: GuardianFactId =
+    GuardianFactId::RecentStartupFailure;
+pub(crate) const RECENT_REPAIR_FAILED_FACT_ID: GuardianFactId = GuardianFactId::RecentRepairFailed;
+pub(crate) const REPAIR_SUPPRESSED_UNTIL_FACT_ID: GuardianFactId =
+    GuardianFactId::RepairSuppressedUntil;
 
 #[derive(Clone, Copy, Debug)]
 pub struct GuardianLaunchFailureMemoryIntakeRequest<'a> {
@@ -268,7 +270,7 @@ fn repair_suppressed_until_fact(
 }
 
 fn memory_fact(
-    id: &str,
+    id: GuardianFactId,
     domain: GuardianDomain,
     ownership: OwnershipClass,
     instance_id: &str,
@@ -276,7 +278,7 @@ fn memory_fact(
 ) -> GuardianFact {
     GuardianFact {
         operation_id: None,
-        id: GuardianFactId::new(id),
+        id,
         domain,
         phase: OperationPhase::Validating,
         reliability: FactReliability::DirectStructured,
@@ -430,9 +432,9 @@ mod tests {
         let facts = launch_failure_memory_guardian_facts(intake_request(&entries));
 
         assert_eq!(facts.len(), 3);
-        assert_eq!(facts[0].id.as_str(), RECENT_STARTUP_FAILURE_FACT_ID);
-        assert_eq!(facts[1].id.as_str(), RECENT_REPAIR_FAILED_FACT_ID);
-        assert_eq!(facts[2].id.as_str(), REPAIR_SUPPRESSED_UNTIL_FACT_ID);
+        assert_eq!(facts[0].id, RECENT_STARTUP_FAILURE_FACT_ID);
+        assert_eq!(facts[1].id, RECENT_REPAIR_FAILED_FACT_ID);
+        assert_eq!(facts[2].id, REPAIR_SUPPRESSED_UNTIL_FACT_ID);
         assert_eq!(field(&facts[0], "occurrences_today"), Some("2"));
         assert_eq!(field(&facts[1], "diagnosis"), Some("jvm_preset_recovery"));
         assert_eq!(
@@ -539,7 +541,7 @@ mod tests {
             launch_failure_memory_guardian_facts(intake_request(std::slice::from_ref(&expired)));
 
         assert_eq!(active_facts.len(), 1);
-        assert_eq!(active_facts[0].id.as_str(), REPAIR_SUPPRESSED_UNTIL_FACT_ID);
+        assert_eq!(active_facts[0].id, REPAIR_SUPPRESSED_UNTIL_FACT_ID);
         assert!(wrong_intent_facts.is_empty());
         assert!(expired_facts.is_empty());
     }
@@ -590,8 +592,8 @@ mod tests {
                 ..intake_request(std::slice::from_ref(&custom_gc_repair))
             });
 
-        assert_eq!(raw_match[0].id.as_str(), RECENT_REPAIR_FAILED_FACT_ID);
-        assert_eq!(gc_match[0].id.as_str(), RECENT_REPAIR_FAILED_FACT_ID);
+        assert_eq!(raw_match[0].id, RECENT_REPAIR_FAILED_FACT_ID);
+        assert_eq!(gc_match[0].id, RECENT_REPAIR_FAILED_FACT_ID);
         assert!(raw_mismatch.is_empty());
         assert!(gc_mismatch.is_empty());
     }

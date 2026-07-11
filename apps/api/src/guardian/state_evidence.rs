@@ -47,7 +47,7 @@ pub fn persisted_state_load_guardian_outcome(
 fn persisted_state_load_fact(target: TargetDescriptor) -> GuardianFact {
     GuardianFact {
         operation_id: None,
-        id: GuardianFactId::new("persisted_state_schema_invalid"),
+        id: GuardianFactId::PersistedStateSchemaInvalid,
         domain: GuardianDomain::State,
         phase: OperationPhase::Startup,
         reliability: FactReliability::DirectStructured,

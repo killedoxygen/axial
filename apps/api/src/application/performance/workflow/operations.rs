@@ -155,7 +155,11 @@ impl PerformanceJournalTransition {
             action,
             target_id: target_id.to_string(),
             rollback,
-            fact_ids: supervision.fact_ids.clone(),
+            fact_ids: supervision
+                .fact_ids
+                .iter()
+                .map(|fact_id| fact_id.as_str().to_string())
+                .collect(),
             diagnosis_ids: supervision
                 .decision
                 .diagnoses
@@ -3205,7 +3209,11 @@ pub(super) async fn record_performance_guardian_supervision(
         .journals()
         .record_guardian_evidence(
             operation_id,
-            supervision.fact_ids.clone(),
+            supervision
+                .fact_ids
+                .iter()
+                .map(|fact_id| fact_id.as_str().to_string())
+                .collect(),
             supervision
                 .decision
                 .diagnoses

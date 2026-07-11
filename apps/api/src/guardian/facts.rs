@@ -25,87 +25,189 @@ pub fn guardian_fact_from_execution(fact: &ExecutionFact, phase: OperationPhase)
 }
 
 fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain, FactReliability) {
-    let id = match fact.kind {
-        ExecutionFactKind::ArtifactMissing | ExecutionFactKind::FileMissing => "artifact_missing",
-        ExecutionFactKind::ArtifactVerified => "artifact_verified",
-        ExecutionFactKind::ChecksumMismatch | ExecutionFactKind::DownloadChecksumMismatch => {
-            "artifact_checksum_mismatch"
+    let (id, domain) = match fact.kind {
+        ExecutionFactKind::ArtifactMissing | ExecutionFactKind::FileMissing => {
+            (GuardianFactId::ArtifactMissing, GuardianDomain::Library)
         }
-        ExecutionFactKind::SizeMismatch | ExecutionFactKind::DownloadSizeMismatch => {
-            "artifact_size_mismatch"
+        ExecutionFactKind::ArtifactVerified => {
+            (GuardianFactId::ArtifactVerified, GuardianDomain::Library)
         }
-        ExecutionFactKind::DownloadProviderFailure => "download_provider_unavailable",
-        ExecutionFactKind::DownloadNetworkFailure | ExecutionFactKind::DownloadInterrupted => {
-            "download_interrupted"
+        ExecutionFactKind::ChecksumMismatch | ExecutionFactKind::DownloadChecksumMismatch => (
+            GuardianFactId::ArtifactChecksumMismatch,
+            GuardianDomain::Library,
+        ),
+        ExecutionFactKind::SizeMismatch | ExecutionFactKind::DownloadSizeMismatch => (
+            GuardianFactId::ArtifactSizeMismatch,
+            GuardianDomain::Library,
+        ),
+        ExecutionFactKind::DownloadProviderFailure => (
+            GuardianFactId::DownloadProviderUnavailable,
+            GuardianDomain::Download,
+        ),
+        ExecutionFactKind::DownloadNetworkFailure | ExecutionFactKind::DownloadInterrupted => (
+            GuardianFactId::DownloadInterrupted,
+            GuardianDomain::Download,
+        ),
+        ExecutionFactKind::DownloadTempDiscarded => (
+            GuardianFactId::DownloadTempDiscarded,
+            GuardianDomain::Download,
+        ),
+        ExecutionFactKind::DownloadTempWriteFailed | ExecutionFactKind::FileTempLeftover => {
+            (GuardianFactId::TempFileLeftover, GuardianDomain::Filesystem)
         }
-        ExecutionFactKind::DownloadTempDiscarded => "download_temp_discarded",
-        ExecutionFactKind::DownloadTempWriteFailed => "temp_file_leftover",
-        ExecutionFactKind::DownloadWrittenToTemp => "download_written_to_temp",
-        ExecutionFactKind::DownloadPromotionFailed => "atomic_promotion_failed",
-        ExecutionFactKind::DownloadPromoted | ExecutionFactKind::FilePromoted => {
-            "atomic_promotion_completed"
+        ExecutionFactKind::DownloadWrittenToTemp => (
+            GuardianFactId::DownloadWrittenToTemp,
+            GuardianDomain::Download,
+        ),
+        ExecutionFactKind::DownloadPromotionFailed => (
+            GuardianFactId::AtomicPromotionFailed,
+            GuardianDomain::Filesystem,
+        ),
+        ExecutionFactKind::DownloadPromoted | ExecutionFactKind::FilePromoted => (
+            GuardianFactId::AtomicPromotionCompleted,
+            GuardianDomain::Filesystem,
+        ),
+        ExecutionFactKind::FileCorrupt => {
+            (GuardianFactId::ManagedFileCorrupt, GuardianDomain::Unknown)
         }
-        ExecutionFactKind::FileCorrupt => "managed_file_corrupt",
-        ExecutionFactKind::FileLocked => "filesystem_locked",
-        ExecutionFactKind::FileOwnershipUnknown => "ownership_unknown",
-        ExecutionFactKind::FilePermissionDenied => "filesystem_permission_denied",
-        ExecutionFactKind::FileQuarantined => "artifact_quarantined",
-        ExecutionFactKind::FileTempLeftover => "temp_file_leftover",
-        ExecutionFactKind::FileWrittenToTemp => "file_written_to_temp",
-        ExecutionFactKind::InstallDependencyFailed => "install_dependency_failed",
-        ExecutionFactKind::RuntimeCorrupt => "managed_runtime_corrupt",
-        ExecutionFactKind::RuntimeJavaOverrideEmpty => "java_override_empty",
-        ExecutionFactKind::RuntimeJavaOverrideUndefinedSentinel => {
-            "java_override_undefined_sentinel"
+        ExecutionFactKind::FileLocked => {
+            (GuardianFactId::FilesystemLocked, GuardianDomain::Filesystem)
         }
+        ExecutionFactKind::FileOwnershipUnknown => {
+            (GuardianFactId::OwnershipUnknown, GuardianDomain::Unknown)
+        }
+        ExecutionFactKind::FilePermissionDenied => (
+            GuardianFactId::FilesystemPermissionDenied,
+            GuardianDomain::Filesystem,
+        ),
+        ExecutionFactKind::FileQuarantined => {
+            (GuardianFactId::ArtifactQuarantined, GuardianDomain::Library)
+        }
+        ExecutionFactKind::FileWrittenToTemp => {
+            (GuardianFactId::FileWrittenToTemp, GuardianDomain::Library)
+        }
+        ExecutionFactKind::InstallDependencyFailed => (
+            GuardianFactId::InstallDependencyFailed,
+            GuardianDomain::Install,
+        ),
+        ExecutionFactKind::RuntimeCorrupt => (
+            GuardianFactId::ManagedRuntimeCorrupt,
+            GuardianDomain::Runtime,
+        ),
+        ExecutionFactKind::RuntimeJavaOverrideEmpty => {
+            (GuardianFactId::JavaOverrideEmpty, GuardianDomain::Runtime)
+        }
+        ExecutionFactKind::RuntimeJavaOverrideUndefinedSentinel => (
+            GuardianFactId::JavaOverrideUndefinedSentinel,
+            GuardianDomain::Runtime,
+        ),
         ExecutionFactKind::RuntimeMissingExecutable => {
             if fact
                 .target
                 .as_ref()
                 .is_some_and(|target| target.ownership == OwnershipClass::UserOwned)
             {
-                "java_override_missing"
+                (GuardianFactId::JavaOverrideMissing, GuardianDomain::Runtime)
             } else {
-                "managed_runtime_missing"
+                (
+                    GuardianFactId::ManagedRuntimeMissing,
+                    GuardianDomain::Runtime,
+                )
             }
         }
-        ExecutionFactKind::RuntimeProbeFailed => "java_probe_failed",
-        ExecutionFactKind::RuntimeReadyMarkerMissing => "managed_runtime_ready_marker_missing",
-        ExecutionFactKind::RuntimeRepairApplied => "managed_runtime_repair_applied",
-        ExecutionFactKind::RuntimeRosettaRequired => "managed_runtime_rosetta_required",
-        ExecutionFactKind::RuntimeUnavailableForPlatform => {
-            "managed_runtime_unavailable_for_platform"
+        ExecutionFactKind::RuntimeProbeFailed => {
+            (GuardianFactId::JavaProbeFailed, GuardianDomain::Runtime)
         }
-        ExecutionFactKind::RuntimeWrongMajor => "java_major_mismatch",
-        ExecutionFactKind::RuntimeWrongUpdate => "java_update_too_old",
-        ExecutionFactKind::JvmArgsEmpty => "jvm_args_empty",
-        ExecutionFactKind::JvmArgsParseFailed => "jvm_args_parse_failed",
-        ExecutionFactKind::JvmArgReservedLauncherFlag => "jvm_arg_reserved_launcher_flag",
-        ExecutionFactKind::JvmArgMemoryConflict => "jvm_arg_memory_conflict",
-        ExecutionFactKind::JvmArgUnsupportedGc => "jvm_arg_unsupported_gc",
-        ExecutionFactKind::JvmArgUnlockOrderInvalid => "jvm_arg_unlock_order_invalid",
-        ExecutionFactKind::JvmArgUnsafeClasspathOverride => "jvm_arg_unsafe_classpath_override",
-        ExecutionFactKind::JvmArgUnsafeNativePathOverride => "jvm_arg_unsafe_native_path_override",
-        ExecutionFactKind::JvmArgAgentOverride => "jvm_arg_agent_override",
-        ExecutionFactKind::LaunchCommandInvalid => "launch_command_invalid",
-        ExecutionFactKind::LaunchCommandPrepared => "launch_command_prepared",
-        ExecutionFactKind::ProcessSpawned => "process_spawned",
-        ExecutionFactKind::ProcessStopIntent => "launcher_stop_requested",
-        ExecutionFactKind::ProcessKilled => "watchdog_killed_process",
-        ExecutionFactKind::ProcessExitCode => exit_code_fact_id(fact),
-        ExecutionFactKind::ProcessBootEvidence => "boot_marker_observed",
-        ExecutionFactKind::ProcessWatchdogAction => "watchdog_killed_process",
-        ExecutionFactKind::ProcessExited => "process_exited",
-        ExecutionFactKind::PrimitiveRefused => "primitive_refused",
-        ExecutionFactKind::ProviderDataInvalid => "provider_data_invalid",
-        ExecutionFactKind::RollbackAvailable => "rollback_available",
-        ExecutionFactKind::RollbackUnavailable => "rollback_unavailable",
+        ExecutionFactKind::RuntimeReadyMarkerMissing => (
+            GuardianFactId::ManagedRuntimeReadyMarkerMissing,
+            GuardianDomain::Runtime,
+        ),
+        ExecutionFactKind::RuntimeRepairApplied => (
+            GuardianFactId::ManagedRuntimeRepairApplied,
+            GuardianDomain::Runtime,
+        ),
+        ExecutionFactKind::RuntimeRosettaRequired => (
+            GuardianFactId::ManagedRuntimeRosettaRequired,
+            GuardianDomain::Runtime,
+        ),
+        ExecutionFactKind::RuntimeUnavailableForPlatform => (
+            GuardianFactId::ManagedRuntimeUnavailableForPlatform,
+            GuardianDomain::Runtime,
+        ),
+        ExecutionFactKind::RuntimeWrongMajor => {
+            (GuardianFactId::JavaMajorMismatch, GuardianDomain::Runtime)
+        }
+        ExecutionFactKind::RuntimeWrongUpdate => {
+            (GuardianFactId::JavaUpdateTooOld, GuardianDomain::Runtime)
+        }
+        ExecutionFactKind::JvmArgsEmpty => (GuardianFactId::JvmArgsEmpty, GuardianDomain::Jvm),
+        ExecutionFactKind::JvmArgsParseFailed => {
+            (GuardianFactId::JvmArgsParseFailed, GuardianDomain::Jvm)
+        }
+        ExecutionFactKind::JvmArgReservedLauncherFlag => (
+            GuardianFactId::JvmArgReservedLauncherFlag,
+            GuardianDomain::Jvm,
+        ),
+        ExecutionFactKind::JvmArgMemoryConflict => {
+            (GuardianFactId::JvmArgMemoryConflict, GuardianDomain::Jvm)
+        }
+        ExecutionFactKind::JvmArgUnsupportedGc => {
+            (GuardianFactId::JvmArgUnsupportedGc, GuardianDomain::Jvm)
+        }
+        ExecutionFactKind::JvmArgUnlockOrderInvalid => (
+            GuardianFactId::JvmArgUnlockOrderInvalid,
+            GuardianDomain::Jvm,
+        ),
+        ExecutionFactKind::JvmArgUnsafeClasspathOverride => (
+            GuardianFactId::JvmArgUnsafeClasspathOverride,
+            GuardianDomain::Jvm,
+        ),
+        ExecutionFactKind::JvmArgUnsafeNativePathOverride => (
+            GuardianFactId::JvmArgUnsafeNativePathOverride,
+            GuardianDomain::Jvm,
+        ),
+        ExecutionFactKind::JvmArgAgentOverride => {
+            (GuardianFactId::JvmArgAgentOverride, GuardianDomain::Jvm)
+        }
+        ExecutionFactKind::LaunchCommandInvalid => {
+            (GuardianFactId::LaunchCommandInvalid, GuardianDomain::Launch)
+        }
+        ExecutionFactKind::LaunchCommandPrepared => (
+            GuardianFactId::LaunchCommandPrepared,
+            GuardianDomain::Launch,
+        ),
+        ExecutionFactKind::ProcessSpawned => {
+            (GuardianFactId::ProcessSpawned, GuardianDomain::Session)
+        }
+        ExecutionFactKind::ProcessStopIntent => (
+            GuardianFactId::LauncherStopRequested,
+            GuardianDomain::Session,
+        ),
+        ExecutionFactKind::ProcessKilled | ExecutionFactKind::ProcessWatchdogAction => (
+            GuardianFactId::WatchdogKilledProcess,
+            GuardianDomain::Session,
+        ),
+        ExecutionFactKind::ProcessExitCode => (exit_code_fact_id(fact), GuardianDomain::Session),
+        ExecutionFactKind::ProcessBootEvidence => {
+            (GuardianFactId::BootMarkerObserved, GuardianDomain::Session)
+        }
+        ExecutionFactKind::ProcessExited => {
+            (GuardianFactId::ProcessExited, GuardianDomain::Session)
+        }
+        ExecutionFactKind::PrimitiveRefused => {
+            (GuardianFactId::PrimitiveRefused, GuardianDomain::Unknown)
+        }
+        ExecutionFactKind::ProviderDataInvalid => {
+            (GuardianFactId::ProviderDataInvalid, GuardianDomain::Network)
+        }
+        ExecutionFactKind::RollbackAvailable => {
+            (GuardianFactId::RollbackAvailable, GuardianDomain::Unknown)
+        }
+        ExecutionFactKind::RollbackUnavailable => {
+            (GuardianFactId::RollbackUnavailable, GuardianDomain::Unknown)
+        }
     };
-    (
-        GuardianFactId::new(id),
-        domain_for_fact_id(id),
-        reliability_for_execution_fact(fact.kind),
-    )
+    (id, domain, reliability_for_execution_fact(fact.kind))
 }
 
 fn public_safe_target(target: &TargetDescriptor) -> TargetDescriptor {
@@ -131,16 +233,16 @@ fn public_safe_fields(fields: &[EvidenceField]) -> Vec<EvidenceField> {
         .collect()
 }
 
-fn exit_code_fact_id(fact: &ExecutionFact) -> &'static str {
+fn exit_code_fact_id(fact: &ExecutionFact) -> GuardianFactId {
     let exit_code = fact
         .fields
         .iter()
         .find(|field| field.key == "exit_code")
         .and_then(|field| field.value.parse::<i32>().ok());
     match exit_code {
-        Some(0) => "exit_code_zero",
-        Some(_) => "exit_code_nonzero",
-        None => "exit_code_unknown",
+        Some(0) => GuardianFactId::ExitCodeZero,
+        Some(_) => GuardianFactId::ExitCodeNonzero,
+        None => GuardianFactId::ExitCodeUnknown,
     }
 }
 
@@ -176,50 +278,5 @@ fn reliability_for_execution_fact(kind: ExecutionFactKind) -> FactReliability {
         | ExecutionFactKind::ProcessExited => FactReliability::ProcessLifecycle,
         ExecutionFactKind::RuntimeReadyMarkerMissing => FactReliability::ExpectedMarkerAbsence,
         _ => FactReliability::DirectStructured,
-    }
-}
-
-fn domain_for_fact_id(id: &str) -> GuardianDomain {
-    if id.starts_with("java_") || id.starts_with("managed_runtime") {
-        GuardianDomain::Runtime
-    } else if id.starts_with("jvm_") || id == "raw_jvm_args_present" {
-        GuardianDomain::Jvm
-    } else if id.starts_with("launch_command") {
-        GuardianDomain::Launch
-    } else if matches!(
-        id,
-        "version_json_missing"
-            | "parent_version_missing"
-            | "incomplete_install"
-            | "client_jar_missing"
-            | "libraries_missing"
-            | "asset_index_missing"
-            | "install_dependency_failed"
-    ) {
-        GuardianDomain::Install
-    } else if id.starts_with("download_") {
-        GuardianDomain::Download
-    } else if id.starts_with("process_")
-        || id.starts_with("exit_code")
-        || id == "boot_marker_observed"
-        || id == "launcher_stop_requested"
-        || id == "watchdog_killed_process"
-    {
-        GuardianDomain::Session
-    } else if id.contains("artifact") || id.starts_with("file_") {
-        GuardianDomain::Library
-    } else if id.starts_with("filesystem_")
-        || id == "temp_file_leftover"
-        || id.starts_with("atomic_promotion_")
-    {
-        GuardianDomain::Filesystem
-    } else if id.starts_with("provider") {
-        GuardianDomain::Network
-    } else if id.starts_with("performance_") {
-        GuardianDomain::Performance
-    } else if id.starts_with("persisted_state_") || id.starts_with("state_") {
-        GuardianDomain::State
-    } else {
-        GuardianDomain::Unknown
     }
 }

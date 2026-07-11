@@ -18,11 +18,11 @@ pub(super) fn readiness_guardian_facts(readiness: &LaunchReadiness) -> Vec<Guard
     readiness
         .reasons
         .iter()
-        .filter_map(|reason| {
-            let id = readiness_guardian_fact_id(reason.id)?;
-            Some(GuardianFact {
+        .map(|reason| {
+            let id = readiness_guardian_fact_id(reason.id);
+            GuardianFact {
                 operation_id: None,
-                id: GuardianFactId::new(id),
+                id,
                 domain: readiness_guardian_domain(reason.id),
                 phase: OperationPhase::Validating,
                 reliability: readiness_guardian_fact_reliability(reason.id),
@@ -36,28 +36,30 @@ pub(super) fn readiness_guardian_facts(readiness: &LaunchReadiness) -> Vec<Guard
                     readiness_guardian_ownership(reason.id),
                 )),
                 fields: Vec::new(),
-            })
+            }
         })
         .collect()
 }
 
-fn readiness_guardian_fact_id(reason: LaunchReadinessReasonId) -> Option<&'static str> {
+fn readiness_guardian_fact_id(reason: LaunchReadinessReasonId) -> GuardianFactId {
     match reason {
-        LaunchReadinessReasonId::InstalledVersionsDegraded => Some("installed_versions_degraded"),
-        LaunchReadinessReasonId::VersionJsonMissing => Some("version_json_missing"),
-        LaunchReadinessReasonId::ParentVersionMissing => Some("parent_version_missing"),
-        LaunchReadinessReasonId::IncompleteInstall => Some("incomplete_install"),
-        LaunchReadinessReasonId::ClientJarMissing => Some("client_jar_missing"),
-        LaunchReadinessReasonId::ClientJarCorrupt => Some("artifact_checksum_mismatch"),
-        LaunchReadinessReasonId::LibrariesMissing => Some("libraries_missing"),
-        LaunchReadinessReasonId::LibrariesCorrupt => Some("artifact_checksum_mismatch"),
-        LaunchReadinessReasonId::LauncherManagedArtifactSignatureCorrupt => {
-            Some("launcher_managed_artifact_signature_corruption")
+        LaunchReadinessReasonId::InstalledVersionsDegraded => {
+            GuardianFactId::InstalledVersionsDegraded
         }
-        LaunchReadinessReasonId::AssetIndexMissing => Some("asset_index_missing"),
-        LaunchReadinessReasonId::AssetIndexCorrupt => Some("artifact_checksum_mismatch"),
-        LaunchReadinessReasonId::ManagedRuntimeMissing => Some("managed_runtime_missing"),
-        LaunchReadinessReasonId::JavaOverrideMissing => Some("java_override_missing"),
+        LaunchReadinessReasonId::VersionJsonMissing => GuardianFactId::VersionJsonMissing,
+        LaunchReadinessReasonId::ParentVersionMissing => GuardianFactId::ParentVersionMissing,
+        LaunchReadinessReasonId::IncompleteInstall => GuardianFactId::IncompleteInstall,
+        LaunchReadinessReasonId::ClientJarMissing => GuardianFactId::ClientJarMissing,
+        LaunchReadinessReasonId::ClientJarCorrupt => GuardianFactId::ArtifactChecksumMismatch,
+        LaunchReadinessReasonId::LibrariesMissing => GuardianFactId::LibrariesMissing,
+        LaunchReadinessReasonId::LibrariesCorrupt => GuardianFactId::ArtifactChecksumMismatch,
+        LaunchReadinessReasonId::LauncherManagedArtifactSignatureCorrupt => {
+            GuardianFactId::LauncherManagedArtifactSignatureCorruption
+        }
+        LaunchReadinessReasonId::AssetIndexMissing => GuardianFactId::AssetIndexMissing,
+        LaunchReadinessReasonId::AssetIndexCorrupt => GuardianFactId::ArtifactChecksumMismatch,
+        LaunchReadinessReasonId::ManagedRuntimeMissing => GuardianFactId::ManagedRuntimeMissing,
+        LaunchReadinessReasonId::JavaOverrideMissing => GuardianFactId::JavaOverrideMissing,
     }
 }
 

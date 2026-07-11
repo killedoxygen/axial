@@ -105,15 +105,7 @@ fn assert_fixture_action_kind(kind: GuardianActionKind) {
 fn checked_in_guardian_fact_ids_fixture_is_byte_stable() {
     let fact_ids = serde_json::from_str::<Vec<GuardianFactId>>(GUARDIAN_FACT_IDS_FIXTURE)
         .expect("fact-id fixture");
-    assert_eq!(fact_ids.len(), 115);
-    assert_eq!(
-        fact_ids
-            .iter()
-            .map(GuardianFactId::as_str)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        115
-    );
+    assert_eq!(fact_ids.as_slice(), GuardianFactId::ALL.as_slice());
 
     let pretty = serde_json::to_string_pretty(&fact_ids).expect("pretty fact-id fixture");
     assert_eq!(format!("{pretty}\n"), GUARDIAN_FACT_IDS_FIXTURE);
@@ -125,6 +117,10 @@ fn checked_in_guardian_fact_ids_fixture_is_byte_stable() {
         serde_json::to_string(&decoded).expect("re-encode compact fact ids"),
         compact
     );
+    let error = serde_json::from_str::<GuardianFactId>(r#""future_fact""#)
+        .expect_err("unknown fact id must be rejected")
+        .to_string();
+    assert!(!error.contains("future_fact"));
 }
 
 #[test]
@@ -294,7 +290,7 @@ fn execution_launch_command_invalid_fact_maps_to_blocking_diagnosis() {
 fn launch_readiness_fact_maps_to_blocking_install_diagnosis() {
     let fact = GuardianFact {
         operation_id: None,
-        id: GuardianFactId::new("incomplete_install"),
+        id: GuardianFactId::IncompleteInstall,
         domain: GuardianDomain::Install,
         phase: OperationPhase::Validating,
         reliability: FactReliability::DirectStructured,
@@ -327,7 +323,7 @@ fn launch_readiness_fact_maps_to_blocking_install_diagnosis() {
 fn managed_runtime_readiness_fact_maps_to_recoverable_diagnosis() {
     let fact = GuardianFact {
         operation_id: None,
-        id: GuardianFactId::new("managed_runtime_missing"),
+        id: GuardianFactId::ManagedRuntimeMissing,
         domain: GuardianDomain::Runtime,
         phase: OperationPhase::Validating,
         reliability: FactReliability::ExpectedMarkerAbsence,
@@ -359,7 +355,7 @@ fn managed_runtime_readiness_fact_maps_to_recoverable_diagnosis() {
 fn diagnosis_inference_graph_declares_evidence_slots_and_target_strategy() {
     let fact = GuardianFact {
         operation_id: None,
-        id: GuardianFactId::new("jvm_args_parse_failed"),
+        id: GuardianFactId::JvmArgsParseFailed,
         domain: GuardianDomain::Jvm,
         phase: OperationPhase::Validating,
         reliability: FactReliability::ExactClassifier,
@@ -380,17 +376,15 @@ fn diagnosis_inference_graph_declares_evidence_slots_and_target_strategy() {
     assert!(diagnosis_graph_nodes().iter().any(|node| {
         node.required_facts
             .iter()
-            .any(|required| required.matches_fact_id("jvm_args_parse_failed"))
+            .any(|required| required.matches_fact_id(GuardianFactId::JvmArgsParseFailed))
     }));
-    assert!(
-        node.supporting_facts
-            .iter()
-            .any(|support| support.fact_id == "jvm_args_parse_failed" && support.weight > 0.0)
-    );
+    assert!(node.supporting_facts.iter().any(|support| {
+        support.fact_id == GuardianFactId::JvmArgsParseFailed && support.weight > 0.0
+    }));
     assert!(
         node.contradicting_facts
             .iter()
-            .any(|fact| fact.fact_id == "boot_marker_observed")
+            .any(|fact| fact.fact_id == GuardianFactId::BootMarkerObserved)
     );
     assert!(node.phase_allowed.contains(&OperationPhase::Validating));
     assert!(node.ownership_allowed.is_empty());
@@ -443,7 +437,7 @@ fn diagnosis_inference_graph_declares_evidence_slots_and_target_strategy() {
 #[test]
 fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
     struct Case {
-        fact_id: &'static str,
+        fact_id: GuardianFactId,
         fact_domain: GuardianDomain,
         phase: OperationPhase,
         ownership: OwnershipClass,
@@ -459,7 +453,7 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
 
     let cases = [
         Case {
-            fact_id: "java_override_missing",
+            fact_id: GuardianFactId::JavaOverrideMissing,
             fact_domain: GuardianDomain::Runtime,
             phase: OperationPhase::Validating,
             ownership: OwnershipClass::UserOwned,
@@ -477,7 +471,7 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
             expected_reason: "selected_java_runtime_unavailable",
         },
         Case {
-            fact_id: "managed_runtime_ready_marker_missing",
+            fact_id: GuardianFactId::ManagedRuntimeReadyMarkerMissing,
             fact_domain: GuardianDomain::Runtime,
             phase: OperationPhase::Preparing,
             ownership: OwnershipClass::LauncherManaged,
@@ -491,7 +485,7 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
             expected_reason: "managed_runtime_needs_repair",
         },
         Case {
-            fact_id: "managed_runtime_unavailable_for_platform",
+            fact_id: GuardianFactId::ManagedRuntimeUnavailableForPlatform,
             fact_domain: GuardianDomain::Runtime,
             phase: OperationPhase::Downloading,
             ownership: OwnershipClass::LauncherManaged,
@@ -505,7 +499,7 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
             expected_reason: "managed_runtime_unavailable_for_platform",
         },
         Case {
-            fact_id: "managed_runtime_rosetta_required",
+            fact_id: GuardianFactId::ManagedRuntimeRosettaRequired,
             fact_domain: GuardianDomain::Runtime,
             phase: OperationPhase::Downloading,
             ownership: OwnershipClass::LauncherManaged,
@@ -519,7 +513,7 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
             expected_reason: "managed_runtime_rosetta_required",
         },
         Case {
-            fact_id: "incomplete_install",
+            fact_id: GuardianFactId::IncompleteInstall,
             fact_domain: GuardianDomain::Install,
             phase: OperationPhase::Validating,
             ownership: OwnershipClass::LauncherManaged,
@@ -533,7 +527,7 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
             expected_reason: "incomplete_install",
         },
         Case {
-            fact_id: "jvm_args_parse_failed",
+            fact_id: GuardianFactId::JvmArgsParseFailed,
             fact_domain: GuardianDomain::Jvm,
             phase: OperationPhase::Validating,
             ownership: OwnershipClass::UserOwned,
@@ -551,7 +545,7 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
             expected_reason: "jvm_args_malformed",
         },
         Case {
-            fact_id: "download_provider_unavailable",
+            fact_id: GuardianFactId::DownloadProviderUnavailable,
             fact_domain: GuardianDomain::Download,
             phase: OperationPhase::Downloading,
             ownership: OwnershipClass::ExternalProviderDerived,
@@ -569,7 +563,7 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
             expected_reason: "download_unavailable",
         },
         Case {
-            fact_id: "install_dependency_failed",
+            fact_id: GuardianFactId::InstallDependencyFailed,
             fact_domain: GuardianDomain::Install,
             phase: OperationPhase::Downloading,
             ownership: OwnershipClass::LauncherManaged,
@@ -583,7 +577,7 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
             expected_reason: "install_dependency_failed",
         },
         Case {
-            fact_id: "temp_file_leftover",
+            fact_id: GuardianFactId::TempFileLeftover,
             fact_domain: GuardianDomain::Filesystem,
             phase: OperationPhase::Downloading,
             ownership: OwnershipClass::LauncherManaged,
@@ -597,7 +591,7 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
             expected_reason: "temp_file_leftover",
         },
         Case {
-            fact_id: "atomic_promotion_failed",
+            fact_id: GuardianFactId::AtomicPromotionFailed,
             fact_domain: GuardianDomain::Filesystem,
             phase: OperationPhase::Downloading,
             ownership: OwnershipClass::LauncherManaged,
@@ -611,7 +605,7 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
             expected_reason: "atomic_promotion_failed",
         },
         Case {
-            fact_id: "exit_code_zero",
+            fact_id: GuardianFactId::ExitCodeZero,
             fact_domain: GuardianDomain::Session,
             phase: OperationPhase::Running,
             ownership: OwnershipClass::LauncherManaged,
@@ -625,7 +619,7 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
             expected_reason: "process_lifecycle_observed",
         },
         Case {
-            fact_id: "performance_health_invalid",
+            fact_id: GuardianFactId::PerformanceHealthInvalid,
             fact_domain: GuardianDomain::Performance,
             phase: OperationPhase::Planning,
             ownership: OwnershipClass::CompositionManaged,
@@ -639,7 +633,7 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
             expected_reason: "performance_health_invalid",
         },
         Case {
-            fact_id: "persisted_state_schema_invalid",
+            fact_id: GuardianFactId::PersistedStateSchemaInvalid,
             fact_domain: GuardianDomain::State,
             phase: OperationPhase::Startup,
             ownership: OwnershipClass::LauncherManaged,
@@ -657,50 +651,66 @@ fn graph_backed_diagnosis_truth_table_covers_current_domain_families() {
     for case in cases {
         let fact = GuardianFact {
             operation_id: None,
-            id: GuardianFactId::new(case.fact_id),
+            id: case.fact_id,
             domain: case.fact_domain,
             phase: case.phase,
             reliability: FactReliability::DirectStructured,
             severity: case.severity_override,
             confidence: case.confidence_override,
             ownership: case.ownership,
-            target: Some(target(case.fact_id, TargetKind::Config, case.ownership)),
+            target: Some(target(
+                case.fact_id.as_str(),
+                TargetKind::Config,
+                case.ownership,
+            )),
             fields: Vec::new(),
         };
 
         let diagnoses = diagnose_facts(&[fact], case.phase);
 
-        assert_eq!(diagnoses.len(), 1, "{}", case.fact_id);
+        assert_eq!(diagnoses.len(), 1, "{}", case.fact_id.as_str());
         let diagnosis = &diagnoses[0];
-        assert_eq!(diagnosis.id.as_str(), case.expected_id, "{}", case.fact_id);
-        assert_eq!(diagnosis.domain, case.expected_domain, "{}", case.fact_id);
         assert_eq!(
-            diagnosis.severity, case.expected_severity,
+            diagnosis.id.as_str(),
+            case.expected_id,
             "{}",
-            case.fact_id
+            case.fact_id.as_str()
         );
         assert_eq!(
-            diagnosis.confidence, case.expected_confidence,
+            diagnosis.domain,
+            case.expected_domain,
             "{}",
-            case.fact_id
+            case.fact_id.as_str()
+        );
+        assert_eq!(
+            diagnosis.severity,
+            case.expected_severity,
+            "{}",
+            case.fact_id.as_str()
+        );
+        assert_eq!(
+            diagnosis.confidence,
+            case.expected_confidence,
+            "{}",
+            case.fact_id.as_str()
         );
         assert_eq!(diagnosis.candidate_actions, case.expected_actions);
         assert_eq!(diagnosis.public_reason_template, case.expected_reason);
-        assert_eq!(diagnosis.fact_ids, vec![case.fact_id.to_string()]);
+        assert_eq!(diagnosis.fact_ids, vec![case.fact_id]);
     }
 }
 
 #[test]
 fn graph_evaluation_truth_table_covers_scoring_inputs_without_output_drift() {
     let provider_fact = guardian_graph_fact(
-        "download_provider_unavailable",
+        GuardianFactId::DownloadProviderUnavailable,
         GuardianDomain::Download,
         OperationPhase::Downloading,
         FactReliability::DirectStructured,
         OwnershipClass::ExternalProviderDerived,
     );
     let interrupted_fact = guardian_graph_fact(
-        "download_interrupted",
+        GuardianFactId::DownloadInterrupted,
         GuardianDomain::Download,
         OperationPhase::Downloading,
         FactReliability::HeuristicClassifier,
@@ -732,14 +742,14 @@ fn graph_evaluation_truth_table_covers_scoring_inputs_without_output_drift() {
     );
 
     let jvm_fact = guardian_graph_fact(
-        "jvm_args_parse_failed",
+        GuardianFactId::JvmArgsParseFailed,
         GuardianDomain::Jvm,
         OperationPhase::Validating,
         FactReliability::ExactClassifier,
         OwnershipClass::UserOwned,
     );
     let boot_fact = guardian_graph_fact(
-        "boot_marker_observed",
+        GuardianFactId::BootMarkerObserved,
         GuardianDomain::Session,
         OperationPhase::Running,
         FactReliability::ProcessLifecycle,
@@ -779,7 +789,7 @@ fn graph_evaluation_truth_table_covers_scoring_inputs_without_output_drift() {
     assert_close(phase_mismatched.evidence_confidence_score, 0.60);
 
     let marker_fact = guardian_graph_fact(
-        "managed_runtime_missing",
+        GuardianFactId::ManagedRuntimeMissing,
         GuardianDomain::Runtime,
         OperationPhase::Validating,
         FactReliability::ExpectedMarkerAbsence,
@@ -807,14 +817,14 @@ fn graph_evaluation_truth_table_covers_scoring_inputs_without_output_drift() {
 #[test]
 fn graph_evaluation_prioritizes_impact_scalar_and_unknown_fallback_threshold() {
     let unsafe_artifact_fact = guardian_graph_fact(
-        "primitive_refused",
+        GuardianFactId::PrimitiveRefused,
         GuardianDomain::Filesystem,
         OperationPhase::Installing,
         FactReliability::DirectStructured,
         OwnershipClass::Unknown,
     );
     let performance_fallback_fact = guardian_graph_fact(
-        "performance_health_fallback",
+        GuardianFactId::PerformanceHealthFallback,
         GuardianDomain::Performance,
         OperationPhase::Planning,
         FactReliability::DirectStructured,
@@ -848,7 +858,7 @@ fn graph_evaluation_prioritizes_impact_scalar_and_unknown_fallback_threshold() {
     );
 
     let unknown_fact = guardian_graph_fact(
-        "provider_payload_changed",
+        GuardianFactId::NoStructuredFact(OperationPhase::Downloading),
         GuardianDomain::Unknown,
         OperationPhase::Downloading,
         FactReliability::HeuristicClassifier,
@@ -858,8 +868,8 @@ fn graph_evaluation_prioritizes_impact_scalar_and_unknown_fallback_threshold() {
         .iter()
         .find(|node| {
             node.required_facts.iter().any(|required| {
-                required.matches_fact_id("download_provider_unavailable")
-                    || required.matches_fact_id("download_interrupted")
+                required.matches_fact_id(GuardianFactId::DownloadProviderUnavailable)
+                    || required.matches_fact_id(GuardianFactId::DownloadInterrupted)
             })
         })
         .expect("download graph node");
@@ -884,7 +894,7 @@ fn graph_evaluation_prioritizes_impact_scalar_and_unknown_fallback_threshold() {
 #[test]
 fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
     struct Case {
-        fact_id: &'static str,
+        fact_id: GuardianFactId,
         domain: GuardianDomain,
         phase: OperationPhase,
         ownership: OwnershipClass,
@@ -893,7 +903,7 @@ fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
 
     let cases = [
         Case {
-            fact_id: "java_override_missing",
+            fact_id: GuardianFactId::JavaOverrideMissing,
             domain: GuardianDomain::Runtime,
             phase: OperationPhase::Validating,
             ownership: OwnershipClass::UserOwned,
@@ -907,7 +917,7 @@ fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
             },
         },
         Case {
-            fact_id: "managed_runtime_ready_marker_missing",
+            fact_id: GuardianFactId::ManagedRuntimeReadyMarkerMissing,
             domain: GuardianDomain::Runtime,
             phase: OperationPhase::Preparing,
             ownership: OwnershipClass::LauncherManaged,
@@ -921,7 +931,7 @@ fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
             },
         },
         Case {
-            fact_id: "artifact_checksum_mismatch",
+            fact_id: GuardianFactId::ArtifactChecksumMismatch,
             domain: GuardianDomain::Install,
             phase: OperationPhase::Downloading,
             ownership: OwnershipClass::LauncherManaged,
@@ -935,7 +945,7 @@ fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
             },
         },
         Case {
-            fact_id: "download_provider_unavailable",
+            fact_id: GuardianFactId::DownloadProviderUnavailable,
             domain: GuardianDomain::Download,
             phase: OperationPhase::Downloading,
             ownership: OwnershipClass::ExternalProviderDerived,
@@ -949,7 +959,7 @@ fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
             },
         },
         Case {
-            fact_id: "primitive_refused",
+            fact_id: GuardianFactId::PrimitiveRefused,
             domain: GuardianDomain::Filesystem,
             phase: OperationPhase::Installing,
             ownership: OwnershipClass::Unknown,
@@ -963,7 +973,7 @@ fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
             },
         },
         Case {
-            fact_id: "performance_health_invalid",
+            fact_id: GuardianFactId::PerformanceHealthInvalid,
             domain: GuardianDomain::Performance,
             phase: OperationPhase::Planning,
             ownership: OwnershipClass::CompositionManaged,
@@ -977,7 +987,7 @@ fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
             },
         },
         Case {
-            fact_id: "performance_repeated_failure_memory",
+            fact_id: GuardianFactId::PerformanceRepeatedFailureMemory,
             domain: GuardianDomain::Performance,
             phase: OperationPhase::Planning,
             ownership: OwnershipClass::CompositionManaged,
@@ -991,7 +1001,7 @@ fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
             },
         },
         Case {
-            fact_id: "performance_user_owned_conflict",
+            fact_id: GuardianFactId::PerformanceUserOwnedConflict,
             domain: GuardianDomain::Performance,
             phase: OperationPhase::Planning,
             ownership: OwnershipClass::UserOwned,
@@ -1005,7 +1015,7 @@ fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
             },
         },
         Case {
-            fact_id: "exit_code_zero",
+            fact_id: GuardianFactId::ExitCodeZero,
             domain: GuardianDomain::Session,
             phase: OperationPhase::Running,
             ownership: OwnershipClass::LauncherManaged,
@@ -1019,7 +1029,7 @@ fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
             },
         },
         Case {
-            fact_id: "persisted_state_schema_invalid",
+            fact_id: GuardianFactId::PersistedStateSchemaInvalid,
             domain: GuardianDomain::State,
             phase: OperationPhase::Startup,
             ownership: OwnershipClass::LauncherManaged,
@@ -1042,14 +1052,16 @@ fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
             FactReliability::DirectStructured,
             case.ownership,
         );
-        let node = diagnosis_node_for_fact(&fact).expect(case.fact_id);
+        let node = diagnosis_node_for_fact(&fact)
+            .unwrap_or_else(|| panic!("missing graph node for {}", case.fact_id.as_str()));
         let evaluation = node.evaluate(std::slice::from_ref(&fact), &fact, case.phase);
 
-        assert_eq!(node.eligibility, case.expected, "{}", case.fact_id);
+        assert_eq!(node.eligibility, case.expected, "{}", case.fact_id.as_str());
         assert_eq!(
-            evaluation.action_eligibility, case.expected,
+            evaluation.action_eligibility,
+            case.expected,
             "{}",
-            case.fact_id
+            case.fact_id.as_str()
         );
     }
 
@@ -1061,7 +1073,7 @@ fn graph_action_eligibility_truth_table_covers_hard_constraint_inputs() {
 #[test]
 fn graph_action_eligibility_stays_internal_to_public_diagnosis_output() {
     let fact = guardian_graph_fact(
-        "jvm_args_parse_failed",
+        GuardianFactId::JvmArgsParseFailed,
         GuardianDomain::Jvm,
         OperationPhase::Validating,
         FactReliability::ExactClassifier,
@@ -1268,7 +1280,7 @@ fn exit_code_fact_maps_zero_and_nonzero_without_exit_classification() {
 #[test]
 fn unknown_facts_produce_low_confidence_unknown_diagnosis() {
     let fact = guardian_graph_fact(
-        "unexpected_signal",
+        GuardianFactId::NoStructuredFact(OperationPhase::Launching),
         GuardianDomain::Unknown,
         OperationPhase::Launching,
         FactReliability::HeuristicClassifier,
@@ -1297,7 +1309,7 @@ fn action_prerequisite_requires_target_and_candidate_action() {
         confidence: GuardianConfidence::Low,
         ownership: OwnershipClass::Unknown,
         phase: OperationPhase::Launching,
-        fact_ids: vec!["fact".to_string()],
+        fact_ids: vec![GuardianFactId::NoStructuredFact(OperationPhase::Launching)],
         affected_targets: Vec::new(),
         impact: Default::default(),
         candidate_actions: vec![GuardianActionKind::RecordOnly],
@@ -1337,7 +1349,7 @@ fn action_plan_representation_carries_prerequisite_metadata() {
         confidence: GuardianConfidence::Confirmed,
         ownership: OwnershipClass::LauncherManaged,
         phase: OperationPhase::Preparing,
-        fact_ids: vec!["managed_runtime_corrupt".to_string()],
+        fact_ids: vec![GuardianFactId::ManagedRuntimeCorrupt],
         affected_targets: vec![target.clone()],
         impact: Default::default(),
         candidate_actions: vec![GuardianActionKind::Repair],
@@ -1402,7 +1414,7 @@ fn empty_fact_set_unknown_diagnosis_has_fallback_target() {
     assert_eq!(diagnoses[0].id.as_str(), "unknown_failure_launching");
     assert_eq!(
         diagnoses[0].fact_ids,
-        vec!["no_structured_fact_launching".to_string()]
+        vec![GuardianFactId::NoStructuredFact(OperationPhase::Launching)]
     );
     assert_eq!(
         diagnoses[0].affected_targets[0],
@@ -1495,7 +1507,7 @@ fn impact_vector_uses_priority_weighting() {
 }
 
 fn guardian_graph_fact(
-    id: &str,
+    id: GuardianFactId,
     domain: GuardianDomain,
     phase: OperationPhase,
     reliability: FactReliability,
@@ -1503,14 +1515,14 @@ fn guardian_graph_fact(
 ) -> GuardianFact {
     GuardianFact {
         operation_id: None,
-        id: GuardianFactId::new(id),
+        id,
         domain,
         phase,
         reliability,
         severity: None,
         confidence: None,
         ownership,
-        target: Some(target(id, TargetKind::Config, ownership)),
+        target: Some(target(id.as_str(), TargetKind::Config, ownership)),
         fields: Vec::new(),
     }
 }

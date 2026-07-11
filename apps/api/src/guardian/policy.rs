@@ -872,7 +872,7 @@ mod tests {
         let ownership = raw_target.ownership;
         let fact = GuardianFact {
             operation_id: None,
-            id: GuardianFactId::new("unexpected_native_exit_signal"),
+            id: GuardianFactId::NoStructuredFact(OperationPhase::Launching),
             domain: GuardianDomain::Unknown,
             phase: OperationPhase::Launching,
             reliability: FactReliability::HeuristicClassifier,
@@ -1071,7 +1071,7 @@ mod tests {
     #[test]
     fn policy_reasoning_consumes_graph_evaluation_and_eligibility_inputs() {
         let diagnosis = graph_backed_diagnosis(
-            "jvm_args_parse_failed",
+            GuardianFactId::JvmArgsParseFailed,
             GuardianDomain::Jvm,
             OperationPhase::Validating,
             OwnershipClass::UserOwned,
@@ -1112,7 +1112,7 @@ mod tests {
     #[test]
     fn graph_policy_reasoning_truth_table_covers_hard_constraint_inputs() {
         struct Case {
-            fact_id: &'static str,
+            fact_id: GuardianFactId,
             domain: GuardianDomain,
             phase: OperationPhase,
             ownership: OwnershipClass,
@@ -1126,7 +1126,7 @@ mod tests {
 
         let cases = [
             Case {
-                fact_id: "managed_runtime_ready_marker_missing",
+                fact_id: GuardianFactId::ManagedRuntimeReadyMarkerMissing,
                 domain: GuardianDomain::Runtime,
                 phase: OperationPhase::Preparing,
                 ownership: OwnershipClass::LauncherManaged,
@@ -1138,7 +1138,7 @@ mod tests {
                 user_intent_sensitive: false,
             },
             Case {
-                fact_id: "artifact_checksum_mismatch",
+                fact_id: GuardianFactId::ArtifactChecksumMismatch,
                 domain: GuardianDomain::Install,
                 phase: OperationPhase::Downloading,
                 ownership: OwnershipClass::UserOwned,
@@ -1150,7 +1150,7 @@ mod tests {
                 user_intent_sensitive: false,
             },
             Case {
-                fact_id: "download_provider_unavailable",
+                fact_id: GuardianFactId::DownloadProviderUnavailable,
                 domain: GuardianDomain::Download,
                 phase: OperationPhase::Downloading,
                 ownership: OwnershipClass::ExternalProviderDerived,
@@ -1162,7 +1162,7 @@ mod tests {
                 user_intent_sensitive: false,
             },
             Case {
-                fact_id: "performance_user_owned_conflict",
+                fact_id: GuardianFactId::PerformanceUserOwnedConflict,
                 domain: GuardianDomain::Performance,
                 phase: OperationPhase::Planning,
                 ownership: OwnershipClass::UserOwned,
@@ -1174,7 +1174,7 @@ mod tests {
                 user_intent_sensitive: true,
             },
             Case {
-                fact_id: "exit_code_zero",
+                fact_id: GuardianFactId::ExitCodeZero,
                 domain: GuardianDomain::Session,
                 phase: OperationPhase::Running,
                 ownership: OwnershipClass::LauncherManaged,
@@ -1195,32 +1195,37 @@ mod tests {
             assert!(
                 reasoning.graph.is_some(),
                 "{} should be graph-backed",
-                case.fact_id
+                case.fact_id.as_str()
             );
             assert_eq!(
-                reasoning.ownership_requirement, case.ownership_requirement,
+                reasoning.ownership_requirement,
+                case.ownership_requirement,
                 "{}",
-                case.fact_id
+                case.fact_id.as_str()
             );
             assert_eq!(
-                reasoning.journal_required, case.journal_required,
+                reasoning.journal_required,
+                case.journal_required,
                 "{}",
-                case.fact_id
+                case.fact_id.as_str()
             );
             assert_eq!(
-                reasoning.destructive_mutation, case.destructive_mutation,
+                reasoning.destructive_mutation,
+                case.destructive_mutation,
                 "{}",
-                case.fact_id
+                case.fact_id.as_str()
             );
             assert_eq!(
-                reasoning.retry_loop_sensitive, case.retry_loop_sensitive,
+                reasoning.retry_loop_sensitive,
+                case.retry_loop_sensitive,
                 "{}",
-                case.fact_id
+                case.fact_id.as_str()
             );
             assert_eq!(
-                reasoning.user_intent_sensitive, case.user_intent_sensitive,
+                reasoning.user_intent_sensitive,
+                case.user_intent_sensitive,
                 "{}",
-                case.fact_id
+                case.fact_id.as_str()
             );
             assert_eq!(
                 reasoning.journal_blocked(
@@ -1228,7 +1233,7 @@ mod tests {
                 ),
                 case.journal_required,
                 "{}",
-                case.fact_id
+                case.fact_id.as_str()
             );
         }
     }
@@ -1236,7 +1241,7 @@ mod tests {
     #[test]
     fn graph_backed_policy_decisions_remain_stable() {
         let runtime_repair = graph_backed_diagnosis(
-            "managed_runtime_ready_marker_missing",
+            GuardianFactId::ManagedRuntimeReadyMarkerMissing,
             GuardianDomain::Runtime,
             OperationPhase::Preparing,
             OwnershipClass::LauncherManaged,
@@ -1251,7 +1256,7 @@ mod tests {
         );
 
         let jvm_parse = graph_backed_diagnosis(
-            "jvm_args_parse_failed",
+            GuardianFactId::JvmArgsParseFailed,
             GuardianDomain::Jvm,
             OperationPhase::Validating,
             OwnershipClass::UserOwned,
@@ -1282,7 +1287,7 @@ mod tests {
         );
 
         let provider_retry = graph_backed_diagnosis(
-            "download_provider_unavailable",
+            GuardianFactId::DownloadProviderUnavailable,
             GuardianDomain::Download,
             OperationPhase::Downloading,
             OwnershipClass::ExternalProviderDerived,
@@ -1297,7 +1302,7 @@ mod tests {
         );
 
         let user_owned_artifact = graph_backed_diagnosis(
-            "artifact_checksum_mismatch",
+            GuardianFactId::ArtifactChecksumMismatch,
             GuardianDomain::Install,
             OperationPhase::Downloading,
             OwnershipClass::UserOwned,
@@ -1331,14 +1336,14 @@ mod tests {
     }
 
     fn graph_backed_diagnosis(
-        fact_id: &str,
+        fact_id: GuardianFactId,
         domain: GuardianDomain,
         phase: OperationPhase,
         ownership: OwnershipClass,
     ) -> Diagnosis {
         let fact = GuardianFact {
             operation_id: None,
-            id: GuardianFactId::new(fact_id),
+            id: fact_id,
             domain,
             phase,
             reliability: FactReliability::DirectStructured,
@@ -1348,13 +1353,13 @@ mod tests {
             target: Some(TargetDescriptor::new(
                 StabilizationSystem::Guardian,
                 target_kind_for_domain(domain),
-                fact_id,
+                fact_id.as_str(),
                 ownership,
             )),
             fields: Vec::new(),
         };
         let diagnoses = diagnose_facts(&[fact], phase);
-        assert_eq!(diagnoses.len(), 1, "{fact_id}");
+        assert_eq!(diagnoses.len(), 1, "{}", fact_id.as_str());
         diagnoses
             .into_iter()
             .next()
@@ -1375,7 +1380,7 @@ mod tests {
             confidence,
             ownership,
             phase: OperationPhase::Preparing,
-            fact_ids: vec![format!("{id}_fact")],
+            fact_ids: vec![GuardianFactId::NoStructuredFact(OperationPhase::Preparing)],
             affected_targets: vec![TargetDescriptor::new(
                 StabilizationSystem::Guardian,
                 TargetKind::Runtime,

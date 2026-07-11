@@ -366,7 +366,7 @@ mod tests {
         );
         let historical_fact = crate::guardian::GuardianFact {
             operation_id: None,
-            id: crate::guardian::GuardianFactId::new("recent_startup_failure"),
+            id: crate::guardian::GuardianFactId::RecentStartupFailure,
             domain: crate::guardian::GuardianDomain::Startup,
             phase: OperationPhase::Validating,
             reliability: crate::guardian::FactReliability::DirectStructured,

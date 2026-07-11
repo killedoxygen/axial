@@ -269,74 +269,75 @@ fn java_fallback_diagnosis(diagnosis_id: &str) -> bool {
 
 fn is_java_override_unavailable_fact(fact: &GuardianFact) -> bool {
     matches!(
-        fact.id.as_str(),
-        "java_override_missing"
-            | "java_override_undefined_sentinel"
-            | "java_probe_failed"
-            | "java_major_mismatch"
-            | "java_update_too_old"
+        fact.id,
+        GuardianFactId::JavaOverrideMissing
+            | GuardianFactId::JavaOverrideUndefinedSentinel
+            | GuardianFactId::JavaProbeFailed
+            | GuardianFactId::JavaMajorMismatch
+            | GuardianFactId::JavaUpdateTooOld
     )
 }
 
 fn is_jvm_preflight_strip_fact(fact: &GuardianFact) -> bool {
     matches!(
-        fact.id.as_str(),
-        "jvm_args_parse_failed"
-            | "jvm_arg_reserved_launcher_flag"
-            | "jvm_arg_memory_conflict"
-            | "jvm_arg_unsupported_gc"
-            | "jvm_arg_unlock_order_invalid"
-            | "jvm_arg_unsafe_classpath_override"
-            | "jvm_arg_unsafe_native_path_override"
-            | "jvm_arg_agent_override"
+        fact.id,
+        GuardianFactId::JvmArgsParseFailed
+            | GuardianFactId::JvmArgReservedLauncherFlag
+            | GuardianFactId::JvmArgMemoryConflict
+            | GuardianFactId::JvmArgUnsupportedGc
+            | GuardianFactId::JvmArgUnlockOrderInvalid
+            | GuardianFactId::JvmArgUnsafeClasspathOverride
+            | GuardianFactId::JvmArgUnsafeNativePathOverride
+            | GuardianFactId::JvmArgAgentOverride
     )
 }
 
 fn readiness_blocks_launch(readiness: GuardianPreflightReadiness<'_>) -> bool {
     !readiness.launchable
         || readiness.facts.iter().any(|fact| {
-            fact.severity == Some(GuardianSeverity::Blocking) && is_readiness_fact(fact.id.as_str())
+            fact.severity == Some(GuardianSeverity::Blocking) && is_readiness_fact(fact.id)
         })
 }
 
-fn is_readiness_fact(id: &str) -> bool {
-    matches!(
-        id,
-        "version_json_missing"
-            | "parent_version_missing"
-            | "incomplete_install"
-            | "client_jar_missing"
-            | "libraries_missing"
-            | "asset_index_missing"
-            | "launcher_managed_artifact_signature_corruption"
-            | "managed_runtime_missing"
-            | "java_override_missing"
-    )
+const READINESS_FACT_IDS: &[GuardianFactId] = &[
+    GuardianFactId::VersionJsonMissing,
+    GuardianFactId::ParentVersionMissing,
+    GuardianFactId::IncompleteInstall,
+    GuardianFactId::ClientJarMissing,
+    GuardianFactId::LibrariesMissing,
+    GuardianFactId::AssetIndexMissing,
+    GuardianFactId::LauncherManagedArtifactSignatureCorruption,
+    GuardianFactId::ManagedRuntimeMissing,
+    GuardianFactId::JavaOverrideMissing,
+];
+
+fn is_readiness_fact(id: GuardianFactId) -> bool {
+    READINESS_FACT_IDS.contains(&id)
 }
 
 fn is_preflight_warning_fact(fact: &GuardianFact) -> bool {
     matches!(
-        fact.id.as_str(),
-        "java_override_empty"
-            | "java_override_undefined_sentinel"
-            | "java_override_missing"
-            | "jvm_args_parse_failed"
-            | "jvm_arg_reserved_launcher_flag"
-            | "jvm_arg_memory_conflict"
-            | "jvm_arg_unsupported_gc"
-            | "jvm_arg_unlock_order_invalid"
-            | "jvm_arg_unsafe_classpath_override"
-            | "jvm_arg_unsafe_native_path_override"
-            | "jvm_arg_agent_override"
-            | "launch_memory_min_clamped"
-            | "launch_memory_allocation_low"
-            | "launch_resource_memory_pressure"
-            | "launch_resource_cpu_pressure"
-            | "launch_resource_install_pressure"
-            | "launch_resource_disk_pressure"
-            | "custom_java_override_present"
-            | "custom_jvm_preset_present"
-            | "custom_jvm_args_present"
+        fact.id,
+        GuardianFactId::JavaOverrideEmpty
+            | GuardianFactId::JavaOverrideUndefinedSentinel
+            | GuardianFactId::JavaOverrideMissing
+            | GuardianFactId::JvmArgsParseFailed
+            | GuardianFactId::JvmArgReservedLauncherFlag
+            | GuardianFactId::JvmArgMemoryConflict
+            | GuardianFactId::JvmArgUnsupportedGc
+            | GuardianFactId::JvmArgUnlockOrderInvalid
+            | GuardianFactId::JvmArgUnsafeClasspathOverride
+            | GuardianFactId::JvmArgUnsafeNativePathOverride
+            | GuardianFactId::JvmArgAgentOverride
+            | GuardianFactId::LaunchMemoryMinClamped
+            | GuardianFactId::LaunchMemoryAllocationLow
+            | GuardianFactId::LaunchResourceMemoryPressure
+            | GuardianFactId::LaunchResourceCpuPressure
+            | GuardianFactId::LaunchResourceInstallPressure
+            | GuardianFactId::LaunchResourceDiskPressure
+            | GuardianFactId::CustomJavaOverridePresent
+            | GuardianFactId::CustomJvmPresetPresent
+            | GuardianFactId::CustomJvmArgsPresent
             | RECENT_STARTUP_FAILURE_FACT_ID
             | RECENT_REPAIR_FAILED_FACT_ID
             | REPAIR_SUPPRESSED_UNTIL_FACT_ID
@@ -391,7 +392,7 @@ fn push_historical_launch_copy(
 
 fn is_historical_launch_fact(fact: &GuardianFact) -> bool {
     matches!(
-        fact.id.as_str(),
+        fact.id,
         RECENT_STARTUP_FAILURE_FACT_ID
             | RECENT_REPAIR_FAILED_FACT_ID
             | REPAIR_SUPPRESSED_UNTIL_FACT_ID
@@ -399,25 +400,31 @@ fn is_historical_launch_fact(fact: &GuardianFact) -> bool {
 }
 
 fn historical_launch_detail(fact: &GuardianFact) -> Option<String> {
-    match fact.id.as_str() {
-        RECENT_STARTUP_FAILURE_FACT_ID => recent_startup_failure_detail(fact),
-        RECENT_REPAIR_FAILED_FACT_ID => repair_failure_copy(fact).map(|copy| copy.0.to_string()),
-        REPAIR_SUPPRESSED_UNTIL_FACT_ID => suppression_time_utc(fact)
-            .map(|time| format!("Guardian will not auto-repair this launch again until {time}.")),
-        _ => None,
+    if fact.id == RECENT_STARTUP_FAILURE_FACT_ID {
+        recent_startup_failure_detail(fact)
+    } else if fact.id == RECENT_REPAIR_FAILED_FACT_ID {
+        repair_failure_copy(fact).map(|copy| copy.0.to_string())
+    } else if fact.id == REPAIR_SUPPRESSED_UNTIL_FACT_ID {
+        suppression_time_utc(fact)
+            .map(|time| format!("Guardian will not auto-repair this launch again until {time}."))
+    } else {
+        None
     }
 }
 
 fn historical_launch_guidance(fact: &GuardianFact) -> Option<String> {
-    match fact.id.as_str() {
-        RECENT_STARTUP_FAILURE_FACT_ID => recent_startup_failure_guidance(fact),
-        RECENT_REPAIR_FAILED_FACT_ID => repair_failure_copy(fact).map(|copy| copy.1.to_string()),
-        REPAIR_SUPPRESSED_UNTIL_FACT_ID => suppression_time_utc(fact).map(|time| {
+    if fact.id == RECENT_STARTUP_FAILURE_FACT_ID {
+        recent_startup_failure_guidance(fact)
+    } else if fact.id == RECENT_REPAIR_FAILED_FACT_ID {
+        repair_failure_copy(fact).map(|copy| copy.1.to_string())
+    } else if fact.id == REPAIR_SUPPRESSED_UNTIL_FACT_ID {
+        suppression_time_utc(fact).map(|time| {
             format!(
                 "Review the launch settings before retrying; unchanged settings will not trigger another automatic repair before {time}."
             )
-        }),
-        _ => None,
+        })
+    } else {
+        None
     }
 }
 
@@ -858,7 +865,7 @@ fn resource_signal_facts(
     if signals.memory_clamped {
         facts.push(signal_fact(
             operation_id.clone(),
-            "launch_memory_min_clamped",
+            GuardianFactId::LaunchMemoryMinClamped,
             GuardianDomain::Launch,
             OwnershipClass::LauncherManaged,
             TargetKind::Config,
@@ -868,7 +875,7 @@ fn resource_signal_facts(
     if signals.low_memory_allocation {
         facts.push(signal_fact(
             operation_id.clone(),
-            "launch_memory_allocation_low",
+            GuardianFactId::LaunchMemoryAllocationLow,
             GuardianDomain::Launch,
             OwnershipClass::LauncherManaged,
             TargetKind::Config,
@@ -878,7 +885,7 @@ fn resource_signal_facts(
     if signals.memory_pressure {
         facts.push(signal_fact(
             operation_id.clone(),
-            "launch_resource_memory_pressure",
+            GuardianFactId::LaunchResourceMemoryPressure,
             GuardianDomain::Performance,
             OwnershipClass::LauncherManaged,
             TargetKind::Session,
@@ -888,7 +895,7 @@ fn resource_signal_facts(
     if signals.cpu_pressure {
         facts.push(signal_fact(
             operation_id.clone(),
-            "launch_resource_cpu_pressure",
+            GuardianFactId::LaunchResourceCpuPressure,
             GuardianDomain::Performance,
             OwnershipClass::LauncherManaged,
             TargetKind::Session,
@@ -898,7 +905,7 @@ fn resource_signal_facts(
     if signals.install_pressure {
         facts.push(signal_fact(
             operation_id.clone(),
-            "launch_resource_install_pressure",
+            GuardianFactId::LaunchResourceInstallPressure,
             GuardianDomain::Performance,
             OwnershipClass::LauncherManaged,
             TargetKind::Session,
@@ -908,7 +915,7 @@ fn resource_signal_facts(
     if signals.disk_pressure {
         facts.push(signal_fact(
             operation_id,
-            "launch_resource_disk_pressure",
+            GuardianFactId::LaunchResourceDiskPressure,
             GuardianDomain::Filesystem,
             OwnershipClass::LauncherManaged,
             TargetKind::FilesystemPath,
@@ -926,7 +933,7 @@ fn override_signal_facts(
     if signals.explicit_java_override {
         facts.push(signal_fact(
             operation_id.clone(),
-            "custom_java_override_present",
+            GuardianFactId::CustomJavaOverridePresent,
             GuardianDomain::Runtime,
             OwnershipClass::UserOwned,
             TargetKind::Config,
@@ -936,7 +943,7 @@ fn override_signal_facts(
     if signals.explicit_jvm_preset {
         facts.push(signal_fact(
             operation_id.clone(),
-            "custom_jvm_preset_present",
+            GuardianFactId::CustomJvmPresetPresent,
             GuardianDomain::Jvm,
             OwnershipClass::UserOwned,
             TargetKind::Config,
@@ -946,7 +953,7 @@ fn override_signal_facts(
     if signals.explicit_jvm_args {
         facts.push(signal_fact(
             operation_id,
-            "custom_jvm_args_present",
+            GuardianFactId::CustomJvmArgsPresent,
             GuardianDomain::Jvm,
             OwnershipClass::UserOwned,
             TargetKind::Config,
@@ -958,7 +965,7 @@ fn override_signal_facts(
 
 fn signal_fact(
     operation_id: Option<OperationId>,
-    id: &str,
+    id: GuardianFactId,
     domain: GuardianDomain,
     ownership: OwnershipClass,
     target_kind: TargetKind,
@@ -966,7 +973,7 @@ fn signal_fact(
 ) -> GuardianFact {
     GuardianFact {
         operation_id,
-        id: GuardianFactId::new(id),
+        id,
         domain,
         phase: OperationPhase::Validating,
         reliability: FactReliability::DirectStructured,
@@ -986,7 +993,7 @@ fn signal_fact(
 fn public_safe_fact(fact: &GuardianFact) -> GuardianFact {
     GuardianFact {
         operation_id: fact.operation_id.as_ref().map(public_safe_operation_id),
-        id: GuardianFactId::new(public_safe_token(fact.id.as_str(), "unknown_fact")),
+        id: fact.id,
         domain: fact.domain,
         phase: fact.phase,
         reliability: fact.reliability,
@@ -1067,7 +1074,7 @@ mod tests {
     #[test]
     fn java_override_unavailable_blocks_when_readiness_says_launch_is_impossible() {
         let readiness_fact = fact(
-            "java_override_missing",
+            GuardianFactId::JavaOverrideMissing,
             GuardianDomain::Runtime,
             GuardianSeverity::Blocking,
             OwnershipClass::UserOwned,
@@ -1089,7 +1096,7 @@ mod tests {
     #[test]
     fn java_override_unavailable_asks_in_custom_when_intent_can_be_confirmed() {
         let fact = fact(
-            "java_override_missing",
+            GuardianFactId::JavaOverrideMissing,
             GuardianDomain::Runtime,
             GuardianSeverity::Blocking,
             OwnershipClass::UserOwned,
@@ -1113,7 +1120,7 @@ mod tests {
     #[test]
     fn java_override_unavailable_directs_managed_java_for_managed_attempt() {
         let fact = fact(
-            "java_override_missing",
+            GuardianFactId::JavaOverrideMissing,
             GuardianDomain::Runtime,
             GuardianSeverity::Blocking,
             OwnershipClass::UserOwned,
@@ -1136,7 +1143,7 @@ mod tests {
     #[test]
     fn malformed_jvm_args_strip_in_managed_preflight_but_block_when_disabled() {
         let fact = fact(
-            "jvm_args_parse_failed",
+            GuardianFactId::JvmArgsParseFailed,
             GuardianDomain::Jvm,
             GuardianSeverity::Blocking,
             OwnershipClass::UserOwned,
@@ -1172,7 +1179,7 @@ mod tests {
     #[test]
     fn missing_launch_artifact_readiness_blocks_preflight() {
         let readiness_fact = fact(
-            "client_jar_missing",
+            GuardianFactId::ClientJarMissing,
             GuardianDomain::Install,
             GuardianSeverity::Blocking,
             OwnershipClass::LauncherManaged,
@@ -1197,7 +1204,7 @@ mod tests {
     #[test]
     fn launcher_managed_signature_readiness_blocks_preflight_with_specific_copy() {
         let readiness_fact = fact(
-            "launcher_managed_artifact_signature_corruption",
+            GuardianFactId::LauncherManagedArtifactSignatureCorruption,
             GuardianDomain::Download,
             GuardianSeverity::Blocking,
             OwnershipClass::LauncherManaged,
@@ -1224,7 +1231,7 @@ mod tests {
     fn public_preflight_copy_and_summary_are_redacted() {
         let fact = GuardianFact {
             operation_id: None,
-            id: GuardianFactId::new("jvm_args_parse_failed"),
+            id: GuardianFactId::JvmArgsParseFailed,
             domain: GuardianDomain::Jvm,
             phase: OperationPhase::Validating,
             reliability: FactReliability::ExactClassifier,
@@ -1595,7 +1602,7 @@ mod tests {
     }
 
     fn fact(
-        id: &str,
+        id: GuardianFactId,
         domain: GuardianDomain,
         severity: GuardianSeverity,
         ownership: OwnershipClass,
@@ -1604,7 +1611,7 @@ mod tests {
     ) -> GuardianFact {
         GuardianFact {
             operation_id: None,
-            id: GuardianFactId::new(id),
+            id,
             domain,
             phase: OperationPhase::Validating,
             reliability: FactReliability::DirectStructured,
@@ -1622,7 +1629,7 @@ mod tests {
     }
 
     fn fact_with_fields<const N: usize>(
-        id: &str,
+        id: GuardianFactId,
         target_id: &str,
         fields: [(&str, &str); N],
     ) -> GuardianFact {

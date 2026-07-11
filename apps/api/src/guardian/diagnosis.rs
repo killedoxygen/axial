@@ -1,7 +1,7 @@
 use super::inference_graph::{AffectedTargetStrategy, diagnosis_node_for_fact};
 use super::{
     Diagnosis, DiagnosisId, GuardianActionKind, GuardianConfidence, GuardianDomain, GuardianFact,
-    GuardianImpactVector, GuardianMode, GuardianSeverity, SafetyCase,
+    GuardianFactId, GuardianImpactVector, GuardianMode, GuardianSeverity, SafetyCase,
 };
 use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
@@ -50,7 +50,7 @@ fn diagnosis_for_fact(
         confidence: evaluation.resolved_confidence,
         ownership: fact.ownership,
         phase,
-        fact_ids: vec![fact.id.as_str().to_string()],
+        fact_ids: vec![fact.id],
         affected_targets: affected_targets_for_fact(fact, phase, node.target_strategy),
         impact: evaluation.impact,
         candidate_actions: node.candidate_actions.to_vec(),
@@ -108,13 +108,10 @@ fn affected_targets_for_fact(
     }
 }
 
-fn supporting_fact_ids(facts: &[GuardianFact], phase: OperationPhase) -> Vec<String> {
-    let mut fact_ids = facts
-        .iter()
-        .map(|fact| fact.id.as_str().to_string())
-        .collect::<Vec<_>>();
+fn supporting_fact_ids(facts: &[GuardianFact], phase: OperationPhase) -> Vec<GuardianFactId> {
+    let mut fact_ids = facts.iter().map(|fact| fact.id).collect::<Vec<_>>();
     if fact_ids.is_empty() {
-        fact_ids.push(format!("no_structured_fact_{}", phase_name(phase)));
+        fact_ids.push(GuardianFactId::NoStructuredFact(phase));
     }
     fact_ids
 }
