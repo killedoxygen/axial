@@ -1,3 +1,4 @@
+use crate::MANAGED_ARTIFACT_MAX_BYTES;
 use hex::encode;
 use reqwest::{Client, Response, StatusCode, Url};
 use serde::Deserialize;
@@ -39,6 +40,8 @@ pub enum ModrinthError {
     HashMismatch { expected: String, actual: String },
     #[error("download size exceeded: expected {expected} bytes got at least {actual} bytes")]
     SizeExceeded { expected: u64, actual: u64 },
+    #[error("download size mismatch: expected {expected} bytes got {actual} bytes")]
+    SizeMismatch { expected: u64, actual: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -116,13 +119,31 @@ impl ModrinthClient {
         Ok(compatible)
     }
 
-    pub async fn download_file_to_path(
+    pub(crate) async fn download_file_to_path(
         &self,
         url: &str,
         expected_sha512: &str,
         expected_size: Option<u64>,
         temp_path: &Path,
-    ) -> Result<(), ModrinthError> {
+    ) -> Result<ManagedDownloadTemp, ModrinthError> {
+        self.download_file_to_path_with_limit(
+            url,
+            expected_sha512,
+            expected_size,
+            temp_path,
+            MANAGED_ARTIFACT_MAX_BYTES,
+        )
+        .await
+    }
+
+    async fn download_file_to_path_with_limit(
+        &self,
+        url: &str,
+        expected_sha512: &str,
+        expected_size: Option<u64>,
+        temp_path: &Path,
+        absolute_max_bytes: u64,
+    ) -> Result<ManagedDownloadTemp, ModrinthError> {
         let response = self.client.get(url).send().await?;
         if !response.status().is_success() {
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
@@ -133,11 +154,16 @@ impl ModrinthClient {
             let body = bounded_response_text(response, RATE_LIMIT_BODY_LIMIT).await;
             return Err(ModrinthError::Http { status, body });
         }
-        if let Some(expected) = expected_size
-            && let Some(actual) = response.content_length()
-            && actual > expected
+        let max_bytes = expected_size
+            .unwrap_or(absolute_max_bytes)
+            .min(absolute_max_bytes);
+        if let Some(actual) = response.content_length()
+            && actual > max_bytes
         {
-            return Err(ModrinthError::SizeExceeded { expected, actual });
+            return Err(ModrinthError::SizeExceeded {
+                expected: max_bytes,
+                actual,
+            });
         }
 
         if let Some(parent) = temp_path
@@ -147,18 +173,25 @@ impl ModrinthClient {
             tokio::fs::create_dir_all(parent).await?;
         }
 
+        let create_path = temp_path.to_path_buf();
+        let created = tokio::task::spawn_blocking(move || CreatedDownloadTemp::create(create_path))
+            .await
+            .map_err(|_| {
+                ModrinthError::Io(io::Error::other(
+                    "managed download temp creation task stopped",
+                ))
+            })??;
+        let (output, owned_temp) = created.into_parts();
+        let mut output = tokio::fs::File::from_std(output);
         let result = async {
-            let mut output = tokio::fs::File::create(temp_path).await?;
             let mut hasher = Sha512::new();
             let mut actual_size = 0_u64;
             let mut response = response;
             while let Some(chunk) = response.chunk().await? {
                 actual_size = actual_size.saturating_add(chunk.len() as u64);
-                if let Some(expected) = expected_size
-                    && actual_size > expected
-                {
+                if actual_size > max_bytes {
                     return Err(ModrinthError::SizeExceeded {
-                        expected,
+                        expected: max_bytes,
                         actual: actual_size,
                     });
                 }
@@ -166,26 +199,114 @@ impl ModrinthClient {
                 output.write_all(&chunk).await?;
             }
             output.flush().await?;
-            Ok::<String, ModrinthError>(encode(hasher.finalize()))
+            Ok::<(String, u64), ModrinthError>((encode(hasher.finalize()), actual_size))
         }
         .await;
 
-        let actual = match result {
-            Ok(actual) => actual,
-            Err(error) => {
-                let _ = tokio::fs::remove_file(temp_path).await;
-                return Err(error);
-            }
-        };
+        let (actual, actual_size) = result?;
+
+        if let Some(expected) = expected_size
+            && actual_size != expected
+        {
+            return Err(ModrinthError::SizeMismatch {
+                expected,
+                actual: actual_size,
+            });
+        }
 
         if !expected_sha512.trim().is_empty() && !actual.eq_ignore_ascii_case(expected_sha512) {
-            let _ = tokio::fs::remove_file(temp_path).await;
             return Err(ModrinthError::HashMismatch {
                 expected: expected_sha512.to_string(),
                 actual,
             });
         }
-        Ok(())
+        Ok(owned_temp)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ManagedDownloadTemp {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl ManagedDownloadTemp {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    pub(crate) async fn cleanup(mut self) -> Result<(), io::Error> {
+        match tokio::fs::remove_file(&self.path).await {
+            Ok(()) => {
+                self.disarm();
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.disarm();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+struct CreatedDownloadTemp {
+    file: Option<std::fs::File>,
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl CreatedDownloadTemp {
+    fn create(path: std::path::PathBuf) -> Result<Self, io::Error> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Self {
+            file: Some(file),
+            path,
+            armed: true,
+        })
+    }
+
+    fn into_parts(mut self) -> (std::fs::File, ManagedDownloadTemp) {
+        let file = self
+            .file
+            .take()
+            .expect("created download temp owns its file");
+        self.armed = false;
+        let guard = ManagedDownloadTemp {
+            path: self.path.clone(),
+            armed: true,
+        };
+        (file, guard)
+    }
+}
+
+impl Drop for CreatedDownloadTemp {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if self.armed
+            && let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!("managed download temp cleanup failed");
+        }
+    }
+}
+
+impl Drop for ManagedDownloadTemp {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!("managed download temp cleanup failed");
+        }
     }
 }
 
@@ -413,7 +534,7 @@ mod tests {
         let temp_path = root.join("sodium.jar.tmp");
         let client = ModrinthClient::new();
 
-        client
+        let _owned_temp = client
             .download_file_to_path(&url, &sha512, Some(body.len() as u64), &temp_path)
             .await
             .expect("download verified file");
@@ -565,6 +686,175 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn download_file_to_path_rejects_truncated_body_without_sha512() {
+        let url = spawn_response_server_with_content_length(
+            "200 OK",
+            Vec::new(),
+            b"short".to_vec(),
+            None,
+        )
+        .await;
+        let root = test_root("download-truncated-provider-size");
+        let temp_path = root.join("managed.jar.tmp");
+        let client = ModrinthClient::new();
+
+        let error = client
+            .download_file_to_path(&url, "", Some(8), &temp_path)
+            .await
+            .expect_err("body shorter than provider size should fail without a hash");
+
+        assert!(matches!(
+            error,
+            ModrinthError::SizeMismatch {
+                expected: 8,
+                actual: 5
+            }
+        ));
+        assert!(!temp_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn download_file_to_path_enforces_absolute_content_length_without_provider_size() {
+        let url = spawn_response_server_with_content_length(
+            "200 OK",
+            Vec::new(),
+            b"oversized".to_vec(),
+            Some(64),
+        )
+        .await;
+        let root = test_root("download-absolute-content-length");
+        let temp_path = root.join("managed.jar.tmp");
+        let client = ModrinthClient::new();
+
+        let error = client
+            .download_file_to_path_with_limit(&url, "", None, &temp_path, 8)
+            .await
+            .expect_err("absolute content-length limit should apply without provider size");
+
+        assert!(matches!(
+            error,
+            ModrinthError::SizeExceeded {
+                expected: 8,
+                actual: 64
+            }
+        ));
+        assert!(!temp_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn download_file_to_path_enforces_absolute_stream_limit_without_provider_size() {
+        let url = spawn_response_server_with_content_length(
+            "200 OK",
+            Vec::new(),
+            b"managed-jar".to_vec(),
+            None,
+        )
+        .await;
+        let root = test_root("download-absolute-stream");
+        let temp_path = root.join("managed.jar.tmp");
+        let client = ModrinthClient::new();
+
+        let error = client
+            .download_file_to_path_with_limit(&url, "", None, &temp_path, 8)
+            .await
+            .expect_err("absolute stream limit should apply without provider size");
+
+        assert!(matches!(
+            error,
+            ModrinthError::SizeExceeded {
+                expected: 8,
+                actual
+            } if actual > 8
+        ));
+        assert!(!temp_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn download_file_to_path_rejects_preexisting_temp_without_truncating_it() {
+        let url = spawn_file_server(b"managed-jar".to_vec()).await;
+        let root = test_root("download-preexisting-temp");
+        let temp_path = root.join("managed.jar.tmp");
+        fs::write(&temp_path, b"preexisting").expect("write preexisting temp");
+        let client = ModrinthClient::new();
+
+        let error = client
+            .download_file_to_path_with_limit(&url, "", None, &temp_path, 64)
+            .await
+            .expect_err("exclusive temp creation should reject a preexisting file");
+
+        assert!(matches!(error, ModrinthError::Io(_)));
+        assert_eq!(
+            fs::read(&temp_path).expect("read preexisting temp"),
+            b"preexisting"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancelled_download_removes_only_its_exclusively_created_temp() {
+        let url = spawn_slow_file_server().await;
+        let root = test_root("download-cancelled-owned-temp");
+        let temp_path = root.join("managed.jar.tmp");
+        let task_temp_path = temp_path.clone();
+        let client = ModrinthClient::new();
+        let task = tokio::spawn(async move {
+            client
+                .download_file_to_path_with_limit(&url, "", None, &task_temp_path, 64)
+                .await
+        });
+
+        for _ in 0..100 {
+            if temp_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            temp_path.exists(),
+            "download should own its temp before cancellation"
+        );
+
+        task.abort();
+        let _ = task.await;
+
+        assert!(!temp_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_file_to_path_rejects_stale_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let body = b"managed-jar".to_vec();
+        let url = spawn_file_server(body.clone()).await;
+        let root = test_root("download-stale-symlink");
+        let victim = root.join("victim.jar");
+        let temp_path = root.join("managed.jar.tmp");
+        fs::write(&victim, b"user-owned").expect("write symlink victim");
+        symlink(&victim, &temp_path).expect("create stale temp symlink");
+        let client = ModrinthClient::new();
+
+        let error = client
+            .download_file_to_path_with_limit(&url, "", None, &temp_path, 64)
+            .await
+            .expect_err("fresh exclusive temp must reject a stale symlink");
+
+        assert!(matches!(error, ModrinthError::Io(_)));
+        assert_eq!(fs::read(&victim).expect("read victim"), b"user-owned");
+        assert!(
+            fs::symlink_metadata(&temp_path)
+                .expect("temp metadata")
+                .file_type()
+                .is_symlink()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     async fn spawn_file_server(body: Vec<u8>) -> String {
         let base_url = spawn_response_server(
             "200 OK",
@@ -576,6 +866,30 @@ mod tests {
         )
         .await;
         format!("{base_url}/files/sodium.jar")
+    }
+
+    async fn spawn_slow_file_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow response server");
+        let addr = listener.local_addr().expect("slow response server addr");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            if stream
+                .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\na")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let _ = stream.write_all(b"managed-jar").await;
+        });
+        format!("http://{addr}/files/slow.jar")
     }
 
     async fn spawn_response_server(

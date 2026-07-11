@@ -12,8 +12,8 @@ use crate::state::contracts::{
 use axial_minecraft::scan_versions;
 use axial_performance::{
     BundleHealth, CompositionPlan, CompositionTier, ManagedArtifactProvider, OwnershipClass,
-    PerformanceMode, ResolutionRequest, StateError, derive_health, effective_performance_plan,
-    load_state, parse_mode,
+    PerformanceMode, ResolutionRequest, StateError, derive_health_async,
+    effective_performance_plan, parse_mode, state::load_state_async,
 };
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
@@ -110,7 +110,7 @@ pub async fn performance_plan(
         "game_version query parameter is required",
     )?;
     let mode = resolve_config_mode(state, query.mode.as_deref())?;
-    let installed_mods = plan_installed_mod_evidence(state, query.instance_id.as_deref())?;
+    let installed_mods = plan_installed_mod_evidence(state, query.instance_id.as_deref()).await?;
     let plan = state.performance().get_plan(ResolutionRequest {
         game_version,
         loader: optional_value(query.loader.as_deref()).unwrap_or_default(),
@@ -137,7 +137,7 @@ pub async fn performance_plan(
     })
 }
 
-fn plan_installed_mod_evidence(
+async fn plan_installed_mod_evidence(
     state: &AppState,
     raw_instance_id: Option<&str>,
 ) -> Result<Vec<String>, (StatusCode, Json<serde_json::Value>)> {
@@ -151,7 +151,7 @@ fn plan_installed_mod_evidence(
         )
     })?;
     let mods_dir = state.instances().game_dir(&instance.id).join("mods");
-    let state_file = match load_state(&mods_dir) {
+    let state_file = match load_state_async(&mods_dir).await {
         Ok(state_file) => state_file,
         Err(StateError::Parse(_)) => {
             return Err((
@@ -178,7 +178,7 @@ fn plan_installed_mod_evidence(
         Err(error) => return Err(internal_error(error)),
     };
 
-    Ok(installed_mod_evidence(&mods_dir, state_file.as_ref()))
+    Ok(installed_mod_evidence_async(&mods_dir, state_file.as_ref()).await)
 }
 
 pub async fn performance_health(
@@ -203,7 +203,7 @@ pub async fn performance_health(
     }
 
     let mods_dir = state.instances().game_dir(&instance.id).join("mods");
-    let state_file = match load_state(&mods_dir) {
+    let state_file = match load_state_async(&mods_dir).await {
         Ok(state_file) => state_file,
         Err(StateError::Parse(_)) => {
             return Ok(invalid_health_response(
@@ -236,9 +236,9 @@ pub async fn performance_health(
         loader,
         mode,
         hardware: state.performance().hardware(),
-        installed_mods: installed_mod_evidence(&mods_dir, state_file.as_ref()),
+        installed_mods: installed_mod_evidence_async(&mods_dir, state_file.as_ref()).await,
     });
-    let (health, warnings) = derive_health(state_file.as_ref(), Some(&plan), &mods_dir);
+    let (health, warnings) = derive_health_async(state_file.as_ref(), Some(&plan), &mods_dir).await;
     let warnings = response_warnings(&plan, warnings);
     let composition_id = state_file
         .as_ref()
@@ -263,7 +263,7 @@ pub async fn performance_health(
         &mut guardian_facts,
         performance_failure_memory_facts(state, OperationPhase::Validating, Some(&composition_id)),
     );
-    let rollback = health_rollback_state(state, &mods_dir);
+    let rollback = health_rollback_state(state, &mods_dir).await;
     let proof = performance_health_proof(
         None,
         health,
@@ -348,8 +348,12 @@ fn append_performance_guardian_facts(facts: &mut Vec<GuardianFact>, more: Vec<Gu
     facts.truncate(PERFORMANCE_GUARDIAN_FACT_LIMIT);
 }
 
-fn health_rollback_state(state: &AppState, mods_dir: &std::path::Path) -> RollbackState {
-    match state.performance().list_rollback_snapshots(mods_dir) {
+async fn health_rollback_state(state: &AppState, mods_dir: &std::path::Path) -> RollbackState {
+    match state
+        .performance()
+        .list_rollback_snapshots_async(mods_dir)
+        .await
+    {
         Ok(snapshots) if !snapshots.is_empty() => RollbackState::Available,
         _ => RollbackState::Unavailable,
     }
@@ -700,9 +704,22 @@ pub(super) fn installed_mod_evidence(
     evidence.into_iter().collect()
 }
 
-pub(super) fn installed_mod_evidence_from_mods_dir(mods_dir: &std::path::Path) -> Vec<String> {
-    let state = load_state(mods_dir).ok().flatten();
-    installed_mod_evidence(mods_dir, state.as_ref())
+async fn installed_mod_evidence_async(
+    mods_dir: &std::path::Path,
+    state: Option<&axial_performance::CompositionState>,
+) -> Vec<String> {
+    let mods_dir = mods_dir.to_path_buf();
+    let state = state.cloned();
+    tokio::task::spawn_blocking(move || installed_mod_evidence(&mods_dir, state.as_ref()))
+        .await
+        .unwrap_or_default()
+}
+
+pub(super) async fn installed_mod_evidence_from_mods_dir_async(
+    mods_dir: &std::path::Path,
+) -> Vec<String> {
+    let state = load_state_async(mods_dir).await.ok().flatten();
+    installed_mod_evidence_async(mods_dir, state.as_ref()).await
 }
 
 fn installed_mod_file_evidence(mods_dir: &std::path::Path) -> Vec<String> {

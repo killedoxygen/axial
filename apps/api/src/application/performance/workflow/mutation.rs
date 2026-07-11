@@ -5,7 +5,7 @@ use super::operations::{
     record_performance_guardian_supervision, record_performance_operation_result,
 };
 use super::plan_health::{
-    PerformanceManagedArtifactSummary, installed_mod_evidence_from_mods_dir,
+    PerformanceManagedArtifactSummary, installed_mod_evidence_from_mods_dir_async,
     managed_artifact_summary, performance_composition_target, resolve_instance_mode,
     resolve_instance_version_target, response_warnings, tier_name,
 };
@@ -25,7 +25,8 @@ use crate::state::AppState;
 use crate::state::contracts::{OperationId, OperationPhase, RollbackState};
 use axial_performance::{
     BundleHealth, CompositionState, InstallError, PerformanceMode, ResolutionRequest,
-    RollbackSnapshotSummary as CoreRollbackSnapshotSummary, StateError, derive_health, load_state,
+    RollbackSnapshotSummary as CoreRollbackSnapshotSummary, StateError, derive_health_async,
+    state::load_state_async,
 };
 use axum::{Json, http::StatusCode};
 use serde::Serialize;
@@ -75,7 +76,8 @@ pub async fn performance_rollback_list(
     let mods_dir = state.instances().game_dir(&instance.id).join("mods");
     let snapshots = state
         .performance()
-        .list_rollback_snapshots(&mods_dir)
+        .list_rollback_snapshots_async(&mods_dir)
+        .await
         .map_err(performance_install_error)?
         .into_iter()
         .map(performance_rollback_snapshot_summary)
@@ -153,7 +155,7 @@ pub(super) async fn execute_performance_operation(
     .await
 }
 
-pub(super) fn performance_operation_journal_identity(
+pub(super) async fn performance_operation_journal_identity(
     state: &AppState,
     operation: &PerformanceOperation,
 ) -> Result<PerformanceJournalIdentity, PerformanceApplicationError> {
@@ -170,7 +172,7 @@ pub(super) fn performance_operation_journal_identity(
 
     if matches!(operation.action, PerformanceInstallAction::Rollback) {
         return Ok(
-            match rollback_preflight(&mods_dir, operation.rollback_id.as_deref()) {
+            match rollback_preflight(&mods_dir, operation.rollback_id.as_deref()).await {
                 Ok((target_id, rollback)) => PerformanceJournalIdentity {
                     action: PerformanceInstallAction::Rollback,
                     target_id,
@@ -189,7 +191,7 @@ pub(super) fn performance_operation_journal_identity(
     if matches!(operation.action, PerformanceInstallAction::Remove)
         || !matches!(mode, PerformanceMode::Managed)
     {
-        return Ok(match preflight_current_performance_state(&mods_dir) {
+        return Ok(match preflight_current_performance_state(&mods_dir).await {
             Ok(current) => PerformanceJournalIdentity {
                 action: PerformanceInstallAction::Remove,
                 target_id: current
@@ -217,9 +219,10 @@ pub(super) fn performance_operation_journal_identity(
         loader,
         mode,
         hardware: state.performance().hardware(),
-        installed_mods: installed_mod_evidence_from_mods_dir(&mods_dir),
+        installed_mods: installed_mod_evidence_from_mods_dir_async(&mods_dir).await,
     });
     let rollback = preflight_current_performance_state(&mods_dir)
+        .await
         .map(|current| rollback_state_for_current_state(current.as_ref()))
         .unwrap_or(RollbackState::Unavailable);
     Ok(PerformanceJournalIdentity {
@@ -235,7 +238,7 @@ async fn execute_performance_rollback(
     mods_dir: &std::path::Path,
     operation: &PerformanceOperation,
 ) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
-    let preflight = rollback_preflight(mods_dir, operation.rollback_id.as_deref());
+    let preflight = rollback_preflight(mods_dir, operation.rollback_id.as_deref()).await;
     let (target_id, rollback_state) = match &preflight {
         Ok((target_id, rollback_state)) => (target_id.clone(), *rollback_state),
         Err(_) => (
@@ -340,18 +343,20 @@ async fn execute_performance_rollback(
     )
     .await?;
 
-    let result = (|| {
+    let result = async {
         let restored_state =
             if let Some(rollback_id) = optional_value(operation.rollback_id.as_deref()) {
                 performance
-                    .rollback_managed_snapshot(mods_dir, &rollback_id)
+                    .rollback_managed_snapshot_async(mods_dir, &rollback_id)
+                    .await
                     .map_err(performance_install_error)?
             } else {
                 performance
-                    .rollback_managed(mods_dir)
+                    .rollback_managed_async(mods_dir)
+                    .await
                     .map_err(performance_install_error)?
             };
-        let (health, warnings) = derive_health(Some(&restored_state), None, mods_dir);
+        let (health, warnings) = derive_health_async(Some(&restored_state), None, mods_dir).await;
 
         Ok(PerformanceInstallResponse {
             active: true,
@@ -367,7 +372,8 @@ async fn execute_performance_rollback(
             managed_artifacts: managed_artifact_summary(Some(&restored_state)),
             warnings,
         })
-    })();
+    }
+    .await;
     record_performance_operation_result(
         state,
         &operation_id,
@@ -389,7 +395,7 @@ async fn execute_performance_remove(
     operation: &PerformanceOperation,
 ) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
     let journal_action = PerformanceInstallAction::Remove;
-    let current_state = preflight_current_performance_state(mods_dir);
+    let current_state = preflight_current_performance_state(mods_dir).await;
     let (target_id, rollback_state) = match &current_state {
         Ok(state) => (
             state
@@ -501,7 +507,8 @@ async fn execute_performance_remove(
     .await?;
 
     let result = performance
-        .remove_managed(mods_dir)
+        .remove_managed_async(mods_dir)
+        .await
         .map(|_| removed_install_response())
         .map_err(performance_install_error);
     record_performance_operation_result(
@@ -532,9 +539,9 @@ async fn execute_performance_install(
         loader,
         mode,
         hardware: state.performance().hardware(),
-        installed_mods: installed_mod_evidence_from_mods_dir(mods_dir),
+        installed_mods: installed_mod_evidence_from_mods_dir_async(mods_dir).await,
     });
-    let current_state = preflight_current_performance_state(mods_dir);
+    let current_state = preflight_current_performance_state(mods_dir).await;
     let rollback_state = match &current_state {
         Ok(state) => rollback_state_for_current_state(state.as_ref()),
         Err(_) => RollbackState::Unavailable,
@@ -647,7 +654,8 @@ async fn execute_performance_install(
         .await
     {
         Ok(installed_state) => {
-            let (health, warnings) = derive_health(Some(&installed_state), Some(&plan), mods_dir);
+            let (health, warnings) =
+                derive_health_async(Some(&installed_state), Some(&plan), mods_dir).await;
             let warnings = response_warnings(&plan, warnings);
             Ok(PerformanceInstallResponse {
                 active: true,
@@ -727,21 +735,25 @@ fn performance_guardian_mode(state: &AppState) -> GuardianMode {
     }
 }
 
-fn preflight_current_performance_state(
+async fn preflight_current_performance_state(
     mods_dir: &std::path::Path,
 ) -> Result<Option<CompositionState>, (StatusCode, Json<serde_json::Value>)> {
-    load_state(mods_dir).map_err(|error| performance_install_error(InstallError::State(error)))
+    load_state_async(mods_dir)
+        .await
+        .map_err(|error| performance_install_error(InstallError::State(error)))
 }
 
-fn rollback_preflight(
+async fn rollback_preflight(
     mods_dir: &std::path::Path,
     rollback_id: Option<&str>,
 ) -> Result<(String, RollbackState), (StatusCode, Json<serde_json::Value>)> {
     let snapshot = if let Some(rollback_id) = optional_value(rollback_id) {
-        axial_performance::state::load_rollback_snapshot_by_id(mods_dir, &rollback_id)
+        axial_performance::state::load_rollback_snapshot_by_id_async(mods_dir, &rollback_id)
+            .await
             .map_err(|error| performance_install_error(InstallError::State(error)))?
     } else {
-        axial_performance::state::load_rollback_snapshot(mods_dir)
+        axial_performance::state::load_rollback_snapshot_async(mods_dir)
+            .await
             .map_err(|error| performance_install_error(InstallError::State(error)))?
     };
 

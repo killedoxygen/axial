@@ -2,10 +2,11 @@ use super::fallback::{empty_state, severe_install_failure};
 use super::manager::PerformanceManager;
 use super::model::InstallError;
 use crate::state::{
-    RollbackSnapshotSummary, list_rollback_snapshots, load_rollback_snapshot,
-    load_rollback_snapshot_async, load_rollback_snapshot_by_id, load_state, managed_artifact_path,
-    remove_state, restore_rollback_snapshot, restore_rollback_snapshot_async,
-    save_rollback_snapshot, save_rollback_snapshot_async, save_state,
+    RollbackSnapshotSummary, list_rollback_snapshots_async, load_rollback_snapshot,
+    load_rollback_snapshot_async, load_rollback_snapshot_by_id_async, load_state,
+    managed_artifact_path, remove_state, restore_rollback_snapshot,
+    restore_rollback_snapshot_async, save_rollback_snapshot, save_rollback_snapshot_async,
+    save_state,
 };
 use crate::types::{CompositionPlan, CompositionState, InstalledMod, PerformanceMode};
 use std::fs;
@@ -20,7 +21,7 @@ impl PerformanceManager {
         instance_mods_dir: &Path,
     ) -> Result<CompositionState, InstallError> {
         if !matches!(plan.mode, PerformanceMode::Managed) {
-            self.remove_managed(instance_mods_dir)?;
+            self.remove_managed_async(instance_mods_dir).await?;
             return Ok(empty_state(plan));
         }
 
@@ -96,36 +97,18 @@ impl PerformanceManager {
         Ok(state)
     }
 
-    pub fn remove_managed(&self, instance_mods_dir: &Path) -> Result<(), InstallError> {
-        if let Some(state) = load_state(instance_mods_dir)? {
-            save_rollback_snapshot(instance_mods_dir, &state)?;
-            let result = (|| -> Result<(), InstallError> {
-                for installed in &state.installed_mods {
-                    let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
-                    if let Err(error) = fs::remove_file(path)
-                        && error.kind() != std::io::ErrorKind::NotFound
-                    {
-                        return Err(InstallError::Io(error));
-                    }
-                }
-                remove_state(instance_mods_dir)?;
-                Ok(())
-            })();
-            self.restore_after_error(instance_mods_dir, result, true)?;
-        }
-        Ok(())
+    pub async fn remove_managed_async(&self, instance_mods_dir: &Path) -> Result<(), InstallError> {
+        let instance_mods_dir = instance_mods_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || remove_managed_transaction(&instance_mods_dir))
+            .await
+            .map_err(|_| {
+                InstallError::Io(std::io::Error::other(
+                    "managed performance removal task stopped before reporting its result",
+                ))
+            })?
     }
 
-    pub fn rollback_managed(
-        &self,
-        instance_mods_dir: &Path,
-    ) -> Result<CompositionState, InstallError> {
-        let snapshot =
-            load_rollback_snapshot(instance_mods_dir)?.ok_or(InstallError::NoRollbackSnapshot)?;
-        Ok(restore_rollback_snapshot(instance_mods_dir, &snapshot)?)
-    }
-
-    async fn rollback_managed_async(
+    pub async fn rollback_managed_async(
         &self,
         instance_mods_dir: &Path,
     ) -> Result<CompositionState, InstallError> {
@@ -135,21 +118,22 @@ impl PerformanceManager {
         Ok(restore_rollback_snapshot_async(instance_mods_dir, &snapshot).await?)
     }
 
-    pub fn rollback_managed_snapshot(
+    pub async fn rollback_managed_snapshot_async(
         &self,
         instance_mods_dir: &Path,
         snapshot_id: &str,
     ) -> Result<CompositionState, InstallError> {
-        let snapshot = load_rollback_snapshot_by_id(instance_mods_dir, snapshot_id)?
+        let snapshot = load_rollback_snapshot_by_id_async(instance_mods_dir, snapshot_id)
+            .await?
             .ok_or(InstallError::RollbackSnapshotNotFound)?;
-        Ok(restore_rollback_snapshot(instance_mods_dir, &snapshot)?)
+        Ok(restore_rollback_snapshot_async(instance_mods_dir, &snapshot).await?)
     }
 
-    pub fn list_rollback_snapshots(
+    pub async fn list_rollback_snapshots_async(
         &self,
         instance_mods_dir: &Path,
     ) -> Result<Vec<RollbackSnapshotSummary>, InstallError> {
-        Ok(list_rollback_snapshots(instance_mods_dir)?)
+        Ok(list_rollback_snapshots_async(instance_mods_dir).await?)
     }
     fn remove_stale_managed(
         &self,
@@ -273,28 +257,6 @@ impl PerformanceManager {
         Ok(())
     }
 
-    fn restore_after_error<T>(
-        &self,
-        instance_mods_dir: &Path,
-        result: Result<T, InstallError>,
-        snapshot_available: bool,
-    ) -> Result<T, InstallError> {
-        match result {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                if snapshot_available
-                    && let Err(rollback_error) = self.rollback_managed(instance_mods_dir)
-                {
-                    warn!(
-                        "failed to restore performance rollback snapshot after error: {}",
-                        rollback_error
-                    );
-                }
-                Err(error)
-            }
-        }
-    }
-
     async fn restore_after_error_async<T>(
         &self,
         instance_mods_dir: &Path,
@@ -317,4 +279,41 @@ impl PerformanceManager {
             }
         }
     }
+}
+
+fn remove_managed_transaction(instance_mods_dir: &Path) -> Result<(), InstallError> {
+    let Some(state) = load_state(instance_mods_dir)? else {
+        return Ok(());
+    };
+    save_rollback_snapshot(instance_mods_dir, &state)?;
+    let result = (|| -> Result<(), InstallError> {
+        for installed in &state.installed_mods {
+            let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
+            if let Err(error) = fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(InstallError::Io(error));
+            }
+        }
+        remove_state(instance_mods_dir)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if let Err(rollback_error) = rollback_managed_transaction(instance_mods_dir) {
+            warn!(
+                "failed to restore performance rollback snapshot after error: {}",
+                rollback_error
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn rollback_managed_transaction(
+    instance_mods_dir: &Path,
+) -> Result<CompositionState, InstallError> {
+    let snapshot =
+        load_rollback_snapshot(instance_mods_dir)?.ok_or(InstallError::NoRollbackSnapshot)?;
+    Ok(restore_rollback_snapshot(instance_mods_dir, &snapshot)?)
 }

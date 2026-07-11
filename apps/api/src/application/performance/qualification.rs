@@ -47,13 +47,18 @@ pub(crate) async fn family_c_qualification_payload(
     }
 
     let proofs = family_c_qualification_proofs(state, &manifest);
-    Ok(family_c_qualification_manifest_payload(
-        Some(state),
-        &manifest,
-        &proofs,
-        [Vec::new(), Vec::new()],
-        true,
-    ))
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        family_c_qualification_manifest_payload(
+            Some(&state),
+            &manifest,
+            &proofs,
+            [Vec::new(), Vec::new()],
+            true,
+        )
+    })
+    .await
+    .map_err(|_| benchmark_suite_storage_error_response())
 }
 
 pub(crate) fn family_c_qualification_preview_payload() -> Result<Value, (StatusCode, Json<Value>)> {

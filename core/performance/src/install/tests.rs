@@ -4,10 +4,10 @@ use super::artifact::{
 };
 use super::manager::PerformanceManager;
 use super::model::InstallError;
-use super::promotion::{promote_file_with_overwrite, promote_file_with_overwrite_async};
+use super::promotion::promote_file_async;
 use super::rules_refresh::remote_rules_refresh_warning;
 use crate::health::{BundleHealth, derive_health};
-use crate::modrinth::ModrinthError;
+use crate::modrinth::{ModrinthClient, ModrinthError};
 use crate::resolve::builtin_manifest;
 use crate::rules_cache::{remote_rules_snapshot, rules_cache_path};
 use crate::signature::RulesSignatureMetadata;
@@ -58,82 +58,6 @@ fn managed_artifact_temp_path_uses_safe_project_suffix() {
         temp_path,
         PathBuf::from("/tmp/mods/mod.jar.projectidwithslash.tmp")
     );
-}
-
-#[test]
-fn promote_file_with_overwrite_replaces_existing_file() {
-    let root = test_root("promote-overwrite-replaces-file");
-    let temp_path = root.join("sodium.jar.tmp");
-    let final_path = root.join("sodium.jar");
-    fs::write(&temp_path, b"fresh").expect("write temp artifact");
-    fs::write(&final_path, b"existing").expect("write existing artifact");
-
-    promote_file_with_overwrite(&temp_path, &final_path).expect("promote replacement");
-
-    assert_eq!(
-        fs::read(&final_path).expect("read promoted artifact"),
-        b"fresh"
-    );
-    assert!(!temp_path.exists());
-    assert_no_replace_backups(&root);
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn promote_file_with_overwrite_preserves_existing_file_when_temp_is_missing() {
-    let root = test_root("promote-overwrite-missing-temp");
-    let temp_path = root.join("sodium.jar.tmp");
-    let final_path = root.join("sodium.jar");
-    fs::write(&final_path, b"existing").expect("write existing artifact");
-
-    promote_file_with_overwrite(&temp_path, &final_path).expect_err("missing temp should fail");
-
-    assert_eq!(
-        fs::read(&final_path).expect("read existing artifact"),
-        b"existing"
-    );
-    assert!(!temp_path.exists());
-    assert_no_replace_backups(&root);
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn promote_file_with_overwrite_preserves_directory_destination_and_removes_temp() {
-    let root = test_root("promote-overwrite-directory");
-    let temp_path = root.join("sodium.jar.tmp");
-    let final_path = root.join("sodium.jar");
-    fs::write(&temp_path, b"fresh").expect("write temp artifact");
-    fs::create_dir(&final_path).expect("create directory destination");
-
-    promote_file_with_overwrite(&temp_path, &final_path)
-        .expect_err("directory destination should fail");
-
-    assert!(final_path.is_dir());
-    assert!(!temp_path.exists());
-    assert_no_replace_backups(&root);
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn async_promote_file_with_overwrite_preserves_directory_destination_and_removes_temp() {
-    let root = test_root("async-promote-overwrite-directory");
-    let temp_path = root.join("sodium.jar.tmp");
-    let final_path = root.join("sodium.jar");
-    fs::write(&temp_path, b"fresh").expect("write temp artifact");
-    fs::create_dir(&final_path).expect("create directory destination");
-
-    promote_file_with_overwrite_async(&temp_path, &final_path)
-        .await
-        .expect_err("directory destination should fail");
-
-    assert!(final_path.is_dir());
-    assert!(!temp_path.exists());
-    assert_no_replace_backups(&root);
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -822,6 +746,35 @@ async fn ensure_installed_replaces_previously_tracked_mismatched_final_file() {
         b"managed-jar"
     );
     assert!(!root.join("sodium.jar.tmp").exists());
+    assert_no_replace_backups(&root);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn tracked_overwrite_rejection_cleans_owned_download_temp() {
+    let root = test_root("tracked-overwrite-rejection-cleans-temp");
+    let temp_path = root.join("sodium.jar.tmp");
+    let final_path = root.join("sodium.jar");
+    fs::create_dir(&final_path).expect("create tracked directory destination");
+    let base_url = spawn_modrinth_server_with_sha512(None).await;
+    let download = ModrinthClient::new()
+        .download_file_to_path(
+            &format!("{base_url}/files/sodium.jar"),
+            "",
+            None,
+            &temp_path,
+        )
+        .await
+        .expect("download owned managed temp");
+
+    promote_file_async(download, &final_path, "sodium.jar", true)
+        .await
+        .expect_err("tracked directory destination should reject overwrite");
+
+    assert!(final_path.is_dir());
+    assert!(!temp_path.exists());
+    assert_no_replace_backups(&root);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1141,8 +1094,8 @@ async fn vanilla_enhanced_fallback_saves_empty_state_and_removes_tracked_files()
     let _ = fs::remove_dir_all(root);
 }
 
-#[test]
-fn rollback_restores_previous_managed_files_without_touching_user_files() {
+#[tokio::test]
+async fn rollback_restores_previous_managed_files_without_touching_user_files() {
     let root = test_root("rollback-restores-managed");
     let manager = PerformanceManager::new().expect("performance manager");
     fs::write(root.join("managed.jar"), b"managed-v1").expect("write managed file");
@@ -1154,12 +1107,14 @@ fn rollback_restores_previous_managed_files_without_touching_user_files() {
     .expect("save state");
 
     manager
-        .remove_managed(&root)
+        .remove_managed_async(&root)
+        .await
         .expect("remove managed bundle");
     fs::write(root.join("user.jar"), b"user-v2").expect("mutate user file");
 
     let restored = manager
-        .rollback_managed(&root)
+        .rollback_managed_async(&root)
+        .await
         .expect("rollback should restore latest snapshot");
 
     assert_eq!(restored.composition_id, "core");
@@ -1183,21 +1138,22 @@ fn rollback_restores_previous_managed_files_without_touching_user_files() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[test]
-fn rollback_without_snapshot_is_predictable() {
+#[tokio::test]
+async fn rollback_without_snapshot_is_predictable() {
     let root = test_root("rollback-missing");
     let manager = PerformanceManager::new().expect("performance manager");
 
     let error = manager
-        .rollback_managed(&root)
+        .rollback_managed_async(&root)
+        .await
         .expect_err("missing snapshot should fail");
 
     assert!(matches!(error, InstallError::NoRollbackSnapshot));
     let _ = fs::remove_dir_all(root);
 }
 
-#[test]
-fn remove_rejects_non_composition_owned_tracked_state_without_deleting_files() {
+#[tokio::test]
+async fn remove_rejects_non_composition_owned_tracked_state_without_deleting_files() {
     let root = test_root("remove-rejects-user-owned-tracked-state");
     let manager = PerformanceManager::new().expect("performance manager");
     fs::create_dir_all(&root).expect("create mods dir");
@@ -1224,7 +1180,8 @@ fn remove_rejects_non_composition_owned_tracked_state_without_deleting_files() {
     .expect("write invalid state");
 
     let error = manager
-        .remove_managed(&root)
+        .remove_managed_async(&root)
+        .await
         .expect_err("invalid ownership should stop removal");
 
     assert!(matches!(
@@ -1236,8 +1193,8 @@ fn remove_rejects_non_composition_owned_tracked_state_without_deleting_files() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[test]
-fn rollback_rejects_path_traversal_metadata() {
+#[tokio::test]
+async fn rollback_rejects_path_traversal_metadata() {
     let root = test_root("rollback-path-traversal");
     let manager = PerformanceManager::new().expect("performance manager");
     let rollback_dir = root.join(".axial-performance").join("rollback");
@@ -1256,7 +1213,8 @@ fn rollback_rejects_path_traversal_metadata() {
     .expect("write snapshot");
 
     let error = manager
-        .rollback_managed(&root)
+        .rollback_managed_async(&root)
+        .await
         .expect_err("traversal metadata should fail");
 
     assert!(matches!(
@@ -1267,8 +1225,8 @@ fn rollback_rejects_path_traversal_metadata() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[test]
-fn hard_remove_error_restores_deleted_managed_file() {
+#[tokio::test]
+async fn remove_rejects_nonregular_tracked_source_before_mutation() {
     let root = test_root("rollback-after-remove-error");
     let manager = PerformanceManager::new().expect("performance manager");
     fs::write(root.join("managed.jar"), b"managed-v1").expect("write managed file");
@@ -1286,10 +1244,14 @@ fn hard_remove_error_restores_deleted_managed_file() {
     .expect("save state");
 
     let error = manager
-        .remove_managed(&root)
+        .remove_managed_async(&root)
+        .await
         .expect_err("directory removal should fail");
 
-    assert!(matches!(error, InstallError::Io(_)));
+    assert!(matches!(
+        error,
+        InstallError::State(StateError::InvalidRollback(_))
+    ));
     assert_eq!(
         fs::read(root.join("managed.jar")).expect("read managed"),
         b"managed-v1"

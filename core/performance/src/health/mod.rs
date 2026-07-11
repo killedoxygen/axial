@@ -12,7 +12,7 @@ pub enum BundleHealth {
     Invalid,
 }
 
-pub fn derive_health(
+pub(crate) fn derive_health(
     state: Option<&CompositionState>,
     plan: Option<&CompositionPlan>,
     instance_mods_dir: &Path,
@@ -63,6 +63,26 @@ pub fn derive_health(
     }
 
     (BundleHealth::Healthy, warnings)
+}
+
+pub async fn derive_health_async(
+    state: Option<&CompositionState>,
+    plan: Option<&CompositionPlan>,
+    instance_mods_dir: &Path,
+) -> (BundleHealth, Vec<String>) {
+    let state = state.cloned();
+    let plan = plan.cloned();
+    let instance_mods_dir = instance_mods_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        derive_health(state.as_ref(), plan.as_ref(), &instance_mods_dir)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        (
+            BundleHealth::Invalid,
+            vec!["managed performance health check stopped".to_string()],
+        )
+    })
 }
 
 fn tier_rank(tier: CompositionTier) -> i32 {

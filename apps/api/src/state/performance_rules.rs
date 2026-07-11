@@ -123,31 +123,34 @@ impl AppPerformanceStore {
         self.manager.hardware()
     }
 
-    pub fn list_rollback_snapshots(
+    pub async fn list_rollback_snapshots_async(
         &self,
         instance_mods_dir: &Path,
     ) -> Result<Vec<RollbackSnapshotSummary>, InstallError> {
-        self.manager.list_rollback_snapshots(instance_mods_dir)
+        self.manager
+            .list_rollback_snapshots_async(instance_mods_dir)
+            .await
     }
 
-    pub fn rollback_managed(
+    pub async fn rollback_managed_async(
         &self,
         instance_mods_dir: &Path,
     ) -> Result<CompositionState, InstallError> {
-        self.manager.rollback_managed(instance_mods_dir)
+        self.manager.rollback_managed_async(instance_mods_dir).await
     }
 
-    pub fn rollback_managed_snapshot(
+    pub async fn rollback_managed_snapshot_async(
         &self,
         instance_mods_dir: &Path,
         snapshot_id: &str,
     ) -> Result<CompositionState, InstallError> {
         self.manager
-            .rollback_managed_snapshot(instance_mods_dir, snapshot_id)
+            .rollback_managed_snapshot_async(instance_mods_dir, snapshot_id)
+            .await
     }
 
-    pub fn remove_managed(&self, instance_mods_dir: &Path) -> Result<(), InstallError> {
-        self.manager.remove_managed(instance_mods_dir)
+    pub async fn remove_managed_async(&self, instance_mods_dir: &Path) -> Result<(), InstallError> {
+        self.manager.remove_managed_async(instance_mods_dir).await
     }
 
     pub async fn ensure_installed(

@@ -1,6 +1,7 @@
 use super::manager::PerformanceManager;
 use super::model::InstallError;
-use super::promotion::promote_file_async;
+use super::promotion::{promote_file_async, reconcile_managed_replace_backups};
+use crate::MANAGED_ARTIFACT_MAX_BYTES;
 use crate::modrinth::{ModrinthError, Version};
 use crate::types::{
     CompositionPlan, CompositionState, InstalledMod, ManagedArtifactIntegrity,
@@ -39,13 +40,24 @@ impl PerformanceManager {
             .ok_or_else(|| InstallError::NoPrimaryFile(managed_mod.project_id.clone()))?;
         let filename = sanitize_mod_filename(&file.filename)?;
         let expected_sha = file.hashes.get("sha512").cloned().unwrap_or_default();
+        if let Some(size) = file.size
+            && size > MANAGED_ARTIFACT_MAX_BYTES
+        {
+            return Err(InstallError::Modrinth(ModrinthError::SizeExceeded {
+                expected: MANAGED_ARTIFACT_MAX_BYTES,
+                actual: size,
+            }));
+        }
         let final_path = instance_mods_dir.join(&filename);
         let was_previously_tracked = state_tracks_filename(previous_state, &filename);
+        let temp_path = managed_artifact_temp_path(&final_path, managed_mod);
+        reconcile_managed_replace_backups(&final_path, was_previously_tracked).await?;
 
         if tokio::fs::try_exists(&final_path).await? {
             if !expected_sha.trim().is_empty()
                 && let Ok(true) = file_matches_sha512(&final_path, &expected_sha, file.size).await
             {
+                reconcile_promoted_temp(&temp_path, &final_path, &expected_sha, file.size).await?;
                 return Ok(InstalledMod {
                     project_id: managed_mod.project_id.clone(),
                     version_id: version.id,
@@ -60,15 +72,15 @@ impl PerformanceManager {
             }
         }
 
-        let temp_path = managed_artifact_temp_path(&final_path, managed_mod);
-        self.modrinth
+        let download = self
+            .modrinth
             .download_file_to_path(&file.url, &expected_sha, file.size, &temp_path)
             .await?;
         if tokio::fs::try_exists(&final_path).await? && !was_previously_tracked {
-            let _ = tokio::fs::remove_file(&temp_path).await;
+            download.cleanup().await?;
             return Err(InstallError::ManagedArtifactTargetExists(filename));
         }
-        promote_file_async(&temp_path, &final_path, &filename, was_previously_tracked).await?;
+        promote_file_async(download, &final_path, &filename, was_previously_tracked).await?;
 
         Ok(InstalledMod {
             project_id: managed_mod.project_id.clone(),
@@ -237,24 +249,113 @@ pub(super) async fn file_matches_sha512(
     expected_sha512: &str,
     expected_size: Option<u64>,
 ) -> Result<bool, std::io::Error> {
-    if let Some(expected_size) = expected_size
-        && tokio::fs::metadata(path).await?.len() != expected_size
-    {
+    let (actual_sha512, actual_size) = bounded_regular_file_sha512(path).await?;
+    if expected_size.is_some_and(|expected_size| actual_size != expected_size) {
         return Ok(false);
+    }
+    Ok(actual_sha512.eq_ignore_ascii_case(expected_sha512))
+}
+
+async fn reconcile_promoted_temp(
+    temp_path: &Path,
+    final_path: &Path,
+    expected_sha512: &str,
+    expected_size: Option<u64>,
+) -> Result<(), InstallError> {
+    match tokio::fs::symlink_metadata(temp_path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(InstallError::Io(error)),
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(InstallError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "managed download temp ownership cannot be proven",
+            )));
+        }
+    }
+    let (temp_sha512, temp_size) = bounded_regular_file_sha512(temp_path).await?;
+    let (final_sha512, final_size) = bounded_regular_file_sha512(final_path).await?;
+    let expected_matches =
+        expected_sha512.trim().is_empty() || temp_sha512.eq_ignore_ascii_case(expected_sha512);
+    if !expected_matches
+        || temp_sha512 != final_sha512
+        || temp_size != final_size
+        || expected_size.is_some_and(|expected| temp_size != expected)
+    {
+        return Err(InstallError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed download temp ownership cannot be proven",
+        )));
+    }
+    tokio::fs::remove_file(temp_path).await?;
+    Ok(())
+}
+
+async fn bounded_regular_file_sha512(path: &Path) -> Result<(String, u64), std::io::Error> {
+    let before = tokio::fs::symlink_metadata(path).await?;
+    if !before.file_type().is_file() || before.len() > MANAGED_ARTIFACT_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed artifact is not a bounded regular file",
+        ));
     }
 
     let mut file = tokio::fs::File::open(path).await?;
+    let opened = file.metadata().await?;
+    let after = tokio::fs::symlink_metadata(path).await?;
+    if !opened.is_file()
+        || !after.file_type().is_file()
+        || !same_file_identity(&opened, &after)
+        || opened.len() != before.len()
+        || after.len() != before.len()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed artifact changed while opening",
+        ));
+    }
     let mut hasher = Sha512::new();
     let mut buffer = vec![0_u8; 64 * 1024];
+    let mut actual_size = 0_u64;
     loop {
         let read = file.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
+        actual_size = actual_size.saturating_add(read as u64);
+        if actual_size > MANAGED_ARTIFACT_MAX_BYTES || actual_size > opened.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "managed artifact changed while reading",
+            ));
+        }
         hasher.update(&buffer[..read]);
     }
+    if actual_size != opened.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "managed artifact changed while reading",
+        ));
+    }
+    Ok((hex::encode(hasher.finalize()), actual_size))
+}
 
-    Ok(hex::encode(hasher.finalize()).eq_ignore_ascii_case(expected_sha512))
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index() == right.file_index()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 fn parent_minor_version(game_version: &str) -> Option<String> {

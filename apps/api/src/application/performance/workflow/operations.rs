@@ -421,7 +421,7 @@ pub(super) async fn queue_performance_operation(
     operation: PerformanceOperation,
     handoff: RequestProducerHandoff,
 ) -> Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)> {
-    let journal_identity = durable_performance_operation_identity(&state, &operation);
+    let journal_identity = durable_performance_operation_identity(&state, &operation).await;
     let (ownership_tx, ownership_rx) = tokio::sync::oneshot::channel();
     let producer = handoff
         .try_claim()
@@ -509,7 +509,7 @@ pub(super) async fn execute_synchronous_performance_operation(
     mut operation: PerformanceOperation,
     handoff: RequestProducerHandoff,
 ) -> Result<PerformanceInstallResponse, PerformanceApplicationError> {
-    let journal_identity = durable_performance_operation_identity(&state, &operation);
+    let journal_identity = durable_performance_operation_identity(&state, &operation).await;
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
     let (failure_signal, failure_rx) = PerformancePersistenceFailureSignal::new();
     operation.persistence_failure = Some(failure_signal);
@@ -2223,11 +2223,12 @@ fn operation_payload(operation: &PerformanceOperation) -> PerformanceOperationPa
     }
 }
 
-fn durable_performance_operation_identity(
+async fn durable_performance_operation_identity(
     state: &AppState,
     operation: &PerformanceOperation,
 ) -> PerformanceOperationJournalIdentity {
     performance_operation_journal_identity(state, operation)
+        .await
         .map(|identity| {
             PerformanceOperationJournalIdentity::new(
                 operation_action_name(identity.action),

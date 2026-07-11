@@ -10,6 +10,8 @@ pub mod state;
 pub mod status;
 pub mod types;
 
+pub(crate) const MANAGED_ARTIFACT_MAX_BYTES: u64 = 512 << 20;
+
 pub use effective::{
     EffectiveContributionSource, EffectiveFallbackPlan, EffectiveInstrumentationMode,
     EffectiveInstrumentationPolicy, EffectiveJvmContribution, EffectiveLaunchSmoothing,
@@ -17,7 +19,7 @@ pub use effective::{
     EffectivePerformanceComposition, EffectivePerformanceExplanation,
     EffectivePerformanceHealthRequirements, EffectivePerformancePlan, effective_performance_plan,
 };
-pub use health::{BundleHealth, derive_health};
+pub use health::{BundleHealth, derive_health_async};
 pub use install::{
     InstallError, PERFORMANCE_RULES_URL_ENV, PerformanceManager, PerformanceRulesAuthority,
     RulesRefreshError, VerifiedRemoteRules, remote_rules_refresh_warning,
