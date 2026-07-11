@@ -66,11 +66,45 @@ pub struct GuardianRepairOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum GuardianRepairStatus {
-    NotNeeded,
     Repaired,
     Blocked,
     Failed,
     Suppressed,
+}
+
+struct RuntimeTerminalContext<'a> {
+    journals: &'a OperationJournalStore,
+    failure_memory: &'a GuardianFailureMemoryStore,
+    diagnosis_id: &'a DiagnosisId,
+    target: &'a TargetDescriptor,
+    mode: GuardianMode,
+    observed_at: &'a str,
+    terminal_failure: Option<&'a tokio::sync::Notify>,
+}
+
+enum RuntimeTerminal {
+    Blocked {
+        action: Option<GuardianActionKind>,
+        summary: &'static str,
+    },
+    Suppressed {
+        action: GuardianActionKind,
+        suppression_until: String,
+    },
+    Repaired {
+        action: GuardianActionKind,
+        facts: Vec<String>,
+    },
+    Failed {
+        action: GuardianActionKind,
+        facts: Vec<String>,
+        suppression_until: Option<String>,
+    },
+}
+
+enum RuntimeTerminalJournal {
+    Create(OperationOutcome),
+    Record(OperationStepResult, Option<&'static str>),
 }
 
 pub async fn execute_managed_runtime_ready_marker_repair(
@@ -84,143 +118,67 @@ pub async fn execute_managed_runtime_ready_marker_repair(
     let runtime_root_target = public_safe_target(request.runtime_root.target());
     let plan = request.plan;
     let target = public_safe_target(&plan.target);
+    let terminal_context = RuntimeTerminalContext {
+        journals: request.journals,
+        failure_memory: request.failure_memory,
+        diagnosis_id: &plan.diagnosis_id,
+        target: &target,
+        mode: request.mode,
+        observed_at: request.observed_at,
+        terminal_failure: request.terminal_failure,
+    };
     let Some(action) = runtime_ready_marker_repair_task(plan) else {
-        if let Some(error) = create_terminal_journal_reconciled(
-            request.journals,
-            &operation_id,
-            &plan.diagnosis_id,
-            &target,
-            OperationStatus::Blocked,
-            OperationOutcome::Blocked,
-            OperationStepResult::Skipped,
-            Vec::new(),
-        )
-        .await?
-        {
-            return Err(error);
-        }
-        return Ok(repair_outcome(
+        return finish_runtime_repair(
+            &terminal_context,
             operation_id,
-            Some(plan.diagnosis_id.clone()),
-            None,
-            GuardianRepairStatus::Blocked,
-            Vec::new(),
-            "guardian_repair_blocked_by_policy",
-        ));
+            RuntimeTerminal::Blocked {
+                action: None,
+                summary: "guardian_repair_blocked_by_policy",
+            },
+        )
+        .await;
     };
 
     if let Some(block_reason) = repair_plan_block_reason(request.mode, plan, &target) {
-        if let Some(error) = create_terminal_journal_reconciled(
-            request.journals,
-            &operation_id,
-            &plan.diagnosis_id,
-            &target,
-            OperationStatus::Blocked,
-            OperationOutcome::Blocked,
-            OperationStepResult::Skipped,
-            Vec::new(),
-        )
-        .await?
-        {
-            return Err(error);
-        }
-        record_repair_memory(
-            request.failure_memory,
-            &plan.diagnosis_id,
-            request.mode,
-            &target,
-            action.action,
-            FailureMemoryActionOutcome::Blocked,
-            request.observed_at,
-            None,
-            false,
-        );
-        return Ok(repair_outcome(
+        return finish_runtime_repair(
+            &terminal_context,
             operation_id,
-            Some(plan.diagnosis_id.clone()),
-            Some(action.action),
-            GuardianRepairStatus::Blocked,
-            Vec::new(),
-            block_reason,
-        ));
+            RuntimeTerminal::Blocked {
+                action: Some(action.action),
+                summary: block_reason,
+            },
+        )
+        .await;
     }
 
     if matches!(
         target.ownership,
         OwnershipClass::UserOwned | OwnershipClass::Unknown
     ) {
-        if let Some(error) = create_terminal_journal_reconciled(
-            request.journals,
-            &operation_id,
-            &plan.diagnosis_id,
-            &target,
-            OperationStatus::Blocked,
-            OperationOutcome::Blocked,
-            OperationStepResult::Skipped,
-            Vec::new(),
-        )
-        .await?
-        {
-            return Err(error);
-        }
-        record_repair_memory(
-            request.failure_memory,
-            &plan.diagnosis_id,
-            request.mode,
-            &target,
-            action.action,
-            FailureMemoryActionOutcome::Blocked,
-            request.observed_at,
-            None,
-            false,
-        );
-        return Ok(repair_outcome(
+        return finish_runtime_repair(
+            &terminal_context,
             operation_id,
-            Some(plan.diagnosis_id.clone()),
-            Some(action.action),
-            GuardianRepairStatus::Blocked,
-            Vec::new(),
-            "guardian_repair_blocked_by_ownership",
-        ));
+            RuntimeTerminal::Blocked {
+                action: Some(action.action),
+                summary: "guardian_repair_blocked_by_ownership",
+            },
+        )
+        .await;
     }
 
     if !ready_marker_repair_target_supported(&target)
         || !ready_marker_repair_target_supported(&runtime_root_target)
         || target != runtime_root_target
     {
-        if let Some(error) = create_terminal_journal_reconciled(
-            request.journals,
-            &operation_id,
-            &plan.diagnosis_id,
-            &target,
-            OperationStatus::Blocked,
-            OperationOutcome::Blocked,
-            OperationStepResult::Skipped,
-            Vec::new(),
-        )
-        .await?
-        {
-            return Err(error);
-        }
-        record_repair_memory(
-            request.failure_memory,
-            &plan.diagnosis_id,
-            request.mode,
-            &target,
-            action.action,
-            FailureMemoryActionOutcome::Blocked,
-            request.observed_at,
-            None,
-            false,
-        );
-        return Ok(repair_outcome(
+        return finish_runtime_repair(
+            &terminal_context,
             operation_id,
-            Some(plan.diagnosis_id.clone()),
-            Some(action.action),
-            GuardianRepairStatus::Blocked,
-            Vec::new(),
-            "guardian_repair_blocked_unsupported_target",
-        ));
+            RuntimeTerminal::Blocked {
+                action: Some(action.action),
+                summary: "guardian_repair_blocked_unsupported_target",
+            },
+        )
+        .await;
     }
 
     let memory_key = FailureMemoryKey::for_observation(
@@ -235,39 +193,15 @@ pub async fn execute_managed_runtime_ready_marker_repair(
         .get(&memory_key)
         .and_then(|entry| runtime_repair_suppression_until(&entry, request.observed_at))
     {
-        if let Some(error) = create_terminal_journal_reconciled(
-            request.journals,
-            &operation_id,
-            &plan.diagnosis_id,
-            &target,
-            OperationStatus::Blocked,
-            OperationOutcome::Suppressed,
-            OperationStepResult::Skipped,
-            Vec::new(),
-        )
-        .await?
-        {
-            return Err(error);
-        }
-        record_repair_memory(
-            request.failure_memory,
-            &plan.diagnosis_id,
-            request.mode,
-            &target,
-            action.action,
-            FailureMemoryActionOutcome::Suppressed,
-            request.observed_at,
-            Some(suppression_until.as_str()),
-            false,
-        );
-        return Ok(repair_outcome(
+        return finish_runtime_repair(
+            &terminal_context,
             operation_id,
-            Some(plan.diagnosis_id.clone()),
-            Some(action.action),
-            GuardianRepairStatus::Suppressed,
-            Vec::new(),
-            "guardian_repair_suppressed",
-        ));
+            RuntimeTerminal::Suppressed {
+                action: action.action,
+                suppression_until,
+            },
+        )
+        .await;
     }
 
     if let Some(error) = create_planned_journal_reconciled(
@@ -309,84 +243,146 @@ pub async fn execute_managed_runtime_ready_marker_repair(
     }) {
         Ok(report) => {
             let fact_ids = fact_ids(&report.facts);
-            let default_suppression_until = default_suppression_until(request.observed_at);
-            if let Some(error) = record_runtime_terminal_reconciled(
-                request.journals,
-                &operation_id,
-                repair_step(
-                    OperationStepResult::Completed,
-                    Some(target.clone()),
-                    fact_ids.clone(),
-                ),
-                None,
-                request.terminal_failure,
-            )
-            .await?
-            {
-                return Err(error);
-            }
-            record_repair_memory(
-                request.failure_memory,
-                &plan.diagnosis_id,
-                request.mode,
-                &target,
-                action.action,
-                FailureMemoryActionOutcome::Repaired,
-                request.observed_at,
-                default_suppression_until.as_deref(),
-                true,
-            );
-            Ok(repair_outcome(
+            finish_runtime_repair(
+                &terminal_context,
                 operation_id,
-                Some(plan.diagnosis_id.clone()),
-                Some(action.action),
-                GuardianRepairStatus::Repaired,
-                fact_ids,
-                "managed_runtime_ready_marker_repaired",
-            ))
+                RuntimeTerminal::Repaired {
+                    action: action.action,
+                    facts: fact_ids,
+                },
+            )
+            .await
         }
         Err(error) => {
             let fact_ids = fact_ids(&error.facts);
             let default_suppression_until = default_suppression_until(request.observed_at);
             let suppression_until = request
                 .suppression_until_on_failure
-                .or(default_suppression_until.as_deref());
-            if let Some(error) = record_runtime_terminal_reconciled(
-                request.journals,
-                &operation_id,
-                repair_step(
-                    OperationStepResult::Failed,
-                    Some(target.clone()),
-                    fact_ids.clone(),
-                ),
-                Some(READY_MARKER_REPAIR_STEP),
-                request.terminal_failure,
-            )
-            .await?
-            {
-                return Err(error);
-            }
-            record_repair_memory(
-                request.failure_memory,
-                &plan.diagnosis_id,
-                request.mode,
-                &target,
-                action.action,
-                FailureMemoryActionOutcome::Failed,
-                request.observed_at,
-                suppression_until,
-                true,
-            );
-            Ok(repair_outcome(
+                .map(str::to_owned)
+                .or(default_suppression_until);
+            finish_runtime_repair(
+                &terminal_context,
                 operation_id,
-                Some(plan.diagnosis_id.clone()),
-                Some(action.action),
-                GuardianRepairStatus::Failed,
-                fact_ids,
-                "managed_runtime_ready_marker_repair_failed",
-            ))
+                RuntimeTerminal::Failed {
+                    action: action.action,
+                    facts: fact_ids,
+                    suppression_until,
+                },
+            )
+            .await
         }
     }
+}
+
+async fn finish_runtime_repair(
+    context: &RuntimeTerminalContext<'_>,
+    operation_id: OperationId,
+    terminal: RuntimeTerminal,
+) -> Result<GuardianRepairOutcome, OperationJournalStoreError> {
+    let (journal, action, status, facts, summary, suppression_until, repair_attempt) =
+        match terminal {
+            RuntimeTerminal::Blocked { action, summary } => (
+                RuntimeTerminalJournal::Create(OperationOutcome::Blocked),
+                action,
+                GuardianRepairStatus::Blocked,
+                Vec::new(),
+                summary,
+                None,
+                false,
+            ),
+            RuntimeTerminal::Suppressed {
+                action,
+                suppression_until,
+            } => (
+                RuntimeTerminalJournal::Create(OperationOutcome::Suppressed),
+                Some(action),
+                GuardianRepairStatus::Suppressed,
+                Vec::new(),
+                "guardian_repair_suppressed",
+                Some(suppression_until),
+                false,
+            ),
+            RuntimeTerminal::Repaired { action, facts } => (
+                RuntimeTerminalJournal::Record(OperationStepResult::Completed, None),
+                Some(action),
+                GuardianRepairStatus::Repaired,
+                facts,
+                "managed_runtime_ready_marker_repaired",
+                default_suppression_until(context.observed_at),
+                true,
+            ),
+            RuntimeTerminal::Failed {
+                action,
+                facts,
+                suppression_until,
+            } => (
+                RuntimeTerminalJournal::Record(
+                    OperationStepResult::Failed,
+                    Some(READY_MARKER_REPAIR_STEP),
+                ),
+                Some(action),
+                GuardianRepairStatus::Failed,
+                facts,
+                "managed_runtime_ready_marker_repair_failed",
+                suppression_until,
+                true,
+            ),
+        };
+    let journal_error = match journal {
+        RuntimeTerminalJournal::Create(outcome) => {
+            create_terminal_journal_reconciled(
+                context.journals,
+                &operation_id,
+                context.diagnosis_id,
+                context.target,
+                OperationStatus::Blocked,
+                outcome,
+                OperationStepResult::Skipped,
+                facts.clone(),
+            )
+            .await?
+        }
+        RuntimeTerminalJournal::Record(step_result, failure_point) => {
+            record_runtime_terminal_reconciled(
+                context.journals,
+                &operation_id,
+                repair_step(step_result, Some(context.target.clone()), facts.clone()),
+                failure_point,
+                context.terminal_failure,
+            )
+            .await?
+        }
+    };
+    if let Some(error) = journal_error {
+        return Err(error);
+    }
+    if let Some(action) = action {
+        let memory_outcome = match status {
+            GuardianRepairStatus::Repaired => FailureMemoryActionOutcome::Repaired,
+            GuardianRepairStatus::Blocked => FailureMemoryActionOutcome::Blocked,
+            GuardianRepairStatus::Failed => FailureMemoryActionOutcome::Failed,
+            GuardianRepairStatus::Suppressed => FailureMemoryActionOutcome::Suppressed,
+        };
+        record_repair_memory(
+            context.failure_memory,
+            context.diagnosis_id,
+            context.mode,
+            context.target,
+            action,
+            memory_outcome,
+            context.observed_at,
+            suppression_until.as_deref(),
+            repair_attempt,
+        );
+    }
+    Ok(repair_outcome(
+        operation_id,
+        Some(context.diagnosis_id.clone()),
+        action,
+        status,
+        facts,
+        summary,
+    ))
 }
 
 fn planned_runtime_journal(

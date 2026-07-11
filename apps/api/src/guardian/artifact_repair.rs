@@ -92,6 +92,27 @@ pub enum GuardianArtifactRepairStatus {
     Suppressed,
 }
 
+enum ArtifactTerminal {
+    Blocked(&'static str),
+    Suppressed(String),
+    Repaired {
+        step_id: &'static str,
+        facts: Vec<String>,
+        quarantined_target: Option<TargetDescriptor>,
+    },
+    Failed {
+        step_id: &'static str,
+        rollback: RollbackState,
+        facts: Vec<String>,
+        summary: &'static str,
+    },
+}
+
+enum ArtifactTerminalJournal {
+    Create(OperationOutcome),
+    Record(&'static str, RollbackState, Option<&'static str>),
+}
+
 pub async fn execute_guardian_artifact_repair(
     request: GuardianArtifactRepairRequest<'_>,
 ) -> Result<GuardianArtifactRepairOutcome, OperationJournalStoreError> {
@@ -99,49 +120,23 @@ pub async fn execute_guardian_artifact_repair(
         .operation_id
         .clone()
         .unwrap_or_else(new_repair_operation_id);
-    let diagnosis_id = request.plan.diagnosis_id.clone();
     let target = request.plan.target.clone();
 
     let checksum = match validate_artifact_repair_request(&request) {
         Ok(checksum) => checksum,
         Err(block_reason) => {
-            if let Some(error) = create_terminal_journal_reconciled(
-                request.journals,
-                &operation_id,
-                request.plan,
-                OperationStatus::Blocked,
-                OperationOutcome::Blocked,
-                OperationStepResult::Skipped,
-                Vec::new(),
-            )
-            .await?
-            {
-                return Err(error);
-            }
-            record_artifact_repair_memory(
-                request.failure_memory,
-                &diagnosis_id,
-                request.mode,
-                &target,
-                FailureMemoryActionOutcome::Blocked,
-                request.observed_at,
-                None,
-                false,
-                None,
-            );
-            return Ok(artifact_repair_outcome(
+            return finish_artifact_repair(
+                &request,
                 operation_id,
-                diagnosis_id,
-                GuardianArtifactRepairStatus::Blocked,
-                Vec::new(),
-                block_reason,
-            ));
+                ArtifactTerminal::Blocked(block_reason),
+            )
+            .await;
         }
     };
 
     let memory_key = FailureMemoryKey::for_observation(
         GuardianDomain::Install,
-        &diagnosis_id,
+        &request.plan.diagnosis_id,
         &target,
         request.mode,
         None,
@@ -151,37 +146,12 @@ pub async fn execute_guardian_artifact_repair(
         .get(&memory_key)
         .and_then(|entry| artifact_repair_suppression_until(&entry, request.observed_at))
     {
-        if let Some(error) = create_terminal_journal_reconciled(
-            request.journals,
-            &operation_id,
-            request.plan,
-            OperationStatus::Blocked,
-            OperationOutcome::Suppressed,
-            OperationStepResult::Skipped,
-            Vec::new(),
-        )
-        .await?
-        {
-            return Err(error);
-        }
-        record_artifact_repair_memory(
-            request.failure_memory,
-            &diagnosis_id,
-            request.mode,
-            &target,
-            FailureMemoryActionOutcome::Suppressed,
-            request.observed_at,
-            Some(suppression_until.as_str()),
-            false,
-            None,
-        );
-        return Ok(artifact_repair_outcome(
+        return finish_artifact_repair(
+            &request,
             operation_id,
-            diagnosis_id,
-            GuardianArtifactRepairStatus::Suppressed,
-            Vec::new(),
-            "guardian_artifact_repair_suppressed",
-        ));
+            ArtifactTerminal::Suppressed(suppression_until),
+        )
+        .await;
     }
 
     if let Some(error) =
@@ -208,40 +178,17 @@ pub async fn execute_guardian_artifact_repair(
                 Ok(report) => report,
                 Err(error) => {
                     let fact_ids = fact_ids(&error.facts);
-                    if let Some(error) = record_artifact_terminal_reconciled(
-                        request.journals,
-                        &operation_id,
-                        repair_step(
-                            "quarantine_launcher_managed_target",
-                            OperationStepResult::Failed,
-                            Some(target.clone()),
-                            fact_ids.clone(),
-                            RollbackState::Unavailable,
-                        ),
-                        Some("quarantine_launcher_managed_target"),
-                    )
-                    .await?
-                    {
-                        return Err(error);
-                    }
-                    record_artifact_repair_memory(
-                        request.failure_memory,
-                        &diagnosis_id,
-                        request.mode,
-                        &target,
-                        FailureMemoryActionOutcome::Failed,
-                        request.observed_at,
-                        default_suppression_until(request.observed_at).as_deref(),
-                        true,
-                        None,
-                    );
-                    return Ok(artifact_repair_outcome(
+                    return finish_artifact_repair(
+                        &request,
                         operation_id,
-                        diagnosis_id,
-                        GuardianArtifactRepairStatus::Failed,
-                        fact_ids,
-                        "guardian_artifact_quarantine_failed",
-                    ));
+                        ArtifactTerminal::Failed {
+                            step_id: "quarantine_launcher_managed_target",
+                            rollback: RollbackState::Unavailable,
+                            facts: fact_ids,
+                            summary: "guardian_artifact_quarantine_failed",
+                        },
+                    )
+                    .await;
                 }
             };
             let quarantine_facts = fact_ids(&quarantine_report.facts);
@@ -320,52 +267,25 @@ pub async fn execute_guardian_artifact_repair(
     match download_url_to_temp(download_request, request.client).await {
         Ok(report) => {
             let fact_ids = fact_ids(&report.facts);
-            if let Some(error) = record_artifact_terminal_reconciled(
-                request.journals,
-                &operation_id,
-                repair_step(
-                    "promote_verified_artifact",
-                    OperationStepResult::Completed,
-                    Some(target.clone()),
-                    fact_ids.clone(),
-                    RollbackState::Available,
-                ),
-                None,
-            )
-            .await?
-            {
-                return Err(error);
-            }
-            record_artifact_repair_memory(
-                request.failure_memory,
-                &diagnosis_id,
-                request.mode,
-                &target,
-                FailureMemoryActionOutcome::Repaired,
-                request.observed_at,
-                default_suppression_until(request.observed_at).as_deref(),
-                true,
-                quarantined_target,
-            );
-            Ok(artifact_repair_outcome(
+            finish_artifact_repair(
+                &request,
                 operation_id,
-                diagnosis_id,
-                GuardianArtifactRepairStatus::Repaired,
-                fact_ids,
-                "guardian_artifact_repaired",
-            ))
+                ArtifactTerminal::Repaired {
+                    step_id: "promote_verified_artifact",
+                    facts: fact_ids,
+                    quarantined_target,
+                },
+            )
+            .await
         }
         Err(error) => {
             let fact_ids = fact_ids(&error.facts);
-            if let Some(error) = record_artifact_terminal_reconciled(
-                request.journals,
-                &operation_id,
-                repair_step(
-                    "download_artifact_to_temp",
-                    OperationStepResult::Failed,
-                    Some(target.clone()),
-                    fact_ids.clone(),
-                    match request.mutation {
+            finish_artifact_repair(
+                &request,
+                operation_id,
+                ArtifactTerminal::Failed {
+                    step_id: "download_artifact_to_temp",
+                    rollback: match request.mutation {
                         GuardianArtifactRepairMutation::QuarantineExisting => {
                             RollbackState::Available
                         }
@@ -373,33 +293,126 @@ pub async fn execute_guardian_artifact_repair(
                             RollbackState::Unavailable
                         }
                     },
-                ),
-                Some("download_artifact_to_temp"),
+                    facts: fact_ids,
+                    summary: "guardian_artifact_redownload_failed",
+                },
             )
-            .await?
-            {
-                return Err(error);
-            }
-            record_artifact_repair_memory(
-                request.failure_memory,
-                &diagnosis_id,
-                request.mode,
-                &target,
-                FailureMemoryActionOutcome::Failed,
-                request.observed_at,
-                default_suppression_until(request.observed_at).as_deref(),
-                true,
-                None,
-            );
-            Ok(artifact_repair_outcome(
-                operation_id,
-                diagnosis_id,
-                GuardianArtifactRepairStatus::Failed,
-                fact_ids,
-                "guardian_artifact_redownload_failed",
-            ))
+            .await
         }
     }
+}
+
+async fn finish_artifact_repair(
+    request: &GuardianArtifactRepairRequest<'_>,
+    operation_id: OperationId,
+    terminal: ArtifactTerminal,
+) -> Result<GuardianArtifactRepairOutcome, OperationJournalStoreError> {
+    let (journal, memory_outcome, status, facts, summary, suppression_until, quarantined) =
+        match terminal {
+            ArtifactTerminal::Blocked(summary) => (
+                ArtifactTerminalJournal::Create(OperationOutcome::Blocked),
+                FailureMemoryActionOutcome::Blocked,
+                GuardianArtifactRepairStatus::Blocked,
+                Vec::new(),
+                summary,
+                None,
+                None,
+            ),
+            ArtifactTerminal::Suppressed(suppression_until) => (
+                ArtifactTerminalJournal::Create(OperationOutcome::Suppressed),
+                FailureMemoryActionOutcome::Suppressed,
+                GuardianArtifactRepairStatus::Suppressed,
+                Vec::new(),
+                "guardian_artifact_repair_suppressed",
+                Some(suppression_until),
+                None,
+            ),
+            ArtifactTerminal::Repaired {
+                step_id,
+                facts,
+                quarantined_target,
+            } => (
+                ArtifactTerminalJournal::Record(step_id, RollbackState::Available, None),
+                FailureMemoryActionOutcome::Repaired,
+                GuardianArtifactRepairStatus::Repaired,
+                facts,
+                "guardian_artifact_repaired",
+                default_suppression_until(request.observed_at),
+                quarantined_target,
+            ),
+            ArtifactTerminal::Failed {
+                step_id,
+                rollback,
+                facts,
+                summary,
+            } => (
+                ArtifactTerminalJournal::Record(step_id, rollback, Some(step_id)),
+                FailureMemoryActionOutcome::Failed,
+                GuardianArtifactRepairStatus::Failed,
+                facts,
+                summary,
+                default_suppression_until(request.observed_at),
+                None,
+            ),
+        };
+    let journal_error = match journal {
+        ArtifactTerminalJournal::Create(outcome) => {
+            create_terminal_journal_reconciled(
+                request.journals,
+                &operation_id,
+                request.plan,
+                OperationStatus::Blocked,
+                outcome,
+                OperationStepResult::Skipped,
+                facts.clone(),
+            )
+            .await?
+        }
+        ArtifactTerminalJournal::Record(step_id, rollback, failure_point) => {
+            let step_result = if failure_point.is_some() {
+                OperationStepResult::Failed
+            } else {
+                OperationStepResult::Completed
+            };
+            record_artifact_terminal_reconciled(
+                request.journals,
+                &operation_id,
+                repair_step(
+                    step_id,
+                    step_result,
+                    Some(request.plan.target.clone()),
+                    facts.clone(),
+                    rollback,
+                ),
+                failure_point,
+            )
+            .await?
+        }
+    };
+    if let Some(error) = journal_error {
+        return Err(error);
+    }
+    record_artifact_repair_memory(
+        request.failure_memory,
+        &request.plan.diagnosis_id,
+        request.mode,
+        &request.plan.target,
+        memory_outcome,
+        request.observed_at,
+        suppression_until.as_deref(),
+        matches!(
+            status,
+            GuardianArtifactRepairStatus::Repaired | GuardianArtifactRepairStatus::Failed
+        ),
+        quarantined,
+    );
+    Ok(artifact_repair_outcome(
+        operation_id,
+        request.plan.diagnosis_id.clone(),
+        status,
+        facts,
+        summary,
+    ))
 }
 
 fn validate_artifact_repair_request<'a>(

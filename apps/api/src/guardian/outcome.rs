@@ -18,7 +18,6 @@ pub struct GuardianUserOutcome {
 pub fn runtime_repair_user_outcome(outcome: &GuardianRepairOutcome) -> GuardianUserOutcome {
     let decision = match outcome.status {
         GuardianRepairStatus::Repaired => GuardianDecisionKind::Repair,
-        GuardianRepairStatus::NotNeeded => GuardianDecisionKind::RecordOnly,
         GuardianRepairStatus::Blocked
         | GuardianRepairStatus::Failed
         | GuardianRepairStatus::Suppressed => GuardianDecisionKind::Block,
@@ -156,11 +155,6 @@ fn runtime_repair_outcome_copy(
             "Guardian blocked launch preflight.",
             vec!["Guardian blocked managed Java runtime repair because it was not safe to apply."],
             vec!["Reinstall or repair the affected version/runtime before launching again."],
-        ),
-        GuardianRepairStatus::NotNeeded => (
-            "Guardian did not need managed Java runtime repair.",
-            vec!["Guardian did not need managed Java runtime repair."],
-            Vec::new(),
         ),
     }
 }
@@ -326,12 +320,6 @@ mod tests {
                 GuardianDecisionKind::Block,
                 "Guardian blocked launch preflight.",
                 "Guardian blocked managed Java runtime repair because it was not safe to apply.",
-            ),
-            (
-                GuardianRepairStatus::NotNeeded,
-                GuardianDecisionKind::RecordOnly,
-                "Guardian did not need managed Java runtime repair.",
-                "Guardian did not need managed Java runtime repair.",
             ),
         ];
 

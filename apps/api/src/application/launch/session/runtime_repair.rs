@@ -250,7 +250,6 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
             );
             Ok(preflight)
         }
-        GuardianRepairStatus::NotNeeded => Ok(preflight),
     }
 }
 
