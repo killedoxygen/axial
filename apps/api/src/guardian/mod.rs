@@ -69,15 +69,14 @@ pub use launch_failure_memory::{
     record_launch_failure_observation,
 };
 pub use launch_recovery::{
-    GuardianLaunchRecoveryActionTemplate, GuardianLaunchRecoveryCurrentIntent,
-    GuardianLaunchRecoveryDirective, GuardianLaunchRecoveryEffect,
-    GuardianLaunchRecoveryJournalTransition, GuardianLaunchRecoveryKind,
-    GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
-    GuardianLaunchRecoveryPlanRequest, GuardianLaunchRecoveryRecordRequest,
-    GuardianLaunchRecoveryStatus, launch_recovery_journal_transition_conflicts,
-    launch_recovery_journal_transition_matches, launch_recovery_user_intent_fingerprint,
-    plan_launch_recovery_directive, record_launch_recovery_attempt, record_launch_recovery_failure,
-    record_launch_recovery_success,
+    GuardianLaunchRecoveryCurrentIntent, GuardianLaunchRecoveryDirective,
+    GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryJournalTransition,
+    GuardianLaunchRecoveryKind, GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryPlan,
+    GuardianLaunchRecoveryPlanRejection, GuardianLaunchRecoveryPlanRequest,
+    GuardianLaunchRecoveryRecordRequest, GuardianLaunchRecoveryStatus,
+    launch_recovery_journal_transition_conflicts, launch_recovery_journal_transition_matches,
+    launch_recovery_user_intent_fingerprint, plan_launch_recovery_directive,
+    record_launch_recovery_attempt, record_launch_recovery_failure, record_launch_recovery_success,
 };
 pub use model::{
     ActionPlanPrerequisite, Diagnosis, DiagnosisId, FactReliability, GuardianAction,

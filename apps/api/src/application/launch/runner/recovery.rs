@@ -2,8 +2,9 @@ use super::trace_launch_event;
 use crate::guardian::{
     GuardianLaunchRecoveryCurrentIntent, GuardianLaunchRecoveryDirective,
     GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryJournalTransition,
-    GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
-    GuardianLaunchRecoveryPlanRequest, GuardianLaunchRecoveryRecordRequest, GuardianUserOutcome,
+    GuardianLaunchRecoveryKind, GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryPlan,
+    GuardianLaunchRecoveryPlanRejection, GuardianLaunchRecoveryPlanRequest,
+    GuardianLaunchRecoveryRecordRequest, GuardianUserOutcome,
     launch_recovery_journal_transition_conflicts, launch_recovery_journal_transition_matches,
     launch_recovery_public_action_label, launch_recovery_suppressed_user_outcome,
     launch_recovery_user_intent_fingerprint, plan_launch_recovery_directive,
@@ -323,8 +324,11 @@ pub(super) fn record_prelaunch_preset_adjustment_directive(
     directive: &GuardianLaunchRecoveryDirective,
 ) {
     if matches!(
-        directive.effect,
-        GuardianLaunchRecoveryEffect::DowngradePreset { .. }
+        (&directive.kind, &directive.effect),
+        (
+            GuardianLaunchRecoveryKind::DowngradePreset,
+            GuardianLaunchRecoveryEffect::DowngradePreset { .. }
+        )
     ) {
         record_guardian_intervention(
             guardian,
@@ -478,8 +482,8 @@ mod tests {
     use super::super::status::serialize_guardian;
     use super::*;
     use crate::guardian::{
-        GuardianLaunchRecoveryKind, GuardianStartupFailureObservation,
-        GuardianStartupFailureRequest, guardian_startup_failure_outcome,
+        GuardianStartupFailureObservation, GuardianStartupFailureRequest,
+        guardian_startup_failure_outcome,
     };
     use crate::state::contracts::{OperationOutcome, OperationStatus, TargetKind};
     use crate::state::failure_memory::FailureMemoryActionOutcome;
