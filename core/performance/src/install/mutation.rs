@@ -83,6 +83,27 @@ impl ManagedMutationError {
 }
 
 impl ManagedCompositionAuthority {
+    pub async fn recover_and_inspect(
+        &self,
+        identity: &ManagedInstanceIdentity,
+    ) -> Result<ManagedCompositionInspection, ManagedMutationError> {
+        self.validate_identity(identity).await?;
+        let mods_dir = identity.mods_dir().to_path_buf();
+        let recovery_dir = mods_dir.clone();
+        let state = tokio::task::spawn_blocking(move || {
+            crate::state::recover_managed_storage(&recovery_dir)
+        })
+        .await
+        .map_err(|_| ManagedMutationError::task_stopped("recover"))?
+        .map_err(|error| ManagedMutationError::indeterminate("recover", error))?;
+        super::artifact::reconcile_managed_artifact_obligations(&mods_dir, state.as_ref())
+            .await
+            .map_err(|error| ManagedMutationError::indeterminate("recover", error))?;
+        tokio::task::spawn_blocking(move || recovered_inspection(&mods_dir))
+            .await
+            .map_err(|_| ManagedMutationError::task_stopped("recover"))?
+    }
+
     pub async fn ensure_installed(
         &self,
         identity: &ManagedInstanceIdentity,
@@ -211,6 +232,26 @@ impl ManagedCompositionAuthority {
         .map_err(|_| ManagedMutationError::task_stopped("identity_validation"))?
         .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))
     }
+}
+
+fn recovered_inspection(
+    instance_mods_dir: &Path,
+) -> Result<ManagedCompositionInspection, ManagedMutationError> {
+    let state = crate::state::load_state_admitted(instance_mods_dir)
+        .map_err(|error| ManagedMutationError::indeterminate("recover", error))?;
+    crate::state::prove_managed_storage_recovered(instance_mods_dir, state.as_ref())
+        .map_err(|error| ManagedMutationError::indeterminate("recover", error))?;
+    let (health, warnings) = crate::health::derive_health(state.as_ref(), None, instance_mods_dir);
+    let installed_mod_evidence = installed_mod_evidence(instance_mods_dir, state.as_ref());
+    let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(instance_mods_dir)
+        .map_err(|error| ManagedMutationError::indeterminate("recover", error))?;
+    Ok(ManagedCompositionInspection {
+        state,
+        health,
+        warnings,
+        installed_mod_evidence,
+        rollback_snapshots,
+    })
 }
 
 fn admitted_inspection_state(
@@ -372,6 +413,9 @@ impl PerformanceManager {
         )
         .await
         .map_err(|error| ManagedMutationError::indeterminate("install_publish", error))?;
+        self.settle_added_managed(instance_mods_dir, &state)
+            .await
+            .map_err(|error| ManagedMutationError::indeterminate("install_settle", error))?;
         self.settle_replaced_managed(instance_mods_dir, previous_state.as_ref(), &state)
             .await
             .map_err(|error| ManagedMutationError::indeterminate("install_settle", error))?;
@@ -507,6 +551,7 @@ impl PerformanceManager {
                 continue;
             }
             remove_managed_artifact(instance_mods_dir, installed)?;
+            crate::state::settle_abandoned_managed_artifact_addition(instance_mods_dir, installed)?;
         }
 
         Ok(())
@@ -530,6 +575,10 @@ impl PerformanceManager {
                     continue;
                 }
                 remove_managed_artifact(instance_mods_dir, installed)?;
+                crate::state::settle_abandoned_managed_artifact_addition(
+                    instance_mods_dir,
+                    installed,
+                )?;
             }
         }
 
@@ -605,6 +654,28 @@ impl PerformanceManager {
             )
             .await?;
         }
+        Ok(())
+    }
+
+    async fn settle_added_managed(
+        &self,
+        instance_mods_dir: &Path,
+        current_state: &CompositionState,
+    ) -> Result<(), InstallError> {
+        let instance_mods_dir = instance_mods_dir.to_path_buf();
+        let current_state = current_state.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::state::reconcile_managed_addition_obligations(
+                &instance_mods_dir,
+                Some(&current_state),
+            )
+        })
+        .await
+        .map_err(|_| {
+            InstallError::Io(std::io::Error::other(
+                "managed addition settlement task stopped",
+            ))
+        })??;
         Ok(())
     }
 }

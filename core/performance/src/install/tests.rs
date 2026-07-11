@@ -5,7 +5,7 @@ use super::artifact::{
 };
 use super::manager::PerformanceManager;
 use super::model::InstallError;
-use super::promotion::promote_file_async;
+use super::promotion::{promote_file_async, promote_file_with_overwrite_async};
 use super::rules_refresh::remote_rules_refresh_warning;
 use crate::health::{BundleHealth, derive_health};
 use crate::modrinth::{ModrinthClient, ModrinthError};
@@ -503,8 +503,8 @@ async fn family_c_forge_core_installs_with_mocked_modrinth_artifacts() {
 }
 
 #[tokio::test]
-async fn ensure_installed_reuses_existing_verified_final_file() {
-    let root = test_root("ensure-installed-reuse-verified-final");
+async fn ensure_installed_does_not_claim_matching_untracked_final_file() {
+    let root = test_root("ensure-installed-preserve-matching-untracked-final");
     let existing = b"already-present-jar";
     fs::write(root.join("sodium.jar"), existing).expect("write existing final file");
     let (base_url, requests) = spawn_modrinth_server_with_sha512_size_and_requests(
@@ -539,15 +539,15 @@ async fn ensure_installed_reuses_existing_verified_final_file() {
     let state = manager
         .ensure_installed(&plan, "1.20.4", &root)
         .await
-        .expect("reuse existing managed artifact");
+        .expect("matching untracked artifact degrades without being claimed");
 
-    assert_eq!(state.installed_mods.len(), 1);
-    assert!(state.installed_mods[0].integrity.sha512_verified);
+    assert!(state.installed_mods.is_empty());
+    assert_eq!(state.failure_count, 1);
     assert_eq!(
-        fs::read(root.join("sodium.jar")).expect("read reused file"),
+        fs::read(root.join("sodium.jar")).expect("read preserved user file"),
         existing
     );
-    assert!(!root.join("sodium.jar.tmp").exists());
+    assert!(root.join(".axial-lock.json").is_file());
     let requests = requests.lock().expect("request log").clone();
     assert!(request_log_contains(
         &requests,
@@ -1203,6 +1203,219 @@ async fn authority_inspection_classifies_invalid_admitted_state_as_definite() {
         error,
         ManagedMutationError::Definite(InstallError::State(StateError::Parse(_)))
     ));
+    let _ = fs::remove_dir_all(instances_root);
+}
+
+#[tokio::test]
+async fn authority_recovery_removes_only_exact_managed_download_duplicate() {
+    let instances_root = test_root("authority-recover-download-duplicate");
+    let instance_id = "0123456789abcdef";
+    let mods_dir = instances_root.join(instance_id).join("mods");
+    fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+    let installed = test_mod("sodium", "managed.jar");
+    fs::write(mods_dir.join("managed.jar"), b"managed-v1").expect("write managed artifact");
+    save_state(&mods_dir, &test_state("core", vec![installed])).expect("save state");
+    let temp_path = mods_dir.join("managed.jar.sodium.tmp");
+    fs::write(&temp_path, b"managed-v1").expect("write exact managed temp duplicate");
+    let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
+    let authority = manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim managed authority");
+    let identity = authority.identify(instance_id).expect("identify instance");
+
+    let inspection = authority
+        .recover_and_inspect(&identity)
+        .await
+        .expect("recover exact duplicate");
+
+    assert!(inspection.state.is_some());
+    assert!(!temp_path.exists());
+    assert_eq!(
+        fs::read(mods_dir.join("managed.jar")).expect("read managed artifact"),
+        b"managed-v1"
+    );
+    let _ = fs::remove_dir_all(instances_root);
+}
+
+#[tokio::test]
+async fn authority_recovery_promotes_exact_managed_download_temp_for_strict_state() {
+    let instances_root = test_root("authority-recover-download-promotion");
+    let instance_id = "0123456789abcdef";
+    let mods_dir = instances_root.join(instance_id).join("mods");
+    fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+    let installed = test_mod("sodium", "managed.jar");
+    save_state(&mods_dir, &test_state("core", vec![installed])).expect("save state");
+    let temp_path = mods_dir.join("managed.jar.sodium.tmp");
+    fs::write(&temp_path, b"managed-v1").expect("write exact managed temp");
+    let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
+    let authority = manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim managed authority");
+    let identity = authority.identify(instance_id).expect("identify instance");
+
+    authority
+        .recover_and_inspect(&identity)
+        .await
+        .expect("promote exact managed temp");
+
+    assert!(!temp_path.exists());
+    assert_eq!(
+        fs::read(mods_dir.join("managed.jar")).expect("read promoted managed artifact"),
+        b"managed-v1"
+    );
+    let _ = fs::remove_dir_all(instances_root);
+}
+
+#[tokio::test]
+async fn authority_recovery_preserves_conflicting_managed_download_temp() {
+    let instances_root = test_root("authority-recover-download-conflict");
+    let instance_id = "0123456789abcdef";
+    let mods_dir = instances_root.join(instance_id).join("mods");
+    fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+    let installed = test_mod("sodium", "managed.jar");
+    fs::write(mods_dir.join("managed.jar"), b"managed-v1").expect("write managed artifact");
+    save_state(&mods_dir, &test_state("core", vec![installed])).expect("save state");
+    let temp_path = mods_dir.join("managed.jar.sodium.tmp");
+    fs::write(&temp_path, b"user-replacement").expect("write conflicting managed temp");
+    let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
+    let authority = manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim managed authority");
+    let identity = authority.identify(instance_id).expect("identify instance");
+
+    let error = authority
+        .recover_and_inspect(&identity)
+        .await
+        .expect_err("conflicting temp must block recovery");
+
+    assert!(matches!(
+        error,
+        ManagedMutationError::Indeterminate(ref outcome) if outcome.operation() == "recover"
+    ));
+    assert_eq!(
+        fs::read(temp_path).expect("read preserved conflicting temp"),
+        b"user-replacement"
+    );
+    assert_eq!(
+        fs::read(mods_dir.join("managed.jar")).expect("read managed artifact"),
+        b"managed-v1"
+    );
+    let _ = fs::remove_dir_all(instances_root);
+}
+
+#[tokio::test]
+async fn authority_recovery_rejects_untracked_managed_download_temp() {
+    let instances_root = test_root("authority-recover-untracked-download");
+    let instance_id = "0123456789abcdef";
+    let mods_dir = instances_root.join(instance_id).join("mods");
+    fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+    let temp_path = mods_dir.join("abandoned.jar.sodium.tmp");
+    fs::write(&temp_path, b"untracked").expect("write untracked managed temp");
+    let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
+    let authority = manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim managed authority");
+    let identity = authority.identify(instance_id).expect("identify instance");
+
+    let error = authority
+        .recover_and_inspect(&identity)
+        .await
+        .expect_err("untracked managed temp must block recovery");
+
+    assert!(matches!(error, ManagedMutationError::Indeterminate(_)));
+    assert_eq!(
+        fs::read(temp_path).expect("read preserved untracked temp"),
+        b"untracked"
+    );
+    let _ = fs::remove_dir_all(instances_root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn authority_recovery_does_not_follow_replacement_digest_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let instances_root = test_root("authority-recover-replacement-symlink");
+    let instance_id = "0123456789abcdef";
+    let mods_dir = instances_root.join(instance_id).join("mods");
+    fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+    let installed = test_mod("sodium", "managed.jar");
+    fs::write(mods_dir.join("managed.jar"), b"managed-v1").expect("write managed artifact");
+    save_state(&mods_dir, &test_state("core", vec![installed.clone()])).expect("save state");
+    let outside = instances_root.join("outside");
+    fs::create_dir(&outside).expect("create outside directory");
+    fs::write(outside.join("victim"), b"outside").expect("write outside victim");
+    let replacements = mods_dir
+        .join(crate::state::STATE_DIR_NAME)
+        .join("mutations")
+        .join("replacements");
+    fs::create_dir_all(&replacements).expect("create replacement root");
+    let digest_link = replacements.join(&installed.integrity.sha512);
+    symlink(&outside, &digest_link).expect("link replacement digest directory");
+    let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
+    let authority = manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim managed authority");
+    let identity = authority.identify(instance_id).expect("identify instance");
+
+    authority
+        .recover_and_inspect(&identity)
+        .await
+        .expect_err("replacement digest symlink must block recovery");
+
+    assert!(
+        fs::symlink_metadata(digest_link)
+            .expect("symlink remains")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read(outside.join("victim")).expect("read outside victim"),
+        b"outside"
+    );
+    let _ = fs::remove_dir_all(instances_root);
+}
+
+#[tokio::test]
+async fn authority_recovery_settles_exact_committed_replacement_backup() {
+    let instances_root = test_root("authority-recover-committed-replacement");
+    let instance_id = "0123456789abcdef";
+    let mods_dir = instances_root.join(instance_id).join("mods");
+    fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+    let final_path = mods_dir.join("managed.jar");
+    let temp_path = mods_dir.join("replacement.download");
+    fs::write(&final_path, b"managed-v1").expect("write old managed artifact");
+    fs::write(&temp_path, b"managed-v2").expect("write replacement temp");
+    let old_digest = hex::encode(sha2::Sha512::digest(b"managed-v1"));
+    let new_digest = hex::encode(sha2::Sha512::digest(b"managed-v2"));
+    promote_file_with_overwrite_async(&temp_path, &final_path, &old_digest, &new_digest)
+        .await
+        .expect("promote replacement");
+    let mut installed = test_mod("sodium", "managed.jar");
+    installed.integrity.sha512 = new_digest;
+    save_state(&mods_dir, &test_state("core", vec![installed])).expect("save committed state");
+    let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
+    let authority = manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim managed authority");
+    let identity = authority.identify(instance_id).expect("identify instance");
+
+    authority
+        .recover_and_inspect(&identity)
+        .await
+        .expect("settle committed replacement");
+
+    assert_eq!(
+        fs::read(final_path).expect("read replacement"),
+        b"managed-v2"
+    );
+    assert!(
+        !mods_dir
+            .join(crate::state::STATE_DIR_NAME)
+            .join("mutations")
+            .join("replacements")
+            .exists()
+    );
     let _ = fs::remove_dir_all(instances_root);
 }
 

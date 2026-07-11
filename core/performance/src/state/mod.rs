@@ -24,6 +24,7 @@ const STATE_FILENAME_MAX_BYTES: usize = 255;
 pub(crate) const STATE_DIR_NAME: &str = ".axial-performance";
 const MUTATION_DIR_NAME: &str = "mutations";
 const REMOVAL_DIR_NAME: &str = "removals";
+const ADDITION_DIR_NAME: &str = "additions";
 const ROLLBACK_DIR_NAME: &str = "rollback";
 const ROLLBACK_FILE_NAME: &str = "latest.json";
 const ROLLBACK_FILES_DIR_NAME: &str = "files";
@@ -35,6 +36,7 @@ const ROLLBACK_METADATA_MAX_BYTES: u64 = 1024 * 1024;
 const ROLLBACK_RETAINED_MAX_BYTES: u64 = MANAGED_ARTIFACT_MAX_BYTES * 2;
 const ROLLBACK_TRANSIENT_MAX_BYTES: u64 =
     ROLLBACK_RETAINED_MAX_BYTES + MANAGED_ARTIFACT_MAX_BYTES + (ROLLBACK_METADATA_MAX_BYTES * 3);
+pub(crate) const RECOVERY_ENTRY_LIMIT: usize = 1024;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -142,7 +144,51 @@ pub(crate) fn reconcile_managed_storage(instance_mods_dir: &Path) -> Result<(), 
     reconcile_state_publication(instance_mods_dir)?;
     let state = load_state_admitted(instance_mods_dir)?;
     reconcile_managed_removal_obligations(instance_mods_dir, state.as_ref())?;
+    reconcile_managed_addition_obligations(instance_mods_dir, state.as_ref())?;
     reconcile_rollback_metadata(instance_mods_dir)
+}
+
+pub(crate) fn recover_managed_storage(
+    instance_mods_dir: &Path,
+) -> Result<Option<CompositionState>, StateError> {
+    reconcile_managed_storage(instance_mods_dir)?;
+    finish_rollback_retention(instance_mods_dir)?;
+    reconcile_managed_storage(instance_mods_dir)?;
+    load_state_admitted(instance_mods_dir)
+}
+
+pub(crate) fn prove_managed_storage_recovered(
+    instance_mods_dir: &Path,
+    state: Option<&CompositionState>,
+) -> Result<(), StateError> {
+    for path in [
+        state_staged_path(instance_mods_dir),
+        state_backup_path(instance_mods_dir),
+        state_delete_path(instance_mods_dir),
+    ] {
+        if path_exists(&path)? {
+            return Err(StateError::InvalidState(
+                "managed state publication obligation remains after recovery".to_string(),
+            ));
+        }
+    }
+    prove_managed_internal_roots(instance_mods_dir)?;
+    prove_removal_obligations_settled(instance_mods_dir)?;
+    prove_rollback_storage_settled(instance_mods_dir)?;
+    for installed in state
+        .into_iter()
+        .flat_map(|state| state.installed_mods.iter())
+    {
+        if !managed_artifact_matches(instance_mods_dir, installed)? {
+            return Err(StateError::InvalidIntegrity {
+                filename: installed.filename.clone(),
+                reason:
+                    "tracked managed artifact is missing or does not match its ownership digest"
+                        .to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn load_state_admitted(
@@ -713,17 +759,18 @@ fn rollback_candidate_storage_bytes(
 fn rollback_storage_bytes(instance_mods_dir: &Path) -> Result<u64, StateError> {
     validate_rollback_internal_roots(instance_mods_dir)?;
     let mut total = 0_u64;
+    let mut count = 0_usize;
     let rollback_dir = rollback_dir_path(instance_mods_dir);
     if !rollback_dir.exists() {
         return Ok(0);
     }
-    total_directory_files(&rollback_dir, false, &mut total)?;
+    total_directory_files(&rollback_dir, false, &mut total, &mut count)?;
     for path in [
         rollback_files_dir_path(instance_mods_dir),
         rollback_history_dir_path(instance_mods_dir),
         rollback_tmp_dir_path(instance_mods_dir),
     ] {
-        total_directory_files(&path, true, &mut total)?;
+        total_directory_files(&path, true, &mut total, &mut count)?;
     }
     Ok(total)
 }
@@ -732,6 +779,7 @@ fn total_directory_files(
     directory: &Path,
     allow_no_subdirectories: bool,
     total: &mut u64,
+    count: &mut usize,
 ) -> Result<(), StateError> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -740,6 +788,7 @@ fn total_directory_files(
     };
     for entry in entries {
         let entry = entry?;
+        admit_recovery_entry(count, "rollback storage entries")?;
         let metadata = fs::symlink_metadata(entry.path())?;
         if metadata.file_type().is_file() {
             *total = total.checked_add(metadata.len()).ok_or_else(|| {
@@ -891,8 +940,10 @@ fn reconcile_prune_artifact_temps(instance_mods_dir: &Path) -> Result<(), StateE
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(StateError::Read(error)),
     };
+    let mut count = 0_usize;
     for entry in entries {
         let entry = entry?;
+        admit_recovery_entry(&mut count, "rollback prune recovery entries")?;
         let Some(filename) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
@@ -1118,6 +1169,8 @@ pub(crate) fn restore_rollback_snapshot_classified(
             .map_err(RollbackRestoreError::Indeterminate)?;
         return Err(RollbackRestoreError::Indeterminate(error));
     }
+    reconcile_managed_addition_obligations(instance_mods_dir, Some(&snapshot.state))
+        .map_err(RollbackRestoreError::Indeterminate)?;
     cleanup_rollback_restore_backups(&restore_targets)
         .map_err(RollbackRestoreError::Indeterminate)?;
     cleanup_rollback_restore_targets(&restore_targets)
@@ -1241,6 +1294,358 @@ pub(crate) fn stage_managed_artifact_removal(
     Ok(backup)
 }
 
+pub(crate) fn stage_managed_artifact_addition(
+    instance_mods_dir: &Path,
+    filename: &str,
+    sha512: &str,
+    source_path: &Path,
+) -> Result<PathBuf, StateError> {
+    validate_managed_filename(filename)?;
+    if !is_valid_sha512(sha512) {
+        return Err(StateError::InvalidIntegrity {
+            filename: filename.to_string(),
+            reason: "managed addition digest is invalid".to_string(),
+        });
+    }
+    if !path_matches_sha512(source_path, sha512)? {
+        return Err(StateError::InvalidIntegrity {
+            filename: filename.to_string(),
+            reason: "managed addition source ownership cannot be proven".to_string(),
+        });
+    }
+    let digest = sha512.to_ascii_lowercase();
+    let obligation = managed_artifact_addition_path(instance_mods_dir, filename, &digest)?;
+    let digest_root = obligation
+        .parent()
+        .expect("managed addition obligation always has a digest parent")
+        .to_path_buf();
+    let addition_root = digest_root
+        .parent()
+        .expect("managed addition digest always has an addition parent")
+        .to_path_buf();
+    let mutation_root = addition_root
+        .parent()
+        .expect("managed addition root always has a mutation parent")
+        .to_path_buf();
+    let state_root = mutation_root
+        .parent()
+        .expect("managed mutation root always has a state parent")
+        .to_path_buf();
+    for path in [&state_root, &mutation_root, &addition_root, &digest_root] {
+        ensure_recovery_directory(path)?;
+    }
+    match fs::hard_link(source_path, &obligation) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let source = fs::symlink_metadata(source_path)?;
+            let existing = fs::symlink_metadata(&obligation)?;
+            if !source.file_type().is_file()
+                || !existing.file_type().is_file()
+                || !same_file_identity(&source, &existing)
+                || !path_matches_sha512(&obligation, &digest)?
+            {
+                return Err(StateError::InvalidState(
+                    "managed addition obligation conflicts with existing ownership".to_string(),
+                ));
+            }
+        }
+        Err(error) => return Err(StateError::Read(error)),
+    }
+    let source = fs::symlink_metadata(source_path)?;
+    let staged = fs::symlink_metadata(&obligation)?;
+    if !source.file_type().is_file()
+        || !staged.file_type().is_file()
+        || !same_file_identity(&source, &staged)
+        || !path_matches_sha512(&obligation, &digest)?
+    {
+        return Err(StateError::InvalidState(
+            "managed addition obligation identity cannot be proven".to_string(),
+        ));
+    }
+    Ok(obligation)
+}
+
+fn managed_artifact_addition_path(
+    instance_mods_dir: &Path,
+    filename: &str,
+    sha512: &str,
+) -> Result<PathBuf, StateError> {
+    validate_managed_filename(filename)?;
+    if !is_valid_sha512(sha512) {
+        return Err(StateError::InvalidIntegrity {
+            filename: filename.to_string(),
+            reason: "managed addition digest is invalid".to_string(),
+        });
+    }
+    Ok(instance_mods_dir
+        .join(STATE_DIR_NAME)
+        .join(MUTATION_DIR_NAME)
+        .join(ADDITION_DIR_NAME)
+        .join(sha512.to_ascii_lowercase())
+        .join(filename))
+}
+
+struct AdmittedManagedAddition {
+    path: PathBuf,
+    metadata: std::fs::Metadata,
+    digest: String,
+    filename: String,
+    tracked: bool,
+    temp_aliases: Vec<(PathBuf, std::fs::Metadata)>,
+}
+
+pub(crate) fn reconcile_managed_addition_obligations(
+    instance_mods_dir: &Path,
+    current_state: Option<&CompositionState>,
+) -> Result<(), StateError> {
+    let state_root = instance_mods_dir.join(STATE_DIR_NAME);
+    let mutation_root = state_root.join(MUTATION_DIR_NAME);
+    let root = mutation_root.join(ADDITION_DIR_NAME);
+    for path in [&state_root, &mutation_root, &root] {
+        validate_managed_recovery_directory(path)?;
+    }
+    let digest_dirs = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    let mut count = 0_usize;
+    let mut digest_dirs_to_remove = Vec::new();
+    let mut admitted = Vec::new();
+    let mut filenames = HashSet::new();
+    for digest_dir in digest_dirs {
+        let digest_dir = digest_dir?;
+        admit_recovery_entry(&mut count, "managed addition obligations")?;
+        if !digest_dir.file_type()?.is_dir() {
+            return Err(StateError::InvalidState(
+                "managed addition digest path is not a directory".to_string(),
+            ));
+        }
+        let digest = digest_dir
+            .file_name()
+            .to_str()
+            .filter(|value| is_valid_sha512(value))
+            .ok_or_else(|| {
+                StateError::InvalidState("managed addition digest is invalid".to_string())
+            })?
+            .to_ascii_lowercase();
+        for entry in fs::read_dir(digest_dir.path())? {
+            let entry = entry?;
+            admit_recovery_entry(&mut count, "managed addition obligations")?;
+            let filename = entry
+                .file_name()
+                .to_str()
+                .ok_or_else(|| StateError::InvalidFilename("managed addition".to_string()))?
+                .to_string();
+            validate_managed_filename(&filename)?;
+            if !filenames.insert(filename.to_ascii_lowercase()) {
+                return Err(StateError::InvalidState(
+                    "managed addition obligations contain duplicate or case-colliding filenames"
+                        .to_string(),
+                ));
+            }
+            let obligation_metadata = fs::symlink_metadata(entry.path())?;
+            if !obligation_metadata.file_type().is_file()
+                || !path_matches_sha512(&entry.path(), &digest)?
+            {
+                return Err(StateError::InvalidIntegrity {
+                    filename,
+                    reason: "managed addition obligation ownership cannot be proven".to_string(),
+                });
+            }
+            let tracked = current_state.is_some_and(|state| {
+                state.installed_mods.iter().any(|installed| {
+                    installed.filename == filename
+                        && installed.integrity.sha512.eq_ignore_ascii_case(&digest)
+                })
+            });
+            let final_path = managed_artifact_path(instance_mods_dir, &filename)?;
+            match fs::symlink_metadata(&final_path) {
+                Ok(final_metadata) => {
+                    if !final_metadata.file_type().is_file()
+                        || !same_file_identity(&obligation_metadata, &final_metadata)
+                        || !path_matches_sha512(&final_path, &digest)?
+                    {
+                        return Err(StateError::InvalidIntegrity {
+                            filename,
+                            reason: "managed addition destination ownership cannot be proven"
+                                .to_string(),
+                        });
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(StateError::Read(error)),
+            }
+            admitted.push(AdmittedManagedAddition {
+                path: entry.path(),
+                metadata: obligation_metadata,
+                digest: digest.clone(),
+                filename,
+                tracked,
+                temp_aliases: Vec::new(),
+            });
+        }
+        digest_dirs_to_remove.push(digest_dir.path());
+    }
+
+    if admitted.is_empty() {
+        for digest_dir in digest_dirs_to_remove {
+            fs::remove_dir(digest_dir)?;
+        }
+        fs::remove_dir(root)?;
+        return Ok(());
+    }
+
+    let by_filename = admitted
+        .iter()
+        .enumerate()
+        .map(|(index, obligation)| (obligation.filename.clone(), index))
+        .collect::<HashMap<_, _>>();
+    for entry in fs::read_dir(instance_mods_dir)? {
+        let entry = entry?;
+        admit_recovery_entry(&mut count, "managed addition recovery scan")?;
+        let entry_name = entry.file_name();
+        let Some((filename, _)) = entry_name
+            .to_str()
+            .and_then(parse_managed_download_temp_name)
+        else {
+            continue;
+        };
+        let Some(index) = by_filename.get(filename).copied() else {
+            continue;
+        };
+        let metadata = fs::symlink_metadata(entry.path())?;
+        let obligation = &admitted[index];
+        if !metadata.file_type().is_file()
+            || !same_file_identity(&metadata, &obligation.metadata)
+            || !path_matches_sha512(&entry.path(), &obligation.digest)?
+        {
+            return Err(StateError::InvalidIntegrity {
+                filename: filename.to_string(),
+                reason: "managed addition temp alias ownership cannot be proven".to_string(),
+            });
+        }
+        admitted[index].temp_aliases.push((entry.path(), metadata));
+    }
+
+    for obligation in &admitted {
+        let final_path = managed_artifact_path(instance_mods_dir, &obligation.filename)?;
+        match fs::symlink_metadata(&final_path) {
+            Ok(final_metadata) => {
+                if !final_metadata.file_type().is_file()
+                    || !same_file_identity(&obligation.metadata, &final_metadata)
+                    || !path_matches_sha512(&final_path, &obligation.digest)?
+                {
+                    return Err(StateError::InvalidIntegrity {
+                        filename: obligation.filename.clone(),
+                        reason: "managed addition destination changed after admission".to_string(),
+                    });
+                }
+                if !obligation.tracked {
+                    remove_identity_bound_file(&final_path, &final_metadata, &obligation.digest)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && obligation.tracked => {
+                fs::hard_link(&obligation.path, &final_path)?;
+                let final_metadata = fs::symlink_metadata(&final_path)?;
+                if !final_metadata.file_type().is_file()
+                    || !same_file_identity(&obligation.metadata, &final_metadata)
+                    || !path_matches_sha512(&final_path, &obligation.digest)?
+                {
+                    return Err(StateError::InvalidIntegrity {
+                        filename: obligation.filename.clone(),
+                        reason: "managed addition destination reconstruction failed".to_string(),
+                    });
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StateError::Read(error)),
+        }
+        for (alias, metadata) in &obligation.temp_aliases {
+            remove_identity_bound_file(alias, metadata, &obligation.digest)?;
+        }
+        remove_identity_bound_file(&obligation.path, &obligation.metadata, &obligation.digest)?;
+    }
+    for digest_dir in digest_dirs_to_remove {
+        fs::remove_dir(digest_dir)?;
+    }
+    fs::remove_dir(root)?;
+    Ok(())
+}
+
+pub(crate) fn settle_abandoned_managed_artifact_addition(
+    instance_mods_dir: &Path,
+    installed: &InstalledMod,
+) -> Result<(), StateError> {
+    let obligation = managed_artifact_addition_path(
+        instance_mods_dir,
+        &installed.filename,
+        &installed.integrity.sha512,
+    )?;
+    let digest_root = obligation
+        .parent()
+        .expect("managed addition obligation always has a digest parent");
+    let addition_root = digest_root
+        .parent()
+        .expect("managed addition digest always has an addition parent");
+    let mutation_root = addition_root
+        .parent()
+        .expect("managed addition root always has a mutation parent");
+    let state_root = mutation_root
+        .parent()
+        .expect("managed mutation root always has a state parent");
+    for path in [state_root, mutation_root, addition_root, digest_root] {
+        validate_managed_recovery_directory(path)?;
+    }
+    let metadata = match fs::symlink_metadata(&obligation) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => {
+            return Err(StateError::InvalidState(
+                "abandoned managed addition obligation is not a regular file".to_string(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    if path_exists(&managed_artifact_path(
+        instance_mods_dir,
+        &installed.filename,
+    )?)? {
+        return Err(StateError::InvalidState(
+            "abandoned managed addition target still exists".to_string(),
+        ));
+    }
+    let mut count = 0_usize;
+    let mut aliases = Vec::new();
+    for entry in fs::read_dir(instance_mods_dir)? {
+        let entry = entry?;
+        admit_recovery_entry(&mut count, "abandoned managed addition scan")?;
+        let is_alias = entry
+            .file_name()
+            .to_str()
+            .and_then(parse_managed_download_temp_name)
+            .is_some_and(|(filename, _)| filename == installed.filename);
+        if !is_alias {
+            continue;
+        }
+        let alias_metadata = fs::symlink_metadata(entry.path())?;
+        if !alias_metadata.file_type().is_file()
+            || !same_file_identity(&metadata, &alias_metadata)
+            || !path_matches_sha512(&entry.path(), &installed.integrity.sha512)?
+        {
+            return Err(StateError::InvalidIntegrity {
+                filename: installed.filename.clone(),
+                reason: "abandoned managed addition temp alias is conflicting".to_string(),
+            });
+        }
+        aliases.push((entry.path(), alias_metadata));
+    }
+    for (path, alias_metadata) in aliases {
+        remove_identity_bound_file(&path, &alias_metadata, &installed.integrity.sha512)?;
+    }
+    remove_identity_bound_file(&obligation, &metadata, &installed.integrity.sha512)
+}
+
 pub(crate) fn settle_managed_artifact_removal(
     instance_mods_dir: &Path,
     installed: &InstalledMod,
@@ -1292,10 +1697,12 @@ pub(crate) fn reconcile_managed_removal_obligations(
     instance_mods_dir: &Path,
     current_state: Option<&CompositionState>,
 ) -> Result<(), StateError> {
-    let root = instance_mods_dir
-        .join(STATE_DIR_NAME)
-        .join(MUTATION_DIR_NAME)
-        .join(REMOVAL_DIR_NAME);
+    let state_root = instance_mods_dir.join(STATE_DIR_NAME);
+    let mutation_root = state_root.join(MUTATION_DIR_NAME);
+    let root = mutation_root.join(REMOVAL_DIR_NAME);
+    for path in [&state_root, &mutation_root, &root] {
+        validate_managed_recovery_directory(path)?;
+    }
     let digest_dirs = match fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1304,6 +1711,7 @@ pub(crate) fn reconcile_managed_removal_obligations(
     let mut count = 0_usize;
     for digest_dir in digest_dirs {
         let digest_dir = digest_dir?;
+        admit_recovery_entry(&mut count, "managed removal obligations")?;
         if !digest_dir.file_type()?.is_dir() {
             return Err(StateError::InvalidState(
                 "managed removal digest path is not a directory".to_string(),
@@ -1321,12 +1729,7 @@ pub(crate) fn reconcile_managed_removal_obligations(
             .to_string();
         for entry in fs::read_dir(digest_dir.path())? {
             let entry = entry?;
-            count = count.saturating_add(1);
-            if count > STATE_MAX_INSTALLED_MODS {
-                return Err(StateError::InvalidState(
-                    "managed removal obligations exceed the limit".to_string(),
-                ));
-            }
+            admit_recovery_entry(&mut count, "managed removal obligations")?;
             let filename = entry
                 .file_name()
                 .to_str()
@@ -1578,6 +1981,7 @@ struct RollbackRestoreTarget {
     source_path: PathBuf,
     temp_path: PathBuf,
     backup_path: PathBuf,
+    addition_path: Option<PathBuf>,
     final_path: PathBuf,
     filename: String,
     previous_sha512: Option<String>,
@@ -1629,6 +2033,16 @@ fn prepare_rollback_restore_targets(
             source_path,
             backup_path,
             temp_path,
+            addition_path: previous_sha512
+                .is_none()
+                .then(|| {
+                    managed_artifact_addition_path(
+                        instance_mods_dir,
+                        &artifact.filename,
+                        &artifact.sha512,
+                    )
+                })
+                .transpose()?,
             final_path,
             filename: artifact.filename.clone(),
             previous_sha512,
@@ -1663,15 +2077,25 @@ fn reconcile_restore_stage_temps(instance_mods_dir: &Path) -> Result<(), StateEr
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(StateError::Read(error)),
     };
+    let mut count = 0_usize;
     for entry in entries {
         let entry = entry?;
+        admit_recovery_entry(&mut count, "rollback restore recovery entries")?;
         let metadata = entry.file_type()?;
         if !metadata.is_file() {
-            continue;
+            return Err(StateError::InvalidRollback(
+                "rollback restore staging contains a non-regular entry".to_string(),
+            ));
         }
-        let Some(filename) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
+        let filename = entry
+            .file_name()
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                StateError::InvalidRollback(
+                    "rollback restore staging filename is invalid".to_string(),
+                )
+            })?;
         let (stem, backup_digest) = if let Some((stem, digest)) = filename
             .split_once("-restore.tmp.previous-")
             .filter(|(_, digest)| {
@@ -1681,25 +2105,31 @@ fn reconcile_restore_stage_temps(instance_mods_dir: &Path) -> Result<(), StateEr
         } else if let Some(stem) = filename.strip_suffix("-restore.tmp") {
             (stem, None)
         } else {
-            continue;
+            return Err(StateError::InvalidRollback(
+                "rollback restore staging contains an unknown obligation".to_string(),
+            ));
         };
-        let Some((prefix, raw_index)) = stem.rsplit_once('-') else {
-            continue;
-        };
-        let Ok(index) = raw_index.parse::<usize>() else {
-            continue;
-        };
+        let (prefix, raw_index) = stem.rsplit_once('-').ok_or_else(|| {
+            StateError::InvalidRollback("rollback restore staging identity is invalid".to_string())
+        })?;
+        let index = raw_index.parse::<usize>().map_err(|_| {
+            StateError::InvalidRollback("rollback restore staging index is invalid".to_string())
+        })?;
         let Some(snapshot) = snapshots.iter().find_map(|record| {
             let stage_prefix = format!("restore--{}--", record.snapshot.id);
             prefix
                 .starts_with(&stage_prefix)
                 .then_some(&record.snapshot)
         }) else {
-            continue;
+            return Err(StateError::InvalidRollback(
+                "rollback restore staging snapshot is not retained".to_string(),
+            ));
         };
-        let Some(artifact) = snapshot.artifacts.get(index) else {
-            continue;
-        };
+        let artifact = snapshot.artifacts.get(index).ok_or_else(|| {
+            StateError::InvalidRollback(
+                "rollback restore staging index is out of range".to_string(),
+            )
+        })?;
         if let Some(backup_digest) = backup_digest {
             let Some(previous) = current.as_ref().and_then(|state| {
                 state
@@ -1881,13 +2311,14 @@ fn regular_rollback_artifact_bytes(path: &Path, stored_filename: &str) -> Result
 }
 
 fn stage_rollback_restore_targets(targets: &[RollbackRestoreTarget]) -> Result<(), StateError> {
-    if let Some(first) = targets.first() {
-        let instance_mods_dir = first
-            .final_path
-            .parent()
-            .ok_or_else(|| StateError::InvalidRollback("invalid rollback target".to_string()))?;
-        ensure_rollback_internal_roots(instance_mods_dir)?;
-    }
+    let Some(first) = targets.first() else {
+        return Ok(());
+    };
+    let instance_mods_dir = first
+        .final_path
+        .parent()
+        .ok_or_else(|| StateError::InvalidRollback("invalid rollback target".to_string()))?;
+    ensure_rollback_internal_roots(instance_mods_dir)?;
     let mut staged = Vec::new();
     for target in targets {
         let result = copy_regular_file_exclusive(&target.source_path, &target.temp_path);
@@ -1905,6 +2336,19 @@ fn stage_rollback_restore_targets(targets: &[RollbackRestoreTarget]) -> Result<(
                 reason: "staged rollback bytes do not match the recorded ownership digest"
                     .to_string(),
             });
+        }
+        if let Some(expected_path) = &target.addition_path {
+            let staged_addition = stage_managed_artifact_addition(
+                instance_mods_dir,
+                &target.filename,
+                &target.restored_sha512,
+                &target.temp_path,
+            )?;
+            if staged_addition != *expected_path {
+                return Err(StateError::InvalidRollback(
+                    "rollback addition obligation path changed during staging".to_string(),
+                ));
+            }
         }
         staged.push(target.temp_path.as_path());
     }
@@ -1939,11 +2383,29 @@ fn publish_rollback_restore_target(target: &RollbackRestoreTarget) -> Result<(),
             };
         }
     }
-    if let Err(error) = fs::rename(&target.temp_path, &target.final_path) {
+    let publication = if let Some(addition_path) = &target.addition_path {
+        fs::hard_link(addition_path, &target.final_path)
+    } else {
+        fs::rename(&target.temp_path, &target.final_path)
+    };
+    if let Err(error) = publication {
         if path_exists(&target.backup_path)? && !path_exists(&target.final_path)? {
             fs::rename(&target.backup_path, &target.final_path)?;
         }
         return Err(StateError::Read(error));
+    }
+    if let Some(addition_path) = &target.addition_path {
+        let addition = fs::symlink_metadata(addition_path)?;
+        let final_metadata = fs::symlink_metadata(&target.final_path)?;
+        if !addition.file_type().is_file()
+            || !final_metadata.file_type().is_file()
+            || !same_file_identity(&addition, &final_metadata)
+            || !path_matches_sha512(&target.final_path, &target.restored_sha512)?
+        {
+            return Err(StateError::InvalidRollback(
+                "rollback addition publication ownership cannot be proven".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1971,13 +2433,25 @@ fn compensate_rollback_restore_targets(
                 remove_owned_file(&target.final_path)?;
             }
             fs::rename(&target.backup_path, &target.final_path)?;
-        } else if target.previous_sha512.is_none() && path_exists(&target.final_path)? {
-            if !path_matches_sha512(&target.final_path, &target.restored_sha512)? {
+        } else if let Some(addition_path) = &target.addition_path
+            && path_exists(&target.final_path)?
+        {
+            let addition = fs::symlink_metadata(addition_path)?;
+            let final_metadata = fs::symlink_metadata(&target.final_path)?;
+            if !addition.file_type().is_file()
+                || !final_metadata.file_type().is_file()
+                || !same_file_identity(&addition, &final_metadata)
+                || !path_matches_sha512(&target.final_path, &target.restored_sha512)?
+            {
                 return Err(StateError::InvalidRollback(
                     "rollback compensation created target ownership cannot be proven".to_string(),
                 ));
             }
-            remove_owned_file(&target.final_path)?;
+            remove_identity_bound_file(
+                &target.final_path,
+                &final_metadata,
+                &target.restored_sha512,
+            )?;
         }
     }
     Ok(())
@@ -2058,6 +2532,23 @@ fn remove_file_matching_sha512(
     {
         return Err(StateError::InvalidState(
             "managed cleanup target identity changed after digest admission".to_string(),
+        ));
+    }
+    fs::remove_file(path).map_err(StateError::Read)
+}
+
+fn remove_identity_bound_file(
+    path: &Path,
+    admitted: &std::fs::Metadata,
+    expected_sha512: &str,
+) -> Result<(), StateError> {
+    let current = fs::symlink_metadata(path)?;
+    if !current.file_type().is_file()
+        || !same_file_identity(admitted, &current)
+        || !path_matches_sha512(path, expected_sha512)?
+    {
+        return Err(StateError::InvalidState(
+            "managed cleanup target identity or digest changed after admission".to_string(),
         ));
     }
     fs::remove_file(path).map_err(StateError::Read)
@@ -2210,6 +2701,56 @@ fn validate_sha512_integrity(filename: &str, sha512: &str) -> Result<(), StateEr
     Ok(())
 }
 
+fn is_valid_sha512(value: &str) -> bool {
+    value.len() == 128 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn parse_managed_download_temp_name(name: &str) -> Option<(&str, &str)> {
+    let (filename, suffix) = name.strip_suffix(".tmp")?.rsplit_once('.')?;
+    (!filename.is_empty()
+        && !suffix.is_empty()
+        && suffix.len() <= 48
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+    .then_some((filename, suffix))
+}
+
+fn admit_recovery_entry(count: &mut usize, label: &str) -> Result<(), StateError> {
+    *count = count.saturating_add(1);
+    if *count > RECOVERY_ENTRY_LIMIT {
+        Err(StateError::InvalidState(format!(
+            "{label} exceed the recovery entry limit"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_recovery_directory(path: &Path) -> Result<(), StateError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(StateError::InvalidState(
+            "managed recovery path is not a regular directory".to_string(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(StateError::Read(error)),
+            }
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+                Ok(_) => Err(StateError::InvalidState(
+                    "managed recovery directory was not created safely".to_string(),
+                )),
+                Err(error) => Err(StateError::Read(error)),
+            }
+        }
+        Err(error) => Err(StateError::Read(error)),
+    }
+}
+
 fn validate_managed_filename(filename: &str) -> Result<(), StateError> {
     let trimmed = filename.trim();
     if trimmed.is_empty()
@@ -2240,8 +2781,10 @@ fn cleanup_proven_history_temps(instance_mods_dir: &Path) -> Result<(), StateErr
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(StateError::Read(error)),
     };
+    let mut count = 0_usize;
     for entry in entries {
         let entry = entry?;
+        admit_recovery_entry(&mut count, "rollback history recovery entries")?;
         let Some(filename) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
@@ -2285,6 +2828,246 @@ fn cleanup_proven_history_temps(instance_mods_dir: &Path) -> Result<(), StateErr
             cleanup_abandoned_snapshot_artifacts(instance_mods_dir, &snapshot)?;
         }
         remove_owned_file(&temp_path)?;
+    }
+    Ok(())
+}
+
+fn prove_managed_internal_roots(instance_mods_dir: &Path) -> Result<(), StateError> {
+    let state_root = instance_mods_dir.join(STATE_DIR_NAME);
+    validate_managed_recovery_directory(&state_root)?;
+    let entries = match fs::read_dir(&state_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    let mut count = 0_usize;
+    for entry in entries {
+        let entry = entry?;
+        admit_recovery_entry(&mut count, "managed internal root entries")?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            StateError::InvalidState("managed internal root name is invalid".to_string())
+        })?;
+        if !matches!(name, MUTATION_DIR_NAME | ROLLBACK_DIR_NAME) || !entry.file_type()?.is_dir() {
+            return Err(StateError::InvalidState(
+                "managed internal root contains an unknown entry".to_string(),
+            ));
+        }
+    }
+
+    let mutation_root = state_root.join(MUTATION_DIR_NAME);
+    validate_managed_recovery_directory(&mutation_root)?;
+    let entries = match fs::read_dir(&mutation_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    for entry in entries {
+        let entry = entry?;
+        admit_recovery_entry(&mut count, "managed internal root entries")?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            StateError::InvalidState("managed mutation root name is invalid".to_string())
+        })?;
+        if !matches!(name, REMOVAL_DIR_NAME | ADDITION_DIR_NAME | "replacements")
+            || !entry.file_type()?.is_dir()
+        {
+            return Err(StateError::InvalidState(
+                "managed mutation root contains an unknown entry".to_string(),
+            ));
+        }
+    }
+    if path_exists(&mutation_root.join(ADDITION_DIR_NAME))? {
+        return Err(StateError::InvalidState(
+            "managed addition obligation root remains after recovery".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn prove_removal_obligations_settled(instance_mods_dir: &Path) -> Result<(), StateError> {
+    let root = instance_mods_dir
+        .join(STATE_DIR_NAME)
+        .join(MUTATION_DIR_NAME)
+        .join(REMOVAL_DIR_NAME);
+    validate_managed_recovery_directory(&root)?;
+    let digest_dirs = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    let mut count = 0_usize;
+    for digest_dir in digest_dirs {
+        let digest_dir = digest_dir?;
+        admit_recovery_entry(&mut count, "managed removal proof entries")?;
+        if !digest_dir.file_type()?.is_dir()
+            || digest_dir
+                .file_name()
+                .to_str()
+                .is_none_or(|value| !is_valid_sha512(value))
+        {
+            return Err(StateError::InvalidState(
+                "managed removal root contains an invalid entry".to_string(),
+            ));
+        }
+        if let Some(entry) = fs::read_dir(digest_dir.path())?.next() {
+            entry?;
+            admit_recovery_entry(&mut count, "managed removal proof entries")?;
+            return Err(StateError::InvalidState(
+                "managed removal obligation remains after recovery".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_managed_recovery_directory(path: &Path) -> Result<(), StateError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(StateError::InvalidState(
+            "managed recovery root is not a regular directory".to_string(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StateError::Read(error)),
+    }
+}
+
+fn prove_rollback_storage_settled(instance_mods_dir: &Path) -> Result<(), StateError> {
+    validate_rollback_internal_roots(instance_mods_dir)?;
+    let rollback_root = rollback_dir_path(instance_mods_dir);
+    let entries = match fs::read_dir(&rollback_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    let mut count = 0_usize;
+    for entry in entries {
+        let entry = entry?;
+        admit_recovery_entry(&mut count, "rollback proof root entries")?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            StateError::InvalidRollback("rollback root name is invalid".to_string())
+        })?;
+        let valid = match name {
+            ROLLBACK_FILE_NAME => entry.file_type()?.is_file(),
+            ROLLBACK_FILES_DIR_NAME | ROLLBACK_HISTORY_DIR_NAME | ROLLBACK_TMP_DIR_NAME => {
+                entry.file_type()?.is_dir()
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(StateError::InvalidRollback(
+                "rollback root contains an unknown or transient entry".to_string(),
+            ));
+        }
+    }
+
+    let snapshots = load_retained_rollback_snapshots(instance_mods_dir)?;
+    if let Some(latest) = snapshots.iter().find(|record| record.latest) {
+        let latest_path = rollback_file_path(instance_mods_dir);
+        let history_path = rollback_history_file_path(instance_mods_dir, &latest.snapshot.id);
+        let latest_metadata = fs::symlink_metadata(&latest_path)?;
+        let history_metadata = fs::symlink_metadata(&history_path)?;
+        if !latest_metadata.file_type().is_file()
+            || !history_metadata.file_type().is_file()
+            || !bounded_regular_files_match(&latest_path, &history_path)?
+        {
+            return Err(StateError::InvalidRollback(
+                "latest rollback metadata does not exactly match its history publication"
+                    .to_string(),
+            ));
+        }
+    }
+    let mut retained_artifacts = HashMap::new();
+    for record in &snapshots {
+        for (index, artifact) in record.snapshot.artifacts.iter().enumerate() {
+            if artifact.stored_filename != format!("{}-{index}.bin", record.snapshot.id)
+                || retained_artifacts
+                    .insert(artifact.stored_filename.as_str(), artifact.sha512.as_str())
+                    .is_some()
+            {
+                return Err(StateError::InvalidRollback(
+                    "retained rollback artifact identity is invalid or ambiguous".to_string(),
+                ));
+            }
+        }
+    }
+    for (stored_filename, expected) in &retained_artifacts {
+        let path = rollback_files_dir_path(instance_mods_dir).join(stored_filename);
+        if !path_matches_sha512(&path, expected)? {
+            return Err(StateError::InvalidRollback(
+                "retained rollback artifact ownership cannot be proven".to_string(),
+            ));
+        }
+    }
+    prove_rollback_directory_files(
+        &rollback_history_dir_path(instance_mods_dir),
+        |name, path| {
+            let snapshot_id = name.strip_suffix(".json").ok_or_else(|| {
+                StateError::InvalidRollback(
+                    "rollback history contains an unknown or transient entry".to_string(),
+                )
+            })?;
+            validate_rollback_snapshot_id(snapshot_id)?;
+            let snapshot = read_rollback_snapshot_file(path)?;
+            if snapshot.id != snapshot_id {
+                return Err(StateError::InvalidRollback(
+                    "rollback history filename does not match its payload id".to_string(),
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    prove_rollback_directory_files(&rollback_files_dir_path(instance_mods_dir), |name, path| {
+        let expected = retained_artifacts.get(name).ok_or_else(|| {
+            StateError::InvalidRollback("rollback artifact is not retained by metadata".to_string())
+        })?;
+        if !path_matches_sha512(path, expected)? {
+            return Err(StateError::InvalidRollback(
+                "retained rollback artifact ownership cannot be proven".to_string(),
+            ));
+        }
+        Ok(())
+    })?;
+    let tmp = rollback_tmp_dir_path(instance_mods_dir);
+    match fs::read_dir(tmp) {
+        Ok(mut entries) => {
+            if let Some(entry) = entries.next() {
+                entry?;
+                return Err(StateError::InvalidRollback(
+                    "rollback staging obligation remains after recovery".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StateError::Read(error)),
+    }
+}
+
+fn prove_rollback_directory_files(
+    directory: &Path,
+    mut prove: impl FnMut(&str, &Path) -> Result<(), StateError>,
+) -> Result<(), StateError> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    let mut count = 0_usize;
+    for entry in entries {
+        let entry = entry?;
+        admit_recovery_entry(&mut count, "rollback proof directory entries")?;
+        if !entry.file_type()?.is_file() {
+            return Err(StateError::InvalidRollback(
+                "rollback storage contains a non-regular entry".to_string(),
+            ));
+        }
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            StateError::InvalidRollback("rollback storage name is invalid".to_string())
+        })?;
+        prove(name, &entry.path())?;
     }
     Ok(())
 }
@@ -2556,8 +3339,10 @@ fn load_retained_rollback_snapshots(
         Err(error) => return Err(StateError::Read(error)),
     };
 
+    let mut count = 0_usize;
     for entry in entries {
         let entry = entry?;
+        admit_recovery_entry(&mut count, "retained rollback history entries")?;
         let file_type = entry.file_type()?;
         if !file_type.is_file() {
             return Err(StateError::InvalidRollback(
@@ -2778,6 +3563,262 @@ mod tests {
             fs::read(root.join(&installed.filename)).expect("read restored managed artifact"),
             b"managed-a"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_recovery_settles_exact_removal_obligation_and_proves_state() {
+        let root = test_root("recover-removal-obligation");
+        let installed = test_mod("sodium", "managed-a.jar");
+        fs::write(root.join(&installed.filename), b"managed-a").expect("write managed artifact");
+        save_state(&root, &test_state("core", vec![installed.clone()]))
+            .expect("save managed state");
+        let backup = stage_managed_artifact_removal(&root, &installed)
+            .expect("stage managed artifact removal");
+
+        let state = recover_managed_storage(&root)
+            .expect("recover managed storage")
+            .expect("managed state");
+        prove_managed_storage_recovered(&root, Some(&state)).expect("prove recovered storage");
+
+        assert_eq!(
+            fs::read(root.join(&installed.filename)).expect("read restored artifact"),
+            b"managed-a"
+        );
+        assert!(!backup.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_recovery_preserves_unknown_restore_temp() {
+        let root = test_root("recover-unknown-restore-temp");
+        let rollback_tmp = rollback_tmp_dir_path(&root);
+        fs::create_dir_all(&rollback_tmp).expect("create rollback temp root");
+        let unknown = rollback_tmp.join("unknown-restore.tmp");
+        fs::write(&unknown, b"unknown").expect("write unknown restore temp");
+
+        let error = recover_managed_storage(&root).expect_err("unknown temp must block recovery");
+
+        assert!(matches!(error, StateError::InvalidRollback(_)));
+        assert_eq!(fs::read(unknown).expect("read preserved temp"), b"unknown");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovered_storage_proof_requires_every_retained_rollback_artifact() {
+        let root = test_root("recover-missing-retained-artifact");
+        let installed = test_mod("sodium", "managed-a.jar");
+        fs::write(root.join(&installed.filename), b"managed-a").expect("write managed artifact");
+        let state = test_state("core", vec![installed]);
+        save_state(&root, &state).expect("save managed state");
+        let snapshot = save_rollback_snapshot(&root, &state).expect("save rollback snapshot");
+        let artifact_path =
+            rollback_files_dir_path(&root).join(&snapshot.artifacts[0].stored_filename);
+        fs::remove_file(&artifact_path).expect("remove retained artifact");
+
+        let error = prove_managed_storage_recovered(&root, Some(&state))
+            .expect_err("missing retained artifact must fail proof");
+
+        assert!(matches!(error, StateError::InvalidRollback(_)));
+        assert!(rollback_file_path(&root).exists());
+        assert!(!artifact_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn addition_recovery_removes_uncommitted_publication_and_temp_alias() {
+        let root = test_root("recover-uncommitted-addition");
+        let filename = "new.jar";
+        let digest = hex::encode(Sha512::digest(b"new-managed"));
+        let temp = root.join("new.jar.sodium.tmp");
+        let final_path = root.join(filename);
+        fs::write(&temp, b"new-managed").expect("write managed temp");
+        let obligation = stage_managed_artifact_addition(&root, filename, &digest, &temp)
+            .expect("stage addition obligation");
+        fs::hard_link(&obligation, &final_path).expect("publish managed final");
+
+        assert!(
+            recover_managed_storage(&root)
+                .expect("recover uncommitted addition")
+                .is_none()
+        );
+
+        assert!(!final_path.exists());
+        assert!(!temp.exists());
+        assert!(!obligation.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn addition_recovery_reconstructs_committed_missing_final() {
+        let root = test_root("recover-committed-addition");
+        let filename = "new.jar";
+        let digest = hex::encode(Sha512::digest(b"new-managed"));
+        let temp = root.join("download.tmp");
+        fs::write(&temp, b"new-managed").expect("write managed temp");
+        let obligation = stage_managed_artifact_addition(&root, filename, &digest, &temp)
+            .expect("stage addition obligation");
+        fs::remove_file(&temp).expect("consume managed temp");
+        let mut installed = test_mod("sodium", filename);
+        installed.integrity.sha512 = digest;
+        save_state(&root, &test_state("core", vec![installed])).expect("commit managed state");
+
+        let recovered = recover_managed_storage(&root)
+            .expect("recover committed addition")
+            .expect("committed state");
+
+        assert_eq!(
+            fs::read(root.join(filename)).expect("read final"),
+            b"new-managed"
+        );
+        assert_eq!(recovered.installed_mods.len(), 1);
+        assert!(!obligation.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_addition_obligation_recovers_before_and_after_state_commit() {
+        for committed in [false, true] {
+            let root = test_root(if committed {
+                "recover-rollback-addition-committed"
+            } else {
+                "recover-rollback-addition-uncommitted"
+            });
+            let installed = test_mod("sodium", "managed-a.jar");
+            fs::write(root.join(&installed.filename), b"managed-a").expect("write rollback source");
+            let target_state = test_state("rollback-target", vec![installed.clone()]);
+            let snapshot =
+                save_rollback_snapshot(&root, &target_state).expect("save rollback snapshot");
+            fs::remove_file(root.join(&installed.filename)).expect("remove rollback source target");
+            let current_state = test_state("current", Vec::new());
+            save_state(&root, &current_state).expect("save current state");
+            let targets = prepare_rollback_restore_targets(
+                &root,
+                &snapshot,
+                &managed_artifacts(Some(&current_state)),
+            )
+            .expect("prepare rollback targets");
+            stage_rollback_restore_targets(&targets).expect("stage rollback targets");
+            publish_rollback_restore_target(&targets[0]).expect("publish rollback addition");
+            if committed {
+                save_state(&root, &target_state).expect("commit rollback state");
+            }
+
+            let recovered = recover_managed_storage(&root).expect("recover rollback addition");
+
+            if committed {
+                assert_eq!(recovered, Some(target_state));
+                assert_eq!(
+                    fs::read(root.join(&installed.filename)).expect("read committed target"),
+                    b"managed-a"
+                );
+            } else {
+                assert_eq!(recovered, Some(current_state));
+                assert!(!root.join(&installed.filename).exists());
+            }
+            assert!(
+                !root
+                    .join(STATE_DIR_NAME)
+                    .join(MUTATION_DIR_NAME)
+                    .join(ADDITION_DIR_NAME)
+                    .exists()
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn addition_recovery_preserves_same_bytes_different_identity_replacement() {
+        let root = test_root("recover-addition-same-bytes-replacement");
+        let filename = "new.jar";
+        let digest = hex::encode(Sha512::digest(b"same-bytes"));
+        let source = root.join("source.download");
+        fs::write(&source, b"same-bytes").expect("write source");
+        let obligation = stage_managed_artifact_addition(&root, filename, &digest, &source)
+            .expect("stage addition obligation");
+        fs::remove_file(source).expect("consume source");
+        fs::write(root.join(filename), b"same-bytes").expect("write replacement inode");
+
+        let error = recover_managed_storage(&root).expect_err("replacement must block recovery");
+
+        assert!(matches!(error, StateError::InvalidIntegrity { .. }));
+        assert_eq!(
+            fs::read(root.join(filename)).expect("read replacement"),
+            b"same-bytes"
+        );
+        assert!(obligation.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn addition_recovery_rejects_case_colliding_obligations_before_mutation() {
+        let root = test_root("recover-addition-case-collision");
+        let first_digest = hex::encode(Sha512::digest(b"first"));
+        let second_digest = hex::encode(Sha512::digest(b"second"));
+        let first_source = root.join("first.download");
+        let second_source = root.join("second.download");
+        fs::write(&first_source, b"first").expect("write first source");
+        fs::write(&second_source, b"second").expect("write second source");
+        let first =
+            stage_managed_artifact_addition(&root, "Case.jar", &first_digest, &first_source)
+                .expect("stage first addition");
+        let second =
+            stage_managed_artifact_addition(&root, "case.jar", &second_digest, &second_source)
+                .expect("stage second addition");
+
+        let error = reconcile_managed_addition_obligations(&root, None)
+            .expect_err("case collision must block recovery");
+
+        assert!(matches!(error, StateError::InvalidState(_)));
+        assert!(first.exists());
+        assert!(second.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removal_recovery_counts_empty_digest_directories() {
+        let root = test_root("recover-removal-entry-limit");
+        let removals = root
+            .join(STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME)
+            .join(REMOVAL_DIR_NAME);
+        fs::create_dir_all(&removals).expect("create removal root");
+        for index in 0..=RECOVERY_ENTRY_LIMIT {
+            fs::create_dir(removals.join(format!("{index:0128x}")))
+                .expect("create removal digest directory");
+        }
+
+        let error = recover_managed_storage(&root).expect_err("entry limit must block recovery");
+
+        assert!(matches!(error, StateError::InvalidState(_)));
+        assert_eq!(
+            fs::read_dir(removals).expect("read removal root").count(),
+            RECOVERY_ENTRY_LIMIT + 1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovered_storage_rejects_divergent_latest_history_payload() {
+        let root = test_root("recover-divergent-latest-history");
+        let snapshot = save_rollback_snapshot(&root, &test_state("core", Vec::new()))
+            .expect("save rollback snapshot");
+        let history = rollback_history_file_path(&root, &snapshot.id);
+        fs::remove_file(&history).expect("remove linked history");
+        let mut divergent = snapshot.clone();
+        divergent.created_at = "2026-05-31T00:00:00Z".to_string();
+        fs::write(
+            &history,
+            serde_json::to_vec_pretty(&divergent).expect("serialize divergent history"),
+        )
+        .expect("write divergent history");
+
+        let error = prove_managed_storage_recovered(&root, None)
+            .expect_err("divergent latest and history must fail proof");
+
+        assert!(matches!(error, StateError::InvalidRollback(_)));
+        assert!(rollback_file_path(&root).exists());
+        assert!(history.exists());
         let _ = fs::remove_dir_all(root);
     }
 

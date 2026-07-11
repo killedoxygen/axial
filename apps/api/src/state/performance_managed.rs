@@ -4,7 +4,7 @@ use axial_performance::{
 };
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{
     Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock as AsyncRwLock,
@@ -16,15 +16,32 @@ const MANAGED_OWNER_LOCK_INVARIANT: &str =
 struct ManagedInstanceEntry {
     identity: ManagedInstanceIdentity,
     gate: Arc<AsyncMutex<()>>,
-    reconciliation_required: AtomicBool,
-    retired: AtomicBool,
+    phase: AtomicU8,
 }
 
 pub(super) struct ManagedCompositionOwner {
     authority: ManagedCompositionAuthority,
     entries: Mutex<HashMap<String, Arc<ManagedInstanceEntry>>>,
     lifecycle: Arc<AsyncRwLock<()>>,
-    admission_closed: AtomicBool,
+    instance_lifecycle: super::instance_lifecycle::InstanceLifecycleGates,
+    close_gate: Arc<AsyncMutex<()>>,
+    phase: AtomicU8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum ManagedEntryPhase {
+    Open = 0,
+    Latched = 1,
+    Retired = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum ManagedOwnerPhase {
+    Running = 0,
+    Closing = 1,
+    Closed = 2,
 }
 
 pub(crate) struct ManagedCompositionAdmission {
@@ -50,20 +67,20 @@ impl ManagedCompositionRetirement {
 impl Drop for ManagedCompositionRetirement {
     fn drop(&mut self) {
         if !self.committed {
-            self.entry.retired.store(false, Ordering::Release);
+            self.entry.store_phase(ManagedEntryPhase::Open);
         }
     }
 }
 
 pub(crate) struct AppManagedCompositionAdmission {
     managed: ManagedCompositionAdmission,
-    _instance_lifecycle: Option<OwnedMutexGuard<()>>,
+    _instance_lifecycle: OwnedMutexGuard<()>,
 }
 
 impl AppManagedCompositionAdmission {
     pub(super) fn bind(
         managed: ManagedCompositionAdmission,
-        instance_lifecycle: Option<OwnedMutexGuard<()>>,
+        instance_lifecycle: OwnedMutexGuard<()>,
     ) -> Self {
         Self {
             managed,
@@ -84,8 +101,10 @@ impl std::ops::Deref for AppManagedCompositionAdmission {
 pub(crate) enum ManagedCompositionAdmissionError {
     #[error("managed composition admission is closed")]
     Closed,
-    #[error("managed composition reconciliation is required for this instance")]
-    ReconciliationRequired,
+    #[error("managed composition exact recovery could not prove a clean state")]
+    RecoveryFailed,
+    #[error("managed composition recovery is blocked while the instance is running")]
+    RecoveryBlockedByActiveSession,
     #[error("managed composition identity is retired")]
     Retired,
     #[error("managed composition identity is invalid: {0}")]
@@ -119,65 +138,81 @@ pub(crate) enum ManagedInspectionError {
 pub(crate) struct ManagedCompositionCloseError;
 
 impl ManagedCompositionOwner {
-    pub(super) fn claim(authority: ManagedCompositionAuthority) -> Self {
+    pub(super) fn claim(
+        authority: ManagedCompositionAuthority,
+        instance_lifecycle: super::instance_lifecycle::InstanceLifecycleGates,
+    ) -> Self {
         Self {
             authority,
             entries: Mutex::new(HashMap::new()),
             lifecycle: Arc::new(AsyncRwLock::new(())),
-            admission_closed: AtomicBool::new(false),
+            instance_lifecycle,
+            close_gate: Arc::new(AsyncMutex::new(())),
+            phase: AtomicU8::new(ManagedOwnerPhase::Running as u8),
         }
     }
 
     pub(super) async fn admit(
         &self,
         instance_id: &str,
-    ) -> Result<ManagedCompositionAdmission, ManagedCompositionAdmissionError> {
-        if self.admission_closed.load(Ordering::Acquire) {
+        instance_lifecycle: OwnedMutexGuard<()>,
+        recovery_allowed: bool,
+    ) -> Result<AppManagedCompositionAdmission, ManagedCompositionAdmissionError> {
+        if self.phase() != ManagedOwnerPhase::Running {
             return Err(ManagedCompositionAdmissionError::Closed);
         }
         let lifecycle = self.lifecycle.clone().read_owned().await;
-        if self.admission_closed.load(Ordering::Acquire) {
+        if self.phase() != ManagedOwnerPhase::Running {
             return Err(ManagedCompositionAdmissionError::Closed);
         }
         let entry = self.entry(instance_id)?;
         let gate = entry.gate.clone().lock_owned().await;
-        if self.admission_closed.load(Ordering::Acquire) {
+        if self.phase() != ManagedOwnerPhase::Running {
             return Err(ManagedCompositionAdmissionError::Closed);
         }
-        if entry.reconciliation_required.load(Ordering::Acquire) {
-            return Err(ManagedCompositionAdmissionError::ReconciliationRequired);
-        }
-        if entry.retired.load(Ordering::Acquire) {
-            return Err(ManagedCompositionAdmissionError::Retired);
-        }
-        Ok(ManagedCompositionAdmission {
+        let admission = ManagedCompositionAdmission {
             authority: self.authority.clone(),
-            entry,
+            entry: entry.clone(),
             _lifecycle: lifecycle,
             _gate: gate,
-        })
+        };
+        match entry.phase() {
+            ManagedEntryPhase::Open => Ok(AppManagedCompositionAdmission::bind(
+                admission,
+                instance_lifecycle,
+            )),
+            ManagedEntryPhase::Retired => Err(ManagedCompositionAdmissionError::Retired),
+            ManagedEntryPhase::Latched if !recovery_allowed => {
+                Err(ManagedCompositionAdmissionError::RecoveryBlockedByActiveSession)
+            }
+            ManagedEntryPhase::Latched => {
+                recover_admission_owned(admission, instance_lifecycle).await
+            }
+        }
     }
 
     pub(super) async fn retire(
         &self,
         instance_id: &str,
     ) -> Result<ManagedCompositionRetirement, ManagedCompositionAdmissionError> {
-        if self.admission_closed.load(Ordering::Acquire) {
+        if self.phase() != ManagedOwnerPhase::Running {
             return Err(ManagedCompositionAdmissionError::Closed);
         }
         let lifecycle = self.lifecycle.clone().read_owned().await;
         let entry = self.entry(instance_id)?;
         let gate = entry.gate.clone().lock_owned().await;
-        if self.admission_closed.load(Ordering::Acquire) {
+        if self.phase() != ManagedOwnerPhase::Running {
             return Err(ManagedCompositionAdmissionError::Closed);
         }
-        if entry.reconciliation_required.load(Ordering::Acquire) {
-            return Err(ManagedCompositionAdmissionError::ReconciliationRequired);
+        match entry.phase() {
+            ManagedEntryPhase::Open => entry.store_phase(ManagedEntryPhase::Retired),
+            ManagedEntryPhase::Latched => {
+                return Err(ManagedCompositionAdmissionError::RecoveryFailed);
+            }
+            ManagedEntryPhase::Retired => {
+                return Err(ManagedCompositionAdmissionError::Retired);
+            }
         }
-        if entry.retired.load(Ordering::Acquire) {
-            return Err(ManagedCompositionAdmissionError::Retired);
-        }
-        entry.retired.store(true, Ordering::Release);
         Ok(ManagedCompositionRetirement {
             entry,
             _lifecycle: lifecycle,
@@ -187,8 +222,22 @@ impl ManagedCompositionOwner {
     }
 
     pub(super) async fn close(&self) -> Result<(), ManagedCompositionCloseError> {
-        self.admission_closed.store(true, Ordering::Release);
-        let _drained = self.lifecycle.write().await;
+        match self.phase.compare_exchange(
+            ManagedOwnerPhase::Running as u8,
+            ManagedOwnerPhase::Closing as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(value) if value == ManagedOwnerPhase::Closing as u8 => {}
+            Err(value) if value == ManagedOwnerPhase::Closed as u8 => return Ok(()),
+            Err(_) => panic!("managed composition owner phase is invalid"),
+        }
+        let _close = self.close_gate.clone().lock_owned().await;
+        if self.phase() == ManagedOwnerPhase::Closed {
+            return Ok(());
+        }
+        let drained = self.lifecycle.write().await;
         let mut entries = self
             .entries
             .lock()
@@ -201,13 +250,32 @@ impl ManagedCompositionOwner {
                 .instance_id()
                 .cmp(right.identity.instance_id())
         });
-        if entries
-            .iter()
-            .any(|entry| entry.reconciliation_required.load(Ordering::Acquire))
-        {
-            return Err(ManagedCompositionCloseError);
+        drop(drained);
+
+        let mut recovery_failed = false;
+        for entry in entries {
+            if entry.phase() != ManagedEntryPhase::Latched {
+                continue;
+            }
+            let instance_lifecycle = self
+                .instance_lifecycle
+                .acquire(entry.identity.instance_id())
+                .await;
+            let gate = entry.gate.clone().lock_owned().await;
+            if entry.phase() != ManagedEntryPhase::Latched {
+                continue;
+            }
+            if !recover_entry_owned(self.authority.clone(), entry, instance_lifecycle, gate).await {
+                recovery_failed = true;
+            }
         }
-        Ok(())
+        if recovery_failed {
+            Err(ManagedCompositionCloseError)
+        } else {
+            self.phase
+                .store(ManagedOwnerPhase::Closed as u8, Ordering::Release);
+            Ok(())
+        }
     }
 
     fn entry(
@@ -222,12 +290,80 @@ impl ManagedCompositionOwner {
         let entry = Arc::new(ManagedInstanceEntry {
             identity,
             gate: Arc::new(AsyncMutex::new(())),
-            reconciliation_required: AtomicBool::new(false),
-            retired: AtomicBool::new(false),
+            phase: AtomicU8::new(ManagedEntryPhase::Open as u8),
         });
         entries.insert(instance_id.to_string(), entry.clone());
         Ok(entry)
     }
+
+    fn phase(&self) -> ManagedOwnerPhase {
+        match self.phase.load(Ordering::Acquire) {
+            value if value == ManagedOwnerPhase::Running as u8 => ManagedOwnerPhase::Running,
+            value if value == ManagedOwnerPhase::Closing as u8 => ManagedOwnerPhase::Closing,
+            value if value == ManagedOwnerPhase::Closed as u8 => ManagedOwnerPhase::Closed,
+            _ => panic!("managed composition owner phase is invalid"),
+        }
+    }
+}
+
+impl ManagedInstanceEntry {
+    fn phase(&self) -> ManagedEntryPhase {
+        match self.phase.load(Ordering::Acquire) {
+            value if value == ManagedEntryPhase::Open as u8 => ManagedEntryPhase::Open,
+            value if value == ManagedEntryPhase::Latched as u8 => ManagedEntryPhase::Latched,
+            value if value == ManagedEntryPhase::Retired as u8 => ManagedEntryPhase::Retired,
+            _ => panic!("managed composition entry phase is invalid"),
+        }
+    }
+
+    fn store_phase(&self, phase: ManagedEntryPhase) {
+        self.phase.store(phase as u8, Ordering::Release);
+    }
+}
+
+async fn recover_admission_owned(
+    admission: ManagedCompositionAdmission,
+    instance_lifecycle: OwnedMutexGuard<()>,
+) -> Result<AppManagedCompositionAdmission, ManagedCompositionAdmissionError> {
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let recovered = admission
+            .authority
+            .recover_and_inspect(&admission.entry.identity)
+            .await
+            .is_ok();
+        if recovered {
+            admission.entry.store_phase(ManagedEntryPhase::Open);
+            let _ = completed_tx.send(Ok(AppManagedCompositionAdmission::bind(
+                admission,
+                instance_lifecycle,
+            )));
+        } else {
+            let _ = completed_tx.send(Err(ManagedCompositionAdmissionError::RecoveryFailed));
+        }
+    });
+    completed_rx
+        .await
+        .unwrap_or(Err(ManagedCompositionAdmissionError::RecoveryFailed))
+}
+
+async fn recover_entry_owned(
+    authority: ManagedCompositionAuthority,
+    entry: Arc<ManagedInstanceEntry>,
+    instance_lifecycle: OwnedMutexGuard<()>,
+    gate: OwnedMutexGuard<()>,
+) -> bool {
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _instance_lifecycle = instance_lifecycle;
+        let _gate = gate;
+        let recovered = authority.recover_and_inspect(&entry.identity).await.is_ok();
+        if recovered {
+            entry.store_phase(ManagedEntryPhase::Open);
+        }
+        let _ = completed_tx.send(recovered);
+    });
+    completed_rx.await.unwrap_or(false)
 }
 
 impl ManagedCompositionAdmission {
@@ -289,9 +425,7 @@ impl ManagedCompositionAdmission {
 
     fn latch_indeterminate<T>(&self, result: &Result<T, ManagedMutationError>) {
         if matches!(result, Err(ManagedMutationError::Indeterminate(_))) {
-            self.entry
-                .reconciliation_required
-                .store(true, Ordering::Release);
+            self.entry.store_phase(ManagedEntryPhase::Latched);
         }
     }
 }
@@ -304,7 +438,10 @@ pub(super) fn managed_authority_claim_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{ManagedCompositionAdmissionError, ManagedCompositionOwner, ManagedMutationError};
+    use super::{
+        ManagedCompositionAdmissionError, ManagedCompositionOwner, ManagedEntryPhase,
+        ManagedMutationError,
+    };
     use axial_performance::PerformanceManager;
     use std::future::Future;
     use std::pin::Pin;
@@ -318,6 +455,7 @@ mod tests {
     struct OwnerFixture {
         root: std::path::PathBuf,
         owner: Arc<ManagedCompositionOwner>,
+        instance_lifecycle: super::super::instance_lifecycle::InstanceLifecycleGates,
     }
 
     impl OwnerFixture {
@@ -333,14 +471,40 @@ mod tests {
             let authority = manager
                 .claim_managed_authority(&root)
                 .expect("claim managed authority");
+            let instance_lifecycle =
+                super::super::instance_lifecycle::InstanceLifecycleGates::default();
             Self {
                 root,
-                owner: Arc::new(ManagedCompositionOwner::claim(authority)),
+                owner: Arc::new(ManagedCompositionOwner::claim(
+                    authority,
+                    instance_lifecycle.clone(),
+                )),
+                instance_lifecycle,
             }
         }
 
         fn mods_dir(&self, instance_id: &str) -> std::path::PathBuf {
             self.root.join(instance_id).join("mods")
+        }
+
+        async fn admit(
+            &self,
+            instance_id: &str,
+        ) -> Result<super::AppManagedCompositionAdmission, ManagedCompositionAdmissionError>
+        {
+            self.admit_with_recovery(instance_id, true).await
+        }
+
+        async fn admit_with_recovery(
+            &self,
+            instance_id: &str,
+            recovery_allowed: bool,
+        ) -> Result<super::AppManagedCompositionAdmission, ManagedCompositionAdmissionError>
+        {
+            let lifecycle = self.instance_lifecycle.acquire(instance_id).await;
+            self.owner
+                .admit(instance_id, lifecycle, recovery_allowed)
+                .await
         }
     }
 
@@ -359,12 +523,8 @@ mod tests {
     #[tokio::test]
     async fn same_instance_admission_waits_for_the_current_guard() {
         let fixture = OwnerFixture::new("same-instance-gate");
-        let first = fixture
-            .owner
-            .admit(INSTANCE_A)
-            .await
-            .expect("first admission");
-        let mut second = Box::pin(fixture.owner.admit(INSTANCE_A));
+        let first = fixture.admit(INSTANCE_A).await.expect("first admission");
+        let mut second = Box::pin(fixture.admit(INSTANCE_A));
 
         assert!(matches!(poll_once(second.as_mut()), Poll::Pending));
         drop(first);
@@ -375,12 +535,8 @@ mod tests {
     #[tokio::test]
     async fn different_instance_admission_progresses_independently() {
         let fixture = OwnerFixture::new("different-instance-gates");
-        let _first = fixture
-            .owner
-            .admit(INSTANCE_A)
-            .await
-            .expect("first admission");
-        let mut second = Box::pin(fixture.owner.admit(INSTANCE_B));
+        let _first = fixture.admit(INSTANCE_A).await.expect("first admission");
+        let mut second = Box::pin(fixture.admit(INSTANCE_B));
 
         let second = match poll_once(second.as_mut()) {
             Poll::Ready(result) => result.expect("different instance admission"),
@@ -392,12 +548,12 @@ mod tests {
     #[tokio::test]
     async fn close_drains_admitted_guards_and_rejects_late_admission() {
         let fixture = OwnerFixture::new("close-drain");
-        let admitted = fixture.owner.admit(INSTANCE_A).await.expect("admission");
+        let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
         let mut close = Box::pin(fixture.owner.close());
 
         assert!(matches!(poll_once(close.as_mut()), Poll::Pending));
         assert!(matches!(
-            fixture.owner.admit(INSTANCE_B).await,
+            fixture.admit(INSTANCE_B).await,
             Err(ManagedCompositionAdmissionError::Closed)
         ));
         drop(admitted);
@@ -413,7 +569,7 @@ mod tests {
             .retire(INSTANCE_A)
             .await
             .expect("retire instance");
-        let mut waiting = Box::pin(uncommitted.owner.admit(INSTANCE_A));
+        let mut waiting = Box::pin(uncommitted.admit(INSTANCE_A));
         assert!(matches!(poll_once(waiting.as_mut()), Poll::Pending));
         drop(retirement);
         waiting
@@ -428,7 +584,7 @@ mod tests {
             .expect("retire instance")
             .commit();
         assert!(matches!(
-            committed.owner.admit(INSTANCE_A).await,
+            committed.admit(INSTANCE_A).await,
             Err(ManagedCompositionAdmissionError::Retired)
         ));
         assert!(matches!(
@@ -444,7 +600,7 @@ mod tests {
         std::fs::create_dir_all(&mods_dir).expect("create instance mods directory");
         std::fs::write(mods_dir.join(".axial-lock.json.new.tmp"), b"not-json")
             .expect("seed ambiguous publication stage");
-        let admitted = fixture.owner.admit(INSTANCE_A).await.expect("admission");
+        let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
 
         assert!(matches!(
             admitted.inspect(None).await,
@@ -452,14 +608,163 @@ mod tests {
         ));
         drop(admitted);
         assert!(matches!(
-            fixture.owner.admit(INSTANCE_A).await,
-            Err(ManagedCompositionAdmissionError::ReconciliationRequired)
+            fixture.admit(INSTANCE_A).await,
+            Err(ManagedCompositionAdmissionError::RecoveryFailed)
         ));
         assert!(fixture.owner.close().await.is_err());
         assert!(matches!(
-            fixture.owner.admit(INSTANCE_B).await,
+            fixture.admit(INSTANCE_B).await,
             Err(ManagedCompositionAdmissionError::Closed)
         ));
+        std::fs::remove_file(mods_dir.join(".axial-lock.json.new.tmp"))
+            .expect("repair ambiguous publication stage");
+        fixture
+            .owner
+            .close()
+            .await
+            .expect("close retries exact recovery");
+        fixture.owner.close().await.expect("close is idempotent");
+    }
+
+    #[tokio::test]
+    async fn later_admission_recovers_latched_entry_before_continuing() {
+        let fixture = OwnerFixture::new("admission-recovery");
+        let mods_dir = fixture.mods_dir(INSTANCE_A);
+        std::fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+        let staged = mods_dir.join(".axial-lock.json.new.tmp");
+        std::fs::write(&staged, b"not-json").expect("seed ambiguous publication stage");
+        let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
+        assert!(matches!(
+            admitted.inspect(None).await,
+            Err(ManagedMutationError::Indeterminate(_))
+        ));
+        drop(admitted);
+        std::fs::remove_file(staged).expect("repair publication stage");
+
+        fixture
+            .admit(INSTANCE_A)
+            .await
+            .expect("exact recovery reopens admission");
+    }
+
+    #[tokio::test]
+    async fn latched_admission_does_not_recover_while_instance_is_running() {
+        let fixture = OwnerFixture::new("active-session-blocks-recovery");
+        let mods_dir = fixture.mods_dir(INSTANCE_A);
+        std::fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+        let staged = mods_dir.join(".axial-lock.json.new.tmp");
+        std::fs::write(&staged, b"not-json").expect("seed ambiguous publication stage");
+        let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
+        assert!(matches!(
+            admitted.inspect(None).await,
+            Err(ManagedMutationError::Indeterminate(_))
+        ));
+        drop(admitted);
+        std::fs::remove_file(staged).expect("repair publication stage");
+
+        assert!(matches!(
+            fixture.admit_with_recovery(INSTANCE_A, false).await,
+            Err(ManagedCompositionAdmissionError::RecoveryBlockedByActiveSession)
+        ));
+        assert_eq!(
+            fixture
+                .owner
+                .entry(INSTANCE_A)
+                .expect("latched entry")
+                .phase(),
+            ManagedEntryPhase::Latched
+        );
+
+        fixture
+            .admit_with_recovery(INSTANCE_A, true)
+            .await
+            .expect("recovery resumes after the instance stops");
+        assert_eq!(
+            fixture
+                .owner
+                .entry(INSTANCE_A)
+                .expect("recovered entry")
+                .phase(),
+            ManagedEntryPhase::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn close_recovers_all_entries_and_retries_only_remaining_latches() {
+        let fixture = OwnerFixture::new("partial-close-retry");
+        let staged_a = fixture
+            .mods_dir(INSTANCE_A)
+            .join(".axial-lock.json.new.tmp");
+        let staged_b = fixture
+            .mods_dir(INSTANCE_B)
+            .join(".axial-lock.json.new.tmp");
+        std::fs::create_dir_all(staged_a.parent().expect("instance A mods parent"))
+            .expect("create instance A mods");
+        std::fs::create_dir_all(staged_b.parent().expect("instance B mods parent"))
+            .expect("create instance B mods");
+        std::fs::write(&staged_a, b"not-json").expect("seed instance A ambiguity");
+        std::fs::write(&staged_b, b"not-json").expect("seed instance B ambiguity");
+        for instance_id in [INSTANCE_A, INSTANCE_B] {
+            let admitted = fixture.admit(instance_id).await.expect("admission");
+            assert!(matches!(
+                admitted.inspect(None).await,
+                Err(ManagedMutationError::Indeterminate(_))
+            ));
+        }
+        std::fs::remove_file(&staged_a).expect("repair instance A");
+
+        assert!(fixture.owner.close().await.is_err());
+        assert_eq!(
+            fixture
+                .owner
+                .entry(INSTANCE_A)
+                .expect("instance A entry")
+                .phase(),
+            ManagedEntryPhase::Open
+        );
+        assert_eq!(
+            fixture
+                .owner
+                .entry(INSTANCE_B)
+                .expect("instance B entry")
+                .phase(),
+            ManagedEntryPhase::Latched
+        );
+
+        std::fs::remove_file(staged_b).expect("repair instance B");
+        fixture.owner.close().await.expect("retry remaining latch");
+        fixture
+            .owner
+            .close()
+            .await
+            .expect("closed owner is idempotent");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canceled_recovery_waiter_does_not_release_owned_guards() {
+        let fixture = OwnerFixture::new("canceled-recovery-waiter");
+        let mods_dir = fixture.mods_dir(INSTANCE_A);
+        std::fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+        let staged = mods_dir.join(".axial-lock.json.new.tmp");
+        std::fs::write(&staged, b"not-json").expect("seed ambiguous publication stage");
+        let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
+        assert!(matches!(
+            admitted.inspect(None).await,
+            Err(ManagedMutationError::Indeterminate(_))
+        ));
+        drop(admitted);
+        std::fs::remove_file(staged).expect("repair publication stage");
+
+        let mut recovery = Box::pin(fixture.admit(INSTANCE_A));
+        assert!(matches!(poll_once(recovery.as_mut()), Poll::Pending));
+        drop(recovery);
+        let mut close = Box::pin(fixture.owner.close());
+        assert!(matches!(poll_once(close.as_mut()), Poll::Pending));
+
+        tokio::task::yield_now().await;
+        close
+            .await
+            .expect("owned recovery completes after waiter cancellation");
     }
 
     #[tokio::test]
@@ -467,16 +772,15 @@ mod tests {
         let fixture = OwnerFixture::new("canonical-identity");
 
         fixture
-            .owner
             .admit(INSTANCE_A)
             .await
             .expect("canonical instance id");
         assert!(matches!(
-            fixture.owner.admit("000000000000000A").await,
+            fixture.admit("000000000000000A").await,
             Err(ManagedCompositionAdmissionError::Identity(_))
         ));
         assert!(matches!(
-            fixture.owner.admit("../00000000000001").await,
+            fixture.admit("../00000000000001").await,
             Err(ManagedCompositionAdmissionError::Identity(_))
         ));
     }

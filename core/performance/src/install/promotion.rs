@@ -32,7 +32,10 @@ pub(super) async fn promote_file_async(
         };
     }
 
-    match tokio::fs::hard_link(temp.path(), final_path).await {
+    let addition = stage_managed_addition_async(temp.path(), final_path, filename, temp.sha512())
+        .await
+        .map_err(InstallError::State)?;
+    match tokio::fs::hard_link(&addition, final_path).await {
         Ok(()) => {
             let proof = async {
                 let temp_metadata = tokio::fs::symlink_metadata(temp.path()).await?;
@@ -78,6 +81,35 @@ pub(super) async fn promote_file_async(
             Err(cleanup_error) => Err(InstallError::Io(cleanup_error)),
         },
     }
+}
+
+async fn stage_managed_addition_async(
+    temp_path: &Path,
+    final_path: &Path,
+    filename: &str,
+    sha512: &str,
+) -> Result<PathBuf, crate::state::StateError> {
+    let instance_mods_dir = final_path
+        .parent()
+        .ok_or_else(|| crate::state::StateError::InvalidFilename(filename.to_string()))?
+        .to_path_buf();
+    let temp_path = temp_path.to_path_buf();
+    let filename = filename.to_string();
+    let sha512 = sha512.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::state::stage_managed_artifact_addition(
+            &instance_mods_dir,
+            &filename,
+            &sha512,
+            &temp_path,
+        )
+    })
+    .await
+    .map_err(|_| {
+        crate::state::StateError::Read(std::io::Error::other(
+            "managed addition staging task stopped",
+        ))
+    })?
 }
 
 pub(super) async fn promote_file_with_overwrite_async(
@@ -198,28 +230,38 @@ pub(super) async fn reconcile_managed_replace_backups(
         Err(error) => return Err(InstallError::Io(error)),
     };
     let mut backups = Vec::new();
+    let mut entry_count = 0_usize;
     let replacements = parent
         .join(crate::state::STATE_DIR_NAME)
         .join(MUTATION_DIR_NAME)
         .join(REPLACEMENT_DIR_NAME);
+    validate_replacement_roots(parent).await?;
     let mut old_entries = match tokio::fs::read_dir(&replacements).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(InstallError::Io(error)),
     };
     while let Some(old_entry) = old_entries.next_entry().await? {
-        if backups.len() >= MUTATION_ENTRY_LIMIT {
+        entry_count += 1;
+        if entry_count > MUTATION_ENTRY_LIMIT {
             return Err(InstallError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "managed artifact replacement obligations exceed the limit",
             )));
         }
-        let Some(old_sha512) = digest_directory_name(&old_entry) else {
+        let Some(old_sha512) = digest_directory_name(&old_entry).await? else {
             return Err(invalid_mutation_root());
         };
         let mut new_entries = tokio::fs::read_dir(old_entry.path()).await?;
         while let Some(new_entry) = new_entries.next_entry().await? {
-            let Some(new_sha512) = digest_directory_name(&new_entry) else {
+            entry_count += 1;
+            if entry_count > MUTATION_ENTRY_LIMIT {
+                return Err(InstallError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "managed artifact replacement obligations exceed the limit",
+                )));
+            }
+            let Some(new_sha512) = digest_directory_name(&new_entry).await? else {
                 return Err(invalid_mutation_root());
             };
             let backup = new_entry.path().join(filename);
@@ -253,6 +295,9 @@ pub(super) async fn reconcile_managed_replace_backups(
             "managed artifact replacement backup ownership cannot be proven",
         )));
     }
+    if !final_exists && !expected_old_sha512.eq_ignore_ascii_case(&backup_old_sha512) {
+        return Err(target_exists(final_path));
+    }
     if final_exists {
         let final_matches_old =
             super::artifact::file_matches_sha512(final_path, &backup_old_sha512, None).await?;
@@ -275,6 +320,60 @@ pub(super) async fn reconcile_managed_replace_backups(
         remove_digest_proven(final_path, &new_sha512).await?;
     }
     tokio::fs::rename(backup, final_path).await?;
+    Ok(())
+}
+
+pub(super) async fn settle_empty_managed_replace_root(
+    instance_mods_dir: &Path,
+) -> Result<(), InstallError> {
+    let replacements = instance_mods_dir
+        .join(crate::state::STATE_DIR_NAME)
+        .join(MUTATION_DIR_NAME)
+        .join(REPLACEMENT_DIR_NAME);
+    validate_replacement_roots(instance_mods_dir).await?;
+    let mut old_entries = match tokio::fs::read_dir(&replacements).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(InstallError::Io(error)),
+    };
+    let mut old_dirs = Vec::new();
+    let mut entry_count = 0_usize;
+    while let Some(old_entry) = old_entries.next_entry().await? {
+        entry_count += 1;
+        if entry_count > MUTATION_ENTRY_LIMIT || digest_directory_name(&old_entry).await?.is_none()
+        {
+            return Err(invalid_mutation_root());
+        }
+        let old_path = old_entry.path();
+        let mut new_entries = tokio::fs::read_dir(&old_path).await?;
+        let mut new_dirs = Vec::new();
+        while let Some(new_entry) = new_entries.next_entry().await? {
+            entry_count += 1;
+            if entry_count > MUTATION_ENTRY_LIMIT
+                || digest_directory_name(&new_entry).await?.is_none()
+            {
+                return Err(invalid_mutation_root());
+            }
+            let new_path = new_entry.path();
+            if tokio::fs::read_dir(&new_path)
+                .await?
+                .next_entry()
+                .await?
+                .is_some()
+            {
+                return Err(invalid_mutation_root());
+            }
+            new_dirs.push(new_path);
+        }
+        for new_dir in new_dirs {
+            tokio::fs::remove_dir(new_dir).await?;
+        }
+        old_dirs.push(old_path);
+    }
+    for old_dir in old_dirs {
+        tokio::fs::remove_dir(old_dir).await?;
+    }
+    tokio::fs::remove_dir(replacements).await?;
     Ok(())
 }
 
@@ -314,11 +413,38 @@ async fn ensure_mutation_directory(path: &Path) -> Result<(), InstallError> {
     }
 }
 
-fn digest_directory_name(entry: &tokio::fs::DirEntry) -> Option<String> {
+async fn validate_replacement_roots(instance_mods_dir: &Path) -> Result<(), InstallError> {
+    for path in [
+        instance_mods_dir.join(crate::state::STATE_DIR_NAME),
+        instance_mods_dir
+            .join(crate::state::STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME),
+        instance_mods_dir
+            .join(crate::state::STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME)
+            .join(REPLACEMENT_DIR_NAME),
+    ] {
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Err(invalid_mutation_root()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(InstallError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+async fn digest_directory_name(
+    entry: &tokio::fs::DirEntry,
+) -> Result<Option<String>, InstallError> {
+    if !entry.file_type().await?.is_dir() {
+        return Ok(None);
+    }
     let name = entry.file_name();
-    let name = name.to_str()?;
-    (name.len() == 128 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| name.to_string())
+    let Some(name) = name.to_str().map(str::to_string) else {
+        return Ok(None);
+    };
+    Ok((name.len() == 128 && name.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(name))
 }
 
 fn valid_digest(value: &str) -> bool {

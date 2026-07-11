@@ -241,11 +241,13 @@ impl AppState {
         let instances = Arc::new(AppInstanceStore::claim(&init.instances).unwrap_or_else(
             |error| panic!("failed to initialize instance registry persistence: {error}"),
         ));
+        let instance_lifecycle_gates = instance_lifecycle::InstanceLifecycleGates::default();
         let performance = Arc::new(
             AppPerformanceStore::claim(
                 init.performance,
                 &config.paths().config_dir,
                 &instances.paths().instances_dir,
+                instance_lifecycle_gates.clone(),
             )
             .unwrap_or_else(|error| {
                 panic!("failed to initialize performance rules persistence: {error}")
@@ -296,7 +298,7 @@ impl AppState {
             telemetry,
             remote_flags,
             launch_reports,
-            instance_lifecycle_gates: instance_lifecycle::InstanceLifecycleGates::default(),
+            instance_lifecycle_gates,
             lifecycle: AppLifecycle::new(),
             shutdown_coordinator: AppShutdownCoordinator::new(),
             startup_warnings: Arc::new(bound_startup_warnings(init.startup_warnings)),
@@ -625,11 +627,7 @@ impl AppState {
         if mutation && self.sessions.has_active_instance(instance_id).await {
             return Err(ManagedInstanceAdmissionError::ActiveSession);
         }
-        let lifecycle = if mutation {
-            Some(self.acquire_instance_lifecycle(instance_id).await)
-        } else {
-            None
-        };
+        let lifecycle = self.acquire_instance_lifecycle(instance_id).await;
         let instance = self
             .instances
             .get(instance_id)
@@ -637,14 +635,21 @@ impl AppState {
         if instance.id != instance_id || !is_canonical_instance_id(&instance.id) {
             return Err(ManagedInstanceAdmissionError::InvalidInstanceIdentity);
         }
-        if mutation && self.sessions.has_active_instance(instance_id).await {
+        let active_session = self.sessions.has_active_instance(instance_id).await;
+        if mutation && active_session {
             return Err(ManagedInstanceAdmissionError::ActiveSession);
         }
-        let managed = self.performance.admit_managed(instance_id).await?;
+        let managed = self
+            .performance
+            .admit_managed(instance_id, lifecycle, !active_session)
+            .await?;
         if self.instances.get(instance_id).as_ref() != Some(&instance) {
             return Err(ManagedInstanceAdmissionError::InstanceNotFound);
         }
-        Ok(AppManagedCompositionAdmission::bind(managed, lifecycle))
+        if mutation && self.sessions.has_active_instance(instance_id).await {
+            return Err(ManagedInstanceAdmissionError::ActiveSession);
+        }
+        Ok(managed)
     }
 
     pub(crate) async fn inspect_managed_instance(

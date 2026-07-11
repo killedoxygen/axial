@@ -460,6 +460,9 @@ impl AppShutdownCoordinator {
     }
 
     async fn close_managed_compositions(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if !self.completed(AppShutdownStep::SessionSettlement) {
+            return Err(AppShutdownError::at(AppShutdownStep::SessionSettlement));
+        }
         if self.completed(AppShutdownStep::ManagedCompositions) {
             return Ok(());
         }
@@ -688,6 +691,66 @@ mod tests {
             Some(AppShutdownError::at(AppShutdownStep::SessionSettlement))
         );
         assert!(coordinator.completed(AppShutdownStep::ProducerDrain));
+    }
+
+    #[tokio::test]
+    async fn managed_close_waits_for_session_settlement_before_recovery() {
+        const INSTANCE_ID: &str = "0000000000000001";
+
+        let fixture = TestFixture::new("managed-close-session-dependency");
+        let coordinator = AppShutdownCoordinator::new();
+        let mods_dir = fixture
+            .root
+            .join("instances")
+            .join(INSTANCE_ID)
+            .join("mods");
+        std::fs::create_dir_all(&mods_dir).expect("create managed instance mods directory");
+        let staged = mods_dir.join(".axial-lock.json.new.tmp");
+        std::fs::write(&staged, b"not-json").expect("seed ambiguous publication stage");
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let admitted = fixture
+            .state
+            .performance
+            .admit_managed(INSTANCE_ID, lifecycle, true)
+            .await
+            .expect("managed admission");
+        assert!(matches!(
+            admitted.inspect(None).await,
+            Err(axial_performance::ManagedMutationError::Indeterminate(_))
+        ));
+        drop(admitted);
+        std::fs::remove_file(staged).expect("repair publication stage");
+
+        let settlement_error = coordinator.finish_settlement(
+            Err(AppShutdownError::at(AppShutdownStep::SessionSettlement)),
+            Ok(()),
+        );
+        assert_eq!(
+            settlement_error,
+            Some(AppShutdownError::at(AppShutdownStep::SessionSettlement))
+        );
+        assert_eq!(
+            coordinator.close_managed_compositions(&fixture.state).await,
+            Err(AppShutdownError::at(AppShutdownStep::SessionSettlement))
+        );
+        assert!(!coordinator.completed(AppShutdownStep::ManagedCompositions));
+
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        assert!(matches!(
+            fixture
+                .state
+                .performance
+                .admit_managed(INSTANCE_ID, lifecycle, false)
+                .await,
+            Err(super::super::performance_managed::ManagedCompositionAdmissionError::RecoveryBlockedByActiveSession)
+        ));
+
+        assert_eq!(coordinator.finish_settlement(Ok(()), Ok(())), None);
+        coordinator
+            .close_managed_compositions(&fixture.state)
+            .await
+            .expect("managed close advances after sessions settle");
+        assert!(coordinator.completed(AppShutdownStep::ManagedCompositions));
     }
 
     #[test]

@@ -80,6 +80,11 @@ impl PerformanceManager {
                     InstallError::ManagedArtifactTargetExists(filename),
                 ));
             }
+            if !was_previously_tracked {
+                return Err(ManagedMutationError::definite(
+                    InstallError::ManagedArtifactTargetExists(filename),
+                ));
+            }
             if !expected_sha.trim().is_empty()
                 && let Ok(true) = file_matches_sha512(&final_path, &expected_sha, file.size).await
             {
@@ -96,11 +101,6 @@ impl PerformanceManager {
                     source: modrinth_source(),
                     integrity: verified_sha512_integrity(expected_sha),
                 });
-            }
-            if !was_previously_tracked {
-                return Err(ManagedMutationError::definite(
-                    InstallError::ManagedArtifactTargetExists(filename),
-                ));
             }
         }
 
@@ -268,7 +268,14 @@ pub(super) fn managed_artifact_install_concurrency(mod_count: usize) -> usize {
 }
 
 pub(super) fn managed_artifact_temp_path(final_path: &Path, managed_mod: &ManagedMod) -> PathBuf {
-    let suffix = safe_temp_suffix(&managed_mod.project_id);
+    managed_artifact_temp_path_for_project(final_path, &managed_mod.project_id)
+}
+
+pub(super) fn managed_artifact_temp_path_for_project(
+    final_path: &Path,
+    project_id: &str,
+) -> PathBuf {
+    let suffix = safe_temp_suffix(project_id);
     PathBuf::from(format!("{}.{}.tmp", final_path.display(), suffix))
 }
 
@@ -323,33 +330,152 @@ async fn reconcile_promoted_temp(
     expected_sha512: &str,
     expected_size: Option<u64>,
 ) -> Result<(), InstallError> {
-    match tokio::fs::symlink_metadata(temp_path).await {
+    let temp_metadata = match tokio::fs::symlink_metadata(temp_path).await {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(InstallError::Io(error)),
-        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
         Ok(_) => {
             return Err(InstallError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "managed download temp ownership cannot be proven",
             )));
         }
-    }
+    };
     let (temp_sha512, temp_size) = bounded_regular_file_sha512(temp_path).await?;
-    let (final_sha512, final_size) = bounded_regular_file_sha512(final_path).await?;
     let expected_matches =
         expected_sha512.trim().is_empty() || temp_sha512.eq_ignore_ascii_case(expected_sha512);
-    if !expected_matches
-        || temp_sha512 != final_sha512
-        || temp_size != final_size
-        || expected_size.is_some_and(|expected| temp_size != expected)
-    {
+    if !expected_matches || expected_size.is_some_and(|expected| temp_size != expected) {
         return Err(InstallError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "managed download temp ownership cannot be proven",
         )));
     }
+    match tokio::fs::symlink_metadata(final_path).await {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let (final_sha512, final_size) = bounded_regular_file_sha512(final_path).await?;
+            if temp_sha512 != final_sha512 || temp_size != final_size {
+                return Err(InstallError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "managed download temp conflicts with its published target",
+                )));
+            }
+            remove_admitted_temp(temp_path, &temp_metadata).await
+        }
+        Ok(_) => Err(InstallError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed download target ownership cannot be proven",
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let current_temp = tokio::fs::symlink_metadata(temp_path).await?;
+            let final_still_absent = matches!(
+                tokio::fs::symlink_metadata(final_path).await,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            );
+            if !current_temp.file_type().is_file()
+                || !same_file_identity(&temp_metadata, &current_temp)
+                || !final_still_absent
+            {
+                return Err(InstallError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "managed download temp changed before recovery promotion",
+                )));
+            }
+            tokio::fs::hard_link(temp_path, final_path).await?;
+            let final_metadata = tokio::fs::symlink_metadata(final_path).await?;
+            let current_temp = tokio::fs::symlink_metadata(temp_path).await?;
+            if !final_metadata.file_type().is_file()
+                || !current_temp.file_type().is_file()
+                || !same_file_identity(&temp_metadata, &current_temp)
+                || !same_file_identity(&current_temp, &final_metadata)
+                || !file_matches_sha512(final_path, expected_sha512, expected_size).await?
+            {
+                return Err(InstallError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "managed download temp promotion ownership cannot be proven",
+                )));
+            }
+            remove_admitted_temp(temp_path, &temp_metadata).await
+        }
+        Err(error) => Err(InstallError::Io(error)),
+    }
+}
+
+pub(super) async fn reconcile_managed_artifact_obligations(
+    instance_mods_dir: &Path,
+    state: Option<&CompositionState>,
+) -> Result<(), InstallError> {
+    for installed in state
+        .into_iter()
+        .flat_map(|state| state.installed_mods.iter())
+    {
+        let final_path = instance_mods_dir.join(&installed.filename);
+        reconcile_managed_replace_backups(&final_path, Some(&installed.integrity.sha512)).await?;
+        reconcile_promoted_temp(
+            &managed_artifact_temp_path_for_project(&final_path, &installed.project_id),
+            &final_path,
+            &installed.integrity.sha512,
+            None,
+        )
+        .await?;
+    }
+    super::promotion::settle_empty_managed_replace_root(instance_mods_dir).await?;
+    prove_no_managed_download_temps(instance_mods_dir).await
+}
+
+async fn remove_admitted_temp(
+    temp_path: &Path,
+    admitted: &std::fs::Metadata,
+) -> Result<(), InstallError> {
+    let current = tokio::fs::symlink_metadata(temp_path).await?;
+    if !current.file_type().is_file() || !same_file_identity(&current, admitted) {
+        return Err(InstallError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed download temp identity changed during recovery",
+        )));
+    }
     tokio::fs::remove_file(temp_path).await?;
     Ok(())
+}
+
+async fn prove_no_managed_download_temps(instance_mods_dir: &Path) -> Result<(), InstallError> {
+    let mut entries = match tokio::fs::read_dir(instance_mods_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(InstallError::Io(error)),
+    };
+    let mut count = 0_usize;
+    while let Some(entry) = entries.next_entry().await? {
+        count = count.saturating_add(1);
+        if count > crate::state::RECOVERY_ENTRY_LIMIT {
+            return Err(InstallError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "managed artifact recovery entries exceed the limit",
+            )));
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if is_managed_download_temp_name(&name) {
+            return Err(InstallError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "managed download temp remains without exact published ownership proof",
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_managed_download_temp_name(name: &str) -> bool {
+    name.strip_suffix(".tmp")
+        .and_then(|stem| stem.rsplit_once('.'))
+        .is_some_and(|(final_name, suffix)| {
+            !final_name.is_empty()
+                && !suffix.is_empty()
+                && suffix.len() <= 48
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
 }
 
 async fn bounded_regular_file_sha512(path: &Path) -> Result<(String, u64), std::io::Error> {

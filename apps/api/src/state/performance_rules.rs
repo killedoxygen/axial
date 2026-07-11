@@ -1,6 +1,6 @@
 use super::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use super::performance_managed::{
-    ManagedCompositionAdmission, ManagedCompositionAdmissionError, ManagedCompositionCloseError,
+    AppManagedCompositionAdmission, ManagedCompositionAdmissionError, ManagedCompositionCloseError,
     ManagedCompositionOwner, ManagedCompositionRetirement, managed_authority_claim_error,
 };
 use crate::execution::persistence::{
@@ -68,10 +68,11 @@ pub struct AppPerformanceStore {
 }
 
 impl AppPerformanceStore {
-    pub(crate) fn claim(
+    pub(super) fn claim(
         manager: Arc<PerformanceManager>,
         config_dir: &Path,
         instances_root: &Path,
+        instance_lifecycle: super::instance_lifecycle::InstanceLifecycleGates,
     ) -> Result<Self, RulesRefreshError> {
         let authority = manager
             .claim_rules_authority(config_dir)
@@ -81,6 +82,7 @@ impl AppPerformanceStore {
             manager
                 .claim_managed_authority(instances_root)
                 .map_err(managed_authority_claim_error)?,
+            instance_lifecycle,
         );
         Ok(Self {
             manager,
@@ -110,6 +112,7 @@ impl AppPerformanceStore {
             manager
                 .claim_managed_authority(&config_dir.join("instances"))
                 .map_err(managed_authority_claim_error)?,
+            super::instance_lifecycle::InstanceLifecycleGates::default(),
         );
         Ok(Self {
             manager,
@@ -144,8 +147,12 @@ impl AppPerformanceStore {
     pub(crate) async fn admit_managed(
         &self,
         instance_id: &str,
-    ) -> Result<ManagedCompositionAdmission, ManagedCompositionAdmissionError> {
-        self.managed.admit(instance_id).await
+        instance_lifecycle: OwnedMutexGuard<()>,
+        recovery_allowed: bool,
+    ) -> Result<AppManagedCompositionAdmission, ManagedCompositionAdmissionError> {
+        self.managed
+            .admit(instance_id, instance_lifecycle, recovery_allowed)
+            .await
     }
 
     pub(crate) async fn close_managed(&self) -> Result<(), ManagedCompositionCloseError> {
