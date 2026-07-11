@@ -3,11 +3,22 @@
 Description: Mod loading error has occurred
 
 net.minecraftforge.fml.LoadingFailedException: Loading errors encountered
-Suspected Mods: Example Machines (examplemachines)
+
+-- MOD examplemachines --
+Details:
+	Mod File: /home/alice/.minecraft/mods/example-machines-3.2.1.jar
+	Failure message: Example Machines (examplemachines) encountered an error
+	Mod Version: 3.2.1
+	Exception message: java.lang.IllegalStateException: machine registry failed
+
+-- MOD unrelatedtools --
+Details:
+	Mod File: /home/alice/.minecraft/mods/unrelated-tools-9.0.0.jar
+	Mod Version: 9.0.0
 
 Mod List:
 	Forge-1.20.1.jar |Forge |forge |47.2.0 |COMMON_SET
 	example-machines-3.2.1.jar |Example Machines |examplemachines |3.2.1 |ERROR
+	unrelated-tools-9.0.0.jar |Unrelated Tools |unrelatedtools |9.0.0 |COMMON_SET
 
-Mod File: /home/alice/.minecraft/mods/example-machines-3.2.1.jar
 JVM Flags: -Dtoken=access-token

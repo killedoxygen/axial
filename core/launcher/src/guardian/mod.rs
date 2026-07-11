@@ -1,3 +1,4 @@
+use crate::crash::is_out_of_memory_failure_line;
 use crate::types::LaunchFailureClass;
 use serde::{Deserialize, Serialize};
 
@@ -671,25 +672,7 @@ pub fn classify_startup_failure_text(text: &str) -> LaunchFailureClass {
 }
 
 fn contains_out_of_memory_failure(text: &str) -> bool {
-    text.contains("java.lang.outofmemoryerror")
-        || text.contains("gc overhead limit exceeded")
-        || text
-            .lines()
-            .map(str::trim)
-            .any(is_native_out_of_memory_line)
-}
-
-fn is_native_out_of_memory_line(line: &str) -> bool {
-    line == "# there is insufficient memory for the java runtime environment to continue."
-        || line
-            .strip_prefix("# native memory allocation (")
-            .and_then(|detail| detail.split_once(") failed to "))
-            .is_some_and(|(_, failure)| {
-                failure.starts_with("allocate ") || failure.starts_with("map ")
-            })
-        || line
-            .strip_prefix("# out of memory error (")
-            .is_some_and(|detail| detail.ends_with(')'))
+    text.lines().any(is_out_of_memory_failure_line)
 }
 
 fn contains_artifact_signature_failure(text: &str) -> bool {

@@ -16,9 +16,10 @@ pub use build::{
     cleanup_natives_dir, plan_resolved_launch, plan_vanilla_launch,
 };
 pub use crash::{
-    CrashEvidence, CrashEvidenceToken, CrashFailurePhase, CrashModEvidence,
-    MAX_CRASH_ARTIFACT_BYTES, MAX_CRASH_EVIDENCE_LINE_BYTES, MAX_CRASH_EVIDENCE_LINES,
-    MAX_CRASH_EVIDENCE_MODS, MAX_CRASH_EVIDENCE_TOKEN_CHARS, parse_crash_evidence,
+    CRASH_ARTIFACT_EXIT_CORRELATION_WINDOW_MS, CrashArtifactKind, CrashEvidence,
+    CrashExceptionClass, CrashFailurePhase, CrashModEvidence, CrashModName, CrashModVersion,
+    CrashNativeFrameKind, CrashNativeModule, CrashNativeSymbol, CrashProblematicFrame,
+    MAX_CRASH_ARTIFACT_BYTES, parse_crash_evidence,
 };
 pub use guardian::{
     GuardianDecision, GuardianIntervention, GuardianInterventionKind, GuardianMode,
