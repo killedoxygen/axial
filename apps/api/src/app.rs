@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
+use tokio::sync::watch;
 use tower_http::services::{ServeDir, ServeFile};
 
 pub const DEFAULT_API_PORT: u16 = 43_430;
@@ -28,6 +28,7 @@ pub const MIN_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_secs
 pub const DEFAULT_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 pub const MAX_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const REMOTE_FLAGS_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const EMBEDDED_API_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 static EMBEDDED_FRONTEND: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../frontend/static");
 
 pub fn default_frontend_dir() -> PathBuf {
@@ -203,13 +204,65 @@ pub fn spawn_benchmark_suite_drivers_resume(state: &AppState) -> bool {
 #[derive(Debug)]
 pub struct ServerHandle {
     pub addr: SocketAddr,
-    pub task: JoinHandle<()>,
+    shutdown: watch::Sender<bool>,
+    completion: watch::Receiver<ServerCompletion>,
 }
 
 #[derive(Debug, Error)]
 pub enum ApiServerError {
     #[error("failed to bind listener: {0}")]
     Bind(#[from] io::Error),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Error)]
+pub enum ApiServerShutdownError {
+    #[error("embedded API server stopped with an error")]
+    Serve,
+    #[error("embedded API server task stopped unexpectedly")]
+    Task,
+    #[error("embedded API server exceeded its graceful shutdown deadline")]
+    Forced,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServerCompletion {
+    Running,
+    Stopped,
+    ServeFailed,
+    TaskStopped,
+    Forced,
+}
+
+impl ServerHandle {
+    pub async fn wait(&self) -> Result<(), ApiServerShutdownError> {
+        let mut completion = self.completion.clone();
+        loop {
+            match *completion.borrow_and_update() {
+                ServerCompletion::Running => {}
+                ServerCompletion::Stopped => return Ok(()),
+                ServerCompletion::ServeFailed => return Err(ApiServerShutdownError::Serve),
+                ServerCompletion::TaskStopped => return Err(ApiServerShutdownError::Task),
+                ServerCompletion::Forced => return Err(ApiServerShutdownError::Forced),
+            }
+            completion
+                .changed()
+                .await
+                .map_err(|_| ApiServerShutdownError::Task)?;
+        }
+    }
+
+    pub async fn shutdown(&self) -> Result<(), ApiServerShutdownError> {
+        // The detached supervisor owns the server task. Once signalled, caller
+        // cancellation cannot abandon either graceful shutdown or the join.
+        let _ = self.shutdown.send(true);
+        self.wait().await
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+    }
 }
 
 pub async fn spawn_background(state: AppState) -> Result<ServerHandle, ApiServerError> {
@@ -220,17 +273,77 @@ pub async fn spawn_background_on(
     state: AppState,
     addr: SocketAddr,
 ) -> Result<ServerHandle, ApiServerError> {
+    spawn_background_router(build_router(state), addr).await
+}
+
+async fn spawn_background_router(
+    router: Router,
+    addr: SocketAddr,
+) -> Result<ServerHandle, ApiServerError> {
+    spawn_background_router_with_grace(router, addr, EMBEDDED_API_SHUTDOWN_GRACE).await
+}
+
+async fn spawn_background_router_with_grace(
+    router: Router,
+    addr: SocketAddr,
+    shutdown_grace: Duration,
+) -> Result<ServerHandle, ApiServerError> {
     let listener = TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
-    let router = build_router(state);
-
-    let task = tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, router).await {
-            tracing::error!("api server stopped: {error}");
-        }
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (completion_tx, completion) = watch::channel(ServerCompletion::Running);
+    let mut server_shutdown_rx = shutdown_rx.clone();
+    let mut task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                while !*server_shutdown_rx.borrow_and_update() {
+                    if server_shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+    });
+    tokio::spawn(async move {
+        let mut shutdown_rx = shutdown_rx;
+        let (result, forced) = tokio::select! {
+            result = &mut task => (result, false),
+            _ = async {
+                while !*shutdown_rx.borrow_and_update() {
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => {
+                match tokio::time::timeout(shutdown_grace, &mut task).await {
+                    Ok(result) => (result, false),
+                    Err(_) => {
+                        task.abort();
+                        (task.await, true)
+                    }
+                }
+            }
+        };
+        let completion = match (forced, result) {
+            (true, _) => ServerCompletion::Forced,
+            (false, Ok(Ok(()))) => ServerCompletion::Stopped,
+            (false, Ok(Err(error))) => {
+                tracing::error!(error_kind = ?error.kind(), "embedded API server stopped");
+                ServerCompletion::ServeFailed
+            }
+            (false, Err(error)) if error.is_cancelled() && *shutdown_rx.borrow() => {
+                ServerCompletion::Stopped
+            }
+            (false, Err(_)) => ServerCompletion::TaskStopped,
+        };
+        let _ = completion_tx.send(completion);
     });
 
-    Ok(ServerHandle { addr, task })
+    Ok(ServerHandle {
+        addr,
+        shutdown,
+        completion,
+    })
 }
 
 async fn serve_embedded_frontend(uri: Uri) -> impl IntoResponse {
@@ -281,7 +394,9 @@ mod tests {
     use super::axial_api_test_support::build_test_state;
     use super::*;
     use std::fs;
-    use tokio::sync::mpsc;
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::{Notify, mpsc};
 
     #[test]
     fn performance_rules_refresh_interval_defaults_and_clamps() {
@@ -350,6 +465,110 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         rx.recv().await.expect("periodic refresh tick");
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn embedded_server_shutdown_is_cancellation_owned_concurrent_and_idempotent() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let route_entered = entered.clone();
+        let route_release = release.clone();
+        let router = Router::new().route(
+            "/hold",
+            get(move || {
+                let entered = route_entered.clone();
+                let release = route_release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    "done"
+                }
+            }),
+        );
+        let server = Arc::new(
+            spawn_background_router(router, SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .expect("spawn embedded API"),
+        );
+        let mut connection = tokio::net::TcpStream::connect(server.addr)
+            .await
+            .expect("connect embedded API");
+        connection
+            .write_all(b"GET /hold HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("start an in-flight request");
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("request entered handler");
+
+        let first_server = server.clone();
+        let first = tokio::spawn(async move { first_server.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut shutdown = server.shutdown.subscribe();
+            while !*shutdown.borrow_and_update() {
+                shutdown.changed().await.expect("shutdown signal");
+            }
+        })
+        .await
+        .expect("shutdown is signalled before waiting");
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("shutdown waiter cancelled")
+                .is_cancelled()
+        );
+        release.notify_one();
+        drop(connection);
+
+        let (second, third) = tokio::join!(server.shutdown(), server.shutdown());
+        assert_eq!(second, Ok(()));
+        assert_eq!(third, Ok(()));
+        assert_eq!(server.shutdown().await, Ok(()));
+        assert!(tokio::net::TcpStream::connect(server.addr).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn embedded_server_reports_forced_stop_after_grace_deadline() {
+        let entered = Arc::new(Notify::new());
+        let route_entered = entered.clone();
+        let router = Router::new().route(
+            "/hold",
+            get(move || {
+                let entered = route_entered.clone();
+                async move {
+                    entered.notify_one();
+                    std::future::pending::<&'static str>().await
+                }
+            }),
+        );
+        let server = spawn_background_router_with_grace(
+            router,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("spawn embedded API");
+        let mut connection = tokio::net::TcpStream::connect(server.addr)
+            .await
+            .expect("connect embedded API");
+        connection
+            .write_all(b"GET /hold HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("start held request");
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("request entered handler");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), server.shutdown())
+                .await
+                .expect("forced shutdown deadline"),
+            Err(ApiServerShutdownError::Forced)
+        );
+        assert_eq!(server.wait().await, Err(ApiServerShutdownError::Forced));
+        assert!(tokio::net::TcpStream::connect(server.addr).await.is_err());
+        drop(connection);
     }
 }
 

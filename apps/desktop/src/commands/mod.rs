@@ -18,6 +18,8 @@ use tauri::{
 
 const RESTART_BUSY_MESSAGE: &str = "Restart is blocked while installs or launches are active.";
 const CLOSE_BUSY_MESSAGE: &str = "Close is blocked while installs or launches are active.";
+const API_CLOSE_FAILED_MESSAGE: &str =
+    "Close is blocked because the local API did not stop cleanly.";
 const AUTH_CLOSE_FAILED_MESSAGE: &str =
     "Close is blocked because secure authentication cleanup is incomplete.";
 const REMOTE_FLAGS_CLOSE_FAILED_MESSAGE: &str =
@@ -201,11 +203,15 @@ fn read_skin_file_from_path(path: PathBuf) -> Result<NativeSkinFile, String> {
 }
 
 #[tauri::command]
-pub async fn app_restart(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn app_restart(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    api: State<'_, ApiRuntimeState>,
+) -> Result<(), String> {
     let active_installs = state.installs().active_install_count().await;
     let active_sessions = state.sessions().active_session_count().await;
     restart_readiness(active_installs, active_sessions)?;
-    prepare_for_exit("restart", state.inner()).await?;
+    prepare_for_exit_with_api("restart", state.inner(), api.inner()).await?;
     app.request_restart();
     Ok(())
 }
@@ -254,12 +260,16 @@ pub fn window_toggle_maximize(app: AppHandle) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub async fn window_close(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn window_close(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    api: State<'_, ApiRuntimeState>,
+) -> Result<(), String> {
     if let Some(error) = close_blocking_error(state.inner()).await {
         return Err(error);
     }
 
-    prepare_for_exit("desktop close", state.inner()).await?;
+    prepare_for_exit_with_api("desktop close", state.inner(), api.inner()).await?;
 
     let window = app
         .get_webview_window("main")
@@ -299,6 +309,20 @@ pub async fn prepare_for_exit(action: &str, state: &AppState) -> Result<(), Stri
     auth_result?;
     remote_flags_result?;
     launch_reports_result
+}
+
+pub async fn prepare_for_exit_with_api(
+    action: &str,
+    state: &AppState,
+    api: &ApiRuntimeState,
+) -> Result<(), String> {
+    let api_result = api
+        .shutdown()
+        .await
+        .map_err(|_| API_CLOSE_FAILED_MESSAGE.to_string());
+    let state_result = prepare_for_exit(action, state).await;
+    api_result?;
+    state_result
 }
 
 #[tauri::command]

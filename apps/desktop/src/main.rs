@@ -75,8 +75,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(Box::new(error));
         }
     };
+    let api_runtime = state::ApiRuntimeState::new(api);
+    let close_event_api = api_runtime.clone();
+    let setup_api_runtime = api_runtime.clone();
 
-    info!("desktop shell connected to {}", api.addr);
+    info!("desktop shell connected to {}", api_runtime.addr());
 
     let run_result = tauri::Builder::default()
         .manage(desktop_state)
@@ -108,6 +111,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 api.prevent_close();
                 let window = window.clone();
                 let state = close_event_state.clone();
+                let api = close_event_api.clone();
                 let discord_presence = close_event_presence.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Some(error) = commands::close_blocking_error(&state).await {
@@ -118,7 +122,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
                     if let Err(error) =
-                        commands::prepare_for_exit("window close request", &state).await
+                        commands::prepare_for_exit_with_api("window close request", &state, &api)
+                            .await
                     {
                         let _ = window.emit(
                             events::DESKTOP_CLOSE_BLOCKED,
@@ -137,10 +142,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         .setup(move |app| {
-            app.manage(state::ApiRuntimeState::new(api.addr));
+            app.manage(setup_api_runtime.clone());
             let handle = app.handle().clone();
+            let api = setup_api_runtime.clone();
             tauri::async_runtime::spawn(async move {
-                let _ = api.task.await;
+                let _ = api.wait().await;
                 let _ = handle.emit(events::DESKTOP_API_STOPPED, serde_json::json!({}));
             });
             Ok(())
@@ -150,14 +156,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(error) = run_result {
         emit_startup_failed(&telemetry);
         discord_presence.shutdown_blocking();
-        commands::prepare_for_exit("desktop event loop failure", &state)
+        commands::prepare_for_exit_with_api("desktop event loop failure", &state, &api_runtime)
             .await
             .map_err(std::io::Error::other)?;
         return Err(Box::new(error));
     }
 
     discord_presence.shutdown_blocking();
-    commands::prepare_for_exit("desktop shutdown", &state)
+    commands::prepare_for_exit_with_api("desktop shutdown", &state, &api_runtime)
         .await
         .map_err(std::io::Error::other)?;
 
