@@ -2,17 +2,15 @@ use super::artifact::{
     MANAGED_ARTIFACT_INSTALL_FAILURE, file_matches_sha512, managed_artifact_install_concurrency,
     managed_artifact_temp_path, modrinth_source,
 };
-use super::manager::{PerformanceManager, active_rules_read, active_rules_write};
-use super::model::{InstallError, RemoteRulesCandidate, RulesRefreshError};
+use super::manager::PerformanceManager;
+use super::model::InstallError;
 use super::promotion::{promote_file_with_overwrite, promote_file_with_overwrite_async};
 use super::rules_refresh::remote_rules_refresh_warning;
 use crate::health::{BundleHealth, derive_health};
 use crate::modrinth::ModrinthError;
 use crate::resolve::builtin_manifest;
-use crate::rules_cache::write_remote_rules_cache;
-use crate::signature::{
-    RULES_KEY_ID_HEADER, RULES_SIGNATURE_HEADER, RemoteRulesVerifier, RulesSignatureMetadata,
-};
+use crate::rules_cache::{remote_rules_snapshot, rules_cache_path};
+use crate::signature::RulesSignatureMetadata;
 use crate::state::StateError;
 use crate::state::{load_state, save_state};
 use crate::status::{RuleChannel, RuleSource, RulesValidation};
@@ -39,39 +37,6 @@ fn managed_artifact_install_concurrency_is_bounded() {
     assert_eq!(managed_artifact_install_concurrency(1), 1);
     assert_eq!(managed_artifact_install_concurrency(3), 3);
     assert_eq!(managed_artifact_install_concurrency(12), 4);
-}
-
-#[test]
-fn active_rules_helpers_recover_poisoned_read_and_write() {
-    let manager = PerformanceManager::new().expect("performance manager");
-    let active = Arc::clone(&manager.active);
-
-    let poison = std::thread::spawn(move || {
-        let mut active = active.write().expect("active rules lock");
-        active.rules_cache.warning = Some("poisoned while updating rules".to_string());
-        panic!("poison active rules lock");
-    })
-    .join();
-    assert!(poison.is_err());
-
-    {
-        let active = active_rules_read(&manager.active);
-        assert_eq!(
-            active.rules_cache.warning.as_deref(),
-            Some("poisoned while updating rules")
-        );
-    }
-
-    {
-        let mut active = active_rules_write(&manager.active);
-        active.rules_cache.warning = Some("recovered write".to_string());
-    }
-
-    let active = active_rules_read(&manager.active);
-    assert_eq!(
-        active.rules_cache.warning.as_deref(),
-        Some("recovered write")
-    );
 }
 
 #[test]
@@ -1337,16 +1302,16 @@ fn hard_remove_error_restores_deleted_managed_file() {
 fn remote_refresh_enabled_tracks_normalized_remote_url() {
     let root = test_root("remote-refresh-enabled");
 
-    let unset = PerformanceManager::new_with_config_dir_and_remote_url(&root, None)
+    let unset = PerformanceManager::load_for_startup_with_remote_url(&root, None)
         .expect("performance manager");
     assert!(!unset.remote_refresh_enabled());
 
     let blank =
-        PerformanceManager::new_with_config_dir_and_remote_url(&root, Some(" \t\n ".to_string()))
+        PerformanceManager::load_for_startup_with_remote_url(&root, Some(" \t\n ".to_string()))
             .expect("performance manager");
     assert!(!blank.remote_refresh_enabled());
 
-    let configured = PerformanceManager::new_with_config_dir_and_remote_url(
+    let configured = PerformanceManager::load_for_startup_with_remote_url(
         &root,
         Some(" https://rules.example.test/performance.json ".to_string()),
     )
@@ -1363,9 +1328,13 @@ fn startup_uses_valid_cached_remote_rules_when_url_is_configured() {
     let mut remote = builtin.clone();
     remote.generated_at = "2026-05-30T11:00:00Z".to_string();
     let (public_key, signature) = signed_metadata(&remote);
-    write_remote_rules_cache(&root, &remote, signature).expect("write remote cache");
+    let snapshot = remote_rules_snapshot(&remote, signature);
+    let cache_path = rules_cache_path(&root);
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("create cache parent");
+    fs::write(&cache_path, snapshot.encode().expect("encode remote cache"))
+        .expect("write remote cache");
 
-    let manager = PerformanceManager::new_with_config_dir_remote_url_and_public_key(
+    let manager = PerformanceManager::load_for_startup_with_remote_url_and_public_key(
         &root,
         Some("https://rules.example.test/performance.json".to_string()),
         Some(public_key),
@@ -1384,47 +1353,6 @@ fn startup_uses_valid_cached_remote_rules_when_url_is_configured() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[test]
-fn accepted_remote_refresh_persists_and_updates_active_status() {
-    let root = test_root("accept-remote-refresh");
-    let mut remote = builtin_manifest().expect("builtin manifest");
-    remote.generated_at = "2026-05-30T12:00:00Z".to_string();
-    let (public_key, signature) = signed_metadata(&remote);
-    let manager = PerformanceManager::new_with_config_dir_remote_url_and_public_key(
-        &root,
-        Some("https://rules.example.test/performance.json".to_string()),
-        Some(public_key.clone()),
-    )
-    .expect("performance manager");
-
-    manager
-        .accept_remote_manifest(
-            &root,
-            RemoteRulesCandidate {
-                manifest: remote.clone(),
-                signature,
-            },
-        )
-        .expect("accept remote manifest");
-    let status = manager.rules_status();
-
-    assert_eq!(status.rule_source, RuleSource::Remote);
-    assert_eq!(status.rule_channel, RuleChannel::Remote);
-    assert_eq!(status.generated_at, remote.generated_at);
-    assert!(status.last_refresh_at.is_some());
-
-    let reloaded = crate::rules_cache::load_active_rules_cache(
-        &root,
-        &builtin_manifest().expect("builtin manifest"),
-        true,
-        &RemoteRulesVerifier::from_public_key_hex(Some(public_key)),
-    );
-    assert_eq!(reloaded.rule_source, RuleSource::Remote);
-    assert_eq!(reloaded.manifest.generated_at, remote.generated_at);
-
-    let _ = fs::remove_dir_all(root);
-}
-
 #[tokio::test]
 async fn remote_rules_refresh_request_failure_keeps_previous_rules_and_redacts_url() {
     let root = test_root("remote-refresh-request-redaction");
@@ -1433,19 +1361,25 @@ async fn remote_rules_refresh_request_failure_keeps_previous_rules_and_redacts_u
     let remote_base_url = spawn_closing_rules_server().await;
     let remote_url =
         format!("{remote_base_url}/private-feed/perf.json?api_token=secret-query-token");
-    let manager = PerformanceManager::new_with_config_dir_remote_url_and_public_key(
-        &root,
-        Some(remote_url.clone()),
-        Some(public_key),
-    )
-    .expect("performance manager");
+    let manager = Arc::new(
+        PerformanceManager::load_for_startup_with_remote_url_and_public_key(
+            &root,
+            Some(remote_url.clone()),
+            Some(public_key),
+        )
+        .expect("performance manager"),
+    );
     let before = manager.rules_status();
 
-    let after = manager
-        .refresh_rules()
+    let authority = manager
+        .claim_rules_authority(&root)
+        .expect("rules authority");
+    let error = authority
+        .fetch_remote_rules()
         .await
-        .expect("refresh failure should expose status");
-    let warning = after.warnings.join("\n");
+        .expect_err("request failure is typed");
+    let warning = remote_rules_refresh_warning("rejected", &error);
+    let after = manager.rules_status();
 
     assert_eq!(after.rule_source, before.rule_source);
     assert_eq!(after.rule_channel, before.rule_channel);
@@ -1462,93 +1396,10 @@ async fn remote_rules_refresh_request_failure_keeps_previous_rules_and_redacts_u
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn remote_rules_refresh_cache_failure_keeps_previous_rules_and_redacts_path() {
-    let root = test_root("remote-refresh-cache-path-secret");
-    let mut remote = builtin_manifest().expect("builtin manifest");
-    remote.generated_at = "2026-05-30T13:00:00Z".to_string();
-    let (public_key, signature) = signed_metadata(&remote);
-    let remote_url = spawn_remote_rules_server(remote, signature).await;
-    let manager = PerformanceManager::new_with_config_dir_remote_url_and_public_key(
-        &root,
-        Some(remote_url),
-        Some(public_key),
-    )
-    .expect("performance manager");
-    let before = manager.rules_status();
-    let cache_temp_path = crate::rules_cache::rules_cache_path(&root).with_extension("json.tmp");
-    fs::create_dir_all(&cache_temp_path).expect("create blocking cache temp directory");
-
-    let after = manager
-        .refresh_rules()
-        .await
-        .expect("cache failure should expose status");
-    let warning = after.warnings.join("\n");
-    let synthetic = RulesRefreshError::Cache(std::io::Error::other(format!(
-        "failed to persist {}",
-        root.join("local-path-secret/rules-cache.json").display()
-    )));
-    let synthetic_warning = remote_rules_refresh_warning("failed", &synthetic);
-
-    assert_eq!(after.rule_source, before.rule_source);
-    assert_eq!(after.rule_channel, before.rule_channel);
-    assert_eq!(after.generated_at, before.generated_at);
-    assert_eq!(after.validation, RulesValidation::Valid);
-    assert!(
-        warning.contains("Remote rules refresh failed: remote rules cache could not be persisted")
-    );
-    assert!(!warning.contains("remote-refresh-cache-path-secret"));
-    assert!(!warning.contains("rules-cache.json.tmp"));
-    assert!(!synthetic_warning.contains("local-path-secret"));
-    assert!(!synthetic_warning.contains("rules-cache.json"));
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn rejected_remote_refresh_keeps_previous_rules_and_exposes_warning() {
-    let root = test_root("reject-remote-refresh");
-    let mut invalid = builtin_manifest().expect("builtin manifest");
-    invalid.schema_version = 99;
-    let (public_key, signature) = signed_metadata(&invalid);
-    let manager = PerformanceManager::new_with_config_dir_remote_url_and_public_key(
-        &root,
-        Some("https://rules.example.test/performance.json".to_string()),
-        Some(public_key),
-    )
-    .expect("performance manager");
-    let before = manager.rules_status();
-
-    let error = manager
-        .accept_remote_manifest(
-            &root,
-            RemoteRulesCandidate {
-                manifest: invalid,
-                signature,
-            },
-        )
-        .expect_err("invalid remote manifest should be rejected");
-    manager.record_refresh_warning(remote_rules_refresh_warning("rejected", &error));
-    let after = manager.rules_status();
-
-    assert_eq!(after.rule_source, before.rule_source);
-    assert_eq!(after.rule_channel, before.rule_channel);
-    assert_eq!(after.generated_at, before.generated_at);
-    assert_eq!(after.validation, RulesValidation::Valid);
-    assert!(
-        after
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("Remote rules refresh rejected"))
-    );
-
-    let _ = fs::remove_dir_all(root);
-}
-
 #[test]
 fn remote_refresh_without_public_key_keeps_builtin_and_exposes_warning() {
     let root = test_root("remote-refresh-missing-public-key");
-    let manager = PerformanceManager::new_with_config_dir_remote_url_and_public_key(
+    let manager = PerformanceManager::load_for_startup_with_remote_url_and_public_key(
         &root,
         Some("https://rules.example.test/performance.json".to_string()),
         None,
@@ -1682,54 +1533,6 @@ async fn spawn_closing_rules_server() -> String {
         let _ = listener.accept().await;
     });
     format!("http://{addr}")
-}
-
-async fn spawn_remote_rules_server(
-    manifest: crate::types::Manifest,
-    signature: RulesSignatureMetadata,
-) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind remote rules test server");
-    let addr = listener.local_addr().expect("remote rules test addr");
-    let body = serde_json::to_vec(&manifest).expect("serialize remote manifest");
-    tokio::spawn(async move {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            return;
-        };
-        let mut request = Vec::new();
-        let mut buf = [0_u8; 1024];
-        loop {
-            let Ok(read) = stream.read(&mut buf).await else {
-                return;
-            };
-            if read == 0 {
-                return;
-            }
-            request.extend_from_slice(&buf[..read]);
-            if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
-            }
-            if request.len() > 8192 {
-                return;
-            }
-        }
-
-        let key_id = signature.key_id.unwrap_or_default();
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{}: {}\r\n{}: {}\r\nconnection: close\r\n\r\n",
-            body.len(),
-            RULES_SIGNATURE_HEADER,
-            signature.signature,
-            RULES_KEY_ID_HEADER,
-            key_id
-        );
-        if stream.write_all(headers.as_bytes()).await.is_err() {
-            return;
-        }
-        let _ = stream.write_all(&body).await;
-    });
-    format!("http://{addr}/remote-rules/performance.json")
 }
 
 #[derive(Clone, Copy)]

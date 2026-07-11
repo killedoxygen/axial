@@ -45,7 +45,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let instances = Arc::new(instance_startup.store);
     let installs = Arc::new(InstallStore::new());
     let sessions = Arc::new(SessionStore::new());
-    let performance = Arc::new(PerformanceManager::new_with_config_dir(&paths.config_dir)?);
+    let performance_config_dir = paths.config_dir.clone();
+    let performance = Arc::new(
+        tokio::task::spawn_blocking(move || {
+            PerformanceManager::load_for_startup(&performance_config_dir)
+        })
+        .await??,
+    );
     let state = AppState::load(AppStateInit {
         app_name: "Axial".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),

@@ -7,17 +7,26 @@ use crate::signature::{RemoteRulesVerifier, configured_remote_rules_verifier};
 use crate::status::{RuleChannel, RuleSource, RulesValidation};
 use crate::types::{CompositionPlan, ResolutionRequest};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use tracing::warn;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
-#[derive(Debug, Clone)]
+pub(super) const ACTIVE_RULES_LOCK_INVARIANT: &str = "active performance rules lock poisoned";
+
+#[derive(Debug)]
 pub struct PerformanceManager {
     pub(super) active: Arc<RwLock<ActiveRules>>,
     pub(super) modrinth: ModrinthClient,
     pub(super) rules_client: reqwest::Client,
-    pub(super) config_dir: Option<PathBuf>,
     pub(super) remote_rules_url: Option<String>,
     pub(super) remote_rules_verifier: RemoteRulesVerifier,
+    pub(super) rules_mutation_allowed: bool,
+    rules_cache_path: Option<PathBuf>,
+    rules_authority_claimed: AtomicBool,
+}
+
+#[derive(Clone)]
+pub struct PerformanceRulesAuthority {
+    pub(super) manager: Arc<PerformanceManager>,
 }
 
 impl PerformanceManager {
@@ -35,28 +44,30 @@ impl PerformanceManager {
             })),
             modrinth: ModrinthClient::new(),
             rules_client: rules_client(),
-            config_dir: None,
             remote_rules_url: None,
             remote_rules_verifier: RemoteRulesVerifier::disabled(),
+            rules_mutation_allowed: true,
+            rules_cache_path: None,
+            rules_authority_claimed: AtomicBool::new(false),
         })
     }
 
-    pub fn new_with_config_dir(config_dir: &Path) -> Result<Self, InstallError> {
-        Self::new_with_config_dir_and_remote_url(config_dir, configured_remote_rules_url())
+    pub fn load_for_startup(config_dir: &Path) -> Result<Self, InstallError> {
+        Self::load_for_startup_with_remote_url(config_dir, configured_remote_rules_url())
     }
 
-    pub fn new_with_config_dir_and_remote_url(
+    pub fn load_for_startup_with_remote_url(
         config_dir: &Path,
         remote_rules_url: Option<String>,
     ) -> Result<Self, InstallError> {
-        Self::new_with_config_dir_remote_url_and_public_key(
+        Self::load_for_startup_with_remote_url_and_public_key(
             config_dir,
             remote_rules_url,
             std::env::var(crate::signature::PERFORMANCE_RULES_PUBLIC_KEY_ENV).ok(),
         )
     }
 
-    pub fn new_with_config_dir_remote_url_and_public_key(
+    pub fn load_for_startup_with_remote_url_and_public_key(
         config_dir: &Path,
         remote_rules_url: Option<String>,
         remote_rules_public_key: Option<String>,
@@ -86,9 +97,11 @@ impl PerformanceManager {
             })),
             modrinth: ModrinthClient::new(),
             rules_client: rules_client(),
-            config_dir: Some(config_dir.to_path_buf()),
             remote_rules_url,
             remote_rules_verifier,
+            rules_mutation_allowed: loaded.mutation_allowed,
+            rules_cache_path: Some(crate::rules_cache::rules_cache_path(config_dir)),
+            rules_authority_claimed: AtomicBool::new(false),
         })
     }
 
@@ -100,16 +113,12 @@ impl PerformanceManager {
     }
 
     pub fn get_plan(&self, request: ResolutionRequest) -> CompositionPlan {
-        let active = active_rules_read(&self.active);
+        let active = self.active.read().expect(ACTIVE_RULES_LOCK_INVARIANT);
         resolve_plan(Some(&active.manifest), request)
     }
 
-    pub fn manifest(&self) -> crate::types::Manifest {
-        active_rules_read(&self.active).manifest.clone()
-    }
-
     pub fn rules_status(&self) -> crate::status::PerformanceRulesStatus {
-        let active = active_rules_read(&self.active);
+        let active = self.active.read().expect(ACTIVE_RULES_LOCK_INVARIANT);
         crate::status::rules_status_for(
             &active.manifest,
             active.rule_source,
@@ -127,20 +136,28 @@ impl PerformanceManager {
     pub fn hardware(&self) -> crate::types::HardwareProfile {
         detect_hardware()
     }
-}
 
-pub(super) fn active_rules_read(active: &RwLock<ActiveRules>) -> RwLockReadGuard<'_, ActiveRules> {
-    active.read().unwrap_or_else(|poisoned| {
-        warn!("performance rules lock poisoned during read; recovering active rules");
-        poisoned.into_inner()
-    })
-}
-
-pub(super) fn active_rules_write(
-    active: &RwLock<ActiveRules>,
-) -> RwLockWriteGuard<'_, ActiveRules> {
-    active.write().unwrap_or_else(|poisoned| {
-        warn!("performance rules lock poisoned during write; recovering active rules");
-        poisoned.into_inner()
-    })
+    pub fn claim_rules_authority(
+        self: &Arc<Self>,
+        config_dir: &Path,
+    ) -> Result<PerformanceRulesAuthority, std::io::Error> {
+        let requested_path = crate::rules_cache::rules_cache_path(config_dir);
+        if self.rules_cache_path.as_ref() != Some(&requested_path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "performance rules authority path does not match startup admission",
+            ));
+        }
+        self.rules_authority_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "performance rules authority is already claimed",
+                )
+            })?;
+        Ok(PerformanceRulesAuthority {
+            manager: self.clone(),
+        })
+    }
 }

@@ -14,6 +14,7 @@ pub(crate) mod launch_reports;
 mod lifecycle;
 pub mod ownership;
 pub mod performance_operations;
+mod performance_rules;
 pub mod presence;
 mod remote_flags;
 mod sessions;
@@ -69,6 +70,7 @@ pub(crate) use lifecycle::{
 };
 #[cfg(test)]
 pub(crate) use lifecycle::{AppLifecyclePhase, LifecycleQuiesceError};
+pub use performance_rules::AppPerformanceStore;
 pub(crate) use remote_flags::{
     RemoteFlagRefreshOutcome, RemoteFlagStore, ResolvedFlagSource, resolve_flag,
 };
@@ -93,7 +95,7 @@ pub struct AppState {
     benchmark_suites: Arc<benchmark_suites::BenchmarkSuiteStore>,
     benchmark_suite_drivers: Arc<benchmark_suite_drivers::BenchmarkSuiteDriverStore>,
     performance_operations: Arc<performance_operations::PerformanceOperationStore>,
-    performance: Arc<PerformanceManager>,
+    performance: Arc<AppPerformanceStore>,
     telemetry: Arc<TelemetryHub>,
     remote_flags: Arc<RemoteFlagStore>,
     launch_reports: Arc<launch_reports::LaunchReportStore>,
@@ -234,6 +236,12 @@ impl AppState {
         let instances = Arc::new(AppInstanceStore::claim(&init.instances).unwrap_or_else(
             |error| panic!("failed to initialize instance registry persistence: {error}"),
         ));
+        let performance = Arc::new(
+            AppPerformanceStore::claim(init.performance, &config.paths().config_dir)
+                .unwrap_or_else(|error| {
+                    panic!("failed to initialize performance rules persistence: {error}")
+                }),
+        );
         let benchmark_suite_retention_claims =
             benchmark_suites::BenchmarkSuiteRetentionClaims::default();
         let benchmark_suite_drivers =
@@ -275,7 +283,7 @@ impl AppState {
             benchmark_suites,
             benchmark_suite_drivers,
             performance_operations,
-            performance: init.performance,
+            performance,
             telemetry,
             remote_flags,
             launch_reports,
@@ -350,8 +358,32 @@ impl AppState {
         &self.journals
     }
 
-    pub fn performance(&self) -> &Arc<PerformanceManager> {
+    pub fn performance(&self) -> &Arc<AppPerformanceStore> {
         &self.performance
+    }
+
+    pub(crate) async fn refresh_performance_rules(
+        &self,
+    ) -> Result<axial_performance::PerformanceRulesStatus, axial_performance::RulesRefreshError>
+    {
+        let performance = self.performance.clone();
+        let gate = performance.acquire_refresh().await?;
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = performance.refresh_with_gate(gate).await;
+            let _ = completed_tx.send(result);
+        });
+        completed_rx.await.map_err(|_| {
+            axial_performance::RulesRefreshError::Cache(std::io::Error::other(
+                "performance rules refresh owner stopped before reporting completion",
+            ))
+        })?
+    }
+
+    pub(crate) async fn close_performance_rules(
+        &self,
+    ) -> Result<(), axial_performance::RulesRefreshError> {
+        self.performance.close().await
     }
 
     pub fn telemetry(&self) -> &Arc<TelemetryHub> {

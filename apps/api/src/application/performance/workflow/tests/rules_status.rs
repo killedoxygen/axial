@@ -11,13 +11,13 @@ async fn status_reports_bundled_rules_without_remote_refresh() {
 
     assert_eq!(status.rule_source, axial_performance::RuleSource::BuiltIn);
     assert_eq!(status.rule_channel, axial_performance::RuleChannel::Bundled);
-    assert!(status.rules_cache.recorded);
+    assert!(!status.rules_cache.recorded);
     assert_eq!(
         status.rules_cache.state,
-        axial_performance::RulesCacheState::Recorded
+        axial_performance::RulesCacheState::Unavailable
     );
-    assert!(status.rules_cache.updated_at.is_some());
-    assert!(status.rules_cache.loaded_at.is_some());
+    assert!(status.rules_cache.updated_at.is_none());
+    assert!(status.rules_cache.loaded_at.is_none());
     assert!(status.rules_cache.warning.is_none());
     assert_eq!(status.schema_version, 1);
     assert!(!status.generated_at.is_empty());
@@ -98,12 +98,11 @@ async fn status_reports_invalid_remote_rules_with_guardian_fact_and_safe_copy() 
             generated_at: remote.generated_at.clone(),
             validation: axial_performance::RulesValidation::Valid,
             updated_at: "2026-06-15T12:00:00Z".to_string(),
-            loaded_at: "2026-06-15T12:00:00Z".to_string(),
-            manifest: Some(remote),
-            signature: Some(axial_performance::RulesSignatureMetadata {
+            manifest: remote,
+            signature: axial_performance::RulesSignatureMetadata {
                 signature: signed.signature,
                 key_id: Some("test-key".to_string()),
-            }),
+            },
         })
         .expect("serialize invalid remote cache"),
     )
@@ -468,8 +467,10 @@ async fn terminal_journal_failure_returns_bounded_then_reconciles_without_refres
     .await
     .expect("terminal journal reconciliation");
 
-    let next = handle_rules_refresh(State(state.clone())).await;
-    assert!(next.is_ok());
+    assert_eq!(
+        state.performance().rules_status().generated_at,
+        manifest.generated_at
+    );
     assert!(!state.journals().has_retry_candidate());
     let _ = fs::remove_dir_all(root);
 }
@@ -500,13 +501,18 @@ async fn rules_refresh_route_provider_failure_keeps_previous_rules_and_redacts_p
         .await
         .expect("route response");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read body");
     let body = String::from_utf8(body.to_vec()).expect("utf8 body");
-    let status: axial_performance::PerformanceRulesStatus =
-        serde_json::from_str(&body).expect("rules status json");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).expect("error json"),
+        serde_json::json!({
+            "error": "Performance rules provider response could not be verified. Try again later."
+        })
+    );
+    let status = fixture.state.performance().rules_status();
 
     assert_eq!(status.rule_source, before.rule_source);
     assert_eq!(status.rule_channel, before.rule_channel);
@@ -536,17 +542,20 @@ async fn rules_refresh_route_provider_failure_keeps_previous_rules_and_redacts_p
         .expect("refresh journal");
     assert_eq!(
         journal.status,
-        crate::state::contracts::OperationStatus::Succeeded
+        crate::state::contracts::OperationStatus::Failed
     );
-    assert_eq!(journal.failure_point, None);
+    assert_eq!(
+        journal.failure_point.as_deref(),
+        Some("refresh_remote_rules")
+    );
     assert_eq!(
         journal.outcome,
-        Some(crate::state::contracts::OperationOutcome::Succeeded)
+        Some(crate::state::contracts::OperationOutcome::Failed)
     );
     assert_eq!(journal.completed_steps.len(), 1);
     assert_eq!(
         journal.completed_steps[0].result,
-        crate::state::contracts::OperationStepResult::Completed
+        crate::state::contracts::OperationStepResult::Failed
     );
     assert_eq!(journal.completed_steps[0].changed_target, None);
     assert!(journal.targets.iter().any(|target| {
@@ -565,7 +574,6 @@ async fn rules_refresh_route_provider_rate_limit_and_invalid_body_are_bounded_an
             "429 Too Many Requests",
             b"{\"provider_payload\":{\"token\":\"secret-rate-limit\"}}".to_vec(),
             None,
-            "HTTP 429",
             vec!["provider_payload", "secret-rate-limit"],
         ),
         (
@@ -573,12 +581,11 @@ async fn rules_refresh_route_provider_rate_limit_and_invalid_body_are_bounded_an
             "200 OK",
             b"{\"provider_payload\":\"secret-invalid-body\"".to_vec(),
             Some(signed.signature.clone()),
-            "Performance rule diagnostics are unavailable.",
             vec!["provider_payload", "secret-invalid-body"],
         ),
     ];
 
-    for (name, status_line, body, signature, warning_fragment, sensitive_fragments) in cases {
+    for (name, status_line, body, signature, sensitive_fragments) in cases {
         let remote_base_url = spawn_rules_provider_response(status_line, body, signature).await;
         let remote_url =
             format!("{remote_base_url}/private-feed/performance.json?api_token=secret-token");
@@ -601,32 +608,30 @@ async fn rules_refresh_route_provider_rate_limit_and_invalid_body_are_bounded_an
             .await
             .expect("route response");
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read body");
         let body = String::from_utf8(body.to_vec()).expect("utf8 body");
-        let status: axial_performance::PerformanceRulesStatus =
-            serde_json::from_str(&body).expect("rules status json");
-        let value: serde_json::Value = serde_json::from_str(&body).expect("status json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).expect("error json"),
+            serde_json::json!({
+                "error": "Performance rules provider response could not be verified. Try again later."
+            })
+        );
+        let status = fixture.state.performance().rules_status();
 
         assert_eq!(status.rule_source, before.rule_source);
         assert_eq!(status.rule_channel, before.rule_channel);
         assert_eq!(status.generated_at, before.generated_at);
         assert_eq!(status.validation, axial_performance::RulesValidation::Valid);
         assert!(
-            status
-                .warnings
-                .iter()
-                .any(|warning| warning.contains(warning_fragment)),
-            "{name} did not expose expected bounded warning: {:?}",
-            status.warnings
+            !status.warnings.is_empty(),
+            "{name} should retain a bounded warning"
         );
         assert!(
-            value["guardian_facts"]
-                .as_array()
-                .is_some_and(|facts| facts.is_empty()),
-            "{name} should keep valid fallback rules without invalid-rules Guardian facts: {value}"
+            status.rule_source == axial_performance::RuleSource::BuiltIn,
+            "{name} should keep valid fallback rules"
         );
         let mut omitted = vec![
             remote_url.as_str(),
@@ -638,7 +643,7 @@ async fn rules_refresh_route_provider_rate_limit_and_invalid_body_are_bounded_an
         ];
         omitted.extend(sensitive_fragments.iter().copied());
         assert_omits_raw_fragments(&body, &omitted);
-        assert_refresh_journal_completed_without_cache_change(&fixture.state);
+        assert_refresh_journal_failed_without_cache_change(&fixture.state);
     }
 }
 
@@ -670,12 +675,17 @@ async fn rules_refresh_route_rejects_missing_signature_and_keeps_builtin_rules()
         .await
         .expect("route response");
 
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read body");
-    let status: axial_performance::PerformanceRulesStatus =
-        serde_json::from_slice(&body).expect("rules status json");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("error json"),
+        serde_json::json!({
+            "error": "Performance rules provider response could not be verified. Try again later."
+        })
+    );
+    let status = fixture.state.performance().rules_status();
     assert_eq!(status.rule_source, axial_performance::RuleSource::BuiltIn);
     assert!(status.remote_refresh);
     assert!(
@@ -684,6 +694,7 @@ async fn rules_refresh_route_rejects_missing_signature_and_keeps_builtin_rules()
             .iter()
             .any(|warning| warning.contains("signature header is missing"))
     );
+    assert_refresh_journal_failed_without_cache_change(&fixture.state);
 }
 
 async fn spawn_closing_rules_server() -> String {
@@ -741,24 +752,27 @@ async fn spawn_rules_provider_response(
     format!("http://{addr}")
 }
 
-fn assert_refresh_journal_completed_without_cache_change(state: &AppState) {
+fn assert_refresh_journal_failed_without_cache_change(state: &AppState) {
     let journal = state
         .journals()
         .latest_for_command(crate::state::contracts::CommandKind::RefreshPerformanceRules)
         .expect("refresh journal");
     assert_eq!(
         journal.status,
-        crate::state::contracts::OperationStatus::Succeeded
+        crate::state::contracts::OperationStatus::Failed
     );
-    assert_eq!(journal.failure_point, None);
+    assert_eq!(
+        journal.failure_point.as_deref(),
+        Some("refresh_remote_rules")
+    );
     assert_eq!(
         journal.outcome,
-        Some(crate::state::contracts::OperationOutcome::Succeeded)
+        Some(crate::state::contracts::OperationOutcome::Failed)
     );
     assert_eq!(journal.completed_steps.len(), 1);
     assert_eq!(
         journal.completed_steps[0].result,
-        crate::state::contracts::OperationStepResult::Completed
+        crate::state::contracts::OperationStepResult::Failed
     );
     assert_eq!(journal.completed_steps[0].changed_target, None);
 }

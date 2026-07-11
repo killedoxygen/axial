@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 const SHUTDOWN_LOCK_INVARIANT: &str =
     "application shutdown lock poisoned; completion state may be inconsistent";
-const SHUTDOWN_STEP_COUNT: usize = 16;
+const SHUTDOWN_STEP_COUNT: usize = 17;
 type ShutdownAttemptChannel = Arc<watch::Sender<Option<Result<(), AppShutdownError>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,6 +13,7 @@ pub enum AppShutdownStep {
     SessionSettlement,
     DriverSettlement,
     ProducerDrain,
+    PerformanceRules,
     SkinFlush,
     DriverStore,
     LaunchReports,
@@ -34,18 +35,19 @@ impl AppShutdownStep {
             Self::SessionSettlement => 1,
             Self::DriverSettlement => 2,
             Self::ProducerDrain => 3,
-            Self::SkinFlush => 4,
-            Self::DriverStore => 5,
-            Self::LaunchReports => 6,
-            Self::BenchmarkSuites => 7,
-            Self::PerformanceOperations => 8,
-            Self::Journals => 9,
-            Self::FailureMemory => 10,
-            Self::Accounts => 11,
-            Self::SecureAuth => 12,
-            Self::RemoteFlags => 13,
-            Self::InstanceRegistry => 14,
-            Self::Config => 15,
+            Self::PerformanceRules => 4,
+            Self::SkinFlush => 5,
+            Self::DriverStore => 6,
+            Self::LaunchReports => 7,
+            Self::BenchmarkSuites => 8,
+            Self::PerformanceOperations => 9,
+            Self::Journals => 10,
+            Self::FailureMemory => 11,
+            Self::Accounts => 12,
+            Self::SecureAuth => 13,
+            Self::RemoteFlags => 14,
+            Self::InstanceRegistry => 15,
+            Self::Config => 16,
         }
     }
 
@@ -55,6 +57,7 @@ impl AppShutdownStep {
             Self::SessionSettlement => "session_settlement",
             Self::DriverSettlement => "driver_settlement",
             Self::ProducerDrain => "producer_drain",
+            Self::PerformanceRules => "performance_rules",
             Self::SkinFlush => "skin_flush",
             Self::DriverStore => "driver_store",
             Self::LaunchReports => "launch_reports",
@@ -181,6 +184,7 @@ impl AppShutdownCoordinator {
             performance_result,
             auth_result,
             remote_result,
+            rules_result,
             instance_result,
             config_result,
         ) = tokio::join!(
@@ -188,6 +192,7 @@ impl AppShutdownCoordinator {
             self.close_performance_chain(state),
             self.close_auth_chain(state),
             self.close_remote_flags(state),
+            self.close_performance_rules(state),
             self.close_instance_registry(state),
             self.close_config(state),
         );
@@ -197,6 +202,7 @@ impl AppShutdownCoordinator {
         retain_first_error(&mut first_error, performance_result);
         retain_first_error(&mut first_error, auth_result);
         retain_first_error(&mut first_error, remote_result);
+        retain_first_error(&mut first_error, rules_result);
         retain_first_error(&mut first_error, instance_result);
         retain_first_error(&mut first_error, config_result);
         first_error.map_or(Ok(()), Err)
@@ -430,6 +436,18 @@ impl AppShutdownCoordinator {
             .await
             .map_err(|_| AppShutdownError::at(AppShutdownStep::RemoteFlags))?;
         self.mark_completed(AppShutdownStep::RemoteFlags);
+        Ok(())
+    }
+
+    async fn close_performance_rules(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if self.completed(AppShutdownStep::PerformanceRules) {
+            return Ok(());
+        }
+        state
+            .close_performance_rules()
+            .await
+            .map_err(|_| AppShutdownError::at(AppShutdownStep::PerformanceRules))?;
+        self.mark_completed(AppShutdownStep::PerformanceRules);
         Ok(())
     }
 
@@ -729,7 +747,7 @@ mod tests {
             let paths = test_paths(&root);
             let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths, InstanceRegistrySnapshot::default())
+                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
                     .expect("load instances"),
             );
             let state = AppState::new(AppStateInit {
@@ -739,7 +757,10 @@ mod tests {
                 instances,
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
-                performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+                performance: Arc::new(
+                    PerformanceManager::load_for_startup(&paths.config_dir)
+                        .expect("performance manager"),
+                ),
                 startup_warnings: Vec::new(),
                 frontend_dir: root.join("frontend"),
             });

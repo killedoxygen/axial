@@ -7,6 +7,13 @@ use crate::types::{
 
 const BUILTIN_CATALOG: &str = include_str!("../catalog.json");
 const KNOWN_RULE_CHANNELS: &[&str] = &["bundled", "local", "remote"];
+const MAX_MANIFEST_ITEMS: usize = 256;
+const MAX_FILTER_ITEMS: usize = 64;
+const MAX_ID_CHARS: usize = 128;
+const MAX_NAME_CHARS: usize = 256;
+const MAX_DESCRIPTION_CHARS: usize = 1024;
+const MAX_VERSION_RANGE_CHARS: usize = 256;
+const MAX_HARDWARE_VALUE: i32 = 1_048_576;
 
 pub fn builtin_manifest() -> Result<Manifest, ResolveError> {
     let manifest = serde_json::from_str::<Manifest>(BUILTIN_CATALOG)?;
@@ -18,12 +25,72 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ResolveError> {
     if manifest.schema_version != 1 {
         return Err(ResolveError::UnsupportedSchema);
     }
+    validate_text(&manifest.generated_at, 64, "generated_at")?;
+    chrono::DateTime::parse_from_rfc3339(&manifest.generated_at)
+        .map_err(|_| ResolveError::ManifestBound("generated_at"))?;
+    validate_text(&manifest.minimum_app_version, 64, "minimum_app_version")?;
+    validate_text(&manifest.rule_channel, 32, "rule_channel")?;
+    validate_count(
+        manifest.artifacts.len(),
+        MAX_MANIFEST_ITEMS,
+        "artifact count",
+    )?;
+    validate_count(
+        manifest.compositions.len(),
+        MAX_MANIFEST_ITEMS,
+        "composition count",
+    )?;
+    validate_count(
+        manifest.emergency_disables.len(),
+        MAX_MANIFEST_ITEMS,
+        "emergency disable count",
+    )?;
     validate_app_version_compatibility(&manifest.minimum_app_version)?;
     validate_rule_channel(&manifest.rule_channel)?;
     let artifacts = validate_artifacts(&manifest.artifacts)?;
 
     let mut ids = std::collections::HashSet::new();
     for composition in &manifest.compositions {
+        validate_text(&composition.id, MAX_ID_CHARS, "composition id")?;
+        validate_text(
+            &composition.display_name,
+            MAX_NAME_CHARS,
+            "composition display name",
+        )?;
+        validate_text(
+            &composition.description,
+            MAX_DESCRIPTION_CHARS,
+            "composition description",
+        )?;
+        validate_optional_text(
+            &composition.fallback_to,
+            MAX_ID_CHARS,
+            "composition fallback",
+        )?;
+        validate_optional_text(
+            &composition.jvm_preset,
+            MAX_NAME_CHARS,
+            "composition jvm preset",
+        )?;
+        validate_count(
+            composition.families.len(),
+            MAX_FILTER_ITEMS,
+            "composition family count",
+        )?;
+        validate_count(
+            composition.loaders.len(),
+            MAX_FILTER_ITEMS,
+            "composition loader count",
+        )?;
+        validate_count(
+            composition.mods.len(),
+            MAX_MANIFEST_ITEMS,
+            "composition mod count",
+        )?;
+        validate_unique_text(&composition.loaders, "composition loaders")?;
+        for loader in &composition.loaders {
+            validate_text(loader, MAX_ID_CHARS, "composition loader")?;
+        }
         if composition.id.is_empty() {
             return Err(ResolveError::MissingCompositionId);
         }
@@ -47,6 +114,32 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ResolveError> {
 
     let mut disable_ids = std::collections::HashSet::new();
     for disable in &manifest.emergency_disables {
+        validate_text(&disable.id, MAX_ID_CHARS, "emergency disable id")?;
+        validate_text(&disable.target_id, MAX_ID_CHARS, "emergency disable target")?;
+        validate_text(
+            &disable.reason,
+            MAX_DESCRIPTION_CHARS,
+            "emergency disable reason",
+        )?;
+        validate_count(
+            disable.families.len(),
+            MAX_FILTER_ITEMS,
+            "emergency family count",
+        )?;
+        validate_count(
+            disable.loaders.len(),
+            MAX_FILTER_ITEMS,
+            "emergency loader count",
+        )?;
+        validate_count(
+            disable.tiers.len(),
+            MAX_FILTER_ITEMS,
+            "emergency tier count",
+        )?;
+        validate_unique_text(&disable.loaders, "emergency loaders")?;
+        for loader in &disable.loaders {
+            validate_text(loader, MAX_ID_CHARS, "emergency loader")?;
+        }
         if disable.id.trim().is_empty() {
             return Err(ResolveError::MissingEmergencyDisableId);
         }
@@ -88,6 +181,13 @@ fn validate_artifacts(
     let mut ids = std::collections::HashSet::new();
     let mut by_id = std::collections::HashMap::new();
     for artifact in artifacts {
+        validate_text(&artifact.id, MAX_ID_CHARS, "artifact id")?;
+        validate_text(
+            &artifact.source.project_id,
+            MAX_ID_CHARS,
+            "artifact project id",
+        )?;
+        validate_text(&artifact.source.slug, MAX_ID_CHARS, "artifact slug")?;
         if artifact.id.trim().is_empty() {
             return Err(ResolveError::MissingArtifactId);
         }
@@ -113,6 +213,23 @@ fn validate_managed_mod_artifact(
     managed_mod: &ManagedMod,
     artifacts: &std::collections::HashMap<String, &ManagedArtifactDefinition>,
 ) -> Result<(), ResolveError> {
+    validate_text(
+        &managed_mod.artifact_id,
+        MAX_ID_CHARS,
+        "managed mod artifact id",
+    )?;
+    validate_text(
+        &managed_mod.project_id,
+        MAX_ID_CHARS,
+        "managed mod project id",
+    )?;
+    validate_text(&managed_mod.slug, MAX_ID_CHARS, "managed mod slug")?;
+    validate_text(&managed_mod.name, MAX_NAME_CHARS, "managed mod name")?;
+    validate_optional_text(
+        &managed_mod.version_range,
+        MAX_VERSION_RANGE_CHARS,
+        "managed mod version range",
+    )?;
     if managed_mod.artifact_id.trim().is_empty() {
         return Err(ResolveError::MissingManagedModArtifactId);
     }
@@ -162,12 +279,17 @@ fn validate_managed_mod_hardware_req(managed_mod: &ManagedMod) -> Result<(), Res
     let Some(requirement) = &managed_mod.hardware_req else {
         return Ok(());
     };
+    validate_optional_text(
+        &requirement.gpu_vendor,
+        64,
+        "managed mod hardware gpu vendor",
+    )?;
     for (field, value) in [
         ("gpu_arch_min", requirement.gpu_arch_min),
         ("min_ram_mb", requirement.min_ram_mb),
         ("min_cores", requirement.min_cores),
     ] {
-        if value < 0 {
+        if !(0..=MAX_HARDWARE_VALUE).contains(&value) {
             return Err(ResolveError::InvalidManagedModHardwareRequirement {
                 artifact_id: managed_mod.artifact_id.clone(),
                 field,
@@ -179,6 +301,11 @@ fn validate_managed_mod_hardware_req(managed_mod: &ManagedMod) -> Result<(), Res
 }
 
 fn validate_managed_mod_mutual_exclusions(managed_mod: &ManagedMod) -> Result<(), ResolveError> {
+    validate_count(
+        managed_mod.mutual_exclusions.len(),
+        MAX_FILTER_ITEMS,
+        "managed mod mutual exclusion count",
+    )?;
     let mut exclusions = std::collections::HashSet::new();
     for exclusion in &managed_mod.mutual_exclusions {
         let trimmed = exclusion.trim();
@@ -189,6 +316,7 @@ fn validate_managed_mod_mutual_exclusions(managed_mod: &ManagedMod) -> Result<()
                 value: exclusion.clone(),
             });
         }
+        validate_text(exclusion, MAX_ID_CHARS, "managed mod mutual exclusion")?;
         if !exclusions.insert(exclusion.to_lowercase()) {
             return Err(ResolveError::InvalidManagedModMutualExclusion {
                 artifact_id: managed_mod.artifact_id.clone(),
@@ -196,6 +324,42 @@ fn validate_managed_mod_mutual_exclusions(managed_mod: &ManagedMod) -> Result<()
                 value: exclusion.clone(),
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_count(actual: usize, max: usize, field: &'static str) -> Result<(), ResolveError> {
+    if actual > max {
+        return Err(ResolveError::ManifestBound(field));
+    }
+    Ok(())
+}
+
+fn validate_text(value: &str, max: usize, field: &'static str) -> Result<(), ResolveError> {
+    if value.chars().count() > max || value.chars().any(char::is_control) {
+        return Err(ResolveError::ManifestBound(field));
+    }
+    Ok(())
+}
+
+fn validate_optional_text(
+    value: &str,
+    max: usize,
+    field: &'static str,
+) -> Result<(), ResolveError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    validate_text(value, max, field)
+}
+
+fn validate_unique_text(values: &[String], field: &'static str) -> Result<(), ResolveError> {
+    let mut seen = std::collections::HashSet::new();
+    if values
+        .iter()
+        .any(|value| !seen.insert(value.to_ascii_lowercase()))
+    {
+        return Err(ResolveError::ManifestBound(field));
     }
     Ok(())
 }

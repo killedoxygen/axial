@@ -181,7 +181,7 @@ mod tests {
                     installs: Arc::new(InstallStore::new()),
                     sessions: Arc::new(SessionStore::new()),
                     performance: Arc::new(
-                        PerformanceManager::new_with_config_dir(&paths.config_dir)
+                        PerformanceManager::load_for_startup(&paths.config_dir)
                             .expect("performance manager"),
                     ),
                     config,

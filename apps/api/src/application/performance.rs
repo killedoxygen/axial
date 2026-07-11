@@ -506,6 +506,19 @@ pub fn refresh_performance_rules_error_response(
                 "error": "performance operations are shutting down"
             })),
         ),
+        RefreshPerformanceRulesError::Refresh(
+            RulesRefreshError::Request(_)
+            | RulesRefreshError::HttpStatus(_)
+            | RulesRefreshError::ResponseTooLarge
+            | RulesRefreshError::Parse(_)
+            | RulesRefreshError::Validation(_)
+            | RulesRefreshError::Signature(_),
+        ) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "Performance rules provider response could not be verified. Try again later."
+            })),
+        ),
         _error => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -565,7 +578,7 @@ async fn handle_refresh_performance_rules(
     }
 
     let before = state.performance().rules_status();
-    match state.performance().refresh_rules().await {
+    match state.refresh_performance_rules().await {
         Ok(status) => {
             let cache_changed = performance_rules_cache_changed(&before, &status);
             if let Some(error) = record_rules_terminal_reconciled(

@@ -1,48 +1,119 @@
-use super::manager::{PerformanceManager, active_rules_write};
+use super::manager::{ACTIVE_RULES_LOCK_INVARIANT, PerformanceManager, PerformanceRulesAuthority};
 use super::model::{
     ActiveRules, PERFORMANCE_RULES_URL_ENV, RemoteRulesCandidate, RulesRefreshError,
+    VerifiedRemoteRules,
 };
 use crate::resolve::validate_manifest;
-use crate::rules_cache::{bounded_warning, write_remote_rules_cache};
+use crate::rules_cache::{
+    RulesCacheState, RulesCacheStatus, bounded_warning, remote_rules_snapshot,
+};
 use crate::signature::{
     RULES_KEY_ID_HEADER, RULES_SIGNATURE_HEADER, signature_metadata_from_header,
 };
 use crate::status::{RuleChannel, RuleSource, RulesValidation};
-use std::path::Path;
+use std::future::Future;
 use std::time::Duration;
 
 const REMOTE_RULES_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RULES_MAX_BYTES: usize = 1024 * 1024;
 
-impl PerformanceManager {
-    pub async fn refresh_rules(
-        &self,
-    ) -> Result<crate::status::PerformanceRulesStatus, RulesRefreshError> {
-        let Some(config_dir) = self.config_dir.as_ref() else {
-            return Err(RulesRefreshError::Unconfigured);
-        };
-        let Some(remote_rules_url) = self.remote_rules_url.as_ref() else {
-            return Err(RulesRefreshError::Unconfigured);
-        };
-        if let Some(warning) = self.remote_rules_verifier.acceptance_warning() {
-            self.record_refresh_warning(format!("Remote rules refresh rejected: {warning}"));
-            return Ok(self.rules_status());
-        }
-
-        match self.fetch_remote_manifest(remote_rules_url).await {
-            Ok(candidate) => match self.accept_remote_manifest(config_dir, candidate) {
-                Ok(()) => Ok(self.rules_status()),
-                Err(error) => {
-                    self.record_refresh_warning(remote_rules_refresh_warning("failed", &error));
-                    Ok(self.rules_status())
-                }
-            },
-            Err(error) => {
-                self.record_refresh_warning(remote_rules_refresh_warning("rejected", &error));
-                Ok(self.rules_status())
-            }
-        }
+impl PerformanceRulesAuthority {
+    pub fn mutation_allowed(&self) -> bool {
+        self.manager.rules_mutation_allowed
     }
+
+    pub async fn fetch_remote_rules(&self) -> Result<VerifiedRemoteRules, RulesRefreshError> {
+        let manager = &self.manager;
+        let Some(remote_rules_url) = manager.remote_rules_url.as_ref() else {
+            return Err(RulesRefreshError::Unconfigured);
+        };
+        if manager.remote_rules_verifier.acceptance_warning().is_some() {
+            let error = match &manager.remote_rules_verifier {
+                crate::signature::RemoteRulesVerifier::MissingPublicKey => {
+                    crate::signature::RulesSignatureError::MissingPublicKey
+                }
+                _ => crate::signature::RulesSignatureError::InvalidPublicKey,
+            };
+            return Err(error.into());
+        }
+        let candidate = manager.fetch_remote_manifest(remote_rules_url).await?;
+        self.verify_remote_manifest(candidate)
+    }
+
+    fn verify_remote_manifest(
+        &self,
+        candidate: RemoteRulesCandidate,
+    ) -> Result<VerifiedRemoteRules, RulesRefreshError> {
+        let manager = &self.manager;
+        let RemoteRulesCandidate {
+            manifest,
+            signature,
+        } = candidate;
+        validate_manifest(&manifest)?;
+        manager
+            .remote_rules_verifier
+            .verify_manifest(&manifest, &signature)?;
+        let snapshot = remote_rules_snapshot(&manifest, signature);
+        let rules_cache = RulesCacheStatus::from_snapshot(&snapshot, RulesCacheState::Recorded);
+        let last_refresh_at = rules_cache.updated_at.clone();
+        Ok(VerifiedRemoteRules {
+            active: ActiveRules {
+                manifest,
+                rule_source: RuleSource::Remote,
+                rule_channel: RuleChannel::Remote,
+                rules_cache,
+                remote_refresh: true,
+                last_refresh_at,
+                validation: RulesValidation::Valid,
+            },
+            snapshot,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn verify_remote_rules_for_test(
+        &self,
+        manifest: crate::types::Manifest,
+        signature: crate::signature::RulesSignatureMetadata,
+    ) -> Result<VerifiedRemoteRules, RulesRefreshError> {
+        self.verify_remote_manifest(RemoteRulesCandidate {
+            manifest,
+            signature,
+        })
+    }
+
+    pub async fn settle_remote_rules<Error, Persisted>(
+        &self,
+        candidate: VerifiedRemoteRules,
+        persisted: Persisted,
+    ) -> Result<crate::status::PerformanceRulesStatus, Error>
+    where
+        Persisted: Future<Output = Result<(), Error>>,
+    {
+        persisted.await?;
+        *self
+            .manager
+            .active
+            .write()
+            .expect(ACTIVE_RULES_LOCK_INVARIANT) = candidate.active;
+        Ok(self.rules_status())
+    }
+
+    pub fn record_refresh_warning(&self, warning: String) {
+        let mut active = self
+            .manager
+            .active
+            .write()
+            .expect(ACTIVE_RULES_LOCK_INVARIANT);
+        active.rules_cache.warning = Some(bounded_warning(warning));
+    }
+
+    pub fn rules_status(&self) -> crate::status::PerformanceRulesStatus {
+        self.manager.rules_status()
+    }
+}
+
+impl PerformanceManager {
     async fn fetch_remote_manifest(
         &self,
         remote_rules_url: &str,
@@ -91,38 +162,6 @@ impl PerformanceManager {
             signature,
         })
     }
-
-    pub(super) fn accept_remote_manifest(
-        &self,
-        config_dir: &Path,
-        candidate: RemoteRulesCandidate,
-    ) -> Result<(), RulesRefreshError> {
-        let RemoteRulesCandidate {
-            manifest,
-            signature,
-        } = candidate;
-        validate_manifest(&manifest)?;
-        self.remote_rules_verifier
-            .verify_manifest(&manifest, &signature)?;
-        let rules_cache = write_remote_rules_cache(config_dir, &manifest, signature)?;
-        let last_refresh_at = rules_cache.updated_at.clone();
-        let mut active = active_rules_write(&self.active);
-        *active = ActiveRules {
-            manifest,
-            rule_source: RuleSource::Remote,
-            rule_channel: RuleChannel::Remote,
-            rules_cache,
-            remote_refresh: true,
-            last_refresh_at,
-            validation: RulesValidation::Valid,
-        };
-        Ok(())
-    }
-
-    pub(super) fn record_refresh_warning(&self, warning: String) {
-        let mut active = active_rules_write(&self.active);
-        active.rules_cache.warning = Some(bounded_warning(warning));
-    }
 }
 
 pub(super) fn configured_remote_rules_url() -> Option<String> {
@@ -135,7 +174,7 @@ pub(super) fn normalize_remote_rules_url(value: Option<String>) -> Option<String
         .filter(|value| !value.is_empty())
 }
 
-pub(super) fn remote_rules_refresh_warning(action: &str, error: &RulesRefreshError) -> String {
+pub fn remote_rules_refresh_warning(action: &str, error: &RulesRefreshError) -> String {
     match error {
         RulesRefreshError::Request(_) => {
             format!("Remote rules refresh {action}: request failed; using previously active rules.")

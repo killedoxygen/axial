@@ -6,6 +6,8 @@ pub enum ResolveError {
     Parse(#[from] serde_json::Error),
     #[error("unsupported schema_version")]
     UnsupportedSchema,
+    #[error("performance manifest exceeds the current {0} bound")]
+    ManifestBound(&'static str),
     #[error("minimum_app_version is required")]
     MissingMinimumAppVersion,
     #[error("minimum_app_version is invalid: {0}")]

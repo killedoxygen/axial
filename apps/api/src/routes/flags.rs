@@ -123,7 +123,7 @@ mod tests {
                 ConfigStore::from_config(paths.clone(), AppConfig::default()).expect("set config"),
             );
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths, InstanceRegistrySnapshot::default())
+                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
                     .expect("load instances"),
             );
             let state = AppState::new(AppStateInit {
@@ -133,7 +133,10 @@ mod tests {
                 instances,
                 installs: Arc::new(InstallStore::new()),
                 sessions: Arc::new(SessionStore::new()),
-                performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+                performance: Arc::new(
+                    PerformanceManager::load_for_startup(&paths.config_dir)
+                        .expect("performance manager"),
+                ),
                 startup_warnings: Vec::new(),
                 frontend_dir: root.join("frontend"),
             });

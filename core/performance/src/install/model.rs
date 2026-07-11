@@ -65,7 +65,19 @@ pub(super) struct ActiveRules {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct RemoteRulesCandidate {
+pub struct RemoteRulesCandidate {
     pub(super) manifest: crate::types::Manifest,
     pub(super) signature: RulesSignatureMetadata,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifiedRemoteRules {
+    pub(super) active: ActiveRules,
+    pub(super) snapshot: crate::rules_cache::RulesCacheSnapshot,
+}
+
+impl VerifiedRemoteRules {
+    pub fn snapshot(&self) -> &crate::rules_cache::RulesCacheSnapshot {
+        &self.snapshot
+    }
 }

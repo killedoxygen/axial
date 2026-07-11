@@ -910,6 +910,22 @@ fn validation_rejects_negative_managed_mod_hardware_requirements() {
 }
 
 #[test]
+fn validation_rejects_oversized_managed_mod_gpu_vendor() {
+    let mut manifest = builtin_manifest().expect("manifest");
+    first_managed_mod_mut(&mut manifest).hardware_req = Some(HardwareRequirement {
+        gpu_vendor: "x".repeat(65),
+        ..HardwareRequirement::default()
+    });
+
+    assert!(matches!(
+        validate_manifest(&manifest),
+        Err(ResolveError::ManifestBound(
+            "managed mod hardware gpu vendor"
+        ))
+    ));
+}
+
+#[test]
 fn validation_accepts_builtin_manifest_and_undeclared_mutual_exclusions() {
     let mut manifest = builtin_manifest().expect("manifest");
     let nvidium = nvidium_managed_mod_mut(&mut manifest);

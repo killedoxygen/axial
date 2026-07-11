@@ -47,6 +47,8 @@ pub enum RulesSignatureError {
     InvalidSignatureEncoding,
     #[error("remote rules signature verification failed")]
     VerificationFailed,
+    #[error("remote rules signature key id is invalid")]
+    InvalidKeyId,
     #[error("failed to serialize remote rules signature payload: {0}")]
     Payload(#[from] serde_json::Error),
     #[error("remote performance manifest failed validation: {0}")]
@@ -101,12 +103,27 @@ impl RemoteRulesVerifier {
         };
 
         validate_manifest(manifest)?;
+        validate_signature_metadata(metadata)?;
         let payload = canonical_manifest_payload(manifest)?;
         let signature = parse_signature(&metadata.signature)?;
         public_key
             .verify_strict(&payload, &signature)
             .map_err(|_| RulesSignatureError::VerificationFailed)
     }
+}
+
+fn validate_signature_metadata(
+    metadata: &RulesSignatureMetadata,
+) -> Result<(), RulesSignatureError> {
+    if let Some(key_id) = metadata.key_id.as_deref()
+        && (key_id.is_empty()
+            || key_id.trim() != key_id
+            || key_id.chars().count() > 64
+            || key_id.chars().any(char::is_control))
+    {
+        return Err(RulesSignatureError::InvalidKeyId);
+    }
+    Ok(())
 }
 
 pub fn configured_remote_rules_verifier(remote_enabled: bool) -> RemoteRulesVerifier {
@@ -128,12 +145,21 @@ pub fn signature_metadata_from_header(
         return Err(RulesSignatureError::MissingSignature);
     };
     parse_signature(signature)?;
+    let key_id = match key_id {
+        Some(value)
+            if value.is_empty()
+                || value.trim() != value
+                || value.chars().count() > 64
+                || value.chars().any(char::is_control) =>
+        {
+            return Err(RulesSignatureError::InvalidKeyId);
+        }
+        Some(value) => Some(value.to_string()),
+        None => None,
+    };
     Ok(RulesSignatureMetadata {
         signature: signature.to_ascii_lowercase(),
-        key_id: key_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.chars().take(64).collect()),
+        key_id,
     })
 }
 
@@ -155,7 +181,10 @@ fn parse_signature(value: &str) -> Result<Signature, RulesSignatureError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RemoteRulesVerifier, RulesSignatureError, RulesSignatureMetadata};
+    use super::{
+        RemoteRulesVerifier, RulesSignatureError, RulesSignatureMetadata,
+        signature_metadata_from_header,
+    };
     use crate::resolve::builtin_manifest;
     use ed25519_dalek::{Signer, SigningKey};
 
@@ -195,6 +224,20 @@ mod tests {
         .expect_err("unknown metadata fields should be invalid");
 
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn signature_header_rejects_padded_or_oversized_key_id() {
+        let signature = "00".repeat(64);
+
+        assert!(matches!(
+            signature_metadata_from_header(Some(&signature), Some(" padded ")),
+            Err(RulesSignatureError::InvalidKeyId)
+        ));
+        assert!(matches!(
+            signature_metadata_from_header(Some(&signature), Some(&"x".repeat(65))),
+            Err(RulesSignatureError::InvalidKeyId)
+        ));
     }
 
     fn signed_metadata(manifest: &crate::types::Manifest) -> (String, RulesSignatureMetadata) {

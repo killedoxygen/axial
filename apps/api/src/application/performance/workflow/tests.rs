@@ -436,7 +436,7 @@ fn build_test_state(
         installs: Arc::new(InstallStore::new()),
         sessions: Arc::new(SessionStore::new()),
         performance: Arc::new(
-            PerformanceManager::new_with_config_dir_remote_url_and_public_key(
+            PerformanceManager::load_for_startup_with_remote_url_and_public_key(
                 &paths.config_dir,
                 remote_rules_url,
                 remote_rules_public_key,

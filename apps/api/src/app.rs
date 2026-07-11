@@ -52,8 +52,7 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 pub fn spawn_performance_rules_refresh(state: &AppState) -> bool {
-    let performance = state.performance().clone();
-    if !performance.remote_refresh_enabled() {
+    if !state.performance().remote_refresh_enabled() {
         return false;
     }
     let Ok(producer) = state.try_claim_producer() else {
@@ -66,11 +65,12 @@ pub fn spawn_performance_rules_refresh(state: &AppState) -> bool {
         interval_seconds = interval.as_secs(),
         "performance rules periodic refresh scheduled"
     );
+    let state = state.clone();
     producer.spawn(run_periodic_refresh_loop(
         move || {
-            let performance = performance.clone();
+            let state = state.clone();
             async move {
-                refresh_performance_rules_once(&performance).await;
+                refresh_performance_rules_once(&state).await;
             }
         },
         interval,
@@ -158,8 +158,8 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>, delay: Duration
     }
 }
 
-async fn refresh_performance_rules_once(performance: &axial_performance::PerformanceManager) {
-    match performance.refresh_rules().await {
+async fn refresh_performance_rules_once(state: &AppState) {
+    match state.refresh_performance_rules().await {
         Ok(status) => {
             if status.warnings.is_empty() {
                 tracing::info!(
@@ -175,9 +175,14 @@ async fn refresh_performance_rules_once(performance: &axial_performance::Perform
             }
         }
         Err(error) => {
-            tracing::warn!("performance rules background refresh failed: {error}");
+            let warning = performance_rules_refresh_log_warning(&error);
+            tracing::warn!(%warning, "performance rules background refresh failed");
         }
     }
+}
+
+fn performance_rules_refresh_log_warning(error: &axial_performance::RulesRefreshError) -> String {
+    axial_performance::remote_rules_refresh_warning("failed", error)
 }
 
 async fn refresh_remote_flags_once(state: &AppState) {
@@ -453,6 +458,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn performance_rules_refresh_log_warning_omits_raw_persistence_details() {
+        let error = axial_performance::RulesRefreshError::Cache(std::io::Error::other(
+            "failed /private/rules-cache.json?token=secret-token",
+        ));
+
+        let warning = performance_rules_refresh_log_warning(&error);
+
+        assert!(warning.contains("remote rules cache could not be persisted"));
+        assert!(!warning.contains("private"));
+        assert!(!warning.contains("rules-cache.json"));
+        assert!(!warning.contains("secret-token"));
+    }
+
     #[tokio::test]
     async fn performance_rules_refresh_spawns_only_when_remote_url_is_configured() {
         let unset_root = axial_api_test_support::test_root("app-refresh-unset");
@@ -698,7 +717,7 @@ mod axial_api_test_support {
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(
-                PerformanceManager::new_with_config_dir_and_remote_url(
+                PerformanceManager::load_for_startup_with_remote_url(
                     &paths.config_dir,
                     remote_rules_url,
                 )

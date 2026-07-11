@@ -1,4 +1,4 @@
-use super::manager::{PerformanceManager, active_rules_read};
+use super::manager::{ACTIVE_RULES_LOCK_INVARIANT, PerformanceManager};
 use crate::types::{
     CompositionPlan, CompositionState, CompositionTier, EmergencyDisable, EmergencyDisableTarget,
     ManagedMod, Manifest, VersionFamily,
@@ -11,7 +11,7 @@ const MAX_INSTALL_FALLBACK_ATTEMPTS: usize = 4;
 
 impl PerformanceManager {
     pub(super) fn install_attempt_plans(&self, plan: &CompositionPlan) -> Vec<CompositionPlan> {
-        let active = active_rules_read(&self.active);
+        let active = self.active.read().expect(ACTIVE_RULES_LOCK_INVARIANT);
         let manifest = &active.manifest;
         let mut plans = vec![plan.clone()];
         let mut seen = std::collections::HashSet::new();

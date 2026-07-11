@@ -107,6 +107,7 @@ pub struct ManagedArtifactIntegrity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HardwareRequirement {
     #[serde(default)]
     pub gpu_vendor: String,
@@ -119,6 +120,7 @@ pub struct HardwareRequirement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedMod {
     pub artifact_id: String,
     pub project_id: String,

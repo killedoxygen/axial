@@ -69,7 +69,10 @@ mod tests {
             instances,
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
-            performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+            performance: Arc::new(
+                PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("performance manager"),
+            ),
             startup_warnings: vec!["startup warning".to_string()],
             frontend_dir: root.join("frontend"),
         });
@@ -121,7 +124,10 @@ mod tests {
             instances,
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
-            performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+            performance: Arc::new(
+                PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("performance manager"),
+            ),
             startup_warnings: Vec::new(),
             frontend_dir: root.join("frontend"),
         });
@@ -164,7 +170,10 @@ mod tests {
             instances,
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
-            performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+            performance: Arc::new(
+                PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("performance manager"),
+            ),
             startup_warnings: Vec::new(),
             frontend_dir: root.join("frontend"),
         });
@@ -208,7 +217,10 @@ mod tests {
             instances,
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
-            performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+            performance: Arc::new(
+                PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("performance manager"),
+            ),
             startup_warnings: Vec::new(),
             frontend_dir: root.join("frontend"),
         });
@@ -246,7 +258,10 @@ mod tests {
             instances: Arc::new(instance_startup.store),
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
-            performance: Arc::new(PerformanceManager::new().expect("performance manager")),
+            performance: Arc::new(
+                PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("performance manager"),
+            ),
             startup_warnings,
             frontend_dir: root.join("frontend"),
         });

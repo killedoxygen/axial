@@ -18,10 +18,13 @@ pub use effective::{
     EffectivePerformanceHealthRequirements, EffectivePerformancePlan, effective_performance_plan,
 };
 pub use health::{BundleHealth, derive_health};
-pub use install::{InstallError, PERFORMANCE_RULES_URL_ENV, PerformanceManager, RulesRefreshError};
+pub use install::{
+    InstallError, PERFORMANCE_RULES_URL_ENV, PerformanceManager, PerformanceRulesAuthority,
+    RulesRefreshError, VerifiedRemoteRules, remote_rules_refresh_warning,
+};
 pub use resolve::{ResolveError, builtin_manifest, detect_hardware, parse_mode, resolve_plan};
 pub use rules_cache::{
-    LoadedRulesCache, RulesCacheSnapshot, RulesCacheState, RulesCacheStatus, rules_cache_path,
+    RULES_CACHE_MAX_BYTES, RulesCacheSnapshot, RulesCacheState, RulesCacheStatus, rules_cache_path,
 };
 pub use signature::{
     PERFORMANCE_RULES_PUBLIC_KEY_ENV, RULES_KEY_ID_HEADER, RULES_SIGNATURE_HEADER,

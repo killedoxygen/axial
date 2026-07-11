@@ -231,7 +231,7 @@ pub(super) fn performance_operation_journal_identity(
 
 async fn execute_performance_rollback(
     state: &AppState,
-    performance: &axial_performance::PerformanceManager,
+    performance: &crate::state::AppPerformanceStore,
     mods_dir: &std::path::Path,
     operation: &PerformanceOperation,
 ) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
@@ -384,7 +384,7 @@ async fn execute_performance_rollback(
 
 async fn execute_performance_remove(
     state: &AppState,
-    performance: &axial_performance::PerformanceManager,
+    performance: &crate::state::AppPerformanceStore,
     mods_dir: &std::path::Path,
     operation: &PerformanceOperation,
 ) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
@@ -520,7 +520,7 @@ async fn execute_performance_remove(
 
 async fn execute_performance_install(
     state: &AppState,
-    performance: &axial_performance::PerformanceManager,
+    performance: &crate::state::AppPerformanceStore,
     mods_dir: &std::path::Path,
     operation: &PerformanceOperation,
     mode: PerformanceMode,
