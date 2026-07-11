@@ -567,32 +567,7 @@ impl OperationJournalStore {
 
     pub async fn retry(&self) -> Result<(), OperationJournalStoreError> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
-        if let Some(persistence) = &self.persistence {
-            let ticket = persistence
-                .writer
-                .retry()
-                .map_err(|error| OperationJournalStoreError::Persistence(error.into()))?;
-            let revision = ticket.revision().get();
-            let candidate = {
-                let records = self.records.read().expect(OPERATION_JOURNAL_LOCK_INVARIANT);
-                records
-                    .retry_candidate
-                    .as_ref()
-                    .filter(|(candidate_revision, _)| *candidate_revision == revision)
-                    .map(|(_, candidate)| candidate.clone())
-                    .unwrap_or_else(|| records.visible.clone())
-            };
-            return self
-                .await_commit(
-                    Some(PendingJournalCommit {
-                        ticket,
-                        revision,
-                        candidate,
-                    }),
-                    mutation,
-                )
-                .await;
-        }
+        let mutation = self.retry_holding_gate(mutation).await?;
         drop(mutation);
         Ok(())
     }
@@ -643,15 +618,56 @@ impl OperationJournalStore {
     }
 
     pub async fn close(&self) -> Result<(), OperationJournalStoreError> {
-        let _mutation = self.mutation_gate.lock().await;
+        let mut mutation = self.mutation_gate.clone().lock_owned().await;
+        if self.has_retry_candidate() {
+            mutation = self.retry_holding_gate(mutation).await?;
+        }
         if let Some(persistence) = &self.persistence {
+            persistence
+                .writer
+                .settle()
+                .await
+                .map_err(|error| OperationJournalStoreError::Persistence(error.into()))?;
             persistence
                 .owner
                 .close()
                 .await
                 .map_err(|error| OperationJournalStoreError::Persistence(error.into()))?;
         }
+        drop(mutation);
         Ok(())
+    }
+
+    async fn retry_holding_gate(
+        &self,
+        mutation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, OperationJournalStoreError> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(mutation);
+        };
+        let ticket = persistence
+            .writer
+            .retry()
+            .map_err(|error| OperationJournalStoreError::Persistence(error.into()))?;
+        let revision = ticket.revision().get();
+        let candidate = {
+            let records = self.records.read().expect(OPERATION_JOURNAL_LOCK_INVARIANT);
+            records
+                .retry_candidate
+                .as_ref()
+                .filter(|(candidate_revision, _)| *candidate_revision == revision)
+                .map(|(_, candidate)| candidate.clone())
+                .unwrap_or_else(|| records.visible.clone())
+        };
+        self.await_commit_holding_gate(
+            Some(PendingJournalCommit {
+                ticket,
+                revision,
+                candidate,
+            }),
+            mutation,
+        )
+        .await
     }
 
     async fn await_commit(
@@ -659,9 +675,18 @@ impl OperationJournalStore {
         commit: Option<PendingJournalCommit>,
         mutation: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<(), OperationJournalStoreError> {
+        let mutation = self.await_commit_holding_gate(commit, mutation).await?;
+        drop(mutation);
+        Ok(())
+    }
+
+    async fn await_commit_holding_gate(
+        &self,
+        commit: Option<PendingJournalCommit>,
+        mutation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, OperationJournalStoreError> {
         let Some(commit) = commit else {
-            drop(mutation);
-            return Ok(());
+            return Ok(mutation);
         };
         let records = self.records.clone();
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
@@ -684,17 +709,15 @@ impl OperationJournalStore {
                     Err(error)
                 }
             };
-            drop(mutation);
-            let _ = completed_tx.send(result);
+            let _ = completed_tx.send((result, mutation));
         });
-        completed_rx
-            .await
-            .map_err(|_| {
-                OperationJournalStoreError::Persistence(io::Error::other(
-                    "operation journal commit observer stopped",
-                ))
-            })?
-            .map_err(|error| OperationJournalStoreError::Persistence(error.into()))
+        let (result, mutation) = completed_rx.await.map_err(|_| {
+            OperationJournalStoreError::Persistence(io::Error::other(
+                "operation journal commit observer stopped",
+            ))
+        })?;
+        result.map_err(|error| OperationJournalStoreError::Persistence(error.into()))?;
+        Ok(mutation)
     }
 }
 
@@ -1722,6 +1745,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_retries_latest_failed_debounced_progress_and_reloads_it() {
+        let (root, paths, backend, coordinator, store) =
+            persistence_fixture("close-retries-debounced-progress");
+        let operation_id = OperationId::new("operation-close-progress-retry");
+        store
+            .create(planned_entry(&operation_id))
+            .await
+            .expect("create journal");
+        backend.fail_next();
+        store
+            .record_progress(&operation_id, completed_step("progress_first"))
+            .await
+            .expect("accept first progress");
+        store
+            .record_progress(&operation_id, completed_step("progress_latest"))
+            .await
+            .expect("accept latest progress");
+        assert!(matches!(
+            store.flush().await,
+            Err(OperationJournalStoreError::Persistence(_))
+        ));
+        assert!(!store.has_retry_candidate());
+
+        store
+            .close()
+            .await
+            .expect("close retries exact debounced snapshot");
+
+        let reloaded =
+            OperationJournalStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("closed owner is released");
+        let journal = reloaded.get(&operation_id).expect("progress reloads");
+        assert_eq!(journal.status, OperationStatus::Running);
+        assert_eq!(journal.completed_steps.len(), 2);
+        assert_eq!(journal.completed_steps[1].step_id, "progress_latest");
+        reloaded.close().await.expect("close reloaded store");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
     async fn physical_failure_stays_hidden_and_retry_publishes_latest_candidate() {
         let (root, _paths, backend, _coordinator, store) =
             persistence_fixture("failure-retry-latest");
@@ -1770,6 +1833,51 @@ mod tests {
             store.get(&operation_id).expect("retried journal").status,
             OperationStatus::Succeeded
         );
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn close_retries_hidden_candidate_and_releases_owner() {
+        let (root, paths, backend, coordinator, store) =
+            persistence_fixture("close-retries-hidden-candidate");
+        let operation_id = OperationId::new("operation-close-retry");
+        store
+            .create(planned_entry(&operation_id))
+            .await
+            .expect("create journal");
+        backend.fail_next();
+        assert!(matches!(
+            store
+                .record_success(
+                    &operation_id,
+                    completed_step("operation_done"),
+                    OperationOutcome::Succeeded,
+                )
+                .await,
+            Err(OperationJournalStoreError::Persistence(_))
+        ));
+        assert_eq!(
+            store.get(&operation_id).expect("visible journal").status,
+            OperationStatus::Planned
+        );
+
+        store
+            .close()
+            .await
+            .expect("close retries the exact hidden candidate");
+        store.close().await.expect("close is idempotent");
+
+        let reloaded =
+            OperationJournalStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("closed owner is released");
+        assert_eq!(
+            reloaded
+                .get(&operation_id)
+                .expect("retried journal reloads")
+                .status,
+            OperationStatus::Succeeded
+        );
+        reloaded.close().await.expect("close reloaded store");
         cleanup(&root);
     }
 

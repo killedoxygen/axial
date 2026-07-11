@@ -303,6 +303,31 @@ impl PerformanceOperationPersistence {
             .insert(operation_id.to_string(), writer);
     }
 
+    async fn settle_writers(
+        &self,
+        excluded_ids: &HashSet<String>,
+    ) -> Result<(), PerformanceOperationStoreError> {
+        let mut writers = self
+            .writers
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .iter()
+            .filter(|(operation_id, _)| !excluded_ids.contains(*operation_id))
+            .map(|(operation_id, writer)| (operation_id.clone(), writer.clone()))
+            .collect::<Vec<_>>();
+        writers.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut first_error = None;
+        for (_, writer) in writers {
+            if let Err(error) = writer.settle().await
+                && first_error.is_none()
+            {
+                first_error = Some(performance_operation_persistence_error(error));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     #[cfg(test)]
     fn writer_count(&self) -> usize {
         self.writers
@@ -690,13 +715,34 @@ impl PerformanceOperationStore {
 
     pub async fn retry_critical(&self, id: &str) -> Result<(), PerformanceOperationStoreError> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
-        let candidate = self
+        let (result, mutation) = self.retry_critical_holding_gate(id, mutation).await;
+        drop(mutation);
+        result
+    }
+
+    async fn retry_critical_holding_gate(
+        &self,
+        id: &str,
+        mutation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> (
+        Result<(), PerformanceOperationStoreError>,
+        Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) {
+        let candidate = match self
             .retry_candidates
             .lock()
             .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
             .get(id)
             .cloned()
-            .ok_or(PerformanceOperationStoreError::RetryUnavailable)?;
+        {
+            Some(candidate) => candidate,
+            None => {
+                return (
+                    Err(PerformanceOperationStoreError::RetryUnavailable),
+                    Some(mutation),
+                );
+            }
+        };
         let Some(persistence) = &self.persistence else {
             apply_status_transition(
                 &mut self
@@ -705,14 +751,25 @@ impl PerformanceOperationStore {
                     .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT),
                 candidate,
             );
-            drop(mutation);
-            return Ok(());
+            self.retry_candidates
+                .lock()
+                .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+                .remove(id);
+            return (Ok(()), Some(mutation));
         };
-        let ticket = persistence
-            .writer(id)?
+        let writer = match persistence.writer(id) {
+            Ok(writer) => writer,
+            Err(error) => return (Err(error), Some(mutation)),
+        };
+        let ticket = match writer
             .retry()
-            .map_err(performance_operation_persistence_error)?;
-        self.await_commit(candidate, ticket, mutation).await
+            .map_err(performance_operation_persistence_error)
+        {
+            Ok(ticket) => ticket,
+            Err(error) => return (Err(error), Some(mutation)),
+        };
+        self.await_commit_holding_gate(candidate, ticket, mutation)
+            .await
     }
 
     pub(crate) fn has_retry_candidate(&self, id: &str) -> bool {
@@ -746,14 +803,18 @@ impl PerformanceOperationStore {
         self.retention_issues()
     }
 
-    #[cfg(test)]
-    pub(crate) fn retry_candidate_ids(&self) -> Vec<String> {
+    fn retry_candidate_ids(&self) -> Vec<String> {
         self.retry_candidates
             .lock()
             .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
             .keys()
             .cloned()
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retry_candidate_ids_for_test(&self) -> Vec<String> {
+        self.retry_candidate_ids()
     }
 
     pub async fn flush(&self) -> Result<(), PerformanceOperationStoreError> {
@@ -781,7 +842,22 @@ impl PerformanceOperationStore {
     }
 
     pub async fn close(&self) -> Result<(), PerformanceOperationStoreError> {
-        let _mutation = self.mutation_gate.lock().await;
+        let mut mutation = self.mutation_gate.clone().lock_owned().await;
+        let mut retry_ids = self.retry_candidate_ids();
+        retry_ids.sort();
+        let mut first_retry_error = None;
+        for id in retry_ids {
+            let (result, next_mutation) = self.retry_critical_holding_gate(&id, mutation).await;
+            let Some(next_mutation) = next_mutation else {
+                return result;
+            };
+            mutation = next_mutation;
+            if let Err(error) = result
+                && first_retry_error.is_none()
+            {
+                first_retry_error = Some(error);
+            }
+        }
         prune_terminal_operations(
             self.inner.clone(),
             self.persistence.clone(),
@@ -789,17 +865,29 @@ impl PerformanceOperationStore {
             self.retention_issues.clone(),
         )
         .await;
+        let retry_ids = self
+            .retry_candidates
+            .lock()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         if let Some(persistence) = &self.persistence {
-            persistence
-                .owner
-                .flush()
-                .await
-                .map_err(performance_operation_persistence_error)?;
+            if let Err(error) = persistence.settle_writers(&retry_ids).await
+                && first_retry_error.is_none()
+            {
+                first_retry_error = Some(error);
+            }
         }
         if !self.retention_issues().is_empty() {
-            return Err(PerformanceOperationStoreError::Persistence(
-                io::Error::other("performance operation terminal retention cleanup is pending"),
-            ));
+            first_retry_error.get_or_insert_with(|| {
+                PerformanceOperationStoreError::Persistence(io::Error::other(
+                    "performance operation terminal retention cleanup is pending",
+                ))
+            });
+        }
+        if let Some(error) = first_retry_error {
+            return Err(error);
         }
         if let Some(persistence) = &self.persistence {
             persistence
@@ -808,6 +896,7 @@ impl PerformanceOperationStore {
                 .await
                 .map_err(performance_operation_persistence_error)?;
         }
+        drop(mutation);
         Ok(())
     }
 
@@ -883,6 +972,22 @@ impl PerformanceOperationStore {
         ticket: AcceptedWrite,
         mutation: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<(), PerformanceOperationStoreError> {
+        let (result, mutation) = self
+            .await_commit_holding_gate(status, ticket, mutation)
+            .await;
+        drop(mutation);
+        result
+    }
+
+    async fn await_commit_holding_gate(
+        &self,
+        status: PerformanceOperationStatus,
+        ticket: AcceptedWrite,
+        mutation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> (
+        Result<(), PerformanceOperationStoreError>,
+        Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) {
         let inner = self.inner.clone();
         let retry_candidates = self.retry_candidates.clone();
         let persistence = self.persistence.clone();
@@ -920,14 +1025,17 @@ impl PerformanceOperationStore {
                     Err(performance_operation_persistence_error(error))
                 }
             };
-            drop(mutation);
-            let _ = completed_tx.send(result);
+            let _ = completed_tx.send((result, mutation));
         });
-        completed_rx.await.map_err(|_| {
-            PerformanceOperationStoreError::Persistence(io::Error::other(
-                "performance operation commit observer stopped",
-            ))
-        })?
+        match completed_rx.await {
+            Ok((result, mutation)) => (result, Some(mutation)),
+            Err(_) => (
+                Err(PerformanceOperationStoreError::Persistence(
+                    io::Error::other("performance operation commit observer stopped"),
+                )),
+                None,
+            ),
+        }
     }
 }
 
@@ -1901,6 +2009,258 @@ mod tests {
             )
             .await
             .expect("terminalized reservation releases instance");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn close_retries_failed_status_and_releases_owner() {
+        let root = test_root("close-retries-failed-status");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        let coordinator = backend.coordinator();
+        backend.set_fail_writes(true);
+        let store = PerformanceOperationStore::try_load_from_paths_with_coordinator(
+            &paths,
+            coordinator.clone(),
+        )
+        .expect("store");
+
+        let failed = store
+            .start_with_identity(
+                "instance-a".to_string(),
+                "install".to_string(),
+                test_payload(),
+                PerformanceOperationJournalIdentity::new(
+                    "install",
+                    "close_retry_failed_status",
+                    RollbackState::Unavailable,
+                ),
+            )
+            .await
+            .expect_err("physical start write fails");
+        let failed_id = failed.operation_id().expect("failed start id").to_string();
+        assert!(store.has_retry_candidate(&failed_id));
+
+        backend.set_fail_writes(false);
+        store
+            .close()
+            .await
+            .expect("close retries exact failed status");
+        store.close().await.expect("close is idempotent");
+
+        let reloaded =
+            PerformanceOperationStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("closed owner is released");
+        let status = reloaded
+            .get(&failed_id)
+            .await
+            .expect("retried status reloads");
+        assert_eq!(status.state, "queued");
+        assert_eq!(status.instance_id, "instance-a");
+        reloaded.close().await.expect("close reloaded store");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn close_attempts_every_failed_status_before_returning_first_error() {
+        let root = test_root("close-attempts-every-failed-status");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        backend.set_fail_writes(true);
+        let store = PerformanceOperationStore::try_load_from_paths_with_coordinator(
+            &paths,
+            backend.coordinator(),
+        )
+        .expect("store");
+
+        let mut failed_ids = Vec::new();
+        for instance_id in ["instance-a", "instance-b"] {
+            let failed = store
+                .start(
+                    instance_id.to_string(),
+                    "install".to_string(),
+                    test_payload(),
+                )
+                .await
+                .expect_err("physical start write fails");
+            failed_ids.push(failed.operation_id().expect("failed start id").to_string());
+        }
+        failed_ids.sort();
+        let first_id = failed_ids[0].clone();
+        let later_id = failed_ids[1].clone();
+        backend.set_fail_writes(false);
+        backend.set_fail_destination(Some(operation_path(&operation_dir(&paths), &first_id)));
+
+        assert!(matches!(
+            store.close().await,
+            Err(PerformanceOperationStoreError::Persistence(_))
+        ));
+        assert!(store.has_retry_candidate(&first_id));
+        assert!(!store.has_retry_candidate(&later_id));
+        assert_eq!(
+            store
+                .get(&later_id)
+                .await
+                .expect("later retry commits")
+                .state,
+            "queued"
+        );
+
+        backend.set_fail_destination(None);
+        store.close().await.expect("remaining retry closes store");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn close_settles_every_failed_debounced_writer_before_returning_first_error() {
+        let root = test_root("close-settles-debounced-writers");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        let coordinator = backend.coordinator();
+        let store = PerformanceOperationStore::try_load_from_paths_with_coordinator(
+            &paths,
+            coordinator.clone(),
+        )
+        .expect("store");
+        let mut ids = Vec::new();
+        for (index, instance_id) in ["instance-a", "instance-b"].into_iter().enumerate() {
+            ids.push(
+                store
+                    .start_with_identity(
+                        instance_id.to_string(),
+                        "install".to_string(),
+                        test_payload(),
+                        PerformanceOperationJournalIdentity::new(
+                            "install",
+                            format!("close_debounced_{index}"),
+                            RollbackState::Unavailable,
+                        ),
+                    )
+                    .await
+                    .expect("operation starts")
+                    .id,
+            );
+        }
+
+        backend.set_fail_writes(true);
+        for id in &ids {
+            store
+                .record_progress(id, "planning")
+                .await
+                .expect("accept first progress");
+            store
+                .record_progress(id, "applying")
+                .await
+                .expect("accept latest progress");
+            assert!(matches!(
+                store
+                    .persistence
+                    .as_ref()
+                    .expect("persistence")
+                    .writer(id)
+                    .expect("writer")
+                    .flush()
+                    .await,
+                Err(_)
+            ));
+            assert!(!store.has_retry_candidate(id));
+        }
+
+        ids.sort();
+        let first_id = ids[0].clone();
+        let later_id = ids[1].clone();
+        backend.set_fail_writes(false);
+        backend.set_fail_destination(Some(operation_path(&operation_dir(&paths), &first_id)));
+        assert!(matches!(
+            store.close().await,
+            Err(PerformanceOperationStoreError::Persistence(_))
+        ));
+
+        let later = load_status_file(&operation_path(&operation_dir(&paths), &later_id))
+            .expect("later debounced writer settles before close returns");
+        assert_eq!(later.state, "applying");
+
+        backend.set_fail_destination(None);
+        store.close().await.expect("remaining writer retry closes");
+        let reloaded =
+            PerformanceOperationStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("closed owner is released");
+        for id in ids {
+            assert_eq!(
+                reloaded
+                    .get(&id)
+                    .await
+                    .expect("latest progress reloads")
+                    .state,
+                "applying"
+            );
+        }
+        reloaded.close().await.expect("close reloaded store");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn close_holds_mutation_gate_across_candidate_retries_and_owner_close() {
+        let root = test_root("close-holds-gate-across-retries");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        backend.set_fail_writes(true);
+        let store = Arc::new(
+            PerformanceOperationStore::try_load_from_paths_with_coordinator(
+                &paths,
+                backend.coordinator(),
+            )
+            .expect("store"),
+        );
+
+        for instance_id in ["instance-a", "instance-b"] {
+            store
+                .start(
+                    instance_id.to_string(),
+                    "install".to_string(),
+                    test_payload(),
+                )
+                .await
+                .expect_err("physical start write fails");
+        }
+        backend.set_fail_writes(false);
+        backend.gate();
+
+        let close_store = store.clone();
+        let close = tokio::spawn(async move { close_store.close().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !backend.entered_write.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first retry enters backend");
+
+        let competing_store = store.clone();
+        let competing = tokio::spawn(async move {
+            competing_store
+                .start(
+                    "instance-c".to_string(),
+                    "install".to_string(),
+                    test_payload(),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!competing.is_finished());
+
+        backend.release();
+        close
+            .await
+            .expect("close task")
+            .expect("all retries and owner close succeed");
+        assert!(matches!(
+            competing.await.expect("competing mutation task"),
+            Err(PerformanceOperationStartError::Store {
+                source: PerformanceOperationStoreError::Persistence(_),
+                ..
+            })
+        ));
         cleanup(&root);
     }
 

@@ -614,6 +614,11 @@ impl GuardianFailureMemoryStore {
     pub async fn close(&self) -> Result<(), FailureMemoryStoreError> {
         if let Some(persistence) = &self.persistence {
             persistence
+                .writer
+                .settle()
+                .await
+                .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
+            persistence
                 .owner
                 .close()
                 .await
@@ -1136,6 +1141,37 @@ mod tests {
         assert_eq!(snapshot.entries[0].key, key);
         assert_eq!(snapshot.entries[0].occurrence_count, 2);
         assert_eq!(snapshot.entries[0].last_observed_at, "2026-06-15T10:01:00Z");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn close_retries_latest_failed_snapshot_and_releases_owner() {
+        let (root, paths, backend, coordinator, store) =
+            persistence_fixture("close-retries-latest");
+        backend.fail_next();
+        let key = retry_entry("2026-06-15T10:00:00Z").key;
+        store
+            .record(retry_entry("2026-06-15T10:00:00Z"))
+            .expect("record first memory");
+        store
+            .record(retry_entry("2026-06-15T10:01:00Z"))
+            .expect("record latest memory");
+
+        store
+            .close()
+            .await
+            .expect("close retries and settles latest snapshot");
+        store.close().await.expect("close is idempotent");
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
+
+        let reloaded =
+            GuardianFailureMemoryStore::try_load_from_paths_with_coordinator(&paths, coordinator)
+                .expect("closed owner is released");
+        let entry = reloaded.get(&key).expect("latest snapshot reloads");
+        assert_eq!(entry.occurrence_count, 2);
+        assert_eq!(entry.last_observed_at, "2026-06-15T10:01:00Z");
+        reloaded.close().await.expect("close reloaded store");
 
         let _ = fs::remove_dir_all(&root);
     }

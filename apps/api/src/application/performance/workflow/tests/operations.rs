@@ -882,7 +882,9 @@ async fn failed_start_returns_bounded_error_then_detached_owner_terminalizes_wit
     .expect_err("failed physical start returns 500");
     assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(json_error_message(&error), PERFORMANCE_JOURNAL_ERROR);
-    let retry_ids = state.performance_operations().retry_candidate_ids();
+    let retry_ids = state
+        .performance_operations()
+        .retry_candidate_ids_for_test();
     assert_eq!(retry_ids.len(), 1);
     let install_id = retry_ids[0].clone();
     let conflict = handle_install(State(state.clone()), Json(payload()))
