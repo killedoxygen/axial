@@ -27,11 +27,7 @@ mod model;
 #[cfg(test)]
 mod tests;
 
-pub use artifact_descriptor::{
-    GuardianArtifactDescriptorError, GuardianMinecraftArtifactKind,
-    GuardianMinecraftArtifactRepairDescriptor, GuardianMinecraftArtifactRepairMetadata,
-    MAX_MINECRAFT_REPAIR_ARTIFACT_BYTES,
-};
+pub use artifact_descriptor::GuardianMinecraftArtifactRepairDescriptor;
 pub use artifact_repair::{
     GuardianArtifactRepairMutation, GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest,
     GuardianArtifactRepairSource, GuardianArtifactRepairStatus, execute_guardian_artifact_repair,
