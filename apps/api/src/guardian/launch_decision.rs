@@ -1,6 +1,6 @@
 use super::{
     Diagnosis, DiagnosisId, GuardianActionKind, GuardianConfidence, GuardianDecision,
-    GuardianDecisionKind, GuardianDomain, GuardianImpactVector, GuardianLaunchRecoveryDirective,
+    GuardianDomain, GuardianImpactVector, GuardianLaunchRecoveryDirective,
     GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind, GuardianMode, GuardianPolicyContext,
     GuardianSeverity, GuardianUserOutcome, SafetyCase, decide_guardian_policy,
 };
@@ -128,7 +128,7 @@ pub fn guardian_prelaunch_preset_adjustment_directive(
         &safety_case,
         policy_context(request.explicit_jvm_preset_present),
     );
-    (decision.kind == GuardianDecisionKind::Downgrade).then(|| {
+    (decision.kind == GuardianActionKind::Downgrade).then(|| {
         let requested = safe_preset_label(requested);
         let effective = safe_preset_label(effective);
         GuardianLaunchRecoveryDirective {
@@ -196,13 +196,13 @@ pub fn guardian_observed_launch_failure_outcome(
     let copy = accepted_launch_failure_copy(failure_class, crash_evidence)?;
     let (decision, phase, summary, detail) = match observed_phase {
         GuardianObservedLaunchFailurePhase::BeforeBoot => (
-            GuardianDecisionKind::Block,
+            GuardianActionKind::Block,
             OperationPhase::Launching,
             "Guardian blocked launch startup.",
             copy.startup_detail.as_str(),
         ),
         GuardianObservedLaunchFailurePhase::AfterBoot => (
-            GuardianDecisionKind::Warn,
+            GuardianActionKind::Warn,
             OperationPhase::Running,
             copy.running_summary.as_str(),
             copy.running_detail.as_str(),
@@ -506,7 +506,7 @@ fn prepare_failure_directive(
     decision: &GuardianDecision,
 ) -> Option<GuardianLaunchRecoveryDirective> {
     match (request.failure_class, decision.kind) {
-        (LaunchFailureClass::JavaRuntimeMismatch, GuardianDecisionKind::Fallback)
+        (LaunchFailureClass::JavaRuntimeMismatch, GuardianActionKind::Fallback)
             if request.requested_java_present
                 && request.explicit_java_override_present
                 && !request.runtime_intervention_applied =>
@@ -521,7 +521,7 @@ fn prepare_failure_directive(
             LaunchFailureClass::JvmUnsupportedOption
             | LaunchFailureClass::JvmExperimentalUnlock
             | LaunchFailureClass::JvmOptionOrdering,
-            GuardianDecisionKind::Strip,
+            GuardianActionKind::Strip,
         ) if request.explicit_jvm_args_present && !request.raw_jvm_args_intervention_applied => {
             Some(GuardianLaunchRecoveryDirective {
                 kind: GuardianLaunchRecoveryKind::StripRawJvmArgs,
@@ -543,13 +543,13 @@ fn startup_failure_directive(
         (&template.effect, decision.kind),
         (
             GuardianLaunchRecoveryEffect::DowngradePreset { .. },
-            GuardianDecisionKind::Downgrade
+            GuardianActionKind::Downgrade
         ) | (
             GuardianLaunchRecoveryEffect::DisableCustomGc,
-            GuardianDecisionKind::Strip
+            GuardianActionKind::Strip
         ) | (
             GuardianLaunchRecoveryEffect::ForceManagedRuntime,
-            GuardianDecisionKind::Fallback
+            GuardianActionKind::Fallback
         )
     );
     decision_matches.then_some(GuardianLaunchRecoveryDirective {
@@ -643,11 +643,11 @@ fn prepare_failure_user_outcome(
     }
 
     let summary = match decision.kind {
-        GuardianDecisionKind::Fallback | GuardianDecisionKind::Strip => {
+        GuardianActionKind::Fallback | GuardianActionKind::Strip => {
             "Guardian adjusted launch preparation."
         }
-        GuardianDecisionKind::AskUser => "Guardian needs confirmation before launch preparation.",
-        GuardianDecisionKind::Block => "Guardian blocked launch preparation.",
+        GuardianActionKind::AskUser => "Guardian needs confirmation before launch preparation.",
+        GuardianActionKind::Block => "Guardian blocked launch preparation.",
         _ => "Guardian recorded launch preparation failure.",
     };
 
@@ -682,11 +682,11 @@ fn startup_failure_user_outcome(
     }
 
     let summary = match decision.kind {
-        GuardianDecisionKind::Downgrade
-        | GuardianDecisionKind::Strip
-        | GuardianDecisionKind::Fallback => "Guardian selected a guarded startup retry.",
-        GuardianDecisionKind::AskUser => "Guardian needs confirmation before startup recovery.",
-        GuardianDecisionKind::Block => "Guardian blocked launch startup.",
+        GuardianActionKind::Downgrade
+        | GuardianActionKind::Strip
+        | GuardianActionKind::Fallback => "Guardian selected a guarded startup retry.",
+        GuardianActionKind::AskUser => "Guardian needs confirmation before startup recovery.",
+        GuardianActionKind::Block => "Guardian blocked launch startup.",
         _ => "Guardian recorded launch startup failure.",
     };
 
@@ -699,16 +699,16 @@ fn startup_failure_user_outcome(
     }
 }
 
-fn public_user_decision(decision: GuardianDecisionKind) -> GuardianDecisionKind {
+fn public_user_decision(decision: GuardianActionKind) -> GuardianActionKind {
     match decision {
-        GuardianDecisionKind::Fallback
-        | GuardianDecisionKind::Strip
-        | GuardianDecisionKind::Downgrade
-        | GuardianDecisionKind::Retry => decision,
-        GuardianDecisionKind::AskUser => GuardianDecisionKind::AskUser,
-        GuardianDecisionKind::Block => GuardianDecisionKind::Block,
-        GuardianDecisionKind::Allow | GuardianDecisionKind::RecordOnly => decision,
-        _ => GuardianDecisionKind::Warn,
+        GuardianActionKind::Fallback
+        | GuardianActionKind::Strip
+        | GuardianActionKind::Downgrade
+        | GuardianActionKind::Retry => decision,
+        GuardianActionKind::AskUser => GuardianActionKind::AskUser,
+        GuardianActionKind::Block => GuardianActionKind::Block,
+        GuardianActionKind::Allow | GuardianActionKind::RecordOnly => decision,
+        _ => GuardianActionKind::Warn,
     }
 }
 
@@ -795,7 +795,6 @@ fn safety_case(mode: GuardianMode, phase: OperationPhase, diagnosis: Diagnosis) 
         mode,
         phase,
         diagnoses: vec![diagnosis],
-        hard_constraints: Vec::new(),
     }
 }
 
@@ -1207,7 +1206,7 @@ mod tests {
         guardian_startup_failure_outcome,
     };
     use crate::guardian::{
-        GuardianDecisionKind, GuardianLaunchRecoveryKind, GuardianMode,
+        GuardianActionKind, GuardianLaunchRecoveryKind, GuardianMode,
         conservative_launch_recovery_preset,
     };
     use crate::state::contracts::{OperationPhase, OwnershipClass};
@@ -1227,10 +1226,7 @@ mod tests {
         });
 
         let directive = outcome.directive.expect("fallback directive");
-        assert_eq!(
-            outcome.guardian_decision.kind,
-            GuardianDecisionKind::Fallback
-        );
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Fallback);
         assert_eq!(
             directive.kind,
             GuardianLaunchRecoveryKind::SwitchManagedRuntime
@@ -1255,7 +1251,7 @@ mod tests {
         });
 
         let directive = outcome.directive.expect("strip directive");
-        assert_eq!(outcome.guardian_decision.kind, GuardianDecisionKind::Strip);
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Strip);
         assert_eq!(directive.kind, GuardianLaunchRecoveryKind::StripRawJvmArgs);
         assert_eq!(
             directive.effect,
@@ -1277,10 +1273,7 @@ mod tests {
         });
 
         assert!(outcome.directive.is_none());
-        assert_eq!(
-            outcome.guardian_decision.kind,
-            GuardianDecisionKind::AskUser
-        );
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::AskUser);
     }
 
     #[test]
@@ -1344,7 +1337,7 @@ mod tests {
         let directive = outcome.directive.expect("downgrade directive");
         assert_eq!(
             outcome.guardian_decision.kind,
-            GuardianDecisionKind::Downgrade
+            GuardianActionKind::Downgrade
         );
         assert_eq!(directive.kind, GuardianLaunchRecoveryKind::DowngradePreset);
         assert_eq!(
@@ -1375,7 +1368,7 @@ mod tests {
         });
 
         let directive = outcome.directive.expect("disable gc directive");
-        assert_eq!(outcome.guardian_decision.kind, GuardianDecisionKind::Strip);
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Strip);
         assert_eq!(directive.kind, GuardianLaunchRecoveryKind::DisableCustomGc);
         assert_eq!(
             directive.effect,
@@ -1403,10 +1396,7 @@ mod tests {
         });
 
         let directive = outcome.directive.expect("runtime switch directive");
-        assert_eq!(
-            outcome.guardian_decision.kind,
-            GuardianDecisionKind::Fallback
-        );
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Fallback);
         assert_eq!(
             directive.kind,
             GuardianLaunchRecoveryKind::SwitchManagedRuntime
@@ -1432,7 +1422,7 @@ mod tests {
             effective_preset: "legacy",
         });
 
-        assert_eq!(outcome.guardian_decision.kind, GuardianDecisionKind::Block);
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Block);
         assert_eq!(
             outcome.safety_case.diagnoses[0].id.as_str(),
             "launcher_managed_artifact_signature_corrupt"
@@ -1466,8 +1456,8 @@ mod tests {
         });
 
         assert_eq!(outcome.failure_class, LaunchFailureClass::OutOfMemory);
-        assert_eq!(outcome.guardian_decision.kind, GuardianDecisionKind::Block);
-        assert_eq!(outcome.user_outcome.decision, GuardianDecisionKind::Block);
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Block);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
         assert_eq!(
             outcome.safety_case.diagnoses[0].id.as_str(),
             "out_of_memory"
@@ -1515,7 +1505,7 @@ mod tests {
             GuardianObservedLaunchFailurePhase::AfterBoot,
         )
         .expect("OOM is an accepted launch crash");
-        assert_eq!(post_boot.decision, GuardianDecisionKind::Warn);
+        assert_eq!(post_boot.decision, GuardianActionKind::Warn);
         assert_eq!(post_boot.phase, OperationPhase::Running);
         assert_eq!(
             post_boot.summary,
@@ -1580,7 +1570,7 @@ mod tests {
                 GuardianObservedLaunchFailurePhase::BeforeBoot,
             )
             .expect("accepted before-boot crash outcome");
-            assert_eq!(before_boot.decision, GuardianDecisionKind::Block);
+            assert_eq!(before_boot.decision, GuardianActionKind::Block);
             assert_eq!(before_boot.phase, OperationPhase::Launching);
             assert_eq!(before_boot.details, outcome.user_outcome.details);
             assert_eq!(before_boot.guidance, outcome.user_outcome.guidance);
@@ -1661,8 +1651,8 @@ mod tests {
             effective_preset: "performance",
         });
 
-        assert_eq!(outcome.guardian_decision.kind, GuardianDecisionKind::Block);
-        assert_eq!(outcome.user_outcome.decision, GuardianDecisionKind::Block);
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Block);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
         assert_eq!(
             outcome.user_outcome.summary,
             "Guardian blocked launch startup."

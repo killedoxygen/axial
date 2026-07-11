@@ -1,6 +1,6 @@
 use super::{
-    DiagnosisId, FactReliability, GuardianDecisionKind, GuardianDomain, GuardianFact,
-    GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianUserOutcome, build_safety_case,
+    DiagnosisId, FactReliability, GuardianActionKind, GuardianDomain, GuardianFact, GuardianFactId,
+    GuardianMode, GuardianPolicyContext, GuardianUserOutcome, build_safety_case,
     decide_guardian_policy, persisted_state_load_user_outcome,
 };
 use crate::state::contracts::{
@@ -9,7 +9,7 @@ use crate::state::contracts::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuardianStateLoadOutcome {
-    pub decision: GuardianDecisionKind,
+    pub decision: GuardianActionKind,
     pub diagnosis_id: DiagnosisId,
     pub user_outcome: GuardianUserOutcome,
 }
@@ -62,7 +62,7 @@ fn persisted_state_load_fact(target: TargetDescriptor) -> GuardianFact {
 #[cfg(test)]
 mod tests {
     use super::persisted_state_load_guardian_outcome;
-    use crate::guardian::GuardianDecisionKind;
+    use crate::guardian::GuardianActionKind;
     use crate::state::contracts::OperationPhase;
 
     #[test]
@@ -74,7 +74,7 @@ mod tests {
     fn state_load_issues_flow_through_guardian_policy() {
         let outcome = persisted_state_load_guardian_outcome(2).expect("guardian outcome");
 
-        assert_eq!(outcome.decision, GuardianDecisionKind::Warn);
+        assert_eq!(outcome.decision, GuardianActionKind::Warn);
         assert_eq!(
             outcome.diagnosis_id.as_str(),
             "persisted_state_schema_invalid"

@@ -1350,7 +1350,11 @@ mod tests {
     fn checked_in_operation_journals_v1_fixture_is_byte_stable() {
         let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V1_FIXTURE)
             .expect("strict fixture");
-        assert_eq!(snapshot.schema, super::OPERATION_JOURNAL_SCHEMA);
+        assert_eq!(
+            super::OPERATION_JOURNAL_SCHEMA,
+            "axial.state.operation_journals.v1"
+        );
+        assert_eq!(snapshot.schema, "axial.state.operation_journals.v1");
         let diagnosis_ids = snapshot
             .entries
             .iter()

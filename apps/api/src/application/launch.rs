@@ -385,11 +385,11 @@ mod tests {
 
         assert_eq!(
             outcome.guardian_decision.kind,
-            crate::guardian::GuardianDecisionKind::RecordOnly
+            crate::guardian::GuardianActionKind::RecordOnly
         );
         assert_eq!(
             outcome.user_outcome.decision,
-            crate::guardian::GuardianDecisionKind::Warn
+            crate::guardian::GuardianActionKind::Warn
         );
         assert_eq!(
             super::launch_preflight_stage_evidence(&outcome, "managed")[0].details,

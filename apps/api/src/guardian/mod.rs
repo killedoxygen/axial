@@ -76,9 +76,8 @@ pub use launch_recovery::{
 pub use model::{
     ActionPlanPrerequisite, Diagnosis, DiagnosisId, FactReliability, GuardianAction,
     GuardianActionKind, GuardianActionPlan, GuardianConfidence, GuardianCoreError,
-    GuardianDecision, GuardianDecisionKind, GuardianDomain, GuardianFact, GuardianFactId,
-    GuardianHardConstraint, GuardianImpactVector, GuardianMode, GuardianSeverity, SafetyCase,
-    SafetyOutcome,
+    GuardianDecision, GuardianDomain, GuardianFact, GuardianFactId, GuardianImpactVector,
+    GuardianMode, GuardianSeverity, SafetyCase, SafetyOutcome,
 };
 pub use outcome::{
     GuardianUserOutcome, install_artifact_repair_user_outcome, install_failure_user_outcome,

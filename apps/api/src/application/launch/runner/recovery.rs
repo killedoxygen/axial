@@ -713,11 +713,11 @@ mod tests {
 
         assert_eq!(
             outcome.guardian_decision.kind,
-            crate::guardian::GuardianDecisionKind::Block
+            crate::guardian::GuardianActionKind::Block
         );
         assert_eq!(
             outcome.user_outcome.decision,
-            crate::guardian::GuardianDecisionKind::Block
+            crate::guardian::GuardianActionKind::Block
         );
         assert!(outcome.directive.is_none());
         assert_eq!(guardian.decision, GuardianDecision::Blocked);

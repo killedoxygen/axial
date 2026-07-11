@@ -17,7 +17,7 @@ use crate::application::{
     launch_preflight_stage_evidence, stage_launch_instance_command,
 };
 use crate::guardian::{
-    GuardianDecisionKind as ApiGuardianDecisionKind, GuardianFact,
+    GuardianActionKind as ApiGuardianActionKind, GuardianFact,
     GuardianLaunchFailureMemoryIntakeRequest, GuardianLaunchRecoveryCurrentIntent,
     GuardianPreflightDirective, GuardianPreflightOutcome, GuardianPreflightOutcomeRequest,
     GuardianPreflightReadiness, guardian_fact_from_execution, guardian_preflight_outcome,
@@ -834,7 +834,7 @@ fn apply_guardian_preflight_interventions(
 fn guardian_preflight_blocks_launch(outcome: &GuardianPreflightOutcome) -> bool {
     matches!(
         outcome.user_outcome.decision,
-        ApiGuardianDecisionKind::Block | ApiGuardianDecisionKind::AskUser
+        ApiGuardianActionKind::Block | ApiGuardianActionKind::AskUser
     )
 }
 

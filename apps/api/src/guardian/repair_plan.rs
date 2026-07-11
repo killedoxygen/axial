@@ -5,7 +5,7 @@
 
 use super::{
     DiagnosisId, GuardianAction, GuardianActionKind, GuardianActionPlan, GuardianConfidence,
-    GuardianDecision, GuardianDecisionKind, GuardianMode,
+    GuardianDecision, GuardianMode,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
 use crate::state::contracts::{
@@ -184,7 +184,7 @@ pub fn plan_managed_runtime_ready_marker_repair(
     if !context.executor_available {
         return Err(GuardianRepairPlanRejection::MissingExecutorCapability);
     }
-    if decision.kind != GuardianDecisionKind::Repair || decision.mode == GuardianMode::Disabled {
+    if decision.kind != GuardianActionKind::Repair || decision.mode == GuardianMode::Disabled {
         return Err(GuardianRepairPlanRejection::NonRepairDecision);
     }
 
@@ -239,7 +239,7 @@ fn plan_launcher_managed_artifact_repair_with_tasks(
     if !context.executor_available {
         return Err(GuardianRepairPlanRejection::MissingExecutorCapability);
     }
-    if decision.kind != GuardianDecisionKind::Repair {
+    if decision.kind != GuardianActionKind::Repair {
         return Err(GuardianRepairPlanRejection::NonRepairDecision);
     }
 
@@ -643,8 +643,7 @@ mod tests {
     };
     use crate::guardian::{
         ActionPlanPrerequisite, DiagnosisId, GuardianAction, GuardianActionKind,
-        GuardianActionPlan, GuardianConfidence, GuardianDecision, GuardianDecisionKind,
-        GuardianMode,
+        GuardianActionPlan, GuardianConfidence, GuardianDecision, GuardianMode,
     };
     use crate::state::contracts::{
         OperationId, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
@@ -842,7 +841,7 @@ mod tests {
     #[test]
     fn rejects_non_repair_and_unsupported_diagnosis() {
         let mut non_repair = repair_decision(OwnershipClass::LauncherManaged);
-        non_repair.kind = GuardianDecisionKind::Block;
+        non_repair.kind = GuardianActionKind::Block;
 
         assert_eq!(
             plan_launcher_managed_artifact_repair(
@@ -946,7 +945,7 @@ mod tests {
         GuardianDecision {
             operation_id: Some(OperationId::new("operation-install-repair")),
             mode: GuardianMode::Managed,
-            kind: GuardianDecisionKind::Repair,
+            kind: GuardianActionKind::Repair,
             diagnoses: vec![DiagnosisId::new("launcher_managed_artifact_corrupt")],
             action_plan: Some(GuardianActionPlan::new(
                 StabilizationSystem::Guardian,
@@ -986,7 +985,7 @@ mod tests {
         GuardianDecision {
             operation_id: Some(operation_id),
             mode: GuardianMode::Managed,
-            kind: GuardianDecisionKind::Repair,
+            kind: GuardianActionKind::Repair,
             diagnoses: vec![diagnosis_id.clone()],
             action_plan: Some(GuardianActionPlan::new(
                 StabilizationSystem::Guardian,

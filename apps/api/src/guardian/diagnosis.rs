@@ -1,7 +1,7 @@
 use super::inference_graph::{AffectedTargetStrategy, diagnosis_node_for_fact};
 use super::{
     Diagnosis, DiagnosisId, GuardianActionKind, GuardianConfidence, GuardianDomain, GuardianFact,
-    GuardianHardConstraint, GuardianImpactVector, GuardianMode, GuardianSeverity, SafetyCase,
+    GuardianImpactVector, GuardianMode, GuardianSeverity, SafetyCase,
 };
 use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
@@ -29,11 +29,6 @@ pub fn build_safety_case(
         mode,
         phase,
         diagnoses: diagnose_facts(facts, phase),
-        hard_constraints: vec![
-            GuardianHardConstraint::OwnershipRequired,
-            GuardianHardConstraint::RedactionRequired,
-            GuardianHardConstraint::RetryLoopForbidden,
-        ],
     }
 }
 

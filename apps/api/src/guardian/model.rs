@@ -185,17 +185,6 @@ pub struct SafetyCase {
     pub mode: GuardianMode,
     pub phase: OperationPhase,
     pub diagnoses: Vec<Diagnosis>,
-    pub hard_constraints: Vec<GuardianHardConstraint>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum GuardianHardConstraint {
-    OwnershipRequired,
-    RedactionRequired,
-    JournalRequiredForMutation,
-    UserOwnedDestructiveMutationForbidden,
-    UnknownOwnedDestructiveMutationForbidden,
-    RetryLoopForbidden,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -211,27 +200,9 @@ pub struct ActionPlanPrerequisite {
 pub struct GuardianDecision {
     pub operation_id: Option<OperationId>,
     pub mode: GuardianMode,
-    pub kind: GuardianDecisionKind,
+    pub kind: GuardianActionKind,
     pub diagnoses: Vec<DiagnosisId>,
     pub action_plan: Option<GuardianActionPlan>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum GuardianDecisionKind {
-    Allow,
-    Warn,
-    Repair,
-    Retry,
-    Replace,
-    Strip,
-    Downgrade,
-    Degrade,
-    Fallback,
-    Quarantine,
-    Rollback,
-    Block,
-    AskUser,
-    RecordOnly,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -268,13 +239,10 @@ pub enum GuardianActionKind {
     Warn,
     Repair,
     Retry,
-    Replace,
     Strip,
     Downgrade,
-    Degrade,
     Fallback,
     Quarantine,
-    Rollback,
     AskUser,
     Block,
     RecordOnly,
@@ -282,7 +250,7 @@ pub enum GuardianActionKind {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SafetyOutcome {
-    pub decision: GuardianDecisionKind,
+    pub decision: GuardianActionKind,
     pub summary: String,
     pub detail: Option<String>,
     pub diagnoses: Vec<DiagnosisId>,

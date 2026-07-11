@@ -29,9 +29,28 @@ fn checked_in_guardian_decision_actions_fixture_is_byte_stable() {
     let decisions =
         serde_json::from_str::<Vec<GuardianDecision>>(GUARDIAN_DECISION_ACTIONS_FIXTURE)
             .expect("decision fixture");
-    assert_eq!(decisions.len(), 11);
-    let mut kinds = std::collections::BTreeSet::new();
+    let expected_kinds = [
+        GuardianActionKind::Allow,
+        GuardianActionKind::Warn,
+        GuardianActionKind::Repair,
+        GuardianActionKind::Retry,
+        GuardianActionKind::Strip,
+        GuardianActionKind::Downgrade,
+        GuardianActionKind::Fallback,
+        GuardianActionKind::Quarantine,
+        GuardianActionKind::AskUser,
+        GuardianActionKind::Block,
+        GuardianActionKind::RecordOnly,
+    ];
+    assert_eq!(
+        decisions
+            .iter()
+            .map(|decision| decision.kind)
+            .collect::<Vec<_>>(),
+        expected_kinds
+    );
     for decision in &decisions {
+        assert_fixture_action_kind(decision.kind);
         let plan = decision.action_plan.as_ref().expect("fixture action plan");
         let action = plan.actions.as_slice().first().expect("fixture action");
         assert_eq!(plan.actions.len(), 1);
@@ -44,11 +63,14 @@ fn checked_in_guardian_decision_actions_fixture_is_byte_stable() {
             plan.prerequisite.candidate_actions.as_slice(),
             &[action.kind]
         );
+        assert_eq!(
+            action.target.as_ref(),
+            plan.prerequisite.affected_targets.first()
+        );
 
         let decision_kind = serde_json::to_string(&decision.kind).expect("decision kind");
         let action_kind = serde_json::to_string(&action.kind).expect("action kind");
         assert_eq!(decision_kind, action_kind);
-        assert!(kinds.insert(decision_kind));
     }
 
     let pretty = serde_json::to_string_pretty(&decisions).expect("pretty decision fixture");
@@ -61,6 +83,22 @@ fn checked_in_guardian_decision_actions_fixture_is_byte_stable() {
         serde_json::to_string(&decoded).expect("re-encode compact decisions"),
         compact
     );
+}
+
+fn assert_fixture_action_kind(kind: GuardianActionKind) {
+    match kind {
+        GuardianActionKind::Allow
+        | GuardianActionKind::Warn
+        | GuardianActionKind::Repair
+        | GuardianActionKind::Retry
+        | GuardianActionKind::Strip
+        | GuardianActionKind::Downgrade
+        | GuardianActionKind::Fallback
+        | GuardianActionKind::Quarantine
+        | GuardianActionKind::AskUser
+        | GuardianActionKind::Block
+        | GuardianActionKind::RecordOnly => {}
+    }
 }
 
 #[test]
@@ -1414,7 +1452,7 @@ fn guardian_fact_redaction_drops_raw_paths_jvm_args_and_tokens() {
 }
 
 #[test]
-fn safety_case_carries_diagnosis_and_hard_constraints() {
+fn safety_case_carries_diagnosis() {
     let execution_fact = ExecutionFact {
         operation_id: None,
         kind: ExecutionFactKind::RuntimeWrongMajor,
@@ -1439,7 +1477,6 @@ fn safety_case_carries_diagnosis_and_hard_constraints() {
         safety_case.diagnoses[0].id.as_str(),
         "java_runtime_major_mismatch"
     );
-    assert!(!safety_case.hard_constraints.is_empty());
 }
 
 #[test]

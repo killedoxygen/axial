@@ -27,7 +27,12 @@
       "actions": [
         {
           "kind": "Allow",
-          "target": null,
+          "target": {
+            "system": "Guardian",
+            "kind": "Instance",
+            "id": "fixture_instance",
+            "ownership": "LauncherManaged"
+          },
           "reason": "launch_command_prepared"
         }
       ]
@@ -61,7 +66,12 @@
       "actions": [
         {
           "kind": "Warn",
-          "target": null,
+          "target": {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_memory",
+            "ownership": "UserOwned"
+          },
           "reason": "launch_memory_allocation_low"
         }
       ]
@@ -95,7 +105,12 @@
       "actions": [
         {
           "kind": "Repair",
-          "target": null,
+          "target": {
+            "system": "Guardian",
+            "kind": "Runtime",
+            "id": "fixture_runtime",
+            "ownership": "LauncherManaged"
+          },
           "reason": "managed_runtime_corrupt"
         }
       ]
@@ -129,7 +144,12 @@
       "actions": [
         {
           "kind": "Retry",
-          "target": null,
+          "target": {
+            "system": "Guardian",
+            "kind": "Session",
+            "id": "fixture_session",
+            "ownership": "LauncherManaged"
+          },
           "reason": "process_lifecycle_observed"
         }
       ]
@@ -163,7 +183,12 @@
       "actions": [
         {
           "kind": "Strip",
-          "target": null,
+          "target": {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_jvm_args",
+            "ownership": "UserOwned"
+          },
           "reason": "jvm_args_malformed"
         }
       ]
@@ -197,7 +222,12 @@
       "actions": [
         {
           "kind": "Downgrade",
-          "target": null,
+          "target": {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_jvm_preset",
+            "ownership": "UserOwned"
+          },
           "reason": "jvm_preset_recovery"
         }
       ]
@@ -231,7 +261,12 @@
       "actions": [
         {
           "kind": "Fallback",
-          "target": null,
+          "target": {
+            "system": "Guardian",
+            "kind": "Runtime",
+            "id": "fixture_java_override",
+            "ownership": "UserOwned"
+          },
           "reason": "java_override_unavailable"
         }
       ]
@@ -265,7 +300,12 @@
       "actions": [
         {
           "kind": "Quarantine",
-          "target": null,
+          "target": {
+            "system": "Guardian",
+            "kind": "Artifact",
+            "id": "fixture_artifact",
+            "ownership": "LauncherManaged"
+          },
           "reason": "launcher_managed_artifact_corrupt"
         }
       ]
@@ -299,7 +339,12 @@
       "actions": [
         {
           "kind": "AskUser",
-          "target": null,
+          "target": {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_custom_java",
+            "ownership": "UserOwned"
+          },
           "reason": "custom_java_override_present"
         }
       ]
@@ -333,7 +378,12 @@
       "actions": [
         {
           "kind": "Block",
-          "target": null,
+          "target": {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_state",
+            "ownership": "LauncherManaged"
+          },
           "reason": "persisted_state_schema_invalid"
         }
       ]
@@ -367,7 +417,12 @@
       "actions": [
         {
           "kind": "RecordOnly",
-          "target": null,
+          "target": {
+            "system": "Guardian",
+            "kind": "Instance",
+            "id": "fixture_unknown",
+            "ownership": "Unknown"
+          },
           "reason": "unknown_failure_planning"
         }
       ]

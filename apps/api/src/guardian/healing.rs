@@ -849,8 +849,8 @@ mod tests {
     use crate::execution::runtime::{ManagedRuntimeRoot, ManagedRuntimeRootError};
     use crate::guardian::{
         ActionPlanPrerequisite, DiagnosisId, GuardianAction, GuardianActionKind,
-        GuardianActionPlan, GuardianDecision, GuardianDecisionKind, GuardianMode,
-        GuardianRepairPlan, GuardianRepairPlanRejection, GuardianRepairPlanningContext,
+        GuardianActionPlan, GuardianDecision, GuardianMode, GuardianRepairPlan,
+        GuardianRepairPlanRejection, GuardianRepairPlanningContext,
         plan_managed_runtime_ready_marker_repair,
     };
     use crate::state::OperationJournalStore;
@@ -1392,7 +1392,7 @@ mod tests {
         for decision in [
             {
                 let mut decision = repair_decision(OwnershipClass::LauncherManaged);
-                decision.kind = GuardianDecisionKind::Block;
+                decision.kind = GuardianActionKind::Block;
                 decision
             },
             {
@@ -1754,7 +1754,7 @@ mod tests {
         GuardianDecision {
             operation_id: Some(operation_id),
             mode: GuardianMode::Managed,
-            kind: GuardianDecisionKind::Repair,
+            kind: GuardianActionKind::Repair,
             diagnoses: vec![diagnosis_id.clone()],
             action_plan: Some(GuardianActionPlan::new(
                 StabilizationSystem::Guardian,

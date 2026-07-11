@@ -1,4 +1,4 @@
-use crate::guardian::{GuardianDecisionKind, GuardianMode};
+use crate::guardian::{GuardianActionKind, GuardianMode};
 use axial_launcher::{
     GuardianDecision as LauncherGuardianDecision, GuardianMode as LauncherGuardianMode,
 };
@@ -10,26 +10,21 @@ pub(super) fn api_guardian_mode(mode: LauncherGuardianMode) -> GuardianMode {
     }
 }
 
-pub(super) fn launcher_guardian_decision(
-    decision: GuardianDecisionKind,
-) -> LauncherGuardianDecision {
+pub(super) fn launcher_guardian_decision(decision: GuardianActionKind) -> LauncherGuardianDecision {
     match decision {
-        GuardianDecisionKind::Allow | GuardianDecisionKind::RecordOnly => {
+        GuardianActionKind::Allow | GuardianActionKind::RecordOnly => {
             LauncherGuardianDecision::Allowed
         }
-        GuardianDecisionKind::Warn => LauncherGuardianDecision::Warned,
-        GuardianDecisionKind::Block | GuardianDecisionKind::AskUser => {
+        GuardianActionKind::Warn => LauncherGuardianDecision::Warned,
+        GuardianActionKind::Block | GuardianActionKind::AskUser => {
             LauncherGuardianDecision::Blocked
         }
-        GuardianDecisionKind::Repair
-        | GuardianDecisionKind::Retry
-        | GuardianDecisionKind::Replace
-        | GuardianDecisionKind::Strip
-        | GuardianDecisionKind::Downgrade
-        | GuardianDecisionKind::Degrade
-        | GuardianDecisionKind::Fallback
-        | GuardianDecisionKind::Quarantine
-        | GuardianDecisionKind::Rollback => LauncherGuardianDecision::Intervened,
+        GuardianActionKind::Repair
+        | GuardianActionKind::Retry
+        | GuardianActionKind::Strip
+        | GuardianActionKind::Downgrade
+        | GuardianActionKind::Fallback
+        | GuardianActionKind::Quarantine => LauncherGuardianDecision::Intervened,
     }
 }
 
@@ -56,15 +51,15 @@ mod tests {
             GuardianMode::Custom
         );
         assert_eq!(
-            launcher_guardian_decision(GuardianDecisionKind::Block),
+            launcher_guardian_decision(GuardianActionKind::Block),
             LauncherGuardianDecision::Blocked
         );
         assert_eq!(
-            launcher_guardian_decision(GuardianDecisionKind::AskUser),
+            launcher_guardian_decision(GuardianActionKind::AskUser),
             LauncherGuardianDecision::Blocked
         );
         assert_eq!(
-            launcher_guardian_decision(GuardianDecisionKind::Repair),
+            launcher_guardian_decision(GuardianActionKind::Repair),
             LauncherGuardianDecision::Intervened
         );
         assert_eq!(

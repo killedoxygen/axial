@@ -8,8 +8,8 @@ use crate::application::{
     InstallVersionPayload, OperationCommandCarrier,
 };
 use crate::guardian::{
-    GuardianDecisionKind, GuardianInstallArtifactFailureEvidence,
-    GuardianInstallArtifactFailureKind, GuardianMode, GuardianPolicyContext, diagnose_facts,
+    GuardianActionKind, GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
+    GuardianMode, GuardianPolicyContext, diagnose_facts,
     install_artifact_failure_from_minecraft_download_fact, install_artifact_failure_guardian_fact,
     install_artifact_failure_guardian_outcome_with_context, install_artifact_failure_safety_case,
 };
@@ -1259,7 +1259,7 @@ fn install_guardian_evidence_update(
     let mut facts = vec![
         prefixed_token_fact(
             GUARDIAN_OUTCOME_DECISION_PREFIX,
-            guardian_decision_kind_id(outcome.decision),
+            guardian_action_kind_id(outcome.decision),
             "guardian_decision",
             48,
         ),
@@ -1419,6 +1419,12 @@ fn record_provider_failure_memory_if_needed(
         return;
     };
     let suppression_until = provider_failure_suppression_until(observed_at);
+    let action_outcome = match outcome.decision {
+        GuardianActionKind::Retry => FailureMemoryActionOutcome::Retried,
+        GuardianActionKind::Block => FailureMemoryActionOutcome::Blocked,
+        GuardianActionKind::AskUser => FailureMemoryActionOutcome::Failed,
+        _ => return,
+    };
     let entry = GuardianFailureMemoryEntry::observed(
         diagnosis.id.clone(),
         diagnosis.domain,
@@ -1427,10 +1433,7 @@ fn record_provider_failure_memory_if_needed(
         Some(PROVIDER_FAILURE_MEMORY_SOURCE),
         observed_at.to_string(),
     )
-    .with_action(
-        guardian_action_kind_for_decision(outcome.decision),
-        failure_memory_outcome_for_decision(outcome.decision),
-    )
+    .with_action(outcome.decision, action_outcome)
     .with_suppression_until(suppression_until);
     if let Err(error) = memory.record(entry) {
         warn!(
@@ -1463,43 +1466,6 @@ fn suppression_active(entry: &GuardianFailureMemoryEntry, observed_at: &str) -> 
     let observed_at = chrono::DateTime::parse_from_rfc3339(observed_at)
         .unwrap_or_else(|_| chrono::Utc::now().fixed_offset());
     suppression_until > observed_at
-}
-
-fn guardian_action_kind_for_decision(
-    decision: GuardianDecisionKind,
-) -> crate::guardian::GuardianActionKind {
-    match decision {
-        GuardianDecisionKind::Allow => crate::guardian::GuardianActionKind::Allow,
-        GuardianDecisionKind::Warn => crate::guardian::GuardianActionKind::Warn,
-        GuardianDecisionKind::Repair => crate::guardian::GuardianActionKind::Repair,
-        GuardianDecisionKind::Retry => crate::guardian::GuardianActionKind::Retry,
-        GuardianDecisionKind::Replace => crate::guardian::GuardianActionKind::Replace,
-        GuardianDecisionKind::Strip => crate::guardian::GuardianActionKind::Strip,
-        GuardianDecisionKind::Downgrade => crate::guardian::GuardianActionKind::Downgrade,
-        GuardianDecisionKind::Degrade => crate::guardian::GuardianActionKind::Degrade,
-        GuardianDecisionKind::Fallback => crate::guardian::GuardianActionKind::Fallback,
-        GuardianDecisionKind::Quarantine => crate::guardian::GuardianActionKind::Quarantine,
-        GuardianDecisionKind::Rollback => crate::guardian::GuardianActionKind::Rollback,
-        GuardianDecisionKind::Block => crate::guardian::GuardianActionKind::Block,
-        GuardianDecisionKind::AskUser => crate::guardian::GuardianActionKind::AskUser,
-        GuardianDecisionKind::RecordOnly => crate::guardian::GuardianActionKind::RecordOnly,
-    }
-}
-
-fn failure_memory_outcome_for_decision(
-    decision: GuardianDecisionKind,
-) -> FailureMemoryActionOutcome {
-    match decision {
-        GuardianDecisionKind::Retry => FailureMemoryActionOutcome::Retried,
-        GuardianDecisionKind::Repair => FailureMemoryActionOutcome::Repaired,
-        GuardianDecisionKind::Degrade => FailureMemoryActionOutcome::Degraded,
-        GuardianDecisionKind::Fallback => FailureMemoryActionOutcome::Degraded,
-        GuardianDecisionKind::Quarantine => FailureMemoryActionOutcome::Quarantined,
-        GuardianDecisionKind::Rollback => FailureMemoryActionOutcome::RolledBack,
-        GuardianDecisionKind::Block => FailureMemoryActionOutcome::Blocked,
-        GuardianDecisionKind::RecordOnly => FailureMemoryActionOutcome::NotNeeded,
-        _ => FailureMemoryActionOutcome::Failed,
-    }
 }
 
 fn prefixed_token_fact(prefix: &str, value: &str, fallback: &str, max_len: usize) -> String {
@@ -1537,22 +1503,19 @@ fn expand_guardian_guidance_fact(value: String) -> String {
     }
 }
 
-fn guardian_decision_kind_id(decision: GuardianDecisionKind) -> &'static str {
+fn guardian_action_kind_id(decision: GuardianActionKind) -> &'static str {
     match decision {
-        GuardianDecisionKind::Allow => "allow",
-        GuardianDecisionKind::Warn => "warn",
-        GuardianDecisionKind::Repair => "repair",
-        GuardianDecisionKind::Retry => "retry",
-        GuardianDecisionKind::Replace => "replace",
-        GuardianDecisionKind::Strip => "strip",
-        GuardianDecisionKind::Downgrade => "downgrade",
-        GuardianDecisionKind::Degrade => "degrade",
-        GuardianDecisionKind::Fallback => "fallback",
-        GuardianDecisionKind::Quarantine => "quarantine",
-        GuardianDecisionKind::Rollback => "rollback",
-        GuardianDecisionKind::Block => "block",
-        GuardianDecisionKind::AskUser => "ask_user",
-        GuardianDecisionKind::RecordOnly => "record_only",
+        GuardianActionKind::Allow => "allow",
+        GuardianActionKind::Warn => "warn",
+        GuardianActionKind::Repair => "repair",
+        GuardianActionKind::Retry => "retry",
+        GuardianActionKind::Strip => "strip",
+        GuardianActionKind::Downgrade => "downgrade",
+        GuardianActionKind::Fallback => "fallback",
+        GuardianActionKind::Quarantine => "quarantine",
+        GuardianActionKind::Block => "block",
+        GuardianActionKind::AskUser => "ask_user",
+        GuardianActionKind::RecordOnly => "record_only",
     }
 }
 

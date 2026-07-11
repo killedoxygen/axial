@@ -70,8 +70,6 @@ pub struct GuardianFailureMemoryEntry {
     pub repair_attempt_count: u32,
     pub quarantined_target: Option<TargetDescriptor>,
     pub suppression_until: Option<String>,
-    pub safe_fallback: Option<FailureMemorySafeFallback>,
-    pub user_decision: Option<FailureMemoryUserDecision>,
     pub target_content_hash: Option<String>,
     pub user_intent_hash: Option<String>,
 }
@@ -112,8 +110,6 @@ impl GuardianFailureMemoryEntry {
             repair_attempt_count: 0,
             quarantined_target: None,
             suppression_until: None,
-            safe_fallback: None,
-            user_decision: None,
             target_content_hash: None,
             user_intent_hash,
         }
@@ -141,16 +137,6 @@ impl GuardianFailureMemoryEntry {
 
     pub fn with_suppression_until(mut self, suppression_until: impl Into<String>) -> Self {
         self.suppression_until = non_empty_string(suppression_until.into());
-        self
-    }
-
-    pub fn with_safe_fallback(mut self, safe_fallback: FailureMemorySafeFallback) -> Self {
-        self.safe_fallback = Some(safe_fallback);
-        self
-    }
-
-    pub fn with_user_decision(mut self, user_decision: FailureMemoryUserDecision) -> Self {
-        self.user_decision = Some(user_decision);
         self
     }
 
@@ -208,14 +194,6 @@ impl GuardianFailureMemoryEntry {
         {
             return Err(FailureMemoryValidationError::InvalidSuppressionTimestamp);
         }
-        if let Some(safe_fallback) = &self.safe_fallback
-            && !is_safe_memory_fragment(&safe_fallback.id)
-        {
-            return Err(FailureMemoryValidationError::UnsafeFallbackId);
-        }
-        if let Some(user_decision) = &self.user_decision {
-            user_decision.validate()?;
-        }
         if let Some(target_content_hash) = &self.target_content_hash
             && !is_safe_memory_fragment(target_content_hash)
         {
@@ -232,94 +210,11 @@ impl GuardianFailureMemoryEntry {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum FailureMemoryActionOutcome {
-    NotNeeded,
     Repaired,
-    Quarantined,
-    RolledBack,
     Retried,
-    Degraded,
     Blocked,
     Failed,
     Suppressed,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FailureMemorySafeFallback {
-    pub kind: FailureMemorySafeFallbackKind,
-    pub id: String,
-}
-
-impl FailureMemorySafeFallback {
-    pub fn new(kind: FailureMemorySafeFallbackKind, id: impl AsRef<str>) -> Self {
-        Self {
-            kind,
-            id: sanitize_target_id(id.as_ref(), "fallback"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub enum FailureMemorySafeFallbackKind {
-    ManagedRuntime,
-    BuiltInPerformanceRules,
-    PreviousPerformanceComposition,
-    VanillaMode,
-    UserGuidance,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FailureMemoryUserDecision {
-    pub decision: FailureMemoryUserDecisionKind,
-    pub decided_at: String,
-    pub suppression_until: Option<String>,
-    pub input_hash: Option<String>,
-}
-
-impl FailureMemoryUserDecision {
-    pub fn new(decision: FailureMemoryUserDecisionKind, decided_at: impl Into<String>) -> Self {
-        Self {
-            decision,
-            decided_at: decided_at.into(),
-            suppression_until: None,
-            input_hash: None,
-        }
-    }
-
-    pub fn with_suppression_until(mut self, suppression_until: impl Into<String>) -> Self {
-        self.suppression_until = non_empty_string(suppression_until.into());
-        self
-    }
-
-    pub fn with_input_hash(mut self, input_hash: impl AsRef<str>) -> Self {
-        self.input_hash = safe_optional_fragment(input_hash.as_ref(), "input_hash");
-        self
-    }
-
-    fn validate(&self) -> Result<(), FailureMemoryValidationError> {
-        if parse_timestamp(&self.decided_at).is_err() {
-            return Err(FailureMemoryValidationError::InvalidDecisionTimestamp);
-        }
-        if let Some(suppression_until) = &self.suppression_until
-            && parse_timestamp(suppression_until).is_err()
-        {
-            return Err(FailureMemoryValidationError::InvalidSuppressionTimestamp);
-        }
-        if let Some(input_hash) = &self.input_hash
-            && !is_safe_memory_fragment(input_hash)
-        {
-            return Err(FailureMemoryValidationError::UnsafeUserDecisionHash);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub enum FailureMemoryUserDecisionKind {
-    Accepted,
-    Declined,
-    Deferred,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -388,16 +283,13 @@ pub enum FailureMemoryValidationError {
     UnsafeKey,
     UnsafeDiagnosisId,
     UnsafeTargetId,
-    UnsafeFallbackId,
     UnsafeTargetHash,
     UnsafeUserIntentHash,
-    UnsafeUserDecisionHash,
     MemoryKeyMismatch,
     OwnershipMismatch,
     ZeroOccurrences,
     InvalidObservedTimestamp,
     InvalidSuppressionTimestamp,
-    InvalidDecisionTimestamp,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -757,9 +649,8 @@ fn encode_snapshot(snapshot: FailureMemorySnapshot) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureMemoryActionOutcome, FailureMemorySafeFallback, FailureMemorySafeFallbackKind,
-        FailureMemorySnapshot, FailureMemoryStoreError, FailureMemoryUserDecision,
-        FailureMemoryUserDecisionKind, GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
+        FailureMemoryActionOutcome, FailureMemorySnapshot, FailureMemoryStoreError,
+        GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
     };
     use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
@@ -852,10 +743,6 @@ mod tests {
     fn failure_memory_entry_round_trips_strict_shape() {
         let entry = retry_entry("2026-06-15T10:00:00Z")
             .with_suppression_until("2026-06-15T10:30:00Z")
-            .with_safe_fallback(FailureMemorySafeFallback::new(
-                FailureMemorySafeFallbackKind::ManagedRuntime,
-                "managed_java_21",
-            ))
             .with_target_content_hash("sha256abc123");
         let snapshot = FailureMemorySnapshot::new(vec![entry.clone()]).expect("snapshot");
         let encoded = snapshot.to_json().expect("serialize snapshot");
@@ -868,7 +755,53 @@ mod tests {
     fn checked_in_failure_memory_v1_fixture_is_byte_stable() {
         let snapshot =
             FailureMemorySnapshot::from_json(FAILURE_MEMORY_V1_FIXTURE).expect("strict fixture");
-        assert_eq!(snapshot.schema, super::FAILURE_MEMORY_SCHEMA);
+        assert_eq!(
+            super::FAILURE_MEMORY_SCHEMA,
+            "axial.guardian.failure_memory.v1"
+        );
+        assert_eq!(snapshot.schema, "axial.guardian.failure_memory.v1");
+        let action_kinds = snapshot
+            .entries
+            .iter()
+            .filter_map(|entry| entry.last_action_kind)
+            .collect::<Vec<_>>();
+        let expected_action_kinds = [
+            GuardianActionKind::Allow,
+            GuardianActionKind::Warn,
+            GuardianActionKind::Repair,
+            GuardianActionKind::Retry,
+            GuardianActionKind::Strip,
+            GuardianActionKind::Downgrade,
+            GuardianActionKind::Fallback,
+            GuardianActionKind::Quarantine,
+            GuardianActionKind::AskUser,
+            GuardianActionKind::Block,
+            GuardianActionKind::RecordOnly,
+        ];
+        assert_eq!(action_kinds.len(), expected_action_kinds.len());
+        assert!(
+            expected_action_kinds
+                .iter()
+                .all(|expected| action_kinds.contains(expected))
+        );
+        let action_outcomes = snapshot
+            .entries
+            .iter()
+            .filter_map(|entry| entry.last_action_outcome)
+            .collect::<std::collections::HashSet<_>>();
+        for outcome in &action_outcomes {
+            assert_fixture_action_outcome(*outcome);
+        }
+        assert_eq!(
+            action_outcomes,
+            std::collections::HashSet::from([
+                FailureMemoryActionOutcome::Repaired,
+                FailureMemoryActionOutcome::Retried,
+                FailureMemoryActionOutcome::Blocked,
+                FailureMemoryActionOutcome::Failed,
+                FailureMemoryActionOutcome::Suppressed,
+            ])
+        );
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
         assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V1_FIXTURE);
@@ -879,6 +812,16 @@ mod tests {
             decoded.to_json().expect("re-encode compact fixture"),
             compact
         );
+    }
+
+    fn assert_fixture_action_outcome(outcome: FailureMemoryActionOutcome) {
+        match outcome {
+            FailureMemoryActionOutcome::Repaired
+            | FailureMemoryActionOutcome::Retried
+            | FailureMemoryActionOutcome::Blocked
+            | FailureMemoryActionOutcome::Failed
+            | FailureMemoryActionOutcome::Suppressed => {}
+        }
     }
 
     #[test]
@@ -905,8 +848,6 @@ mod tests {
                 "repair_attempt_count": 0,
                 "quarantined_target": null,
                 "suppression_until": null,
-                "safe_fallback": null,
-                "user_decision": null,
                 "target_content_hash": null,
                 "user_intent_hash": "intent",
                 "unexpected": true
@@ -938,8 +879,6 @@ mod tests {
                 "repair_attempt_count": 0,
                 "quarantined_target": null,
                 "suppression_until": null,
-                "safe_fallback": null,
-                "user_decision": null,
                 "target_content_hash": null,
                 "user_intent_hash": "intent"
             }]
@@ -960,22 +899,6 @@ mod tests {
             "2026-06-15T10:00:00Z",
         );
         assert!(unsafe_entry.validate().is_err());
-
-        let unsafe_fallback =
-            retry_entry("2026-06-15T10:10:00Z").with_safe_fallback(FailureMemorySafeFallback {
-                kind: FailureMemorySafeFallbackKind::ManagedRuntime,
-                id: r"C:\Users\Alice\runtime".to_string(),
-            });
-        assert!(unsafe_fallback.validate().is_err());
-
-        let unsafe_decision =
-            retry_entry("2026-06-15T10:11:00Z").with_user_decision(FailureMemoryUserDecision {
-                decision: FailureMemoryUserDecisionKind::Declined,
-                decided_at: "2026-06-15T10:11:30Z".to_string(),
-                suppression_until: Some("2026-06-15T10:30:00Z".to_string()),
-                input_hash: Some("/home/alice/settings".to_string()),
-            });
-        assert!(unsafe_decision.validate().is_err());
 
         let bad_timestamp = retry_entry("not-a-date");
         assert!(bad_timestamp.validate().is_err());
@@ -1100,31 +1023,6 @@ mod tests {
     }
 
     #[test]
-    fn user_decline_suppression_shape_records_decision() {
-        let entry = retry_entry("2026-06-15T11:00:00Z")
-            .with_action(
-                GuardianActionKind::AskUser,
-                FailureMemoryActionOutcome::Suppressed,
-            )
-            .with_user_decision(
-                FailureMemoryUserDecision::new(
-                    FailureMemoryUserDecisionKind::Declined,
-                    "2026-06-15T11:00:30Z",
-                )
-                .with_suppression_until("2026-06-15T12:00:00Z")
-                .with_input_hash("settings_hash_1"),
-            );
-
-        let decision = entry.user_decision.expect("user decision");
-        assert_eq!(decision.decision, FailureMemoryUserDecisionKind::Declined);
-        assert_eq!(
-            decision.suppression_until.as_deref(),
-            Some("2026-06-15T12:00:00Z")
-        );
-        assert_eq!(decision.input_hash.as_deref(), Some("settings_hash_1"));
-    }
-
-    #[test]
     fn changed_target_hash_reset_shape_is_explicit() {
         let entry = retry_entry("2026-06-15T12:00:00Z").with_target_content_hash("sha256_old123");
 
@@ -1151,17 +1049,9 @@ mod tests {
             GuardianActionKind::RecordOnly,
             FailureMemoryActionOutcome::Suppressed,
         )
-        .with_safe_fallback(FailureMemorySafeFallback::new(
-            FailureMemorySafeFallbackKind::BuiltInPerformanceRules,
-            "builtin_rules",
-        ))
         .with_suppression_until("2026-06-15T13:05:00Z");
 
         assert_eq!(entry.ownership, OwnershipClass::ExternalProviderDerived);
-        assert_eq!(
-            entry.safe_fallback.as_ref().map(|fallback| fallback.kind),
-            Some(FailureMemorySafeFallbackKind::BuiltInPerformanceRules)
-        );
         assert!(entry.validate().is_ok());
     }
 

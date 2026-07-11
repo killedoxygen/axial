@@ -1,4 +1,4 @@
-use crate::guardian::GuardianDecisionKind;
+use crate::guardian::GuardianActionKind;
 use std::time::Duration;
 
 pub(crate) fn ms(duration: Duration) -> u64 {
@@ -114,7 +114,7 @@ pub(crate) struct LaunchSessionTiming<'a> {
     pub runtime_repair: Duration,
     pub insert: Option<Duration>,
     pub readiness_launchable: bool,
-    pub guardian_decision: GuardianDecisionKind,
+    pub guardian_decision: GuardianActionKind,
 }
 
 pub(crate) fn trace_launch_session(timing: LaunchSessionTiming<'_>, message: &'static str) {
@@ -150,7 +150,7 @@ pub(crate) struct LaunchPreflightFactTiming<'a> {
     pub readiness_launchable: bool,
     pub reason_count: usize,
     pub fact_count: usize,
-    pub guardian_decision: GuardianDecisionKind,
+    pub guardian_decision: GuardianActionKind,
     pub java_probe_count: u8,
     pub java_probe_source: &'a str,
     pub installed_versions_source: &'a str,
@@ -188,7 +188,7 @@ pub(crate) struct LaunchPreflightResponseTiming<'a> {
     pub version_id: &'a str,
     pub total: Duration,
     pub readiness_launchable: bool,
-    pub guardian_decision: GuardianDecisionKind,
+    pub guardian_decision: GuardianActionKind,
     pub reason_count: usize,
     pub fact_count: usize,
 }

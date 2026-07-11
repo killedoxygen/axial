@@ -5,8 +5,7 @@ use super::inference_graph::{
 };
 use super::{
     ActionPlanPrerequisite, Diagnosis, GuardianAction, GuardianActionKind, GuardianActionPlan,
-    GuardianConfidence, GuardianDecision, GuardianDecisionKind, GuardianMode, GuardianSeverity,
-    SafetyCase,
+    GuardianConfidence, GuardianDecision, GuardianMode, GuardianSeverity, SafetyCase,
 };
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor};
 
@@ -144,7 +143,7 @@ pub fn decide_guardian_policy(
         return GuardianDecision {
             operation_id: safety_case.operation_id.clone(),
             mode: safety_case.mode,
-            kind: GuardianDecisionKind::Block,
+            kind: GuardianActionKind::Block,
             diagnoses,
             action_plan: None,
         };
@@ -154,7 +153,7 @@ pub fn decide_guardian_policy(
         return GuardianDecision {
             operation_id: safety_case.operation_id.clone(),
             mode: safety_case.mode,
-            kind: GuardianDecisionKind::Allow,
+            kind: GuardianActionKind::Allow,
             diagnoses,
             action_plan: None,
         };
@@ -164,16 +163,15 @@ pub fn decide_guardian_policy(
         return GuardianDecision {
             operation_id: safety_case.operation_id.clone(),
             mode: safety_case.mode,
-            kind: GuardianDecisionKind::Block,
+            kind: GuardianActionKind::Block,
             diagnoses,
             action_plan: None,
         };
     };
-    let kind = decision_kind_for_action(selection.kind);
     GuardianDecision {
         operation_id: safety_case.operation_id.clone(),
         mode: safety_case.mode,
-        kind,
+        kind: selection.kind,
         diagnoses,
         action_plan: Some(GuardianActionPlan::new(
             StabilizationSystem::Guardian,
@@ -481,7 +479,7 @@ fn custom_mode_permission(
                 0.0
             }
         }
-        GuardianActionKind::Fallback | GuardianActionKind::Degrade => {
+        GuardianActionKind::Fallback => {
             if !reasoning.explicit_intent_blocks_automatic_change(context) {
                 0.75
             } else {
@@ -495,11 +493,9 @@ fn custom_mode_permission(
                 0.0
             }
         }
-        GuardianActionKind::Replace
-        | GuardianActionKind::Strip
+        GuardianActionKind::Strip
         | GuardianActionKind::Downgrade
-        | GuardianActionKind::Quarantine
-        | GuardianActionKind::Rollback => 0.0,
+        | GuardianActionKind::Quarantine => 0.0,
     }
 }
 
@@ -517,36 +513,14 @@ fn action_rank(mode: GuardianMode, action: GuardianActionKind) -> u8 {
         GuardianActionKind::Allow => 0,
         GuardianActionKind::Repair => 20,
         GuardianActionKind::Fallback => 25,
-        GuardianActionKind::Degrade => 30,
         GuardianActionKind::Strip => 35,
         GuardianActionKind::Downgrade => 40,
         GuardianActionKind::Retry => 45,
         GuardianActionKind::Quarantine => 50,
-        GuardianActionKind::Rollback => 55,
-        GuardianActionKind::Replace => 60,
         GuardianActionKind::Warn => 70,
         GuardianActionKind::AskUser => 80,
         GuardianActionKind::RecordOnly => 90,
         GuardianActionKind::Block => 100,
-    }
-}
-
-fn decision_kind_for_action(action: GuardianActionKind) -> GuardianDecisionKind {
-    match action {
-        GuardianActionKind::Allow => GuardianDecisionKind::Allow,
-        GuardianActionKind::Warn => GuardianDecisionKind::Warn,
-        GuardianActionKind::Repair => GuardianDecisionKind::Repair,
-        GuardianActionKind::Retry => GuardianDecisionKind::Retry,
-        GuardianActionKind::Replace => GuardianDecisionKind::Replace,
-        GuardianActionKind::Strip => GuardianDecisionKind::Strip,
-        GuardianActionKind::Downgrade => GuardianDecisionKind::Downgrade,
-        GuardianActionKind::Degrade => GuardianDecisionKind::Degrade,
-        GuardianActionKind::Fallback => GuardianDecisionKind::Fallback,
-        GuardianActionKind::Quarantine => GuardianDecisionKind::Quarantine,
-        GuardianActionKind::Rollback => GuardianDecisionKind::Rollback,
-        GuardianActionKind::AskUser => GuardianDecisionKind::AskUser,
-        GuardianActionKind::Block => GuardianDecisionKind::Block,
-        GuardianActionKind::RecordOnly => GuardianDecisionKind::RecordOnly,
     }
 }
 
@@ -579,11 +553,9 @@ fn reversibility_score(action: GuardianActionKind) -> f32 {
         | GuardianActionKind::Block => 0.95,
         GuardianActionKind::Strip
         | GuardianActionKind::Downgrade
-        | GuardianActionKind::Degrade
         | GuardianActionKind::Fallback
         | GuardianActionKind::Retry => 0.85,
-        GuardianActionKind::Rollback => 0.75,
-        GuardianActionKind::Repair | GuardianActionKind::Replace => 0.65,
+        GuardianActionKind::Repair => 0.65,
         GuardianActionKind::Quarantine => 0.60,
     }
 }
@@ -614,13 +586,10 @@ fn requires_journal(action: GuardianActionKind) -> bool {
         action,
         GuardianActionKind::Repair
             | GuardianActionKind::Retry
-            | GuardianActionKind::Replace
             | GuardianActionKind::Strip
             | GuardianActionKind::Downgrade
-            | GuardianActionKind::Degrade
             | GuardianActionKind::Fallback
             | GuardianActionKind::Quarantine
-            | GuardianActionKind::Rollback
     )
 }
 
@@ -658,10 +627,7 @@ fn action_requires_journal(
 fn is_destructive_mutation(action: GuardianActionKind) -> bool {
     matches!(
         action,
-        GuardianActionKind::Repair
-            | GuardianActionKind::Replace
-            | GuardianActionKind::Quarantine
-            | GuardianActionKind::Rollback
+        GuardianActionKind::Repair | GuardianActionKind::Quarantine
     )
 }
 
@@ -717,13 +683,10 @@ fn action_changes_user_intent(action: GuardianActionKind) -> bool {
         action,
         GuardianActionKind::Repair
             | GuardianActionKind::Retry
-            | GuardianActionKind::Replace
             | GuardianActionKind::Strip
             | GuardianActionKind::Downgrade
-            | GuardianActionKind::Degrade
             | GuardianActionKind::Fallback
             | GuardianActionKind::Quarantine
-            | GuardianActionKind::Rollback
     )
 }
 
@@ -733,7 +696,6 @@ fn is_attempt_action(action: GuardianActionKind) -> bool {
         GuardianActionKind::Retry
             | GuardianActionKind::Strip
             | GuardianActionKind::Downgrade
-            | GuardianActionKind::Degrade
             | GuardianActionKind::Fallback
     )
 }
@@ -741,10 +703,7 @@ fn is_attempt_action(action: GuardianActionKind) -> bool {
 fn is_managed_mutation_action(action: GuardianActionKind) -> bool {
     matches!(
         action,
-        GuardianActionKind::Repair
-            | GuardianActionKind::Replace
-            | GuardianActionKind::Quarantine
-            | GuardianActionKind::Rollback
+        GuardianActionKind::Repair | GuardianActionKind::Quarantine
     )
 }
 
@@ -759,15 +718,13 @@ mod tests {
     };
     use crate::guardian::{
         Diagnosis, DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence,
-        GuardianDecisionKind, GuardianDomain, GuardianFact, GuardianFactId, GuardianImpactVector,
-        GuardianMode, GuardianSeverity, SafetyCase, diagnose_facts,
+        GuardianDomain, GuardianFact, GuardianFactId, GuardianImpactVector, GuardianMode,
+        GuardianSeverity, SafetyCase, diagnose_facts,
     };
     use crate::state::contracts::{
         OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
     };
-    use crate::state::failure_memory::{
-        FailureMemoryActionOutcome, GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
-    };
+    use crate::state::failure_memory::{GuardianFailureMemoryEntry, GuardianFailureMemoryStore};
 
     #[test]
     fn managed_mode_repairs_launcher_managed_corruption() {
@@ -783,7 +740,7 @@ mod tests {
         let decision =
             decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
 
-        assert_eq!(decision.kind, GuardianDecisionKind::Repair);
+        assert_eq!(decision.kind, GuardianActionKind::Repair);
         let plan = decision.action_plan.expect("action plan");
         assert_eq!(plan.prerequisite.ownership, OwnershipClass::LauncherManaged);
         assert_eq!(plan.prerequisite.confidence, GuardianConfidence::Confirmed);
@@ -805,7 +762,7 @@ mod tests {
         let decision =
             decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
 
-        assert_eq!(decision.kind, GuardianDecisionKind::Block);
+        assert_eq!(decision.kind, GuardianActionKind::Block);
         assert!(decision.action_plan.is_none());
     }
 
@@ -867,7 +824,7 @@ mod tests {
             GuardianPolicyContext::current_operation().with_explicit_user_intent(),
         );
 
-        assert_eq!(decision.kind, GuardianDecisionKind::AskUser);
+        assert_eq!(decision.kind, GuardianActionKind::AskUser);
     }
 
     #[test]
@@ -884,7 +841,7 @@ mod tests {
         let decision =
             decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
 
-        assert_eq!(decision.kind, GuardianDecisionKind::Block);
+        assert_eq!(decision.kind, GuardianActionKind::Block);
     }
 
     #[test]
@@ -901,7 +858,7 @@ mod tests {
         let decision =
             decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
 
-        assert_eq!(decision.kind, GuardianDecisionKind::RecordOnly);
+        assert_eq!(decision.kind, GuardianActionKind::RecordOnly);
     }
 
     #[test]
@@ -940,12 +897,7 @@ mod tests {
         assert_eq!(diagnosis.domain, GuardianDomain::Unknown);
         assert_eq!(diagnosis.confidence, GuardianConfidence::Low);
         assert_eq!(diagnosis.ownership, OwnershipClass::Unknown);
-        for destructive in [
-            GuardianActionKind::Repair,
-            GuardianActionKind::Replace,
-            GuardianActionKind::Quarantine,
-            GuardianActionKind::Rollback,
-        ] {
+        for destructive in [GuardianActionKind::Repair, GuardianActionKind::Quarantine] {
             assert!(!diagnosis.candidate_actions.contains(&destructive));
         }
 
@@ -954,12 +906,11 @@ mod tests {
             mode: GuardianMode::Managed,
             phase: OperationPhase::Launching,
             diagnoses: vec![diagnosis.clone()],
-            hard_constraints: Vec::new(),
         };
         let decision =
             decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
 
-        assert_eq!(decision.kind, GuardianDecisionKind::RecordOnly);
+        assert_eq!(decision.kind, GuardianActionKind::RecordOnly);
         let plan = decision
             .action_plan
             .as_ref()
@@ -972,20 +923,14 @@ mod tests {
         let failure_memory = GuardianFailureMemoryStore::new();
         for observed_at in ["2026-06-16T10:00:00Z", "2026-06-16T10:01:00Z"] {
             failure_memory
-                .record(
-                    GuardianFailureMemoryEntry::observed(
-                        diagnosis.id.clone(),
-                        diagnosis.domain,
-                        safe_target.clone(),
-                        GuardianMode::Managed,
-                        None,
-                        observed_at,
-                    )
-                    .with_action(
-                        GuardianActionKind::RecordOnly,
-                        FailureMemoryActionOutcome::NotNeeded,
-                    ),
-                )
+                .record(GuardianFailureMemoryEntry::observed(
+                    diagnosis.id.clone(),
+                    diagnosis.domain,
+                    safe_target.clone(),
+                    GuardianMode::Managed,
+                    None,
+                    observed_at,
+                ))
                 .expect("record unknown failure memory");
         }
 
@@ -993,14 +938,8 @@ mod tests {
         assert_eq!(memory.len(), 1);
         assert_eq!(memory[0].occurrence_count, 2);
         assert_eq!(memory[0].repair_attempt_count, 0);
-        assert_eq!(
-            memory[0].last_action_kind,
-            Some(GuardianActionKind::RecordOnly)
-        );
-        assert_eq!(
-            memory[0].last_action_outcome,
-            Some(FailureMemoryActionOutcome::NotNeeded)
-        );
+        assert_eq!(memory[0].last_action_kind, None);
+        assert_eq!(memory[0].last_action_outcome, None);
         assert_eq!(memory[0].ownership, OwnershipClass::Unknown);
         assert!(memory[0].quarantined_target.is_none());
 
@@ -1030,7 +969,7 @@ mod tests {
             GuardianPolicyContext::current_operation().with_missing_journal(),
         );
 
-        assert_eq!(decision.kind, GuardianDecisionKind::Block);
+        assert_eq!(decision.kind, GuardianActionKind::Block);
     }
 
     #[test]
@@ -1049,7 +988,7 @@ mod tests {
             GuardianPolicyContext::current_operation().with_unredacted_public_boundary(),
         );
 
-        assert_eq!(decision.kind, GuardianDecisionKind::Block);
+        assert_eq!(decision.kind, GuardianActionKind::Block);
         assert!(decision.action_plan.is_none());
     }
 
@@ -1073,7 +1012,7 @@ mod tests {
             GuardianPolicyContext::current_operation().with_suppression(),
         );
 
-        assert_eq!(decision.kind, GuardianDecisionKind::Block);
+        assert_eq!(decision.kind, GuardianActionKind::Block);
     }
 
     #[test]
@@ -1096,7 +1035,7 @@ mod tests {
         let decision =
             decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
 
-        assert_eq!(decision.kind, GuardianDecisionKind::Fallback);
+        assert_eq!(decision.kind, GuardianActionKind::Fallback);
     }
 
     #[test]
@@ -1308,7 +1247,7 @@ mod tests {
                 GuardianPolicyContext::current_operation(),
             )
             .kind,
-            GuardianDecisionKind::Repair
+            GuardianActionKind::Repair
         );
 
         let jvm_parse = graph_backed_diagnosis(
@@ -1323,7 +1262,7 @@ mod tests {
                 GuardianPolicyContext::current_operation(),
             )
             .kind,
-            GuardianDecisionKind::Strip
+            GuardianActionKind::Strip
         );
         assert_eq!(
             decide_guardian_policy(
@@ -1331,7 +1270,7 @@ mod tests {
                 GuardianPolicyContext::current_operation().with_explicit_user_intent(),
             )
             .kind,
-            GuardianDecisionKind::AskUser
+            GuardianActionKind::AskUser
         );
         assert_eq!(
             decide_guardian_policy(
@@ -1339,7 +1278,7 @@ mod tests {
                 GuardianPolicyContext::current_operation(),
             )
             .kind,
-            GuardianDecisionKind::Block
+            GuardianActionKind::Block
         );
 
         let provider_retry = graph_backed_diagnosis(
@@ -1354,7 +1293,7 @@ mod tests {
                 GuardianPolicyContext::current_operation().with_suppression(),
             )
             .kind,
-            GuardianDecisionKind::Block
+            GuardianActionKind::Block
         );
 
         let user_owned_artifact = graph_backed_diagnosis(
@@ -1369,7 +1308,7 @@ mod tests {
                 GuardianPolicyContext::current_operation(),
             )
             .kind,
-            GuardianDecisionKind::Block
+            GuardianActionKind::Block
         );
     }
 
@@ -1379,7 +1318,6 @@ mod tests {
             mode,
             phase: OperationPhase::Preparing,
             diagnoses: vec![diagnosis],
-            hard_constraints: Vec::new(),
         }
     }
 
@@ -1389,7 +1327,6 @@ mod tests {
             mode,
             phase: diagnosis.phase,
             diagnoses: vec![diagnosis],
-            hard_constraints: Vec::new(),
         }
     }
 

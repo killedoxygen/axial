@@ -21,8 +21,6 @@
       "repair_attempt_count": 0,
       "quarantined_target": null,
       "suppression_until": null,
-      "safe_fallback": null,
-      "user_decision": null,
       "target_content_hash": null,
       "user_intent_hash": "intent_01"
     },
@@ -46,8 +44,6 @@
       "repair_attempt_count": 0,
       "quarantined_target": null,
       "suppression_until": null,
-      "safe_fallback": null,
-      "user_decision": null,
       "target_content_hash": null,
       "user_intent_hash": "intent_02"
     },
@@ -76,8 +72,6 @@
         "ownership": "LauncherManaged"
       },
       "suppression_until": null,
-      "safe_fallback": null,
-      "user_decision": null,
       "target_content_hash": "content_hash_03",
       "user_intent_hash": "intent_03"
     },
@@ -101,8 +95,6 @@
       "repair_attempt_count": 0,
       "quarantined_target": null,
       "suppression_until": "2026-07-01T01:04:00Z",
-      "safe_fallback": null,
-      "user_decision": null,
       "target_content_hash": null,
       "user_intent_hash": "intent_04"
     },
@@ -126,8 +118,6 @@
       "repair_attempt_count": 0,
       "quarantined_target": null,
       "suppression_until": null,
-      "safe_fallback": null,
-      "user_decision": null,
       "target_content_hash": null,
       "user_intent_hash": "intent_06"
     },
@@ -151,8 +141,6 @@
       "repair_attempt_count": 0,
       "quarantined_target": null,
       "suppression_until": null,
-      "safe_fallback": null,
-      "user_decision": null,
       "target_content_hash": null,
       "user_intent_hash": "intent_07"
     },
@@ -176,8 +164,6 @@
       "repair_attempt_count": 0,
       "quarantined_target": null,
       "suppression_until": "2026-07-01T01:09:00Z",
-      "safe_fallback": null,
-      "user_decision": null,
       "target_content_hash": null,
       "user_intent_hash": "intent_09"
     },
@@ -206,8 +192,6 @@
         "ownership": "Unknown"
       },
       "suppression_until": null,
-      "safe_fallback": null,
-      "user_decision": null,
       "target_content_hash": "content_hash_10",
       "user_intent_hash": "intent_10"
     },
@@ -231,13 +215,6 @@
       "repair_attempt_count": 0,
       "quarantined_target": null,
       "suppression_until": "2026-07-01T01:12:00Z",
-      "safe_fallback": null,
-      "user_decision": {
-        "decision": "Declined",
-        "decided_at": "2026-07-01T00:12:30Z",
-        "suppression_until": "2026-07-01T01:12:00Z",
-        "input_hash": "decision_hash_12"
-      },
       "target_content_hash": null,
       "user_intent_hash": "intent_12"
     },
@@ -261,13 +238,6 @@
       "repair_attempt_count": 0,
       "quarantined_target": null,
       "suppression_until": null,
-      "safe_fallback": null,
-      "user_decision": {
-        "decision": "Accepted",
-        "decided_at": "2026-07-01T00:13:30Z",
-        "suppression_until": null,
-        "input_hash": "decision_hash_13"
-      },
       "target_content_hash": null,
       "user_intent_hash": "intent_13"
     },
@@ -291,13 +261,6 @@
       "repair_attempt_count": 0,
       "quarantined_target": null,
       "suppression_until": null,
-      "safe_fallback": null,
-      "user_decision": {
-        "decision": "Deferred",
-        "decided_at": "2026-07-01T00:14:30Z",
-        "suppression_until": null,
-        "input_hash": "decision_hash_14"
-      },
       "target_content_hash": null,
       "user_intent_hash": "intent_14"
     }

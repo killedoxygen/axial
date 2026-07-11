@@ -1,5 +1,5 @@
 use super::{
-    GuardianDecisionKind, GuardianLaunchRecoveryKind, GuardianLaunchRecoveryPlan,
+    GuardianActionKind, GuardianLaunchRecoveryKind, GuardianLaunchRecoveryPlan,
     GuardianPerformanceSupervisionRejection, GuardianRepairOutcome, GuardianRepairStatus,
 };
 use crate::state::contracts::OperationPhase;
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GuardianUserOutcome {
-    pub decision: GuardianDecisionKind,
+    pub decision: GuardianActionKind,
     pub phase: OperationPhase,
     pub summary: String,
     pub details: Vec<String>,
@@ -16,10 +16,10 @@ pub struct GuardianUserOutcome {
 
 pub fn runtime_repair_user_outcome(outcome: &GuardianRepairOutcome) -> GuardianUserOutcome {
     let decision = match outcome.status {
-        GuardianRepairStatus::Repaired => GuardianDecisionKind::Repair,
+        GuardianRepairStatus::Repaired => GuardianActionKind::Repair,
         GuardianRepairStatus::Blocked
         | GuardianRepairStatus::Failed
-        | GuardianRepairStatus::Suppressed => GuardianDecisionKind::Block,
+        | GuardianRepairStatus::Suppressed => GuardianActionKind::Block,
     };
     let (summary, details, guidance) = runtime_repair_outcome_copy(outcome.status);
     GuardianUserOutcome {
@@ -34,9 +34,9 @@ pub fn runtime_repair_user_outcome(outcome: &GuardianRepairOutcome) -> GuardianU
 pub fn install_artifact_repair_user_outcome(status: &str) -> GuardianUserOutcome {
     let normalized = status.trim();
     let decision = match normalized {
-        "repaired" => GuardianDecisionKind::Repair,
-        "blocked" | "failed" | "suppressed" => GuardianDecisionKind::Block,
-        _ => GuardianDecisionKind::RecordOnly,
+        "repaired" => GuardianActionKind::Repair,
+        "blocked" | "failed" | "suppressed" => GuardianActionKind::Block,
+        _ => GuardianActionKind::RecordOnly,
     };
     let (summary, detail) = install_artifact_repair_outcome_copy(normalized);
 
@@ -50,7 +50,7 @@ pub fn install_artifact_repair_user_outcome(status: &str) -> GuardianUserOutcome
 }
 
 pub fn install_failure_user_outcome(
-    decision: GuardianDecisionKind,
+    decision: GuardianActionKind,
     diagnosis_id: &str,
 ) -> GuardianUserOutcome {
     let (summary, details, guidance) = install_failure_outcome_copy(diagnosis_id, decision);
@@ -71,7 +71,7 @@ pub fn launch_recovery_suppressed_user_outcome(
         launch_recovery_public_action_label(plan.directive.kind)
     );
     GuardianUserOutcome {
-        decision: GuardianDecisionKind::Block,
+        decision: GuardianActionKind::Block,
         phase: OperationPhase::Repairing,
         summary: detail.clone(),
         details: vec![detail],
@@ -96,7 +96,7 @@ pub fn performance_supervision_rejection_user_outcome(
     phase: OperationPhase,
 ) -> GuardianUserOutcome {
     GuardianUserOutcome {
-        decision: GuardianDecisionKind::Block,
+        decision: GuardianActionKind::Block,
         phase,
         summary: "performance update was blocked by Guardian safety supervision".to_string(),
         details: Vec::new(),
@@ -105,7 +105,7 @@ pub fn performance_supervision_rejection_user_outcome(
 }
 
 pub fn persisted_state_load_user_outcome(
-    decision: GuardianDecisionKind,
+    decision: GuardianActionKind,
     diagnosis_id: &str,
 ) -> GuardianUserOutcome {
     let (summary, details, guidance) = persisted_state_load_outcome_copy(diagnosis_id);
@@ -174,10 +174,10 @@ fn install_artifact_repair_outcome_copy(status: &str) -> (&'static str, Option<&
 
 fn install_failure_outcome_copy(
     diagnosis_id: &str,
-    decision: GuardianDecisionKind,
+    decision: GuardianActionKind,
 ) -> (&'static str, Vec<&'static str>, Vec<&'static str>) {
     match diagnosis_id {
-        "download_unavailable" if decision == GuardianDecisionKind::Block => (
+        "download_unavailable" if decision == GuardianActionKind::Block => (
             "Guardian paused install retry after repeated provider failure.",
             vec![
                 "The install stopped because the same provider or network download failure repeated within the retry cooldown.",
@@ -274,7 +274,7 @@ mod tests {
         persisted_state_load_user_outcome, runtime_repair_user_outcome,
     };
     use crate::guardian::{
-        DiagnosisId, GuardianActionKind, GuardianDecisionKind, GuardianLaunchRecoveryDirective,
+        DiagnosisId, GuardianActionKind, GuardianLaunchRecoveryDirective,
         GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind,
         GuardianLaunchRecoveryPlanRequest, GuardianPerformanceSupervisionRejection,
         GuardianRepairOutcome, GuardianRepairStatus, plan_launch_recovery_directive,
@@ -286,25 +286,25 @@ mod tests {
         let cases = [
             (
                 GuardianRepairStatus::Repaired,
-                GuardianDecisionKind::Repair,
+                GuardianActionKind::Repair,
                 "Guardian repaired launch state before launch.",
                 "Guardian repaired the managed Java runtime before launch.",
             ),
             (
                 GuardianRepairStatus::Suppressed,
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "Guardian blocked launch preflight.",
                 "Guardian suppressed managed Java runtime repair because the same repair failed recently.",
             ),
             (
                 GuardianRepairStatus::Failed,
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "Guardian blocked launch preflight.",
                 "Guardian could not repair the managed Java runtime automatically.",
             ),
             (
                 GuardianRepairStatus::Blocked,
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "Guardian blocked launch preflight.",
                 "Guardian blocked managed Java runtime repair because it was not safe to apply.",
             ),
@@ -317,7 +317,7 @@ mod tests {
             assert_eq!(outcome.phase, OperationPhase::Repairing);
             assert_eq!(outcome.summary, summary);
             assert_eq!(outcome.details, vec![detail.to_string()]);
-            if decision == GuardianDecisionKind::Block {
+            if decision == GuardianActionKind::Block {
                 assert_eq!(
                     outcome.guidance,
                     vec![
@@ -334,31 +334,31 @@ mod tests {
         let cases = [
             (
                 "repaired",
-                GuardianDecisionKind::Repair,
+                GuardianActionKind::Repair,
                 "Guardian repaired a launcher-managed install artifact.",
                 "Retry the install to continue from the repaired state.",
             ),
             (
                 "suppressed",
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "Guardian paused automatic install repair after repeated failure.",
                 "Check connection and storage permissions before trying again.",
             ),
             (
                 "blocked",
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "Guardian blocked automatic install repair because it was unsafe.",
                 "The launcher did not mutate files that were not proven launcher-managed.",
             ),
             (
                 "failed",
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "Guardian could not repair the launcher-managed install artifact.",
                 "Check connection and storage permissions before trying again.",
             ),
             (
                 "unknown",
-                GuardianDecisionKind::RecordOnly,
+                GuardianActionKind::RecordOnly,
                 "Guardian recorded an install repair outcome.",
                 "Check the install operation status before retrying.",
             ),
@@ -379,55 +379,55 @@ mod tests {
         let cases = [
             (
                 "download_unavailable",
-                GuardianDecisionKind::Retry,
+                GuardianActionKind::Retry,
                 "Guardian classified the install download failure as retryable.",
                 "provider or network download",
             ),
             (
                 "install_artifact_metadata_invalid",
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "Guardian blocked install because provider metadata could not be trusted.",
                 "invalid provider metadata",
             ),
             (
                 "install_dependency_failed",
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "Guardian blocked loader install because the required base install failed.",
                 "base Minecraft install failed",
             ),
             (
                 "managed_runtime_rosetta_required",
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "This Minecraft version needs Rosetta 2 on Apple Silicon Macs.",
                 "Rosetta 2",
             ),
             (
                 "managed_runtime_unavailable_for_platform",
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "This Minecraft version needs a Java runtime that is not available for this device.",
                 "required managed Java runtime",
             ),
             (
                 "filesystem_permission_denied",
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "Guardian blocked install because Axial could not write launcher-managed files safely.",
                 "filesystem refused",
             ),
             (
                 "temp_file_leftover",
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "Guardian blocked install because temporary download state could not be written safely.",
                 "temporary download state",
             ),
             (
                 "atomic_promotion_failed",
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "Guardian blocked install because verified download data could not be promoted safely.",
                 "atomic promotion failed",
             ),
             (
                 "artifact_ownership_unsafe",
-                GuardianDecisionKind::Block,
+                GuardianActionKind::Block,
                 "Guardian blocked install to protect user-owned or unknown files.",
                 "ownership was unsafe",
             ),
@@ -453,11 +453,11 @@ mod tests {
     #[test]
     fn persisted_state_load_outcome_authors_bounded_public_copy() {
         let outcome = persisted_state_load_user_outcome(
-            GuardianDecisionKind::Warn,
+            GuardianActionKind::Warn,
             "persisted_state_schema_invalid",
         );
 
-        assert_eq!(outcome.decision, GuardianDecisionKind::Warn);
+        assert_eq!(outcome.decision, GuardianActionKind::Warn);
         assert_eq!(outcome.phase, OperationPhase::Startup);
         assert_eq!(
             outcome.summary,
@@ -499,7 +499,7 @@ mod tests {
 
         let outcome = launch_recovery_suppressed_user_outcome(&plan);
 
-        assert_eq!(outcome.decision, GuardianDecisionKind::Block);
+        assert_eq!(outcome.decision, GuardianActionKind::Block);
         assert_eq!(outcome.phase, OperationPhase::Repairing);
         assert_eq!(
             outcome.summary,
@@ -522,7 +522,7 @@ mod tests {
             OperationPhase::Installing,
         );
 
-        assert_eq!(outcome.decision, GuardianDecisionKind::Block);
+        assert_eq!(outcome.decision, GuardianActionKind::Block);
         assert_eq!(outcome.phase, OperationPhase::Installing);
         assert_eq!(
             outcome.summary,

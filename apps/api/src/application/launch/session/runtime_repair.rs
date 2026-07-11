@@ -5,7 +5,7 @@ use crate::execution::runtime::{
     ManagedRuntimeRoot, ManagedRuntimeVerificationRequest, verify_managed_runtime,
 };
 use crate::guardian::{
-    GuardianDecisionKind as ApiGuardianDecisionKind, GuardianManagedRuntimeRepairRequest,
+    GuardianActionKind as ApiGuardianActionKind, GuardianManagedRuntimeRepairRequest,
     GuardianPreflightOutcome, GuardianPreflightOutcomeRequest, GuardianRepairPlanningContext,
     GuardianRepairStatus, GuardianUserOutcome, execute_managed_runtime_ready_marker_repair,
     guardian_fact_from_execution, guardian_preflight_outcome,
@@ -339,11 +339,11 @@ fn block_preflight_outcome_for_runtime_repair(
     preflight: &mut GuardianPreflightOutcome,
     outcome: &GuardianUserOutcome,
 ) {
-    preflight.guardian_decision.kind = ApiGuardianDecisionKind::Block;
-    preflight.safety.decision = ApiGuardianDecisionKind::Block;
+    preflight.guardian_decision.kind = ApiGuardianActionKind::Block;
+    preflight.safety.decision = ApiGuardianActionKind::Block;
     preflight.safety.summary = outcome.summary.clone();
     preflight.safety.detail = outcome.details.first().cloned();
-    preflight.user_outcome.decision = ApiGuardianDecisionKind::Block;
+    preflight.user_outcome.decision = ApiGuardianActionKind::Block;
     preflight.user_outcome.summary = outcome.summary.clone();
     preflight.user_outcome.details = outcome.details.clone();
     preflight.user_outcome.guidance = outcome.guidance.clone();

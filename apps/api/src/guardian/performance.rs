@@ -1,5 +1,5 @@
 use super::{
-    FactReliability, GuardianConfidence, GuardianDecision, GuardianDecisionKind, GuardianDomain,
+    FactReliability, GuardianActionKind, GuardianConfidence, GuardianDecision, GuardianDomain,
     GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianSeverity,
     build_safety_case, decide_guardian_policy,
 };
@@ -75,7 +75,7 @@ pub fn plan_performance_supervision(
         GuardianDecision {
             operation_id: request.operation_id.clone(),
             mode: request.mode,
-            kind: GuardianDecisionKind::Allow,
+            kind: GuardianActionKind::Allow,
             diagnoses: Vec::new(),
             action_plan: None,
         }
@@ -92,11 +92,7 @@ pub fn plan_performance_supervision(
     if !performance_supervision_allows(request.operation, decision.kind) {
         return Err(GuardianPerformanceSupervisionRejection::GuardianBlocked);
     }
-    if matches!(
-        decision.kind,
-        GuardianDecisionKind::Fallback | GuardianDecisionKind::Degrade
-    ) && request.fallback_chain_len == 0
-    {
+    if decision.kind == GuardianActionKind::Fallback && request.fallback_chain_len == 0 {
         return Err(GuardianPerformanceSupervisionRejection::FallbackUnavailable);
     }
 
@@ -318,29 +314,23 @@ fn composition_target(composition_id: &str) -> TargetDescriptor {
 
 fn performance_supervision_allows(
     operation: GuardianPerformanceOperationKind,
-    decision: GuardianDecisionKind,
+    decision: GuardianActionKind,
 ) -> bool {
     match operation {
         GuardianPerformanceOperationKind::ApplyManagedComposition => matches!(
             decision,
-            GuardianDecisionKind::Allow
-                | GuardianDecisionKind::RecordOnly
-                | GuardianDecisionKind::Warn
-                | GuardianDecisionKind::Fallback
-                | GuardianDecisionKind::Degrade
+            GuardianActionKind::Allow
+                | GuardianActionKind::RecordOnly
+                | GuardianActionKind::Warn
+                | GuardianActionKind::Fallback
         ),
         GuardianPerformanceOperationKind::RemoveManagedComposition => matches!(
             decision,
-            GuardianDecisionKind::Allow
-                | GuardianDecisionKind::RecordOnly
-                | GuardianDecisionKind::Warn
+            GuardianActionKind::Allow | GuardianActionKind::RecordOnly | GuardianActionKind::Warn
         ),
         GuardianPerformanceOperationKind::RollbackManagedComposition => matches!(
             decision,
-            GuardianDecisionKind::Allow
-                | GuardianDecisionKind::RecordOnly
-                | GuardianDecisionKind::Warn
-                | GuardianDecisionKind::Rollback
+            GuardianActionKind::Allow | GuardianActionKind::RecordOnly | GuardianActionKind::Warn
         ),
     }
 }
@@ -375,7 +365,7 @@ mod tests {
         plan_performance_supervision,
     };
     use crate::guardian::{
-        GuardianActionKind, GuardianConfidence, GuardianDecisionKind, GuardianDomain, GuardianMode,
+        GuardianActionKind, GuardianConfidence, GuardianDomain, GuardianMode,
         GuardianPolicyContext, GuardianSeverity, diagnose_facts,
     };
     use crate::state::contracts::{
@@ -560,7 +550,7 @@ mod tests {
         })
         .expect("fallback supervision plan");
 
-        assert_eq!(supervision.decision.kind, GuardianDecisionKind::Warn);
+        assert_eq!(supervision.decision.kind, GuardianActionKind::Warn);
         assert!(supervision.fallback_authorized);
         assert_eq!(supervision.max_fallback_attempts, 1);
         assert_eq!(supervision.fact_ids, vec!["performance_fallback_selected"]);
@@ -607,7 +597,7 @@ mod tests {
         .expect("rollback supervision plan");
 
         assert!(!supervision.rollback_authorized);
-        assert_eq!(supervision.decision.kind, GuardianDecisionKind::Allow);
+        assert_eq!(supervision.decision.kind, GuardianActionKind::Allow);
     }
 
     fn performance_target(id: &str, ownership: OwnershipClass) -> TargetDescriptor {

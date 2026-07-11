@@ -1402,9 +1402,7 @@ pub fn trace_launch_event(session_id: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guardian::{
-        GuardianDecisionKind, GuardianDomain, GuardianMode, GuardianUserOutcome,
-    };
+    use crate::guardian::{GuardianActionKind, GuardianDomain, GuardianMode, GuardianUserOutcome};
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
     use crate::state::contracts::{
         OperationPhase, OwnershipClass, StabilizationSystem, TargetKind,
@@ -2403,7 +2401,7 @@ mod tests {
             .expect("insert session");
         let mut guardian = GuardianSummary::new(axial_launcher::GuardianMode::Managed);
         let user_outcome = GuardianUserOutcome {
-            decision: GuardianDecisionKind::Block,
+            decision: GuardianActionKind::Block,
             phase: OperationPhase::Preparing,
             summary: "Guardian blocked launch recovery planning.".to_string(),
             details: vec!["The recovery directive could not be planned safely.".to_string()],
@@ -3329,8 +3327,6 @@ exit 1
         assert_eq!(entry.last_action_outcome, None);
         assert_eq!(entry.repair_attempt_count, 0);
         assert_eq!(entry.suppression_until, None);
-        assert_eq!(entry.safe_fallback, None);
-        assert_eq!(entry.user_decision, None);
         assert_eq!(entry.target_content_hash, None);
         assert_eq!(entry.user_intent_hash, None);
     }

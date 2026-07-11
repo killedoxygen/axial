@@ -6,7 +6,7 @@
 
 use super::GuardianPolicyContext;
 use super::{
-    DiagnosisId, GuardianDecisionKind, GuardianFact, GuardianMode, GuardianRepairPlan,
+    DiagnosisId, GuardianActionKind, GuardianFact, GuardianMode, GuardianRepairPlan,
     GuardianRepairPlanRejection, GuardianUserOutcome, SafetyCase, build_safety_case,
     decide_guardian_policy, guardian_fact_from_execution, install_failure_user_outcome,
     plan_launcher_managed_artifact_repair, plan_launcher_managed_missing_artifact_repair,
@@ -92,7 +92,7 @@ pub enum GuardianInstallArtifactRepairPlanRejection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuardianInstallFailureOutcome {
     pub diagnosis_id: DiagnosisId,
-    pub decision: GuardianDecisionKind,
+    pub decision: GuardianActionKind,
     pub user_outcome: GuardianUserOutcome,
 }
 
@@ -180,9 +180,7 @@ pub fn install_artifact_failure_guardian_outcome_with_context(
     let decision = decide_guardian_policy(&safety_case, context);
     if matches!(
         decision.kind,
-        GuardianDecisionKind::Allow
-            | GuardianDecisionKind::RecordOnly
-            | GuardianDecisionKind::Repair
+        GuardianActionKind::Allow | GuardianActionKind::RecordOnly | GuardianActionKind::Repair
     ) {
         return None;
     }
@@ -220,7 +218,7 @@ pub fn plan_install_artifact_failure_repair(
 
     let safety_case = install_artifact_failure_safety_case(operation_id, mode, phase, evidence);
     let decision = decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
-    if decision.kind != GuardianDecisionKind::Repair {
+    if decision.kind != GuardianActionKind::Repair {
         return Err(GuardianInstallArtifactRepairPlanRejection::PolicyDidNotSelectRepair);
     }
 
@@ -325,7 +323,7 @@ fn target_kind_for_install_failure(kind: GuardianInstallArtifactFailureKind) -> 
 }
 
 fn install_failure_user_outcome_from_evidence(
-    decision: GuardianDecisionKind,
+    decision: GuardianActionKind,
     diagnosis_id: &str,
     evidence: &[GuardianInstallArtifactFailureEvidence],
 ) -> GuardianUserOutcome {
@@ -610,10 +608,7 @@ mod tests {
             .expect("Guardian outcome");
 
             assert_eq!(outcome.diagnosis_id.as_str(), "download_unavailable");
-            assert_eq!(
-                outcome.decision,
-                crate::guardian::GuardianDecisionKind::Retry
-            );
+            assert_eq!(outcome.decision, crate::guardian::GuardianActionKind::Retry);
             assert!(
                 outcome
                     .user_outcome
@@ -653,10 +648,7 @@ mod tests {
             outcome.diagnosis_id.as_str(),
             "managed_runtime_unavailable_for_platform"
         );
-        assert_eq!(
-            outcome.decision,
-            crate::guardian::GuardianDecisionKind::Block
-        );
+        assert_eq!(outcome.decision, crate::guardian::GuardianActionKind::Block);
         assert_eq!(
             outcome.user_outcome.summary,
             "This Minecraft version needs a Java runtime that is not available for this device."
@@ -718,10 +710,7 @@ mod tests {
             outcome.diagnosis_id.as_str(),
             "managed_runtime_rosetta_required"
         );
-        assert_eq!(
-            outcome.decision,
-            crate::guardian::GuardianDecisionKind::Block
-        );
+        assert_eq!(outcome.decision, crate::guardian::GuardianActionKind::Block);
         assert_eq!(
             outcome.user_outcome.summary,
             "This Minecraft version needs Rosetta 2 on Apple Silicon Macs."
@@ -818,10 +807,7 @@ mod tests {
             .expect("Guardian outcome");
 
             assert_eq!(outcome.diagnosis_id.as_str(), diagnosis_id);
-            assert_eq!(
-                outcome.decision,
-                crate::guardian::GuardianDecisionKind::Block
-            );
+            assert_eq!(outcome.decision, crate::guardian::GuardianActionKind::Block);
             assert!(
                 outcome.user_outcome.summary.contains(summary_fragment),
                 "{diagnosis_id} summary did not contain expected fragment: {:?}",

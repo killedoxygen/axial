@@ -1,5 +1,5 @@
 use super::{
-    FactReliability, GuardianConfidence, GuardianDecision, GuardianDecisionKind, GuardianDomain,
+    FactReliability, GuardianActionKind, GuardianConfidence, GuardianDecision, GuardianDomain,
     GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianSeverity,
     GuardianUserOutcome, SafetyCase, SafetyOutcome, build_safety_case, decide_guardian_policy,
     launch_failure_memory::{
@@ -196,47 +196,47 @@ fn preflight_decision_kind(
     request: &GuardianPreflightOutcomeRequest<'_>,
     facts: &[GuardianFact],
     decision: &GuardianDecision,
-) -> GuardianDecisionKind {
-    if readiness_blocks_launch(request.readiness) || decision.kind == GuardianDecisionKind::Block {
-        return GuardianDecisionKind::Block;
+) -> GuardianActionKind {
+    if readiness_blocks_launch(request.readiness) || decision.kind == GuardianActionKind::Block {
+        return GuardianActionKind::Block;
     }
     if request.mode == GuardianMode::Managed
-        && decision.kind == GuardianDecisionKind::Fallback
+        && decision.kind == GuardianActionKind::Fallback
         && facts.iter().any(is_java_override_unavailable_fact)
     {
-        return GuardianDecisionKind::Fallback;
+        return GuardianActionKind::Fallback;
     }
     if request.mode == GuardianMode::Managed
-        && decision.kind == GuardianDecisionKind::Strip
+        && decision.kind == GuardianActionKind::Strip
         && facts.iter().any(is_jvm_preflight_strip_fact)
     {
-        return GuardianDecisionKind::Strip;
+        return GuardianActionKind::Strip;
     }
-    if decision.kind == GuardianDecisionKind::AskUser {
+    if decision.kind == GuardianActionKind::AskUser {
         if decision
             .diagnoses
             .iter()
             .any(|diagnosis| diagnosis.as_str() == "java_override_unavailable")
         {
-            return GuardianDecisionKind::AskUser;
+            return GuardianActionKind::AskUser;
         }
         if facts.iter().any(is_preflight_warning_fact) {
-            return GuardianDecisionKind::Warn;
+            return GuardianActionKind::Warn;
         }
-        return GuardianDecisionKind::AskUser;
+        return GuardianActionKind::AskUser;
     }
     if facts.iter().any(is_preflight_warning_fact) {
-        return GuardianDecisionKind::Warn;
+        return GuardianActionKind::Warn;
     }
     decision.kind
 }
 
 fn preflight_directives(
-    decision: GuardianDecisionKind,
+    decision: GuardianActionKind,
     safety_case: &SafetyCase,
 ) -> Vec<GuardianPreflightDirective> {
     let mut directives = Vec::new();
-    if decision == GuardianDecisionKind::Fallback
+    if decision == GuardianActionKind::Fallback
         && safety_case
             .diagnoses
             .iter()
@@ -244,7 +244,7 @@ fn preflight_directives(
     {
         directives.push(GuardianPreflightDirective::UseManagedJavaForAttempt);
     }
-    if decision == GuardianDecisionKind::Strip
+    if decision == GuardianActionKind::Strip
         && safety_case.diagnoses.iter().any(|diagnosis| {
             matches!(
                 diagnosis.id.as_str(),
@@ -344,13 +344,13 @@ fn is_preflight_warning_fact(fact: &GuardianFact) -> bool {
 }
 
 fn preflight_copy(
-    decision: GuardianDecisionKind,
+    decision: GuardianActionKind,
     safety_case: &SafetyCase,
     facts: &[GuardianFact],
 ) -> (Vec<String>, Vec<String>) {
     let mut details = Vec::new();
     let mut guidance = Vec::new();
-    if decision == GuardianDecisionKind::Warn {
+    if decision == GuardianActionKind::Warn {
         push_historical_launch_copy(facts, &mut details, &mut guidance);
     }
     for diagnosis in &safety_case.diagnoses {
@@ -361,10 +361,10 @@ fn preflight_copy(
             push_unique_public(&mut guidance, value, MAX_PREFLIGHT_GUIDANCE);
         }
     }
-    if decision != GuardianDecisionKind::Warn {
+    if decision != GuardianActionKind::Warn {
         push_historical_launch_copy(facts, &mut details, &mut guidance);
     }
-    if details.is_empty() && decision == GuardianDecisionKind::Block {
+    if details.is_empty() && decision == GuardianActionKind::Block {
         push_unique_public(
             &mut details,
             "Guardian blocked launch because preflight readiness failed.",
@@ -594,19 +594,16 @@ fn fact_field_u32(fact: &GuardianFact, key: &str) -> Option<u32> {
     fact_field(fact, key)?.parse().ok()
 }
 
-fn detail_for_diagnosis(
-    diagnosis_id: &str,
-    decision: GuardianDecisionKind,
-) -> Option<&'static str> {
+fn detail_for_diagnosis(diagnosis_id: &str, decision: GuardianActionKind) -> Option<&'static str> {
     match diagnosis_id {
         "java_override_unavailable" => match decision {
-            GuardianDecisionKind::Fallback => Some(
+            GuardianActionKind::Fallback => Some(
                 "Guardian will ignore the unavailable Java override and use managed Java for this launch.",
             ),
-            GuardianDecisionKind::Block => {
+            GuardianActionKind::Block => {
                 Some("Guardian blocked launch because the selected Java override is unavailable.")
             }
-            GuardianDecisionKind::AskUser => {
+            GuardianActionKind::AskUser => {
                 Some("Guardian needs confirmation before changing the selected Java override.")
             }
             _ => Some(
@@ -614,13 +611,13 @@ fn detail_for_diagnosis(
             ),
         },
         "java_probe_failed" => match decision {
-            GuardianDecisionKind::Fallback => Some(
+            GuardianActionKind::Fallback => Some(
                 "Guardian will ignore the Java override that failed probing and use managed Java for this launch.",
             ),
-            GuardianDecisionKind::Block => Some(
+            GuardianActionKind::Block => Some(
                 "Guardian blocked launch because the selected Java override could not be probed.",
             ),
-            GuardianDecisionKind::AskUser => Some(
+            GuardianActionKind::AskUser => Some(
                 "Guardian needs confirmation before bypassing a Java override that could not be probed.",
             ),
             _ => Some(
@@ -628,13 +625,13 @@ fn detail_for_diagnosis(
             ),
         },
         "java_runtime_major_mismatch" => match decision {
-            GuardianDecisionKind::Fallback => Some(
+            GuardianActionKind::Fallback => Some(
                 "Guardian will ignore the incompatible Java override and use managed Java for this launch.",
             ),
-            GuardianDecisionKind::Block => Some(
+            GuardianActionKind::Block => Some(
                 "Guardian blocked launch because the selected Java override has the wrong Java version.",
             ),
-            GuardianDecisionKind::AskUser => {
+            GuardianActionKind::AskUser => {
                 Some("Guardian needs confirmation before bypassing an incompatible Java override.")
             }
             _ => Some(
@@ -642,19 +639,19 @@ fn detail_for_diagnosis(
             ),
         },
         "java_runtime_update_too_old" => match decision {
-            GuardianDecisionKind::Fallback => Some(
+            GuardianActionKind::Fallback => Some(
                 "Guardian will ignore the outdated Java override and use managed Java for this launch.",
             ),
-            GuardianDecisionKind::Block => {
+            GuardianActionKind::Block => {
                 Some("Guardian blocked launch because the selected Java 8 override is too old.")
             }
-            GuardianDecisionKind::AskUser => {
+            GuardianActionKind::AskUser => {
                 Some("Guardian needs confirmation before bypassing an outdated Java override.")
             }
             _ => Some("Guardian detected a Java 8 override that is too old for this launch."),
         },
         "jvm_args_malformed" => match decision {
-            GuardianDecisionKind::Strip => {
+            GuardianActionKind::Strip => {
                 Some("Guardian removed malformed explicit JVM args for this launch.")
             }
             _ => Some(
@@ -662,7 +659,7 @@ fn detail_for_diagnosis(
             ),
         },
         "jvm_arg_unsupported" => match decision {
-            GuardianDecisionKind::Strip => {
+            GuardianActionKind::Strip => {
                 Some("Guardian removed unsupported explicit JVM args for this launch.")
             }
             _ => Some(
@@ -670,7 +667,7 @@ fn detail_for_diagnosis(
             ),
         },
         "jvm_arg_unsafe_override" => match decision {
-            GuardianDecisionKind::Strip => Some(
+            GuardianActionKind::Strip => Some(
                 "Guardian removed explicit JVM args that override launcher-owned settings for this launch.",
             ),
             _ => Some(
@@ -733,14 +730,14 @@ fn detail_for_diagnosis(
 
 fn guidance_for_diagnosis(
     diagnosis_id: &str,
-    decision: GuardianDecisionKind,
+    decision: GuardianActionKind,
 ) -> Option<&'static str> {
     match diagnosis_id {
         "java_override_unavailable" => match decision {
-            GuardianDecisionKind::Fallback => Some(
+            GuardianActionKind::Fallback => Some(
                 "Update or remove the bad Java override after launch if you want to use Custom Java again.",
             ),
-            GuardianDecisionKind::AskUser => {
+            GuardianActionKind::AskUser => {
                 Some("Confirm managed Java for this launch or choose a valid Java runtime.")
             }
             _ => Some(
@@ -748,10 +745,10 @@ fn guidance_for_diagnosis(
             ),
         },
         "java_probe_failed" => match decision {
-            GuardianDecisionKind::Fallback => Some(
+            GuardianActionKind::Fallback => Some(
                 "Update or remove the Java override after launch if you want to use Custom Java again.",
             ),
-            GuardianDecisionKind::AskUser => Some(
+            GuardianActionKind::AskUser => Some(
                 "Confirm managed Java for this launch or choose a Java runtime that can be probed.",
             ),
             _ => Some(
@@ -759,31 +756,31 @@ fn guidance_for_diagnosis(
             ),
         },
         "java_runtime_major_mismatch" => match decision {
-            GuardianDecisionKind::Fallback => Some(
+            GuardianActionKind::Fallback => Some(
                 "Choose a Java runtime matching this Minecraft version before re-enabling the override.",
             ),
-            GuardianDecisionKind::AskUser => {
+            GuardianActionKind::AskUser => {
                 Some("Confirm managed Java for this launch or choose a compatible Java runtime.")
             }
             _ => Some("Choose a Java runtime matching this Minecraft version requirement."),
         },
         "java_runtime_update_too_old" => match decision {
-            GuardianDecisionKind::Fallback => {
+            GuardianActionKind::Fallback => {
                 Some("Use Java 8u312 or newer before re-enabling this override.")
             }
-            GuardianDecisionKind::AskUser => {
+            GuardianActionKind::AskUser => {
                 Some("Confirm managed Java for this launch or choose Java 8u312 or newer.")
             }
             _ => Some("Use Java 8u312 or newer for this legacy launch."),
         },
         "jvm_args_malformed" => match decision {
-            GuardianDecisionKind::Strip => Some("Fix the saved JVM args before re-enabling them."),
+            GuardianActionKind::Strip => Some("Fix the saved JVM args before re-enabling them."),
             _ => Some(
                 "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
             ),
         },
         "jvm_arg_unsupported" => match decision {
-            GuardianDecisionKind::Strip => Some(
+            GuardianActionKind::Strip => Some(
                 "Use JVM flags supported by the selected Java runtime before re-enabling them.",
             ),
             _ => Some(
@@ -791,7 +788,7 @@ fn guidance_for_diagnosis(
             ),
         },
         "jvm_arg_unsafe_override" => match decision {
-            GuardianDecisionKind::Strip => Some(
+            GuardianActionKind::Strip => Some(
                 "Remove memory, classpath, native-path, or agent overrides from saved JVM args before re-enabling them.",
             ),
             _ => Some(
@@ -838,15 +835,15 @@ fn guidance_for_diagnosis(
     }
 }
 
-fn preflight_summary(decision: GuardianDecisionKind) -> &'static str {
+fn preflight_summary(decision: GuardianActionKind) -> &'static str {
     match decision {
-        GuardianDecisionKind::Allow | GuardianDecisionKind::RecordOnly => {
+        GuardianActionKind::Allow | GuardianActionKind::RecordOnly => {
             "Guardian recorded launch preflight readiness."
         }
-        GuardianDecisionKind::Warn => "Guardian found launch preflight warnings.",
-        GuardianDecisionKind::AskUser => "Guardian needs confirmation before launch.",
-        GuardianDecisionKind::Block => "Guardian blocked launch preflight.",
-        GuardianDecisionKind::Fallback | GuardianDecisionKind::Strip => {
+        GuardianActionKind::Warn => "Guardian found launch preflight warnings.",
+        GuardianActionKind::AskUser => "Guardian needs confirmation before launch.",
+        GuardianActionKind::Block => "Guardian blocked launch preflight.",
+        GuardianActionKind::Fallback | GuardianActionKind::Strip => {
             "Guardian adjusted launch preflight."
         }
         _ => "Guardian selected a guarded launch preflight action.",
@@ -1057,7 +1054,7 @@ mod tests {
         guardian_preflight_outcome, launch_failure_plain_label,
     };
     use crate::guardian::{
-        FactReliability, GuardianConfidence, GuardianDecisionKind, GuardianDomain, GuardianFact,
+        FactReliability, GuardianActionKind, GuardianConfidence, GuardianDomain, GuardianFact,
         GuardianFactId, GuardianMode, GuardianPreflightDirective, GuardianSeverity,
         is_guardian_launch_crash_class,
     };
@@ -1083,8 +1080,8 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Custom, &[])
         });
 
-        assert_eq!(outcome.user_outcome.decision, GuardianDecisionKind::Block);
-        assert_eq!(outcome.safety.decision, GuardianDecisionKind::Block);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
+        assert_eq!(outcome.safety.decision, GuardianActionKind::Block);
         assert!(outcome.user_outcome.details.iter().any(|detail| detail
             == "Guardian blocked launch because the selected Java override is unavailable."));
     }
@@ -1105,11 +1102,8 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Custom, &[fact])
         });
 
-        assert_eq!(
-            outcome.guardian_decision.kind,
-            GuardianDecisionKind::AskUser
-        );
-        assert_eq!(outcome.user_outcome.decision, GuardianDecisionKind::AskUser);
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::AskUser);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::AskUser);
         assert!(outcome.user_outcome.guidance.contains(
             &"Confirm managed Java for this launch or choose a valid Java runtime.".to_string()
         ));
@@ -1132,10 +1126,7 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[fact])
         });
 
-        assert_eq!(
-            outcome.user_outcome.decision,
-            GuardianDecisionKind::Fallback
-        );
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Fallback);
         assert_eq!(
             outcome.directives,
             vec![GuardianPreflightDirective::UseManagedJavaForAttempt]
@@ -1160,8 +1151,8 @@ mod tests {
                 std::slice::from_ref(&fact),
             )
         });
-        assert_eq!(managed.guardian_decision.kind, GuardianDecisionKind::Strip);
-        assert_eq!(managed.user_outcome.decision, GuardianDecisionKind::Strip);
+        assert_eq!(managed.guardian_decision.kind, GuardianActionKind::Strip);
+        assert_eq!(managed.user_outcome.decision, GuardianActionKind::Strip);
         assert_eq!(
             managed.directives,
             vec![GuardianPreflightDirective::StripExplicitJvmArgsForAttempt]
@@ -1174,7 +1165,7 @@ mod tests {
             explicit_user_intent: true,
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Disabled, &[fact])
         });
-        assert_eq!(disabled.user_outcome.decision, GuardianDecisionKind::Block);
+        assert_eq!(disabled.user_outcome.decision, GuardianActionKind::Block);
         assert!(disabled.directives.is_empty());
     }
 
@@ -1194,7 +1185,7 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[])
         });
 
-        assert_eq!(outcome.user_outcome.decision, GuardianDecisionKind::Block);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
         assert!(outcome.user_outcome.details.contains(
             &"Guardian blocked launch because client game files are missing.".to_string()
         ));
@@ -1219,7 +1210,7 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[])
         });
 
-        assert_eq!(outcome.user_outcome.decision, GuardianDecisionKind::Block);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
         assert!(outcome.user_outcome.details.contains(
             &"Guardian blocked launch because launcher-managed jar signatures are inconsistent."
                 .to_string()
@@ -1314,7 +1305,7 @@ mod tests {
                     ..GuardianPreflightOutcomeRequest::new(mode, &[historical_fact])
                 });
 
-                assert_eq!(outcome.user_outcome.decision, GuardianDecisionKind::Warn);
+                assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Warn);
                 assert!(outcome.directives.is_empty());
             }
         }
@@ -1514,7 +1505,7 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &historical_facts)
         });
 
-        assert_eq!(outcome.user_outcome.decision, GuardianDecisionKind::Warn);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Warn);
         assert_eq!(outcome.user_outcome.details.len(), 6);
         assert_eq!(outcome.user_outcome.guidance.len(), 6);
         assert!(

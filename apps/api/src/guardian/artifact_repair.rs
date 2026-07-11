@@ -976,8 +976,8 @@ mod tests {
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{
         ActionPlanPrerequisite, DiagnosisId, GuardianAction, GuardianActionKind,
-        GuardianActionPlan, GuardianConfidence, GuardianDecision, GuardianDecisionKind,
-        GuardianMode, GuardianRepairPlanningContext, plan_launcher_managed_artifact_repair,
+        GuardianActionPlan, GuardianConfidence, GuardianDecision, GuardianMode,
+        GuardianRepairPlanningContext, plan_launcher_managed_artifact_repair,
         plan_launcher_managed_missing_artifact_repair,
     };
     use crate::state::OperationJournalStore;
@@ -1854,7 +1854,7 @@ mod tests {
         GuardianDecision {
             operation_id: Some(OperationId::new("operation-install-repair")),
             mode: GuardianMode::Managed,
-            kind: GuardianDecisionKind::Repair,
+            kind: GuardianActionKind::Repair,
             diagnoses: vec![DiagnosisId::new("launcher_managed_artifact_corrupt")],
             action_plan: Some(GuardianActionPlan::new(
                 StabilizationSystem::Guardian,
