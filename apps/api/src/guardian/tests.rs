@@ -5,15 +5,89 @@ use super::inference_graph::{
 };
 use super::{
     ActionPlanPrerequisite, Diagnosis, FactReliability, GuardianAction, GuardianActionKind,
-    GuardianActionPlan, GuardianConfidence, GuardianDomain, GuardianFact, GuardianFactId,
-    GuardianMode, GuardianSeverity, GuardianSeverity::Repairable, build_safety_case,
-    diagnose_facts, guardian_fact_from_execution,
+    GuardianActionPlan, GuardianConfidence, GuardianDecision, GuardianDomain, GuardianFact,
+    GuardianFactId, GuardianMode, GuardianSeverity, GuardianSeverity::Repairable,
+    build_safety_case, diagnose_facts, guardian_fact_from_execution,
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
+
+const GUARDIAN_DECISION_ACTIONS_FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/guardian/guardian-decision-actions.json"
+));
+const GUARDIAN_FACT_IDS_FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/guardian/guardian-fact-ids.json"
+));
+
+#[test]
+fn checked_in_guardian_decision_actions_fixture_is_byte_stable() {
+    let decisions =
+        serde_json::from_str::<Vec<GuardianDecision>>(GUARDIAN_DECISION_ACTIONS_FIXTURE)
+            .expect("decision fixture");
+    assert_eq!(decisions.len(), 11);
+    let mut kinds = std::collections::BTreeSet::new();
+    for decision in &decisions {
+        let plan = decision.action_plan.as_ref().expect("fixture action plan");
+        let action = plan.actions.as_slice().first().expect("fixture action");
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(
+            decision.diagnoses.as_slice(),
+            std::slice::from_ref(&plan.prerequisite.diagnosis_id)
+        );
+        assert_eq!(action.reason, plan.prerequisite.diagnosis_id);
+        assert_eq!(
+            plan.prerequisite.candidate_actions.as_slice(),
+            &[action.kind]
+        );
+
+        let decision_kind = serde_json::to_string(&decision.kind).expect("decision kind");
+        let action_kind = serde_json::to_string(&action.kind).expect("action kind");
+        assert_eq!(decision_kind, action_kind);
+        assert!(kinds.insert(decision_kind));
+    }
+
+    let pretty = serde_json::to_string_pretty(&decisions).expect("pretty decision fixture");
+    assert_eq!(format!("{pretty}\n"), GUARDIAN_DECISION_ACTIONS_FIXTURE);
+
+    let compact = serde_json::to_string(&decisions).expect("compact decision fixture");
+    let decoded =
+        serde_json::from_str::<Vec<GuardianDecision>>(&compact).expect("decode compact decisions");
+    assert_eq!(
+        serde_json::to_string(&decoded).expect("re-encode compact decisions"),
+        compact
+    );
+}
+
+#[test]
+fn checked_in_guardian_fact_ids_fixture_is_byte_stable() {
+    let fact_ids = serde_json::from_str::<Vec<GuardianFactId>>(GUARDIAN_FACT_IDS_FIXTURE)
+        .expect("fact-id fixture");
+    assert_eq!(fact_ids.len(), 115);
+    assert_eq!(
+        fact_ids
+            .iter()
+            .map(GuardianFactId::as_str)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        115
+    );
+
+    let pretty = serde_json::to_string_pretty(&fact_ids).expect("pretty fact-id fixture");
+    assert_eq!(format!("{pretty}\n"), GUARDIAN_FACT_IDS_FIXTURE);
+
+    let compact = serde_json::to_string(&fact_ids).expect("compact fact-id fixture");
+    let decoded =
+        serde_json::from_str::<Vec<GuardianFactId>>(&compact).expect("decode compact fact ids");
+    assert_eq!(
+        serde_json::to_string(&decoded).expect("re-encode compact fact ids"),
+        compact
+    );
+}
 
 #[test]
 fn execution_runtime_fact_maps_to_confirmed_runtime_diagnosis() {

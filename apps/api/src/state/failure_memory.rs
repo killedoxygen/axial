@@ -777,6 +777,11 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    const FAILURE_MEMORY_V1_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/guardian/failure-memory-v1.json"
+    ));
+
     struct CountingFileBackend {
         attempts: AtomicUsize,
         failures: AtomicUsize,
@@ -857,6 +862,23 @@ mod tests {
         let decoded = FailureMemorySnapshot::from_json(&encoded).expect("deserialize snapshot");
 
         assert_eq!(decoded.entries, vec![entry]);
+    }
+
+    #[test]
+    fn checked_in_failure_memory_v1_fixture_is_byte_stable() {
+        let snapshot =
+            FailureMemorySnapshot::from_json(FAILURE_MEMORY_V1_FIXTURE).expect("strict fixture");
+        assert_eq!(snapshot.schema, super::FAILURE_MEMORY_SCHEMA);
+
+        let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
+        assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V1_FIXTURE);
+
+        let compact = snapshot.to_json().expect("compact fixture json");
+        let decoded = FailureMemorySnapshot::from_json(&compact).expect("decode compact fixture");
+        assert_eq!(
+            decoded.to_json().expect("re-encode compact fixture"),
+            compact
+        );
     }
 
     #[test]

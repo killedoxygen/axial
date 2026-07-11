@@ -1047,6 +1047,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
 
+    const OPERATION_JOURNALS_V1_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/guardian/operation-journals-v1.json"
+    ));
+
     struct RecordingFileBackend {
         attempts: AtomicUsize,
         failures: AtomicUsize,
@@ -1339,6 +1344,37 @@ mod tests {
             }]
         });
         assert!(OperationJournalSnapshot::from_json(&unknown_field.to_string()).is_err());
+    }
+
+    #[test]
+    fn checked_in_operation_journals_v1_fixture_is_byte_stable() {
+        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V1_FIXTURE)
+            .expect("strict fixture");
+        assert_eq!(snapshot.schema, super::OPERATION_JOURNAL_SCHEMA);
+        let diagnosis_ids = snapshot
+            .entries
+            .iter()
+            .flat_map(|entry| entry.guardian_diagnosis_ids.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(diagnosis_ids.len(), 78);
+        assert_eq!(
+            diagnosis_ids
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            78
+        );
+
+        let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
+        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V1_FIXTURE);
+
+        let compact = snapshot.to_json().expect("compact fixture json");
+        let decoded =
+            OperationJournalSnapshot::from_json(&compact).expect("decode compact fixture");
+        assert_eq!(
+            decoded.to_json().expect("re-encode compact fixture"),
+            compact
+        );
     }
 
     #[test]

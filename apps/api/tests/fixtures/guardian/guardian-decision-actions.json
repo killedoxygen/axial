@@ -1,0 +1,376 @@
+[
+  {
+    "operation_id": "guardian-decision-allow",
+    "mode": "Managed",
+    "kind": "Allow",
+    "diagnoses": [
+      "launch_command_prepared"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "launch_command_prepared",
+        "ownership": "LauncherManaged",
+        "confidence": "Confirmed",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Instance",
+            "id": "fixture_instance",
+            "ownership": "LauncherManaged"
+          }
+        ],
+        "candidate_actions": [
+          "Allow"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Allow",
+          "target": null,
+          "reason": "launch_command_prepared"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "guardian-decision-warn",
+    "mode": "Custom",
+    "kind": "Warn",
+    "diagnoses": [
+      "launch_memory_allocation_low"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "launch_memory_allocation_low",
+        "ownership": "UserOwned",
+        "confidence": "High",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_memory",
+            "ownership": "UserOwned"
+          }
+        ],
+        "candidate_actions": [
+          "Warn"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Warn",
+          "target": null,
+          "reason": "launch_memory_allocation_low"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "guardian-decision-repair",
+    "mode": "Managed",
+    "kind": "Repair",
+    "diagnoses": [
+      "managed_runtime_corrupt"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "managed_runtime_corrupt",
+        "ownership": "LauncherManaged",
+        "confidence": "Confirmed",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Runtime",
+            "id": "fixture_runtime",
+            "ownership": "LauncherManaged"
+          }
+        ],
+        "candidate_actions": [
+          "Repair"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Repair",
+          "target": null,
+          "reason": "managed_runtime_corrupt"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "guardian-decision-retry",
+    "mode": "Managed",
+    "kind": "Retry",
+    "diagnoses": [
+      "process_lifecycle_observed"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "process_lifecycle_observed",
+        "ownership": "LauncherManaged",
+        "confidence": "Confirmed",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Session",
+            "id": "fixture_session",
+            "ownership": "LauncherManaged"
+          }
+        ],
+        "candidate_actions": [
+          "Retry"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Retry",
+          "target": null,
+          "reason": "process_lifecycle_observed"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "guardian-decision-strip",
+    "mode": "Managed",
+    "kind": "Strip",
+    "diagnoses": [
+      "jvm_args_malformed"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "jvm_args_malformed",
+        "ownership": "UserOwned",
+        "confidence": "Confirmed",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_jvm_args",
+            "ownership": "UserOwned"
+          }
+        ],
+        "candidate_actions": [
+          "Strip"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Strip",
+          "target": null,
+          "reason": "jvm_args_malformed"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "guardian-decision-downgrade",
+    "mode": "Managed",
+    "kind": "Downgrade",
+    "diagnoses": [
+      "jvm_preset_recovery"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "jvm_preset_recovery",
+        "ownership": "UserOwned",
+        "confidence": "High",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_jvm_preset",
+            "ownership": "UserOwned"
+          }
+        ],
+        "candidate_actions": [
+          "Downgrade"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Downgrade",
+          "target": null,
+          "reason": "jvm_preset_recovery"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "guardian-decision-fallback",
+    "mode": "Managed",
+    "kind": "Fallback",
+    "diagnoses": [
+      "java_override_unavailable"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "java_override_unavailable",
+        "ownership": "UserOwned",
+        "confidence": "Confirmed",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Runtime",
+            "id": "fixture_java_override",
+            "ownership": "UserOwned"
+          }
+        ],
+        "candidate_actions": [
+          "Fallback"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Fallback",
+          "target": null,
+          "reason": "java_override_unavailable"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "guardian-decision-quarantine",
+    "mode": "Managed",
+    "kind": "Quarantine",
+    "diagnoses": [
+      "launcher_managed_artifact_corrupt"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "launcher_managed_artifact_corrupt",
+        "ownership": "LauncherManaged",
+        "confidence": "Confirmed",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Artifact",
+            "id": "fixture_artifact",
+            "ownership": "LauncherManaged"
+          }
+        ],
+        "candidate_actions": [
+          "Quarantine"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Quarantine",
+          "target": null,
+          "reason": "launcher_managed_artifact_corrupt"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "guardian-decision-ask-user",
+    "mode": "Custom",
+    "kind": "AskUser",
+    "diagnoses": [
+      "custom_java_override_present"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "custom_java_override_present",
+        "ownership": "UserOwned",
+        "confidence": "High",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_custom_java",
+            "ownership": "UserOwned"
+          }
+        ],
+        "candidate_actions": [
+          "AskUser"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "AskUser",
+          "target": null,
+          "reason": "custom_java_override_present"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "guardian-decision-block",
+    "mode": "Disabled",
+    "kind": "Block",
+    "diagnoses": [
+      "persisted_state_schema_invalid"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "persisted_state_schema_invalid",
+        "ownership": "LauncherManaged",
+        "confidence": "Certain",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Config",
+            "id": "fixture_state",
+            "ownership": "LauncherManaged"
+          }
+        ],
+        "candidate_actions": [
+          "Block"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "Block",
+          "target": null,
+          "reason": "persisted_state_schema_invalid"
+        }
+      ]
+    }
+  },
+  {
+    "operation_id": "guardian-decision-record-only",
+    "mode": "Disabled",
+    "kind": "RecordOnly",
+    "diagnoses": [
+      "unknown_failure_planning"
+    ],
+    "action_plan": {
+      "owner": "Guardian",
+      "prerequisite": {
+        "diagnosis_id": "unknown_failure_planning",
+        "ownership": "Unknown",
+        "confidence": "Low",
+        "affected_targets": [
+          {
+            "system": "Guardian",
+            "kind": "Instance",
+            "id": "fixture_unknown",
+            "ownership": "Unknown"
+          }
+        ],
+        "candidate_actions": [
+          "RecordOnly"
+        ]
+      },
+      "actions": [
+        {
+          "kind": "RecordOnly",
+          "target": null,
+          "reason": "unknown_failure_planning"
+        }
+      ]
+    }
+  }
+]
