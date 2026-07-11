@@ -20,7 +20,67 @@ use std::time::Duration;
 const JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
 const JOURNAL_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
-pub(super) fn plan_guardian_launch_recovery_directive(
+pub(super) enum RecoveryDirectiveOutcome {
+    Apply(GuardianLaunchRecoveryPlan),
+    Exhausted,
+    Rejected,
+    Suppressed(GuardianUserOutcome),
+}
+
+pub(super) struct RecoveryDirectiveRequest<'a> {
+    pub(super) state: &'a AppState,
+    pub(super) session_id: &'a str,
+    pub(super) intent: &'a axial_launcher::LaunchIntent,
+    pub(super) directive: GuardianLaunchRecoveryDirective,
+    pub(super) mode: crate::guardian::GuardianMode,
+    pub(super) failure_class: LaunchFailureClass,
+    pub(super) recovery_attempts: &'a mut u8,
+    pub(super) max_recovery_attempts: u8,
+    pub(super) guardian: &'a mut GuardianSummary,
+}
+
+pub(super) async fn handle_recovery_directive(
+    request: RecoveryDirectiveRequest<'_>,
+) -> Result<RecoveryDirectiveOutcome, OperationJournalStoreError> {
+    if *request.recovery_attempts >= request.max_recovery_attempts {
+        return Ok(RecoveryDirectiveOutcome::Exhausted);
+    }
+    *request.recovery_attempts += 1;
+
+    let Ok(plan) = plan_guardian_launch_recovery_directive(
+        request.intent,
+        request.directive,
+        request.mode,
+        request.failure_class,
+    ) else {
+        return Ok(RecoveryDirectiveOutcome::Rejected);
+    };
+    let outcome =
+        record_guardian_launch_recovery_attempt(request.state, request.session_id, &plan).await?;
+    if outcome.status == crate::guardian::GuardianLaunchRecoveryStatus::Suppressed {
+        let user_outcome = suppressed_launch_recovery_outcome(&plan);
+        request
+            .state
+            .sessions()
+            .emit_log(request.session_id, "system", user_outcome.summary.clone())
+            .await;
+        block_guardian_for_suppressed_launch_recovery(request.guardian, &user_outcome);
+        return Ok(RecoveryDirectiveOutcome::Suppressed(user_outcome));
+    }
+
+    request
+        .state
+        .sessions()
+        .emit_log(
+            request.session_id,
+            "system",
+            plan.directive.description.clone(),
+        )
+        .await;
+    Ok(RecoveryDirectiveOutcome::Apply(plan))
+}
+
+fn plan_guardian_launch_recovery_directive(
     intent: &axial_launcher::LaunchIntent,
     directive: GuardianLaunchRecoveryDirective,
     mode: crate::guardian::GuardianMode,
@@ -45,7 +105,7 @@ pub(super) fn plan_guardian_launch_recovery_directive(
     })
 }
 
-pub(super) async fn record_guardian_launch_recovery_attempt(
+async fn record_guardian_launch_recovery_attempt(
     state: &AppState,
     session_id: &str,
     plan: &GuardianLaunchRecoveryPlan,
@@ -290,13 +350,11 @@ fn reject_mismatched_launch_recovery_transition(
     Ok(())
 }
 
-pub(super) fn suppressed_launch_recovery_outcome(
-    plan: &GuardianLaunchRecoveryPlan,
-) -> GuardianUserOutcome {
+fn suppressed_launch_recovery_outcome(plan: &GuardianLaunchRecoveryPlan) -> GuardianUserOutcome {
     launch_recovery_suppressed_user_outcome(plan)
 }
 
-pub(super) fn block_guardian_for_suppressed_launch_recovery(
+fn block_guardian_for_suppressed_launch_recovery(
     guardian: &mut GuardianSummary,
     outcome: &GuardianUserOutcome,
 ) {

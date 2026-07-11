@@ -11,12 +11,12 @@ use crate::execution::launch::{
     LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
 };
 use crate::guardian::{
-    GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryStatus, GuardianObservedLaunchFailurePhase,
-    GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
-    GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianUserOutcome,
-    guardian_observed_launch_failure_outcome, guardian_prelaunch_preset_adjustment_directive,
-    guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
-    is_guardian_launch_crash_class, record_launch_failure_observation,
+    GuardianLaunchRecoveryPlan, GuardianObservedLaunchFailurePhase, GuardianPrepareFailureRequest,
+    GuardianPresetAdjustmentRequest, GuardianStartupFailureObservation,
+    GuardianStartupFailureRequest, guardian_observed_launch_failure_outcome,
+    guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
+    guardian_startup_failure_outcome, is_guardian_launch_crash_class,
+    record_launch_failure_observation,
 };
 use crate::logging::{append_trace, timestamp_utc};
 use crate::observability::telemetry::{
@@ -40,11 +40,10 @@ use metadata::persist_launch_metadata;
 use prewarm::{format_prewarm_run_summary, prewarm_launch_plan};
 use proof::persist_launch_proof_with_context_owned as persist_launch_proof_with_context;
 use recovery::{
-    apply_prepare_recovery_directive, apply_startup_recovery_directive,
-    block_guardian_for_suppressed_launch_recovery, block_guardian_with_user_outcome,
-    plan_guardian_launch_recovery_directive, record_failed_self_healing_if_any,
-    record_guardian_launch_recovery_attempt, record_prelaunch_preset_adjustment_directive,
-    record_successful_self_healing_if_any, suppressed_launch_recovery_outcome,
+    RecoveryDirectiveOutcome, RecoveryDirectiveRequest, apply_prepare_recovery_directive,
+    apply_startup_recovery_directive, block_guardian_with_user_outcome, handle_recovery_directive,
+    record_failed_self_healing_if_any, record_prelaunch_preset_adjustment_directive,
+    record_successful_self_healing_if_any,
 };
 use spawn::{
     launch_command_target, launch_spawn_failed_stage_evidence, launch_spawn_stage_evidence,
@@ -628,111 +627,72 @@ async fn launch_session_inner_with_control(
                             .raw_jvm_args_intervention_applied,
                     });
                 if let Some(directive) = prepare_outcome.directive.clone() {
-                    let Some(reservation) = reserve_recovery_attempt(&mut recovery_attempts) else {
-                        control.record_capped_prepare_failure(&error);
-                        block_guardian_with_user_outcome(
-                            &mut guardian,
-                            &prepare_outcome.user_outcome,
-                        );
-                        emit_pending_launch_failure(&state, &mut launch_completion_pending);
-                        return Err(fail_launch(
-                            &state,
-                            producer,
-                            &session_id,
-                            LaunchFailure {
-                                proof_context: Some(&proof_context),
-                                class: failure_class,
-                                message: &prepare_outcome.user_outcome.summary,
-                                healing: error.healing,
-                                guardian: Some(guardian.clone()),
-                                outcome: None,
-                            },
-                        )
-                        .await);
-                    };
-                    let recovery_plan = match plan_budgeted_guardian_launch_recovery_directive(
-                        &intent,
-                        directive,
-                        launch_policy_guardian_mode(intent.guardian.mode),
-                        failure_class,
-                        reservation,
-                    ) {
-                        Ok(recovery_plan) => recovery_plan,
-                        Err(_) => {
-                            emit_pending_launch_failure(&state, &mut launch_completion_pending);
-                            return Err(fail_rejected_launch_recovery_plan(
-                                &state,
-                                producer,
-                                &session_id,
-                                RejectedLaunchRecovery {
-                                    proof_context: Some(&proof_context),
-                                    failure_class,
-                                    user_outcome: &prepare_outcome.user_outcome,
-                                    healing: error.healing.clone(),
-                                },
-                                &mut guardian,
-                            )
-                            .await);
-                        }
-                    };
-                    let recovery_outcome = record_guardian_launch_recovery_attempt(
+                    let failure_message =
+                        match handle_recovery_directive(RecoveryDirectiveRequest {
+                            state: &state,
+                            session_id: &session_id,
+                            intent: &intent,
+                            directive,
+                            mode: launch_policy_guardian_mode(intent.guardian.mode),
+                            failure_class,
+                            recovery_attempts: &mut recovery_attempts,
+                            max_recovery_attempts: MAX_RECOVERY_ATTEMPTS,
+                            guardian: &mut guardian,
+                        })
+                        .await
+                        .map_err(guardian_journal_error)?
+                        {
+                            RecoveryDirectiveOutcome::Apply(recovery_plan) => {
+                                if control.apply_prepare_recovery_directive(
+                                    &mut guardian,
+                                    &mut attempt,
+                                    &recovery_plan,
+                                ) {
+                                    last_recovery_plan = Some(recovery_plan);
+                                }
+                                continue;
+                            }
+                            RecoveryDirectiveOutcome::Exhausted => {
+                                control.record_capped_prepare_failure(&error);
+                                block_guardian_with_user_outcome(
+                                    &mut guardian,
+                                    &prepare_outcome.user_outcome,
+                                );
+                                prepare_outcome.user_outcome.summary.clone()
+                            }
+                            RecoveryDirectiveOutcome::Rejected => {
+                                block_guardian_with_user_outcome(
+                                    &mut guardian,
+                                    &prepare_outcome.user_outcome,
+                                );
+                                prepare_outcome.user_outcome.summary.clone()
+                            }
+                            RecoveryDirectiveOutcome::Suppressed(recovery_user_outcome) => {
+                                recovery_user_outcome.summary
+                            }
+                        };
+                    return Err(finish_launch_failure(
                         &state,
+                        producer,
                         &session_id,
-                        &recovery_plan,
+                        &mut launch_completion_pending,
+                        LaunchFailure {
+                            proof_context: Some(&proof_context),
+                            class: failure_class,
+                            message: &failure_message,
+                            healing: error.healing,
+                            guardian: Some(guardian.clone()),
+                            outcome: None,
+                        },
                     )
-                    .await
-                    .map_err(guardian_journal_error)?;
-                    if recovery_outcome.status == GuardianLaunchRecoveryStatus::Suppressed {
-                        let recovery_user_outcome =
-                            suppressed_launch_recovery_outcome(&recovery_plan);
-                        let message = recovery_user_outcome.summary.clone();
-                        state
-                            .sessions()
-                            .emit_log(&session_id, "system", message.clone())
-                            .await;
-                        block_guardian_for_suppressed_launch_recovery(
-                            &mut guardian,
-                            &recovery_user_outcome,
-                        );
-                        emit_pending_launch_failure(&state, &mut launch_completion_pending);
-                        return Err(fail_launch(
-                            &state,
-                            producer,
-                            &session_id,
-                            LaunchFailure {
-                                proof_context: Some(&proof_context),
-                                class: failure_class,
-                                message: &message,
-                                healing: error.healing,
-                                guardian: Some(guardian.clone()),
-                                outcome: None,
-                            },
-                        )
-                        .await);
-                    }
-                    state
-                        .sessions()
-                        .emit_log(
-                            &session_id,
-                            "system",
-                            recovery_plan.directive.description.clone(),
-                        )
-                        .await;
-                    if control.apply_prepare_recovery_directive(
-                        &mut guardian,
-                        &mut attempt,
-                        &recovery_plan,
-                    ) {
-                        last_recovery_plan = Some(recovery_plan);
-                    }
-                    continue;
+                    .await);
                 }
                 block_guardian_with_user_outcome(&mut guardian, &prepare_outcome.user_outcome);
-                emit_pending_launch_failure(&state, &mut launch_completion_pending);
-                return Err(fail_launch(
+                return Err(finish_launch_failure(
                     &state,
                     producer,
                     &session_id,
+                    &mut launch_completion_pending,
                     LaunchFailure {
                         proof_context: Some(&proof_context),
                         class: failure_class,
@@ -838,11 +798,11 @@ async fn launch_session_inner_with_control(
                     &session_id,
                     &format!("launch command preparation failed: {}", error),
                 );
-                emit_pending_launch_failure(&state, &mut launch_completion_pending);
-                return Err(fail_launch(
+                return Err(finish_launch_failure(
                     &state,
                     producer,
                     &session_id,
+                    &mut launch_completion_pending,
                     LaunchFailure {
                         proof_context: Some(&proof_context),
                         class: LaunchFailureClass::Unknown,
@@ -885,11 +845,11 @@ async fn launch_session_inner_with_control(
                 &session_id,
                 &format!("legacy virtual asset repair failed: {error}"),
             );
-            emit_pending_launch_failure(&state, &mut launch_completion_pending);
-            return Err(fail_launch(
+            return Err(finish_launch_failure(
                 &state,
                 producer,
                 &session_id,
+                &mut launch_completion_pending,
                 LaunchFailure {
                     proof_context: Some(&proof_context),
                     class: LaunchFailureClass::Unknown,
@@ -987,11 +947,7 @@ async fn launch_session_inner_with_control(
                     .sessions()
                     .record_stage_evidence(&session_id, launch_spawn_failed_stage_evidence())
                     .await;
-                emit_launch_completed(
-                    &state,
-                    &mut launch_completion_pending,
-                    TelemetryLaunchOutcome::Failure,
-                );
+                emit_pending_launch_failure(&state, &mut launch_completion_pending);
                 state.telemetry().emit(TelemetryEvent::error_captured(
                     TelemetryErrorKind::LaunchSpawnFailed,
                     TelemetryErrorArea::Launch,
@@ -999,10 +955,11 @@ async fn launch_session_inner_with_control(
                     LaunchSessionExitReason::SpawnFailed.summary(),
                 ));
                 trace_launch_event(&session_id, &format!("spawn failed: {error}"));
-                return Err(fail_launch(
+                return Err(finish_launch_failure(
                     &state,
                     producer,
                     &session_id,
+                    &mut launch_completion_pending,
                     LaunchFailure {
                         proof_context: Some(&proof_context),
                         class: LaunchFailureClass::Unknown,
@@ -1165,133 +1122,74 @@ async fn launch_session_inner_with_control(
                     failure_class.as_str(),
                 ));
                 if let Some(directive) = startup_outcome.directive.clone() {
-                    let Some(reservation) = reserve_recovery_attempt(&mut recovery_attempts) else {
-                        let healing =
-                            startup_failure_healing(&intent, &prepared, &attempt, failure_class);
-                        block_guardian_with_user_outcome(
-                            &mut guardian,
-                            &startup_outcome.user_outcome,
-                        );
-                        emit_launch_completed(
-                            &state,
-                            &mut launch_completion_pending,
-                            TelemetryLaunchOutcome::Failure,
-                        );
-                        return Err(fail_launch(
-                            &state,
-                            producer,
-                            &session_id,
-                            LaunchFailure {
-                                proof_context: Some(&proof_context),
-                                class: failure_class,
-                                message: &startup_outcome.user_outcome.summary,
-                                healing,
-                                guardian: Some(guardian.clone()),
-                                outcome: None,
-                            },
-                        )
-                        .await);
-                    };
-                    let recovery_plan = match plan_budgeted_guardian_launch_recovery_directive(
-                        &intent,
-                        directive,
-                        launch_policy_guardian_mode(intent.guardian.mode),
-                        failure_class,
-                        reservation,
-                    ) {
-                        Ok(recovery_plan) => recovery_plan,
-                        Err(_) => {
-                            let healing = startup_failure_healing(
-                                &intent,
-                                &prepared,
-                                &attempt,
-                                failure_class,
-                            );
-                            emit_launch_completed(
-                                &state,
-                                &mut launch_completion_pending,
-                                TelemetryLaunchOutcome::Failure,
-                            );
-                            return Err(fail_rejected_launch_recovery_plan(
-                                &state,
-                                producer,
-                                &session_id,
-                                RejectedLaunchRecovery {
-                                    proof_context: Some(&proof_context),
-                                    failure_class,
-                                    user_outcome: &startup_outcome.user_outcome,
-                                    healing,
-                                },
-                                &mut guardian,
-                            )
-                            .await);
-                        }
-                    };
-                    let recovery_outcome = record_guardian_launch_recovery_attempt(
+                    let failure_message =
+                        match handle_recovery_directive(RecoveryDirectiveRequest {
+                            state: &state,
+                            session_id: &session_id,
+                            intent: &intent,
+                            directive,
+                            mode: launch_policy_guardian_mode(intent.guardian.mode),
+                            failure_class,
+                            recovery_attempts: &mut recovery_attempts,
+                            max_recovery_attempts: MAX_RECOVERY_ATTEMPTS,
+                            guardian: &mut guardian,
+                        })
+                        .await
+                        .map_err(guardian_journal_error)?
+                        {
+                            RecoveryDirectiveOutcome::Apply(recovery_plan) => {
+                                apply_startup_recovery_directive(
+                                    &mut guardian,
+                                    &mut attempt,
+                                    &recovery_plan,
+                                );
+                                last_recovery_plan = Some(recovery_plan);
+                                continue;
+                            }
+                            RecoveryDirectiveOutcome::Exhausted => {
+                                block_guardian_with_user_outcome(
+                                    &mut guardian,
+                                    &startup_outcome.user_outcome,
+                                );
+                                startup_outcome.user_outcome.summary.clone()
+                            }
+                            RecoveryDirectiveOutcome::Rejected => {
+                                block_guardian_with_user_outcome(
+                                    &mut guardian,
+                                    &startup_outcome.user_outcome,
+                                );
+                                startup_outcome.user_outcome.summary.clone()
+                            }
+                            RecoveryDirectiveOutcome::Suppressed(recovery_user_outcome) => {
+                                recovery_user_outcome.summary
+                            }
+                        };
+                    let healing =
+                        startup_failure_healing(&intent, &prepared, &attempt, failure_class);
+                    return Err(finish_launch_failure(
                         &state,
+                        producer,
                         &session_id,
-                        &recovery_plan,
+                        &mut launch_completion_pending,
+                        LaunchFailure {
+                            proof_context: Some(&proof_context),
+                            class: failure_class,
+                            message: &failure_message,
+                            healing,
+                            guardian: Some(guardian.clone()),
+                            outcome: None,
+                        },
                     )
-                    .await
-                    .map_err(guardian_journal_error)?;
-                    if recovery_outcome.status == GuardianLaunchRecoveryStatus::Suppressed {
-                        let recovery_user_outcome =
-                            suppressed_launch_recovery_outcome(&recovery_plan);
-                        let message = recovery_user_outcome.summary.clone();
-                        state
-                            .sessions()
-                            .emit_log(&session_id, "system", message.clone())
-                            .await;
-                        block_guardian_for_suppressed_launch_recovery(
-                            &mut guardian,
-                            &recovery_user_outcome,
-                        );
-                        let healing =
-                            startup_failure_healing(&intent, &prepared, &attempt, failure_class);
-                        emit_launch_completed(
-                            &state,
-                            &mut launch_completion_pending,
-                            TelemetryLaunchOutcome::Failure,
-                        );
-                        return Err(fail_launch(
-                            &state,
-                            producer,
-                            &session_id,
-                            LaunchFailure {
-                                proof_context: Some(&proof_context),
-                                class: failure_class,
-                                message: &message,
-                                healing,
-                                guardian: Some(guardian.clone()),
-                                outcome: None,
-                            },
-                        )
-                        .await);
-                    }
-                    state
-                        .sessions()
-                        .emit_log(
-                            &session_id,
-                            "system",
-                            recovery_plan.directive.description.clone(),
-                        )
-                        .await;
-                    apply_startup_recovery_directive(&mut guardian, &mut attempt, &recovery_plan);
-                    last_recovery_plan = Some(recovery_plan);
-                    continue;
+                    .await);
                 }
 
                 let healing = startup_failure_healing(&intent, &prepared, &attempt, failure_class);
                 block_guardian_with_user_outcome(&mut guardian, &startup_outcome.user_outcome);
-                emit_launch_completed(
-                    &state,
-                    &mut launch_completion_pending,
-                    TelemetryLaunchOutcome::Failure,
-                );
-                return Err(fail_launch(
+                return Err(finish_launch_failure(
                     &state,
                     producer,
                     &session_id,
+                    &mut launch_completion_pending,
                     LaunchFailure {
                         proof_context: Some(&proof_context),
                         class: failure_class,
@@ -1305,26 +1203,6 @@ async fn launch_session_inner_with_control(
             }
         }
     }
-}
-
-struct RecoveryAttemptReservation;
-
-fn reserve_recovery_attempt(recovery_attempts: &mut u8) -> Option<RecoveryAttemptReservation> {
-    if *recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
-        return None;
-    }
-    *recovery_attempts += 1;
-    Some(RecoveryAttemptReservation)
-}
-
-fn plan_budgeted_guardian_launch_recovery_directive(
-    intent: &axial_launcher::LaunchIntent,
-    directive: crate::guardian::GuardianLaunchRecoveryDirective,
-    mode: crate::guardian::GuardianMode,
-    failure_class: LaunchFailureClass,
-    _reservation: RecoveryAttemptReservation,
-) -> Result<GuardianLaunchRecoveryPlan, crate::guardian::GuardianLaunchRecoveryPlanRejection> {
-    plan_guardian_launch_recovery_directive(intent, directive, mode, failure_class)
 }
 
 #[derive(Default)]
@@ -1403,35 +1281,15 @@ fn guardian_journal_error(_error: OperationJournalStoreError) -> LaunchRequestEr
     }
 }
 
-struct RejectedLaunchRecovery<'a> {
-    proof_context: Option<&'a LaunchProofContext>,
-    failure_class: LaunchFailureClass,
-    user_outcome: &'a GuardianUserOutcome,
-    healing: Option<axial_launcher::LaunchHealingSummary>,
-}
-
-async fn fail_rejected_launch_recovery_plan(
+async fn finish_launch_failure(
     state: &AppState,
     producer: &crate::state::ProducerLease,
     session_id: &str,
-    failure: RejectedLaunchRecovery<'_>,
-    guardian: &mut GuardianSummary,
+    launch_completion_pending: &mut bool,
+    failure: LaunchFailure<'_>,
 ) -> LaunchRequestError {
-    block_guardian_with_user_outcome(guardian, failure.user_outcome);
-    fail_launch(
-        state,
-        producer,
-        session_id,
-        LaunchFailure {
-            proof_context: failure.proof_context,
-            class: failure.failure_class,
-            message: &failure.user_outcome.summary,
-            healing: failure.healing,
-            guardian: Some(guardian.clone()),
-            outcome: None,
-        },
-    )
-    .await
+    emit_pending_launch_failure(state, launch_completion_pending);
+    fail_launch(state, producer, session_id, failure).await
 }
 
 fn emit_launch_started(
@@ -1552,7 +1410,9 @@ pub fn trace_launch_event(session_id: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guardian::{GuardianDecisionKind, GuardianDomain, GuardianMode};
+    use crate::guardian::{
+        GuardianDecisionKind, GuardianDomain, GuardianMode, GuardianUserOutcome,
+    };
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
     use crate::state::contracts::{
         OperationPhase, OwnershipClass, StabilizationSystem, TargetKind,
@@ -1643,6 +1503,23 @@ mod tests {
             raw_jvm_args_intervention_applied: false,
         });
         assert_eq!(error.message, final_outcome.user_outcome.summary);
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("failed launch session");
+        assert_eq!(
+            record
+                .stages
+                .iter()
+                .flat_map(|stage| &stage.evidence)
+                .filter(|evidence| {
+                    evidence.id == "guardian_launch_safety_decision"
+                        && evidence.system == "guardian"
+                })
+                .count(),
+            1
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2541,17 +2418,21 @@ mod tests {
             guidance: Vec::new(),
         };
 
-        let error = fail_rejected_launch_recovery_plan(
+        block_guardian_with_user_outcome(&mut guardian, &user_outcome);
+        let mut launch_completion_pending = true;
+        let error = finish_launch_failure(
             &state,
             &state.try_claim_producer().expect("claim failure producer"),
             session_id,
-            RejectedLaunchRecovery {
+            &mut launch_completion_pending,
+            LaunchFailure {
                 proof_context: None,
-                failure_class: LaunchFailureClass::Unknown,
-                user_outcome: &user_outcome,
+                class: LaunchFailureClass::Unknown,
+                message: &user_outcome.summary,
                 healing: None,
+                guardian: Some(guardian.clone()),
+                outcome: None,
             },
-            &mut guardian,
         )
         .await;
 
