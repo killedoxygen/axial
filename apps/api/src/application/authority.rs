@@ -618,3 +618,141 @@ pub enum RouteBoundaryEnforcement {
     EnforceNow,
     AfterCutover(RouteCutoverPhase),
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    const MANAGED_OWNER: &str = "apps/api/src/state/performance_managed.rs";
+    const MANAGED_CLAIM: &str = "apps/api/src/state/performance_rules.rs";
+
+    #[test]
+    fn managed_composition_production_sources_cross_the_state_authority() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("api crate must live under apps/ in the repository");
+        let source_root = repo_root.join("apps/api/src");
+        let mut sources = Vec::new();
+        collect_rust_sources(&source_root, &mut sources);
+        sources.sort();
+
+        let mut violations = Vec::new();
+        for path in sources {
+            let relative = path
+                .strip_prefix(repo_root)
+                .expect("API source must be inside the repository")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if is_test_source(&path) || relative == "apps/api/src/application/authority.rs" {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("read API source");
+            let production = without_trailing_test_module(&source);
+            let compact = production
+                .chars()
+                .filter(|value| !value.is_whitespace())
+                .collect::<String>();
+
+            for marker in [
+                "load_state",
+                "save_state",
+                "remove_state",
+                "load_rollback_snapshot",
+                "save_rollback_snapshot",
+                "restore_rollback_snapshot",
+                "derive_health",
+                "derive_health_async",
+            ] {
+                if contains_call(production, marker) {
+                    violations.push(format!("{relative}: {marker}("));
+                }
+            }
+            if compact.contains("axial_performance::state::") {
+                violations.push(format!("{relative}: axial_performance::state::"));
+            }
+
+            let performance_source = relative.starts_with("apps/api/src/application/performance/")
+                || relative == "apps/api/src/routes/performance.rs";
+            if performance_source {
+                for marker in ["game_dir(", ".join(\"mods\")"] {
+                    if compact.contains(marker) {
+                        violations.push(format!("{relative}: {marker}"));
+                    }
+                }
+            }
+
+            if relative != MANAGED_OWNER {
+                for marker in [
+                    "ManagedCompositionAuthority",
+                    "ManagedInstanceIdentity",
+                    ".authority.identify(",
+                    ".authority.inspect(",
+                    ".authority.resolve_and_inspect(",
+                    ".authority.ensure_installed(",
+                    ".authority.remove_managed(",
+                    ".authority.rollback_managed(",
+                    ".authority.rollback_managed_snapshot(",
+                ] {
+                    if compact.contains(marker) {
+                        violations.push(format!("{relative}: {marker}"));
+                    }
+                }
+            }
+            if relative != MANAGED_CLAIM && compact.contains(".claim_managed_authority(") {
+                violations.push(format!("{relative}: .claim_managed_authority("));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "managed composition authority bypasses:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    fn collect_rust_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(directory).expect("read API source directory") {
+            let entry = entry.expect("read API source entry");
+            let file_type = entry.file_type().expect("read API source entry type");
+            if file_type.is_dir() {
+                collect_rust_sources(&entry.path(), sources);
+            } else if file_type.is_file()
+                && entry.path().extension().is_some_and(|value| value == "rs")
+            {
+                sources.push(entry.path());
+            }
+        }
+    }
+
+    fn is_test_source(path: &Path) -> bool {
+        path.file_name().is_some_and(|value| value == "tests.rs")
+            || path.components().any(|part| part.as_os_str() == "tests")
+    }
+
+    fn without_trailing_test_module(source: &str) -> &str {
+        let mut search_start = 0;
+        while let Some(offset) = source[search_start..].find("#[cfg(test)]") {
+            let attribute_start = search_start + offset;
+            let after_attribute = &source[attribute_start + "#[cfg(test)]".len()..];
+            let item = after_attribute.trim_start();
+            if item.starts_with("mod tests {") || item.starts_with("mod tests;") {
+                return &source[..attribute_start];
+            }
+            search_start = attribute_start + "#[cfg(test)]".len();
+        }
+        source
+    }
+
+    fn contains_call(source: &str, name: &str) -> bool {
+        source.match_indices(name).any(|(offset, _)| {
+            let before_is_identifier = source[..offset]
+                .chars()
+                .next_back()
+                .is_some_and(|value| value.is_ascii_alphanumeric() || value == '_');
+            let after = source[offset + name.len()..].trim_start();
+            !before_is_identifier && after.starts_with('(')
+        })
+    }
+}

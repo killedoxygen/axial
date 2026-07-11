@@ -174,6 +174,9 @@ impl ManagedCompositionOwner {
         if entry.reconciliation_required.load(Ordering::Acquire) {
             return Err(ManagedCompositionAdmissionError::ReconciliationRequired);
         }
+        if entry.retired.load(Ordering::Acquire) {
+            return Err(ManagedCompositionAdmissionError::Retired);
+        }
         entry.retired.store(true, Ordering::Release);
         Ok(ManagedCompositionRetirement {
             entry,
@@ -297,4 +300,184 @@ pub(super) fn managed_authority_claim_error(
     error: io::Error,
 ) -> axial_performance::RulesRefreshError {
     axial_performance::RulesRefreshError::Cache(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ManagedCompositionAdmissionError, ManagedCompositionOwner, ManagedMutationError};
+    use axial_performance::PerformanceManager;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::task::{Context, Poll};
+
+    const INSTANCE_A: &str = "0000000000000001";
+    const INSTANCE_B: &str = "0000000000000002";
+
+    struct OwnerFixture {
+        root: std::path::PathBuf,
+        owner: Arc<ManagedCompositionOwner>,
+    }
+
+    impl OwnerFixture {
+        fn new(name: &str) -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+            let root = std::env::temp_dir().join(format!(
+                "axial-managed-owner-{name}-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&root).expect("create managed owner root");
+            let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
+            let authority = manager
+                .claim_managed_authority(&root)
+                .expect("claim managed authority");
+            Self {
+                root,
+                owner: Arc::new(ManagedCompositionOwner::claim(authority)),
+            }
+        }
+
+        fn mods_dir(&self, instance_id: &str) -> std::path::PathBuf {
+            self.root.join(instance_id).join("mods")
+        }
+    }
+
+    impl Drop for OwnerFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn poll_once<Output>(future: Pin<&mut impl Future<Output = Output>>) -> Poll<Output> {
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        future.poll(&mut context)
+    }
+
+    #[tokio::test]
+    async fn same_instance_admission_waits_for_the_current_guard() {
+        let fixture = OwnerFixture::new("same-instance-gate");
+        let first = fixture
+            .owner
+            .admit(INSTANCE_A)
+            .await
+            .expect("first admission");
+        let mut second = Box::pin(fixture.owner.admit(INSTANCE_A));
+
+        assert!(matches!(poll_once(second.as_mut()), Poll::Pending));
+        drop(first);
+
+        second.await.expect("second admission after guard release");
+    }
+
+    #[tokio::test]
+    async fn different_instance_admission_progresses_independently() {
+        let fixture = OwnerFixture::new("different-instance-gates");
+        let _first = fixture
+            .owner
+            .admit(INSTANCE_A)
+            .await
+            .expect("first admission");
+        let mut second = Box::pin(fixture.owner.admit(INSTANCE_B));
+
+        let second = match poll_once(second.as_mut()) {
+            Poll::Ready(result) => result.expect("different instance admission"),
+            Poll::Pending => panic!("different instance admission must not share the gate"),
+        };
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn close_drains_admitted_guards_and_rejects_late_admission() {
+        let fixture = OwnerFixture::new("close-drain");
+        let admitted = fixture.owner.admit(INSTANCE_A).await.expect("admission");
+        let mut close = Box::pin(fixture.owner.close());
+
+        assert!(matches!(poll_once(close.as_mut()), Poll::Pending));
+        assert!(matches!(
+            fixture.owner.admit(INSTANCE_B).await,
+            Err(ManagedCompositionAdmissionError::Closed)
+        ));
+        drop(admitted);
+
+        close.await.expect("close after admitted guard drains");
+    }
+
+    #[tokio::test]
+    async fn retirement_rolls_back_uncommitted_and_preserves_committed_tombstone() {
+        let uncommitted = OwnerFixture::new("retirement-rollback");
+        let retirement = uncommitted
+            .owner
+            .retire(INSTANCE_A)
+            .await
+            .expect("retire instance");
+        let mut waiting = Box::pin(uncommitted.owner.admit(INSTANCE_A));
+        assert!(matches!(poll_once(waiting.as_mut()), Poll::Pending));
+        drop(retirement);
+        waiting
+            .await
+            .expect("uncommitted retirement clears tombstone");
+
+        let committed = OwnerFixture::new("retirement-commit");
+        committed
+            .owner
+            .retire(INSTANCE_A)
+            .await
+            .expect("retire instance")
+            .commit();
+        assert!(matches!(
+            committed.owner.admit(INSTANCE_A).await,
+            Err(ManagedCompositionAdmissionError::Retired)
+        ));
+        assert!(matches!(
+            committed.owner.retire(INSTANCE_A).await,
+            Err(ManagedCompositionAdmissionError::Retired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn indeterminate_inspection_latches_admission_and_close() {
+        let fixture = OwnerFixture::new("inspection-latch");
+        let mods_dir = fixture.mods_dir(INSTANCE_A);
+        std::fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+        std::fs::write(mods_dir.join(".axial-lock.json.new.tmp"), b"not-json")
+            .expect("seed ambiguous publication stage");
+        let admitted = fixture.owner.admit(INSTANCE_A).await.expect("admission");
+
+        assert!(matches!(
+            admitted.inspect(None).await,
+            Err(ManagedMutationError::Indeterminate(_))
+        ));
+        drop(admitted);
+        assert!(matches!(
+            fixture.owner.admit(INSTANCE_A).await,
+            Err(ManagedCompositionAdmissionError::ReconciliationRequired)
+        ));
+        assert!(fixture.owner.close().await.is_err());
+        assert!(matches!(
+            fixture.owner.admit(INSTANCE_B).await,
+            Err(ManagedCompositionAdmissionError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn admission_accepts_only_canonical_instance_ids() {
+        let fixture = OwnerFixture::new("canonical-identity");
+
+        fixture
+            .owner
+            .admit(INSTANCE_A)
+            .await
+            .expect("canonical instance id");
+        assert!(matches!(
+            fixture.owner.admit("000000000000000A").await,
+            Err(ManagedCompositionAdmissionError::Identity(_))
+        ));
+        assert!(matches!(
+            fixture.owner.admit("../00000000000001").await,
+            Err(ManagedCompositionAdmissionError::Identity(_))
+        ));
+    }
 }

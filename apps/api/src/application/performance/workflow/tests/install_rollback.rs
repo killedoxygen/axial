@@ -239,6 +239,71 @@ async fn install_custom_mode_removes_only_managed_artifacts() {
 }
 
 #[tokio::test]
+async fn managed_remove_rejects_active_session_then_succeeds_after_settlement() {
+    let fixture = TestFixture::new("remove-active-session");
+    let instance_id = fixture.add_instance("Running managed", "1.20.4-fabric");
+    let mods_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance_id)
+        .join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+    fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed mod");
+    let managed_state = test_composition_state(
+        "core",
+        vec![test_installed_mod_for_bytes(
+            "sodium",
+            "managed.jar",
+            b"managed",
+        )],
+    );
+    write_managed_state_fixture(&mods_dir, &managed_state);
+    fixture
+        .state
+        .sessions()
+        .insert(test_launch_record("running-managed-session", &instance_id))
+        .await
+        .expect("insert active session");
+
+    let request = || InstallRequest {
+        instance_id: Some(instance_id.clone()),
+        game_version: None,
+        loader: None,
+        mode: None,
+        action: Some("remove".to_string()),
+        rollback_id: None,
+        queued: None,
+    };
+    let (status, Json(body)) = handle_install(State(fixture.state.clone()), Json(request()))
+        .await
+        .expect_err("active session must reject managed mutation");
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": "managed composition mutation is blocked while the instance is running"
+        })
+    );
+    assert!(mods_dir.join("managed.jar").is_file());
+    assert!(mods_dir.join(".axial-lock.json").is_file());
+
+    fixture
+        .state
+        .sessions()
+        .terminate_all()
+        .await
+        .expect("settle active session");
+    let Json(response) = handle_install(State(fixture.state.clone()), Json(request()))
+        .await
+        .expect("managed mutation after session settlement");
+
+    assert_eq!(response.status, "removed");
+    assert!(!mods_dir.join("managed.jar").exists());
+    assert!(!mods_dir.join(".axial-lock.json").exists());
+}
+
+#[tokio::test]
 async fn install_remove_rejects_invalid_ownership_without_deleting_files() {
     let fixture = TestFixture::new("install-invalid-ownership-remove");
     let instance_id = fixture.add_instance("Custom", "1.20.4-fabric");

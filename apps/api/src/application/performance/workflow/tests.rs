@@ -4,6 +4,7 @@ use crate::state::performance_operations::{
 };
 use crate::state::{AppStateInit, DownloadProgress, InstallStore, SessionStore};
 use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
 use axial_performance::modrinth::ModrinthError;
 use axial_performance::{CompositionState, InstalledMod, PerformanceManager};
 use axum::{
@@ -472,6 +473,31 @@ fn test_root(name: &str) -> PathBuf {
     ));
     fs::create_dir_all(&path).expect("create test root");
     path
+}
+
+fn test_launch_record(session_id: &str, instance_id: &str) -> LaunchSessionRecord {
+    LaunchSessionRecord {
+        session_id: SessionId(session_id.to_string()),
+        instance_id: instance_id.to_string(),
+        version_id: "1.20.4-fabric".to_string(),
+        launched_at: Some("2026-07-11T00:00:00.000Z".to_string()),
+        benchmark: None,
+        state: LaunchState::Queued,
+        pid: None,
+        process_started_at_ms: None,
+        boot_completed_at_ms: None,
+        boot_duration_ms: None,
+        priority: None,
+        exit_code: None,
+        command: Vec::new(),
+        java_path: None,
+        natives_dir: None,
+        failure: None,
+        healing: None,
+        guardian: None,
+        outcome: None,
+        stages: Vec::new(),
+    }
 }
 
 fn test_paths(root: &std::path::Path) -> AppPaths {
