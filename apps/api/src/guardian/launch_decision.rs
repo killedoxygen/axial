@@ -8,7 +8,7 @@ use crate::observability::{RedactionAudience, sanitize_evidence_text};
 use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
-use axial_launcher::LaunchFailureClass;
+use axial_launcher::{CrashEvidence, LaunchFailureClass};
 use serde::{Deserialize, Serialize};
 
 const MAX_LAUNCH_DECISION_SUMMARY_CHARS: usize = 180;
@@ -54,6 +54,7 @@ pub enum GuardianStartupFailureObservation {
 pub struct GuardianStartupFailureRequest<'a> {
     pub mode: GuardianMode,
     pub observation: GuardianStartupFailureObservation,
+    pub crash_evidence: Option<&'a CrashEvidence>,
     pub target_version_id: &'a str,
     pub runtime_major: u32,
     pub requested_java_present: bool,
@@ -179,18 +180,79 @@ pub fn guardian_startup_failure_outcome(
     }
 }
 
-pub fn guardian_post_boot_out_of_memory_outcome() -> GuardianUserOutcome {
-    GuardianUserOutcome {
+pub fn is_guardian_launch_crash_class(failure_class: LaunchFailureClass) -> bool {
+    matches!(
+        failure_class,
+        LaunchFailureClass::OutOfMemory
+            | LaunchFailureClass::GraphicsDriverCrash
+            | LaunchFailureClass::MissingDependency
+            | LaunchFailureClass::ModTransformationFailure
+            | LaunchFailureClass::ModAttributedCrash
+    )
+}
+
+pub fn guardian_post_boot_launch_failure_outcome(
+    failure_class: LaunchFailureClass,
+    crash_evidence: Option<&CrashEvidence>,
+) -> Option<GuardianUserOutcome> {
+    let (summary, detail, guidance) = match failure_class {
+        LaunchFailureClass::OutOfMemory => (
+            "Minecraft stopped after running out of memory.",
+            "Guardian detected an out-of-memory crash after startup completed.",
+            "Review the instance memory allocation and close memory-heavy apps before retrying.",
+        ),
+        LaunchFailureClass::GraphicsDriverCrash => (
+            "Minecraft stopped after a graphics driver crash.",
+            "Guardian detected a native graphics driver crash after startup completed.",
+            "Update or reinstall the graphics driver, then retry without graphics overlays.",
+        ),
+        LaunchFailureClass::MissingDependency => (
+            "Minecraft stopped because a dependency was missing.",
+            "Guardian detected a missing class or dependency after startup completed.",
+            "Check the installed mods for missing or incompatible dependencies before retrying.",
+        ),
+        LaunchFailureClass::ModTransformationFailure => (
+            "Minecraft stopped during mod transformation.",
+            "Guardian detected a mod transformation or mixin failure after startup completed.",
+            "Update or remove the recently changed mod before retrying.",
+        ),
+        LaunchFailureClass::ModAttributedCrash => {
+            let suspected_mod = suspected_mod_label(crash_evidence);
+            let summary = suspected_mod
+                .as_ref()
+                .map(|name| format!("Minecraft stopped in a crash attributed to {name}."))
+                .unwrap_or_else(|| "Minecraft stopped in a mod-attributed crash.".to_string());
+            let detail = suspected_mod
+                .as_ref()
+                .map(|name| format!("Guardian attributes the crash to the installed mod {name}."))
+                .unwrap_or_else(|| {
+                    "Guardian found typed crash evidence that attributes the failure to an installed mod."
+                        .to_string()
+                });
+            let guidance = suspected_mod
+                .as_ref()
+                .map(|name| format!("Update or remove {name} before retrying."))
+                .unwrap_or_else(|| {
+                    "Update or remove the suspected mod before retrying.".to_string()
+                });
+            return Some(GuardianUserOutcome {
+                decision: GuardianDecisionKind::Warn,
+                phase: OperationPhase::Running,
+                summary: public_summary(&summary),
+                details: bounded_public_lines([detail.as_str()]),
+                guidance: bounded_public_lines([guidance.as_str()]),
+            });
+        }
+        _ => return None,
+    };
+
+    Some(GuardianUserOutcome {
         decision: GuardianDecisionKind::Warn,
         phase: OperationPhase::Running,
-        summary: public_summary("Minecraft stopped after running out of memory."),
-        details: bounded_public_lines([
-            "Guardian detected an out-of-memory crash after startup completed.",
-        ]),
-        guidance: bounded_public_lines([
-            "Review the instance memory allocation and close memory-heavy apps before retrying.",
-        ]),
-    }
+        summary: public_summary(summary),
+        details: bounded_public_lines([detail]),
+        guidance: bounded_public_lines([guidance]),
+    })
 }
 
 pub fn conservative_launch_recovery_preset(version_id: &str, runtime_major: u32) -> String {
@@ -317,9 +379,31 @@ fn startup_failure_diagnosis(
                 candidate_actions: startup_java_candidate_actions(recovery_template),
                 public_reason_template: "java_runtime_major_mismatch".to_string(),
             },
-            LaunchFailureClass::OutOfMemory => {
-                blocking_startup_diagnosis("out_of_memory", failure_class, GuardianConfidence::High)
-            }
+            LaunchFailureClass::OutOfMemory => blocking_user_owned_startup_diagnosis(
+                "out_of_memory",
+                failure_class,
+                GuardianConfidence::High,
+            ),
+            LaunchFailureClass::GraphicsDriverCrash => blocking_user_owned_startup_diagnosis(
+                "graphics_driver_crash",
+                failure_class,
+                GuardianConfidence::High,
+            ),
+            LaunchFailureClass::MissingDependency => blocking_user_owned_startup_diagnosis(
+                "missing_dependency",
+                failure_class,
+                GuardianConfidence::High,
+            ),
+            LaunchFailureClass::ModTransformationFailure => blocking_user_owned_startup_diagnosis(
+                "mod_transformation_failure",
+                failure_class,
+                GuardianConfidence::High,
+            ),
+            LaunchFailureClass::ModAttributedCrash => blocking_user_owned_startup_diagnosis(
+                "mod_attributed_crash",
+                failure_class,
+                GuardianConfidence::High,
+            ),
             LaunchFailureClass::ClasspathModuleConflict => blocking_startup_diagnosis(
                 "classpath_module_conflict",
                 failure_class,
@@ -540,13 +624,23 @@ fn startup_failure_user_outcome(
     } else {
         push_public_line(
             &mut details,
-            startup_failure_reason(request.observation, failure_class),
+            &startup_failure_reason(request, failure_class),
         );
     }
 
     let mut guidance = Vec::new();
-    for line in startup_failure_guidance(request, failure_class) {
-        push_public_line(&mut guidance, line);
+    if failure_class == LaunchFailureClass::ModAttributedCrash
+        && let Some(name) = suspected_mod_label(request.crash_evidence)
+    {
+        push_public_line(
+            &mut guidance,
+            &format!("Update or remove {name} before retrying."),
+        );
+    }
+    if guidance.is_empty() {
+        for line in startup_failure_guidance(request, failure_class) {
+            push_public_line(&mut guidance, line);
+        }
     }
 
     let summary = match decision.kind {
@@ -701,22 +795,48 @@ fn blocking_startup_diagnosis(
     failure_class: LaunchFailureClass,
     confidence: GuardianConfidence,
 ) -> Diagnosis {
+    blocking_startup_diagnosis_with_ownership(
+        id,
+        failure_class,
+        confidence,
+        OwnershipClass::LauncherManaged,
+        "startup_monitoring",
+    )
+}
+
+fn blocking_user_owned_startup_diagnosis(
+    id: &str,
+    failure_class: LaunchFailureClass,
+    confidence: GuardianConfidence,
+) -> Diagnosis {
+    blocking_startup_diagnosis_with_ownership(
+        id,
+        failure_class,
+        confidence,
+        OwnershipClass::UserOwned,
+        "instance_crash",
+    )
+}
+
+fn blocking_startup_diagnosis_with_ownership(
+    id: &str,
+    failure_class: LaunchFailureClass,
+    confidence: GuardianConfidence,
+    ownership: OwnershipClass,
+    target_id: &str,
+) -> Diagnosis {
     Diagnosis {
         id: DiagnosisId::new(id),
         domain: GuardianDomain::Startup,
         severity: GuardianSeverity::Blocking,
         confidence,
-        ownership: OwnershipClass::LauncherManaged,
+        ownership,
         phase: OperationPhase::Launching,
         fact_ids: vec![
             "process_exited_before_boot".to_string(),
             failure_class_fact_id(failure_class).to_string(),
         ],
-        affected_targets: vec![target(
-            GuardianDomain::Startup,
-            "startup_monitoring",
-            OwnershipClass::LauncherManaged,
-        )],
+        affected_targets: vec![target(GuardianDomain::Startup, target_id, ownership)],
         impact: GuardianImpactVector::launch_blocking(),
         candidate_actions: vec![GuardianActionKind::Block],
         public_reason_template: id.to_string(),
@@ -806,6 +926,10 @@ fn failure_class_fact_id(failure_class: LaunchFailureClass) -> &'static str {
         LaunchFailureClass::JvmExperimentalUnlock => "jvm_arg_experimental_unlock_missing",
         LaunchFailureClass::JvmOptionOrdering => "jvm_arg_unlock_order_invalid",
         LaunchFailureClass::OutOfMemory => "out_of_memory",
+        LaunchFailureClass::GraphicsDriverCrash => "graphics_driver_crash",
+        LaunchFailureClass::MissingDependency => "missing_dependency",
+        LaunchFailureClass::ModTransformationFailure => "mod_transformation_failure",
+        LaunchFailureClass::ModAttributedCrash => "mod_attributed_crash",
         LaunchFailureClass::ClasspathModuleConflict => "classpath_module_conflict",
         LaunchFailureClass::LauncherManagedArtifactSignature => {
             "launcher_managed_artifact_signature_corruption"
@@ -832,10 +956,10 @@ fn prepare_failure_reason(failure_class: LaunchFailureClass) -> &'static str {
 }
 
 fn startup_failure_reason(
-    observation: GuardianStartupFailureObservation,
+    request: &GuardianStartupFailureRequest<'_>,
     failure_class: LaunchFailureClass,
-) -> &'static str {
-    match observation {
+) -> String {
+    let reason = match request.observation {
         GuardianStartupFailureObservation::Stalled => {
             "No startup activity was observed before the startup window ended."
         }
@@ -851,6 +975,18 @@ fn startup_failure_reason(
             LaunchFailureClass::OutOfMemory => {
                 "Minecraft exited before startup completed after running out of memory."
             }
+            LaunchFailureClass::GraphicsDriverCrash => {
+                "Minecraft exited before startup completed with a detected graphics driver crash."
+            }
+            LaunchFailureClass::MissingDependency => {
+                "Minecraft exited before startup completed because a required dependency was missing."
+            }
+            LaunchFailureClass::ModTransformationFailure => {
+                "Minecraft exited before startup completed with a detected mod transformation or mixin failure."
+            }
+            LaunchFailureClass::ModAttributedCrash => return suspected_mod_label(request.crash_evidence)
+                .map(|name| format!("Minecraft exited before startup completed with a crash attributed to {name}."))
+                .unwrap_or_else(|| "Minecraft exited before startup completed with a crash attributed to an installed mod.".to_string()),
             LaunchFailureClass::ClasspathModuleConflict => {
                 "Minecraft exited before startup completed with a detected classpath or module conflict."
             }
@@ -870,7 +1006,8 @@ fn startup_failure_reason(
                 "Minecraft exited before Guardian could verify a completed startup."
             }
         },
-    }
+    };
+    reason.to_string()
 }
 
 fn prepare_failure_guidance(
@@ -911,6 +1048,20 @@ fn prepare_failure_guidance(
                 "Review the instance memory allocation and close memory-heavy apps before retrying.",
             ]
         }
+        LaunchFailureClass::GraphicsDriverCrash => {
+            vec!["Update or reinstall the graphics driver, then retry without graphics overlays."]
+        }
+        LaunchFailureClass::MissingDependency => {
+            vec![
+                "Check the installed mods for missing or incompatible dependencies before retrying.",
+            ]
+        }
+        LaunchFailureClass::ModTransformationFailure => {
+            vec!["Update or remove the recently changed mod before retrying."]
+        }
+        LaunchFailureClass::ModAttributedCrash => {
+            vec!["Update or remove the suspected mod before retrying."]
+        }
         _ => Vec::new(),
     }
 }
@@ -950,6 +1101,12 @@ fn bounded_public_text(value: &str) -> Option<String> {
         RedactionAudience::UserVisible,
         MAX_LAUNCH_DECISION_DETAIL_CHARS,
     )
+}
+
+fn suspected_mod_label(crash_evidence: Option<&CrashEvidence>) -> Option<String> {
+    crash_evidence
+        .and_then(|evidence| evidence.suspected_mods.first())
+        .and_then(|suspected_mod| bounded_public_text(suspected_mod.name.as_str()))
 }
 
 fn bounded_public_lines<const N: usize>(values: [&str; N]) -> Vec<String> {
@@ -1021,15 +1178,15 @@ mod tests {
     use super::{
         GuardianLaunchRecoveryEffect, GuardianPrepareFailureRequest,
         GuardianStartupFailureObservation, GuardianStartupFailureRequest,
-        guardian_post_boot_out_of_memory_outcome, guardian_prelaunch_preset_adjustment_directive,
+        guardian_post_boot_launch_failure_outcome, guardian_prelaunch_preset_adjustment_directive,
         guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
     };
     use crate::guardian::{
         GuardianDecisionKind, GuardianLaunchRecoveryKind, GuardianMode,
         conservative_launch_recovery_preset,
     };
-    use crate::state::contracts::OperationPhase;
-    use axial_launcher::LaunchFailureClass;
+    use crate::state::contracts::{OperationPhase, OwnershipClass};
+    use axial_launcher::{CrashEvidence, LaunchFailureClass};
 
     #[test]
     fn managed_prepare_java_mismatch_returns_managed_runtime_fallback_directive() {
@@ -1147,6 +1304,7 @@ mod tests {
             observation: GuardianStartupFailureObservation::Exited {
                 failure_class: LaunchFailureClass::JvmUnsupportedOption,
             },
+            crash_evidence: None,
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,
@@ -1179,6 +1337,7 @@ mod tests {
             observation: GuardianStartupFailureObservation::Exited {
                 failure_class: LaunchFailureClass::JvmUnsupportedOption,
             },
+            crash_evidence: None,
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,
@@ -1206,6 +1365,7 @@ mod tests {
             observation: GuardianStartupFailureObservation::Exited {
                 failure_class: LaunchFailureClass::JavaRuntimeMismatch,
             },
+            crash_evidence: None,
             target_version_id: "1.21.1",
             runtime_major: 8,
             requested_java_present: true,
@@ -1235,6 +1395,7 @@ mod tests {
             observation: GuardianStartupFailureObservation::Exited {
                 failure_class: LaunchFailureClass::LauncherManagedArtifactSignature,
             },
+            crash_evidence: None,
             target_version_id: "1.5.2",
             runtime_major: 8,
             requested_java_present: false,
@@ -1267,6 +1428,7 @@ mod tests {
             observation: GuardianStartupFailureObservation::Exited {
                 failure_class: LaunchFailureClass::OutOfMemory,
             },
+            crash_evidence: None,
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,
@@ -1317,7 +1479,14 @@ mod tests {
                 .all(|line| line.chars().count() <= super::MAX_LAUNCH_DECISION_DETAIL_CHARS)
         );
 
-        let post_boot = guardian_post_boot_out_of_memory_outcome();
+        assert_eq!(
+            outcome.safety_case.diagnoses[0].ownership,
+            OwnershipClass::UserOwned
+        );
+
+        let post_boot =
+            guardian_post_boot_launch_failure_outcome(LaunchFailureClass::OutOfMemory, None)
+                .expect("OOM is an accepted launch crash");
         assert_eq!(post_boot.decision, GuardianDecisionKind::Warn);
         assert_eq!(post_boot.phase, OperationPhase::Running);
         assert_eq!(
@@ -1335,10 +1504,103 @@ mod tests {
     }
 
     #[test]
+    fn accepted_crash_classes_are_user_owned_with_bounded_specific_copy() {
+        for failure_class in [
+            LaunchFailureClass::GraphicsDriverCrash,
+            LaunchFailureClass::MissingDependency,
+            LaunchFailureClass::ModTransformationFailure,
+            LaunchFailureClass::ModAttributedCrash,
+        ] {
+            let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
+                mode: GuardianMode::Managed,
+                observation: GuardianStartupFailureObservation::Exited { failure_class },
+                crash_evidence: None,
+                target_version_id: "1.21.1",
+                runtime_major: 21,
+                requested_java_present: false,
+                explicit_java_override_present: false,
+                explicit_jvm_args_present: false,
+                explicit_jvm_preset_present: false,
+                startup_recovery_applied: false,
+                disable_custom_gc: false,
+                effective_preset: "performance",
+            });
+
+            assert_eq!(
+                outcome.safety_case.diagnoses[0].id.as_str(),
+                failure_class.as_str()
+            );
+            assert_eq!(
+                outcome.safety_case.diagnoses[0].ownership,
+                OwnershipClass::UserOwned
+            );
+            assert!(outcome.directive.is_none());
+            assert!(!outcome.user_outcome.details.is_empty());
+            assert!(!outcome.user_outcome.guidance.is_empty());
+            assert!(
+                outcome
+                    .user_outcome
+                    .details
+                    .iter()
+                    .chain(&outcome.user_outcome.guidance)
+                    .all(|line| line.chars().count() <= super::MAX_LAUNCH_DECISION_DETAIL_CHARS)
+            );
+
+            let post_boot = guardian_post_boot_launch_failure_outcome(failure_class, None)
+                .expect("accepted post-boot crash outcome");
+            assert_eq!(post_boot.phase, OperationPhase::Running);
+            assert!(!post_boot.details.is_empty());
+            assert!(!post_boot.guidance.is_empty());
+        }
+    }
+
+    #[test]
+    fn mod_attributed_copy_uses_only_bounded_typed_mod_name() {
+        let crash_evidence: CrashEvidence = serde_json::from_value(serde_json::json!({
+            "source": "minecraft_crash_report",
+            "truncated": false,
+            "suspected_mods": [{"name": "Example Machines"}],
+            "names_out_of_memory": false
+        }))
+        .expect("typed crash evidence");
+        let startup = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
+            mode: GuardianMode::Managed,
+            observation: GuardianStartupFailureObservation::Exited {
+                failure_class: LaunchFailureClass::ModAttributedCrash,
+            },
+            crash_evidence: Some(&crash_evidence),
+            target_version_id: "1.21.1",
+            runtime_major: 21,
+            requested_java_present: false,
+            explicit_java_override_present: false,
+            explicit_jvm_args_present: false,
+            explicit_jvm_preset_present: false,
+            startup_recovery_applied: false,
+            disable_custom_gc: false,
+            effective_preset: "performance",
+        });
+        let post_boot = guardian_post_boot_launch_failure_outcome(
+            LaunchFailureClass::ModAttributedCrash,
+            Some(&crash_evidence),
+        )
+        .expect("mod-attributed post-boot outcome");
+
+        assert!(startup.user_outcome.details[0].contains("Example Machines"));
+        assert!(startup.user_outcome.guidance[0].contains("Example Machines"));
+        assert!(post_boot.summary.contains("Example Machines"));
+        assert!(post_boot.details[0].contains("Example Machines"));
+        assert!(post_boot.guidance[0].contains("Example Machines"));
+        assert!(
+            guardian_post_boot_launch_failure_outcome(LaunchFailureClass::Unknown, None).is_none()
+        );
+    }
+
+    #[test]
     fn startup_stall_blocks_with_guardian_authored_redacted_outcome() {
         let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
             mode: GuardianMode::Managed,
             observation: GuardianStartupFailureObservation::Stalled,
+            crash_evidence: None,
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,

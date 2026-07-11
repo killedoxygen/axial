@@ -10,13 +10,13 @@ pub mod healing;
 pub mod install_evidence;
 pub mod jvm_preset;
 pub mod launch_decision;
+pub mod launch_failure_memory;
 pub mod launch_recovery;
 pub mod outcome;
 pub mod performance;
 pub mod policy;
 pub mod preflight;
 pub mod repair_plan;
-pub mod startup_failure_memory;
 pub mod state_evidence;
 
 mod diagnosis;
@@ -59,9 +59,11 @@ pub use launch_decision::{
     GuardianPrepareFailureOutcome, GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
     GuardianStartupFailureObservation, GuardianStartupFailureOutcome,
     GuardianStartupFailureRequest, conservative_launch_recovery_preset,
-    guardian_post_boot_out_of_memory_outcome, guardian_prelaunch_preset_adjustment_directive,
+    guardian_post_boot_launch_failure_outcome, guardian_prelaunch_preset_adjustment_directive,
     guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
+    is_guardian_launch_crash_class,
 };
+pub use launch_failure_memory::record_launch_failure_observation;
 pub use launch_recovery::{
     GuardianLaunchRecoveryActionTemplate, GuardianLaunchRecoveryDirective,
     GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryExecutor, GuardianLaunchRecoveryKind,
@@ -107,5 +109,4 @@ pub use repair_plan::{
     GuardianRepairTask, GuardianRepairTaskKind, plan_launcher_managed_artifact_repair,
     plan_launcher_managed_missing_artifact_repair, plan_managed_runtime_ready_marker_repair,
 };
-pub use startup_failure_memory::record_out_of_memory_observation;
 pub use state_evidence::{GuardianStateLoadOutcome, persisted_state_load_guardian_outcome};

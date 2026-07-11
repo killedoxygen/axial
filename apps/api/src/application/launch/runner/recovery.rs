@@ -698,6 +698,7 @@ mod tests {
         let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
             mode: launch_policy_guardian_mode(GuardianMode::Managed),
             observation: GuardianStartupFailureObservation::Stalled,
+            crash_evidence: None,
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,
@@ -747,6 +748,7 @@ mod tests {
             observation: GuardianStartupFailureObservation::Exited {
                 failure_class: LaunchFailureClass::JvmUnsupportedOption,
             },
+            crash_evidence: None,
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,
@@ -792,6 +794,7 @@ mod tests {
             observation: GuardianStartupFailureObservation::Exited {
                 failure_class: LaunchFailureClass::JvmUnsupportedOption,
             },
+            crash_evidence: None,
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,

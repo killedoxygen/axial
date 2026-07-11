@@ -13,9 +13,10 @@ use crate::execution::launch::{
 use crate::guardian::{
     GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryStatus, GuardianPrepareFailureRequest,
     GuardianPresetAdjustmentRequest, GuardianStartupFailureObservation,
-    GuardianStartupFailureRequest, GuardianUserOutcome, guardian_post_boot_out_of_memory_outcome,
+    GuardianStartupFailureRequest, GuardianUserOutcome, guardian_post_boot_launch_failure_outcome,
     guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
-    guardian_startup_failure_outcome, record_out_of_memory_observation,
+    guardian_startup_failure_outcome, is_guardian_launch_crash_class,
+    record_launch_failure_observation,
 };
 use crate::logging::{append_trace, timestamp_utc};
 use crate::observability::telemetry::{
@@ -219,27 +220,40 @@ async fn own_terminal_observation(
     };
 
     if let Some(record) = terminal {
+        let accepted_failure_class = record
+            .failure
+            .as_ref()
+            .map(|failure| failure.class)
+            .filter(|failure_class| is_guardian_launch_crash_class(*failure_class));
         if record.boot_completed_at_ms.is_some()
-            && record
-                .failure
-                .as_ref()
-                .is_some_and(|failure| failure.class == LaunchFailureClass::OutOfMemory)
             && record
                 .outcome
                 .as_ref()
                 .is_some_and(|outcome| outcome.reason == LaunchSessionExitReason::CrashedAfterBoot)
         {
-            settle_post_boot_out_of_memory(
-                &state,
-                &session_id,
-                &instance_id,
-                guardian_mode,
-                &launched_at,
-                proof_context,
-                record,
-                guardian,
-            )
-            .await;
+            if let Some(failure_class) = accepted_failure_class {
+                settle_post_boot_launch_failure(
+                    &state,
+                    &session_id,
+                    &instance_id,
+                    guardian_mode,
+                    failure_class,
+                    &launched_at,
+                    proof_context,
+                    record,
+                    guardian,
+                )
+                .await;
+            } else {
+                persist_post_boot_terminal_proof(
+                    &state,
+                    &session_id,
+                    &launched_at,
+                    proof_context,
+                    record,
+                )
+                .await;
+            }
         } else {
             persist_post_boot_terminal_proof(
                 &state,
@@ -291,17 +305,24 @@ async fn persist_post_boot_terminal_proof(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn settle_post_boot_out_of_memory(
+async fn settle_post_boot_launch_failure(
     state: &AppState,
     session_id: &str,
     instance_id: &str,
     guardian_mode: crate::guardian::GuardianMode,
+    failure_class: LaunchFailureClass,
     launched_at: &str,
     proof_context: LaunchProofContext,
     record: crate::state::LaunchSessionRecord,
     mut guardian: GuardianSummary,
 ) {
-    let user_outcome = guardian_post_boot_out_of_memory_outcome();
+    let Some(user_outcome) =
+        guardian_post_boot_launch_failure_outcome(failure_class, record.crash_evidence.as_ref())
+    else {
+        persist_post_boot_terminal_proof(state, session_id, launched_at, proof_context, record)
+            .await;
+        return;
+    };
     guardian.decision = axial_launcher::GuardianDecision::Warned;
     guardian.message = Some(user_outcome.summary.clone());
     for detail in &user_outcome.details {
@@ -320,9 +341,9 @@ async fn settle_post_boot_out_of_memory(
                 benchmark: None,
                 pid: None,
                 exit_code: record.exit_code,
-                failure_class: Some(LaunchFailureClass::OutOfMemory.as_str().to_string()),
+                failure_class: Some(failure_class.as_str().to_string()),
                 failure_detail: Some(user_outcome.summary.clone()),
-                crash_evidence: None,
+                crash_evidence: record.crash_evidence.clone(),
                 healing: record.healing.clone(),
                 guardian: serialize_guardian(Some(guardian)),
                 outcome: record.outcome.clone(),
@@ -334,15 +355,17 @@ async fn settle_post_boot_out_of_memory(
         .await;
 
     let observed_at = timestamp_utc();
-    if let Err(error) = record_out_of_memory_observation(
+    if let Err(error) = record_launch_failure_observation(
         state.failure_memory(),
         instance_id,
         guardian_mode,
+        failure_class,
         &observed_at,
     ) {
         tracing::warn!(
             error_kind = error.class(),
-            "failed to record post-boot out-of-memory observation"
+            failure_class = failure_class.as_str(),
+            "failed to record post-boot launch failure observation"
         );
     }
 
@@ -360,7 +383,10 @@ async fn settle_post_boot_out_of_memory(
         .await
         .is_err()
     {
-        tracing::warn!("failed to persist post-boot out-of-memory launch proof");
+        tracing::warn!(
+            failure_class = failure_class.as_str(),
+            "failed to persist post-boot launch failure proof"
+        );
     }
 }
 
@@ -1087,15 +1113,18 @@ async fn launch_session_inner_with_control(
                     let _ = state.sessions().kill(&session_id).await;
                 }
 
+                let terminal_record = if stalled {
+                    None
+                } else {
+                    state.sessions().get(&session_id).await
+                };
                 let observation = if stalled {
                     GuardianStartupFailureObservation::Stalled
                 } else {
                     GuardianStartupFailureObservation::Exited {
-                        failure_class: state
-                            .sessions()
-                            .get(&session_id)
-                            .await
-                            .and_then(|record| record.failure.map(|failure| failure.class))
+                        failure_class: terminal_record
+                            .as_ref()
+                            .and_then(|record| record.failure.as_ref().map(|failure| failure.class))
                             .unwrap_or(LaunchFailureClass::Unknown),
                     }
                 };
@@ -1104,6 +1133,9 @@ async fn launch_session_inner_with_control(
                     guardian_startup_failure_outcome(GuardianStartupFailureRequest {
                         mode: guardian_mode,
                         observation,
+                        crash_evidence: terminal_record
+                            .as_ref()
+                            .and_then(|record| record.crash_evidence.as_ref()),
                         target_version_id: &intent.target_version_id,
                         runtime_major: prepared.runtime.effective_info.major,
                         requested_java_present: !intent.requested_java.trim().is_empty(),
@@ -1116,17 +1148,19 @@ async fn launch_session_inner_with_control(
                         effective_preset: &prepared.effective_preset,
                     });
                 let failure_class = startup_outcome.failure_class;
-                if failure_class == LaunchFailureClass::OutOfMemory {
+                if is_guardian_launch_crash_class(failure_class) {
                     let observed_at = timestamp_utc();
-                    if let Err(error) = record_out_of_memory_observation(
+                    if let Err(error) = record_launch_failure_observation(
                         state.failure_memory(),
                         &intent.instance_id,
                         guardian_mode,
+                        failure_class,
                         &observed_at,
                     ) {
                         tracing::warn!(
                             error_kind = error.class(),
-                            "failed to record out-of-memory startup observation"
+                            failure_class = failure_class.as_str(),
+                            "failed to record startup launch failure observation"
                         );
                     }
                 }
@@ -1962,7 +1996,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn post_boot_mod_crash_persists_typed_evidence_without_guardian_policy() {
+    async fn post_boot_mod_crash_settles_guardian_copy_proof_and_failure_memory() {
         let root = unique_test_dir("launch-post-boot-mod-crash-e2e");
         let state = test_app_state(&root);
         let session_id = "launch-post-boot-mod-crash-e2e";
@@ -2016,15 +2050,6 @@ mod tests {
         assert_eq!(evidence.suspected_mods.len(), 1);
         assert_eq!(evidence.suspected_mods[0].name.as_str(), "Example Machines");
         assert!(terminal.guardian.is_some());
-        let status_payload = super::super::reports::launch_status_payload(&state, session_id)
-            .await
-            .expect("mod crash status payload");
-        assert_eq!(
-            status_payload["crash_evidence"]["suspected_mods"][0]["name"],
-            "Example Machines"
-        );
-        assert!(!status_payload.to_string().contains("/home/alice"));
-
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if state.sessions().retention_hold_count(session_id).await == Some(0)
@@ -2057,11 +2082,36 @@ mod tests {
                 .map(|version| version.as_str()),
             Some("3.2.1")
         );
+        assert_eq!(proof.failure_class.as_deref(), Some("mod_attributed_crash"));
+        assert!(
+            proof
+                .failure_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("Example Machines"))
+        );
+        let status_payload = super::super::reports::launch_status_payload(&state, session_id)
+            .await
+            .expect("settled mod crash status payload");
+        assert_eq!(
+            status_payload["crash_evidence"]["suspected_mods"][0]["name"],
+            "Example Machines"
+        );
+        assert_eq!(status_payload["failure_class"], "mod_attributed_crash");
+        assert!(
+            status_payload["failure_detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("Example Machines"))
+        );
+        assert!(!status_payload.to_string().contains("/home/alice"));
         let proof_json = serde_json::to_string(&proof).expect("serialize mod crash proof");
         for private in ["/home/alice", "raw-secret-token", "-Duser.home"] {
             assert!(!proof_json.contains(private));
         }
-        assert!(state.failure_memory().list().is_empty());
+        let memory = state.failure_memory().list();
+        assert_eq!(memory.len(), 1);
+        assert_eq!(memory[0].diagnosis_id.as_str(), "mod_attributed_crash");
+        assert_eq!(memory[0].target.id, "instance");
+        assert_eq!(memory[0].occurrence_count, 1);
 
         let _ = fs::remove_dir_all(root);
     }
