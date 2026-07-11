@@ -168,17 +168,17 @@
       "user_intent_hash": "intent_09"
     },
     {
-      "key": "Library:artifact_ownership_unsafe:Guardian.Config.fixture_target_10:Managed:intent_10",
-      "diagnosis_id": "artifact_ownership_unsafe",
+      "key": "Library:launcher_managed_artifact_corrupt:Guardian.Artifact.fixture_target_10:Managed:intent_10",
+      "diagnosis_id": "launcher_managed_artifact_corrupt",
       "domain": "Library",
       "mode": "Managed",
       "target": {
         "system": "Guardian",
-        "kind": "Config",
+        "kind": "Artifact",
         "id": "fixture_target_10",
-        "ownership": "Unknown"
+        "ownership": "LauncherManaged"
       },
-      "ownership": "Unknown",
+      "ownership": "LauncherManaged",
       "first_observed_at": "2026-07-01T00:10:00Z",
       "last_observed_at": "2026-07-01T00:10:00Z",
       "occurrence_count": 1,
@@ -187,9 +187,9 @@
       "repair_attempt_count": 1,
       "quarantined_target": {
         "system": "Guardian",
-        "kind": "Config",
+        "kind": "Artifact",
         "id": "fixture_quarantine_10",
-        "ownership": "Unknown"
+        "ownership": "LauncherManaged"
       },
       "suppression_until": null,
       "target_content_hash": "content_hash_10",
