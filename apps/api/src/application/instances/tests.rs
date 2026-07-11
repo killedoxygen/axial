@@ -1182,15 +1182,15 @@ async fn instance_crud_handlers_create_list_get_update_and_delete() {
     )
     .await
     .expect("create instance");
-    assert_eq!(created.name, "Survival");
-    assert_eq!(created.version_id, "1.21.1");
-    assert_eq!(created.icon, "grass");
-    assert_eq!(created.accent, "#5aa469");
+    assert_eq!(created.instance.name, "Survival");
+    assert_eq!(created.instance.version_id, "1.21.1");
+    assert_eq!(created.instance.icon, "grass");
+    assert_eq!(created.instance.accent, "#5aa469");
 
     let listed = handle_list_instances(&fixture.state, &fixture.producer).await;
     assert_eq!(listed.last_instance_id, None);
     assert_eq!(listed.instances.len(), 1);
-    assert_eq!(listed.instances[0].instance.id, created.id);
+    assert_eq!(listed.instances[0].instance.id, created.instance.id);
     assert_eq!(listed.instances[0].instance.name, "Survival");
     assert!(!listed.instances[0].launchable);
     assert_eq!(
@@ -1203,7 +1203,7 @@ async fn instance_crud_handlers_create_list_get_update_and_delete() {
         axial_config::LaunchPrimaryAction::Install
     );
 
-    let fetched = handle_get_instance(&fixture.state, &fixture.producer, &created.id)
+    let fetched = handle_get_instance(&fixture.state, &fixture.producer, &created.instance.id)
         .await
         .expect("get instance");
     assert_eq!(fetched.instance, created.instance.instance);
@@ -1211,7 +1211,7 @@ async fn instance_crud_handlers_create_list_get_update_and_delete() {
     let updated = handle_update_instance(
         &fixture.state,
         &fixture.producer,
-        &created.id,
+        &created.instance.id,
         InstancePatch {
             name: Some("Skyblock".to_string()),
             max_memory_mb: Some(4096),
@@ -1221,20 +1221,26 @@ async fn instance_crud_handlers_create_list_get_update_and_delete() {
     )
     .await
     .expect("update instance");
-    assert_eq!(updated.id, created.id);
+    assert_eq!(updated.id, created.instance.id);
     assert_eq!(updated.name, "Skyblock");
     assert_eq!(updated.version_id, "1.21.1");
     assert_eq!(updated.max_memory_mb, 4096);
     assert_eq!(updated.icon, "cloud");
 
-    let game_dir = fixture.state.instances().game_dir(&created.id);
+    let game_dir = fixture.state.instances().game_dir(&created.instance.id);
     fs::write(game_dir.join("logs").join("latest.log"), "started").expect("write log");
 
-    let body = handle_delete_instance(&fixture.state, &created.id, HashMap::new())
+    let body = handle_delete_instance(&fixture.state, &created.instance.id, HashMap::new())
         .await
         .expect("delete instance");
     assert_eq!(body, serde_json::json!({ "status": "ok" }));
-    assert!(fixture.state.instances().get(&created.id).is_none());
+    assert!(
+        fixture
+            .state
+            .instances()
+            .get(&created.instance.id)
+            .is_none()
+    );
     assert!(!game_dir.exists());
 }
 
@@ -1460,6 +1466,38 @@ async fn create_queue_failure_rolls_back_created_instance() {
 }
 
 #[tokio::test]
+async fn create_queue_failure_surfaces_compensation_persistence_failure() {
+    let fixture = TestFixture::new("create-queue-compensation-failure");
+    let instance = add_test_instance(&fixture, "Retained", "1.21.1");
+    let instances_file = fixture.state.instances().paths().instances_file.clone();
+    fs::create_dir_all(instances_file.parent().expect("registry parent"))
+        .expect("create registry parent");
+    fs::create_dir(&instances_file).expect("block registry file promotion");
+
+    let (status, Json(body)) = super::create::queue_create_install_or_rollback(
+        &fixture.state,
+        &instance.id,
+        Some(crate::application::InstallQueueRequest {
+            kind: String::new(),
+            version_id: String::new(),
+            manifest_url: String::new(),
+            component_id: String::new(),
+            build_id: String::new(),
+        }),
+    )
+    .await
+    .expect_err("closed persistence should prevent create compensation");
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_bounded_error_body(
+        &body,
+        "Could not create the instance. Check app data permissions and try again.",
+    );
+    assert!(fixture.state.instances().get(&instance.id).is_some());
+    assert!(fixture.state.instances().game_dir(&instance.id).exists());
+}
+
+#[tokio::test]
 async fn create_instance_duplicate_name_gets_backend_owned_suffix() {
     let fixture = TestFixture::new("create-name-conflict");
     let library_dir = fixture.configure_create_manifest(&["1.21.1", "1.21.2"]);
@@ -1477,7 +1515,7 @@ async fn create_instance_duplicate_name_gets_backend_owned_suffix() {
     )
     .await
     .expect("create original instance");
-    assert_eq!(original.name, "Survival");
+    assert_eq!(original.instance.name, "Survival");
 
     let created = handle_create_instance(
         &fixture.state,
@@ -1492,8 +1530,8 @@ async fn create_instance_duplicate_name_gets_backend_owned_suffix() {
     .await
     .expect("duplicate name should be resolved by Application");
 
-    assert_eq!(created.name, "Survival (1)");
-    assert_eq!(created.version_id, "1.21.2");
+    assert_eq!(created.instance.name, "Survival (1)");
+    assert_eq!(created.instance.version_id, "1.21.2");
     assert_eq!(fixture.state.instances().list().len(), 2);
 }
 
@@ -1523,18 +1561,18 @@ async fn create_instance_applies_initial_settings_and_supported_preset_in_backen
         created.result.command,
         crate::state::contracts::CommandKind::CreateInstance
     );
-    assert_eq!(created.max_memory_mb, 6144);
-    assert_eq!(created.min_memory_mb, 1024);
-    assert_eq!(created.window_width, 1280);
-    assert_eq!(created.window_height, 720);
-    assert_eq!(created.art_seed, 42);
-    assert_eq!(created.jvm_preset, "performance");
+    assert_eq!(created.instance.max_memory_mb, 6144);
+    assert_eq!(created.instance.min_memory_mb, 1024);
+    assert_eq!(created.instance.window_width, 1280);
+    assert_eq!(created.instance.window_height, 720);
+    assert_eq!(created.instance.art_seed, 42);
+    assert_eq!(created.instance.jvm_preset, "performance");
     assert!(created.guardian_notice.is_none());
     assert_eq!(
         fixture
             .state
             .instances()
-            .get(&created.id)
+            .get(&created.instance.id)
             .expect("stored instance")
             .jvm_preset,
         "performance"
@@ -1560,7 +1598,7 @@ async fn create_instance_unknown_preset_resets_to_auto_without_echoing_raw_value
     .await
     .expect("create instance with unknown preset");
 
-    assert_eq!(created.jvm_preset, "");
+    assert_eq!(created.instance.jvm_preset, "");
     assert_eq!(
         created
             .guardian_notice
@@ -1595,7 +1633,7 @@ async fn create_instance_blank_preset_remains_auto_without_warning() {
     .await
     .expect("create instance with blank preset");
 
-    assert_eq!(created.jvm_preset, "");
+    assert_eq!(created.instance.jvm_preset, "");
     assert!(created.guardian_notice.is_none());
     assert_eq!(created.view_model.tone, "success");
 }
@@ -1807,7 +1845,7 @@ async fn create_instance_loader_version_uses_beta_build_when_only_beta_builds_ex
     .await
     .expect("beta-only loader version should create");
 
-    assert_eq!(created.version_id, beta_version_id);
+    assert_eq!(created.instance.version_id, beta_version_id);
     let queued = created.queued_install.expect("queued install summary");
     assert_eq!(queued.kind, "loader");
     assert_eq!(queued.state_id, "install_queued");
@@ -1859,7 +1897,10 @@ async fn create_instance_quilt_java25_default_uses_compatible_beta_fallback() {
     .await
     .expect("compatible Quilt beta fallback should create");
 
-    assert_eq!(created.version_id, "quilt-loader-0.30.0-beta.8-26.1.2");
+    assert_eq!(
+        created.instance.version_id,
+        "quilt-loader-0.30.0-beta.8-26.1.2"
+    );
     let queued = created.queued_install.expect("queued install summary");
     assert_eq!(queued.kind, "loader");
     assert_eq!(queued.label, "Quilt 0.30.0-beta.8 for Minecraft 26.1.2");
@@ -2334,7 +2375,7 @@ async fn create_instance_vanilla_selection_returns_backend_queue_state() {
     .await
     .expect("create and queue install");
 
-    assert_eq!(created.version_id, "1.21.2");
+    assert_eq!(created.instance.version_id, "1.21.2");
     let queued = created.queued_install.expect("queued install summary");
     assert_eq!(queued.state_id, "install_queued");
     assert_eq!(queued.kind, "vanilla");
@@ -2374,8 +2415,8 @@ async fn create_instance_installed_vanilla_selection_does_not_queue_install() {
     .await
     .expect("create installed vanilla instance");
 
-    assert_eq!(created.version_id, "1.21.1");
-    assert!(created.launchable);
+    assert_eq!(created.instance.version_id, "1.21.1");
+    assert!(created.instance.launchable);
     assert!(created.install_queue.is_none());
     assert!(created.queued_install.is_none());
     assert_eq!(created.view_model.state_id, "created");
@@ -2399,7 +2440,7 @@ async fn create_instance_vanilla_reuses_one_request_snapshot_without_warm_walks(
         .await
         .expect("create installed vanilla instance");
 
-        assert!(created.launchable);
+        assert!(created.instance.launchable);
         assert!(created.install_queue.is_none());
         assert_eq!(fixture.state.installed_versions_walk_count(), 1);
     }
@@ -2433,7 +2474,7 @@ async fn create_instance_loader_reuses_one_request_snapshot_without_warm_walks()
         .await
         .expect("create installed loader instance");
 
-        assert!(created.launchable);
+        assert!(created.instance.launchable);
         assert!(created.install_queue.is_none());
         assert_eq!(fixture.state.installed_versions_walk_count(), 1);
     }
@@ -2474,7 +2515,7 @@ async fn create_instance_loader_selection_resolves_cached_build_and_queues_backe
     .await
     .expect("create and queue loader install");
 
-    assert_eq!(created.version_id, "fabric-loader-0.16.14-1.21.99");
+    assert_eq!(created.instance.version_id, "fabric-loader-0.16.14-1.21.99");
     let queued = created.queued_install.expect("queued install summary");
     assert_eq!(queued.state_id, "install_queued");
     assert_eq!(queued.kind, "loader");

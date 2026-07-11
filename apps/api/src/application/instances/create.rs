@@ -30,7 +30,7 @@ use crate::state::contracts::{CommandKind, OperationId, OperationStatus};
 use crate::state::{
     AppState, InstalledVersionsLookup, ProducerLease, RequestProducerHandoff, new_instance,
 };
-use axial_config::{EnrichedInstance, Instance, generate_instance_id};
+use axial_config::{EnrichedInstance, Instance, InstanceStoreError, generate_instance_id};
 use axial_launcher::{
     GuardianMode, LaunchReadinessReasonId, LaunchReadinessRequest, LaunchReadinessSeverity,
     inspect_launch_readiness,
@@ -45,10 +45,10 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
-    ops::Deref,
     path::Path,
     time::{Duration, Instant},
 };
+use tracing::error;
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct CreateInstanceRequest {
@@ -274,14 +274,6 @@ pub(crate) struct CreateInstanceResponse {
     pub queued_install: Option<CreateQueuedInstallSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardian_notice: Option<CreateGuardianNotice>,
-}
-
-impl Deref for CreateInstanceResponse {
-    type Target = EnrichedInstance;
-
-    fn deref(&self) -> &Self::Target {
-        &self.instance
-    }
 }
 
 pub(crate) async fn handle_create_instance_view(
@@ -815,11 +807,16 @@ pub(super) async fn queue_create_install_or_rollback_owned(
     match queue_create_install_request(state, request, handoff).await {
         Ok(install_queue) => Ok(install_queue),
         Err(error) => {
-            rollback_created_instance(state, instance_id)
-                .await
-                .map_err(|rollback_error| {
-                    instance_write_error_response(InstanceWriteOperation::Create, rollback_error)
-                })?;
+            if let Err(rollback_error) = rollback_created_instance(state, instance_id).await {
+                error!(
+                    failure_class = instance_store_error_class(&rollback_error),
+                    "create compensation rollback persistence failed"
+                );
+                return Err(instance_write_error_response(
+                    InstanceWriteOperation::Create,
+                    rollback_error,
+                ));
+            }
             Err(error)
         }
     }
@@ -887,8 +884,18 @@ fn create_shutdown_error_response(
 async fn rollback_created_instance(
     state: &AppState,
     instance_id: &str,
-) -> Result<(), axial_config::InstanceStoreError> {
+) -> Result<(), InstanceStoreError> {
     state.delete_instance(instance_id.to_string(), true).await
+}
+
+fn instance_store_error_class(error: &InstanceStoreError) -> &'static str {
+    match error {
+        InstanceStoreError::Read(_) => "read",
+        InstanceStoreError::Parse(_) => "parse",
+        InstanceStoreError::Validation(_) => "validation",
+        InstanceStoreError::TooLarge { .. } => "too_large",
+        InstanceStoreError::Persistence(_) => "persistence",
+    }
 }
 
 fn create_queued_install_summary(
