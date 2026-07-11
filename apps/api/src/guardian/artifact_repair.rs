@@ -95,39 +95,42 @@ pub async fn execute_guardian_artifact_repair(
     let diagnosis_id = request.plan.diagnosis_id.clone();
     let target = request.plan.target.clone();
 
-    if let Some(block_reason) = pre_execution_block_reason(&request) {
-        if let Some(error) = create_terminal_journal_reconciled(
-            request.journals,
-            &operation_id,
-            request.plan,
-            OperationStatus::Blocked,
-            OperationOutcome::Blocked,
-            OperationStepResult::Skipped,
-            Vec::new(),
-        )
-        .await?
-        {
-            return Err(error);
+    let checksum = match validate_artifact_repair_request(&request) {
+        Ok(checksum) => checksum,
+        Err(block_reason) => {
+            if let Some(error) = create_terminal_journal_reconciled(
+                request.journals,
+                &operation_id,
+                request.plan,
+                OperationStatus::Blocked,
+                OperationOutcome::Blocked,
+                OperationStepResult::Skipped,
+                Vec::new(),
+            )
+            .await?
+            {
+                return Err(error);
+            }
+            record_artifact_repair_memory(
+                request.failure_memory,
+                &diagnosis_id,
+                request.mode,
+                &target,
+                FailureMemoryActionOutcome::Blocked,
+                request.observed_at,
+                None,
+                false,
+                None,
+            );
+            return Ok(artifact_repair_outcome(
+                operation_id,
+                diagnosis_id,
+                GuardianArtifactRepairStatus::Blocked,
+                Vec::new(),
+                block_reason,
+            ));
         }
-        record_artifact_repair_memory(
-            request.failure_memory,
-            &diagnosis_id,
-            request.mode,
-            &target,
-            FailureMemoryActionOutcome::Blocked,
-            request.observed_at,
-            None,
-            false,
-            None,
-        );
-        return Ok(artifact_repair_outcome(
-            operation_id,
-            diagnosis_id,
-            GuardianArtifactRepairStatus::Blocked,
-            Vec::new(),
-            block_reason,
-        ));
-    }
+    };
 
     let memory_key = FailureMemoryKey::for_observation(
         GuardianDomain::Install,
@@ -286,8 +289,6 @@ pub async fn execute_guardian_artifact_repair(
         }
     }
 
-    let checksum =
-        source_download_checksum(&request.source).expect("source checksum validated before repair");
     let mut download_request =
         DownloadToTempRequest::new(target.clone(), request.destination, request.source.url)
             .with_expected_checksum(checksum);
@@ -393,39 +394,42 @@ pub async fn execute_guardian_missing_artifact_repair(
     let diagnosis_id = request.plan.diagnosis_id.clone();
     let target = request.plan.target.clone();
 
-    if let Some(block_reason) = pre_missing_artifact_execution_block_reason(&request) {
-        if let Some(error) = create_terminal_journal_reconciled(
-            request.journals,
-            &operation_id,
-            request.plan,
-            OperationStatus::Blocked,
-            OperationOutcome::Blocked,
-            OperationStepResult::Skipped,
-            Vec::new(),
-        )
-        .await?
-        {
-            return Err(error);
+    let checksum = match validate_missing_artifact_repair_request(&request) {
+        Ok(checksum) => checksum,
+        Err(block_reason) => {
+            if let Some(error) = create_terminal_journal_reconciled(
+                request.journals,
+                &operation_id,
+                request.plan,
+                OperationStatus::Blocked,
+                OperationOutcome::Blocked,
+                OperationStepResult::Skipped,
+                Vec::new(),
+            )
+            .await?
+            {
+                return Err(error);
+            }
+            record_artifact_repair_memory(
+                request.failure_memory,
+                &diagnosis_id,
+                request.mode,
+                &target,
+                FailureMemoryActionOutcome::Blocked,
+                request.observed_at,
+                None,
+                false,
+                None,
+            );
+            return Ok(artifact_repair_outcome(
+                operation_id,
+                diagnosis_id,
+                GuardianArtifactRepairStatus::Blocked,
+                Vec::new(),
+                block_reason,
+            ));
         }
-        record_artifact_repair_memory(
-            request.failure_memory,
-            &diagnosis_id,
-            request.mode,
-            &target,
-            FailureMemoryActionOutcome::Blocked,
-            request.observed_at,
-            None,
-            false,
-            None,
-        );
-        return Ok(artifact_repair_outcome(
-            operation_id,
-            diagnosis_id,
-            GuardianArtifactRepairStatus::Blocked,
-            Vec::new(),
-            block_reason,
-        ));
-    }
+    };
 
     let memory_key = FailureMemoryKey::for_observation(
         GuardianDomain::Install,
@@ -486,8 +490,6 @@ pub async fn execute_guardian_missing_artifact_repair(
         return Err(error);
     }
 
-    let checksum =
-        source_download_checksum(&request.source).expect("source checksum validated before repair");
     let mut download_request =
         DownloadToTempRequest::new(target.clone(), request.destination, request.source.url)
             .with_expected_checksum(checksum);
@@ -577,7 +579,9 @@ pub async fn execute_guardian_missing_artifact_repair(
     }
 }
 
-fn pre_execution_block_reason(request: &GuardianArtifactRepairRequest<'_>) -> Option<&'static str> {
+fn validate_artifact_repair_request<'a>(
+    request: &GuardianArtifactRepairRequest<'a>,
+) -> Result<DownloadChecksum<'a>, &'static str> {
     if request.plan.tasks.len() != 6
         || !request
             .plan
@@ -595,26 +599,26 @@ fn pre_execution_block_reason(request: &GuardianArtifactRepairRequest<'_>) -> Op
             .iter()
             .any(|task| task.kind == GuardianRepairTaskKind::PromoteVerifiedArtifact)
     {
-        return Some("guardian_artifact_repair_blocked_invalid_plan");
+        return Err("guardian_artifact_repair_blocked_invalid_plan");
     }
     if request.source.url.trim().is_empty()
         || request.source.checksum_algorithm.trim().is_empty()
         || request.source.expected_checksum.trim().is_empty()
     {
-        return Some("guardian_artifact_repair_blocked_missing_source");
+        return Err("guardian_artifact_repair_blocked_missing_source");
     }
     let Some(checksum) = source_download_checksum(&request.source) else {
-        return Some("guardian_artifact_repair_blocked_unsupported_checksum");
+        return Err("guardian_artifact_repair_blocked_unsupported_checksum");
     };
     if !valid_download_checksum_metadata(checksum) {
-        return Some("guardian_artifact_repair_blocked_invalid_checksum");
+        return Err("guardian_artifact_repair_blocked_invalid_checksum");
     }
-    None
+    Ok(checksum)
 }
 
-fn pre_missing_artifact_execution_block_reason(
-    request: &GuardianArtifactRepairRequest<'_>,
-) -> Option<&'static str> {
+fn validate_missing_artifact_repair_request<'a>(
+    request: &GuardianArtifactRepairRequest<'a>,
+) -> Result<DownloadChecksum<'a>, &'static str> {
     if request.plan.tasks.len() != 5
         || request
             .plan
@@ -632,26 +636,26 @@ fn pre_missing_artifact_execution_block_reason(
             .iter()
             .any(|task| task.kind == GuardianRepairTaskKind::PromoteVerifiedArtifact)
     {
-        return Some("guardian_missing_artifact_repair_blocked_invalid_plan");
+        return Err("guardian_missing_artifact_repair_blocked_invalid_plan");
     }
     match request.destination.try_exists() {
         Ok(false) => {}
-        Ok(true) => return Some("guardian_missing_artifact_repair_blocked_target_exists"),
-        Err(_) => return Some("guardian_missing_artifact_repair_blocked_target_unreadable"),
+        Ok(true) => return Err("guardian_missing_artifact_repair_blocked_target_exists"),
+        Err(_) => return Err("guardian_missing_artifact_repair_blocked_target_unreadable"),
     }
     if request.source.url.trim().is_empty()
         || request.source.checksum_algorithm.trim().is_empty()
         || request.source.expected_checksum.trim().is_empty()
     {
-        return Some("guardian_artifact_repair_blocked_missing_source");
+        return Err("guardian_artifact_repair_blocked_missing_source");
     }
     let Some(checksum) = source_download_checksum(&request.source) else {
-        return Some("guardian_artifact_repair_blocked_unsupported_checksum");
+        return Err("guardian_artifact_repair_blocked_unsupported_checksum");
     };
     if !valid_download_checksum_metadata(checksum) {
-        return Some("guardian_artifact_repair_blocked_invalid_checksum");
+        return Err("guardian_artifact_repair_blocked_invalid_checksum");
     }
-    None
+    Ok(checksum)
 }
 
 fn source_download_checksum<'a>(
@@ -1806,6 +1810,40 @@ mod tests {
         assert_eq!(fs::read(&destination).expect("original"), b"corrupt");
         assert_eq!(server.request_count(), 0);
         assert!(!root_contains_quarantine(&root, b"corrupt"));
+
+        server.stop();
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn unsupported_checksum_blocks_missing_artifact_without_network() {
+        let root = test_root("missing-artifact-unsupported-checksum");
+        fs::create_dir_all(&root).expect("root");
+        let destination = root.join("missing.jar");
+        let replacement = b"fresh artifact".to_vec();
+        let server = TestByteServer::start(replacement);
+        let stores = stores();
+        let plan = missing_artifact_plan();
+
+        let outcome = execute_guardian_missing_artifact_repair(request_with_checksum(
+            &plan,
+            &destination,
+            &server.url,
+            "sha512",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            None,
+            &stores,
+            "2026-06-15T10:00:00Z",
+        ))
+        .await;
+
+        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Blocked);
+        assert_eq!(
+            outcome.summary,
+            "guardian_artifact_repair_blocked_unsupported_checksum"
+        );
+        assert!(!destination.exists());
+        assert_eq!(server.request_count(), 0);
 
         server.stop();
         cleanup(&root);
