@@ -95,32 +95,28 @@ fn instance_write_error_response(
     error: InstanceStoreError,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let (status, message) = match error {
-        InstanceStoreError::Read(error) => match error.kind() {
-            ErrorKind::NotFound => (StatusCode::NOT_FOUND, "instance not found".to_string()),
-            ErrorKind::AlreadyExists => (
-                StatusCode::CONFLICT,
-                "an instance with this name already exists".to_string(),
-            ),
-            ErrorKind::InvalidInput => (StatusCode::BAD_REQUEST, error.to_string()),
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                operation.internal_error_message().to_string(),
-            ),
-        },
-        InstanceStoreError::Parse(_) => (
+        InstanceStoreError::Read(error) | InstanceStoreError::Persistence(error) => {
+            match error.kind() {
+                ErrorKind::NotFound => (StatusCode::NOT_FOUND, "instance not found".to_string()),
+                ErrorKind::AlreadyExists => (
+                    StatusCode::CONFLICT,
+                    "an instance with this name already exists".to_string(),
+                ),
+                ErrorKind::InvalidInput => (StatusCode::BAD_REQUEST, error.to_string()),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    operation.internal_error_message().to_string(),
+                ),
+            }
+        }
+        InstanceStoreError::Validation(message) => (StatusCode::BAD_REQUEST, message.to_string()),
+        InstanceStoreError::Parse(_) | InstanceStoreError::TooLarge { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
             operation.internal_error_message().to_string(),
         ),
     };
 
     (status, Json(serde_json::json!({ "error": message })))
-}
-
-fn instance_error_kind(error: &InstanceStoreError) -> Option<ErrorKind> {
-    match error {
-        InstanceStoreError::Read(error) => Some(error.kind()),
-        InstanceStoreError::Parse(_) => None,
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -347,10 +343,13 @@ pub(crate) async fn handle_duplicate_instance(
     payload: Option<DuplicateInstanceRequest>,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
     let payload = payload.unwrap_or_default();
-    let mc_dir = state.library_dir().map(PathBuf::from);
     state
-        .instances()
-        .duplicate(id, payload.name, mc_dir.as_deref())
+        .duplicate_instance(
+            id.to_string(),
+            payload.name,
+            state.library_dir().map(PathBuf::from),
+        )
+        .await
         .map(|instance| enrich_instance_for_state(state, instance))
         .map_err(|error| instance_write_error_response(InstanceWriteOperation::Duplicate, error))
 }
@@ -377,62 +376,75 @@ pub(crate) async fn handle_update_instance(
     id: &str,
     patch: InstancePatch,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
-    let mut instance = state.instances().get(id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "instance not found" })),
-        )
-    })?;
-
-    if let Some(name) = patch.name.filter(|value| !value.trim().is_empty()) {
-        instance.name = name;
-    }
-    if let Some(version_id) = patch.version_id.filter(|value| !value.trim().is_empty())
-        && version_id != instance.version_id
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "direct version changes are not supported"
-            })),
-        ));
-    }
-    if let Some(art_seed) = patch.art_seed {
-        instance.art_seed = art_seed;
-    }
-    if let Some(max_memory_mb) = patch.max_memory_mb {
-        instance.max_memory_mb = max_memory_mb.max(0);
-    }
-    if let Some(min_memory_mb) = patch.min_memory_mb {
-        instance.min_memory_mb = min_memory_mb.max(0);
-    }
-    if let Some(java_path) = patch.java_path {
-        instance.java_path = java_path;
-    }
-    if let Some(window_width) = patch.window_width {
-        instance.window_width = window_width.max(0);
-    }
-    if let Some(window_height) = patch.window_height {
-        instance.window_height = window_height.max(0);
-    }
-    if let Some(jvm_preset) = patch.jvm_preset {
-        instance.jvm_preset = normalize_create_jvm_preset(Some(&jvm_preset)).stored_preset;
-    }
-    if let Some(performance_mode) = patch.performance_mode {
-        instance.performance_mode = performance_mode;
-    }
-    if let Some(extra_jvm_args) = patch.extra_jvm_args {
-        instance.extra_jvm_args = extra_jvm_args;
-    }
-    if let Some(icon) = patch.icon {
-        instance.icon = icon;
-    }
-    if let Some(accent) = patch.accent {
-        instance.accent = accent;
-    }
+    let id = id.to_string();
     state
-        .instances()
-        .update(instance)
+        .mutate_instances(move |registry| {
+            let Some(index) = registry.instances.iter().position(|stored| stored.id == id) else {
+                return Err(InstanceStoreError::Persistence(std::io::Error::new(
+                    ErrorKind::NotFound,
+                    "instance not found",
+                )));
+            };
+            let mut instance = registry.instances[index].clone();
+            if let Some(name) = patch.name.filter(|value| !value.trim().is_empty()) {
+                if registry
+                    .instances
+                    .iter()
+                    .enumerate()
+                    .any(|(stored_index, stored)| stored_index != index && stored.name == name)
+                {
+                    return Err(InstanceStoreError::Persistence(std::io::Error::new(
+                        ErrorKind::AlreadyExists,
+                        "an instance with this name already exists",
+                    )));
+                }
+                instance.name = name;
+            }
+            if let Some(version_id) = patch.version_id.filter(|value| !value.trim().is_empty())
+                && version_id != instance.version_id
+            {
+                return Err(InstanceStoreError::Persistence(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "direct version changes are not supported",
+                )));
+            }
+            if let Some(value) = patch.art_seed {
+                instance.art_seed = value;
+            }
+            if let Some(value) = patch.max_memory_mb {
+                instance.max_memory_mb = value.max(0);
+            }
+            if let Some(value) = patch.min_memory_mb {
+                instance.min_memory_mb = value.max(0);
+            }
+            if let Some(value) = patch.java_path {
+                instance.java_path = value;
+            }
+            if let Some(value) = patch.window_width {
+                instance.window_width = value.max(0);
+            }
+            if let Some(value) = patch.window_height {
+                instance.window_height = value.max(0);
+            }
+            if let Some(value) = patch.jvm_preset {
+                instance.jvm_preset = normalize_create_jvm_preset(Some(&value)).stored_preset;
+            }
+            if let Some(value) = patch.performance_mode {
+                instance.performance_mode = value;
+            }
+            if let Some(value) = patch.extra_jvm_args {
+                instance.extra_jvm_args = value;
+            }
+            if let Some(value) = patch.icon {
+                instance.icon = value;
+            }
+            if let Some(value) = patch.accent {
+                instance.accent = value;
+            }
+            registry.instances[index] = instance.clone();
+            Ok(instance)
+        })
+        .await
         .map(|instance| enrich_instance_for_state(state, instance))
         .map_err(|error| instance_write_error_response(InstanceWriteOperation::Update, error))
 }
@@ -448,13 +460,7 @@ pub(crate) async fn handle_delete_instance(
     id: &str,
     query: std::collections::HashMap<String, String>,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    if state.instances().get(id).is_none() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "instance not found" })),
-        ));
-    }
-
+    let _lifecycle = state.acquire_instance_lifecycle(id).await;
     if state.sessions().has_active_instance(id).await {
         return Err((
             StatusCode::CONFLICT,
@@ -466,8 +472,8 @@ pub(crate) async fn handle_delete_instance(
 
     let keep_files = query.get("keep_files").is_some_and(|value| value == "true");
     state
-        .instances()
-        .remove(id, !keep_files)
+        .delete_instance(id.to_string(), !keep_files)
+        .await
         .map_err(|error| instance_write_error_response(InstanceWriteOperation::Delete, error))?;
 
     Ok(serde_json::json!({ "status": "ok" }))

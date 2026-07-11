@@ -133,7 +133,7 @@ fn is_port_suffix(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::state::{AppStateInit, InstallStore, RequestProducerHandoff, SessionStore};
-    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use axum::body::{Body, Bytes, to_bytes};
     use axum::extract::Extension;
@@ -446,7 +446,10 @@ mod tests {
             let root = test_root(name);
             let paths = test_paths(&root);
             let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            let instances = Arc::new(InstanceStore::load_from(paths).expect("load instances"));
+            let instances = Arc::new(
+                InstanceStore::from_snapshot(paths, InstanceRegistrySnapshot::default())
+                    .expect("load instances"),
+            );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
                 version: "test".to_string(),

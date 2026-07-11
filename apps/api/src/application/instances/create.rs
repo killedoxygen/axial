@@ -11,8 +11,7 @@ use super::{
         preferred_loader_build, select_preferred_loader_build,
         stale_loader_version_catalog_message,
     },
-    enrich_instance_for_state, instance_error_kind, instance_write_error_response,
-    scan_current_versions,
+    enrich_instance_for_state, instance_write_error_response, scan_current_versions,
 };
 use crate::application::install::InstallQueueInstallItemViewModel;
 use crate::application::timing::{CreateViewTiming, trace_create_view};
@@ -28,10 +27,10 @@ use crate::guardian::{
     normalize_create_jvm_preset,
 };
 use crate::observability::telemetry::TelemetryEvent;
-use crate::state::AppState;
 use crate::state::RequestProducerHandoff;
 use crate::state::contracts::{CommandKind, OperationId, OperationStatus};
-use axial_config::{EnrichedInstance, Instance};
+use crate::state::{AppState, new_instance};
+use axial_config::{EnrichedInstance, Instance, generate_instance_id};
 use axial_launcher::{
     GuardianMode, LaunchReadinessReasonId, LaunchReadinessRequest, LaunchReadinessSeverity,
     inspect_launch_readiness,
@@ -50,8 +49,6 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-
-const MAX_CREATE_NAME_COLLISION_RETRIES: usize = 9;
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct CreateInstanceRequest {
@@ -444,16 +441,12 @@ pub(crate) async fn handle_create_instance_owned(
     let mc_dir = state.library_dir().map(PathBuf::from);
     let install_request = create_install_queue_request_if_needed(state, &selection)?;
     let queued_install_request = install_request.clone();
-    let instance =
-        create_instance_with_unique_name(state, &payload, &selection, mc_dir.as_deref())?;
+    let instance = build_created_instance(&payload, &selection, &preset)?;
+    let instance = state
+        .create_instance(instance, mc_dir)
+        .await
+        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Create, error))?;
     let created_instance_id = instance.id.clone();
-    let instance = match apply_create_initial_settings(state, instance, &payload, &preset) {
-        Ok(instance) => instance,
-        Err(error) => {
-            rollback_created_instance(state, &created_instance_id);
-            return Err(error);
-        }
-    };
     let install_queue = queue_create_install_or_rollback_owned(
         state,
         &created_instance_id,
@@ -703,96 +696,42 @@ async fn resolve_vanilla_create_selection(
     })
 }
 
-fn create_instance_with_unique_name(
-    state: &AppState,
+fn build_created_instance(
     payload: &CreateInstanceRequest,
     selection: &CreateSelection,
-    mc_dir: Option<&std::path::Path>,
-) -> Result<Instance, (StatusCode, Json<serde_json::Value>)> {
-    let base_name = payload.name.trim();
-    if base_name.is_empty() {
-        return Err(bad_create_request("instance name is required"));
-    }
-
-    for attempt in 0..=MAX_CREATE_NAME_COLLISION_RETRIES {
-        let name = if attempt == 0 {
-            base_name.to_string()
-        } else {
-            format!("{base_name} ({attempt})")
-        };
-        match state.instances().add(
-            name,
-            selection.target_version_id().to_string(),
-            payload.icon.clone(),
-            payload.accent.clone(),
-            mc_dir,
-        ) {
-            Ok(instance) => return Ok(instance),
-            Err(error)
-                if attempt < MAX_CREATE_NAME_COLLISION_RETRIES
-                    && instance_error_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) =>
-            {
-                continue;
-            }
-            Err(error) => {
-                return Err(instance_write_error_response(
-                    InstanceWriteOperation::Create,
-                    error,
-                ));
-            }
-        }
-    }
-
-    Err((
-        StatusCode::CONFLICT,
-        Json(serde_json::json!({ "error": "an instance with this name already exists" })),
-    ))
-}
-
-fn apply_create_initial_settings(
-    state: &AppState,
-    mut instance: Instance,
-    payload: &CreateInstanceRequest,
     preset: &GuardianJvmPresetResolution,
 ) -> Result<Instance, (StatusCode, Json<serde_json::Value>)> {
-    let mut changed = false;
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return Err(bad_create_request("instance name is required"));
+    }
+    let mut instance = new_instance(
+        generate_instance_id(),
+        name.to_string(),
+        selection.target_version_id().to_string(),
+        payload.icon.clone(),
+        payload.accent.clone(),
+    );
     if let Some(art_seed) = payload.art_seed {
         instance.art_seed = art_seed;
-        changed = true;
     }
     if let Some(max_memory_mb) = payload.max_memory_mb {
         instance.max_memory_mb = max_memory_mb.max(0);
-        changed = true;
     }
     if let Some(min_memory_mb) = payload.min_memory_mb {
         instance.min_memory_mb = min_memory_mb.max(0);
-        changed = true;
     }
     if let Some(window_width) = payload.window_width {
         instance.window_width = window_width.max(0);
-        changed = true;
     }
     if let Some(window_height) = payload.window_height {
         instance.window_height = window_height.max(0);
-        changed = true;
     }
-    if instance.jvm_preset != preset.stored_preset {
-        instance.jvm_preset = preset.stored_preset.clone();
-        changed = true;
-    }
+    instance.jvm_preset = preset.stored_preset.clone();
     if let Some(auto_optimize) = payload.auto_optimize {
         instance.auto_optimize = auto_optimize;
-        changed = true;
     }
-
-    if !changed {
-        return Ok(instance);
-    }
-
-    state
-        .instances()
-        .update(instance)
-        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Create, error))
+    Ok(instance)
 }
 
 fn create_install_queue_request_if_needed(
@@ -832,7 +771,11 @@ pub(super) async fn queue_create_install_or_rollback_owned(
     match queue_create_install_request(state, request, handoff).await {
         Ok(install_queue) => Ok(install_queue),
         Err(error) => {
-            rollback_created_instance(state, instance_id);
+            rollback_created_instance(state, instance_id)
+                .await
+                .map_err(|rollback_error| {
+                    instance_write_error_response(InstanceWriteOperation::Create, rollback_error)
+                })?;
             Err(error)
         }
     }
@@ -890,8 +833,11 @@ fn version_is_launch_ready_or_user_blocked(
         .all(|reason| reason.id == LaunchReadinessReasonId::JavaOverrideMissing))
 }
 
-fn rollback_created_instance(state: &AppState, instance_id: &str) {
-    let _ = state.instances().remove(instance_id, true);
+async fn rollback_created_instance(
+    state: &AppState,
+    instance_id: &str,
+) -> Result<(), axial_config::InstanceStoreError> {
+    state.delete_instance(instance_id.to_string(), true).await
 }
 
 fn create_queued_install_summary(

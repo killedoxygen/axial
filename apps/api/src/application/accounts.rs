@@ -600,7 +600,7 @@ mod tests {
         AppStateInit, AuthLoginMinecraftProfile, AuthLoginMinecraftSkin, InstallStore,
         NewAuthLoginMinecraftAccount, NewAuthLoginMsaToken, SessionStore,
     };
-    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use std::{
         fs,
@@ -735,8 +735,10 @@ mod tests {
             let config = Arc::new(
                 ConfigStore::from_config(paths.clone(), AppConfig::default()).expect("set config"),
             );
-            let instances =
-                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+            let instances = Arc::new(
+                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                    .expect("load instances"),
+            );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
                 version: "test".to_string(),

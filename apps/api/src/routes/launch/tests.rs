@@ -3536,6 +3536,10 @@ impl RouteTestFixture {
             .await
             .expect("close config store before reload");
         self.state
+            .close_instance_registry()
+            .await
+            .expect("close instance registry before reload");
+        self.state
             .accounts()
             .close()
             .await
@@ -3575,7 +3579,7 @@ impl RouteTestFixture {
 
     fn from_root_paths(root: PathBuf, paths: AppPaths) -> Self {
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        let instances = Arc::new(InstanceStore::load_for_startup(paths.clone()).store);
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -3661,13 +3665,7 @@ impl RouteTestFixture {
     fn add_instance(&self, name: &str, version_id: &str) -> String {
         self.state
             .instances()
-            .add(
-                name.to_string(),
-                version_id.to_string(),
-                String::new(),
-                String::new(),
-                None,
-            )
+            .insert_for_test(name.to_string(), version_id.to_string())
             .expect("add instance")
             .id
     }
@@ -3677,7 +3675,7 @@ impl RouteTestFixture {
         update(&mut instance);
         self.state
             .instances()
-            .update(instance)
+            .replace_for_test(instance)
             .expect("update instance");
     }
 

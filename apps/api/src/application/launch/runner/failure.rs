@@ -160,7 +160,7 @@ async fn emit_terminal_failure(
 mod tests {
     use super::*;
     use crate::state::{AppStateInit, InstallStore, LaunchEvent, SessionStore};
-    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_launcher::{LaunchSessionExitReason, LaunchSessionRecord, LaunchState, SessionId};
     use axial_performance::PerformanceManager;
     use std::fs;
@@ -338,7 +338,10 @@ mod tests {
     fn test_app_state(root: &Path) -> AppState {
         let paths = test_paths(root);
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                .expect("load instances"),
+        );
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),

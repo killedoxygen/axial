@@ -32,7 +32,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config_paths = paths.clone();
     let config_startup =
         tokio::task::spawn_blocking(move || ConfigStore::load_for_startup(config_paths)).await??;
-    let instance_startup = InstanceStore::load_for_startup(paths.clone());
+    let instance_paths = paths.clone();
+    let instance_startup =
+        tokio::task::spawn_blocking(move || InstanceStore::load_for_startup(instance_paths))
+            .await?;
     let mut startup_warnings = config_startup.warnings;
     startup_warnings.extend(instance_startup.warnings);
     let config = Arc::new(config_startup.store);

@@ -293,13 +293,7 @@ impl TestFixture {
     fn add_instance(&self, name: &str, version_id: &str) -> String {
         self.state
             .instances()
-            .add(
-                name.to_string(),
-                version_id.to_string(),
-                String::new(),
-                String::new(),
-                None,
-            )
+            .insert_for_test(name.to_string(), version_id.to_string())
             .expect("add instance")
             .id
     }
@@ -433,7 +427,7 @@ fn build_test_state(
         )
         .expect("configure library dir"),
     );
-    let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+    let instances = Arc::new(InstanceStore::load_for_startup(paths.clone()).store);
     AppState::new(AppStateInit {
         app_name: "Axial".to_string(),
         version: "test".to_string(),

@@ -6,7 +6,7 @@ use crate::state::{
     AppStateInit, AuthLoginMinecraftProfile, InstallStore, NewAuthLoginMinecraftAccount,
     NewAuthLoginMsaToken, SessionStore,
 };
-use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_launcher::{
     GuardianDecision, LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB, LaunchReadinessReason,
     LaunchReadinessReasonId, LaunchReadinessSeverity, OverrideOrigin, SessionId,
@@ -48,7 +48,10 @@ impl TestFixture {
             )
             .expect("set library dir"),
         );
-        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                .expect("load instances"),
+        );
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -67,13 +70,7 @@ impl TestFixture {
     fn add_instance(&self, name: &str, version_id: &str) -> String {
         self.state
             .instances()
-            .add(
-                name.to_string(),
-                version_id.to_string(),
-                String::new(),
-                String::new(),
-                None,
-            )
+            .insert_for_test(name.to_string(), version_id.to_string())
             .expect("add instance")
             .id
     }
@@ -151,7 +148,7 @@ impl TestFixture {
         update(&mut instance);
         self.state
             .instances()
-            .update(instance)
+            .replace_for_test(instance)
             .expect("update instance");
     }
 

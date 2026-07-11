@@ -32,7 +32,9 @@ async fn handle_update_flag(
 #[cfg(test)]
 mod tests {
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
-    use axial_config::{AppConfig, AppPaths, ConfigStore, FEATURE_FLAGS, InstanceStore};
+    use axial_config::{
+        AppConfig, AppPaths, ConfigStore, FEATURE_FLAGS, InstanceRegistrySnapshot, InstanceStore,
+    };
     use axial_performance::PerformanceManager;
     use axum::{
         body::{Body, to_bytes},
@@ -120,7 +122,10 @@ mod tests {
             let config = Arc::new(
                 ConfigStore::from_config(paths.clone(), AppConfig::default()).expect("set config"),
             );
-            let instances = Arc::new(InstanceStore::load_from(paths).expect("load instances"));
+            let instances = Arc::new(
+                InstanceStore::from_snapshot(paths, InstanceRegistrySnapshot::default())
+                    .expect("load instances"),
+            );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
                 version: "test".to_string(),

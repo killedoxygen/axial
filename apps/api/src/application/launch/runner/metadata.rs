@@ -1,10 +1,9 @@
-use crate::state::AppState;
+use crate::state::{AppState, instance_not_found_error};
 use axial_config::Instance;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LaunchMetadataPersistenceError {
     InstanceHistory,
-    LastInstance,
     Config,
 }
 
@@ -17,19 +16,22 @@ pub(super) async fn persist_launch_metadata(
     launched_at: &str,
 ) -> Result<(), LaunchMetadataPersistenceError> {
     instance.last_played_at = launched_at.to_string();
+    let instance_id = instance.id.clone();
+    let last_played_at = instance.last_played_at.clone();
     let mut first_error = state
-        .instances()
-        .update(instance.clone())
+        .mutate_instances(move |latest| {
+            let stored = latest
+                .instances
+                .iter_mut()
+                .find(|stored| stored.id == instance_id)
+                .ok_or_else(instance_not_found_error)?;
+            stored.last_played_at = last_played_at;
+            latest.last_instance_id = instance_id;
+            Ok(())
+        })
+        .await
         .err()
         .map(|_| LaunchMetadataPersistenceError::InstanceHistory);
-    if state
-        .instances()
-        .set_last_instance_id(instance.id.clone())
-        .is_err()
-        && first_error.is_none()
-    {
-        first_error = Some(LaunchMetadataPersistenceError::LastInstance);
-    }
 
     let username = username.to_string();
     if state
@@ -56,7 +58,7 @@ pub(super) async fn persist_launch_metadata(
 mod tests {
     use super::*;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
-    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -69,13 +71,7 @@ mod tests {
         let state = test_app_state(&root);
         let mut instance = state
             .instances()
-            .add(
-                "Launch Metadata".to_string(),
-                "1.21.1".to_string(),
-                String::new(),
-                String::new(),
-                None,
-            )
+            .insert_for_test("Launch Metadata".to_string(), "1.21.1".to_string())
             .expect("add instance");
         state
             .mutate_config(move |latest| {
@@ -125,13 +121,7 @@ mod tests {
         let state = test_app_state(&root);
         let mut instance = state
             .instances()
-            .add(
-                "Launch Metadata".to_string(),
-                "1.21.1".to_string(),
-                String::new(),
-                String::new(),
-                None,
-            )
+            .insert_for_test("Launch Metadata".to_string(), "1.21.1".to_string())
             .expect("add instance");
         state
             .mutate_config(move |latest| {
@@ -168,15 +158,8 @@ mod tests {
         let state = test_app_state(&root);
         let mut instance = state
             .instances()
-            .add(
-                "Launch Metadata Failure".to_string(),
-                "1.21.1".to_string(),
-                String::new(),
-                String::new(),
-                None,
-            )
+            .insert_for_test("Launch Metadata Failure".to_string(), "1.21.1".to_string())
             .expect("add instance");
-        fs::remove_file(&paths.instances_file).expect("remove instance registry");
         fs::create_dir_all(&paths.instances_file).expect("block instance registry path");
 
         let result = persist_launch_metadata(
@@ -190,6 +173,12 @@ mod tests {
         .await;
 
         assert_eq!(result, Err(LaunchMetadataPersistenceError::InstanceHistory));
+        let stored = state
+            .instances()
+            .get(&instance.id)
+            .expect("stored instance");
+        assert!(stored.last_played_at.is_empty());
+        assert_eq!(state.instances().last_instance_id(), None);
         let config = state.config().current();
         assert_eq!(config.username, "ConfigStillRuns");
         assert_eq!(config.max_memory_mb, 5120);
@@ -201,7 +190,10 @@ mod tests {
     fn test_app_state(root: &Path) -> AppState {
         let paths = test_paths(root);
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                .expect("load instances"),
+        );
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),

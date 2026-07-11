@@ -175,7 +175,7 @@ mod tests {
         AppStateInit, InstallStore, SessionStore,
         performance_operations::PerformanceOperationPayload,
     };
-    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use axum::{
         body::{Body, to_bytes},
@@ -294,8 +294,10 @@ mod tests {
             let root = test_root(name);
             let paths = test_paths(&root);
             let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            let instances =
-                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+            let instances = Arc::new(
+                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                    .expect("load instances"),
+            );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
                 version: "test".to_string(),
@@ -334,13 +336,7 @@ mod tests {
         fn add_instance(&self, name: &str, version_id: &str) -> String {
             self.state
                 .instances()
-                .add(
-                    name.to_string(),
-                    version_id.to_string(),
-                    String::new(),
-                    String::new(),
-                    None,
-                )
+                .insert_for_test(name.to_string(), version_id.to_string())
                 .expect("add instance")
                 .id
         }

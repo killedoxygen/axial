@@ -24,7 +24,7 @@ use crate::guardian::{
 use crate::logging::timestamp_utc;
 use crate::state::contracts::OperationPhase;
 use crate::state::launch_reports::{LaunchBenchmarkMetadata, LaunchProofResourceBudget};
-use crate::state::{AppState, LaunchSessionRecord};
+use crate::state::{AppState, LaunchSessionRecord, ensure_instance_layout};
 use auth::{LaunchAuthRefreshOptions, resolve_launch_auth_context};
 use axial_config::{AppConfig, Instance};
 use axial_launcher::{
@@ -180,6 +180,7 @@ async fn prepare_launch_session_with_auth_refresh(
         )
     })?;
     let library_dir = PathBuf::from(library_dir);
+    let instance_lifecycle = state.acquire_instance_lifecycle(&payload.instance_id).await;
 
     let instance = state.instances().get(&payload.instance_id).ok_or_else(|| {
         (
@@ -194,10 +195,13 @@ async fn prepare_launch_session_with_auth_refresh(
         ));
     }
     let layout_started_at = Instant::now();
-    state
-        .instances()
-        .ensure_instance_layout(&instance.id, Some(&library_dir))
-        .map_err(launch_layout_error_response)?;
+    ensure_instance_layout(
+        state.instances().paths().clone(),
+        instance.id.clone(),
+        Some(library_dir.clone()),
+    )
+    .await
+    .map_err(launch_layout_error_response)?;
     let layout_elapsed = layout_started_at.elapsed();
     let game_dir = state.instances().game_dir(&instance.id);
 
@@ -327,6 +331,7 @@ async fn prepare_launch_session_with_auth_refresh(
         })
         .await
         .map_err(launch_session_admission_error_response)?;
+    drop(instance_lifecycle);
     let insert_elapsed = insert_started_at.elapsed();
     trace_launch_event(
         &session_id.0,

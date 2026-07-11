@@ -13,7 +13,7 @@ use crate::state::{
     AppState, AppStateInit, GuardianFailureMemoryStore, InstallStore, OperationJournalStore,
     SessionStore,
 };
-use axial_config::{AppPaths, ConfigStore, InstanceStore};
+use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_minecraft::download::{
     ExecutionDownloadFact, ExecutionDownloadFactKind, ExpectedIntegrity,
     SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind,
@@ -4003,7 +4003,10 @@ fn assert_no_public_raw_fragments(message: &str) {
 fn build_test_state(root: &Path) -> AppState {
     let paths = test_app_paths(root);
     let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-    let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+    let instances = Arc::new(
+        InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+            .expect("load instances"),
+    );
     AppState::new(AppStateInit {
         app_name: "Axial".to_string(),
         version: "test".to_string(),

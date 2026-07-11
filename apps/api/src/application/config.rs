@@ -196,7 +196,8 @@ mod tests {
         state::{AppState, AppStateInit, InstallStore, SessionStore},
     };
     use axial_config::{
-        AppConfig, AppConfigValidationError, AppPaths, ConfigStore, ConfigStoreError, InstanceStore,
+        AppConfig, AppConfigValidationError, AppPaths, ConfigStore, ConfigStoreError,
+        InstanceRegistrySnapshot, InstanceStore,
     };
     use axial_performance::PerformanceManager;
     use axum::Json;
@@ -411,8 +412,10 @@ mod tests {
             let config = Arc::new(
                 ConfigStore::from_config(paths.clone(), AppConfig::default()).expect("set config"),
             );
-            let instances =
-                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+            let instances = Arc::new(
+                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                    .expect("load instances"),
+            );
             let telemetry = Arc::new(TelemetryHub::new(
                 config.clone(),
                 Some(TEST_TELEMETRY_KEY.to_string()),

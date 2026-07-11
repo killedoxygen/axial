@@ -302,7 +302,7 @@ async fn handle_delete_instance(
 mod tests {
     use super::*;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
-    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use axum::{
         body::{Body, to_bytes},
@@ -399,13 +399,7 @@ mod tests {
         let instance = fixture
             .state
             .instances()
-            .add(
-                "Route override".to_string(),
-                "1.21.1".to_string(),
-                String::new(),
-                String::new(),
-                None,
-            )
+            .insert_for_test("Route override".to_string(), "1.21.1".to_string())
             .expect("add instance");
 
         let (status, payload) = fixture
@@ -442,8 +436,10 @@ mod tests {
             let root = test_root(name);
             let paths = test_paths(&root);
             let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            let instances =
-                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+            let instances = Arc::new(
+                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                    .expect("load instances"),
+            );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
                 version: "test".to_string(),

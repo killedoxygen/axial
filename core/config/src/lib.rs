@@ -6,8 +6,10 @@ pub mod store;
 
 pub use flags::{FEATURE_FLAGS, FeatureFlagDef, FlagStage, find_flag};
 pub use instances::{
-    EnrichedInstance, Instance, InstanceStore, InstanceStoreError, InstanceStoreStartup,
-    LaunchActionState, LaunchActionTone, LaunchPrimaryAction,
+    EnrichedInstance, INSTANCE_REGISTRY_MAX_BYTES, INSTANCE_REGISTRY_SCHEMA_VERSION, Instance,
+    InstanceRegistrySnapshot, InstanceStore, InstanceStoreError, InstanceStoreStartup,
+    LaunchActionState, LaunchActionTone, LaunchPrimaryAction, derive_instance_art_seed,
+    generate_instance_id, is_canonical_instance_id,
 };
 pub use models::{
     AppConfig, AppConfigValidationError, LAUNCH_AUTH_MODE_OFFLINE, LAUNCH_AUTH_MODE_ONLINE,

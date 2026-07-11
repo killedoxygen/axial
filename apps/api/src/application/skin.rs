@@ -110,7 +110,7 @@ mod tests {
         AuthLoginMinecraftCape, AuthLoginMinecraftProfile, AuthLoginMinecraftSkin,
         NewAuthLoginMinecraftAccount, NewAuthLoginMsaToken,
     };
-    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use axum::{
         body::{Bytes, to_bytes},
@@ -144,8 +144,10 @@ mod tests {
                 )
                 .expect("set username"),
             );
-            let instances =
-                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+            let instances = Arc::new(
+                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                    .expect("load instances"),
+            );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
                 version: "test".to_string(),

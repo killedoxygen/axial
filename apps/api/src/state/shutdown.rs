@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 const SHUTDOWN_LOCK_INVARIANT: &str =
     "application shutdown lock poisoned; completion state may be inconsistent";
-const SHUTDOWN_STEP_COUNT: usize = 15;
+const SHUTDOWN_STEP_COUNT: usize = 16;
 type ShutdownAttemptChannel = Arc<watch::Sender<Option<Result<(), AppShutdownError>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,6 +23,7 @@ pub enum AppShutdownStep {
     Accounts,
     SecureAuth,
     RemoteFlags,
+    InstanceRegistry,
     Config,
 }
 
@@ -43,7 +44,8 @@ impl AppShutdownStep {
             Self::Accounts => 11,
             Self::SecureAuth => 12,
             Self::RemoteFlags => 13,
-            Self::Config => 14,
+            Self::InstanceRegistry => 14,
+            Self::Config => 15,
         }
     }
 
@@ -63,6 +65,7 @@ impl AppShutdownStep {
             Self::Accounts => "accounts",
             Self::SecureAuth => "secure_auth",
             Self::RemoteFlags => "remote_flags",
+            Self::InstanceRegistry => "instance_registry",
             Self::Config => "config",
         }
     }
@@ -173,11 +176,19 @@ impl AppShutdownCoordinator {
         let mut first_error = self.finish_producer_drain(settlement_error, producer_result)?;
 
         let skin_result = self.flush_skin(state).await;
-        let (benchmark_result, performance_result, auth_result, remote_result, config_result) = tokio::join!(
+        let (
+            benchmark_result,
+            performance_result,
+            auth_result,
+            remote_result,
+            instance_result,
+            config_result,
+        ) = tokio::join!(
             self.close_benchmark_chain(state),
             self.close_performance_chain(state),
             self.close_auth_chain(state),
             self.close_remote_flags(state),
+            self.close_instance_registry(state),
             self.close_config(state),
         );
 
@@ -186,6 +197,7 @@ impl AppShutdownCoordinator {
         retain_first_error(&mut first_error, performance_result);
         retain_first_error(&mut first_error, auth_result);
         retain_first_error(&mut first_error, remote_result);
+        retain_first_error(&mut first_error, instance_result);
         retain_first_error(&mut first_error, config_result);
         first_error.map_or(Ok(()), Err)
     }
@@ -433,6 +445,18 @@ impl AppShutdownCoordinator {
         Ok(())
     }
 
+    async fn close_instance_registry(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if self.completed(AppShutdownStep::InstanceRegistry) {
+            return Ok(());
+        }
+        state
+            .close_instance_registry()
+            .await
+            .map_err(|_| AppShutdownError::at(AppShutdownStep::InstanceRegistry))?;
+        self.mark_completed(AppShutdownStep::InstanceRegistry);
+        Ok(())
+    }
+
     fn completed(&self, step: AppShutdownStep) -> bool {
         self.shared
             .state
@@ -500,7 +524,7 @@ impl ShutdownAttempt {
 mod tests {
     use super::*;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
-    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -704,7 +728,10 @@ mod tests {
             let root = test_root(name);
             let paths = test_paths(&root);
             let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            let instances = Arc::new(InstanceStore::load_from(paths).expect("load instances"));
+            let instances = Arc::new(
+                InstanceStore::from_snapshot(paths, InstanceRegistrySnapshot::default())
+                    .expect("load instances"),
+            );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
                 version: "test".to_string(),

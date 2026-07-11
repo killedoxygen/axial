@@ -358,7 +358,7 @@ mod tests {
     use super::*;
     use crate::execution::persistence::AtomicWriteBackend;
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
-    use axial_config::InstanceStore;
+    use axial_config::{InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -747,7 +747,10 @@ mod tests {
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
-            instances: Arc::new(InstanceStore::load_from(paths.clone()).expect("instance store")),
+            instances: Arc::new(
+                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                    .expect("instance store"),
+            ),
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),
             performance: Arc::new(PerformanceManager::new().expect("performance manager")),

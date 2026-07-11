@@ -999,7 +999,7 @@ mod tests {
     use super::*;
     use crate::app::default_frontend_dir;
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
-    use axial_config::{AppPaths, InstanceStore};
+    use axial_config::{AppPaths, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use axum::{Json, Router, extract::State, http::StatusCode, http::Uri, routing::post};
     use std::fs;
@@ -1547,8 +1547,13 @@ mod tests {
     }
 
     fn test_state(fixture: &TestConfig, telemetry: Arc<TelemetryHub>) -> AppState {
-        let instances =
-            Arc::new(InstanceStore::load_from(fixture.paths.clone()).expect("load instances"));
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(
+                fixture.paths.clone(),
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
+        );
         AppState::new_with_telemetry(
             AppStateInit {
                 app_name: "Axial".to_string(),

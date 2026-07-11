@@ -1,6 +1,6 @@
 use super::*;
 use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
-use axial_config::{AppPaths, ConfigStore, InstanceStore};
+use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
 use axial_minecraft::VersionEntry;
 use axial_performance::PerformanceManager;
@@ -266,13 +266,7 @@ async fn instance_log_tail_rejects_unsafe_log_name() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Tail invalid log".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Tail invalid log".to_string(), "1.21.1".to_string())
         .expect("add instance");
 
     let (status, Json(body)) =
@@ -290,13 +284,7 @@ async fn instance_log_tail_returns_bounded_truncated_tail() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Tail truncated log".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Tail truncated log".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let logs_dir = fixture
         .state
@@ -326,13 +314,7 @@ async fn instance_log_tail_redacts_sensitive_public_lines() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Redacted log tail".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Redacted log tail".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let logs_dir = fixture
         .state
@@ -428,13 +410,7 @@ async fn instance_screenshot_file_serves_valid_local_image() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Serve screenshots".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Serve screenshots".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let screenshots_dir = fixture
         .state
@@ -472,13 +448,7 @@ async fn instance_screenshot_file_rejects_too_large_image() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Large screenshot".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Large screenshot".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let screenshots_dir = fixture
         .state
@@ -506,13 +476,7 @@ async fn instance_screenshot_rename_reports_not_found_conflict_and_success() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Rename screenshots".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Rename screenshots".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let screenshots_dir = fixture
         .state
@@ -597,13 +561,7 @@ async fn instance_screenshot_delete_removes_only_named_file() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Delete screenshots".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Delete screenshots".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let screenshots_dir = fixture
         .state
@@ -677,13 +635,7 @@ async fn instance_mod_update_reports_not_found_conflict_and_success() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Update mods".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Update mods".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let mods_dir = fixture
         .state
@@ -758,13 +710,7 @@ async fn instance_mod_delete_removes_only_named_mod_file() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Delete mods".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Delete mods".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let mods_dir = fixture
         .state
@@ -820,13 +766,7 @@ async fn instance_world_rename_reports_not_found_conflict_and_success() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Rename worlds".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Rename worlds".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let saves_dir = fixture
         .state
@@ -887,13 +827,7 @@ async fn instance_world_delete_removes_only_named_world_directory() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Delete worlds".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Delete worlds".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let saves_dir = fixture
         .state
@@ -923,13 +857,7 @@ async fn instance_world_backup_copies_directory_to_instance_local_label() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Backup worlds".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Backup worlds".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let game_dir = fixture.state.instances().game_dir(&instance.id);
     let world_dir = game_dir.join("saves").join("Backup Me");
@@ -1001,13 +929,7 @@ async fn instance_world_mutations_reject_active_instance() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Running worlds".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Running worlds".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let game_dir = fixture.state.instances().game_dir(&instance.id);
     fs::create_dir_all(game_dir.join("saves").join("World")).expect("create world");
@@ -1036,24 +958,12 @@ async fn update_instance_allows_unchanged_name_and_maps_name_collision_to_confli
     let alpha = fixture
         .state
         .instances()
-        .add(
-            "Alpha".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Alpha".to_string(), "1.21.1".to_string())
         .expect("add alpha");
     let beta = fixture
         .state
         .instances()
-        .add(
-            "Beta".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Beta".to_string(), "1.21.1".to_string())
         .expect("add beta");
 
     let updated = handle_update_instance(
@@ -1104,13 +1014,7 @@ async fn update_instance_unknown_jvm_preset_resets_to_auto_without_echoing_raw_v
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Preset tamper".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Preset tamper".to_string(), "1.21.1".to_string())
         .expect("add instance");
 
     let updated = handle_update_instance(
@@ -1149,13 +1053,7 @@ async fn update_instance_response_redacts_java_path_and_jvm_args() {
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Runtime override".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Runtime override".to_string(), "1.21.1".to_string())
         .expect("add instance");
 
     let raw_java = r"C:\Users\Alice\.jdks\bad\bin\java.exe";
@@ -1204,13 +1102,7 @@ async fn public_instance_responses_redact_stored_runtime_overrides() {
     let mut instance = fixture
         .state
         .instances()
-        .add(
-            "Runtime override".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Runtime override".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let raw_java = r"C:\Users\Alice\.jdks\bad\bin\java.exe";
     let raw_args = "-Dtoken=raw-secret-token -javaagent:C:\\Users\\Alice\\agent.jar";
@@ -1219,7 +1111,7 @@ async fn public_instance_responses_redact_stored_runtime_overrides() {
     fixture
         .state
         .instances()
-        .update(instance.clone())
+        .replace_for_test(instance.clone())
         .expect("store runtime overrides");
 
     let listed = handle_list_instances(&fixture.state).await;
@@ -2513,24 +2405,12 @@ async fn duplicate_instance_existing_name_maps_to_conflict_json_error() {
     let source = fixture
         .state
         .instances()
-        .add(
-            "Source".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Source".to_string(), "1.21.1".to_string())
         .expect("add source instance");
     fixture
         .state
         .instances()
-        .add(
-            "Existing".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Existing".to_string(), "1.21.1".to_string())
         .expect("add existing instance");
 
     let (status, Json(body)) = handle_duplicate_instance(
@@ -2570,13 +2450,7 @@ async fn open_instance_folder_rejects_traversal_subfolder_without_creating_escap
     let instance = fixture
         .state
         .instances()
-        .add(
-            "Traversal".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Traversal".to_string(), "1.21.1".to_string())
         .expect("add instance");
     let game_dir = fixture.state.instances().game_dir(&instance.id);
     let escaped_dir = game_dir
@@ -2636,13 +2510,7 @@ async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
     let remove_files = fixture
         .state
         .instances()
-        .add(
-            "Remove files".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Remove files".to_string(), "1.21.1".to_string())
         .expect("add remove-files instance");
     let remove_game_dir = fixture.state.instances().game_dir(&remove_files.id);
     fs::write(remove_game_dir.join("mods").join("example.jar"), "mod").expect("write mod");
@@ -2656,13 +2524,7 @@ async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
     let keep_files = fixture
         .state
         .instances()
-        .add(
-            "Keep files".to_string(),
-            "1.21.1".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test("Keep files".to_string(), "1.21.1".to_string())
         .expect("add keep-files instance");
     let keep_game_dir = fixture.state.instances().game_dir(&keep_files.id);
     let keep_marker = keep_game_dir.join("saves").join("world").join("level.dat");
@@ -2680,6 +2542,45 @@ async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
 
     assert!(fixture.state.instances().get(&keep_files.id).is_none());
     assert!(keep_marker.exists());
+}
+
+#[tokio::test]
+async fn delete_waits_for_launch_admission_and_rejects_newly_queued_session() {
+    let fixture = TestFixture::new("delete-launch-admission");
+    let instance = add_test_instance(&fixture, "Launch admission", "1.21.1");
+    let lifecycle = fixture.state.acquire_instance_lifecycle(&instance.id).await;
+    let deleting_state = fixture.state.clone();
+    let deleting_id = instance.id.clone();
+    let mut delete = Box::pin(handle_delete_instance(
+        &deleting_state,
+        &deleting_id,
+        HashMap::new(),
+    ));
+    {
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(delete.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+    }
+
+    fixture
+        .state
+        .sessions()
+        .insert(test_launch_record("delete-launch-session", &instance.id))
+        .await
+        .expect("queue session while launch owns lifecycle admission");
+    drop(lifecycle);
+
+    let (status, Json(body)) = delete.await.expect_err("queued launch must block deletion");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_bounded_error_body(
+        &body,
+        "cannot delete a running instance; stop the game first",
+    );
+    assert!(fixture.state.instances().get(&instance.id).is_some());
+    assert!(fixture.state.instances().game_dir(&instance.id).is_dir());
 }
 
 fn assert_bounded_error_body(body: &serde_json::Value, expected: &str) {
@@ -3176,13 +3077,7 @@ fn add_test_instance(
     fixture
         .state
         .instances()
-        .add(
-            name.to_string(),
-            version_id.to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
+        .insert_for_test(name.to_string(), version_id.to_string())
         .expect("add test instance")
 }
 
@@ -3249,7 +3144,10 @@ impl TestFixture {
         let root = test_root(name);
         let paths = test_paths(&root);
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                .expect("load instances"),
+        );
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),

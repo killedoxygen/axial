@@ -1062,7 +1062,7 @@ mod tests {
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
     use crate::state::contracts::OperationPhase;
     use crate::state::{AppStateInit, InstallStore, LaunchEvent, SessionStore};
-    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_launcher::{LaunchSessionRecord, SessionId};
     use axial_performance::PerformanceManager;
     use std::fs;
@@ -1223,13 +1223,7 @@ mod tests {
         let state = test_app_state_with_library(&root);
         let instance = state
             .instances()
-            .add(
-                "Termination rejection".to_string(),
-                "1.21.1".to_string(),
-                String::new(),
-                String::new(),
-                None,
-            )
+            .insert_for_test("Termination rejection".to_string(), "1.21.1".to_string())
             .expect("add test instance");
         let session_id = "rejected-launch-failure-termination";
         let process_release = root.join("release-process");
@@ -1479,7 +1473,10 @@ mod tests {
     fn test_app_state(root: &Path) -> AppState {
         let paths = test_paths(root);
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                .expect("load instances"),
+        );
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -1505,7 +1502,10 @@ mod tests {
         )
         .expect("seed telemetry config");
         let config = Arc::new(config_store);
-        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                .expect("load instances"),
+        );
         let telemetry = Arc::new(TelemetryHub::new(
             config.clone(),
             Some(TEST_TELEMETRY_KEY.to_string()),
@@ -1539,7 +1539,10 @@ mod tests {
         )
         .expect("set test library");
         let config = Arc::new(config_store);
-        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                .expect("load instances"),
+        );
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),

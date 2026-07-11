@@ -607,7 +607,7 @@ pub(crate) fn launch_kill_error_response(error: std::io::Error) -> super::Launch
 mod tests {
     use super::{LaunchStatusViewModel, public_launch_status_json, stop_launch_session};
     use crate::state::{AppState, AppStateInit, InstallStore, LaunchStatusEvent, SessionStore};
-    use axial_config::{AppPaths, ConfigStore, InstanceStore};
+    use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
     use axial_performance::PerformanceManager;
     use axum::http::StatusCode;
@@ -709,7 +709,10 @@ mod tests {
     fn test_app_state(root: &Path) -> AppState {
         let paths = test_paths(root);
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                .expect("load instances"),
+        );
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),

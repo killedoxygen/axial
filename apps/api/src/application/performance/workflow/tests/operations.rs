@@ -192,16 +192,8 @@ async fn terminal_journal_failure_retries_before_status_and_stream_release() {
     let status_backend = Arc::new(ScriptedOperationBackend::default());
     let state =
         build_test_state_with_operation_backends(&root, journal_backend.clone(), status_backend);
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
 
     let Json(response) = handle_install(
@@ -310,16 +302,8 @@ async fn pre_effect_status_acceptance_failure_does_not_run_filesystem_effect() {
         journal_backend.clone(),
         status_backend.clone(),
     );
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let lock_path = seed_managed_lock(&state, &instance_id, "pre-effect-preserved");
     let status = state
@@ -607,16 +591,8 @@ async fn synchronous_effect_status_commit_failure_terminalizes_without_running_e
         journal_backend.clone(),
         status_backend.clone(),
     );
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let lock_path = seed_managed_lock(&state, &instance_id, "status-failure-preserved");
     let request_state = state.clone();
@@ -699,16 +675,8 @@ async fn pre_effect_journal_acceptance_failure_exits_without_retry_or_filesystem
     let status_backend = Arc::new(ScriptedOperationBackend::default());
     let state =
         build_test_state_with_operation_backends(&root, journal_backend.clone(), status_backend);
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let lock_path = seed_managed_lock(&state, &instance_id, "journal-acceptance-preserved");
     let status = state
@@ -785,16 +753,8 @@ async fn committed_guardian_evidence_is_reused_after_retry_without_rerun_loop() 
     journal_backend.fail_attempt(2);
     let status_backend = Arc::new(ScriptedOperationBackend::default());
     let state = build_test_state_with_operation_backends(&root, journal_backend, status_backend);
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let lock_path = seed_managed_lock(&state, &instance_id, "evidence-retry");
 
@@ -851,16 +811,8 @@ async fn failed_start_returns_bounded_error_then_detached_owner_terminalizes_wit
     status_backend.set_fail_all(true);
     let state =
         build_test_state_with_operation_backends(&root, journal_backend, status_backend.clone());
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let lock_path = seed_managed_lock(&state, &instance_id, "failed-start-preserved");
     let payload = || InstallRequest {
@@ -928,16 +880,8 @@ async fn aborted_queued_request_does_not_cancel_owned_start_or_worker() {
     status_backend.gate_attempt(1);
     let state =
         build_test_state_with_operation_backends(&root, journal_backend, status_backend.clone());
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let lock_path = seed_managed_lock(&state, &instance_id, "abort-owned");
     let request_state = state.clone();
@@ -1021,16 +965,8 @@ async fn synchronous_planned_commit_failure_is_bounded_and_never_runs_effect() {
     let status_backend = Arc::new(ScriptedOperationBackend::default());
     let state =
         build_test_state_with_operation_backends(&root, journal_backend.clone(), status_backend);
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let lock_path = seed_managed_lock(&state, &instance_id, "sync-planned-preserved");
     let request_state = state.clone();
@@ -1096,16 +1032,8 @@ async fn synchronous_terminal_intent_failure_reconciles_without_restart_replay()
     let status_backend = Arc::new(ScriptedOperationBackend::default());
     let state =
         build_test_state_with_operation_backends(&root, journal_backend.clone(), status_backend);
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let lock_path = seed_managed_lock(&state, &instance_id, "sync-effect-once");
     let request_state = state.clone();
@@ -1176,16 +1104,8 @@ async fn synchronous_terminal_intent_failure_reconciles_without_restart_replay()
 async fn restart_terminalizes_mismatched_gated_journal_without_spinning() {
     let root = test_root("restart-mismatched-gate");
     let state = build_test_state(&root, None, None);
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let lock_path = seed_managed_lock(&state, &instance_id, "expected-target");
     let status = state
@@ -1544,16 +1464,8 @@ async fn foreign_retry_candidate_is_cleared_before_requested_journal_is_applied(
         .await
         .expect_err("seed foreign failed candidate");
     assert!(state.journals().has_retry_candidate());
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let lock_path = seed_managed_lock(&state, &instance_id, "foreign-candidate");
 
@@ -1867,16 +1779,8 @@ async fn instance_operation_route_returns_null_when_none_exists() {
 async fn instance_operation_route_discovers_reloaded_pending_operation() {
     let root = test_root("instance-operation-reloaded");
     let state = build_test_state(&root, None, None);
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let started = state
         .performance_operations()
@@ -1945,16 +1849,8 @@ async fn instance_operation_route_discovers_reloaded_pending_operation() {
 async fn startup_resume_runs_persisted_pending_remove_operation() {
     let root = test_root("startup-resume-remove");
     let state = build_test_state(&root, None, None);
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let started = state
         .performance_operations()
@@ -2097,16 +1993,8 @@ async fn startup_finishes_terminal_intent_without_replaying_effect() {
 async fn startup_finishes_rollback_intent_with_distinct_result_target_and_proof() {
     let root = test_root("restart-rollback-result-target");
     let state = build_test_state(&root, None, None);
-    let instance_id = state
-        .instances()
-        .add(
-            "Rollback".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add rollback instance")
+    let instance_id = insert_persisted_test_instance(&state, "Rollback", "1.20.4-fabric")
+        .await
         .id;
     let status = state
         .performance_operations()
@@ -2462,16 +2350,8 @@ async fn startup_invalid_terminal_status_cannot_republish_matching_success_proof
 async fn startup_unknown_status_state_fails_without_effect() {
     let root = test_root("restart-unknown-state");
     let state = build_test_state(&root, None, None);
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let lock_path = seed_managed_lock(&state, &instance_id, "unknown-state-lock");
     state
@@ -2691,16 +2571,8 @@ async fn startup_terminalizes_journal_only_performance_operation_without_status(
 async fn custom_install_resume_preserves_effective_remove_identity() {
     let root = test_root("restart-custom-effective-remove");
     let state = build_test_state(&root, None, None);
-    let instance_id = state
-        .instances()
-        .add(
-            "Custom".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add custom instance")
+    let instance_id = insert_persisted_test_instance(&state, "Custom", "1.20.4-fabric")
+        .await
         .id;
     let status = state
         .performance_operations()
@@ -2766,16 +2638,8 @@ async fn custom_install_resume_preserves_effective_remove_identity() {
 async fn persisted_identity_rejects_preflight_target_drift_on_resume() {
     let root = test_root("restart-preflight-drift");
     let state = build_test_state(&root, None, None);
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     seed_managed_lock(&state, &instance_id, "original-target");
     let status = state
@@ -2820,16 +2684,8 @@ async fn invalid_timestamps_are_unknown_on_both_operation_endpoints() {
     let root = test_root("public-operation-timestamps");
     let operation_id = test_performance_operation_id(1);
     let seed = build_test_state(&root, None, None);
-    let instance_id = seed
-        .instances()
-        .add(
-            "Timestamp".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add timestamp instance")
+    let instance_id = insert_persisted_test_instance(&seed, "Timestamp", "1.20.4-fabric")
+        .await
         .id;
     seed.performance_operations()
         .close()
@@ -3141,22 +2997,32 @@ enum RestartCheckpoint {
     EffectStarted,
 }
 
+async fn insert_persisted_test_instance(
+    state: &AppState,
+    name: &str,
+    version_id: &str,
+) -> axial_config::Instance {
+    let instance = crate::state::new_instance(
+        axial_config::generate_instance_id(),
+        name.to_string(),
+        version_id.to_string(),
+        String::new(),
+        String::new(),
+    );
+    state
+        .create_instance(instance, None)
+        .await
+        .expect("persist restart instance fixture")
+}
+
 async fn seed_restart_checkpoint(
     name: &str,
     checkpoint: RestartCheckpoint,
 ) -> (PathBuf, String, String, PathBuf) {
     let root = test_root(name);
     let state = build_test_state(&root, None, None);
-    let instance_id = state
-        .instances()
-        .add(
-            "Managed".to_string(),
-            "1.20.4-fabric".to_string(),
-            String::new(),
-            String::new(),
-            None,
-        )
-        .expect("add instance")
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
         .id;
     let lock_path = seed_managed_lock(&state, &instance_id, name);
     let status = state

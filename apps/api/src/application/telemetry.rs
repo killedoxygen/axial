@@ -60,7 +60,7 @@ mod tests {
     use crate::app::default_frontend_dir;
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
     use crate::state::{AppStateInit, InstallStore, SessionStore};
-    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use std::{fs, path::PathBuf, sync::Arc};
 
@@ -172,7 +172,11 @@ mod tests {
                     app_name: "Axial".to_string(),
                     version: "test".to_string(),
                     instances: Arc::new(
-                        InstanceStore::load_from(paths.clone()).expect("load instances"),
+                        InstanceStore::from_snapshot(
+                            paths.clone(),
+                            InstanceRegistrySnapshot::default(),
+                        )
+                        .expect("load instances"),
                     ),
                     installs: Arc::new(InstallStore::new()),
                     sessions: Arc::new(SessionStore::new()),

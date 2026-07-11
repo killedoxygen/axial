@@ -319,7 +319,7 @@ async fn health_custom_mode_ignores_corrupt_state_and_has_one_warnings_field() {
     fixture
         .state
         .instances()
-        .update(instance)
+        .replace_for_test(instance)
         .expect("update instance");
     let mods_dir = fixture
         .state

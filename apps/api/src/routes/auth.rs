@@ -51,7 +51,10 @@ mod tests {
             NewAuthLoginMsaToken, SessionStore,
         },
     };
-    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore, LAUNCH_AUTH_MODE_ONLINE};
+    use axial_config::{
+        AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore,
+        LAUNCH_AUTH_MODE_ONLINE,
+    };
     use axial_performance::PerformanceManager;
     use axum::{
         body::{Body, Bytes, to_bytes},
@@ -177,8 +180,10 @@ mod tests {
                 )
                 .expect("set config"),
             );
-            let instances =
-                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+            let instances = Arc::new(
+                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                    .expect("load instances"),
+            );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
                 version: "test".to_string(),

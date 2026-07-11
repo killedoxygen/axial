@@ -1770,7 +1770,7 @@ mod tests {
     use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::state::{AppStateInit, InstallStore, SessionStore};
-    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
+    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_launcher::{LaunchSessionRecord, SessionId};
     use axial_performance::PerformanceManager;
     use std::fs;
@@ -2472,8 +2472,10 @@ mod tests {
                 )
                 .expect("set library dir"),
             );
-            let instances =
-                Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
+            let instances = Arc::new(
+                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                    .expect("load instances"),
+            );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),
                 version: "test".to_string(),
@@ -2491,13 +2493,7 @@ mod tests {
         fn add_instance(&self, name: &str, version_id: &str) -> String {
             self.state
                 .instances()
-                .add(
-                    name.to_string(),
-                    version_id.to_string(),
-                    String::new(),
-                    String::new(),
-                    None,
-                )
+                .insert_for_test(name.to_string(), version_id.to_string())
                 .expect("add instance")
                 .id
         }

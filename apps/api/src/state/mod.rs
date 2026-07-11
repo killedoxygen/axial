@@ -7,6 +7,8 @@ mod config;
 pub mod contracts;
 pub mod failure_memory;
 mod installs;
+mod instance_lifecycle;
+mod instance_registry;
 mod journals;
 pub(crate) mod launch_reports;
 mod lifecycle;
@@ -19,7 +21,8 @@ mod shutdown;
 pub mod skins;
 
 use axial_config::{
-    AppConfig, ConfigStore as StartupConfigStore, ConfigStoreError, InstanceStore, find_flag,
+    AppConfig, ConfigStore as StartupConfigStore, ConfigStoreError,
+    InstanceStore as StartupInstanceStore, InstanceStoreError, find_flag,
 };
 pub use axial_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
 pub use axial_minecraft::download::DownloadProgress;
@@ -53,6 +56,9 @@ pub use installs::{
     InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec, InstallSnapshot, InstallStore,
     QueuedInstallEntry,
 };
+pub use instance_registry::AppInstanceStore;
+pub(crate) use instance_registry::new_instance;
+pub(crate) use instance_registry::{ensure_instance_layout, instance_not_found_error};
 pub(crate) use journals::{
     OperationJournalReconciliation, operation_journal_completed_step_is_visible,
     operation_journal_plan_is_visible, operation_journal_terminal_is_visible,
@@ -76,7 +82,7 @@ pub struct AppState {
     app_name: String,
     version: String,
     config: Arc<AppConfigStore>,
-    instances: Arc<InstanceStore>,
+    instances: Arc<AppInstanceStore>,
     accounts: Arc<LauncherAccountStore>,
     auth_logins: Arc<AuthLoginStore>,
     installs: Arc<InstallStore>,
@@ -91,6 +97,7 @@ pub struct AppState {
     telemetry: Arc<TelemetryHub>,
     remote_flags: Arc<RemoteFlagStore>,
     launch_reports: Arc<launch_reports::LaunchReportStore>,
+    instance_lifecycle_gates: instance_lifecycle::InstanceLifecycleGates,
     lifecycle: AppLifecycle,
     shutdown_coordinator: AppShutdownCoordinator,
     startup_warnings: Arc<Vec<String>>,
@@ -104,7 +111,7 @@ pub struct AppStateInit {
     pub app_name: String,
     pub version: String,
     pub config: Arc<StartupConfigStore>,
-    pub instances: Arc<InstanceStore>,
+    pub instances: Arc<StartupInstanceStore>,
     pub installs: Arc<InstallStore>,
     pub sessions: Arc<SessionStore>,
     pub performance: Arc<PerformanceManager>,
@@ -224,6 +231,9 @@ impl AppState {
         auth_logins: Arc<AuthLoginStore>,
         remote_flags: Arc<RemoteFlagStore>,
     ) -> Self {
+        let instances = Arc::new(AppInstanceStore::claim(&init.instances).unwrap_or_else(
+            |error| panic!("failed to initialize instance registry persistence: {error}"),
+        ));
         let benchmark_suite_retention_claims =
             benchmark_suites::BenchmarkSuiteRetentionClaims::default();
         let benchmark_suite_drivers =
@@ -254,7 +264,7 @@ impl AppState {
             app_name: init.app_name,
             version: init.version,
             config,
-            instances: init.instances,
+            instances,
             accounts,
             auth_logins,
             installs: init.installs,
@@ -269,6 +279,7 @@ impl AppState {
             telemetry,
             remote_flags,
             launch_reports,
+            instance_lifecycle_gates: instance_lifecycle::InstanceLifecycleGates::default(),
             lifecycle: AppLifecycle::new(),
             shutdown_coordinator: AppShutdownCoordinator::new(),
             startup_warnings: Arc::new(bound_startup_warnings(init.startup_warnings)),
@@ -291,7 +302,7 @@ impl AppState {
         &self.config
     }
 
-    pub fn instances(&self) -> &Arc<InstanceStore> {
+    pub fn instances(&self) -> &Arc<AppInstanceStore> {
         &self.instances
     }
 
@@ -431,6 +442,107 @@ impl AppState {
 
     pub(crate) async fn close_config(&self) -> Result<(), ConfigStoreError> {
         self.config.close(self.config_commit_observer()).await
+    }
+
+    pub async fn mutate_instances<ResultValue, Mutation>(
+        &self,
+        mutation: Mutation,
+    ) -> Result<ResultValue, InstanceStoreError>
+    where
+        ResultValue: Send + 'static,
+        Mutation: FnOnce(
+                &mut axial_config::InstanceRegistrySnapshot,
+            ) -> Result<ResultValue, InstanceStoreError>
+            + Send
+            + 'static,
+    {
+        let instances = self.instances.clone();
+        let gate = instances.acquire_mutation().await?;
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = instances.mutate_with_gate(mutation, gate).await;
+            let _ = completed_tx.send(result);
+        });
+        completed_rx.await.map_err(|_| {
+            InstanceStoreError::Persistence(std::io::Error::other(
+                "instance registry mutation owner stopped before reporting completion",
+            ))
+        })?
+    }
+
+    pub(crate) async fn create_instance(
+        &self,
+        instance: axial_config::Instance,
+        library_dir: Option<PathBuf>,
+    ) -> Result<axial_config::Instance, InstanceStoreError> {
+        let instances = self.instances.clone();
+        let gate = instances.acquire_mutation().await?;
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = instances
+                .create_with_gate(instance, library_dir, gate)
+                .await;
+            let _ = completed_tx.send(result);
+        });
+        completed_rx.await.map_err(|_| {
+            InstanceStoreError::Persistence(std::io::Error::other(
+                "instance creation owner stopped before reporting completion",
+            ))
+        })?
+    }
+
+    pub(crate) async fn duplicate_instance(
+        &self,
+        source_id: String,
+        requested_name: Option<String>,
+        library_dir: Option<PathBuf>,
+    ) -> Result<axial_config::Instance, InstanceStoreError> {
+        let instances = self.instances.clone();
+        let gate = instances.acquire_mutation().await?;
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = instances
+                .duplicate_with_gate(source_id, requested_name, library_dir, gate)
+                .await;
+            let _ = completed_tx.send(result);
+        });
+        completed_rx.await.map_err(|_| {
+            InstanceStoreError::Persistence(std::io::Error::other(
+                "instance duplication owner stopped before reporting completion",
+            ))
+        })?
+    }
+
+    pub(crate) async fn delete_instance(
+        &self,
+        instance_id: String,
+        delete_files: bool,
+    ) -> Result<(), InstanceStoreError> {
+        let instances = self.instances.clone();
+        let gate = instances.acquire_mutation().await?;
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = instances
+                .delete_with_gate(instance_id, delete_files, gate)
+                .await;
+            let _ = completed_tx.send(result);
+        });
+        completed_rx.await.map_err(|_| {
+            InstanceStoreError::Persistence(std::io::Error::other(
+                "instance deletion owner stopped before reporting completion",
+            ))
+        })?
+    }
+
+    pub(crate) async fn acquire_instance_lifecycle(
+        &self,
+        instance_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.instance_lifecycle_gates.acquire(instance_id).await
+    }
+
+    pub(crate) async fn close_instance_registry(&self) -> Result<(), InstanceStoreError> {
+        self.instances.close().await
     }
 
     fn config_commit_observer(&self) -> Arc<dyn Fn(AppConfig, AppConfig) + Send + Sync> {
