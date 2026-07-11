@@ -223,10 +223,11 @@ pub fn launch_request_error_response(error: LaunchRequestError) -> LaunchApplica
 }
 
 pub fn launch_request_error_status(error: &LaunchRequestError) -> StatusCode {
-    if error.guardian.as_ref().is_some_and(|guardian| {
-        crate::guardian::launch_summary_decision_kind(guardian)
-            == crate::guardian::GuardianDecisionKind::Block
-    }) {
+    if error
+        .guardian
+        .as_ref()
+        .is_some_and(|guardian| guardian.decision == axial_launcher::GuardianDecision::Blocked)
+    {
         StatusCode::UNPROCESSABLE_ENTITY
     } else {
         StatusCode::INTERNAL_SERVER_ERROR

@@ -6,9 +6,8 @@ use super::inference_graph::{
 use super::{
     ActionPlanPrerequisite, Diagnosis, GuardianAction, GuardianActionKind, GuardianActionPlan,
     GuardianConfidence, GuardianDecision, GuardianDecisionKind, GuardianMode, GuardianSeverity,
-    SafetyCase, SafetyOutcome,
+    SafetyCase,
 };
-use crate::observability::{RedactionAudience, sanitize_evidence_text};
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,38 +203,6 @@ pub fn action_safety_score(
     let ownership = ownership_risk_for_action(diagnosis.ownership, action);
     let memory = reasoning.memory_penalty(context);
     permission * reversibility * (1.0 - ownership) * (1.0 - memory)
-}
-
-pub fn launch_summary_decision_kind(
-    summary: &axial_launcher::GuardianSummary,
-) -> GuardianDecisionKind {
-    match summary.decision {
-        axial_launcher::GuardianDecision::Allowed => GuardianDecisionKind::Allow,
-        axial_launcher::GuardianDecision::Warned => GuardianDecisionKind::Warn,
-        axial_launcher::GuardianDecision::Blocked => GuardianDecisionKind::Block,
-        axial_launcher::GuardianDecision::Intervened => summary
-            .interventions
-            .first()
-            .map(|intervention| launch_intervention_decision_kind(intervention.kind))
-            .unwrap_or(GuardianDecisionKind::RecordOnly),
-    }
-}
-
-pub fn launch_summary_safety_outcome(summary: &axial_launcher::GuardianSummary) -> SafetyOutcome {
-    let decision = launch_summary_decision_kind(summary);
-    SafetyOutcome {
-        decision,
-        summary: summary
-            .message
-            .as_deref()
-            .and_then(|message| sanitize_public_text(message, 180))
-            .unwrap_or_else(|| launch_summary_fallback_message(decision).to_string()),
-        detail: summary
-            .details
-            .iter()
-            .find_map(|detail| sanitize_public_text(detail, 240)),
-        diagnoses: Vec::new(),
-    }
 }
 
 fn strongest_diagnosis(diagnoses: &[Diagnosis]) -> Option<&Diagnosis> {
@@ -781,41 +748,11 @@ fn is_managed_mutation_action(action: GuardianActionKind) -> bool {
     )
 }
 
-fn launch_intervention_decision_kind(
-    intervention: axial_launcher::GuardianInterventionKind,
-) -> GuardianDecisionKind {
-    match intervention {
-        axial_launcher::GuardianInterventionKind::SwitchManagedRuntime => {
-            GuardianDecisionKind::Fallback
-        }
-        axial_launcher::GuardianInterventionKind::StripJvmArgs => GuardianDecisionKind::Strip,
-        axial_launcher::GuardianInterventionKind::DowngradePreset => {
-            GuardianDecisionKind::Downgrade
-        }
-        axial_launcher::GuardianInterventionKind::DisableCustomGc => GuardianDecisionKind::Strip,
-    }
-}
-
-fn launch_summary_fallback_message(decision: GuardianDecisionKind) -> &'static str {
-    match decision {
-        GuardianDecisionKind::Allow => "guardian_allowed",
-        GuardianDecisionKind::Warn => "guardian_warned",
-        GuardianDecisionKind::Block => "guardian_blocked",
-        GuardianDecisionKind::RecordOnly => "guardian_record_only",
-        _ => "guardian_intervened",
-    }
-}
-
-fn sanitize_public_text(value: &str, max_chars: usize) -> Option<String> {
-    sanitize_evidence_text(value, RedactionAudience::UserVisible, max_chars)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         GuardianPolicyContext, action_safety_score, decide_guardian_policy,
-        decision_pressure_score, launch_summary_decision_kind, launch_summary_safety_outcome,
-        policy_reasoning_input,
+        decision_pressure_score, policy_reasoning_input,
     };
     use crate::guardian::inference_graph::{
         JournalRequirement, OwnershipRequirement, RetryLoopSensitivity, UserIntentSensitivity,
@@ -1433,83 +1370,6 @@ mod tests {
             )
             .kind,
             GuardianDecisionKind::Block
-        );
-    }
-
-    #[test]
-    fn launch_summary_warning_and_block_map_to_policy_outcomes() {
-        let mut warned = axial_launcher::GuardianSummary::new(axial_launcher::GuardianMode::Custom);
-        warned.warn_with_guidance(vec![
-            "Guardian Custom mode will keep explicit JVM args; remove them first if startup becomes unstable.".to_string(),
-        ]);
-        assert_eq!(
-            launch_summary_decision_kind(&warned),
-            GuardianDecisionKind::Warn
-        );
-        assert_eq!(
-            launch_summary_safety_outcome(&warned).decision,
-            GuardianDecisionKind::Warn
-        );
-
-        let mut blocked =
-            axial_launcher::GuardianSummary::new(axial_launcher::GuardianMode::Managed);
-        blocked.block_with_reason_and_guidance(
-            "explicit Java override targets Java 8 but this version requires Java 17",
-            vec!["Remove the Java override or switch Guardian Mode back to Managed.".to_string()],
-        );
-        assert_eq!(
-            launch_summary_decision_kind(&blocked),
-            GuardianDecisionKind::Block
-        );
-        assert_eq!(
-            launch_summary_safety_outcome(&blocked).detail.as_deref(),
-            Some("explicit Java override targets Java 8 but this version requires Java 17")
-        );
-    }
-
-    #[test]
-    fn launch_summary_interventions_map_to_specific_policy_actions() {
-        let mut summary =
-            axial_launcher::GuardianSummary::new(axial_launcher::GuardianMode::Managed);
-        summary.record_intervention(
-            axial_launcher::GuardianInterventionKind::SwitchManagedRuntime,
-            "Guardian switched to managed Java before launch",
-            false,
-        );
-
-        assert_eq!(
-            launch_summary_decision_kind(&summary),
-            GuardianDecisionKind::Fallback
-        );
-    }
-
-    #[test]
-    fn launch_summary_unknown_intervention_does_not_overstate_repair() {
-        let mut summary =
-            axial_launcher::GuardianSummary::new(axial_launcher::GuardianMode::Managed);
-        summary.decision = axial_launcher::GuardianDecision::Intervened;
-
-        assert_eq!(
-            launch_summary_decision_kind(&summary),
-            GuardianDecisionKind::RecordOnly
-        );
-    }
-
-    #[test]
-    fn launch_summary_outcome_redacts_unsafe_details() {
-        let mut summary =
-            axial_launcher::GuardianSummary::new(axial_launcher::GuardianMode::Managed);
-        summary.block_with_reason_and_guidance(
-            "/home/alice/java.exe --accessToken secret -Xmx8192M",
-            vec!["Review the latest game log before retrying.".to_string()],
-        );
-
-        let outcome = launch_summary_safety_outcome(&summary);
-
-        assert_eq!(outcome.decision, GuardianDecisionKind::Block);
-        assert_eq!(
-            outcome.detail.as_deref(),
-            Some("Review the latest game log before retrying.")
         );
     }
 

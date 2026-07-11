@@ -96,7 +96,6 @@ pub use performance::{
 };
 pub use policy::{
     GuardianPolicyContext, action_safety_score, decide_guardian_policy, decision_pressure_score,
-    launch_summary_decision_kind, launch_summary_safety_outcome,
 };
 pub use preflight::{
     GuardianPreflightDirective, GuardianPreflightOutcome, GuardianPreflightOutcomeRequest,
