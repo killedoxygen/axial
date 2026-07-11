@@ -8,6 +8,7 @@
     "dev:desktop": "node esbuild.mjs serve --strict-port",
     "dev:mock": "node esbuild.mjs serve --strict-port --mock",
     "watch": "node esbuild.mjs watch",
+    "test:look-guardian": "node --experimental-strip-types --test test/look-guardian.test.mjs",
     "check": "tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

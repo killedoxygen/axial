@@ -1,14 +1,9 @@
 import type { Theme } from '../tokens';
 
-export interface TileHueVerdict {
-  harmonious: boolean;
-  message: string | null;
-  suggestions: number[];
-}
-
 const BLEND_LIMIT = 25;
 const ANALOGOUS_LIMIT = 80;
 const PALETTE_SIZE = 7;
+const MAX_PALETTE_ATTEMPTS = 240;
 
 const HARMONIOUS_SEGMENTS: Array<[number, number]> = [
   [-ANALOGOUS_LIMIT, -BLEND_LIMIT],
@@ -37,11 +32,11 @@ const PALETTE_PROFILES: Array<Array<[number, number]>> = [
   HARMONIOUS_SEGMENTS,
 ];
 
-export function wrapHue(hue: number): number {
+function wrapHue(hue: number): number {
   return ((Math.round(hue) % 360) + 360) % 360;
 }
 
-export function hueDistance(a: number, b: number): number {
+function hueDistance(a: number, b: number): number {
   const delta = Math.abs(wrapHue(a) - wrapHue(b));
   return Math.min(delta, 360 - delta);
 }
@@ -51,7 +46,7 @@ export function seedForTileHue(hue: number): number {
   return wrapped === 0 ? 360 : wrapped;
 }
 
-export function isHueHarmonious(hue: number, theme: Theme): boolean {
+function isHueHarmonious(hue: number, theme: Theme): boolean {
   const wrapped = wrapHue(hue);
   const distance = hueDistance(wrapped, theme.hue);
   return distance >= BLEND_LIMIT && distance <= ANALOGOUS_LIMIT;
@@ -91,26 +86,14 @@ function paletteProfile(seed: number): Array<[number, number]> {
 }
 
 function evenlySpreadPalette(theme: Theme, seed: number, segments: Array<[number, number]>): number[] {
-  let state = seed;
   const lengthTotal = domainLength(segments);
   const step = lengthTotal / PALETTE_SIZE;
-  const colors: Array<{ position: number; hue: number }> = [];
-
-  state = nextRandom(state);
+  const state = nextRandom(seed);
   const phase = (state / 4294967296) * step;
-  const jitterLimit = Math.min(5, step * 0.4);
-
-  for (let index = 0; index < PALETTE_SIZE; index += 1) {
-    state = nextRandom(state);
-    const jitter = (state / 4294967296 - 0.5) * jitterLimit * 2;
-    const position = phase + (index + 0.5) * step + jitter;
-    colors.push({
-      position,
-      hue: wrapHue(theme.hue + offsetAt(position, segments)),
-    });
-  }
-
-  return colors.sort((a, b) => a.position - b.position).map((color) => color.hue);
+  return Array.from({ length: PALETTE_SIZE }, (_, index) => {
+    const position = phase + (index + 0.5) * step;
+    return wrapHue(theme.hue + offsetAt(position, segments));
+  });
 }
 
 export function harmoniousTilePalette(theme: Theme, seed: number): number[] {
@@ -120,7 +103,7 @@ export function harmoniousTilePalette(theme: Theme, seed: number): number[] {
   const picks: Array<{ position: number; hue: number }> = [];
   let minGap = 22;
   let attempts = 0;
-  while (picks.length < PALETTE_SIZE && attempts < 240) {
+  while (picks.length < PALETTE_SIZE && attempts < MAX_PALETTE_ATTEMPTS) {
     state = nextRandom(state);
     attempts += 1;
     if (attempts % 24 === 0) minGap = Math.max(6, minGap - 6);
@@ -140,18 +123,4 @@ export function resolveTileHue(hue: number, theme: Theme): number {
   return [...harmoniousTilePalette(theme, seedForTileHue(wrapped))].sort(
     (a, b) => hueDistance(a, wrapped) - hueDistance(b, wrapped),
   )[0]!;
-}
-
-export function assessTileHue(hue: number, theme: Theme): TileHueVerdict {
-  if (isHueHarmonious(hue, theme)) {
-    return { harmonious: true, message: null, suggestions: [] };
-  }
-  const suggestions = [...harmoniousTilePalette(theme, seedForTileHue(hue))]
-    .sort((a, b) => hueDistance(a, hue) - hueDistance(b, hue))
-    .slice(0, 2);
-  return {
-    harmonious: false,
-    message: 'This color will not sit well with your theme',
-    suggestions,
-  };
 }
