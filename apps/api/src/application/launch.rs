@@ -131,7 +131,7 @@ pub(crate) fn launch_preflight_stage_evidence(
             "Guardian recorded the launch safety decision.",
             vec![
                 format!("mode:{:?}", outcome.guardian_decision.mode),
-                format!("decision:{:?}", outcome.guardian_decision.kind),
+                format!("decision:{:?}", outcome.user_outcome.decision),
                 format!("diagnoses:{}", outcome.safety_case.diagnoses.len()),
             ],
         ),
@@ -353,5 +353,50 @@ mod tests {
         assert!(!encoded.contains("Alice"));
         assert!(!encoded.contains("-Xmx"));
         assert!(!encoded.contains("Users"));
+    }
+
+    #[test]
+    fn launch_preflight_stage_evidence_records_effective_warning_verdict() {
+        let target = TargetDescriptor::new(
+            StabilizationSystem::Guardian,
+            TargetKind::Instance,
+            "instance-a",
+            OwnershipClass::UserOwned,
+        );
+        let historical_fact = crate::guardian::GuardianFact {
+            operation_id: None,
+            id: crate::guardian::GuardianFactId::new("recent_startup_failure"),
+            domain: crate::guardian::GuardianDomain::Startup,
+            phase: OperationPhase::Validating,
+            reliability: crate::guardian::FactReliability::DirectStructured,
+            severity: Some(crate::guardian::GuardianSeverity::Warning),
+            confidence: Some(crate::guardian::GuardianConfidence::Confirmed),
+            ownership: target.ownership,
+            target: Some(target),
+            fields: Vec::new(),
+        };
+        let outcome = crate::guardian::guardian_preflight_outcome(
+            crate::guardian::GuardianPreflightOutcomeRequest::new(
+                crate::guardian::GuardianMode::Managed,
+                &[historical_fact],
+            ),
+        );
+
+        assert_eq!(
+            outcome.guardian_decision.kind,
+            crate::guardian::GuardianDecisionKind::RecordOnly
+        );
+        assert_eq!(
+            outcome.user_outcome.decision,
+            crate::guardian::GuardianDecisionKind::Warn
+        );
+        assert_eq!(
+            super::launch_preflight_stage_evidence(&outcome, "managed")[0].details,
+            vec![
+                "mode:Managed".to_string(),
+                "decision:Warn".to_string(),
+                "diagnoses:1".to_string(),
+            ]
+        );
     }
 }

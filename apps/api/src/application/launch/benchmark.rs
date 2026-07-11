@@ -2038,6 +2038,18 @@ mod tests {
             .await
             .expect("terminal prepared session");
         assert_eq!(record.state, LaunchState::Failed);
+        assert_eq!(
+            record
+                .stages
+                .iter()
+                .flat_map(|stage| &stage.evidence)
+                .filter(|evidence| {
+                    evidence.id == "guardian_launch_safety_decision"
+                        && evidence.system == "guardian"
+                })
+                .count(),
+            1
+        );
         assert!(fixture.state.sessions().active_records().await.is_empty());
 
         for index in 0..=32 {
