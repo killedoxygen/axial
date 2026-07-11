@@ -1,6 +1,33 @@
 use super::*;
 
 #[tokio::test]
+async fn prepare_launch_session_rejects_shutdown_without_returning_a_task() {
+    let fixture = TestFixture::new("prepare-rejects-shutdown-admission");
+    fixture.write_ready_install("1.21.1");
+    let instance_id = fixture.add_instance("Shutdown admission", "1.21.1");
+    fixture
+        .state
+        .sessions()
+        .terminate_all()
+        .await
+        .expect("latch session shutdown");
+
+    let error = match fixture.prepare(instance_id, None).await {
+        Ok(_) => panic!("shutdown must reject launch preparation"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        error.1.0,
+        serde_json::json!({
+            "error": "Launches are unavailable while the application is shutting down."
+        })
+    );
+    assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+}
+
+#[tokio::test]
 async fn prepare_launch_session_ensures_instance_layout_before_building_intent() {
     let fixture = TestFixture::new("prepare-ensures-layout");
     fixture.write_ready_install("1.21.1");
@@ -287,7 +314,8 @@ async fn prepare_launch_session_rejects_same_instance_active_launch() {
             outcome: None,
             stages: Vec::new(),
         })
-        .await;
+        .await
+        .expect("insert session");
 
     let error = match prepare_launch_session(
         &fixture.state,

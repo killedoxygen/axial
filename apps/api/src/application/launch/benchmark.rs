@@ -1941,7 +1941,8 @@ mod tests {
                 .state
                 .sessions()
                 .insert(test_record(&completed_id))
-                .await;
+                .await
+                .expect("insert session");
             fixture
                 .state
                 .sessions()
@@ -2201,7 +2202,11 @@ mod tests {
             .update_run_state_for_session(session_id, "running")
             .await
             .expect("commit running outcome");
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let terminal_events = state
             .sessions()
             .subscribe(session_id)

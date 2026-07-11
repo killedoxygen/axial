@@ -146,6 +146,14 @@ impl ProcessControlHandle {
     }
 
     #[cfg(test)]
+    pub(super) async fn wait_until_reaped(&self) {
+        let mut reaped = self.reaped.clone();
+        if reaped.borrow().is_none() {
+            reaped.changed().await.expect("process reap signal");
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn reject_next_start_kill(&self) {
         self.reject_next_start_kill.store(true, Ordering::SeqCst);
     }
@@ -343,6 +351,15 @@ pub(super) struct OutputPumpTasks {
     stdout: Option<JoinHandle<()>>,
     stderr: Option<JoinHandle<()>>,
     processor: JoinHandle<()>,
+}
+
+#[cfg(test)]
+pub(super) fn output_pump_tasks_with_processor(processor: JoinHandle<()>) -> OutputPumpTasks {
+    OutputPumpTasks {
+        stdout: None,
+        stderr: None,
+        processor,
+    }
 }
 
 impl OutputPumpTasks {
@@ -866,7 +883,7 @@ mod tests {
         record.outcome = Some(LaunchSessionOutcome::from_reason(
             LaunchSessionExitReason::CrashedBeforeBoot,
         ));
-        store.insert(record.clone()).await;
+        store.insert(record.clone()).await.expect("insert session");
         let attempt = store
             .current_process_attempt(session_id)
             .await
@@ -902,7 +919,7 @@ mod tests {
         let session_id = "output-drain-inflight-failure";
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
         let attempt = store
             .current_process_attempt(session_id)
             .await
@@ -1141,7 +1158,7 @@ mod tests {
         let session_id = "watchdog-terminal-before-drain";
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
         let attempt = store
             .current_process_attempt(session_id)
             .await
@@ -1342,7 +1359,10 @@ mod tests {
     async fn replacement_commits_before_superseded_owner_drain_and_removes_exact_registry_id() {
         let store = Arc::new(SessionStore::new());
         let session_id = "owner-nonblocking-replacement";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let old_attempt = store
             .current_process_attempt(session_id)
             .await
@@ -1371,7 +1391,10 @@ mod tests {
             );
         }
 
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let current_attempt = store
             .current_process_attempt(session_id)
             .await
@@ -1414,7 +1437,10 @@ mod tests {
     async fn shutdown_registry_reaps_a_live_superseded_owner_before_clear() {
         let store = Arc::new(SessionStore::new());
         let session_id = "shutdown-superseded-owner";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let old_attempt = store
             .current_process_attempt(session_id)
             .await
@@ -1452,6 +1478,7 @@ mod tests {
             .expect("shutdown superseded owner");
 
         assert!(!process_is_live(pid));
+        assert!(store.active_processes.lock().await.is_empty());
         assert!(store.sessions.read().await.is_empty());
     }
 
@@ -1483,6 +1510,12 @@ mod tests {
         assert!(!process_is_live(pid));
         assert!(store.get(session_id).await.is_some());
         store.active_processes.lock().await.remove(&rejected_id);
+        store
+            .terminate_all()
+            .await
+            .expect("shutdown retries after rejected owner is repaired");
+        assert!(store.active_processes.lock().await.is_empty());
+        assert!(store.sessions.read().await.is_empty());
     }
 
     #[cfg(unix)]
@@ -1521,6 +1554,7 @@ mod tests {
         let lifecycle = tokio::time::timeout(Duration::from_secs(2), lifecycle)
             .await
             .expect("detached coordinator completion");
+        assert!(store.active_processes.lock().await.is_empty());
         assert!(store.sessions.read().await.is_empty());
         drop(lifecycle);
     }

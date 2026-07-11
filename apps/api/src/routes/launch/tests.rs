@@ -303,7 +303,12 @@ async fn launch_command_route_redacts_public_diagnostics_from_json() {
         ],
         "account_id": "account-secret"
     }));
-    fixture.state.sessions().insert(record).await;
+    fixture
+        .state
+        .sessions()
+        .insert(record)
+        .await
+        .expect("insert session");
 
     let response = router()
         .with_state(fixture.state.clone())
@@ -386,7 +391,12 @@ async fn launch_status_route_redacts_raw_record_diagnostics_from_json() {
         "health": "ok",
         "raw": "/tmp/secret-fallback"
     }));
-    fixture.state.sessions().insert(record).await;
+    fixture
+        .state
+        .sessions()
+        .insert(record)
+        .await
+        .expect("insert session");
 
     let response = router()
         .with_state(fixture.state.clone())
@@ -1881,6 +1891,54 @@ async fn launch_route_online_auth_unready_returns_backend_notice_without_session
 }
 
 #[tokio::test]
+async fn launch_route_returns_bounded_503_without_spawning_after_shutdown_rejection() {
+    let fixture = RouteTestFixture::new("launch-shutdown-admission-route");
+    fixture.configure_library();
+    fixture.write_ready_install("1.21.1");
+    let instance_id = fixture.add_instance("Shutdown admission", "1.21.1");
+    fixture
+        .state
+        .sessions()
+        .terminate_all()
+        .await
+        .expect("latch session shutdown");
+
+    let response = router()
+        .with_state(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/launch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "instance_id": instance_id,
+                        "username": null,
+                        "max_memory_mb": null,
+                        "min_memory_mb": null,
+                        "client_started_at_ms": null
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).expect("launch error json"),
+        serde_json::json!({
+            "error": "Launches are unavailable while the application is shutting down."
+        })
+    );
+    assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+}
+
+#[tokio::test]
 async fn family_c_qualification_route_returns_ready_for_complete_suite() {
     let fixture = RouteTestFixture::new("family-c-qualification-ready-route");
     let instance_id = fixture.add_instance("Family C", FAMILY_C_QUALIFICATION_VERSION);
@@ -2421,7 +2479,10 @@ async fn benchmark_suite_driver_stop_reports_stopped_without_killing_sessions() 
     let store = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverStore::new();
     let suite_id = test_suite_id("driver-stop", "development");
     let sessions = crate::state::SessionStore::new();
-    sessions.insert(test_record("active-suite-session")).await;
+    sessions
+        .insert(test_record("active-suite-session"))
+        .await
+        .expect("insert session");
     let summary = crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary {
         run_count: 2,
         launched_run_count: 1,
@@ -2607,7 +2668,8 @@ async fn benchmark_suite_driver_resume_starts_fresh_driver_from_terminal_record(
         .state
         .sessions()
         .insert(test_record("session-0"))
-        .await;
+        .await
+        .expect("insert session");
     let stopped = fixture
         .stopped_driver(&suite_id, "development", 45_000)
         .await;
@@ -2656,7 +2718,8 @@ async fn benchmark_suite_driver_startup_resume_starts_fresh_driver_from_restart_
         .state
         .sessions()
         .insert(test_record("session-0"))
-        .await;
+        .await
+        .expect("insert session");
 
     let summary = resume_restart_interrupted_benchmark_suite_drivers(reloaded.state.clone())
         .await
@@ -2916,7 +2979,10 @@ fn benchmark_suite_missing_lookup_error_uses_json_404() {
 #[tokio::test]
 async fn benchmark_suite_tick_active_returns_non_error_without_launching() {
     let store = crate::state::SessionStore::new();
-    store.insert(test_record("active-suite-session")).await;
+    store
+        .insert(test_record("active-suite-session"))
+        .await
+        .expect("insert session");
     let plan = benchmark_suite_plan("development").expect("development plan");
     let suite_id = test_suite_id("tick-active", "development");
     let input = BenchmarkSuitePlanInput {

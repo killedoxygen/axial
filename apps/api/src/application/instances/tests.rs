@@ -1015,7 +1015,8 @@ async fn instance_world_mutations_reject_active_instance() {
         .state
         .sessions()
         .insert(test_launch_record("active-world-session", &instance.id))
-        .await;
+        .await
+        .expect("insert session");
 
     let (status, Json(body)) = handle_delete_instance_world(&fixture.state, &instance.id, "World")
         .await

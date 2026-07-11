@@ -613,7 +613,11 @@ mod tests {
         let root = unique_test_dir("stop-launch-retention-error");
         let state = test_app_state(&root);
         let session_id = "stop-kill-error";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         state
             .sessions()
             .release_terminal_retention_hold(session_id)
@@ -630,7 +634,11 @@ mod tests {
             .await;
         for index in 0..=32 {
             let completed_id = format!("completed-{index}");
-            state.sessions().insert(test_record(&completed_id)).await;
+            state
+                .sessions()
+                .insert(test_record(&completed_id))
+                .await
+                .expect("insert session");
             state
                 .sessions()
                 .release_terminal_retention_hold(&completed_id)

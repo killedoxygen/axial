@@ -17,13 +17,10 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast};
-
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast};
 
 const MAX_GUARDIAN_STAGE_DETAILS: usize = 8;
 const MAX_STAGE_EVIDENCE: usize = 16;
@@ -161,11 +158,17 @@ fn boot_promotion_gate(
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, SessionEntry>>,
     active_processes: Mutex<HashMap<u64, supervisor::ProcessControlHandle>>,
+    process_owner_changes: Notify,
     lifecycle_transition: Arc<Mutex<()>>,
+    shutdown_started: AtomicBool,
     changes: broadcast::Sender<()>,
     next_attempt_id: AtomicU64,
     next_terminal_sequence: AtomicU64,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("launch session store is shutting down")]
+pub struct SessionAdmissionError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupOutcome {
@@ -321,7 +324,9 @@ impl SessionStore {
         Self {
             sessions: RwLock::new(HashMap::new()),
             active_processes: Mutex::new(HashMap::new()),
+            process_owner_changes: Notify::new(),
             lifecycle_transition: Arc::new(Mutex::new(())),
+            shutdown_started: AtomicBool::new(false),
             changes,
             next_attempt_id: AtomicU64::new(0),
             next_terminal_sequence: AtomicU64::new(0),
@@ -372,8 +377,14 @@ impl SessionStore {
         })
     }
 
-    pub async fn insert(&self, mut record: LaunchSessionRecord) {
+    pub async fn insert(
+        &self,
+        mut record: LaunchSessionRecord,
+    ) -> Result<(), SessionAdmissionError> {
         let _lifecycle_transition = self.lifecycle_transition.lock().await;
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err(SessionAdmissionError);
+        }
         let (events, _) = broadcast::channel(256);
         ensure_stage_started(&mut record, now_ms());
         let previous_process = self
@@ -402,6 +413,7 @@ impl SessionStore {
             let _ = previous_process.terminate(supervisor::ProcessTerminalCause::Replacement);
         }
         self.notify_changed();
+        Ok(())
     }
 
     pub async fn get(&self, session_id: &str) -> Option<LaunchSessionRecord> {
@@ -453,6 +465,7 @@ impl SessionStore {
 
     pub(super) async fn process_owner_completed(&self, attempt_id: u64) {
         self.active_processes.lock().await.remove(&attempt_id);
+        self.process_owner_changes.notify_waiters();
     }
 
     pub async fn attach_benchmark(
@@ -850,6 +863,9 @@ impl SessionStore {
         mut command: Command,
     ) -> std::io::Result<LaunchSessionRecord> {
         let _lifecycle_transition = self.lifecycle_transition.lock().await;
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err(session_shutdown_error());
+        }
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         command.kill_on_drop(true);
         let priority = match priority::configure_start_priority(&mut command) {
@@ -1204,43 +1220,77 @@ impl SessionStore {
     }
 
     pub async fn terminate_all(self: &Arc<Self>) -> std::io::Result<()> {
+        self.shutdown_started.store(true, Ordering::Release);
         let store = self.clone();
-        tokio::spawn(async move { store.coordinate_terminate_all().await })
-            .await
-            .map_err(|error| {
-                std::io::Error::other(format!("shutdown coordinator failed: {error}"))
-            })?
+        tokio::spawn(async move {
+            let lifecycle_transition = store.lifecycle_transition.clone().lock_owned().await;
+            store.coordinate_terminate_all(lifecycle_transition).await
+        })
+        .await
+        .map_err(|_| std::io::Error::other("launch process shutdown coordinator stopped"))?
     }
 
-    async fn coordinate_terminate_all(self: &Arc<Self>) -> std::io::Result<()> {
-        let _lifecycle_transition = self.lifecycle_transition.lock().await;
+    async fn coordinate_terminate_all(
+        self: &Arc<Self>,
+        _lifecycle_transition: OwnedMutexGuard<()>,
+    ) -> std::io::Result<()> {
         let processes = self
             .active_processes
             .lock()
             .await
-            .values()
-            .cloned()
+            .iter()
+            .map(|(attempt_id, process)| (*attempt_id, process.clone()))
             .collect::<Vec<_>>();
         let mut requests = processes
-            .iter()
-            .map(|process| process.terminate(supervisor::ProcessTerminalCause::Shutdown))
+            .into_iter()
+            .map(|(attempt_id, process)| {
+                (
+                    attempt_id,
+                    process.terminate(supervisor::ProcessTerminalCause::Shutdown),
+                )
+            })
             .collect::<Vec<_>>();
 
         let mut first_error = None;
-        for request in &mut requests {
-            if let Err(error) = request.reaped().await
+        let mut settled_owner_ids = Vec::new();
+        for (attempt_id, request) in &mut requests {
+            let result = request.settled().await;
+            if request.terminal_is_settled() {
+                settled_owner_ids.push(*attempt_id);
+            }
+            if let Err(error) = result
                 && first_error.is_none()
             {
-                first_error = Some(error);
+                first_error = Some(bounded_shutdown_error(&error));
             }
+        }
+        for attempt_id in settled_owner_ids {
+            self.wait_for_process_owner_removal(attempt_id).await;
         }
         if let Some(error) = first_error {
             return Err(error);
+        }
+        if !self.active_processes.lock().await.is_empty() {
+            return Err(std::io::Error::other(
+                "launch process shutdown is incomplete",
+            ));
         }
 
         self.sessions.write().await.clear();
         self.notify_changed();
         Ok(())
+    }
+
+    async fn wait_for_process_owner_removal(&self, attempt_id: u64) {
+        loop {
+            let removed = self.process_owner_changes.notified();
+            tokio::pin!(removed);
+            removed.as_mut().enable();
+            if !self.active_processes.lock().await.contains_key(&attempt_id) {
+                return;
+            }
+            removed.await;
+        }
     }
 
     pub async fn active_records(&self) -> Vec<LaunchSessionRecord> {
@@ -1350,6 +1400,17 @@ impl SessionStore {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+}
+
+fn session_shutdown_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "launch session store is shutting down",
+    )
+}
+
+fn bounded_shutdown_error(error: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), "launch process shutdown is incomplete")
 }
 
 fn evict_oldest_terminal_sessions(sessions: &mut HashMap<String, SessionEntry>) -> bool {
@@ -1906,12 +1967,18 @@ mod tests {
     #[tokio::test]
     async fn launch_terminal_session_retention_bounds_repeated_transitions_and_keeps_active() {
         let store = SessionStore::new();
-        store.insert(test_record("active-session")).await;
+        store
+            .insert(test_record("active-session"))
+            .await
+            .expect("insert session");
 
         let overflow = 5;
         for index in 0..MAX_RETAINED_TERMINAL_SESSIONS + overflow {
             let session_id = format!("terminal-{index}");
-            store.insert(test_record(&session_id)).await;
+            store
+                .insert(test_record(&session_id))
+                .await
+                .expect("insert session");
             store.release_terminal_retention_hold(&session_id).await;
             store
                 .emit_status(&session_id, terminal_status(Some(0), None, None))
@@ -1944,7 +2011,10 @@ mod tests {
 
         for index in 0..=MAX_RETAINED_TERMINAL_SESSIONS {
             let session_id = format!("terminal-{index}");
-            store.insert(test_record(&session_id)).await;
+            store
+                .insert(test_record(&session_id))
+                .await
+                .expect("insert session");
             if session_id == retained_session_id {
                 retained_receiver = store.subscribe(&session_id).await;
             }
@@ -1974,7 +2044,10 @@ mod tests {
     async fn launch_retry_pending_terminal_survives_pressure_and_resumes_original_stream() {
         let store = SessionStore::new();
         let retry_session_id = "retry-pending";
-        store.insert(test_record(retry_session_id)).await;
+        store
+            .insert(test_record(retry_session_id))
+            .await
+            .expect("insert session");
         let mut receiver = store
             .subscribe(retry_session_id)
             .await
@@ -2001,7 +2074,10 @@ mod tests {
     async fn launch_nested_retention_holds_require_the_final_release_for_eligibility() {
         let store = SessionStore::new();
         let session_id = "nested-holds";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         assert!(
             store
                 .acquire_terminal_retention_hold(session_id)
@@ -2041,7 +2117,10 @@ mod tests {
     async fn launch_proof_pending_terminal_survives_pressure_until_its_hold_is_released() {
         let store = SessionStore::new();
         let proof_session_id = "proof-pending";
-        store.insert(test_record(proof_session_id)).await;
+        store
+            .insert(test_record(proof_session_id))
+            .await
+            .expect("insert session");
         store
             .emit_status(
                 proof_session_id,
@@ -2077,7 +2156,10 @@ mod tests {
     async fn insert_retention_ready_terminal_burst(store: &SessionStore, prefix: &str) {
         for index in 0..=MAX_RETAINED_TERMINAL_SESSIONS {
             let session_id = format!("{prefix}-{index}");
-            store.insert(test_record(&session_id)).await;
+            store
+                .insert(test_record(&session_id))
+                .await
+                .expect("insert session");
             store.release_terminal_retention_hold(&session_id).await;
             store
                 .emit_status(&session_id, terminal_status(Some(0), None, None))
@@ -2088,7 +2170,10 @@ mod tests {
     #[tokio::test]
     async fn launch_stage_history_tracks_transitions_results_and_healing_notes() {
         let store = SessionStore::new();
-        store.insert(test_record("stage-history")).await;
+        store
+            .insert(test_record("stage-history"))
+            .await
+            .expect("insert session");
 
         let initial = store.get("stage-history").await.expect("initial record");
         assert_eq!(initial.stages.len(), 1);
@@ -2170,7 +2255,10 @@ mod tests {
     #[tokio::test]
     async fn launch_stage_history_captures_guardian_details_before_healing_warnings() {
         let store = SessionStore::new();
-        store.insert(test_record("guardian-stage-notes")).await;
+        store
+            .insert(test_record("guardian-stage-notes"))
+            .await
+            .expect("insert session");
 
         let mut receiver = store
             .subscribe("guardian-stage-notes")
@@ -2244,7 +2332,10 @@ mod tests {
     #[tokio::test]
     async fn launch_status_public_notice_and_stage_notes_redact_sensitive_details() {
         let store = SessionStore::new();
-        store.insert(test_record("guardian-stage-redaction")).await;
+        store
+            .insert(test_record("guardian-stage-redaction"))
+            .await
+            .expect("insert session");
 
         let mut receiver = store
             .subscribe("guardian-stage-redaction")
@@ -2321,7 +2412,10 @@ mod tests {
     #[tokio::test]
     async fn launch_stage_history_merges_sanitized_stage_evidence() {
         let store = SessionStore::new();
-        store.insert(test_record("stage-evidence")).await;
+        store
+            .insert(test_record("stage-evidence"))
+            .await
+            .expect("insert session");
 
         let mut receiver = store.subscribe("stage-evidence").await.expect("subscribe");
         store
@@ -2384,7 +2478,10 @@ mod tests {
     async fn launch_stage_history_ignores_allowed_empty_and_malformed_guardian_notes() {
         let store = SessionStore::new();
 
-        store.insert(test_record("guardian-allowed")).await;
+        store
+            .insert(test_record("guardian-allowed"))
+            .await
+            .expect("insert session");
         store
             .emit_status(
                 "guardian-allowed",
@@ -2412,7 +2509,10 @@ mod tests {
         assert!(allowed.stages[1].warnings.is_empty());
         assert_eq!(allowed.stages[1].fallback_reason, None);
 
-        store.insert(test_record("guardian-empty")).await;
+        store
+            .insert(test_record("guardian-empty"))
+            .await
+            .expect("insert session");
         store
             .emit_status(
                 "guardian-empty",
@@ -2441,7 +2541,10 @@ mod tests {
         assert!(empty.stages[1].warnings.is_empty());
         assert_eq!(empty.stages[1].fallback_reason, None);
 
-        store.insert(test_record("guardian-malformed")).await;
+        store
+            .insert(test_record("guardian-malformed"))
+            .await
+            .expect("insert session");
         store
             .emit_status(
                 "guardian-malformed",
@@ -2507,7 +2610,10 @@ mod tests {
     #[tokio::test]
     async fn launch_status_events_preserve_attached_benchmark_metadata() {
         let store = SessionStore::new();
-        store.insert(test_record("benchmark-status")).await;
+        store
+            .insert(test_record("benchmark-status"))
+            .await
+            .expect("insert session");
         let benchmark = json!({
             "id": "benchmark-status",
             "profile": "dev-default",
@@ -2590,10 +2696,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_and_repeated_shutdown_calls_are_idempotent() {
+        let store = Arc::new(SessionStore::new());
+        store
+            .insert(test_record("shutdown-idempotent"))
+            .await
+            .expect("insert session");
+
+        let (first, second) = tokio::join!(store.terminate_all(), store.terminate_all());
+        first.expect("first shutdown succeeds");
+        second.expect("concurrent shutdown succeeds");
+        store
+            .terminate_all()
+            .await
+            .expect("repeated shutdown succeeds");
+
+        assert!(store.sessions.read().await.is_empty());
+        assert!(store.active_processes.lock().await.is_empty());
+        assert!(
+            store
+                .insert(test_record("shutdown-stays-latched"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_latches_before_the_owned_coordinator_is_scheduled() {
+        let store = Arc::new(SessionStore::new());
+        let mut shutdown = Box::pin(store.terminate_all());
+        let mut completed = None;
+
+        std::future::poll_fn(|context| {
+            if let std::task::Poll::Ready(result) = shutdown.as_mut().poll(context) {
+                completed = Some(result);
+            }
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        assert!(store.shutdown_started.load(Ordering::Acquire));
+        match completed {
+            Some(result) => result.expect("shutdown succeeds"),
+            None => shutdown.await.expect("shutdown succeeds"),
+        }
+    }
+
+    #[tokio::test]
     async fn failed_spawn_preserves_the_session_attempt() {
         let store = Arc::new(SessionStore::new());
         let session_id = "failed-start-registration";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let original_attempt = store
             .current_process_attempt(session_id)
             .await
@@ -2622,7 +2778,10 @@ mod tests {
     async fn cancelled_post_spawn_registration_kills_only_the_unregistered_child() {
         let store = Arc::new(SessionStore::new());
         let session_id = "cancelled-post-spawn-registration";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let mut old_command = Command::new("sh");
         old_command.arg("-c").arg("exec sleep 30");
         let old_child = attach_test_child(&store, session_id, old_command).await;
@@ -2669,7 +2828,10 @@ mod tests {
     async fn cancelled_insert_waiting_for_store_does_not_signal_the_old_child() {
         let store = Arc::new(SessionStore::new());
         let session_id = "cancelled-insert-replacement";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let mut old_command = Command::new("sh");
         old_command.arg("-c").arg("exec sleep 30");
         let old_child = attach_test_child(&store, session_id, old_command).await;
@@ -2680,7 +2842,10 @@ mod tests {
         let sessions = store.sessions.read().await;
         let insert_store = store.clone();
         let insert = tokio::spawn(async move {
-            insert_store.insert(test_record(session_id)).await;
+            insert_store
+                .insert(test_record(session_id))
+                .await
+                .expect("insert session");
         });
         tokio::task::yield_now().await;
         insert.abort();
@@ -2767,7 +2932,7 @@ mod tests {
 
         let mut replacement = test_record(session_id);
         replacement.version_id = "replacement".to_string();
-        store.insert(replacement).await;
+        store.insert(replacement).await.expect("insert session");
         let error_class =
             match tokio::time::timeout(Duration::from_secs(2), pending.wait_for_settlement())
                 .await
@@ -2793,7 +2958,10 @@ mod tests {
     async fn launch_process_exit_preserves_observed_failure_class_without_raw_detail() {
         let store = Arc::new(SessionStore::new());
         let session_id = "class-only-observed-failure";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let mut receiver = store.subscribe(session_id).await.expect("subscribe");
 
         let mut command = Command::new("sh");
@@ -2850,7 +3018,10 @@ mod tests {
     async fn process_exit_drains_the_final_output_failure_before_classification() {
         let store = Arc::new(SessionStore::new());
         let session_id = "drained-final-output-failure";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let mut command = Command::new("sh");
         command.arg("-c").arg(
             "i=0; while [ $i -lt 5000 ]; do printf '%s\\n' '[main/INFO]: loading modded game resources' >&2; i=$((i + 1)); done; printf '%s\\n' \"Unrecognized VM option '-XX:+UseZGC'\" >&2; exit 1",
@@ -2890,7 +3061,7 @@ mod tests {
         let mut record = test_record("boot-marker-duration");
         record.state = LaunchState::Starting;
         record.process_started_at_ms = Some(now_ms().saturating_sub(4_200));
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
 
         let mut receiver = store
             .subscribe("boot-marker-duration")
@@ -2948,7 +3119,7 @@ mod tests {
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
         record.process_started_at_ms = Some(now_ms().saturating_sub(1_000));
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
         {
             let mut sessions = store.sessions.write().await;
             sessions
@@ -3022,7 +3193,7 @@ mod tests {
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
         record.process_started_at_ms = Some(now_ms().saturating_sub(1_000));
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
         let mut receiver = store.subscribe(session_id).await.expect("subscribe");
         let effect_started = Arc::new(AtomicBool::new(false));
         let release_effect = Arc::new(std::sync::Barrier::new(2));
@@ -3114,7 +3285,7 @@ mod tests {
         let session_id = "cancelled-boot-effect";
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
         set_failure_observed_at(&store, session_id, now_ms()).await;
         let attempt = store
             .current_process_attempt(session_id)
@@ -3233,7 +3404,7 @@ mod tests {
         let session_id = "late-monitoring-status";
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
         let attempt = store
             .current_process_attempt(session_id)
             .await
@@ -3309,7 +3480,7 @@ mod tests {
         let session_id = "nonstartup-boot-marker";
         let mut record = test_record(session_id);
         record.state = LaunchState::Running;
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
         let mut receiver = store.subscribe(session_id).await.expect("subscribe");
 
         store
@@ -3336,7 +3507,7 @@ mod tests {
         let session_id = "stop-adjacent-boot-marker";
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
         mark_stop_requested(&store, session_id).await;
         let effect_ran = AtomicBool::new(false);
 
@@ -3356,7 +3527,7 @@ mod tests {
         let session_id = "stop-after-boot-promotion";
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
 
         emit_test_boot(&store, session_id, "test_promoted", |child| {
             assert!(child.is_none());
@@ -3379,7 +3550,7 @@ mod tests {
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
         record.pid = Some(41);
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
         let effect_ran = AtomicBool::new(false);
 
         emit_test_boot(&store, session_id, "skipped_missing_process_handle", |_| {
@@ -3398,7 +3569,7 @@ mod tests {
         let session_id = "boot-marker-after-physical-exit";
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
         let effect_ran = AtomicBool::new(false);
 
         emit_test_boot_reply(
@@ -3419,7 +3590,7 @@ mod tests {
         let session_id = "boot-marker-exit-during-promotion";
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
         let effect_ran = AtomicBool::new(false);
 
         emit_test_boot_reply(
@@ -3437,7 +3608,10 @@ mod tests {
     async fn failure_freshness_uses_the_exit_observation_boundary() {
         let store = SessionStore::new();
         let session_id = "failure-freshness-boundary";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let attempt = store
             .current_process_attempt(session_id)
             .await
@@ -3475,7 +3649,10 @@ mod tests {
     async fn launch_log_events_preserve_normal_minecraft_markers() {
         let store = SessionStore::new();
         let session_id = "normal-log-marker";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let mut receiver = store.subscribe(session_id).await.expect("subscribe");
 
         store
@@ -3501,7 +3678,10 @@ mod tests {
     async fn launch_log_events_redact_sensitive_public_lines() {
         let store = SessionStore::new();
         let session_id = "sensitive-log-line";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let mut receiver = store.subscribe(session_id).await.expect("subscribe");
 
         store
@@ -3529,7 +3709,7 @@ mod tests {
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
         record.process_started_at_ms = Some(now_ms().saturating_sub(1_000));
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
 
         store
             .emit_log(session_id, "stderr", "Unrecognized VM option '-XX:+UseZGC'")
@@ -3581,7 +3761,10 @@ mod tests {
     async fn launch_stop_request_records_execution_stop_intent_evidence() {
         let store = Arc::new(SessionStore::new());
         let session_id = "stop-intent-evidence";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let mut receiver = store.subscribe(session_id).await.expect("subscribe");
         let mut command = Command::new("sh");
         command.arg("-c").arg("sleep 5");
@@ -3685,7 +3868,10 @@ mod tests {
         let replacement_store = store.clone();
         let replacement = tokio::spawn(async move {
             let _ = started.send(());
-            replacement_store.insert(test_record(session_id)).await;
+            replacement_store
+                .insert(test_record(session_id))
+                .await
+                .expect("insert session");
         });
         started_rx.await.expect("replacement started");
         tokio::task::yield_now().await;
@@ -3754,7 +3940,10 @@ mod tests {
     async fn failed_user_stop_rolls_back_retention_and_lifecycle_guard() {
         let store = Arc::new(SessionStore::new());
         let session_id = "failed-user-stop-lease";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         store
             .sessions
             .write()
@@ -3786,7 +3975,10 @@ mod tests {
     async fn unavailable_launch_failure_settlement_keeps_the_session_active_and_retained() {
         let store = Arc::new(SessionStore::new());
         let session_id = "unavailable-launch-failure-settlement";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         {
             let mut sessions = store.sessions.write().await;
             let entry = sessions.get_mut(session_id).expect("session entry");
@@ -3817,7 +4009,10 @@ mod tests {
     async fn cancelled_begin_user_stop_detaches_retention_cleanup() {
         let store = Arc::new(SessionStore::new());
         let session_id = "cancelled-begin-user-stop";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let gated = attach_reap_gated_test_child(&store, session_id).await;
         let stop_store = store.clone();
         let stop = tokio::spawn(async move { stop_store.begin_user_stop(session_id).await });
@@ -3912,7 +4107,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn terminate_all_reaps_every_current_owner_before_clearing_sessions() {
+    async fn terminate_all_settles_every_current_owner_before_clearing_sessions() {
         let store = Arc::new(SessionStore::new());
         let mut pids = Vec::new();
         let mut receivers = Vec::new();
@@ -3935,6 +4130,7 @@ mod tests {
             .expect("shutdown owners");
 
         assert!(pids.into_iter().all(|pid| !process_is_live(pid)));
+        assert!(store.active_processes.lock().await.is_empty());
         assert!(store.sessions.read().await.is_empty());
         for receiver in &mut receivers {
             assert!(receiver.try_recv().is_err());
@@ -3943,10 +4139,207 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn cancelled_shutdown_waiting_for_admitted_launch_keeps_detached_coordinator() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "shutdown-cancelled-before-gate";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let pid_path = test_pid_path("shutdown-cancelled-before-gate");
+        let _ = std::fs::remove_file(&pid_path);
+        let sessions = store.sessions.read().await;
+        let start_store = store.clone();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf '%s' $$ > \"$1\"; exec sleep 30")
+            .arg("shutdown-cancelled-before-gate")
+            .arg(&pid_path);
+        let start = tokio::spawn(async move {
+            start_store
+                .start_process(test_record(session_id), command)
+                .await
+        });
+        let pid = wait_for_pid_file(&pid_path).await;
+
+        let shutdown_store = store.clone();
+        let shutdown = tokio::spawn(async move { shutdown_store.terminate_all().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.shutdown_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown latch deadline");
+        shutdown.abort();
+        assert!(
+            shutdown
+                .await
+                .expect_err("cancelled shutdown")
+                .is_cancelled()
+        );
+        assert!(store.shutdown_started.load(Ordering::Acquire));
+
+        drop(sessions);
+        let launched = tokio::time::timeout(Duration::from_secs(2), start)
+            .await
+            .expect("admitted launch registration deadline")
+            .expect("admitted launch task")
+            .expect("admitted launch registers");
+        assert_eq!(launched.pid, Some(pid));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store.active_processes.lock().await.is_empty()
+                    && store.sessions.read().await.is_empty()
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("original shutdown coordinator completion");
+        assert!(!process_is_live(pid));
+        assert!(store.active_processes.lock().await.is_empty());
+        assert!(store.sessions.read().await.is_empty());
+        store
+            .terminate_all()
+            .await
+            .expect("later shutdown observes idempotent completion");
+        let _ = std::fs::remove_file(pid_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_latch_rejects_queued_insert_and_relaunch_and_is_idempotent() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "shutdown-admission-latch";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let gated = attach_reap_gated_test_child(&store, session_id).await;
+        let shutdown_store = store.clone();
+        let shutdown = tokio::spawn(async move { shutdown_store.terminate_all().await });
+        gated
+            .reap_reached
+            .await
+            .expect("shutdown reaches process reap gate");
+
+        let insert_store = store.clone();
+        let insert = tokio::spawn(async move {
+            insert_store
+                .insert(test_record("insert-after-shutdown"))
+                .await
+        });
+        let start_store = store.clone();
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec sleep 30");
+        let start = tokio::spawn(async move {
+            start_store
+                .start_process(test_record(session_id), command)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!insert.is_finished());
+        assert!(!start.is_finished());
+
+        gated.release_reap.send(()).expect("release process reap");
+        shutdown
+            .await
+            .expect("shutdown task")
+            .expect("shutdown succeeds");
+        insert
+            .await
+            .expect("insert task")
+            .expect_err("insert is rejected after shutdown begins");
+        let error = start
+            .await
+            .expect("relaunch task")
+            .expect_err("relaunch is rejected after shutdown begins");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+        assert_eq!(error.to_string(), "launch session store is shutting down");
+        assert!(store.sessions.read().await.is_empty());
+        assert!(store.active_processes.lock().await.is_empty());
+        store
+            .terminate_all()
+            .await
+            .expect("repeated shutdown is idempotent");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_all_waits_for_output_settlement_and_exact_owner_removal() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "shutdown-output-settlement";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("process attempt");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec sleep 30").kill_on_drop(true);
+        let child = command.spawn().expect("shutdown child");
+        let (control, owner) = supervisor::prepare_process_owner(child);
+        let release_output = Arc::new(Notify::new());
+        let output_release = release_output.clone();
+        {
+            let mut active = store.active_processes.lock().await;
+            let mut sessions = store.sessions.write().await;
+            sessions.get_mut(session_id).expect("session").process = Some(control.clone());
+            active.insert(attempt.id, control.clone());
+            owner.spawn(
+                store.clone(),
+                session_id.to_string(),
+                attempt.clone(),
+                supervisor::output_pump_tasks_with_processor(tokio::spawn(async move {
+                    output_release.notified().await;
+                })),
+            );
+        }
+        let shutdown_store = store.clone();
+        let shutdown = tokio::spawn(async move { shutdown_store.terminate_all().await });
+        control.wait_until_reaped().await;
+
+        assert!(!shutdown.is_finished());
+        assert!(
+            store
+                .active_processes
+                .lock()
+                .await
+                .contains_key(&attempt.id)
+        );
+        assert!(store.get(session_id).await.is_some());
+
+        release_output.notify_one();
+        shutdown
+            .await
+            .expect("shutdown task")
+            .expect("shutdown waits for owner completion");
+        assert!(
+            !store
+                .active_processes
+                .lock()
+                .await
+                .contains_key(&attempt.id)
+        );
+        assert!(store.sessions.read().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn launch_watchdog_kills_outputting_process_without_boot_marker() {
         let store = Arc::new(SessionStore::new());
         let session_id = "watchdog-no-boot-marker";
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let mut receiver = store.subscribe(session_id).await.expect("subscribe");
         let mut command = Command::new("sh");
         command
@@ -4018,7 +4411,8 @@ mod tests {
         let session_id = "stale-failure-clean-exit";
         store
             .insert(terminal_record(session_id, LaunchState::Running, true))
-            .await;
+            .await
+            .expect("insert session");
 
         {
             let mut sessions = store.sessions.write().await;
@@ -4150,7 +4544,10 @@ mod tests {
         let launcher_stop_session = "launcher-stop";
         let launcher_stop_record =
             terminal_record(launcher_stop_session, LaunchState::Running, true);
-        store.insert(launcher_stop_record).await;
+        store
+            .insert(launcher_stop_record)
+            .await
+            .expect("insert session");
         mark_stop_requested(&store, launcher_stop_session).await;
         let mut receiver = store
             .subscribe(launcher_stop_session)
@@ -4234,7 +4631,7 @@ mod tests {
         let mut record = test_record("timeout-running");
         record.state = LaunchState::Monitoring;
         record.process_started_at_ms = Some(now_ms().saturating_sub(5_000));
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
 
         store
             .emit_log("timeout-running", "stdout", "ordinary startup output")
@@ -4287,16 +4684,19 @@ mod tests {
         let store = SessionStore::new();
         let mut active = test_record("active-memory");
         active.command = vec!["java".to_string(), "-Xmx2048M".to_string()];
-        store.insert(active).await;
+        store.insert(active).await.expect("insert session");
 
         let mut queued_without_command = test_record("queued-without-command");
         queued_without_command.command = Vec::new();
-        store.insert(queued_without_command).await;
+        store
+            .insert(queued_without_command)
+            .await
+            .expect("insert session");
 
         let mut exited = test_record("exited-memory");
         exited.state = LaunchState::Exited;
         exited.command = vec!["java".to_string(), "-Xmx8192M".to_string()];
-        store.insert(exited).await;
+        store.insert(exited).await.expect("insert session");
 
         assert_eq!(store.active_memory_allocation_mb().await, 2048);
     }
@@ -4304,15 +4704,18 @@ mod tests {
     #[tokio::test]
     async fn launch_active_session_count_excludes_terminal_sessions() {
         let store = SessionStore::new();
-        store.insert(test_record("queued-count")).await;
+        store
+            .insert(test_record("queued-count"))
+            .await
+            .expect("insert session");
 
         let mut starting = test_record("starting-count");
         starting.state = LaunchState::Starting;
-        store.insert(starting).await;
+        store.insert(starting).await.expect("insert session");
 
         let mut exited = test_record("exited-count");
         exited.state = LaunchState::Exited;
-        store.insert(exited).await;
+        store.insert(exited).await.expect("insert session");
 
         assert_eq!(store.active_session_count().await, 2);
     }
@@ -4322,11 +4725,11 @@ mod tests {
         let store = SessionStore::new();
         let mut failed = test_record("failed-session");
         failed.state = LaunchState::Failed;
-        store.insert(failed).await;
+        store.insert(failed).await.expect("insert session");
 
         let mut exited = test_record("exited-session");
         exited.state = LaunchState::Exited;
-        store.insert(exited).await;
+        store.insert(exited).await.expect("insert session");
 
         assert!(
             !store
@@ -4338,7 +4741,10 @@ mod tests {
     #[tokio::test]
     async fn launch_active_session_id_lookup_detects_non_terminal_sessions() {
         let store = SessionStore::new();
-        store.insert(test_record("queued-session")).await;
+        store
+            .insert(test_record("queued-session"))
+            .await
+            .expect("insert session");
 
         assert!(
             store
@@ -4353,7 +4759,7 @@ mod tests {
         status: LaunchStatusEvent,
     ) -> (LaunchStatusEvent, LaunchSessionRecord) {
         let session_id = record.session_id.0.clone();
-        store.insert(record).await;
+        store.insert(record).await.expect("insert session");
         let mut receiver = store.subscribe(&session_id).await.expect("subscribe");
         store.emit_status(&session_id, status).await;
         let status = recv_status(&mut receiver).await;
@@ -4494,14 +4900,17 @@ mod tests {
     }
 
     async fn replace_session(store: &SessionStore, session_id: &str) -> Arc<ProcessAttemptScope> {
-        store.insert(test_record(session_id)).await;
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let stale_attempt = store
             .current_process_attempt(session_id)
             .await
             .expect("stale attempt");
         let mut replacement = test_record(session_id);
         replacement.state = LaunchState::Starting;
-        store.insert(replacement).await;
+        store.insert(replacement).await.expect("insert session");
         stale_attempt
     }
 

@@ -221,7 +221,11 @@ mod tests {
         let root = unique_test_dir("live-launch-failure");
         let state = test_app_state(&root);
         let session_id = "unsafe-live-failure";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let mut events = state
             .sessions()
             .subscribe(session_id)
@@ -287,7 +291,11 @@ mod tests {
         let root = unique_test_dir("spawn-failed-outcome");
         let state = test_app_state(&root);
         let session_id = "spawn-failed-outcome";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
 
         let expected = LaunchSessionOutcome::from_reason(LaunchSessionExitReason::SpawnFailed);
         let _ = fail_launch_with_outcome(

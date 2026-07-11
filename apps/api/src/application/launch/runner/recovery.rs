@@ -885,7 +885,11 @@ mod tests {
         let root = unique_test_dir("runner-launch-recovery-memory");
         let state = test_app_state(&root);
         let session_id = "runner-launch-recovery-memory";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
         let plan = test_recovery_plan(
             session_id,
@@ -1001,7 +1005,11 @@ mod tests {
             let root = unique_test_dir(name);
             let state = test_app_state(&root);
             let session_id = name;
-            state.sessions().insert(test_record(session_id)).await;
+            state
+                .sessions()
+                .insert(test_record(session_id))
+                .await
+                .expect("insert session");
             let intent = test_launch_intent(&root, session_id);
             let plan = test_recovery_plan(session_id, &intent, kind);
             assert_eq!(
@@ -1073,7 +1081,11 @@ mod tests {
         let root = unique_test_dir("runner-preset-recovery-suppression");
         let state = test_app_state(&root);
         let session_id = "runner-preset-recovery-suppression";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
         let plan = test_recovery_plan(
             session_id,
@@ -1155,7 +1167,11 @@ mod tests {
         let root = unique_test_dir("runner-terminal-journal-retry");
         let state = test_app_state(&root);
         let session_id = "runner-terminal-journal-retry";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
         let plan = test_recovery_plan(
             session_id,
@@ -1222,7 +1238,11 @@ mod tests {
         let root = unique_test_dir("runner-missing-recovery-operation");
         let state = test_app_state(&root);
         let session_id = "runner-missing-recovery-operation";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
         let plan = test_recovery_plan(
             session_id,
@@ -1257,7 +1277,11 @@ mod tests {
         let root = unique_test_dir("runner-terminal-journal-cancel");
         let state = test_app_state(&root);
         let session_id = "runner-terminal-journal-cancel";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
         let plan = test_recovery_plan(
             session_id,

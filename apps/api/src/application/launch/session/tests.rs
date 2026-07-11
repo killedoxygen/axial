@@ -254,7 +254,8 @@ impl TestFixture {
                 outcome: None,
                 stages: Vec::new(),
             })
-            .await;
+            .await
+            .expect("insert session");
     }
 
     async fn add_active_install(&self, install_id: &str) {

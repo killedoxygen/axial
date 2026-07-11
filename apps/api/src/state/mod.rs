@@ -54,7 +54,7 @@ pub(crate) use remote_flags::{
     RemoteFlagRefreshOutcome, RemoteFlagStore, ResolvedFlagSource, resolve_flag,
 };
 pub(crate) use sessions::{LaunchFailureTermination, LaunchFailureTerminationErrorClass};
-pub use sessions::{SessionStore, StartupOutcome};
+pub use sessions::{SessionAdmissionError, SessionStore, StartupOutcome};
 
 #[derive(Clone)]
 pub struct AppState {

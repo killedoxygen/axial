@@ -1021,7 +1021,11 @@ mod tests {
         let root = unique_test_dir("rejected-launch-recovery-plan");
         let state = test_app_state(&root);
         let session_id = "rejected-launch-recovery-plan";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let mut guardian = GuardianSummary::new(axial_launcher::GuardianMode::Managed);
         let user_outcome = GuardianUserOutcome {
             decision: GuardianDecisionKind::Block,
@@ -1064,7 +1068,11 @@ mod tests {
         let root = unique_test_dir("nonretryable-launch-journal-error");
         let state = test_app_state(&root);
         let session_id = "nonretryable-launch-journal-error";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let error = guardian_journal_error(OperationJournalStoreError::MissingOperation);
 
         let result = match terminalize_unhandled_launch_error(&state, session_id, Err(error)).await
@@ -1094,7 +1102,11 @@ mod tests {
         let root = unique_test_dir("spawned-launch-journal-error");
         let state = test_app_state(&root);
         let session_id = "spawned-launch-journal-error";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let mut command = Command::new("sh");
         command.arg("-c").arg("sleep 30");
         state
@@ -1156,7 +1168,11 @@ mod tests {
         let process_release = root.join("release-process");
         let mut record = test_record(session_id);
         record.instance_id = instance.id.clone();
-        state.sessions().insert(record.clone()).await;
+        state
+            .sessions()
+            .insert(record.clone())
+            .await
+            .expect("insert session");
         let mut command = Command::new("sh");
         command
             .arg("-c")
@@ -1314,7 +1330,11 @@ mod tests {
         let root = unique_test_dir("runner-stage-evidence");
         let state = test_app_state(&root);
         let session_id = "runner-stage-evidence";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let mut events = state
             .sessions()
             .subscribe(session_id)

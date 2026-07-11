@@ -308,7 +308,8 @@ async fn prepare_launch_session_with_auth_refresh(
             outcome: None,
             stages: Vec::new(),
         })
-        .await;
+        .await
+        .map_err(launch_session_admission_error_response)?;
     let insert_elapsed = insert_started_at.elapsed();
     trace_launch_event(
         &session_id.0,
@@ -368,6 +369,17 @@ fn launch_journal_error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({
             "error": "Could not record the launch repair safely. Check app data permissions and try again."
+        })),
+    )
+}
+
+fn launch_session_admission_error_response(
+    _error: crate::state::SessionAdmissionError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "Launches are unavailable while the application is shutting down."
         })),
     )
 }

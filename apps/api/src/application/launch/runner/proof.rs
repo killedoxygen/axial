@@ -108,7 +108,11 @@ mod tests {
         let root = unique_test_dir("launch-proof-persistence");
         let state = test_app_state(&root);
         let session_id = "launch-proof-persistence";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
 
         let command = vec![
             r"C:\Users\Alice\.jdks\java.exe".to_string(),
@@ -172,7 +176,11 @@ mod tests {
         let root = unique_test_dir("launch-proof-dropped-waiter");
         let state = test_app_state(&root);
         let session_id = "launch-proof-dropped-waiter";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let instance_id = "instance";
         let suite_id = crate::state::benchmark_suites::derive_suite_id(instance_id, "development");
         let plan = development_suite_plan();
@@ -216,7 +224,11 @@ mod tests {
         let root = unique_test_dir("launch-proof-failure-suite-outcome");
         let state = test_app_state(&root);
         let session_id = "launch-proof-failure-suite-outcome";
-        state.sessions().insert(test_record(session_id)).await;
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
         let instance_id = "instance";
         let suite_id = crate::state::benchmark_suites::derive_suite_id(instance_id, "development");
         let plan = development_suite_plan();
