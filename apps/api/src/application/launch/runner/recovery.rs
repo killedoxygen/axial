@@ -25,7 +25,6 @@ const JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
 const JOURNAL_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
 pub(super) fn plan_guardian_launch_recovery_directive(
-    session_id: &str,
     intent: &axial_launcher::LaunchIntent,
     directive: GuardianLaunchRecoveryDirective,
     mode: crate::guardian::GuardianMode,
@@ -33,7 +32,7 @@ pub(super) fn plan_guardian_launch_recovery_directive(
 ) -> Result<GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection> {
     let user_intent_hash = launch_recovery_user_intent_hash(intent, directive.kind);
     plan_launch_recovery_directive(GuardianLaunchRecoveryPlanRequest {
-        session_id,
+        instance_id: &intent.instance_id,
         mode,
         directive,
         failure_class,
@@ -640,7 +639,7 @@ mod tests {
         GuardianStartupFailureObservation, GuardianStartupFailureRequest,
         guardian_startup_failure_outcome,
     };
-    use crate::state::contracts::OperationStatus;
+    use crate::state::contracts::{OperationStatus, TargetKind};
     use crate::state::failure_memory::FailureMemoryActionOutcome;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
@@ -849,7 +848,6 @@ mod tests {
                     .to_string(),
         };
         let plan = plan_guardian_launch_recovery_directive(
-            "session",
             &intent,
             directive,
             crate::guardian::GuardianMode::Managed,
@@ -894,11 +892,9 @@ mod tests {
             .await
             .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
-        let plan = test_recovery_plan(
-            session_id,
-            &intent,
-            GuardianLaunchRecoveryKind::StripRawJvmArgs,
-        );
+        let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
+        assert_eq!(plan.target.kind, TargetKind::Instance);
+        assert_eq!(plan.target.id, intent.instance_id);
 
         let attempt = record_guardian_launch_recovery_attempt(
             &state,
@@ -922,15 +918,13 @@ mod tests {
         .await
         .expect("persist failed launch recovery");
 
-        let suppressed_plan = test_recovery_plan(
-            session_id,
-            &intent,
-            GuardianLaunchRecoveryKind::StripRawJvmArgs,
-        );
+        let suppressed_plan =
+            test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
+        let later_session_id = "runner-launch-recovery-memory-later-session";
 
         let suppressed = record_guardian_launch_recovery_attempt(
             &state,
-            session_id,
+            later_session_id,
             &suppressed_plan,
             LaunchFailureClass::JvmUnsupportedOption,
         )
@@ -1014,7 +1008,7 @@ mod tests {
                 .await
                 .expect("insert session");
             let intent = test_launch_intent(&root, session_id);
-            let plan = test_recovery_plan(session_id, &intent, kind);
+            let plan = test_recovery_plan(&intent, kind);
             assert_eq!(
                 plan.trigger_failure_class,
                 LaunchFailureClass::JvmUnsupportedOption
@@ -1062,7 +1056,7 @@ mod tests {
                 Some(FailureMemoryActionOutcome::Failed)
             );
 
-            let suppressed_plan = test_recovery_plan(session_id, &intent, kind);
+            let suppressed_plan = test_recovery_plan(&intent, kind);
             let suppressed = record_guardian_launch_recovery_attempt(
                 &state,
                 session_id,
@@ -1090,11 +1084,7 @@ mod tests {
             .await
             .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
-        let plan = test_recovery_plan(
-            session_id,
-            &intent,
-            GuardianLaunchRecoveryKind::DowngradePreset,
-        );
+        let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::DowngradePreset);
 
         let attempt = record_guardian_launch_recovery_attempt(
             &state,
@@ -1118,11 +1108,8 @@ mod tests {
         .await
         .expect("persist failed launch recovery");
 
-        let suppressed_plan = test_recovery_plan(
-            session_id,
-            &intent,
-            GuardianLaunchRecoveryKind::DowngradePreset,
-        );
+        let suppressed_plan =
+            test_recovery_plan(&intent, GuardianLaunchRecoveryKind::DowngradePreset);
 
         let suppressed = record_guardian_launch_recovery_attempt(
             &state,
@@ -1176,11 +1163,7 @@ mod tests {
             .await
             .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
-        let plan = test_recovery_plan(
-            session_id,
-            &intent,
-            GuardianLaunchRecoveryKind::StripRawJvmArgs,
-        );
+        let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
         record_guardian_launch_recovery_attempt(
             &state,
             session_id,
@@ -1247,11 +1230,7 @@ mod tests {
             .await
             .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
-        let plan = test_recovery_plan(
-            session_id,
-            &intent,
-            GuardianLaunchRecoveryKind::StripRawJvmArgs,
-        );
+        let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
 
         let error = tokio::time::timeout(
             Duration::from_millis(250),
@@ -1286,11 +1265,7 @@ mod tests {
             .await
             .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
-        let plan = test_recovery_plan(
-            session_id,
-            &intent,
-            GuardianLaunchRecoveryKind::StripRawJvmArgs,
-        );
+        let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
         record_guardian_launch_recovery_attempt(
             &state,
             session_id,
@@ -1353,11 +1328,7 @@ mod tests {
     #[test]
     fn suppressed_launch_recovery_block_uses_existing_guardian_block_copy() {
         let intent = test_launch_intent(Path::new("/tmp/axial-test"), "session");
-        let plan = test_recovery_plan(
-            "session",
-            &intent,
-            GuardianLaunchRecoveryKind::StripRawJvmArgs,
-        );
+        let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
         let outcome = suppressed_launch_recovery_outcome(&plan);
         let reason = outcome.summary.clone();
         let mut guardian = GuardianSummary::new(GuardianMode::Managed);
@@ -1383,7 +1354,6 @@ mod tests {
     }
 
     fn test_recovery_plan(
-        session_id: &str,
         intent: &axial_launcher::LaunchIntent,
         kind: GuardianLaunchRecoveryKind,
     ) -> GuardianLaunchRecoveryPlan {
@@ -1415,7 +1385,6 @@ mod tests {
             },
         };
         plan_guardian_launch_recovery_directive(
-            session_id,
             intent,
             directive,
             crate::guardian::GuardianMode::Managed,

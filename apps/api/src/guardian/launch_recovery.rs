@@ -110,7 +110,7 @@ pub struct GuardianLaunchRecoveryPlan {
 
 #[derive(Clone, Debug)]
 pub struct GuardianLaunchRecoveryPlanRequest<'a> {
-    pub session_id: &'a str,
+    pub instance_id: &'a str,
     pub mode: GuardianMode,
     pub directive: GuardianLaunchRecoveryDirective,
     pub failure_class: LaunchFailureClass,
@@ -161,7 +161,7 @@ pub fn plan_launch_recovery_directive(
     Ok(GuardianLaunchRecoveryPlan {
         operation_id: new_launch_recovery_operation_id(request.directive.kind),
         mode: request.mode,
-        target: launch_recovery_target(request.session_id),
+        target: launch_recovery_target(request.instance_id),
         action_template: launch_recovery_action_template(&request.directive),
         directive: request.directive,
         trigger_failure_class: request.failure_class,
@@ -393,11 +393,11 @@ fn launch_recovery_action_template(
     }
 }
 
-fn launch_recovery_target(session_id: &str) -> TargetDescriptor {
+fn launch_recovery_target(instance_id: &str) -> TargetDescriptor {
     TargetDescriptor::new(
         StabilizationSystem::Guardian,
-        TargetKind::Session,
-        format!("launch_recovery_{}", safe_id(session_id, "session")),
+        TargetKind::Instance,
+        instance_id,
         OwnershipClass::LauncherManaged,
     )
 }
@@ -610,7 +610,7 @@ mod tests {
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{GuardianActionKind, GuardianMode};
     use crate::state::OperationJournalStore;
-    use crate::state::contracts::{CommandKind, OperationStatus};
+    use crate::state::contracts::{CommandKind, OperationStatus, OwnershipClass, TargetKind};
     use crate::state::failure_memory::{
         FailureMemoryActionOutcome, FailureMemorySnapshot, GuardianFailureMemoryStore,
         failure_memory_path,
@@ -896,11 +896,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_recovery_attempt_is_suppressed_while_failure_window_is_active() {
+    async fn later_session_for_same_instance_is_suppressed_and_merges_memory() {
         let journals = OperationJournalStore::new();
         let failure_memory = GuardianFailureMemoryStore::new();
         let initial_plan = plan(
-            "session-3",
+            "instance-3",
             GuardianLaunchRecoveryKind::DowngradePreset,
             Some("preset_override_present"),
         );
@@ -926,7 +926,7 @@ mod tests {
         .expect("persist launch recovery failure");
 
         let suppressed_plan = plan(
-            "session-3",
+            "instance-3",
             GuardianLaunchRecoveryKind::DowngradePreset,
             Some("preset_override_present"),
         );
@@ -942,11 +942,76 @@ mod tests {
         .expect("persist suppressed launch recovery attempt");
 
         assert_eq!(outcome.status, GuardianLaunchRecoveryStatus::Suppressed);
+        assert_ne!(initial_plan.operation_id, suppressed_plan.operation_id);
         let memory = failure_memory.list();
+        assert_eq!(memory.len(), 1);
+        assert_eq!(memory[0].target.kind, TargetKind::Instance);
+        assert_eq!(memory[0].target.id, "instance-3");
+        assert_eq!(memory[0].occurrence_count, 2);
         assert_eq!(
             memory[0].last_action_outcome,
             Some(FailureMemoryActionOutcome::Suppressed)
         );
+    }
+
+    #[tokio::test]
+    async fn launch_recovery_suppression_is_independent_between_instances() {
+        let journals = OperationJournalStore::new();
+        let failure_memory = GuardianFailureMemoryStore::new();
+        let first_plan = plan(
+            "instance-a",
+            GuardianLaunchRecoveryKind::DowngradePreset,
+            Some("preset_override_present"),
+        );
+
+        record_launch_recovery_attempt(request(
+            &first_plan,
+            LaunchFailureClass::JvmUnsupportedOption,
+            "2026-06-15T09:59:00Z",
+            &journals,
+            &failure_memory,
+        ))
+        .await
+        .expect("persist first instance recovery attempt");
+        record_launch_recovery_failure(request(
+            &first_plan,
+            LaunchFailureClass::JvmUnsupportedOption,
+            "2026-06-15T10:00:00Z",
+            &journals,
+            &failure_memory,
+        ))
+        .await
+        .expect("persist first instance recovery failure");
+
+        let second_plan = plan(
+            "instance-b",
+            GuardianLaunchRecoveryKind::DowngradePreset,
+            Some("preset_override_present"),
+        );
+        let outcome = record_launch_recovery_attempt(request(
+            &second_plan,
+            LaunchFailureClass::JvmUnsupportedOption,
+            "2026-06-15T10:05:00Z",
+            &journals,
+            &failure_memory,
+        ))
+        .await
+        .expect("persist independent second instance recovery attempt");
+
+        assert_eq!(outcome.status, GuardianLaunchRecoveryStatus::Recorded);
+        record_launch_recovery_failure(request(
+            &second_plan,
+            LaunchFailureClass::JvmUnsupportedOption,
+            "2026-06-15T10:06:00Z",
+            &journals,
+            &failure_memory,
+        ))
+        .await
+        .expect("persist independent second instance recovery failure");
+        let memory = failure_memory.list();
+        assert_eq!(memory.len(), 2);
+        assert!(memory.iter().any(|entry| entry.target.id == "instance-a"));
+        assert!(memory.iter().any(|entry| entry.target.id == "instance-b"));
     }
 
     #[tokio::test]
@@ -1091,7 +1156,7 @@ mod tests {
     #[test]
     fn launch_recovery_directive_plan_declares_action_template() {
         let plan = plan(
-            "session-4",
+            "instance-4",
             GuardianLaunchRecoveryKind::SwitchManagedRuntime,
             Some("java_override_present:1.21.1"),
         );
@@ -1106,6 +1171,9 @@ mod tests {
         );
         assert_eq!(plan.action_template.max_attempts, 1);
         assert_eq!(plan.max_depth, 1);
+        assert_eq!(plan.target.kind, TargetKind::Instance);
+        assert_eq!(plan.target.id, "instance-4");
+        assert_eq!(plan.target.ownership, OwnershipClass::LauncherManaged);
         assert!(
             plan.user_intent_hash
                 .as_deref()
@@ -1121,7 +1189,7 @@ mod tests {
     #[test]
     fn launch_recovery_plan_rejects_mismatched_directive_effect() {
         let rejection = plan_launch_recovery_directive(GuardianLaunchRecoveryPlanRequest {
-            session_id: "session-5",
+            instance_id: "instance-5",
             mode: GuardianMode::Managed,
             directive: GuardianLaunchRecoveryDirective {
                 kind: GuardianLaunchRecoveryKind::StripRawJvmArgs,
@@ -1156,12 +1224,12 @@ mod tests {
     }
 
     fn plan(
-        session_id: &str,
+        instance_id: &str,
         kind: GuardianLaunchRecoveryKind,
         user_intent_hash: Option<&str>,
     ) -> GuardianLaunchRecoveryPlan {
         plan_launch_recovery_directive(GuardianLaunchRecoveryPlanRequest {
-            session_id,
+            instance_id,
             mode: GuardianMode::Managed,
             directive: directive(kind),
             failure_class: LaunchFailureClass::JvmUnsupportedOption,

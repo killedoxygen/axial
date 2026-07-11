@@ -515,7 +515,7 @@ mod tests {
     #[test]
     fn launch_recovery_suppression_outcome_authors_public_copy() {
         let plan = plan_launch_recovery_directive(GuardianLaunchRecoveryPlanRequest {
-            session_id: "session-1",
+            instance_id: "instance-1",
             mode: crate::guardian::GuardianMode::Managed,
             directive: GuardianLaunchRecoveryDirective {
                 kind: GuardianLaunchRecoveryKind::StripRawJvmArgs,

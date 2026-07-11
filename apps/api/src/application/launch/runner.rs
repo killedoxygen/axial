@@ -314,22 +314,23 @@ async fn settle_observed_launch_failure(
         persist_terminal_proof(state, session_id, launched_at, proof_context, record).await;
         return;
     };
-    let (guardian_decision, terminal_state) = match observed_phase {
+    let terminal_state = match observed_phase {
         GuardianObservedLaunchFailurePhase::BeforeBoot => {
-            (axial_launcher::GuardianDecision::Blocked, "failed")
+            block_guardian_with_user_outcome(&mut guardian, &user_outcome);
+            "failed"
         }
         GuardianObservedLaunchFailurePhase::AfterBoot => {
-            (axial_launcher::GuardianDecision::Warned, "exited")
+            guardian.decision = axial_launcher::GuardianDecision::Warned;
+            guardian.message = Some(user_outcome.summary.clone());
+            for detail in &user_outcome.details {
+                push_unique_guardian_detail(&mut guardian.details, detail);
+            }
+            for guidance in &user_outcome.guidance {
+                push_unique_guardian_detail(&mut guardian.guidance, guidance);
+            }
+            "exited"
         }
     };
-    guardian.decision = guardian_decision;
-    guardian.message = Some(user_outcome.summary.clone());
-    for detail in &user_outcome.details {
-        push_unique_guardian_detail(&mut guardian.details, detail);
-    }
-    for guidance in &user_outcome.guidance {
-        push_unique_guardian_detail(&mut guardian.guidance, guidance);
-    }
 
     state
         .sessions()
@@ -657,7 +658,6 @@ async fn launch_session_inner_with_control(
                         .await);
                     };
                     let recovery_plan = match plan_budgeted_guardian_launch_recovery_directive(
-                        &session_id,
                         &intent,
                         directive,
                         launch_policy_guardian_mode(intent.guardian.mode),
@@ -761,7 +761,6 @@ async fn launch_session_inner_with_control(
                 explicit_jvm_preset_present: intent.guardian.has_named_preset(),
             })
             && let Ok(plan) = plan_guardian_launch_recovery_directive(
-                &session_id,
                 &intent,
                 directive,
                 launch_policy_guardian_mode(intent.guardian.mode),
@@ -1208,7 +1207,6 @@ async fn launch_session_inner_with_control(
                         .await);
                     };
                     let recovery_plan = match plan_budgeted_guardian_launch_recovery_directive(
-                        &session_id,
                         &intent,
                         directive,
                         launch_policy_guardian_mode(intent.guardian.mode),
@@ -1335,14 +1333,13 @@ fn reserve_recovery_attempt(recovery_attempts: &mut u8) -> Option<RecoveryAttemp
 }
 
 fn plan_budgeted_guardian_launch_recovery_directive(
-    session_id: &str,
     intent: &axial_launcher::LaunchIntent,
     directive: crate::guardian::GuardianLaunchRecoveryDirective,
     mode: crate::guardian::GuardianMode,
     failure_class: LaunchFailureClass,
     _reservation: RecoveryAttemptReservation,
 ) -> Result<GuardianLaunchRecoveryPlan, crate::guardian::GuardianLaunchRecoveryPlanRejection> {
-    plan_guardian_launch_recovery_directive(session_id, intent, directive, mode, failure_class)
+    plan_guardian_launch_recovery_directive(intent, directive, mode, failure_class)
 }
 
 #[derive(Default)]
@@ -2243,6 +2240,12 @@ mod tests {
         let guardian = record.guardian.as_ref().expect("startup failure guardian");
         assert_eq!(guardian["decision"], "blocked");
         assert_eq!(guardian["message"], "Guardian blocked launch startup.");
+        let guardian_details = guardian["details"].as_array().expect("Guardian details");
+        let guardian_guidance = guardian["guidance"].as_array().expect("Guardian guidance");
+        assert!(!guardian_guidance.is_empty());
+        for guidance in guardian_guidance {
+            assert!(guardian_details.contains(guidance));
+        }
         assert_eq!(
             record
                 .failure

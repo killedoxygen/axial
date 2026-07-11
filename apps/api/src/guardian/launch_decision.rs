@@ -292,7 +292,16 @@ fn accepted_launch_failure_copy(
                 guidance,
             });
         }
-        _ => return None,
+        LaunchFailureClass::Unknown
+        | LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering
+        | LaunchFailureClass::JavaRuntimeMismatch
+        | LaunchFailureClass::ClasspathModuleConflict
+        | LaunchFailureClass::LauncherManagedArtifactSignature
+        | LaunchFailureClass::AuthModeIncompatible
+        | LaunchFailureClass::LoaderBootstrapFailure
+        | LaunchFailureClass::StartupStalled => return None,
     };
 
     Some(AcceptedLaunchFailureCopy {
