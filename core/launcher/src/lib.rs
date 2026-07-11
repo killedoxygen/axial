@@ -1,5 +1,6 @@
 pub mod build;
 pub mod crash;
+pub mod failure;
 pub mod guardian;
 pub mod healing;
 pub mod jvm;
@@ -21,11 +22,12 @@ pub use crash::{
     CrashNativeFrameKind, CrashNativeModule, CrashNativeSymbol, CrashProblematicFrame,
     MAX_CRASH_ARTIFACT_BYTES, parse_crash_evidence,
 };
+pub use failure::{classify_launch_failure, classify_startup_failure_text};
 pub use guardian::{
     GuardianDecision, GuardianIntervention, GuardianInterventionKind, GuardianMode,
     GuardianSummary, LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB,
     LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB, LaunchCpuLoadWarningFacts, LaunchGuardianContext,
-    LaunchResourceWarningFacts, OverrideOrigin, classify_startup_failure_text,
+    LaunchResourceWarningFacts, OverrideOrigin,
 };
 pub use healing::{HealingEvent, HealingEventKind};
 pub use jvm::{

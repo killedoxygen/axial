@@ -67,6 +67,10 @@ pub fn format_failure_class(class: LaunchFailureClass) -> &'static str {
         LaunchFailureClass::JvmOptionOrdering => "JVM option ordering conflict",
         LaunchFailureClass::JavaRuntimeMismatch => "Java runtime mismatch",
         LaunchFailureClass::OutOfMemory => "out of memory",
+        LaunchFailureClass::GraphicsDriverCrash => "graphics driver crash",
+        LaunchFailureClass::MissingDependency => "missing dependency",
+        LaunchFailureClass::ModTransformationFailure => "mod transformation failure",
+        LaunchFailureClass::ModAttributedCrash => "mod-attributed crash",
         LaunchFailureClass::ClasspathModuleConflict => "classpath or module conflict",
         LaunchFailureClass::LauncherManagedArtifactSignature => {
             "launcher-managed artifact signature corruption"

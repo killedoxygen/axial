@@ -1,5 +1,3 @@
-use crate::crash::is_out_of_memory_failure_line;
-use crate::types::LaunchFailureClass;
 use serde::{Deserialize, Serialize};
 
 pub const LAUNCH_MEMORY_HEADROOM_MB: u64 = 2048;
@@ -621,97 +619,14 @@ fn format_load_x100(value: u64) -> String {
     format!("{}.{:02}", value / 100, value % 100)
 }
 
-pub fn classify_startup_failure_text(text: &str) -> LaunchFailureClass {
-    let lower = text.trim().to_lowercase();
-    if lower.is_empty() {
-        return LaunchFailureClass::Unknown;
-    }
-    if lower.contains("unrecognized vm option") || lower.contains("unsupported vm option") {
-        return LaunchFailureClass::JvmUnsupportedOption;
-    }
-    if lower.contains("must be enabled via -xx:+unlockexperimentalvmoptions") {
-        return LaunchFailureClass::JvmExperimentalUnlock;
-    }
-    if lower.contains("unlock option must precede") || lower.contains("must precede") {
-        return LaunchFailureClass::JvmOptionOrdering;
-    }
-    if lower.contains("unsupportedclassversionerror")
-        || lower.contains("compiled by a more recent version of the java runtime")
-        || lower.contains("requires java")
-    {
-        return LaunchFailureClass::JavaRuntimeMismatch;
-    }
-    if contains_out_of_memory_failure(&lower) {
-        return LaunchFailureClass::OutOfMemory;
-    }
-    if contains_artifact_signature_failure(&lower) {
-        return LaunchFailureClass::LauncherManagedArtifactSignature;
-    }
-    if lower.contains("resolutionexception: modules")
-        || lower.contains("export package")
-        || lower.contains("modulelayerhandler.buildlayer")
-        || lower.contains("noclassdeffounderror")
-        || lower.contains("classnotfoundexception")
-        || lower.contains("failed to locate library:")
-        || lower.contains("unsatisfiedlinkerror")
-    {
-        return LaunchFailureClass::ClasspathModuleConflict;
-    }
-    if lower.contains("nosuchelementexception: no value present")
-        || (contains_loader_bootstrap_marker(&lower) && contains_failure_context(&lower))
-    {
-        return LaunchFailureClass::LoaderBootstrapFailure;
-    }
-    if lower.contains("microsoft account")
-        || lower.contains("check your microsoft account")
-        || lower.contains("multiplayer is disabled")
-    {
-        return LaunchFailureClass::AuthModeIncompatible;
-    }
-    LaunchFailureClass::Unknown
-}
-
-fn contains_out_of_memory_failure(text: &str) -> bool {
-    text.lines().any(is_out_of_memory_failure_line)
-}
-
-fn contains_artifact_signature_failure(text: &str) -> bool {
-    text.contains("invalid signature file digest")
-        || (text.contains("securityexception")
-            && text.contains("signer information does not match")
-            && text.contains("same package"))
-        || (text.contains("securityexception")
-            && text.contains("signature file")
-            && text.contains("digest"))
-        || (text.contains("securityexception")
-            && text.contains("manifest main attributes")
-            && text.contains("digest"))
-        || (text.contains("securityexception") && text.contains("digest error"))
-}
-
-fn contains_loader_bootstrap_marker(text: &str) -> bool {
-    text.contains("bootstraplauncher")
-        || text.contains("modlauncher")
-        || text.contains("fml loading")
-}
-
-fn contains_failure_context(text: &str) -> bool {
-    text.contains("exception")
-        || text.contains("error")
-        || text.contains("fail")
-        || text.contains("unable")
-        || text.contains("could not")
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         GuardianInterventionKind, GuardianMode, GuardianSummary,
         LOW_MEMORY_ALLOCATION_WARNING_THRESHOLD_MB, LaunchCpuLoadWarningFacts,
         LaunchGuardianContext, LaunchResourceWarningFacts, LaunchWarningFacts, OverrideOrigin,
-        classify_startup_failure_text, summarize_launch_warnings,
+        summarize_launch_warnings,
     };
-    use crate::types::LaunchFailureClass;
     use serde_json::json;
 
     #[test]
@@ -799,111 +714,6 @@ mod tests {
                 "Remove the Java override or switch Guardian Mode back to Managed.",
             ]
         );
-    }
-
-    #[test]
-    fn startup_failure_text_classification_is_bounded_to_failure_class() {
-        assert_eq!(
-            classify_startup_failure_text(
-                "Unrecognized VM option '-XX:+UseZGC' in /home/alice/.axial/instances/secret"
-            ),
-            LaunchFailureClass::JvmUnsupportedOption
-        );
-        assert_eq!(
-            classify_startup_failure_text(
-                "java.lang.UnsupportedClassVersionError: compiled by a more recent version of the Java Runtime"
-            ),
-            LaunchFailureClass::JavaRuntimeMismatch
-        );
-        assert_eq!(
-            classify_startup_failure_text(
-                "Caused by: java.lang.NoClassDefFoundError: org/lwjgl/glfw/GLFW"
-            ),
-            LaunchFailureClass::ClasspathModuleConflict
-        );
-        assert_eq!(
-            classify_startup_failure_text(
-                "java.lang.UnsatisfiedLinkError: Failed to locate library: lwjgl.dll"
-            ),
-            LaunchFailureClass::ClasspathModuleConflict
-        );
-        assert_eq!(
-            classify_startup_failure_text(
-                "java.lang.SecurityException: class net.minecraft.SomeClass signer information does not match signer information of other classes in the same package"
-            ),
-            LaunchFailureClass::LauncherManagedArtifactSignature
-        );
-        assert_eq!(
-            classify_startup_failure_text(
-                "Exception in thread \"main\" java.lang.SecurityException: Invalid signature file digest for Manifest main attributes"
-            ),
-            LaunchFailureClass::LauncherManagedArtifactSignature
-        );
-        assert_eq!(
-            classify_startup_failure_text(
-                "java.lang.SecurityException: SHA-256 digest error for net/minecraft/client/Minecraft.class"
-            ),
-            LaunchFailureClass::LauncherManagedArtifactSignature
-        );
-        assert_eq!(
-            classify_startup_failure_text(
-                "[main/INFO] [cpw.mods.modlauncher.Launcher/MODLAUNCHER]: ModLauncher running"
-            ),
-            LaunchFailureClass::Unknown
-        );
-        assert_eq!(
-            classify_startup_failure_text(
-                "[EARLYDISPLAY/]: If this message is the only thing at the bottom of your log before a crash, you probably have a driver issue."
-            ),
-            LaunchFailureClass::Unknown
-        );
-        assert_eq!(
-            classify_startup_failure_text(
-                "cpw.mods.modlauncher.api.IncompatibleEnvironmentException: failed to load transformation service"
-            ),
-            LaunchFailureClass::LoaderBootstrapFailure
-        );
-        assert_eq!(
-            classify_startup_failure_text("ordinary launcher output"),
-            LaunchFailureClass::Unknown
-        );
-    }
-
-    #[test]
-    fn startup_failure_text_classifies_out_of_memory_signatures() {
-        for output in [
-            "Exception in thread \"Render thread\" java.lang.OutOfMemoryError: Java heap space",
-            "java.lang.OutOfMemoryError: GC overhead limit exceeded",
-            "GC overhead limit exceeded",
-            "# There is insufficient memory for the Java Runtime Environment to continue.",
-            "# Native memory allocation (malloc) failed to allocate 1048576 bytes. Error detail: AllocateHeap",
-            "# Native memory allocation (mmap) failed to map 65536 bytes. Error detail: committing reserved memory.",
-            "# Out of Memory Error (allocation.cpp:44)",
-        ] {
-            assert_eq!(
-                classify_startup_failure_text(output),
-                LaunchFailureClass::OutOfMemory,
-                "expected OOM classification for {output:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn startup_failure_text_rejects_incidental_memory_text() {
-        for output in [
-            "[main/INFO] Loading MemoryLeakFix 1.1.5 and ModernFix",
-            "[main/INFO] Allocated memory: 4096 MiB",
-            "Memory settings saved successfully",
-            "Native memory allocation completed",
-            "Out of Memory Error is the title of this troubleshooting guide",
-            "# Out of Memory Error handling is enabled",
-        ] {
-            assert_eq!(
-                classify_startup_failure_text(output),
-                LaunchFailureClass::Unknown,
-                "unexpected OOM classification for {output:?}"
-            );
-        }
     }
 
     #[test]
