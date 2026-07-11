@@ -899,9 +899,9 @@ fn reconcile_restore_stage_temps(instance_mods_dir: &Path) -> Result<(), StateEr
             continue;
         };
         let Some(snapshot) = snapshots.iter().find_map(|record| {
-            let new_prefix = format!("restore--{}--", record.snapshot.id);
-            let old_prefix = format!("{}-", record.snapshot.id);
-            (prefix.starts_with(&new_prefix) || prefix.starts_with(&old_prefix))
+            let stage_prefix = format!("restore--{}--", record.snapshot.id);
+            prefix
+                .starts_with(&stage_prefix)
                 .then_some(&record.snapshot)
         }) else {
             continue;
@@ -2091,36 +2091,6 @@ mod tests {
             b"user-temp"
         );
 
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn rollback_bypasses_preexisting_internal_stage_without_truncating_it() {
-        let root = test_root("restore-internal-stage-collision");
-        fs::write(root.join("managed-a.jar"), b"snapshot-managed").expect("write managed a");
-        let snapshot = save_rollback_snapshot(
-            &root,
-            &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
-        )
-        .expect("save snapshot");
-        fs::remove_file(root.join("managed-a.jar")).expect("remove target");
-        let old_stage_id = format!("{}-{}", snapshot.id, std::process::id());
-        let stage_path = rollback_restore_temp_path(&root, &old_stage_id, 0);
-        fs::create_dir_all(stage_path.parent().expect("stage parent"))
-            .expect("create stage parent");
-        fs::write(&stage_path, b"preexisting").expect("write preexisting stage");
-
-        restore_rollback_snapshot(&root, &snapshot)
-            .expect("a unique stage transaction should bypass an ambiguous old collision");
-
-        assert_eq!(
-            fs::read(&stage_path).expect("read preexisting stage"),
-            b"preexisting"
-        );
-        assert_eq!(
-            fs::read(root.join("managed-a.jar")).expect("read restored target"),
-            b"snapshot-managed"
-        );
         let _ = fs::remove_dir_all(root);
     }
 
