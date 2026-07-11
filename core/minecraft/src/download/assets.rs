@@ -11,6 +11,7 @@ use super::path_safety::{
 };
 use super::plan::TransferPlan;
 use super::transfer::ensure_selected_artifact_with_client;
+use crate::asset_index::AssetIndexFlags;
 use crate::launch::AssetIndex as VersionAssetIndex;
 use crate::paths::assets_dir;
 use futures_util::StreamExt;
@@ -29,10 +30,8 @@ pub(super) struct AssetDownloadPipeline {
 #[derive(Deserialize)]
 struct AssetIndex {
     objects: HashMap<String, AssetObject>,
-    #[serde(default, rename = "virtual")]
-    virtual_flag: bool,
-    #[serde(default, rename = "map_to_resources")]
-    map_to_resources: bool,
+    #[serde(flatten)]
+    flags: AssetIndexFlags,
 }
 
 #[derive(Deserialize)]
@@ -207,7 +206,7 @@ where
         }
     }
 
-    if index.virtual_flag || index.map_to_resources {
+    if index.flags.requires_virtual_repair() {
         let virtual_dir = assets_dir(mc_dir).join("virtual").join("legacy");
         copy_virtual_assets(
             &objects_dir,
@@ -228,7 +227,7 @@ pub async fn repair_virtual_assets_from_index(
     asset_index_path: &Path,
 ) -> Result<bool, DownloadError> {
     let index = read_asset_index(asset_index_path).await?;
-    if !index.virtual_flag && !index.map_to_resources {
+    if !index.flags.requires_virtual_repair() {
         return Ok(false);
     }
     let objects_dir = assets_dir(mc_dir).join("objects");

@@ -540,9 +540,23 @@ async fn launch_session_inner(
             }
         };
 
-        if let Err(error) =
-            repair_legacy_virtual_assets_before_launch(&intent, &prepared.plan).await
-        {
+        let asset_repair =
+            repair_legacy_virtual_assets_before_launch(&intent.library_dir, &prepared.plan).await;
+        match &asset_repair {
+            Ok(outcome) => trace_launch_event(
+                &session_id,
+                &format!(
+                    "runner asset-index repair_stage_full_object_parse_attempts={} result={}",
+                    outcome.full_object_parse_attempts(),
+                    outcome.label()
+                ),
+            ),
+            Err(_) => trace_launch_event(
+                &session_id,
+                "runner asset-index repair_stage_full_object_parse_attempts=1 result=failed",
+            ),
+        }
+        if let Err(error) = asset_repair {
             record_failed_self_healing_if_any(
                 &state,
                 &session_id,
@@ -1005,19 +1019,46 @@ fn emit_pending_launch_failure(state: &AppState, launch_completion_pending: &mut
     );
 }
 
-async fn repair_legacy_virtual_assets_before_launch(
-    intent: &axial_launcher::LaunchIntent,
-    plan: &axial_launcher::VanillaLaunchPlan,
-) -> Result<(), axial_minecraft::download::DownloadError> {
-    let asset_index_id = plan.version.asset_index.id.trim();
-    if asset_index_id.is_empty() {
-        return Ok(());
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyVirtualAssetRepairOutcome {
+    SkippedModern,
+    RepairedLegacy,
+}
+
+impl LegacyVirtualAssetRepairOutcome {
+    fn full_object_parse_attempts(self) -> usize {
+        match self {
+            Self::SkippedModern => 0,
+            Self::RepairedLegacy => 1,
+        }
     }
-    let asset_index_path = assets_dir(&intent.library_dir)
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SkippedModern => "skipped_modern",
+            Self::RepairedLegacy => "repaired_legacy",
+        }
+    }
+}
+
+async fn repair_legacy_virtual_assets_before_launch(
+    library_dir: &std::path::Path,
+    plan: &axial_launcher::VanillaLaunchPlan,
+) -> Result<LegacyVirtualAssetRepairOutcome, axial_minecraft::download::DownloadError> {
+    if !plan.requires_virtual_asset_repair {
+        return Ok(LegacyVirtualAssetRepairOutcome::SkippedModern);
+    }
+    let asset_index_id = plan.version.asset_index.id.trim();
+    let asset_index_path = assets_dir(library_dir)
         .join("indexes")
         .join(format!("{asset_index_id}.json"));
-    repair_virtual_assets_from_index(&intent.library_dir, &asset_index_path).await?;
-    Ok(())
+    let repaired = repair_virtual_assets_from_index(library_dir, &asset_index_path).await?;
+    if !repaired {
+        return Err(axial_minecraft::download::DownloadError::Integrity(
+            "asset index legacy flags changed during launch preparation".to_string(),
+        ));
+    }
+    Ok(LegacyVirtualAssetRepairOutcome::RepairedLegacy)
 }
 
 fn launch_policy_guardian_mode(
@@ -1073,6 +1114,38 @@ mod tests {
 
     const TEST_TELEMETRY_INSTALL_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
     const TEST_TELEMETRY_KEY: &str = "phc_test";
+
+    #[tokio::test]
+    async fn modern_plan_skips_repair_stage_full_asset_index_parse() {
+        let root = unique_test_dir("modern-asset-index-guard");
+        write_runner_asset_index(&root, "modern", r#"{"objects":"not-an-object-map"}"#);
+        let plan = test_asset_launch_plan("modern", false);
+
+        let outcome = repair_legacy_virtual_assets_before_launch(&root, &plan)
+            .await
+            .expect("modern asset repair guard");
+
+        assert_eq!(outcome, LegacyVirtualAssetRepairOutcome::SkippedModern);
+        assert_eq!(outcome.full_object_parse_attempts(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn legacy_plan_invokes_repair_stage_full_asset_index_parser() {
+        let root = unique_test_dir("legacy-asset-index-guard");
+        write_runner_asset_index(
+            &root,
+            "legacy",
+            r#"{"objects":"not-an-object-map","map_to_resources":true}"#,
+        );
+        let plan = test_asset_launch_plan("legacy", true);
+
+        assert!(matches!(
+            repair_legacy_virtual_assets_before_launch(&root, &plan).await,
+            Err(axial_minecraft::download::DownloadError::ParseVersion(_))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[tokio::test]
     async fn rejected_launch_recovery_plan_finishes_terminal_and_persists_proof() {
@@ -1600,6 +1673,36 @@ mod tests {
             outcome: None,
             stages: Vec::new(),
         }
+    }
+
+    fn test_asset_launch_plan(
+        asset_index_id: &str,
+        requires_virtual_asset_repair: bool,
+    ) -> axial_launcher::VanillaLaunchPlan {
+        axial_launcher::VanillaLaunchPlan {
+            version: serde_json::from_value(serde_json::json!({
+                "id": "test",
+                "assetIndex": { "id": asset_index_id }
+            }))
+            .expect("test version"),
+            requires_virtual_asset_repair,
+            libraries: Vec::new(),
+            client_jar_path: None,
+            natives_dir: None,
+            classpath: String::new(),
+            jvm_args: Vec::new(),
+            game_args: Vec::new(),
+            main_class: String::new(),
+            command: Vec::new(),
+            game_dir: PathBuf::new(),
+        }
+    }
+
+    fn write_runner_asset_index(root: &Path, asset_index_id: &str, contents: &str) {
+        let indexes_dir = assets_dir(root).join("indexes");
+        fs::create_dir_all(&indexes_dir).expect("asset indexes directory");
+        fs::write(indexes_dir.join(format!("{asset_index_id}.json")), contents)
+            .expect("asset index");
     }
 
     fn assert_no_sensitive_stage_evidence(text: &str) {

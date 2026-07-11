@@ -1033,6 +1033,25 @@ echo 'openjdk version "21.0.3" 2024-04-16' >&2
     }
 
     fn write_version_json(path: &Path, value: serde_json::Value) {
+        if let Some(asset_index_id) = value
+            .get("assetIndex")
+            .and_then(|asset_index| asset_index.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|asset_index_id| !asset_index_id.is_empty())
+        {
+            let library_dir = path
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .expect("library directory");
+            let indexes_dir = library_dir.join("assets").join("indexes");
+            fs::create_dir_all(&indexes_dir).expect("asset indexes directory");
+            fs::write(
+                indexes_dir.join(format!("{asset_index_id}.json")),
+                r#"{"objects":{}}"#,
+            )
+            .expect("asset index");
+        }
         fs::write(
             path,
             serde_json::to_vec_pretty(&value).expect("serialize version json"),

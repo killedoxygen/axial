@@ -2,9 +2,9 @@ pub mod steps;
 
 use crate::runtime::RuntimeSelection;
 use axial_minecraft::{
-    LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath, client_jar_path,
-    default_environment, is_legacy_assets, libraries_dir, offline_uuid, resolve_arguments,
-    resolve_libraries, resolve_version,
+    LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson,
+    asset_index_requires_virtual_repair, build_classpath, client_jar_path, default_environment,
+    libraries_dir, offline_uuid, resolve_arguments, resolve_libraries, resolve_version,
 };
 use md5::compute as md5_compute;
 use std::fmt;
@@ -91,6 +91,7 @@ pub struct VanillaLaunchRequest {
 #[derive(Debug, Clone)]
 pub struct VanillaLaunchPlan {
     pub version: VersionJson,
+    pub requires_virtual_asset_repair: bool,
     pub libraries: Vec<ResolvedLibrary>,
     pub client_jar_path: Option<PathBuf>,
     pub natives_dir: Option<PathBuf>,
@@ -106,6 +107,8 @@ pub struct VanillaLaunchPlan {
 pub enum VanillaLaunchPlanError {
     #[error(transparent)]
     LaunchModel(#[from] LaunchModelError),
+    #[error(transparent)]
+    AssetIndexFlags(#[from] axial_minecraft::AssetIndexFlagsError),
     #[error("effective runtime path is empty")]
     MissingRuntime,
     #[error("failed to prepare legacy natives: {0}")]
@@ -130,6 +133,8 @@ pub fn plan_resolved_launch(
     version: VersionJson,
 ) -> Result<VanillaLaunchPlan, VanillaLaunchPlanError> {
     let client_jar = find_client_jar(&request.mc_dir, &version, &request.version_id);
+    let requires_virtual_asset_repair =
+        asset_index_requires_virtual_repair(&request.mc_dir, &version.asset_index.id)?;
 
     let mut env = default_environment();
     let game_dir = request
@@ -150,9 +155,7 @@ pub fn plan_resolved_launch(
     } else {
         None
     };
-    let game_assets = if !version.asset_index.id.is_empty()
-        && is_legacy_assets(&request.mc_dir, &version.asset_index.id)
-    {
+    let game_assets = if requires_virtual_asset_repair {
         request
             .mc_dir
             .join("assets")
@@ -229,6 +232,7 @@ pub fn plan_resolved_launch(
 
     Ok(VanillaLaunchPlan {
         version,
+        requires_virtual_asset_repair,
         libraries,
         client_jar_path: client_jar,
         natives_dir,
@@ -610,6 +614,11 @@ mod tests {
             }]
         }))
         .expect("version json");
+        write_test_asset_index(
+            &root.join("library"),
+            "test-assets",
+            serde_json::json!({ "objects": {} }),
+        );
 
         let library_dir = root.join("library");
         let plan = plan_resolved_launch(
@@ -722,6 +731,55 @@ mod tests {
         assert!(plan.command.iter().any(|arg| arg == "--accessToken"));
         assert!(plan.command.iter().any(|arg| arg == "0"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_plan_carries_legacy_asset_repair_verdict() {
+        let root = unique_temp_root("axial-build-legacy-assets");
+        write_test_asset_index(
+            &root,
+            "test-assets",
+            serde_json::json!({ "objects": {}, "virtual": true }),
+        );
+
+        let plan = plan_resolved_launch(
+            &test_launch_request(&root, "auth-test"),
+            asset_version_json(),
+        )
+        .expect("legacy asset launch plan");
+
+        assert!(plan.requires_virtual_asset_repair);
+        assert_arg_value(
+            &plan.game_args,
+            "--gameAssets",
+            &root
+                .join("assets")
+                .join("virtual")
+                .join("legacy")
+                .to_string_lossy(),
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_plan_rejects_malformed_asset_flags() {
+        let root = unique_temp_root("axial-build-malformed-assets");
+        write_test_asset_index(
+            &root,
+            "test-assets",
+            serde_json::json!({ "objects": {}, "virtual": "yes" }),
+        );
+
+        assert!(matches!(
+            plan_resolved_launch(
+                &test_launch_request(&root, "auth-test"),
+                asset_version_json(),
+            ),
+            Err(VanillaLaunchPlanError::AssetIndexFlags(
+                axial_minecraft::AssetIndexFlagsError::Parse(_)
+            ))
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -896,6 +954,11 @@ mod tests {
             ]
         }))
         .expect("version json");
+        write_test_asset_index(
+            &root,
+            "pre-1.6",
+            serde_json::json!({ "objects": {}, "virtual": true }),
+        );
 
         let plan = plan_resolved_launch(
             &VanillaLaunchRequest {
@@ -1109,6 +1172,7 @@ mod tests {
             .to_string(),
         )
         .expect("version json");
+        write_test_asset_index(&root, "test-assets", serde_json::json!({ "objects": {} }));
 
         let native_jar = library_dir.join("lwjgl-3.3.3-natives-linux.jar");
         let file = fs::File::create(&native_jar).expect("native jar");
@@ -1382,10 +1446,18 @@ mod tests {
                     "-Dauth.client=${clientid}"
                 ]
             },
-            "assetIndex": { "id": "test-assets" },
+            "assetIndex": {},
             "libraries": []
         }))
         .expect("version json")
+    }
+
+    fn asset_version_json() -> VersionJson {
+        let mut version = auth_version_json();
+        version.asset_index.id = "test-assets".to_string();
+        version.arguments = None;
+        version.minecraft_arguments = "--gameAssets ${game_assets}".to_string();
+        version
     }
 
     fn assert_arg_value(args: &[String], name: &str, expected: &str) {
@@ -1420,6 +1492,24 @@ mod tests {
         }
     }
 
+    fn test_launch_request(root: &Path, version_id: &str) -> VanillaLaunchRequest {
+        VanillaLaunchRequest {
+            session_id: "test-session".to_string(),
+            mc_dir: root.to_path_buf(),
+            version_id: version_id.to_string(),
+            target_version_id: String::new(),
+            auth: LaunchAuthContext::offline("Player"),
+            runtime: test_runtime(),
+            game_dir: None,
+            launcher_name: "axial".to_string(),
+            launcher_version: "test".to_string(),
+            min_memory_mb: None,
+            max_memory_mb: None,
+            extra_jvm_args: Vec::new(),
+            resolution: None,
+        }
+    }
+
     fn unique_temp_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "{label}-{}-{}",
@@ -1432,6 +1522,14 @@ mod tests {
     }
 
     fn write_test_version_json(root: &Path, version_id: &str, value: serde_json::Value) {
+        if let Some(asset_index_id) = value
+            .get("assetIndex")
+            .and_then(|asset_index| asset_index.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|asset_index_id| !asset_index_id.is_empty())
+        {
+            write_test_asset_index(root, asset_index_id, serde_json::json!({ "objects": {} }));
+        }
         let version_dir = root.join("versions").join(version_id);
         fs::create_dir_all(&version_dir).expect("version dir");
         fs::write(
@@ -1439,6 +1537,16 @@ mod tests {
             value.to_string(),
         )
         .expect("version json");
+    }
+
+    fn write_test_asset_index(root: &Path, asset_index_id: &str, value: serde_json::Value) {
+        let indexes_dir = root.join("assets").join("indexes");
+        fs::create_dir_all(&indexes_dir).expect("asset indexes directory");
+        fs::write(
+            indexes_dir.join(format!("{asset_index_id}.json")),
+            value.to_string(),
+        )
+        .expect("asset index");
     }
 
     fn write_native_zip(path: &Path, contents: &[u8]) -> io::Result<()> {

@@ -90,25 +90,3 @@ pub fn create_minecraft_dir(dir: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
-
-pub fn is_legacy_assets(mc_dir: &Path, asset_index_id: &str) -> bool {
-    let index_path = assets_dir(mc_dir)
-        .join("indexes")
-        .join(format!("{asset_index_id}.json"));
-    let Ok(data) = std::fs::read_to_string(index_path) else {
-        return false;
-    };
-
-    #[derive(serde::Deserialize)]
-    struct AssetIndexFlags {
-        #[serde(rename = "virtual", default)]
-        virtual_flag: bool,
-        #[serde(rename = "map_to_resources", default)]
-        map_to_resources: bool,
-    }
-
-    let Ok(flags) = serde_json::from_str::<AssetIndexFlags>(&data) else {
-        return false;
-    };
-    flags.virtual_flag || flags.map_to_resources
-}
