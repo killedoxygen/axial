@@ -747,6 +747,33 @@ mod tests {
     }
 
     #[test]
+    fn every_diagnosis_id_round_trips_through_strict_failure_memory_snapshot() {
+        for diagnosis_id in DiagnosisId::ALL {
+            let entry = GuardianFailureMemoryEntry::observed(
+                diagnosis_id,
+                GuardianDomain::Launch,
+                classify_current_artifact(
+                    CurrentArtifact::UnknownFilesystemPath,
+                    diagnosis_id.as_str(),
+                )
+                .target,
+                GuardianMode::Managed,
+                Some("diagnosis_inventory"),
+                "2026-06-15T10:00:00Z",
+            );
+            let snapshot = FailureMemorySnapshot::new(vec![entry.clone()]).expect("snapshot");
+            let encoded = snapshot.to_json().expect("serialize snapshot");
+            let value = serde_json::from_str::<serde_json::Value>(&encoded).expect("snapshot json");
+
+            assert_eq!(value["entries"][0]["diagnosis_id"], diagnosis_id.as_str());
+
+            let decoded = FailureMemorySnapshot::from_json(&encoded).expect("strict snapshot");
+            assert_eq!(decoded.schema, super::FAILURE_MEMORY_SCHEMA);
+            assert_eq!(decoded.entries, vec![entry]);
+        }
+    }
+
+    #[test]
     fn checked_in_failure_memory_v1_fixture_is_byte_stable() {
         let snapshot =
             FailureMemorySnapshot::from_json(FAILURE_MEMORY_V1_FIXTURE).expect("strict fixture");
