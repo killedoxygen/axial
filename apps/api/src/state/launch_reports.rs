@@ -4067,6 +4067,7 @@ mod tests {
             java_path: Some("/usr/bin/java".to_string()),
             natives_dir: Some("/tmp/natives".to_string()),
             failure: None,
+            crash_evidence: None,
             healing: Some(json!({ "fallback_applied": "test fallback" })),
             guardian: Some(json!({ "mode": "managed" })),
             outcome: None,

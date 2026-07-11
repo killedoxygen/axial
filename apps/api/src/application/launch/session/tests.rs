@@ -252,6 +252,7 @@ impl TestFixture {
                 java_path: None,
                 natives_dir: None,
                 failure: None,
+                crash_evidence: None,
                 healing: None,
                 guardian: None,
                 outcome: None,

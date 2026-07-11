@@ -2,6 +2,7 @@ use super::{
     ProcessAttemptScope, ProcessKillReason, ProcessObservation, SessionStore, now_ms, priority,
     process_kill_stage_evidence, process_observation_stage_evidence,
 };
+use crate::execution::crash::{CrashArtifactCollectionRequest, collect_crash_evidence};
 use axial_launcher::{
     LaunchSessionExitReason, LaunchSessionOutcome, LaunchState, LaunchStatusEvent,
 };
@@ -779,6 +780,27 @@ async fn settle_process_exit(
     {
         return;
     }
+    let should_collect_crash = requested_cause.is_none()
+        && (output_processor_error.is_some()
+            || exit_context.observed_failure.is_some()
+            || status.as_ref().map_or(true, |status| !status.success()));
+    let crash_evidence = if should_collect_crash {
+        match (
+            exit_context.crash_artifact_game_dir.clone(),
+            store.crash_collection_permits.try_acquire(),
+        ) {
+            (Some(game_dir), Ok(_permit)) => {
+                collect_crash_evidence(CrashArtifactCollectionRequest::new(
+                    game_dir,
+                    exit_observed_at_ms,
+                ))
+                .await
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     let (exit_code, failure_class, failure_detail, evidence) = if let Some(error) =
         output_processor_error
     {
@@ -835,6 +857,7 @@ async fn settle_process_exit(
                 exit_code,
                 failure_class,
                 failure_detail,
+                crash_evidence,
                 healing: exit_context.record.healing.clone(),
                 guardian: exit_context.record.guardian.clone(),
                 outcome: (requested_cause == Some(ProcessTerminalCause::UserStop)).then(|| {
@@ -871,6 +894,7 @@ async fn settle_watchdog_exit(
                 exit_code: Some(-1),
                 failure_class: Some("startup_stalled".to_string()),
                 failure_detail: Some("no startup activity observed".to_string()),
+                crash_evidence: None,
                 healing: exit_context.record.healing.clone(),
                 guardian: exit_context.record.guardian.clone(),
                 outcome: Some(LaunchSessionOutcome::from_reason(

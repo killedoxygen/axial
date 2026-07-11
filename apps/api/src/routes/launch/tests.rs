@@ -4232,6 +4232,7 @@ fn test_record(session_id: &str) -> LaunchSessionRecord {
         java_path: None,
         natives_dir: None,
         failure: None,
+        crash_evidence: None,
         healing: None,
         guardian: None,
         outcome: None,

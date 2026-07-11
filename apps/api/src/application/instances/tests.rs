@@ -3364,6 +3364,7 @@ fn test_launch_record(session_id: &str, instance_id: &str) -> LaunchSessionRecor
         java_path: None,
         natives_dir: None,
         failure: None,
+        crash_evidence: None,
         healing: None,
         guardian: None,
         outcome: None,

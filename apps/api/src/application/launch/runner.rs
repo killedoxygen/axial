@@ -279,6 +279,7 @@ async fn settle_post_boot_out_of_memory(
                 exit_code: record.exit_code,
                 failure_class: Some(LaunchFailureClass::OutOfMemory.as_str().to_string()),
                 failure_detail: Some(user_outcome.summary.clone()),
+                crash_evidence: None,
                 healing: record.healing.clone(),
                 guardian: serialize_guardian(Some(guardian)),
                 outcome: record.outcome.clone(),
@@ -899,6 +900,7 @@ async fn launch_session_inner_with_control(
                 .as_ref()
                 .map(|path| path.to_string_lossy().to_string()),
             failure: None,
+            crash_evidence: None,
             healing: prepared
                 .healing
                 .as_ref()
@@ -1654,6 +1656,12 @@ mod tests {
             record.outcome.as_ref().expect("OOM session outcome").reason,
             LaunchSessionExitReason::StartupFailed
         );
+        let crash_evidence = record.crash_evidence.as_ref().expect("OOM crash evidence");
+        assert_eq!(
+            crash_evidence.source,
+            axial_launcher::CrashArtifactKind::MinecraftCrashReport
+        );
+        assert!(crash_evidence.names_out_of_memory);
 
         let status_payload = super::super::reports::launch_status_payload(&state, session_id)
             .await
@@ -1664,6 +1672,10 @@ mod tests {
             "Guardian blocked launch startup."
         );
         assert_eq!(status_payload["guardian"]["decision"], "blocked");
+        assert_eq!(
+            status_payload["crash_evidence"]["exception_class"],
+            "java.lang.OutOfMemoryError"
+        );
 
         let proof = state
             .launch_reports()
@@ -1799,6 +1811,12 @@ mod tests {
                 .and_then(|guardian| guardian.get("decision")),
             Some(&serde_json::json!("warned"))
         );
+        assert!(
+            terminal_status
+                .crash_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.names_out_of_memory)
+        );
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -1828,6 +1846,14 @@ mod tests {
                 .expect("post-boot record outcome")
                 .reason,
             LaunchSessionExitReason::CrashedAfterBoot
+        );
+        assert_eq!(
+            record
+                .crash_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.exception_class.as_ref())
+                .map(|exception| exception.as_str()),
+            Some("java.lang.OutOfMemoryError")
         );
         assert_eq!(
             state.sessions().retention_hold_count(session_id).await,
@@ -2549,6 +2575,7 @@ mod tests {
             java_path: None,
             natives_dir: None,
             failure: None,
+            crash_evidence: None,
             healing: None,
             guardian: None,
             outcome: None,
@@ -2638,6 +2665,14 @@ if [ "$1" = "-XshowSettings:property" ]; then
   exit 0
 fi
 {boot_marker}
+mkdir -p crash-reports
+cat > crash-reports/crash-guardian-oom.txt <<'CRASH'
+---- Minecraft Crash Report ----
+Description: Rendering game
+java.lang.OutOfMemoryError: Java heap space
+JVM Flags: -Duser.home=/home/alice -Dtoken=raw-secret-token
+Player: SecretPlayer
+CRASH
 printf '%s\n' 'java.lang.OutOfMemoryError: Java heap space /home/alice/.axial/secret --accessToken raw-secret-token -Xmx8192M -Dtoken=raw provider_payload=provider-secret account_id=account-secret username=SecretPlayer eyJheader123456789.abcdEFGH12345678.ijklMNOP12345678' >&2
 printf '%s\n' 'at SecretMod.crash(/home/alice/SecretMod.java:42)' >&2
 exit 1

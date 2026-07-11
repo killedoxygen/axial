@@ -308,6 +308,7 @@ async fn prepare_launch_session_rejects_same_instance_active_launch() {
             java_path: None,
             natives_dir: None,
             failure: None,
+            crash_evidence: None,
             healing: None,
             guardian: None,
             outcome: None,

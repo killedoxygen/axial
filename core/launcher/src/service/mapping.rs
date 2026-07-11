@@ -348,6 +348,7 @@ pub fn snapshot_status(
             .failure
             .as_ref()
             .and_then(|failure| failure.detail.clone()),
+        crash_evidence: record.crash_evidence.clone(),
         healing: record.healing.clone(),
         guardian: record.guardian.clone(),
         outcome: record.outcome.clone(),

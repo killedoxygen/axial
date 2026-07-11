@@ -3,6 +3,7 @@
 //! Execution owns bounded concrete capabilities and reports facts about low
 //! level work. These contracts do not authorize product policy decisions.
 
+pub(crate) mod crash;
 pub mod download;
 pub mod file;
 pub mod jvm;

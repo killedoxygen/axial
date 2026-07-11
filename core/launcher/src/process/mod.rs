@@ -1,3 +1,4 @@
+use crate::crash::CrashEvidence;
 use crate::types::{LaunchFailure, LaunchState, SessionId};
 use serde::{Deserialize, Serialize};
 
@@ -138,6 +139,8 @@ pub struct LaunchStatusEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub crash_evidence: Option<CrashEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub healing: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guardian: Option<serde_json::Value>,
@@ -202,6 +205,7 @@ pub struct LaunchSessionRecord {
     pub java_path: Option<String>,
     pub natives_dir: Option<String>,
     pub failure: Option<LaunchFailure>,
+    pub crash_evidence: Option<CrashEvidence>,
     pub healing: Option<serde_json::Value>,
     pub guardian: Option<serde_json::Value>,
     pub outcome: Option<LaunchSessionOutcome>,

@@ -330,6 +330,7 @@ async fn prepare_launch_session_with_auth_refresh(
             java_path: None,
             natives_dir: None,
             failure: None,
+            crash_evidence: None,
             healing: None,
             guardian: serde_json::to_value(&preflight.guardian_summary).ok(),
             outcome: None,

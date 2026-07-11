@@ -63,6 +63,7 @@ evidence_value!(CrashNativeSymbol, is_safe_native_identifier);
 #[serde(rename_all = "snake_case")]
 pub enum CrashNativeFrameKind {
     Native,
+    Vm,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,10 +466,19 @@ fn parse_exception_class(line: &str, allow_bare: bool) -> Option<CrashExceptionC
 
 fn parse_problematic_frame(line: &str) -> Option<CrashProblematicFrame> {
     let value = line.strip_prefix('#').unwrap_or(line).trim();
-    let value = value
+    let (kind, value) = if let Some(value) = value
         .strip_prefix("C  ")
-        .or_else(|| value.strip_prefix("C "))?
-        .trim();
+        .or_else(|| value.strip_prefix("C "))
+    {
+        (CrashNativeFrameKind::Native, value.trim())
+    } else if let Some(value) = value
+        .strip_prefix("V  ")
+        .or_else(|| value.strip_prefix("V "))
+    {
+        (CrashNativeFrameKind::Vm, value.trim())
+    } else {
+        return None;
+    };
     let start = value.find('[')?;
     let end = value[start..].find(']')? + start;
     let raw_frame = &value[start + 1..end];
@@ -484,7 +494,7 @@ fn parse_problematic_frame(line: &str) -> Option<CrashProblematicFrame> {
         .filter(|value| !value.is_empty())
         .and_then(CrashNativeSymbol::checked);
     Some(CrashProblematicFrame {
-        kind: CrashNativeFrameKind::Native,
+        kind,
         module,
         symbol,
     })
@@ -709,6 +719,22 @@ mod tests {
         let encoded = serde_json::to_string(&frame).unwrap();
         assert!(!encoded.contains(".so"));
         assert!(!encoded.contains("0x"));
+    }
+
+    #[test]
+    fn hs_err_vm_frame_uses_the_same_structured_redaction() {
+        let evidence = parse_crash_evidence(
+            CrashArtifactKind::JvmFatalError,
+            b"# Problematic frame:\n# V  [libjvm.so+0xc1a55] VMError::report_and_die+0x2",
+        )
+        .expect("VM frame");
+        let frame = evidence.problematic_frame.expect("problematic frame");
+        assert_eq!(frame.kind, CrashNativeFrameKind::Vm);
+        assert_eq!(frame.module.as_str(), "libjvm");
+        assert_eq!(
+            frame.symbol.as_ref().map(|value| value.as_str()),
+            Some("VMError::report_and_die")
+        );
     }
 
     #[test]

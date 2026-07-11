@@ -35,6 +35,7 @@ pub(super) async fn emit_status(
                 exit_code: None,
                 failure_class: failure_class.map(failure_class_name).map(str::to_string),
                 failure_detail: None,
+                crash_evidence: None,
                 healing: serialize_healing(healing),
                 guardian: serialize_guardian(guardian),
                 outcome: None,

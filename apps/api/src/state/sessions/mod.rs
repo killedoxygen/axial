@@ -15,12 +15,13 @@ use axial_launcher::{
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, broadcast};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, Semaphore, broadcast};
 
 const MAX_GUARDIAN_STAGE_DETAILS: usize = 8;
 const MAX_STAGE_EVIDENCE: usize = 16;
@@ -32,7 +33,7 @@ const MAX_NOTICE_DETAILS: usize = 8;
 const MAX_LAUNCH_LOG_LINE_CHARS: usize = 1_000;
 const MAX_RETAINED_TERMINAL_SESSIONS: usize = 32;
 const PRIVATE_NOTICE_FALLBACK: &str = "Launch status details were hidden for privacy.";
-const FAILURE_SIGNAL_VALID_FOR_EXIT_MS: u64 = 15_000;
+const MAX_CONCURRENT_CRASH_COLLECTIONS: usize = 2;
 
 pub(super) struct ProcessAttemptScope {
     pub(super) id: u64,
@@ -54,6 +55,7 @@ struct SessionEntry {
     record: LaunchSessionRecord,
     events: broadcast::Sender<LaunchEvent>,
     observed_failure: Option<ObservedFailureSignal>,
+    crash_artifact_game_dir: Option<PathBuf>,
     log_count: usize,
     stop_requested: bool,
     retention_holds: usize,
@@ -69,7 +71,7 @@ struct ObservedFailureSignal {
 impl ObservedFailureSignal {
     fn fresh_for_exit(self, exit_observed_at_ms: u64) -> Option<LaunchFailureClass> {
         let age_ms = exit_observed_at_ms.saturating_sub(self.observed_at_ms);
-        (age_ms <= FAILURE_SIGNAL_VALID_FOR_EXIT_MS).then_some(self.class)
+        (age_ms <= axial_launcher::CRASH_ARTIFACT_EXIT_CORRELATION_WINDOW_MS).then_some(self.class)
     }
 }
 
@@ -89,6 +91,7 @@ struct RawLogLine {
 pub(super) struct ProcessExitContext {
     pub(super) record: LaunchSessionRecord,
     pub(super) observed_failure: Option<LaunchFailureClass>,
+    pub(super) crash_artifact_game_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -164,6 +167,7 @@ pub struct SessionStore {
     changes: broadcast::Sender<()>,
     next_attempt_id: AtomicU64,
     next_terminal_sequence: AtomicU64,
+    crash_collection_permits: Semaphore,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -485,6 +489,7 @@ impl SessionStore {
             changes,
             next_attempt_id: AtomicU64::new(0),
             next_terminal_sequence: AtomicU64::new(0),
+            crash_collection_permits: Semaphore::new(MAX_CONCURRENT_CRASH_COLLECTIONS),
         }
     }
 
@@ -557,6 +562,7 @@ impl SessionStore {
                 record,
                 events,
                 observed_failure: None,
+                crash_artifact_game_dir: None,
                 log_count: 0,
                 stop_requested: false,
                 retention_holds: 1,
@@ -594,6 +600,7 @@ impl SessionStore {
             observed_failure: entry
                 .observed_failure
                 .and_then(|signal| signal.fresh_for_exit(exit_observed_at_ms)),
+            crash_artifact_game_dir: entry.crash_artifact_game_dir.clone(),
         })
     }
 
@@ -979,6 +986,7 @@ impl SessionStore {
             exit_code: None,
             failure_class: None,
             failure_detail: None,
+            crash_evidence: None,
             healing: entry.record.healing.clone(),
             guardian: entry.record.guardian.clone(),
             outcome: None,
@@ -1058,6 +1066,7 @@ impl SessionStore {
         }
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         command.kill_on_drop(true);
+        let crash_artifact_game_dir = command.as_std().get_current_dir().map(PathBuf::from);
         let priority = match priority::configure_start_priority(&mut command) {
             Ok(mode) => LaunchPriorityEvidence {
                 start_mode: mode.proof_value().to_string(),
@@ -1107,6 +1116,7 @@ impl SessionStore {
         record.boot_duration_ms = None;
         record.state = LaunchState::Starting;
         record.failure = None;
+        record.crash_evidence = None;
         record.outcome = None;
         let (process, owner) = supervisor::prepare_process_owner(child);
         let attempt = ProcessAttemptScope::new(self.next_attempt_id());
@@ -1138,6 +1148,7 @@ impl SessionStore {
             exit_code: None,
             failure_class: None,
             failure_detail: None,
+            crash_evidence: None,
             healing: stored_record.healing.clone(),
             guardian: stored_record.guardian.clone(),
             outcome: None,
@@ -1151,6 +1162,7 @@ impl SessionStore {
             record: stored_record,
             events,
             observed_failure: None,
+            crash_artifact_game_dir,
             log_count: 0,
             stop_requested: false,
             retention_holds,
@@ -1670,6 +1682,11 @@ fn apply_status_update(entry: &mut SessionEntry, event: &mut LaunchStatusEvent) 
             detail: event.failure_detail.clone(),
         });
     }
+    if event.crash_evidence.is_some() {
+        entry.record.crash_evidence = event.crash_evidence.clone();
+    } else {
+        event.crash_evidence = entry.record.crash_evidence.clone();
+    }
     if event.healing.is_some() {
         entry.record.healing = event.healing.clone();
     }
@@ -2159,6 +2176,7 @@ fn test_record(session_id: &str) -> LaunchSessionRecord {
         java_path: None,
         natives_dir: None,
         failure: None,
+        crash_evidence: None,
         healing: None,
         guardian: None,
         outcome: None,
@@ -2401,6 +2419,7 @@ mod tests {
                     exit_code: None,
                     failure_class: None,
                     failure_detail: None,
+                    crash_evidence: None,
                     healing: Some(json!({
                         "warnings": ["Requested Java override was bypassed"],
                         "fallback_applied": "Guardian switched to managed Java before launch"
@@ -2441,6 +2460,7 @@ mod tests {
                     exit_code: Some(-1),
                     failure_class: Some("startup_stalled".to_string()),
                     failure_detail: Some("no startup activity observed".to_string()),
+                    crash_evidence: None,
                     healing: None,
                     guardian: None,
                     outcome: None,
@@ -2484,6 +2504,7 @@ mod tests {
                     exit_code: None,
                     failure_class: None,
                     failure_detail: None,
+                    crash_evidence: None,
                     healing: Some(json!({
                         "warnings": [
                             "Java override was bypassed",
@@ -2561,6 +2582,7 @@ mod tests {
                     exit_code: None,
                     failure_class: None,
                     failure_detail: None,
+                    crash_evidence: None,
                     healing: Some(json!({
                         "warnings": [
                             "Healing added safe fallback context",
@@ -2638,6 +2660,7 @@ mod tests {
                     exit_code: None,
                     failure_class: None,
                     failure_detail: None,
+                    crash_evidence: None,
                     healing: None,
                     guardian: None,
                     outcome: None,
@@ -2702,6 +2725,7 @@ mod tests {
                     exit_code: None,
                     failure_class: None,
                     failure_detail: None,
+                    crash_evidence: None,
                     healing: None,
                     guardian: Some(json!({
                         "mode": "managed",
@@ -2733,6 +2757,7 @@ mod tests {
                     exit_code: None,
                     failure_class: None,
                     failure_detail: None,
+                    crash_evidence: None,
                     healing: Some(json!("not an object")),
                     guardian: Some(json!({
                         "mode": "managed",
@@ -2765,6 +2790,7 @@ mod tests {
                     exit_code: None,
                     failure_class: None,
                     failure_detail: None,
+                    crash_evidence: None,
                     healing: None,
                     guardian: Some(json!("not an object")),
                     outcome: None,
@@ -2795,6 +2821,7 @@ mod tests {
             exit_code: None,
             failure_class: None,
             failure_detail: None,
+            crash_evidence: None,
             healing: None,
             guardian: Some(json!({
                 "mode": "managed",
@@ -2849,6 +2876,7 @@ mod tests {
                     exit_code: None,
                     failure_class: None,
                     failure_detail: None,
+                    crash_evidence: None,
                     healing: None,
                     guardian: None,
                     outcome: None,
@@ -4003,7 +4031,7 @@ mod tests {
         set_failure_observed_at(
             &store,
             session_id,
-            exit_observed_at_ms - FAILURE_SIGNAL_VALID_FOR_EXIT_MS,
+            exit_observed_at_ms - axial_launcher::CRASH_ARTIFACT_EXIT_CORRELATION_WINDOW_MS,
         )
         .await;
         assert_eq!(
@@ -4016,7 +4044,7 @@ mod tests {
         set_failure_observed_at(
             &store,
             session_id,
-            exit_observed_at_ms - FAILURE_SIGNAL_VALID_FOR_EXIT_MS - 1,
+            exit_observed_at_ms - axial_launcher::CRASH_ARTIFACT_EXIT_CORRELATION_WINDOW_MS - 1,
         )
         .await;
         assert_eq!(
@@ -4121,6 +4149,7 @@ mod tests {
                     exit_code: Some(0),
                     failure_class: None,
                     failure_detail: None,
+                    crash_evidence: None,
                     healing: None,
                     guardian: None,
                     outcome: None,
@@ -5002,7 +5031,8 @@ mod tests {
             let entry = sessions.get_mut(session_id).expect("session entry");
             entry.observed_failure = Some(ObservedFailureSignal {
                 class: LaunchFailureClass::JvmUnsupportedOption,
-                observed_at_ms: now_ms().saturating_sub(FAILURE_SIGNAL_VALID_FOR_EXIT_MS + 1),
+                observed_at_ms: now_ms()
+                    .saturating_sub(axial_launcher::CRASH_ARTIFACT_EXIT_CORRELATION_WINDOW_MS + 1),
             });
         }
 
@@ -5028,6 +5058,7 @@ mod tests {
                     failure_class: exit_failure
                         .map(|failure_class| failure_class.as_str().to_string()),
                     failure_detail: None,
+                    crash_evidence: None,
                     healing: None,
                     guardian: None,
                     outcome: None,
@@ -5232,6 +5263,7 @@ mod tests {
                     exit_code: None,
                     failure_class: None,
                     failure_detail: None,
+                    crash_evidence: None,
                     healing: None,
                     guardian: None,
                     outcome: None,
@@ -5699,6 +5731,7 @@ mod tests {
             exit_code,
             failure_class: failure_class.map(ToOwned::to_owned),
             failure_detail: failure_detail.map(ToOwned::to_owned),
+            crash_evidence: None,
             healing: None,
             guardian: None,
             outcome: None,
