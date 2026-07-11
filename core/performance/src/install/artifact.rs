@@ -330,18 +330,16 @@ async fn reconcile_promoted_temp(
     expected_sha512: &str,
     expected_size: Option<u64>,
 ) -> Result<(), InstallError> {
-    let temp_metadata = match tokio::fs::symlink_metadata(temp_path).await {
+    let temp_admission = match crate::file_identity::admit_async(temp_path).await {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(InstallError::Io(error)),
-        Ok(metadata) if metadata.file_type().is_file() => metadata,
-        Ok(_) => {
-            return Err(InstallError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "managed download temp ownership cannot be proven",
-            )));
-        }
+        Ok(admission) => admission,
     };
+    let temp_identity = temp_admission.identity();
+    let temp_admitted_len = temp_admission.metadata().len();
+    drop(temp_admission);
     let (temp_sha512, temp_size) = bounded_regular_file_sha512(temp_path).await?;
+    crate::file_identity::revalidate_async(temp_path, temp_identity, temp_admitted_len).await?;
     let expected_matches =
         expected_sha512.trim().is_empty() || temp_sha512.eq_ignore_ascii_case(expected_sha512);
     if !expected_matches || expected_size.is_some_and(|expected| temp_size != expected) {
@@ -359,7 +357,7 @@ async fn reconcile_promoted_temp(
                     "managed download temp conflicts with its published target",
                 )));
             }
-            remove_admitted_temp(temp_path, &temp_metadata).await
+            remove_admitted_temp(temp_path, temp_identity).await
         }
         Ok(_) => Err(InstallError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -372,7 +370,13 @@ async fn reconcile_promoted_temp(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound
             );
             if !current_temp.file_type().is_file()
-                || !same_file_identity(&temp_metadata, &current_temp)
+                || crate::file_identity::revalidate_async(
+                    temp_path,
+                    temp_identity,
+                    temp_admitted_len,
+                )
+                .await
+                .is_err()
                 || !final_still_absent
             {
                 return Err(InstallError::Io(std::io::Error::new(
@@ -385,8 +389,20 @@ async fn reconcile_promoted_temp(
             let current_temp = tokio::fs::symlink_metadata(temp_path).await?;
             if !final_metadata.file_type().is_file()
                 || !current_temp.file_type().is_file()
-                || !same_file_identity(&temp_metadata, &current_temp)
-                || !same_file_identity(&current_temp, &final_metadata)
+                || crate::file_identity::revalidate_async(
+                    temp_path,
+                    temp_identity,
+                    temp_admitted_len,
+                )
+                .await
+                .is_err()
+                || crate::file_identity::revalidate_async(
+                    final_path,
+                    temp_identity,
+                    temp_admitted_len,
+                )
+                .await
+                .is_err()
                 || !file_matches_sha512(final_path, expected_sha512, expected_size).await?
             {
                 return Err(InstallError::Io(std::io::Error::new(
@@ -394,7 +410,7 @@ async fn reconcile_promoted_temp(
                     "managed download temp promotion ownership cannot be proven",
                 )));
             }
-            remove_admitted_temp(temp_path, &temp_metadata).await
+            remove_admitted_temp(temp_path, temp_identity).await
         }
         Err(error) => Err(InstallError::Io(error)),
     }
@@ -424,10 +440,14 @@ pub(super) async fn reconcile_managed_artifact_obligations(
 
 async fn remove_admitted_temp(
     temp_path: &Path,
-    admitted: &std::fs::Metadata,
+    admitted: crate::file_identity::FileIdentity,
 ) -> Result<(), InstallError> {
     let current = tokio::fs::symlink_metadata(temp_path).await?;
-    if !current.file_type().is_file() || !same_file_identity(&current, admitted) {
+    if !current.file_type().is_file()
+        || crate::file_identity::revalidate_async(temp_path, admitted, current.len())
+            .await
+            .is_err()
+    {
         return Err(InstallError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "managed download temp identity changed during recovery",
@@ -479,28 +499,17 @@ fn is_managed_download_temp_name(name: &str) -> bool {
 }
 
 async fn bounded_regular_file_sha512(path: &Path) -> Result<(String, u64), std::io::Error> {
-    let before = tokio::fs::symlink_metadata(path).await?;
-    if !before.file_type().is_file() || before.len() > MANAGED_ARTIFACT_MAX_BYTES {
+    let admitted = crate::file_identity::admit_async(path).await?;
+    if admitted.metadata().len() > MANAGED_ARTIFACT_MAX_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "managed artifact is not a bounded regular file",
         ));
     }
-
-    let mut file = tokio::fs::File::open(path).await?;
-    let opened = file.metadata().await?;
-    let after = tokio::fs::symlink_metadata(path).await?;
-    if !opened.is_file()
-        || !after.file_type().is_file()
-        || !same_file_identity(&opened, &after)
-        || opened.len() != before.len()
-        || after.len() != before.len()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "managed artifact changed while opening",
-        ));
-    }
+    let opened_len = admitted.metadata().len();
+    let identity = admitted.identity();
+    crate::file_identity::revalidate_async(path, identity, opened_len).await?;
+    let mut file = tokio::fs::File::from_std(admitted.into_file());
     let mut hasher = Sha512::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut actual_size = 0_u64;
@@ -510,7 +519,7 @@ async fn bounded_regular_file_sha512(path: &Path) -> Result<(String, u64), std::
             break;
         }
         actual_size = actual_size.saturating_add(read as u64);
-        if actual_size > MANAGED_ARTIFACT_MAX_BYTES || actual_size > opened.len() {
+        if actual_size > MANAGED_ARTIFACT_MAX_BYTES || actual_size > opened_len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "managed artifact changed while reading",
@@ -518,31 +527,14 @@ async fn bounded_regular_file_sha512(path: &Path) -> Result<(String, u64), std::
         }
         hasher.update(&buffer[..read]);
     }
-    if actual_size != opened.len() {
+    if actual_size != opened_len {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "managed artifact changed while reading",
         ));
     }
+    crate::file_identity::revalidate_async(path, identity, opened_len).await?;
     Ok((hex::encode(hasher.finalize()), actual_size))
-}
-
-#[cfg(unix)]
-pub(super) fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-pub(super) fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(super) fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 fn parent_minor_version(game_version: &str) -> Option<String> {

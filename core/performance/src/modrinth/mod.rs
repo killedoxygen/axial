@@ -228,7 +228,7 @@ impl ModrinthClient {
 pub(crate) struct ManagedDownloadTemp {
     path: std::path::PathBuf,
     sha512: String,
-    identity: std::fs::Metadata,
+    identity: crate::file_identity::FileIdentity,
     armed: bool,
 }
 
@@ -241,8 +241,14 @@ impl ManagedDownloadTemp {
         &self.sha512
     }
 
-    pub(crate) fn owns_metadata(&self, metadata: &std::fs::Metadata) -> bool {
-        metadata.file_type().is_file() && same_file_identity(metadata, &self.identity)
+    pub(crate) fn owns_path(&self, path: &Path, expected_len: u64) -> bool {
+        crate::file_identity::revalidate(path, self.identity, expected_len).is_ok()
+    }
+
+    pub(crate) async fn owns_path_async(&self, path: &Path, expected_len: u64) -> bool {
+        crate::file_identity::revalidate_async(path, self.identity, expected_len)
+            .await
+            .is_ok()
     }
 
     fn with_sha512(mut self, sha512: String) -> Self {
@@ -263,7 +269,7 @@ impl ManagedDownloadTemp {
             }
             Err(error) => return Err(error),
         };
-        if !current.file_type().is_file() || !same_file_identity(&current, &self.identity) {
+        if !self.owns_path_async(&self.path, current.len()).await {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "managed download temp identity changed before cleanup",
@@ -286,7 +292,7 @@ impl ManagedDownloadTemp {
 struct CreatedDownloadTemp {
     file: Option<std::fs::File>,
     path: std::path::PathBuf,
-    identity: std::fs::Metadata,
+    identity: crate::file_identity::FileIdentity,
     armed: bool,
 }
 
@@ -296,7 +302,7 @@ impl CreatedDownloadTemp {
             .write(true)
             .create_new(true)
             .open(&path)?;
-        let identity = file.metadata()?;
+        let identity = crate::file_identity::from_file(&file)?;
         Ok(Self {
             file: Some(file),
             path,
@@ -310,7 +316,12 @@ impl CreatedDownloadTemp {
             .file
             .take()
             .expect("created download temp owns its file");
-        let identity = file.metadata()?;
+        let identity = crate::file_identity::from_file(&file)?;
+        if identity != self.identity {
+            return Err(io::Error::other(
+                "managed download temp identity changed after creation",
+            ));
+        }
         self.armed = false;
         let guard = ManagedDownloadTemp {
             path: self.path.clone(),
@@ -327,7 +338,9 @@ impl Drop for CreatedDownloadTemp {
         drop(self.file.take());
         if self.armed
             && std::fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
-                metadata.file_type().is_file() && same_file_identity(&metadata, &self.identity)
+                metadata.file_type().is_file()
+                    && crate::file_identity::revalidate(&self.path, self.identity, metadata.len())
+                        .is_ok()
             })
             && let Err(error) = std::fs::remove_file(&self.path)
             && error.kind() != io::ErrorKind::NotFound
@@ -340,9 +353,8 @@ impl Drop for CreatedDownloadTemp {
 impl Drop for ManagedDownloadTemp {
     fn drop(&mut self) {
         if self.armed {
-            let removable = std::fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
-                metadata.file_type().is_file() && same_file_identity(&metadata, &self.identity)
-            });
+            let removable = std::fs::symlink_metadata(&self.path)
+                .is_ok_and(|metadata| self.owns_path(&self.path, metadata.len()));
             if removable
                 && let Err(error) = std::fs::remove_file(&self.path)
                 && error.kind() != io::ErrorKind::NotFound
@@ -351,24 +363,6 @@ impl Drop for ManagedDownloadTemp {
             }
         }
     }
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 fn modrinth_http_client() -> Client {

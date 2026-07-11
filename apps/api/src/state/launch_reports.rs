@@ -1578,7 +1578,7 @@ fn load_admitted_report(path: &Path) -> io::Result<LaunchProofRecord> {
     if path.extension().and_then(|value| value.to_str()) != Some("json") {
         return Err(invalid_report("launch report filename is not canonical"));
     }
-    let metadata_before = fs::symlink_metadata(path)?;
+    let (metadata_before, identity_before) = admitted_path_snapshot(path)?;
     if metadata_before.file_type().is_symlink()
         || !metadata_before.is_file()
         || metadata_before.len() > MAX_REPORT_BYTES
@@ -1587,12 +1587,17 @@ fn load_admitted_report(path: &Path) -> io::Result<LaunchProofRecord> {
     }
     let file = File::open(path)?;
     let opened_metadata = file.metadata()?;
-    let metadata_after = fs::symlink_metadata(path)?;
+    let opened_identity = admitted_file_identity(&file, &opened_metadata)?;
+    let (metadata_after, identity_after) = admitted_path_snapshot(path)?;
     if metadata_after.file_type().is_symlink()
         || !metadata_after.is_file()
-        || !opened_file_identity_matches(&metadata_before, &opened_metadata, &metadata_after)
         || opened_metadata.len() > MAX_REPORT_BYTES
     {
+        return Err(invalid_report(
+            "launch report file identity changed during admission",
+        ));
+    }
+    if identity_before != opened_identity || opened_identity != identity_after {
         return Err(invalid_report(
             "launch report file identity changed during admission",
         ));
@@ -1610,46 +1615,113 @@ fn load_admitted_report(path: &Path) -> io::Result<LaunchProofRecord> {
     Ok(report)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdmittedFileIdentity {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Windows {
+        volume_serial: u64,
+        file_id: [u8; 16],
+    },
+}
+
 #[cfg(unix)]
-fn opened_file_identity_matches(
-    before: &fs::Metadata,
-    opened: &fs::Metadata,
-    after: &fs::Metadata,
-) -> bool {
+fn admitted_path_snapshot(path: &Path) -> io::Result<(fs::Metadata, AdmittedFileIdentity)> {
+    let metadata = fs::symlink_metadata(path)?;
+    let identity = admitted_unix_identity(&metadata)?;
+    Ok((metadata, identity))
+}
+
+#[cfg(unix)]
+fn admitted_unix_identity(metadata: &fs::Metadata) -> io::Result<AdmittedFileIdentity> {
     use std::os::unix::fs::MetadataExt;
 
-    before.dev() == opened.dev()
-        && before.ino() == opened.ino()
-        && opened.dev() == after.dev()
-        && opened.ino() == after.ino()
+    if !metadata.file_type().is_file() {
+        return Err(invalid_report("launch report identity is not a file"));
+    }
+    Ok(AdmittedFileIdentity::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
 #[cfg(windows)]
-fn opened_file_identity_matches(
-    before: &fs::Metadata,
-    opened: &fs::Metadata,
-    after: &fs::Metadata,
-) -> bool {
-    use std::os::windows::fs::MetadataExt;
+fn admitted_path_snapshot(path: &Path) -> io::Result<(fs::Metadata, AdmittedFileIdentity)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
-    before.volume_serial_number().is_some()
-        && before.volume_serial_number() == opened.volume_serial_number()
-        && opened.volume_serial_number() == after.volume_serial_number()
-        && before.file_index().is_some()
-        && before.file_index() == opened.file_index()
-        && opened.file_index() == after.file_index()
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let identity = admitted_file_identity(&file, &metadata)?;
+    Ok((metadata, identity))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn opened_file_identity_matches(
-    before: &fs::Metadata,
-    opened: &fs::Metadata,
-    after: &fs::Metadata,
-) -> bool {
-    before.len() == opened.len()
-        && opened.len() == after.len()
-        && before.modified().ok() == opened.modified().ok()
-        && opened.modified().ok() == after.modified().ok()
+fn admitted_path_snapshot(_path: &Path) -> io::Result<(fs::Metadata, AdmittedFileIdentity)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "exact launch report identity is unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn admitted_file_identity(
+    _file: &File,
+    metadata: &fs::Metadata,
+) -> io::Result<AdmittedFileIdentity> {
+    admitted_unix_identity(metadata)
+}
+
+#[cfg(windows)]
+fn admitted_file_identity(
+    file: &File,
+    metadata: &fs::Metadata,
+) -> io::Result<AdmittedFileIdentity> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    if !metadata.file_type().is_file() {
+        return Err(invalid_report("launch report identity is not a file"));
+    }
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: `file` owns a valid handle, and `info` is a correctly sized writable buffer.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(AdmittedFileIdentity::Windows {
+        volume_serial: info.VolumeSerialNumber,
+        file_id: info.FileId.Identifier,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn admitted_file_identity(
+    _file: &File,
+    _metadata: &fs::Metadata,
+) -> io::Result<AdmittedFileIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "exact launch report identity is unavailable on this platform",
+    ))
 }
 
 fn validate_admitted_report(report: &LaunchProofRecord, file_name: &str) -> io::Result<()> {
@@ -2656,6 +2728,29 @@ mod tests {
             fs::read(hostile_path).expect("reread hostile"),
             hostile_bytes
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn admitted_identity_tracks_filesystem_objects_instead_of_contents() {
+        let root = test_root("report-file-identity");
+        fs::create_dir_all(&root).expect("create identity test directory");
+        let source = root.join("source.json");
+        let alias = root.join("alias.json");
+        let distinct = root.join("distinct.json");
+        fs::write(&source, b"same bytes").expect("write source");
+        fs::hard_link(&source, &alias).expect("create source hardlink");
+        fs::write(&distinct, b"same bytes").expect("write distinct file");
+
+        let (_, source_identity) = admitted_path_snapshot(&source).unwrap();
+
+        assert_eq!(source_identity, admitted_path_snapshot(&alias).unwrap().1);
+        assert_ne!(
+            source_identity,
+            admitted_path_snapshot(&distinct).unwrap().1
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 

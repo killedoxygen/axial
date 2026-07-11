@@ -363,9 +363,20 @@ pub(crate) fn reconcile_state_publication(instance_mods_dir: &Path) -> Result<()
             let admitted_destination = read_state_snapshot_file(&destination)?;
             if path_exists(&backup)? {
                 let admitted_backup = read_state_snapshot_file(&backup)?;
-                let destination_metadata = fs::symlink_metadata(&destination)?;
-                let backup_metadata = fs::symlink_metadata(&backup)?;
-                if !same_file_identity(&destination_metadata, &backup_metadata)
+                let destination_identity = admit_file_identity(&destination).map_err(|error| {
+                    identity_admission_error(
+                        error,
+                        StateError::InvalidState(
+                            "performance state destination identity cannot be proven".to_string(),
+                        ),
+                    )
+                })?;
+                if crate::file_identity::revalidate(
+                    &backup,
+                    destination_identity.0,
+                    destination_identity.1,
+                )
+                .is_err()
                     || admitted_destination.sha512 != admitted_backup.sha512
                 {
                     return Err(StateError::InvalidState(
@@ -399,9 +410,20 @@ pub(crate) fn reconcile_state_publication(instance_mods_dir: &Path) -> Result<()
     let backup_snapshot = read_state_snapshot_if_present(&backup)?;
     match (destination_snapshot, staged_snapshot, backup_snapshot) {
         (Some(destination_admitted), Some(_staged_admitted), Some(backup_admitted)) => {
-            let destination_metadata = fs::symlink_metadata(&destination)?;
-            let backup_metadata = fs::symlink_metadata(&backup)?;
-            if !same_file_identity(&destination_metadata, &backup_metadata)
+            let destination_identity = admit_file_identity(&destination).map_err(|error| {
+                identity_admission_error(
+                    error,
+                    StateError::InvalidState(
+                        "performance state destination identity cannot be proven".to_string(),
+                    ),
+                )
+            })?;
+            if crate::file_identity::revalidate(
+                &backup,
+                destination_identity.0,
+                destination_identity.1,
+            )
+            .is_err()
                 || destination_admitted.sha512 != backup_admitted.sha512
             {
                 return Err(StateError::InvalidState(
@@ -483,35 +505,31 @@ fn read_bounded_regular_file_if_present(
     path: &Path,
     max_bytes: u64,
 ) -> Result<Option<Vec<u8>>, StateError> {
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    let admitted = match crate::file_identity::admit(path) {
+        Ok(admitted) => admitted,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(StateError::InvalidState(
+                "performance state obligation is not a bounded regular file".to_string(),
+            ));
+        }
         Err(error) => return Err(StateError::Read(error)),
     };
-    if !before.file_type().is_file() || before.len() > max_bytes {
+    if admitted.metadata().len() > max_bytes {
         return Err(StateError::InvalidState(
             "performance state obligation is not a bounded regular file".to_string(),
         ));
     }
-    let mut file = fs::File::open(path)?;
-    let opened = file.metadata()?;
-    let after = fs::symlink_metadata(path)?;
-    if !opened.is_file()
-        || !after.file_type().is_file()
-        || !same_file_identity(&before, &opened)
-        || !same_file_identity(&opened, &after)
-        || before.len() != opened.len()
-        || before.len() != after.len()
-    {
-        return Err(StateError::InvalidState(
-            "performance state file identity changed during admission".to_string(),
-        ));
-    }
-    let mut data = Vec::with_capacity(before.len() as usize);
+    let identity = admitted.identity();
+    let admitted_len = admitted.metadata().len();
+    let mut file = admitted.into_file();
+    let mut data = Vec::with_capacity(admitted_len as usize);
     std::io::Read::by_ref(&mut file)
         .take(max_bytes.saturating_add(1))
         .read_to_end(&mut data)?;
-    if data.len() as u64 != before.len() {
+    if data.len() as u64 != admitted_len
+        || crate::file_identity::revalidate(path, identity, admitted_len).is_err()
+    {
         return Err(StateError::InvalidState(
             "performance state bytes changed during admission".to_string(),
         ));
@@ -530,17 +548,13 @@ fn reserve_backup_exclusive(
     expected_sha512: Option<&str>,
 ) -> Result<(), StateError> {
     fs::hard_link(source, backup).map_err(|source| publication(phase, source))?;
-    let source_metadata = fs::symlink_metadata(source)
-        .map_err(|source| publication(StatePublicationPhase::Reconcile, source))?;
-    let backup_metadata = fs::symlink_metadata(backup)
+    let (source_identity, source_len) = admit_file_identity(source)
         .map_err(|source| publication(StatePublicationPhase::Reconcile, source))?;
     let digest_matches = match expected_sha512 {
         Some(expected) => path_matches_sha512(backup, expected)?,
         None => true,
     };
-    if !source_metadata.file_type().is_file()
-        || !backup_metadata.file_type().is_file()
-        || !same_file_identity(&source_metadata, &backup_metadata)
+    if crate::file_identity::revalidate(backup, source_identity, source_len).is_err()
         || !digest_matches
     {
         remove_publication_file(backup, StatePublicationPhase::Cleanup)?;
@@ -548,9 +562,7 @@ fn reserve_backup_exclusive(
             "performance state backup ownership cannot be proven".to_string(),
         ));
     }
-    let current = fs::symlink_metadata(source)
-        .map_err(|source| publication(StatePublicationPhase::Reconcile, source))?;
-    if !same_file_identity(&current, &backup_metadata) {
+    if crate::file_identity::revalidate(source, source_identity, source_len).is_err() {
         remove_publication_file(backup, StatePublicationPhase::Cleanup)?;
         return Err(StateError::InvalidState(
             "performance state destination changed during backup".to_string(),
@@ -1337,11 +1349,15 @@ pub(crate) fn stage_managed_artifact_addition(
     match fs::hard_link(source_path, &obligation) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let source = fs::symlink_metadata(source_path)?;
-            let existing = fs::symlink_metadata(&obligation)?;
-            if !source.file_type().is_file()
-                || !existing.file_type().is_file()
-                || !same_file_identity(&source, &existing)
+            let (identity, len) = admit_file_identity(source_path).map_err(|error| {
+                identity_admission_error(
+                    error,
+                    StateError::InvalidState(
+                        "managed addition obligation conflicts with existing ownership".to_string(),
+                    ),
+                )
+            })?;
+            if crate::file_identity::revalidate(&obligation, identity, len).is_err()
                 || !path_matches_sha512(&obligation, &digest)?
             {
                 return Err(StateError::InvalidState(
@@ -1351,11 +1367,15 @@ pub(crate) fn stage_managed_artifact_addition(
         }
         Err(error) => return Err(StateError::Read(error)),
     }
-    let source = fs::symlink_metadata(source_path)?;
-    let staged = fs::symlink_metadata(&obligation)?;
-    if !source.file_type().is_file()
-        || !staged.file_type().is_file()
-        || !same_file_identity(&source, &staged)
+    let (identity, len) = admit_file_identity(source_path).map_err(|error| {
+        identity_admission_error(
+            error,
+            StateError::InvalidState(
+                "managed addition obligation identity cannot be proven".to_string(),
+            ),
+        )
+    })?;
+    if crate::file_identity::revalidate(&obligation, identity, len).is_err()
         || !path_matches_sha512(&obligation, &digest)?
     {
         return Err(StateError::InvalidState(
@@ -1387,11 +1407,12 @@ fn managed_artifact_addition_path(
 
 struct AdmittedManagedAddition {
     path: PathBuf,
-    metadata: std::fs::Metadata,
+    identity: crate::file_identity::FileIdentity,
+    len: u64,
     digest: String,
     filename: String,
     tracked: bool,
-    temp_aliases: Vec<(PathBuf, std::fs::Metadata)>,
+    temp_aliases: Vec<(PathBuf, crate::file_identity::FileIdentity)>,
 }
 
 pub(crate) fn reconcile_managed_addition_obligations(
@@ -1444,9 +1465,23 @@ pub(crate) fn reconcile_managed_addition_obligations(
                         .to_string(),
                 ));
             }
-            let obligation_metadata = fs::symlink_metadata(entry.path())?;
-            if !obligation_metadata.file_type().is_file()
-                || !path_matches_sha512(&entry.path(), &digest)?
+            let obligation_identity = admit_file_identity(&entry.path()).map_err(|error| {
+                identity_admission_error(
+                    error,
+                    StateError::InvalidIntegrity {
+                        filename: filename.clone(),
+                        reason: "managed addition obligation ownership cannot be proven"
+                            .to_string(),
+                    },
+                )
+            })?;
+            if !path_matches_sha512(&entry.path(), &digest)?
+                || crate::file_identity::revalidate(
+                    &entry.path(),
+                    obligation_identity.0,
+                    obligation_identity.1,
+                )
+                .is_err()
             {
                 return Err(StateError::InvalidIntegrity {
                     filename,
@@ -1463,7 +1498,12 @@ pub(crate) fn reconcile_managed_addition_obligations(
             match fs::symlink_metadata(&final_path) {
                 Ok(final_metadata) => {
                     if !final_metadata.file_type().is_file()
-                        || !same_file_identity(&obligation_metadata, &final_metadata)
+                        || crate::file_identity::revalidate(
+                            &final_path,
+                            obligation_identity.0,
+                            obligation_identity.1,
+                        )
+                        .is_err()
                         || !path_matches_sha512(&final_path, &digest)?
                     {
                         return Err(StateError::InvalidIntegrity {
@@ -1478,7 +1518,8 @@ pub(crate) fn reconcile_managed_addition_obligations(
             }
             admitted.push(AdmittedManagedAddition {
                 path: entry.path(),
-                metadata: obligation_metadata,
+                identity: obligation_identity.0,
+                len: obligation_identity.1,
                 digest: digest.clone(),
                 filename,
                 tracked,
@@ -1514,10 +1555,17 @@ pub(crate) fn reconcile_managed_addition_obligations(
         let Some(index) = by_filename.get(filename).copied() else {
             continue;
         };
-        let metadata = fs::symlink_metadata(entry.path())?;
+        let identity = admit_file_identity(&entry.path()).map_err(|error| {
+            identity_admission_error(
+                error,
+                StateError::InvalidIntegrity {
+                    filename: filename.to_string(),
+                    reason: "managed addition temp alias ownership cannot be proven".to_string(),
+                },
+            )
+        })?;
         let obligation = &admitted[index];
-        if !metadata.file_type().is_file()
-            || !same_file_identity(&metadata, &obligation.metadata)
+        if identity.0 != obligation.identity
             || !path_matches_sha512(&entry.path(), &obligation.digest)?
         {
             return Err(StateError::InvalidIntegrity {
@@ -1525,7 +1573,9 @@ pub(crate) fn reconcile_managed_addition_obligations(
                 reason: "managed addition temp alias ownership cannot be proven".to_string(),
             });
         }
-        admitted[index].temp_aliases.push((entry.path(), metadata));
+        admitted[index]
+            .temp_aliases
+            .push((entry.path(), identity.0));
     }
 
     for obligation in &admitted {
@@ -1533,7 +1583,12 @@ pub(crate) fn reconcile_managed_addition_obligations(
         match fs::symlink_metadata(&final_path) {
             Ok(final_metadata) => {
                 if !final_metadata.file_type().is_file()
-                    || !same_file_identity(&obligation.metadata, &final_metadata)
+                    || crate::file_identity::revalidate(
+                        &final_path,
+                        obligation.identity,
+                        obligation.len,
+                    )
+                    .is_err()
                     || !path_matches_sha512(&final_path, &obligation.digest)?
                 {
                     return Err(StateError::InvalidIntegrity {
@@ -1542,14 +1597,24 @@ pub(crate) fn reconcile_managed_addition_obligations(
                     });
                 }
                 if !obligation.tracked {
-                    remove_identity_bound_file(&final_path, &final_metadata, &obligation.digest)?;
+                    remove_identity_bound_file(
+                        &final_path,
+                        obligation.identity,
+                        obligation.len,
+                        &obligation.digest,
+                    )?;
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && obligation.tracked => {
                 fs::hard_link(&obligation.path, &final_path)?;
                 let final_metadata = fs::symlink_metadata(&final_path)?;
                 if !final_metadata.file_type().is_file()
-                    || !same_file_identity(&obligation.metadata, &final_metadata)
+                    || crate::file_identity::revalidate(
+                        &final_path,
+                        obligation.identity,
+                        obligation.len,
+                    )
+                    .is_err()
                     || !path_matches_sha512(&final_path, &obligation.digest)?
                 {
                     return Err(StateError::InvalidIntegrity {
@@ -1561,10 +1626,15 @@ pub(crate) fn reconcile_managed_addition_obligations(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(StateError::Read(error)),
         }
-        for (alias, metadata) in &obligation.temp_aliases {
-            remove_identity_bound_file(alias, metadata, &obligation.digest)?;
+        for (alias, identity) in &obligation.temp_aliases {
+            remove_identity_bound_file(alias, *identity, obligation.len, &obligation.digest)?;
         }
-        remove_identity_bound_file(&obligation.path, &obligation.metadata, &obligation.digest)?;
+        remove_identity_bound_file(
+            &obligation.path,
+            obligation.identity,
+            obligation.len,
+            &obligation.digest,
+        )?;
     }
     for digest_dir in digest_dirs_to_remove {
         fs::remove_dir(digest_dir)?;
@@ -1597,14 +1667,14 @@ pub(crate) fn settle_abandoned_managed_artifact_addition(
     for path in [state_root, mutation_root, addition_root, digest_root] {
         validate_managed_recovery_directory(path)?;
     }
-    let metadata = match fs::symlink_metadata(&obligation) {
-        Ok(metadata) if metadata.file_type().is_file() => metadata,
-        Ok(_) => {
+    let (identity, len) = match admit_file_identity(&obligation) {
+        Ok(admitted) => admitted,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
             return Err(StateError::InvalidState(
                 "abandoned managed addition obligation is not a regular file".to_string(),
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(StateError::Read(error)),
     };
     if path_exists(&managed_artifact_path(
@@ -1628,9 +1698,16 @@ pub(crate) fn settle_abandoned_managed_artifact_addition(
         if !is_alias {
             continue;
         }
-        let alias_metadata = fs::symlink_metadata(entry.path())?;
-        if !alias_metadata.file_type().is_file()
-            || !same_file_identity(&metadata, &alias_metadata)
+        let alias_identity = admit_file_identity(&entry.path()).map_err(|error| {
+            identity_admission_error(
+                error,
+                StateError::InvalidIntegrity {
+                    filename: installed.filename.clone(),
+                    reason: "abandoned managed addition temp alias is conflicting".to_string(),
+                },
+            )
+        })?;
+        if identity != alias_identity.0
             || !path_matches_sha512(&entry.path(), &installed.integrity.sha512)?
         {
             return Err(StateError::InvalidIntegrity {
@@ -1638,12 +1715,12 @@ pub(crate) fn settle_abandoned_managed_artifact_addition(
                 reason: "abandoned managed addition temp alias is conflicting".to_string(),
             });
         }
-        aliases.push((entry.path(), alias_metadata));
+        aliases.push((entry.path(), alias_identity.0));
     }
-    for (path, alias_metadata) in aliases {
-        remove_identity_bound_file(&path, &alias_metadata, &installed.integrity.sha512)?;
+    for (path, alias_identity) in aliases {
+        remove_identity_bound_file(&path, alias_identity, len, &installed.integrity.sha512)?;
     }
-    remove_identity_bound_file(&obligation, &metadata, &installed.integrity.sha512)
+    remove_identity_bound_file(&obligation, identity, len, &installed.integrity.sha512)
 }
 
 pub(crate) fn settle_managed_artifact_removal(
@@ -2251,26 +2328,22 @@ fn bounded_file_sha512(path: &Path, expected_bytes: u64) -> Result<Vec<u8>, Stat
 fn admit_bounded_file_sha512(
     path: &Path,
     expected_bytes: u64,
-) -> Result<(Vec<u8>, std::fs::Metadata), StateError> {
-    let before = fs::symlink_metadata(path)?;
-    if !before.file_type().is_file()
-        || before.len() != expected_bytes
-        || expected_bytes > MANAGED_ARTIFACT_MAX_BYTES
-    {
-        return Ok((Vec::new(), before));
+) -> Result<(Vec<u8>, Option<crate::file_identity::FileIdentity>), StateError> {
+    if expected_bytes > MANAGED_ARTIFACT_MAX_BYTES {
+        return Ok((Vec::new(), None));
     }
-    let mut file = fs::File::open(path)?;
-    let opened = file.metadata()?;
-    let after = fs::symlink_metadata(path)?;
-    if !opened.is_file()
-        || !after.file_type().is_file()
-        || !same_file_identity(&before, &opened)
-        || !same_file_identity(&opened, &after)
-        || opened.len() != expected_bytes
-        || after.len() != expected_bytes
-    {
-        return Ok((Vec::new(), opened));
+    let admitted = match crate::file_identity::admit(path) {
+        Ok(admitted) => admitted,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            return Ok((Vec::new(), None));
+        }
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    if admitted.metadata().len() != expected_bytes {
+        return Ok((Vec::new(), None));
     }
+    let identity = admitted.identity();
+    let mut file = admitted.into_file();
     let mut hasher = Sha512::new();
     let mut buffer = [0_u8; 64 * 1024];
     let mut total = 0_u64;
@@ -2281,21 +2354,17 @@ fn admit_bounded_file_sha512(
         }
         total = total.saturating_add(read as u64);
         if total > expected_bytes || total > MANAGED_ARTIFACT_MAX_BYTES {
-            return Ok((Vec::new(), opened));
+            return Ok((Vec::new(), None));
         }
         hasher.update(&buffer[..read]);
     }
     if total != expected_bytes {
-        return Ok((Vec::new(), opened));
+        return Ok((Vec::new(), None));
     }
-    let admitted = fs::symlink_metadata(path)?;
-    if !admitted.file_type().is_file()
-        || !same_file_identity(&opened, &admitted)
-        || admitted.len() != expected_bytes
-    {
-        return Ok((Vec::new(), opened));
+    if crate::file_identity::revalidate(path, identity, expected_bytes).is_err() {
+        return Ok((Vec::new(), None));
     }
-    Ok((hasher.finalize().to_vec(), opened))
+    Ok((hasher.finalize().to_vec(), Some(identity)))
 }
 
 fn regular_rollback_artifact_bytes(path: &Path, stored_filename: &str) -> Result<u64, StateError> {
@@ -2395,11 +2464,15 @@ fn publish_rollback_restore_target(target: &RollbackRestoreTarget) -> Result<(),
         return Err(StateError::Read(error));
     }
     if let Some(addition_path) = &target.addition_path {
-        let addition = fs::symlink_metadata(addition_path)?;
-        let final_metadata = fs::symlink_metadata(&target.final_path)?;
-        if !addition.file_type().is_file()
-            || !final_metadata.file_type().is_file()
-            || !same_file_identity(&addition, &final_metadata)
+        let addition = admit_file_identity(addition_path).map_err(|error| {
+            identity_admission_error(
+                error,
+                StateError::InvalidRollback(
+                    "rollback addition publication ownership cannot be proven".to_string(),
+                ),
+            )
+        })?;
+        if crate::file_identity::revalidate(&target.final_path, addition.0, addition.1).is_err()
             || !path_matches_sha512(&target.final_path, &target.restored_sha512)?
         {
             return Err(StateError::InvalidRollback(
@@ -2436,11 +2509,16 @@ fn compensate_rollback_restore_targets(
         } else if let Some(addition_path) = &target.addition_path
             && path_exists(&target.final_path)?
         {
-            let addition = fs::symlink_metadata(addition_path)?;
-            let final_metadata = fs::symlink_metadata(&target.final_path)?;
-            if !addition.file_type().is_file()
-                || !final_metadata.file_type().is_file()
-                || !same_file_identity(&addition, &final_metadata)
+            let addition = admit_file_identity(addition_path).map_err(|error| {
+                identity_admission_error(
+                    error,
+                    StateError::InvalidRollback(
+                        "rollback compensation created target ownership cannot be proven"
+                            .to_string(),
+                    ),
+                )
+            })?;
+            if crate::file_identity::revalidate(&target.final_path, addition.0, addition.1).is_err()
                 || !path_matches_sha512(&target.final_path, &target.restored_sha512)?
             {
                 return Err(StateError::InvalidRollback(
@@ -2449,7 +2527,8 @@ fn compensate_rollback_restore_targets(
             }
             remove_identity_bound_file(
                 &target.final_path,
-                &final_metadata,
+                addition.0,
+                addition.1,
                 &target.restored_sha512,
             )?;
         }
@@ -2525,11 +2604,10 @@ fn remove_file_matching_sha512(
             "managed cleanup target bytes changed after admission".to_string(),
         ));
     }
-    let current = fs::symlink_metadata(path)?;
-    if !current.file_type().is_file()
-        || !same_file_identity(&admitted, &current)
-        || current.len() != metadata.len()
-    {
+    let admitted = admitted.ok_or_else(|| {
+        StateError::InvalidState("managed cleanup target identity was not admitted".to_string())
+    })?;
+    if crate::file_identity::revalidate(path, admitted, metadata.len()).is_err() {
         return Err(StateError::InvalidState(
             "managed cleanup target identity changed after digest admission".to_string(),
         ));
@@ -2539,13 +2617,13 @@ fn remove_file_matching_sha512(
 
 fn remove_identity_bound_file(
     path: &Path,
-    admitted: &std::fs::Metadata,
+    admitted: crate::file_identity::FileIdentity,
+    admitted_len: u64,
     expected_sha512: &str,
 ) -> Result<(), StateError> {
-    let current = fs::symlink_metadata(path)?;
-    if !current.file_type().is_file()
-        || !same_file_identity(admitted, &current)
+    if crate::file_identity::revalidate(path, admitted, admitted_len).is_err()
         || !path_matches_sha512(path, expected_sha512)?
+        || crate::file_identity::revalidate(path, admitted, admitted_len).is_err()
     {
         return Err(StateError::InvalidState(
             "managed cleanup target identity or digest changed after admission".to_string(),
@@ -2554,32 +2632,36 @@ fn remove_identity_bound_file(
     fs::remove_file(path).map_err(StateError::Read)
 }
 
+fn admit_file_identity(
+    path: &Path,
+) -> Result<(crate::file_identity::FileIdentity, u64), std::io::Error> {
+    let admitted = crate::file_identity::admit(path)?;
+    Ok((admitted.identity(), admitted.metadata().len()))
+}
+
+fn identity_admission_error(error: std::io::Error, invalid: StateError) -> StateError {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        invalid
+    } else {
+        StateError::Read(error)
+    }
+}
+
 fn remove_admitted_regular_file(path: &Path) -> Result<(), std::io::Error> {
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => metadata,
-        Ok(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "managed cleanup target is not a regular file",
-            ));
-        }
+    let admitted = match crate::file_identity::admit(path) {
+        Ok(admitted) => admitted,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    let file = fs::File::open(path)?;
-    let opened = file.metadata()?;
-    let after = fs::symlink_metadata(path)?;
-    if !opened.is_file()
-        || !after.file_type().is_file()
-        || !same_file_identity(&before, &opened)
-        || !same_file_identity(&opened, &after)
+    if crate::file_identity::revalidate(path, admitted.identity(), admitted.metadata().len())
+        .is_err()
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "managed cleanup target identity changed during admission",
         ));
     }
-    drop(file);
+    drop(admitted);
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -3125,54 +3207,34 @@ fn cleanup_proven_latest_temp(instance_mods_dir: &Path) -> Result<(), StateError
 }
 
 fn read_bounded_regular_metadata_file(path: &Path) -> Result<Vec<u8>, StateError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.len() > ROLLBACK_METADATA_MAX_BYTES {
+    let admitted = crate::file_identity::admit(path).map_err(|error| {
+        identity_admission_error(
+            error,
+            StateError::InvalidRollback(
+                "rollback metadata obligation is not a bounded regular file".to_string(),
+            ),
+        )
+    })?;
+    if admitted.metadata().len() > ROLLBACK_METADATA_MAX_BYTES {
         return Err(StateError::InvalidRollback(
             "rollback metadata obligation is not a bounded regular file".to_string(),
         ));
     }
-    let mut file = fs::File::open(path)?;
-    let opened = file.metadata()?;
-    let after = fs::symlink_metadata(path)?;
-    if !opened.is_file()
-        || !after.file_type().is_file()
-        || !same_file_identity(&metadata, &opened)
-        || !same_file_identity(&opened, &after)
-        || opened.len() != metadata.len()
-        || after.len() != metadata.len()
-    {
-        return Err(StateError::InvalidRollback(
-            "rollback metadata changed while opening".to_string(),
-        ));
-    }
-    let mut data = Vec::with_capacity(metadata.len() as usize);
+    let identity = admitted.identity();
+    let admitted_len = admitted.metadata().len();
+    let mut file = admitted.into_file();
+    let mut data = Vec::with_capacity(admitted_len as usize);
     std::io::Read::by_ref(&mut file)
         .take(ROLLBACK_METADATA_MAX_BYTES + 1)
         .read_to_end(&mut data)?;
-    if data.len() as u64 != metadata.len() {
+    if data.len() as u64 != admitted_len
+        || crate::file_identity::revalidate(path, identity, admitted_len).is_err()
+    {
         return Err(StateError::InvalidRollback(
             "rollback metadata changed while reconciling cleanup".to_string(),
         ));
     }
     Ok(data)
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 fn read_rollback_snapshot_file(path: &Path) -> Result<RollbackSnapshot, StateError> {

@@ -1,4 +1,5 @@
 pub mod effective;
+mod file_identity;
 mod health;
 pub mod install;
 pub mod modrinth;

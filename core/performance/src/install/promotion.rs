@@ -40,9 +40,8 @@ pub(super) async fn promote_file_async(
             let proof = async {
                 let temp_metadata = tokio::fs::symlink_metadata(temp.path()).await?;
                 let final_metadata = tokio::fs::symlink_metadata(final_path).await?;
-                if !temp.owns_metadata(&temp_metadata)
-                    || !temp.owns_metadata(&final_metadata)
-                    || !super::artifact::same_file_identity(&temp_metadata, &final_metadata)
+                if !temp.owns_path_async(temp.path(), temp_metadata.len()).await
+                    || !temp.owns_path_async(final_path, final_metadata.len()).await
                     || !super::artifact::file_matches_sha512(final_path, temp.sha512(), None)
                         .await?
                 {
@@ -55,9 +54,8 @@ pub(super) async fn promote_file_async(
             }
             .await;
             if let Err(error) = proof {
-                if tokio::fs::symlink_metadata(final_path)
-                    .await
-                    .is_ok_and(|metadata| temp.owns_metadata(&metadata))
+                if let Ok(metadata) = tokio::fs::symlink_metadata(final_path).await
+                    && temp.owns_path_async(final_path, metadata.len()).await
                 {
                     tokio::fs::remove_file(final_path).await?;
                 }
@@ -132,22 +130,26 @@ pub(super) async fn promote_file_with_overwrite_async(
         managed_artifact_replace_backup_path(final_path, expected_old_sha512, expected_new_sha512)
             .await?;
     tokio::fs::hard_link(final_path, &backup_path).await?;
-    let source_metadata = tokio::fs::symlink_metadata(final_path).await?;
-    let backup_metadata = tokio::fs::symlink_metadata(&backup_path).await?;
-    if !source_metadata.file_type().is_file()
-        || !backup_metadata.file_type().is_file()
-        || !super::artifact::same_file_identity(&source_metadata, &backup_metadata)
+    let source = crate::file_identity::admit_async(final_path).await?;
+    let source_identity = source.identity();
+    let source_len = source.metadata().len();
+    drop(source);
+    if crate::file_identity::revalidate_async(&backup_path, source_identity, source_len)
+        .await
+        .is_err()
         || !super::artifact::file_matches_sha512(&backup_path, expected_old_sha512, None).await?
     {
-        remove_if_identity(&backup_path, &backup_metadata).await?;
+        remove_if_identity(&backup_path, source_identity, source_len).await?;
         return Err(target_exists(final_path));
     }
-    let current_metadata = tokio::fs::symlink_metadata(final_path).await?;
-    if !super::artifact::same_file_identity(&current_metadata, &backup_metadata) {
-        remove_if_identity(&backup_path, &backup_metadata).await?;
+    if crate::file_identity::revalidate_async(final_path, source_identity, source_len)
+        .await
+        .is_err()
+    {
+        remove_if_identity(&backup_path, source_identity, source_len).await?;
         return Err(target_exists(final_path));
     }
-    remove_if_identity(final_path, &backup_metadata).await?;
+    remove_if_identity(final_path, source_identity, source_len).await?;
     match tokio::fs::rename(temp_path, final_path).await {
         Ok(()) => Ok(()),
         Err(error) => match tokio::fs::rename(&backup_path, final_path).await {
@@ -378,18 +380,29 @@ pub(super) async fn settle_empty_managed_replace_root(
 }
 
 async fn remove_digest_proven(path: &Path, digest: &str) -> Result<(), InstallError> {
-    let metadata = tokio::fs::symlink_metadata(path).await?;
-    if !metadata.file_type().is_file()
-        || !super::artifact::file_matches_sha512(path, digest, None).await?
+    let admitted = crate::file_identity::admit_async(path).await?;
+    let identity = admitted.identity();
+    let len = admitted.metadata().len();
+    drop(admitted);
+    if !super::artifact::file_matches_sha512(path, digest, None).await?
+        || crate::file_identity::revalidate_async(path, identity, len)
+            .await
+            .is_err()
     {
         return Err(invalid_mutation_root());
     }
-    remove_if_identity(path, &metadata).await
+    remove_if_identity(path, identity, len).await
 }
 
-async fn remove_if_identity(path: &Path, admitted: &std::fs::Metadata) -> Result<(), InstallError> {
-    let current = tokio::fs::symlink_metadata(path).await?;
-    if !current.file_type().is_file() || !super::artifact::same_file_identity(&current, admitted) {
+async fn remove_if_identity(
+    path: &Path,
+    admitted: crate::file_identity::FileIdentity,
+    admitted_len: u64,
+) -> Result<(), InstallError> {
+    if crate::file_identity::revalidate_async(path, admitted, admitted_len)
+        .await
+        .is_err()
+    {
         return Err(invalid_mutation_root());
     }
     tokio::fs::remove_file(path).await?;
