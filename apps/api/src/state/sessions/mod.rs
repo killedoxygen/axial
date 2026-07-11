@@ -1303,14 +1303,6 @@ impl SessionStore {
             .collect()
     }
 
-    #[cfg(test)]
-    pub(crate) async fn inject_rejected_process_owner(&self) {
-        self.active_processes.lock().await.insert(
-            self.next_attempt_id(),
-            supervisor::rejected_process_control_handle(),
-        );
-    }
-
     pub async fn has_active_instance(&self, instance_id: &str) -> bool {
         self.sessions.read().await.values().any(|entry| {
             entry.record.instance_id == instance_id

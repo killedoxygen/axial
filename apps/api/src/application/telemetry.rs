@@ -152,14 +152,15 @@ mod tests {
         fn new(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
-            let config = ConfigStore::load_from(paths.clone()).expect("load config store");
-            config
-                .update(AppConfig {
+            let config = ConfigStore::from_config(
+                paths.clone(),
+                AppConfig {
                     telemetry_enabled: true,
                     telemetry_install_id: TEST_INSTALL_ID.to_string(),
                     ..AppConfig::default()
-                })
-                .expect("seed config");
+                },
+            )
+            .expect("seed config");
             let config = Arc::new(config);
             let telemetry = Arc::new(TelemetryHub::new(
                 config.clone(),

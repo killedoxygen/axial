@@ -4,8 +4,7 @@ import { api } from '../../api';
 import { ensureFlags, refreshFlags, setFlagOverride } from '../../flags';
 import { Button, Toggle } from '../../ui/Atoms';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
-import { navigate, ROUTE_STORAGE_KEY } from '../../ui-state';
-import { STORAGE_KEY } from '../../state';
+import { navigate } from '../../ui-state';
 import { config, devMode, featureFlags, featureFlagsLoadState } from '../../store';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
@@ -90,7 +89,6 @@ export function AdvancedSettingsSection(): JSX.Element {
   const savedTelemetry = cfg?.telemetry_enabled === true;
   const [telemetryEnabled, setTelemetryEnabled] = useState(savedTelemetry);
   const [savingTelemetry, setSavingTelemetry] = useState(false);
-  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     setTelemetryEnabled(savedTelemetry);
@@ -111,27 +109,6 @@ export function AdvancedSettingsSection(): JSX.Element {
       toast(`Could not save anonymous usage stats setting: ${errMessage(err)}`, 'error');
     } finally {
       setSavingTelemetry(false);
-    }
-  };
-
-  const flush = async (): Promise<void> => {
-    const { showConfirm } = await import('../../ui/Dialog');
-    const ok = await showConfirm('Delete all Axial-owned data and reset the launcher to first run?', {
-      destructive: true,
-      confirmText: 'Reset',
-    });
-    if (!ok) return;
-    setBusy(true);
-    try {
-      await api('POST', '/dev/flush');
-      for (const key of [STORAGE_KEY, ROUTE_STORAGE_KEY]) {
-        localStorage.removeItem(key);
-      }
-      location.reload();
-    } catch (err) {
-      toast(`Failed: ${errMessage(err)}`);
-    } finally {
-      setBusy(false);
     }
   };
 
@@ -164,17 +141,6 @@ export function AdvancedSettingsSection(): JSX.Element {
         />
       )}
       {isDev && <PerformanceLabSlot />}
-      {isDev && (
-        <SettingRow
-          title="Flush all data"
-          description="Deletes every Axial-managed file and restarts from first run. Existing libraries selected through 'Use existing' are preserved."
-          control={
-            <Button variant="danger" icon="trash" disabled={busy} onClick={flush}>
-              {busy ? 'Flushing…' : 'Flush'}
-            </Button>
-          }
-        />
-      )}
     </SettingsSection>
   );
 }

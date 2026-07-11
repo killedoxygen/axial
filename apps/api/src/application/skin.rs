@@ -134,13 +134,16 @@ mod tests {
         fn new(name: &str, username: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            config
-                .replace_in_memory(AppConfig {
-                    username: username.to_string(),
-                    ..AppConfig::default()
-                })
-                .expect("set username");
+            let config = Arc::new(
+                ConfigStore::from_config(
+                    paths.clone(),
+                    AppConfig {
+                        username: username.to_string(),
+                        ..AppConfig::default()
+                    },
+                )
+                .expect("set username"),
+            );
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let state = AppState::new(AppStateInit {

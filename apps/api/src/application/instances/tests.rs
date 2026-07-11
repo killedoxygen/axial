@@ -1344,7 +1344,7 @@ async fn list_instances_summary_reports_missing_libraries() {
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_with_missing_library(&library_dir, "1.21.1");
     let instance = add_test_instance(&fixture, "Missing library", "1.21.1");
 
@@ -1368,7 +1368,7 @@ async fn list_instances_summary_does_not_walk_asset_objects() {
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_with_missing_asset_object(&library_dir, "1.21.1");
     let instance = add_test_instance(&fixture, "Missing asset", "1.21.1");
 
@@ -1388,7 +1388,7 @@ async fn list_instances_summary_does_not_hash_client_jar() {
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_with_corrupt_client_jar(&library_dir, "1.21.1");
     let instance = add_test_instance(&fixture, "Corrupt client", "1.21.1");
 
@@ -1408,7 +1408,7 @@ async fn list_instances_incomplete_parent_marker_does_not_show_launch_action() {
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_child_version_with_incomplete_parent(
         &library_dir,
         "fabric-loader-0.16.14-1.21.1",
@@ -1436,7 +1436,7 @@ async fn list_instances_installed_ready_version_transitions_to_launch_action() {
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_installed_vanilla_version(&library_dir, "1.21.1");
     let instance = add_test_instance(&fixture, "Ready", "1.21.1");
 
@@ -1456,7 +1456,7 @@ async fn degraded_version_scan_blocks_instances_and_create_queue_checks() {
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["1.21.1"]);
     let bad_version_dir = library_dir.join("versions").join("1.21.1");
     fs::create_dir_all(&bad_version_dir).expect("create bad version dir");
@@ -1970,7 +1970,7 @@ async fn create_instance_view_returns_backend_authored_version_rows() {
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["1.21.1", "1.21.2"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
     for component in axial_minecraft::fetch_components() {
@@ -2030,7 +2030,7 @@ async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["1.21.1"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
     for component in axial_minecraft::fetch_components() {
@@ -2082,7 +2082,7 @@ async fn create_instance_view_reuses_installed_scan_until_invalidated() {
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["1.21.1"]);
 
     let view = handle_create_instance_view(&fixture.state, None).await;
@@ -2118,7 +2118,7 @@ async fn create_instance_view_tags_beta_only_loader_version_rows_without_blockin
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["26.2", "1.7.10_pre4"]);
     for component in axial_minecraft::fetch_components() {
         let versions = match component.id {
@@ -2172,7 +2172,7 @@ async fn create_instance_view_keeps_fabric_and_quilt_snapshot_rows_enabled() {
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["26.2"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if matches!(
@@ -2222,7 +2222,7 @@ async fn create_instance_view_disables_known_incompatible_quilt_java25_default()
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["26.1.3", "26.1.2", "1.21.10"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
@@ -2296,7 +2296,7 @@ async fn create_instance_view_tags_quilt_java25_without_cached_builds() {
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["26.1.2"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
@@ -2332,7 +2332,7 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["26.1.2"]);
     for component in axial_minecraft::fetch_components() {
         let versions = if component.id == axial_minecraft::LoaderComponentId::Quilt {
@@ -2378,7 +2378,7 @@ async fn create_instance_vanilla_selection_returns_backend_queue_state() {
     let fixture = TestFixture::new("create-vanilla-queue");
     fixture
         .state
-        .set_library_dir(fixture.root.join("library").to_string_lossy().to_string());
+        .set_library_dir_for_test(fixture.root.join("library").to_string_lossy().to_string());
     write_version_manifest_cache(&fixture.root.join("library"), &["1.21.2"]);
     fixture
         .state
@@ -2441,7 +2441,7 @@ async fn create_instance_installed_vanilla_selection_does_not_queue_install() {
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     write_version_manifest_cache(&library_dir, &["1.21.1"]);
     write_installed_vanilla_version(&library_dir, "1.21.1");
 
@@ -2469,7 +2469,7 @@ async fn create_instance_loader_selection_resolves_cached_build_and_queues_backe
     let library_dir = fixture.root.join("library");
     fixture
         .state
-        .set_library_dir(library_dir.to_string_lossy().to_string());
+        .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
     fixture
         .state
         .installs()
@@ -3268,7 +3268,7 @@ impl TestFixture {
     fn configure_create_manifest(&self, version_ids: &[&str]) -> PathBuf {
         let library_dir = self.root.join("library");
         self.state
-            .set_library_dir(library_dir.to_string_lossy().to_string());
+            .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
         write_version_manifest_cache(&library_dir, version_ids);
         library_dir
     }

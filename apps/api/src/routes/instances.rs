@@ -462,7 +462,7 @@ mod tests {
         fn configure_create_manifest(&self, version_ids: &[&str]) {
             let library_dir = self.root.join("library");
             self.state
-                .set_library_dir(library_dir.to_string_lossy().to_string());
+                .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
             write_route_version_manifest_cache(&library_dir, version_ids);
         }
 

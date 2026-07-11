@@ -212,7 +212,7 @@ pub(crate) async fn auth_refresh_for_state(
                 return accounts::account_persistence_failed_response();
             }
         };
-        if let Err(error) = accounts::sync_config_for_account(state, &account) {
+        if let Err(error) = accounts::sync_config_for_account(state, &account).await {
             tracing::warn!("account config sync after auth refresh failed: {error}");
             return accounts::account_persistence_failed_response();
         }
@@ -245,7 +245,7 @@ pub(crate) async fn auth_profile_sync_for_state(
                 return accounts::account_persistence_failed_response();
             }
         };
-        if let Err(error) = accounts::sync_config_for_account(state, &account) {
+        if let Err(error) = accounts::sync_config_for_account(state, &account).await {
             tracing::warn!("account config sync after profile sync failed: {error}");
             return accounts::account_persistence_failed_response();
         }
@@ -563,9 +563,13 @@ pub(crate) async fn auth_logout_for_state(
         return response;
     }
 
-    let mut next = state.config().current();
-    next.launch_auth_mode = LAUNCH_AUTH_MODE_OFFLINE.to_string();
-    match state.update_config(next) {
+    match state
+        .mutate_config(move |latest| {
+            latest.launch_auth_mode = LAUNCH_AUTH_MODE_OFFLINE.to_string();
+            Ok(())
+        })
+        .await
+    {
         Ok(_) => {}
         Err(error) => {
             tracing::warn!("config sync after auth logout failed: {error}");
@@ -1548,7 +1552,7 @@ mod tests {
         fixture
             .state
             .config()
-            .replace_in_memory(config)
+            .replace_for_test(config)
             .expect("set online config");
 
         let response = auth_logout_for_state(&fixture.state).await;
@@ -1651,13 +1655,16 @@ mod tests {
         fn new_inner(name: &str, username: &str, failing_accounts: bool) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            config
-                .replace_in_memory(AppConfig {
-                    username: username.to_string(),
-                    ..AppConfig::default()
-                })
-                .expect("set username");
+            let config = Arc::new(
+                ConfigStore::from_config(
+                    paths.clone(),
+                    AppConfig {
+                        username: username.to_string(),
+                        ..AppConfig::default()
+                    },
+                )
+                .expect("set username"),
+            );
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let state = AppState::new(AppStateInit {

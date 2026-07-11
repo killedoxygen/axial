@@ -117,10 +117,9 @@ mod tests {
         fn new(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            config
-                .replace_in_memory(AppConfig::default())
-                .expect("set config");
+            let config = Arc::new(
+                ConfigStore::from_config(paths.clone(), AppConfig::default()).expect("set config"),
+            );
             let instances = Arc::new(InstanceStore::load_from(paths).expect("load instances"));
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),

@@ -36,14 +36,14 @@ async fn handle_setup_set_dir(
     State(state): State<AppState>,
     Json(payload): Json<SetupPathRequest>,
 ) -> Result<Json<application::SetupLibraryResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::setup_set_dir(&state, payload).map(Json)
+    application::setup_set_dir(&state, payload).await.map(Json)
 }
 
 async fn handle_setup_init(
     State(state): State<AppState>,
     Json(payload): Json<SetupPathRequest>,
 ) -> Result<Json<application::SetupLibraryResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::setup_init(&state, payload).map(Json)
+    application::setup_init(&state, payload).await.map(Json)
 }
 
 async fn handle_setup_browse() -> Json<application::SetupBrowseResponse> {
@@ -53,5 +53,5 @@ async fn handle_setup_browse() -> Json<application::SetupBrowseResponse> {
 async fn handle_onboarding_complete(
     State(state): State<AppState>,
 ) -> Result<Json<application::SetupStatusResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::onboarding_complete(&state).map(Json)
+    application::onboarding_complete(&state).await.map(Json)
 }

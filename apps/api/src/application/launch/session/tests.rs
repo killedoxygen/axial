@@ -38,13 +38,16 @@ impl TestFixture {
         let root = test_root(name);
         let paths = test_paths(&root);
         fs::create_dir_all(&paths.library_dir).expect("create library dir");
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        config
-            .replace_in_memory(AppConfig {
-                library_dir: paths.library_dir.to_string_lossy().to_string(),
-                ..AppConfig::default()
-            })
-            .expect("set library dir");
+        let config = Arc::new(
+            ConfigStore::from_config(
+                paths.clone(),
+                AppConfig {
+                    library_dir: paths.library_dir.to_string_lossy().to_string(),
+                    ..AppConfig::default()
+                },
+            )
+            .expect("set library dir"),
+        );
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
@@ -157,7 +160,7 @@ impl TestFixture {
         config.guardian_mode = mode.to_string();
         self.state
             .config()
-            .replace_in_memory(config)
+            .replace_for_test(config)
             .expect("set guardian mode");
     }
 
@@ -166,7 +169,7 @@ impl TestFixture {
         config.launch_auth_mode = mode.to_string();
         self.state
             .config()
-            .replace_in_memory(config)
+            .replace_for_test(config)
             .expect("set launch auth mode");
     }
 
@@ -175,7 +178,7 @@ impl TestFixture {
         config.jvm_preset = preset.to_string();
         self.state
             .config()
-            .replace_in_memory(config)
+            .replace_for_test(config)
             .expect("set global jvm preset");
     }
 
@@ -184,7 +187,7 @@ impl TestFixture {
         config.java_path_override = java_path.to_string();
         self.state
             .config()
-            .replace_in_memory(config)
+            .replace_for_test(config)
             .expect("set global java override");
     }
 

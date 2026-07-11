@@ -1,28 +1,55 @@
 use crate::state::AppState;
-use axial_config::{AppConfig, Instance};
+use axial_config::Instance;
 
-pub(super) fn persist_launch_metadata(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LaunchMetadataPersistenceError {
+    InstanceHistory,
+    LastInstance,
+    Config,
+}
+
+pub(super) async fn persist_launch_metadata(
     state: &AppState,
     instance: &mut Instance,
-    config: &AppConfig,
     username: &str,
     max_memory_mb: i32,
     min_memory_mb: i32,
     launched_at: &str,
-) {
+) -> Result<(), LaunchMetadataPersistenceError> {
     instance.last_played_at = launched_at.to_string();
-    let _ = state.instances().update(instance.clone());
-    let _ = state.instances().set_last_instance_id(instance.id.clone());
+    let mut first_error = state
+        .instances()
+        .update(instance.clone())
+        .err()
+        .map(|_| LaunchMetadataPersistenceError::InstanceHistory);
+    if state
+        .instances()
+        .set_last_instance_id(instance.id.clone())
+        .is_err()
+        && first_error.is_none()
+    {
+        first_error = Some(LaunchMetadataPersistenceError::LastInstance);
+    }
 
-    let mut next = config.clone();
-    next.username = username.to_string();
-    if max_memory_mb > 0 {
-        next.max_memory_mb = max_memory_mb;
+    let username = username.to_string();
+    if state
+        .mutate_config(move |latest| {
+            latest.username = username;
+            if max_memory_mb > 0 {
+                latest.max_memory_mb = max_memory_mb;
+            }
+            if min_memory_mb > 0 {
+                latest.min_memory_mb = min_memory_mb;
+            }
+            Ok(())
+        })
+        .await
+        .is_err()
+        && first_error.is_none()
+    {
+        first_error = Some(LaunchMetadataPersistenceError::Config);
     }
-    if min_memory_mb > 0 {
-        next.min_memory_mb = min_memory_mb;
-    }
-    let _ = state.update_config(next);
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -36,8 +63,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn persist_launch_metadata_updates_instance_last_played_last_instance_and_config() {
+    #[tokio::test]
+    async fn persist_launch_metadata_updates_instance_last_played_last_instance_and_config() {
         let root = unique_test_dir("launch-metadata-persistence");
         let state = test_app_state(&root);
         let mut instance = state
@@ -50,22 +77,27 @@ mod tests {
                 None,
             )
             .expect("add instance");
-        let mut config = state.config().current();
-        config.username = "BeforeLaunch".to_string();
-        config.max_memory_mb = 3072;
-        config.min_memory_mb = 512;
-        config.theme = "existing-theme".to_string();
-        state.update_config(config.clone()).expect("seed config");
+        state
+            .mutate_config(move |latest| {
+                latest.username = "BeforeLaunch".to_string();
+                latest.max_memory_mb = 3072;
+                latest.min_memory_mb = 512;
+                latest.theme = "existing-theme".to_string();
+                Ok(())
+            })
+            .await
+            .expect("seed config");
 
         persist_launch_metadata(
             &state,
             &mut instance,
-            &config,
             "AfterLaunch",
             6144,
             1024,
             "2026-01-01T00:00:00.000Z",
-        );
+        )
+        .await
+        .expect("persist launch metadata");
 
         let stored = state
             .instances()
@@ -87,8 +119,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn persist_launch_metadata_keeps_existing_memory_when_new_values_are_not_positive() {
+    #[tokio::test]
+    async fn persist_launch_metadata_keeps_existing_memory_when_new_values_are_not_positive() {
         let root = unique_test_dir("launch-metadata-non-positive-memory");
         let state = test_app_state(&root);
         let mut instance = state
@@ -101,25 +133,67 @@ mod tests {
                 None,
             )
             .expect("add instance");
-        let mut config = state.config().current();
-        config.max_memory_mb = 4096;
-        config.min_memory_mb = 768;
-        state.update_config(config.clone()).expect("seed config");
+        state
+            .mutate_config(move |latest| {
+                latest.max_memory_mb = 4096;
+                latest.min_memory_mb = 768;
+                Ok(())
+            })
+            .await
+            .expect("seed config");
 
         persist_launch_metadata(
             &state,
             &mut instance,
-            &config,
             "MemoryKept",
             0,
             -1,
             "2026-01-01T00:00:00.000Z",
-        );
+        )
+        .await
+        .expect("persist launch metadata");
 
         let updated = state.config().current();
         assert_eq!(updated.username, "MemoryKept");
         assert_eq!(updated.max_memory_mb, 4096);
         assert_eq!(updated.min_memory_mb, 768);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn instance_failure_does_not_skip_independent_config_metadata() {
+        let root = unique_test_dir("launch-metadata-instance-failure");
+        let paths = test_paths(&root);
+        let state = test_app_state(&root);
+        let mut instance = state
+            .instances()
+            .add(
+                "Launch Metadata Failure".to_string(),
+                "1.21.1".to_string(),
+                String::new(),
+                String::new(),
+                None,
+            )
+            .expect("add instance");
+        fs::remove_file(&paths.instances_file).expect("remove instance registry");
+        fs::create_dir_all(&paths.instances_file).expect("block instance registry path");
+
+        let result = persist_launch_metadata(
+            &state,
+            &mut instance,
+            "ConfigStillRuns",
+            5120,
+            768,
+            "2026-01-01T00:00:00.000Z",
+        )
+        .await;
+
+        assert_eq!(result, Err(LaunchMetadataPersistenceError::InstanceHistory));
+        let config = state.config().current();
+        assert_eq!(config.username, "ConfigStillRuns");
+        assert_eq!(config.max_memory_mb, 5120);
+        assert_eq!(config.min_memory_mb, 768);
 
         let _ = fs::remove_dir_all(root);
     }

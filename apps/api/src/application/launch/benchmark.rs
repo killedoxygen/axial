@@ -2462,13 +2462,16 @@ mod tests {
             let root = test_root(name);
             let paths = test_paths(&root);
             fs::create_dir_all(&paths.library_dir).expect("create library dir");
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            config
-                .replace_in_memory(AppConfig {
-                    library_dir: paths.library_dir.to_string_lossy().to_string(),
-                    ..AppConfig::default()
-                })
-                .expect("set library dir");
+            let config = Arc::new(
+                ConfigStore::from_config(
+                    paths.clone(),
+                    AppConfig {
+                        library_dir: paths.library_dir.to_string_lossy().to_string(),
+                        ..AppConfig::default()
+                    },
+                )
+                .expect("set library dir"),
+            );
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let state = AppState::new(AppStateInit {

@@ -97,7 +97,9 @@ pub(crate) async fn create_offline_account(
         .create_offline_account(&request.username)
         .await
         .map_err(account_store_error)?;
-    apply_selected_account_to_config(state, &account).map_err(config_error)?;
+    sync_config_for_account(state, &account)
+        .await
+        .map_err(config_error)?;
     let response = account_response_for_record(state, account, true).await;
     Ok(Json(AccountActionResponse {
         status: "account_created",
@@ -131,7 +133,9 @@ pub(crate) async fn patch_account(
     let active =
         state.accounts().active_account_id().as_deref() == Some(account.account_id.as_str());
     if active {
-        apply_selected_account_to_config(state, &account).map_err(config_error)?;
+        sync_config_for_account(state, &account)
+            .await
+            .map_err(config_error)?;
     }
     let response = account_response_for_record(state, account, active).await;
     Ok(Json(AccountActionResponse {
@@ -160,7 +164,9 @@ pub(crate) async fn select_account(
         .await
         .map_err(account_store_error)?
         .ok_or_else(account_missing_error)?;
-    apply_selected_account_to_config(state, &account).map_err(config_error)?;
+    sync_config_for_account(state, &account)
+        .await
+        .map_err(config_error)?;
     let response = account_response_for_record(state, account, true).await;
     Ok(Json(AccountActionResponse {
         status: "account_selected",
@@ -205,12 +211,18 @@ pub(crate) async fn remove_account(
     match next_active {
         Some(active) => {
             activate_account_auth(state, &active).await?;
-            apply_selected_account_to_config(state, &active).map_err(config_error)?;
+            sync_config_for_account(state, &active)
+                .await
+                .map_err(config_error)?;
         }
         None => {
-            let mut next = state.config().current();
-            next.launch_auth_mode = LAUNCH_AUTH_MODE_OFFLINE.to_string();
-            state.update_config(next).map_err(config_error)?;
+            state
+                .mutate_config(move |latest| {
+                    latest.launch_auth_mode = LAUNCH_AUTH_MODE_OFFLINE.to_string();
+                    Ok(())
+                })
+                .await
+                .map_err(config_error)?;
         }
     }
 
@@ -268,7 +280,7 @@ pub(crate) async fn account_list_response(
     state: &AppState,
 ) -> Result<AccountListResponse, (StatusCode, Json<serde_json::Value>)> {
     if let Some(repaired_active) = reconcile_microsoft_accounts_from_auth(state).await?
-        && let Err(error) = sync_config_for_account(state, &repaired_active)
+        && let Err(error) = sync_config_for_account(state, &repaired_active).await
     {
         tracing::warn!("account config sync after auth account repair failed: {error}");
     }
@@ -358,23 +370,23 @@ fn account_view_model(
     AccountViewModel { detail }
 }
 
-pub(crate) fn sync_config_for_account(
+pub(crate) async fn sync_config_for_account(
     state: &AppState,
     account: &LauncherAccountRecord,
 ) -> Result<(), ConfigStoreError> {
-    let mut next = state.config().current();
-    match account.kind {
-        LauncherAccountKind::Microsoft => {
-            next.launch_auth_mode = LAUNCH_AUTH_MODE_ONLINE.to_string();
-            next.username = account.display_name.clone();
-        }
-        LauncherAccountKind::Offline => {
-            next.launch_auth_mode = LAUNCH_AUTH_MODE_OFFLINE.to_string();
-            next.username = account.display_name.clone();
-        }
-    }
-    let _ = state.update_config(next)?;
-    Ok(())
+    let username = account.display_name.clone();
+    let launch_auth_mode = match account.kind {
+        LauncherAccountKind::Microsoft => LAUNCH_AUTH_MODE_ONLINE.to_string(),
+        LauncherAccountKind::Offline => LAUNCH_AUTH_MODE_OFFLINE.to_string(),
+    };
+    state
+        .mutate_config(move |latest| {
+            latest.launch_auth_mode = launch_auth_mode;
+            latest.username = username;
+            Ok(())
+        })
+        .await
+        .map(|_| ())
 }
 
 pub(crate) async fn sync_active_offline_account_from_username(
@@ -491,13 +503,6 @@ fn auth_state_map(states: Vec<AuthLoginAccountState>) -> HashMap<String, AuthLog
         .into_iter()
         .map(|state| (state.login_id.clone(), state))
         .collect()
-}
-
-fn apply_selected_account_to_config(
-    state: &AppState,
-    account: &LauncherAccountRecord,
-) -> Result<(), ConfigStoreError> {
-    sync_config_for_account(state, account)
 }
 
 async fn activate_account_auth(
@@ -727,10 +732,9 @@ mod tests {
         fn new(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            config
-                .replace_in_memory(AppConfig::default())
-                .expect("set config");
+            let config = Arc::new(
+                ConfigStore::from_config(paths.clone(), AppConfig::default()).expect("set config"),
+            );
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let state = AppState::new(AppStateInit {

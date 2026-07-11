@@ -124,7 +124,7 @@ async fn prepare_launch_session_syncs_active_offline_account_from_config_usernam
     fixture
         .state
         .config()
-        .replace_in_memory(config)
+        .replace_for_test(config)
         .expect("set config username");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
 
@@ -196,7 +196,6 @@ async fn prepare_launch_session_uses_online_auth_context_from_active_minecraft_a
         .await
         .expect("prepare launch session");
 
-    assert_eq!(prepared.task.config.username, "Player");
     assert_eq!(prepared.task.intent.username, "Player");
     assert_eq!(prepared.task.intent.auth.player_name, "ProfileName");
     assert_eq!(

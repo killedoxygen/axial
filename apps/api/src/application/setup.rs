@@ -82,7 +82,7 @@ pub fn setup_validate(payload: SetupPathRequest) -> SetupValidateResponse {
     }
 }
 
-pub fn setup_set_dir(
+pub async fn setup_set_dir(
     state: &AppState,
     payload: SetupPathRequest,
 ) -> Result<SetupLibraryResponse, ApiError> {
@@ -96,10 +96,15 @@ pub fn setup_set_dir(
         ));
     }
 
-    let mut config = state.config().current();
-    config.library_dir = payload.path.clone();
-    config.library_mode = "existing".to_string();
-    state.update_config(config).map_err(setup_config_error)?;
+    let library_dir = payload.path.clone();
+    state
+        .mutate_config(move |latest| {
+            latest.library_dir = library_dir;
+            latest.library_mode = "existing".to_string();
+            Ok(())
+        })
+        .await
+        .map_err(setup_config_error)?;
     invalidate_create_view_cache();
     let _ = ensure_launcher_profiles(&path, "");
 
@@ -110,7 +115,7 @@ pub fn setup_set_dir(
     })
 }
 
-pub fn setup_init(
+pub async fn setup_init(
     state: &AppState,
     payload: SetupPathRequest,
 ) -> Result<SetupLibraryResponse, ApiError> {
@@ -129,10 +134,15 @@ pub fn setup_init(
     create_minecraft_dir(&path).map_err(setup_managed_create_error)?;
     let _ = ensure_launcher_profiles(&path, "");
 
-    let mut config = state.config().current();
-    config.library_dir = path.to_string_lossy().to_string();
-    config.library_mode = "managed".to_string();
-    state.update_config(config).map_err(setup_config_error)?;
+    let library_dir = path.to_string_lossy().to_string();
+    state
+        .mutate_config(move |latest| {
+            latest.library_dir = library_dir;
+            latest.library_mode = "managed".to_string();
+            Ok(())
+        })
+        .await
+        .map_err(setup_config_error)?;
     invalidate_create_view_cache();
 
     Ok(SetupLibraryResponse {
@@ -146,12 +156,13 @@ pub fn setup_browse() -> SetupBrowseResponse {
     SetupBrowseResponse { path: "" }
 }
 
-pub fn onboarding_complete(state: &AppState) -> Result<SetupStatusResponse, ApiError> {
-    let mut config = state.config().current();
-    config.onboarding_done = true;
+pub async fn onboarding_complete(state: &AppState) -> Result<SetupStatusResponse, ApiError> {
     state
-        .config()
-        .update(config)
+        .mutate_config(move |latest| {
+            latest.onboarding_done = true;
+            Ok(())
+        })
+        .await
         .map_err(onboarding_save_error)?;
     Ok(SetupStatusResponse { status: "ok" })
 }

@@ -4166,9 +4166,9 @@ fn configure_library_dir(state: &AppState, library_dir: &Path) {
     config.library_dir = library_dir.to_string_lossy().to_string();
     state
         .config()
-        .replace_in_memory(config.clone())
+        .replace_for_test(config.clone())
         .expect("config update");
-    state.set_library_dir(config.library_dir);
+    state.set_library_dir_for_test(config.library_dir);
 }
 
 fn test_app_paths(root: &Path) -> AppPaths {

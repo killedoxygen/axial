@@ -47,12 +47,12 @@ pub struct FlagOverridePatch {
 
 pub fn list_flags(state: &AppState) -> FlagsResponse {
     let config = state.config().current();
-    let remote_active = state.remote_flags_active_for(&config);
-    let remote_values = if remote_active {
-        state.remote_flags().values_snapshot()
-    } else {
-        Default::default()
-    };
+    let remote_identity = state.remote_flag_identity_for(&config);
+    let remote_active = remote_identity.is_some();
+    let remote_values = remote_identity
+        .as_deref()
+        .map(|identity| state.remote_flags().values_snapshot(identity))
+        .unwrap_or_default();
     let flags = FEATURE_FLAGS
         .iter()
         .filter(|flag| cfg!(debug_assertions) || !flag.dev_only)
@@ -98,17 +98,21 @@ pub async fn update_flag(
         return Err(unknown_flag_response());
     };
 
-    let mut next = state.config().current();
-    if let Some(enabled) = patch.enabled {
-        next.feature_overrides.insert(flag.key.to_string(), enabled);
-    } else {
-        next.feature_overrides.remove(flag.key);
-    }
-
-    state.update_config(next).map_err(|error| {
-        emit_config_save_failed(state, &error);
-        config_update_error_response(error)
-    })?;
+    let key = flag.key.to_string();
+    state
+        .mutate_config(move |latest| -> Result<(), ConfigStoreError> {
+            if let Some(enabled) = patch.enabled {
+                latest.feature_overrides.insert(key, enabled);
+            } else {
+                latest.feature_overrides.remove(&key);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            emit_config_save_failed(state, &error);
+            config_update_error_response(error)
+        })?;
 
     Ok(list_flags(state))
 }
@@ -294,10 +298,9 @@ mod tests {
         fn new(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            config
-                .replace_in_memory(AppConfig::default())
-                .expect("set config");
+            let config = Arc::new(
+                ConfigStore::from_config(paths.clone(), AppConfig::default()).expect("set config"),
+            );
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let state = AppState::new(AppStateInit {

@@ -48,84 +48,87 @@ pub fn current_config(state: &AppState) -> AppConfig {
 }
 
 pub async fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppConfig, ApiError> {
-    let mut next = state.config().current();
-    let previous_library_dir = next.library_dir.clone();
     let sync_offline_username = patch.username.is_some();
-    if let Some(username) = patch.username {
-        next.username = username;
-    }
-    if let Some(launch_auth_mode) = patch.launch_auth_mode {
-        next.launch_auth_mode = launch_auth_mode;
-    }
-    if let Some(max_memory_mb) = patch.max_memory_mb.filter(|value| *value > 0) {
-        next.max_memory_mb = max_memory_mb;
-    }
-    if let Some(min_memory_mb) = patch.min_memory_mb.filter(|value| *value > 0) {
-        next.min_memory_mb = min_memory_mb;
-    }
-    if let Some(java_path_override) = patch.java_path_override {
-        next.java_path_override = java_path_override;
-    }
-    if let Some(window_width) = patch.window_width {
-        next.window_width = window_width;
-    }
-    if let Some(window_height) = patch.window_height {
-        next.window_height = window_height;
-    }
-    if let Some(onboarding_done) = patch.onboarding_done {
-        next.onboarding_done = onboarding_done;
-    }
-    if let Some(jvm_preset) = patch.jvm_preset {
-        next.jvm_preset = jvm_preset;
-    }
-    if let Some(performance_mode) = patch.performance_mode {
-        next.performance_mode = performance_mode;
-    }
-    if let Some(guardian_mode) = patch.guardian_mode {
-        next.guardian_mode = guardian_mode;
-    }
-    if let Some(theme) = patch.theme {
-        next.theme = theme;
-    }
-    if let Some(custom_hue) = patch.custom_hue {
-        next.custom_hue = Some(custom_hue);
-    }
-    if let Some(custom_vibrancy) = patch.custom_vibrancy {
-        next.custom_vibrancy = Some(custom_vibrancy);
-    }
-    if let Some(lightness) = patch.lightness {
-        next.lightness = Some(lightness);
-    }
-    if let Some(telemetry_enabled) = patch.telemetry_enabled {
-        next.telemetry_enabled = telemetry_enabled;
-    }
-    if let Some(discord_rpc_enabled) = patch.discord_rpc_enabled {
-        next.discord_rpc_enabled = discord_rpc_enabled;
-    }
-    if let Some(discord_rpc_onboarding_seen) = patch.discord_rpc_onboarding_seen {
-        next.discord_rpc_onboarding_seen = discord_rpc_onboarding_seen;
-    }
-    if let Some(music_enabled) = patch.music_enabled {
-        next.music_enabled = Some(music_enabled);
-    }
-    if let Some(music_volume) = patch.music_volume {
-        next.music_volume = Some(music_volume);
-    }
-    if let Some(music_track) = patch.music_track {
-        next.music_track = music_track.max(0);
-    }
-    if let Some(library_dir) = patch.library_dir {
-        next.library_dir = library_dir;
-    }
-    if let Some(library_mode) = patch.library_mode {
-        next.library_mode = library_mode;
-    }
+    let invalidate_library_cache = patch.library_dir.is_some();
+    let emit_save_failure = patch.telemetry_enabled != Some(false);
 
-    let telemetry_enabled_after_patch = next.telemetry_enabled;
-
-    match state.update_config(next) {
+    match state
+        .mutate_config(move |latest| -> Result<(), ConfigStoreError> {
+            if let Some(username) = patch.username {
+                latest.username = username;
+            }
+            if let Some(launch_auth_mode) = patch.launch_auth_mode {
+                latest.launch_auth_mode = launch_auth_mode;
+            }
+            if let Some(max_memory_mb) = patch.max_memory_mb.filter(|value| *value > 0) {
+                latest.max_memory_mb = max_memory_mb;
+            }
+            if let Some(min_memory_mb) = patch.min_memory_mb.filter(|value| *value > 0) {
+                latest.min_memory_mb = min_memory_mb;
+            }
+            if let Some(java_path_override) = patch.java_path_override {
+                latest.java_path_override = java_path_override;
+            }
+            if let Some(window_width) = patch.window_width {
+                latest.window_width = window_width;
+            }
+            if let Some(window_height) = patch.window_height {
+                latest.window_height = window_height;
+            }
+            if let Some(onboarding_done) = patch.onboarding_done {
+                latest.onboarding_done = onboarding_done;
+            }
+            if let Some(jvm_preset) = patch.jvm_preset {
+                latest.jvm_preset = jvm_preset;
+            }
+            if let Some(performance_mode) = patch.performance_mode {
+                latest.performance_mode = performance_mode;
+            }
+            if let Some(guardian_mode) = patch.guardian_mode {
+                latest.guardian_mode = guardian_mode;
+            }
+            if let Some(theme) = patch.theme {
+                latest.theme = theme;
+            }
+            if let Some(custom_hue) = patch.custom_hue {
+                latest.custom_hue = Some(custom_hue);
+            }
+            if let Some(custom_vibrancy) = patch.custom_vibrancy {
+                latest.custom_vibrancy = Some(custom_vibrancy);
+            }
+            if let Some(lightness) = patch.lightness {
+                latest.lightness = Some(lightness);
+            }
+            if let Some(telemetry_enabled) = patch.telemetry_enabled {
+                latest.telemetry_enabled = telemetry_enabled;
+            }
+            if let Some(discord_rpc_enabled) = patch.discord_rpc_enabled {
+                latest.discord_rpc_enabled = discord_rpc_enabled;
+            }
+            if let Some(discord_rpc_onboarding_seen) = patch.discord_rpc_onboarding_seen {
+                latest.discord_rpc_onboarding_seen = discord_rpc_onboarding_seen;
+            }
+            if let Some(music_enabled) = patch.music_enabled {
+                latest.music_enabled = Some(music_enabled);
+            }
+            if let Some(music_volume) = patch.music_volume {
+                latest.music_volume = Some(music_volume);
+            }
+            if let Some(music_track) = patch.music_track {
+                latest.music_track = music_track.max(0);
+            }
+            if let Some(library_dir) = patch.library_dir {
+                latest.library_dir = library_dir;
+            }
+            if let Some(library_mode) = patch.library_mode {
+                latest.library_mode = library_mode;
+            }
+            Ok(())
+        })
+        .await
+    {
         Ok(config) => {
-            if config.library_dir != previous_library_dir {
+            if invalidate_library_cache {
                 application::instances::invalidate_create_view_cache();
             }
             if sync_offline_username {
@@ -136,7 +139,7 @@ pub async fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppCo
             Ok(config)
         }
         Err(error) => {
-            emit_config_save_failed(state, &error, telemetry_enabled_after_patch);
+            emit_config_save_failed(state, &error, emit_save_failure);
             Err(config_update_error_response(error))
         }
     }
@@ -187,7 +190,9 @@ fn config_account_sync_error_response(error: std::io::Error) -> ApiError {
 mod tests {
     use super::{CONFIG_SAVE_ERROR_MESSAGE, ConfigPatch, config_update_error_response};
     use crate::{
-        observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub},
+        observability::telemetry::{
+            DEFAULT_POSTHOG_HOST, TelemetryEvent, TelemetryHub, TelemetryLaunchOutcome,
+        },
         state::{AppState, AppStateInit, InstallStore, SessionStore},
     };
     use axial_config::{
@@ -349,6 +354,14 @@ mod tests {
             telemetry_install_id: TEST_TELEMETRY_INSTALL_ID.to_string(),
             ..AppConfig::default()
         });
+        fixture
+            .state
+            .telemetry()
+            .emit(TelemetryEvent::launch_completed(
+                TelemetryLaunchOutcome::Success,
+            ));
+        assert_eq!(fixture.state.telemetry().queue_len_for_test(), 1);
+        let mut changes = fixture.state.subscribe_config_changes();
         fixture.block_config_dir();
 
         let result = super::update_config(
@@ -362,7 +375,28 @@ mod tests {
 
         assert!(result.is_err());
         assert!(fixture.state.config().current().telemetry_enabled);
+        assert_eq!(fixture.state.telemetry().queue_len_for_test(), 1);
+        assert!(matches!(
+            changes.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        fixture.unblock_config_dir();
+        super::update_config(
+            &fixture.state,
+            ConfigPatch {
+                telemetry_enabled: Some(false),
+                ..ConfigPatch::default()
+            },
+        )
+        .await
+        .expect("retry retained telemetry disable");
+        assert!(!fixture.state.config().current().telemetry_enabled);
         assert_eq!(fixture.state.telemetry().queue_len_for_test(), 0);
+        changes
+            .recv()
+            .await
+            .expect("durable retry publishes config change");
     }
 
     struct TestFixture {
@@ -374,10 +408,9 @@ mod tests {
         fn new(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
-            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-            config
-                .replace_in_memory(AppConfig::default())
-                .expect("set config");
+            let config = Arc::new(
+                ConfigStore::from_config(paths.clone(), AppConfig::default()).expect("set config"),
+            );
             let instances =
                 Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
             let telemetry = Arc::new(TelemetryHub::new(
@@ -406,7 +439,7 @@ mod tests {
         fn seed_config(&self, config: AppConfig) {
             self.state
                 .config()
-                .replace_in_memory(config)
+                .replace_for_test(config)
                 .expect("seed config");
         }
 
@@ -414,6 +447,11 @@ mod tests {
             fs::create_dir_all(&self.root).expect("create test root");
             fs::write(self.root.join("config"), "not a directory")
                 .expect("block config directory with file");
+        }
+
+        fn unblock_config_dir(&self) {
+            fs::remove_file(self.root.join("config")).expect("remove config directory blocker");
+            fs::create_dir_all(self.root.join("config")).expect("restore config directory");
         }
     }
 

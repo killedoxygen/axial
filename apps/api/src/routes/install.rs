@@ -258,7 +258,7 @@ mod tests {
         fs::create_dir_all(&library_dir).expect("library dir");
         fixture
             .state
-            .set_library_dir(library_dir.to_string_lossy().to_string());
+            .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
         fixture
             .state
             .installs()
@@ -336,7 +336,7 @@ mod tests {
         fs::create_dir_all(&library_dir).expect("library dir");
         fixture
             .state
-            .set_library_dir(library_dir.to_string_lossy().to_string());
+            .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
 
         let (status, payload) = fixture
             .request_json_body(

@@ -218,7 +218,6 @@ async fn launch_session_inner(
         application,
         boundary,
         mut instance,
-        config,
         intent,
         mut guardian,
         launched_at,
@@ -738,15 +737,18 @@ async fn launch_session_inner(
                     Some(&proof_context),
                 )
                 .await;
-                persist_launch_metadata(
+                if let Err(stage) = persist_launch_metadata(
                     &state,
                     &mut instance,
-                    &config,
                     &intent.username,
                     intent.max_memory_mb,
                     intent.min_memory_mb,
                     &launched_at,
-                );
+                )
+                .await
+                {
+                    tracing::warn!(?stage, "launch metadata persistence failed");
+                }
                 return Ok(LaunchSuccess {
                     session_id: session_id.clone(),
                     instance_id: intent.instance_id.clone(),
@@ -1493,14 +1495,15 @@ mod tests {
 
     fn test_app_state_with_telemetry(root: &Path) -> AppState {
         let paths = test_paths(root);
-        let config_store = ConfigStore::load_from(paths.clone()).expect("load config");
-        config_store
-            .update(AppConfig {
+        let config_store = ConfigStore::from_config(
+            paths.clone(),
+            AppConfig {
                 telemetry_enabled: true,
                 telemetry_install_id: TEST_TELEMETRY_INSTALL_ID.to_string(),
                 ..AppConfig::default()
-            })
-            .expect("seed telemetry config");
+            },
+        )
+        .expect("seed telemetry config");
         let config = Arc::new(config_store);
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         let telemetry = Arc::new(TelemetryHub::new(
@@ -1527,13 +1530,14 @@ mod tests {
 
     fn test_app_state_with_library(root: &Path) -> AppState {
         let paths = test_paths(root);
-        let config_store = ConfigStore::load_from(paths.clone()).expect("load config");
-        config_store
-            .replace_in_memory(AppConfig {
+        let config_store = ConfigStore::from_config(
+            paths.clone(),
+            AppConfig {
                 library_dir: paths.library_dir.to_string_lossy().to_string(),
                 ..AppConfig::default()
-            })
-            .expect("set test library");
+            },
+        )
+        .expect("set test library");
         let config = Arc::new(config_store);
         let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
         AppState::new(AppStateInit {

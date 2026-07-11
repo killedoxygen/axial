@@ -9,7 +9,7 @@ use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
 use crate::state::contracts::TargetDescriptor;
 use crate::state::{AppStateInit, InstallStore, SessionStore};
-use axial_config::{AppConfig, AppPaths, ConfigStore, Instance, InstanceStore};
+use axial_config::{AppPaths, ConfigStore, Instance, InstanceStore};
 use axial_launcher::{
     GuardianDecision, GuardianMode, GuardianSummary, LaunchAuthContext, LaunchGuardianContext,
     LaunchIntent, LaunchSessionRecord, LaunchStageRecord, LaunchState, SessionId,
@@ -3532,6 +3532,10 @@ impl RouteTestFixture {
         // Graceful AppState shutdown terminalizes drivers. These restart tests must preserve the
         // interrupted record while releasing exact persistence paths for the replacement state.
         self.state
+            .close_config()
+            .await
+            .expect("close config store before reload");
+        self.state
             .accounts()
             .close()
             .await
@@ -3593,10 +3597,10 @@ impl RouteTestFixture {
         config.library_dir = self.paths.library_dir.to_string_lossy().to_string();
         self.state
             .config()
-            .replace_in_memory(config)
+            .replace_for_test(config)
             .expect("set library dir");
         self.state
-            .set_library_dir(self.paths.library_dir.to_string_lossy().to_string());
+            .set_library_dir_for_test(self.paths.library_dir.to_string_lossy().to_string());
     }
 
     fn set_launch_auth_mode(&self, mode: &str) {
@@ -3604,7 +3608,7 @@ impl RouteTestFixture {
         config.launch_auth_mode = mode.to_string();
         self.state
             .config()
-            .replace_in_memory(config)
+            .replace_for_test(config)
             .expect("set launch auth mode");
     }
 
@@ -4251,7 +4255,6 @@ fn test_launch_session_task() -> launch_app::LaunchSessionTask {
             icon: String::new(),
             accent: String::new(),
         },
-        config: AppConfig::default(),
         intent: LaunchIntent {
             session_id: "session-queued".to_string(),
             library_dir: PathBuf::from("/tmp/axial-test-library"),

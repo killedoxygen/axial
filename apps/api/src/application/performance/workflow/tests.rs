@@ -423,13 +423,16 @@ fn build_test_state(
     remote_rules_public_key: Option<String>,
 ) -> AppState {
     let paths = test_paths(root);
-    let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-    config
-        .replace_in_memory(AppConfig {
-            library_dir: paths.library_dir.to_string_lossy().to_string(),
-            ..config.current()
-        })
-        .expect("configure library dir");
+    let config = Arc::new(
+        ConfigStore::from_config(
+            paths.clone(),
+            AppConfig {
+                library_dir: paths.library_dir.to_string_lossy().to_string(),
+                ..AppConfig::default()
+            },
+        )
+        .expect("configure library dir"),
+    );
     let instances = Arc::new(InstanceStore::load_from(paths.clone()).expect("load instances"));
     AppState::new(AppStateInit {
         app_name: "Axial".to_string(),

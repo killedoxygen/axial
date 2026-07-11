@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 const SHUTDOWN_LOCK_INVARIANT: &str =
     "application shutdown lock poisoned; completion state may be inconsistent";
-const SHUTDOWN_STEP_COUNT: usize = 14;
+const SHUTDOWN_STEP_COUNT: usize = 15;
 type ShutdownAttemptChannel = Arc<watch::Sender<Option<Result<(), AppShutdownError>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,6 +23,7 @@ pub enum AppShutdownStep {
     Accounts,
     SecureAuth,
     RemoteFlags,
+    Config,
 }
 
 impl AppShutdownStep {
@@ -42,6 +43,7 @@ impl AppShutdownStep {
             Self::Accounts => 11,
             Self::SecureAuth => 12,
             Self::RemoteFlags => 13,
+            Self::Config => 14,
         }
     }
 
@@ -61,6 +63,7 @@ impl AppShutdownStep {
             Self::Accounts => "accounts",
             Self::SecureAuth => "secure_auth",
             Self::RemoteFlags => "remote_flags",
+            Self::Config => "config",
         }
     }
 }
@@ -170,11 +173,12 @@ impl AppShutdownCoordinator {
         let mut first_error = self.finish_producer_drain(settlement_error, producer_result)?;
 
         let skin_result = self.flush_skin(state).await;
-        let (benchmark_result, performance_result, auth_result, remote_result) = tokio::join!(
+        let (benchmark_result, performance_result, auth_result, remote_result, config_result) = tokio::join!(
             self.close_benchmark_chain(state),
             self.close_performance_chain(state),
             self.close_auth_chain(state),
             self.close_remote_flags(state),
+            self.close_config(state),
         );
 
         retain_first_error(&mut first_error, skin_result);
@@ -182,6 +186,7 @@ impl AppShutdownCoordinator {
         retain_first_error(&mut first_error, performance_result);
         retain_first_error(&mut first_error, auth_result);
         retain_first_error(&mut first_error, remote_result);
+        retain_first_error(&mut first_error, config_result);
         first_error.map_or(Ok(()), Err)
     }
 
@@ -413,6 +418,18 @@ impl AppShutdownCoordinator {
             .await
             .map_err(|_| AppShutdownError::at(AppShutdownStep::RemoteFlags))?;
         self.mark_completed(AppShutdownStep::RemoteFlags);
+        Ok(())
+    }
+
+    async fn close_config(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if self.completed(AppShutdownStep::Config) {
+            return Ok(());
+        }
+        state
+            .close_config()
+            .await
+            .map_err(|_| AppShutdownError::at(AppShutdownStep::Config))?;
+        self.mark_completed(AppShutdownStep::Config);
         Ok(())
     }
 

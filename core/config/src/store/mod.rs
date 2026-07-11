@@ -1,13 +1,14 @@
 use crate::models::{AppConfig, AppConfigValidationError};
 use crate::paths::AppPaths;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
-use std::sync::RwLock;
 use thiserror::Error;
 
 pub struct ConfigStore {
     paths: AppPaths,
-    config: RwLock<AppConfig>,
+    config: AppConfig,
+    mutation_allowed: bool,
 }
 
 pub struct ConfigStartupLoad {
@@ -16,6 +17,7 @@ pub struct ConfigStartupLoad {
 }
 
 const CONFIG_STARTUP_WARNING: &str = "Axial could not load settings, so it started with safe defaults. Check app data permissions or restore the settings file.";
+pub const CONFIG_MAX_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ConfigStoreError {
@@ -25,125 +27,106 @@ pub enum ConfigStoreError {
     Parse(#[from] serde_json::Error),
     #[error(transparent)]
     Validation(#[from] AppConfigValidationError),
+    #[error("failed to persist config: {0}")]
+    Persistence(std::io::Error),
+    #[error("config exceeds the maximum persisted size of {max_bytes} bytes")]
+    TooLarge { max_bytes: u64 },
 }
 
 impl ConfigStore {
-    fn replace_file(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
-        let first_error = match fs::rename(source, destination) {
-            Ok(()) => return Ok(()),
-            Err(error) => error,
-        };
-
-        match fs::symlink_metadata(source) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(first_error),
-            Err(error) => return Err(error),
-        }
-
-        if destination.exists() && !destination.is_dir() {
-            let _ = fs::remove_file(destination);
-        }
-
-        match fs::rename(source, destination) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let _ = fs::remove_file(source);
-                Err(error)
-            }
-        }
-    }
-
-    pub fn load_default() -> Result<Self, ConfigStoreError> {
-        Self::load_from(AppPaths::detect())
-    }
-
     pub fn load_from(paths: AppPaths) -> Result<Self, ConfigStoreError> {
-        let config = match fs::read_to_string(&paths.config_file) {
-            Ok(data) => serde_json::from_str::<AppConfig>(&data)?.normalized()?,
+        let config = match read_config(&paths.config_file) {
+            Ok(data) => serde_json::from_slice::<AppConfig>(&data)?.normalized()?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => AppConfig::default(),
             Err(error) => return Err(ConfigStoreError::Read(error)),
         };
 
         Ok(Self {
             paths,
-            config: RwLock::new(config),
+            config,
+            mutation_allowed: true,
         })
     }
 
     pub fn load_for_startup(paths: AppPaths) -> Result<ConfigStartupLoad, ConfigStoreError> {
-        let (config, warnings) = match fs::read_to_string(&paths.config_file) {
+        let (config, warnings, mutation_allowed) = match read_config(&paths.config_file) {
             Ok(data) => match load_config_for_startup(&data) {
-                Ok(config) => (config, Vec::new()),
+                Ok(config) => (config, Vec::new(), true),
                 Err(ConfigStoreError::Parse(_) | ConfigStoreError::Validation(_)) => (
                     AppConfig::default(),
                     vec![CONFIG_STARTUP_WARNING.to_string()],
+                    false,
                 ),
                 Err(error) => return Err(error),
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (AppConfig::default(), Vec::new())
+                (AppConfig::default(), Vec::new(), true)
             }
             Err(_) => (
                 AppConfig::default(),
                 vec![CONFIG_STARTUP_WARNING.to_string()],
+                false,
             ),
         };
 
         Ok(ConfigStartupLoad {
             store: Self {
                 paths,
-                config: RwLock::new(config),
+                config,
+                mutation_allowed,
             },
             warnings,
         })
     }
 
     pub fn current(&self) -> AppConfig {
-        self.config
-            .read()
-            .map(|value| value.clone())
-            .unwrap_or_else(|_| AppConfig::default())
+        self.config.clone()
     }
 
-    pub fn update(&self, next: AppConfig) -> Result<AppConfig, ConfigStoreError> {
-        let normalized = next.normalized()?;
-        fs::create_dir_all(&self.paths.config_dir)?;
-        let data = serde_json::to_string_pretty(&normalized)?;
-        let temp_path = self.paths.config_file.with_extension("json.tmp");
-        fs::write(&temp_path, data)?;
-        Self::replace_file(&temp_path, &self.paths.config_file)?;
-
-        let mut guard = self
-            .config
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = normalized.clone();
-
-        Ok(normalized)
-    }
-
-    pub fn replace_in_memory(&self, next: AppConfig) -> Result<(), ConfigStoreError> {
-        let normalized = next.normalized()?;
-        let mut guard = self
-            .config
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = normalized;
-        Ok(())
+    pub fn from_config(paths: AppPaths, config: AppConfig) -> Result<Self, ConfigStoreError> {
+        Ok(Self {
+            paths,
+            config: config.normalized()?,
+            mutation_allowed: true,
+        })
     }
 
     pub fn paths(&self) -> &AppPaths {
         &self.paths
     }
+
+    pub fn mutation_allowed(&self) -> bool {
+        self.mutation_allowed
+    }
 }
 
-fn load_config_for_startup(data: &str) -> Result<AppConfig, ConfigStoreError> {
-    Ok(serde_json::from_str::<AppConfig>(data)?.normalized()?)
+fn load_config_for_startup(data: &[u8]) -> Result<AppConfig, ConfigStoreError> {
+    Ok(serde_json::from_slice::<AppConfig>(data)?.normalized()?)
+}
+
+fn read_config(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > CONFIG_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "config file is not a bounded regular file",
+        ));
+    }
+    let mut data = Vec::with_capacity(metadata.len() as usize);
+    let mut bounded = fs::File::open(path)?.take(CONFIG_MAX_BYTES + 1);
+    bounded.read_to_end(&mut data)?;
+    if data.len() as u64 > CONFIG_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "config file exceeds the maximum size",
+        ));
+    }
+    Ok(data)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigStore, ConfigStoreError};
+    use super::{CONFIG_MAX_BYTES, ConfigStore, ConfigStoreError};
     use crate::{AppConfig, AppConfigValidationError, AppPaths};
     use std::fs;
     use std::path::PathBuf;
@@ -234,6 +217,7 @@ mod tests {
             .expect("startup load should tolerate invalid config");
 
         assert_eq!(loaded.store.current(), AppConfig::default());
+        assert!(!loaded.store.mutation_allowed());
         assert_eq!(
             loaded.warnings,
             vec![super::CONFIG_STARTUP_WARNING.to_string()]
@@ -257,6 +241,7 @@ mod tests {
             .expect("startup load should tolerate malformed config");
 
         assert_eq!(loaded.store.current(), AppConfig::default());
+        assert!(!loaded.store.mutation_allowed());
         assert_eq!(
             loaded.warnings,
             vec![super::CONFIG_STARTUP_WARNING.to_string()]
@@ -282,6 +267,7 @@ mod tests {
             .expect("startup load should tolerate config read error");
 
         assert_eq!(loaded.store.current(), AppConfig::default());
+        assert!(!loaded.store.mutation_allowed());
         assert_eq!(
             loaded.warnings,
             vec![super::CONFIG_STARTUP_WARNING.to_string()]
@@ -303,6 +289,7 @@ mod tests {
             .expect("missing config should load for startup");
 
         assert_eq!(loaded.store.current(), AppConfig::default());
+        assert!(loaded.store.mutation_allowed());
         assert!(loaded.warnings.is_empty());
         assert!(!paths.config_file.exists());
 
@@ -325,6 +312,7 @@ mod tests {
             .expect("startup should tolerate invalid config");
 
         assert_eq!(loaded.store.current(), AppConfig::default());
+        assert!(!loaded.store.mutation_allowed());
         assert_eq!(
             loaded.warnings,
             vec![super::CONFIG_STARTUP_WARNING.to_string()]
@@ -338,74 +326,79 @@ mod tests {
     }
 
     #[test]
-    fn update_rejects_invalid_username_without_writing_file() {
-        let paths = test_paths("update-invalid-username");
-        let store = ConfigStore::load_from(paths.clone()).expect("missing config should load");
+    fn startup_rejects_unknown_fields_without_rewriting() {
+        let paths = test_paths("startup-unknown-field");
+        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        let data = r#"{"username":"Player","removed_legacy_setting":true}"#;
+        fs::write(&paths.config_file, data).expect("should write config with unknown field");
 
-        let err = store
-            .update(AppConfig {
+        let loaded = ConfigStore::load_for_startup(paths.clone())
+            .expect("startup should contain schema rejection");
+
+        assert_eq!(loaded.store.current(), AppConfig::default());
+        assert!(!loaded.store.mutation_allowed());
+        assert_eq!(
+            loaded.warnings,
+            vec![super::CONFIG_STARTUP_WARNING.to_string()]
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.config_file).expect("rejected config should remain readable"),
+            data
+        );
+
+        cleanup(&paths.config_dir);
+    }
+
+    #[test]
+    fn startup_rejects_oversized_config_without_reading_or_rewriting_it() {
+        let paths = test_paths("startup-oversized");
+        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        let data = vec![b' '; CONFIG_MAX_BYTES as usize + 1];
+        fs::write(&paths.config_file, &data).expect("should write oversized config");
+
+        let loaded = ConfigStore::load_for_startup(paths.clone())
+            .expect("startup should contain oversized config rejection");
+
+        assert_eq!(loaded.store.current(), AppConfig::default());
+        assert!(!loaded.store.mutation_allowed());
+        assert_eq!(
+            loaded.warnings,
+            vec![super::CONFIG_STARTUP_WARNING.to_string()]
+        );
+        assert_eq!(
+            fs::metadata(&paths.config_file)
+                .expect("oversized config should remain")
+                .len(),
+            CONFIG_MAX_BYTES + 1
+        );
+        assert_eq!(
+            fs::read(&paths.config_file).expect("oversized config should remain readable"),
+            data
+        );
+        assert!(matches!(
+            ConfigStore::load_from(paths.clone()),
+            Err(ConfigStoreError::Read(error)) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+
+        cleanup(&paths.config_dir);
+    }
+
+    #[test]
+    fn from_config_rejects_invalid_username_without_writing_file() {
+        let paths = test_paths("update-invalid-username");
+        let err = match ConfigStore::from_config(
+            paths.clone(),
+            AppConfig {
                 username: "bad name".to_string(),
                 ..AppConfig::default()
-            })
-            .expect_err("invalid config should fail");
+            },
+        ) {
+            Ok(_) => panic!("invalid config should fail"),
+            Err(error) => error,
+        };
 
         assert!(matches!(err, ConfigStoreError::Validation(_)));
         assert!(!paths.config_file.exists());
-
-        cleanup(&paths.config_dir);
-    }
-
-    #[test]
-    fn replace_file_replaces_existing_config_file() {
-        let paths = test_paths("replace-existing-config");
-        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
-        let temp_path = paths.config_file.with_extension("json.tmp");
-        fs::write(&paths.config_file, "old config").expect("should write existing config");
-        fs::write(&temp_path, "new config").expect("should write temp config");
-
-        ConfigStore::replace_file(&temp_path, &paths.config_file).expect("replace config");
-
-        assert_eq!(
-            fs::read_to_string(&paths.config_file).expect("config should remain readable"),
-            "new config"
-        );
-        assert!(!temp_path.exists());
-
-        cleanup(&paths.config_dir);
-    }
-
-    #[test]
-    fn replace_file_preserves_existing_config_when_temp_is_missing() {
-        let paths = test_paths("replace-missing-temp");
-        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
-        let temp_path = paths.config_file.with_extension("json.tmp");
-        fs::write(&paths.config_file, "existing config").expect("should write existing config");
-
-        let error = ConfigStore::replace_file(&temp_path, &paths.config_file)
-            .expect_err("missing temp should fail");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-        assert_eq!(
-            fs::read_to_string(&paths.config_file).expect("config should remain readable"),
-            "existing config"
-        );
-        assert!(!temp_path.exists());
-
-        cleanup(&paths.config_dir);
-    }
-
-    #[test]
-    fn replace_file_preserves_directory_destination_on_failed_promotion() {
-        let paths = test_paths("replace-directory-destination");
-        fs::create_dir_all(&paths.config_file).expect("should create config path as directory");
-        let temp_path = paths.config_file.with_extension("json.tmp");
-        fs::write(&temp_path, "new config").expect("should write temp config");
-
-        ConfigStore::replace_file(&temp_path, &paths.config_file)
-            .expect_err("directory destination should fail");
-
-        assert!(paths.config_file.is_dir());
-        assert!(!temp_path.exists());
 
         cleanup(&paths.config_dir);
     }

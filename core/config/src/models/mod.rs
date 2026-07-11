@@ -50,9 +50,12 @@ pub enum AppConfigValidationError {
     InvalidUsername(&'static str),
     #[error("invalid launch auth mode: {0}")]
     InvalidLaunchAuthMode(&'static str),
+    #[error("invalid telemetry install id")]
+    InvalidTelemetryInstallId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub username: String,
     #[serde(default = "default_launch_auth_mode")]
@@ -161,22 +164,17 @@ impl AppConfig {
             self.library_mode = "managed".to_string();
         }
         self.telemetry_install_id = if self.telemetry_enabled {
-            normalize_telemetry_install_id(&self.telemetry_install_id)
+            let install_id = self.telemetry_install_id.trim();
+            if !install_id.is_empty() && !telemetry_install_id_has_uuid_shape(install_id) {
+                return Err(AppConfigValidationError::InvalidTelemetryInstallId);
+            }
+            install_id.to_string()
         } else {
             String::new()
         };
         self.feature_overrides
             .retain(|key, _| find_flag(key).is_some());
         Ok(self)
-    }
-}
-
-fn normalize_telemetry_install_id(value: &str) -> String {
-    let value = value.trim();
-    if telemetry_install_id_has_uuid_shape(value) {
-        value.to_string()
-    } else {
-        String::new()
     }
 }
 
@@ -287,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn normalized_trims_and_soft_repairs_telemetry_install_id() {
+    fn normalized_trims_valid_and_rejects_invalid_telemetry_install_id() {
         let config = AppConfig {
             telemetry_enabled: true,
             telemetry_install_id: "  123e4567-e89b-12d3-a456-426614174000  ".to_string(),
@@ -306,15 +304,15 @@ mod tests {
             "123e4567-e89b-12d3-a456-42661417400z",
             "not-a-uuid",
         ] {
-            let config = AppConfig {
+            let error = AppConfig {
                 telemetry_enabled: true,
                 telemetry_install_id: invalid.to_string(),
                 ..AppConfig::default()
             }
             .normalized()
-            .expect("invalid install id should soft repair");
+            .expect_err("invalid install id should be rejected");
 
-            assert!(config.telemetry_install_id.is_empty());
+            assert_eq!(error, AppConfigValidationError::InvalidTelemetryInstallId);
         }
     }
 

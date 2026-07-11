@@ -22,7 +22,7 @@ const REMOTE_FLAGS_MAX_BYTES: usize = 1024 * 1024;
 const REMOTE_FLAGS_USER_AGENT: &str = concat!("axial/", env!("CARGO_PKG_VERSION"), " remote-flags");
 const REMOTE_FLAGS_CACHE_FILE: &str = "remote-cache.json";
 const REMOTE_FLAGS_CACHE_SCHEMA: &str = "axial.remote_flags";
-const REMOTE_FLAGS_CACHE_SCHEMA_VERSION: u32 = 1;
+const REMOTE_FLAGS_CACHE_SCHEMA_VERSION: u32 = 2;
 const REMOTE_FLAG_STORE_LOCK_INVARIANT: &str =
     "remote flag store lock poisoned; committed and persisted state may diverge";
 
@@ -147,24 +147,24 @@ impl RemoteFlagStore {
         }
     }
 
-    pub(crate) fn values_snapshot(&self) -> BTreeMap<String, bool> {
+    pub(crate) fn values_snapshot(&self, distinct_id: &str) -> BTreeMap<String, bool> {
         self.state
             .lock()
             .expect(REMOTE_FLAG_STORE_LOCK_INVARIANT)
             .visible
             .as_ref()
+            .filter(|snapshot| snapshot.distinct_id == distinct_id)
             .map(|snapshot| snapshot.values.clone())
             .unwrap_or_default()
     }
 
     #[cfg(test)]
-    pub fn fetched_at(&self) -> Option<String> {
+    fn visible_snapshot_for_test(&self) -> Option<RemoteFlagCacheSnapshot> {
         self.state
             .lock()
             .expect(REMOTE_FLAG_STORE_LOCK_INVARIANT)
             .visible
-            .as_ref()
-            .map(|snapshot| snapshot.fetched_at.clone())
+            .clone()
     }
 
     pub(crate) async fn refresh_once(
@@ -179,16 +179,23 @@ impl RemoteFlagStore {
             return Ok(RemoteFlagRefreshOutcome::Skipped);
         };
         self.reconcile_retry().await?;
+        if !telemetry.export_is_admitted(&distinct_id) {
+            return Ok(RemoteFlagRefreshOutcome::Skipped);
+        }
         let request = RemoteFlagFetchRequest {
             host: telemetry.configured_posthog_host(),
             key,
-            distinct_id,
+            distinct_id: distinct_id.clone(),
         };
         let values = fetch_remote_flags(&request).await?;
+        if !telemetry.export_is_admitted(&distinct_id) {
+            return Ok(RemoteFlagRefreshOutcome::Skipped);
+        }
         let flag_count = values.len();
         let snapshot = RemoteFlagCacheSnapshot {
             schema: REMOTE_FLAGS_CACHE_SCHEMA.to_string(),
             schema_version: REMOTE_FLAGS_CACHE_SCHEMA_VERSION,
+            distinct_id,
             fetched_at: Utc::now().to_rfc3339(),
             values,
         };
@@ -328,12 +335,14 @@ impl RemoteFlagStore {
     #[cfg(test)]
     pub(crate) fn replace_values_for_test(
         &self,
+        distinct_id: String,
         values: BTreeMap<String, bool>,
         fetched_at: Option<String>,
     ) {
         let visible = fetched_at.map(|fetched_at| RemoteFlagCacheSnapshot {
             schema: REMOTE_FLAGS_CACHE_SCHEMA.to_string(),
             schema_version: REMOTE_FLAGS_CACHE_SCHEMA_VERSION,
+            distinct_id,
             fetched_at,
             values,
         });
@@ -391,6 +400,7 @@ struct RemoteFlagFetchRequest {
 struct RemoteFlagCacheSnapshot {
     schema: String,
     schema_version: u32,
+    distinct_id: String,
     fetched_at: String,
     values: BTreeMap<String, bool>,
 }
@@ -484,6 +494,7 @@ fn load_remote_flags_cache_with_registry(
     let mut snapshot = serde_json::from_slice::<RemoteFlagCacheSnapshot>(&data).ok()?;
     if snapshot.schema != REMOTE_FLAGS_CACHE_SCHEMA
         || snapshot.schema_version != REMOTE_FLAGS_CACHE_SCHEMA_VERSION
+        || !remote_flags_identity_is_canonical(&snapshot.distinct_id)
     {
         return None;
     }
@@ -497,6 +508,12 @@ fn load_remote_flags_cache_with_registry(
 
     snapshot.values = filter_registered_remote_values_with_registry(snapshot.values, registry);
     Some(snapshot)
+}
+
+fn remote_flags_identity_is_canonical(value: &str) -> bool {
+    uuid::Uuid::parse_str(value)
+        .map(|identity| identity.hyphenated().to_string() == value)
+        .unwrap_or(false)
 }
 
 fn encode_remote_flags_cache(snapshot: RemoteFlagCacheSnapshot) -> io::Result<Vec<u8>> {
@@ -544,6 +561,7 @@ fn remote_flags_client() -> reqwest::Client {
 mod tests {
     use super::*;
     use crate::execution::persistence::AtomicWriteBackend;
+    use crate::observability::telemetry::TelemetryConfigSource;
     use axial_config::{AppConfig, FlagStage};
     use axum::{Json, Router, extract::State, http::StatusCode, http::Uri, routing::post};
     use serde_json::Value;
@@ -590,6 +608,28 @@ mod tests {
     }
 
     struct WriteGateHandle(Arc<WriteGate>);
+
+    struct MutableTelemetryConfig {
+        current: Mutex<AppConfig>,
+    }
+
+    impl MutableTelemetryConfig {
+        fn new(config: AppConfig) -> Self {
+            Self {
+                current: Mutex::new(config),
+            }
+        }
+
+        fn replace(&self, config: AppConfig) {
+            *self.current.lock().expect("mutable config lock") = config;
+        }
+    }
+
+    impl TelemetryConfigSource for MutableTelemetryConfig {
+        fn current(&self) -> AppConfig {
+            self.current.lock().expect("mutable config lock").clone()
+        }
+    }
 
     impl RecordingBackend {
         fn new() -> Self {
@@ -798,7 +838,22 @@ mod tests {
             &path,
             serde_json::to_vec(&serde_json::json!({
                 "schema": REMOTE_FLAGS_CACHE_SCHEMA,
+                "schema_version": 1,
+                "distinct_id": INSTALL_ID,
+                "fetched_at": Utc::now().to_rfc3339(),
+                "values": { "remote.test": true }
+            }))
+            .expect("serialize retired v1 cache"),
+        )
+        .expect("write retired v1 cache");
+        assert!(load_remote_flags_cache_with_registry(&path, Utc::now(), TEST_REGISTRY).is_none());
+
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": REMOTE_FLAGS_CACHE_SCHEMA,
                 "schema_version": REMOTE_FLAGS_CACHE_SCHEMA_VERSION,
+                "distinct_id": INSTALL_ID,
                 "fetched_at": Utc::now().to_rfc3339(),
                 "values": { "remote.test": true },
                 "junk": true
@@ -813,6 +868,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "schema": REMOTE_FLAGS_CACHE_SCHEMA,
                 "schema_version": REMOTE_FLAGS_CACHE_SCHEMA_VERSION,
+                "distinct_id": INSTALL_ID,
                 "fetched_at": "not a timestamp",
                 "values": { "remote.test": true }
             }))
@@ -834,9 +890,10 @@ mod tests {
         let raw = encode_remote_flags_cache(snapshot).expect("encode cache");
         let value = serde_json::from_slice::<Value>(&raw).expect("cache json");
         let object = value.as_object().expect("cache object");
-        assert_eq!(object.len(), 4);
+        assert_eq!(object.len(), 5);
         assert_eq!(value["schema"], REMOTE_FLAGS_CACHE_SCHEMA);
         assert_eq!(value["schema_version"], REMOTE_FLAGS_CACHE_SCHEMA_VERSION);
+        assert_eq!(value["distinct_id"], INSTALL_ID);
         assert!(object.contains_key("fetched_at"));
         assert!(object.contains_key("values"));
         assert_eq!(value["values"][TEST_KEY], false);
@@ -857,15 +914,21 @@ mod tests {
         let fetched_at = "2026-01-02T00:00:00Z".to_string();
 
         store.replace_values_for_test(
+            INSTALL_ID.to_string(),
             BTreeMap::from([(TEST_KEY.to_string(), false)]),
             Some(fetched_at.clone()),
         );
 
         assert_eq!(
-            store.values_snapshot(),
+            store.values_snapshot(INSTALL_ID),
             BTreeMap::from([(TEST_KEY.to_string(), false)])
         );
-        assert_eq!(store.fetched_at(), Some(fetched_at));
+        assert_eq!(
+            store
+                .visible_snapshot_for_test()
+                .map(|snapshot| snapshot.fetched_at),
+            Some(fetched_at)
+        );
     }
 
     #[tokio::test]
@@ -882,14 +945,49 @@ mod tests {
         let task = tokio::spawn(async move { task_store.commit(task_candidate).await });
 
         backend.wait_for_attempt(1).await;
-        assert!(store.values_snapshot().is_empty());
+        assert!(store.values_snapshot(INSTALL_ID).is_empty());
         task.abort();
         assert!(task.await.expect_err("caller is cancelled").is_cancelled());
         gate.release();
         store.close().await.expect("observer settles before close");
 
         assert_eq!(backend.committed_snapshots(), vec![candidate.clone()]);
-        assert_eq!(store.values_snapshot(), candidate.values);
+        assert_eq!(store.values_snapshot(INSTALL_ID), candidate.values);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cache_settled_after_identity_rotation_is_effective_only_for_its_identity() {
+        const NEXT_INSTALL_ID: &str = "123e4567-e89b-12d3-a456-426614174001";
+        let (root, backend, store) = persistence_fixture("identity-bound-commit");
+        let store = Arc::new(store);
+        let candidate = cache_snapshot(
+            "2026-01-02T00:00:00Z".to_string(),
+            BTreeMap::from([(TEST_KEY.to_string(), false)]),
+        );
+        let gate = backend.gate_next();
+        let task = {
+            let store = store.clone();
+            let candidate = candidate.clone();
+            tokio::spawn(async move { store.commit(candidate).await })
+        };
+
+        backend.wait_for_attempt(1).await;
+        assert!(store.values_snapshot(NEXT_INSTALL_ID).is_empty());
+        gate.release();
+        task.await
+            .expect("identity-bound cache task")
+            .expect("identity-bound cache commit");
+
+        assert_eq!(store.values_snapshot(INSTALL_ID), candidate.values);
+        assert!(store.values_snapshot(NEXT_INSTALL_ID).is_empty());
+        assert_eq!(
+            store
+                .visible_snapshot_for_test()
+                .map(|snapshot| snapshot.distinct_id),
+            Some(INSTALL_ID.to_string())
+        );
+        store.close().await.expect("close remote flag store");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -910,14 +1008,14 @@ mod tests {
             store.commit(first.clone()).await,
             Err(RemoteFlagRefreshError::Persistence)
         ));
-        assert!(store.values_snapshot().is_empty());
+        assert!(store.values_snapshot(INSTALL_ID).is_empty());
         store
             .commit(second.clone())
             .await
             .expect("retry first then commit second");
 
         assert_eq!(backend.committed_snapshots(), vec![first, second.clone()]);
-        assert_eq!(store.values_snapshot(), second.values);
+        assert_eq!(store.values_snapshot(INSTALL_ID), second.values);
         store.close().await.expect("close remote flag store");
         let _ = fs::remove_dir_all(root);
     }
@@ -939,7 +1037,7 @@ mod tests {
         store.close().await.expect("close is idempotent");
 
         assert_eq!(backend.committed_snapshots(), vec![candidate.clone()]);
-        assert_eq!(store.values_snapshot(), candidate.values);
+        assert_eq!(store.values_snapshot(INSTALL_ID), candidate.values);
         assert!(matches!(
             store
                 .commit(cache_snapshot(
@@ -968,7 +1066,7 @@ mod tests {
             RemoteFlagStore::load_from_config_dir_blocking(root.clone(), coordinator, Utc::now())
                 .expect("load remote flag store");
 
-        assert!(store.values_snapshot().is_empty());
+        assert!(store.values_snapshot(INSTALL_ID).is_empty());
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
         assert_eq!(fs::read(&path).expect("reread hostile cache"), original);
         store.close().await.expect("close remote flag store");
@@ -1042,19 +1140,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_discards_response_after_consent_identity_changes() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping remote flag identity race test: bind denied");
+                return;
+            }
+            Err(error) => panic!("bind remote flag identity race server: {error}"),
+        };
+        let addr = listener.local_addr().expect("identity race listener addr");
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let app = Router::new()
+            .route("/flags", post(delayed_flags))
+            .with_state((entered_tx, release.clone()));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let config = Arc::new(MutableTelemetryConfig::new(AppConfig {
+            telemetry_enabled: true,
+            telemetry_install_id: INSTALL_ID.to_string(),
+            ..AppConfig::default()
+        }));
+        let telemetry = Arc::new(TelemetryHub::new(
+            config.clone(),
+            Some(POSTHOG_KEY.to_string()),
+            format!("http://{addr}"),
+        ));
+        let store = Arc::new(RemoteFlagStore::default());
+        let refresh = {
+            let store = store.clone();
+            let telemetry = telemetry.clone();
+            tokio::spawn(async move { store.refresh_once(&telemetry).await })
+        };
+
+        entered_rx.recv().await.expect("remote request entered");
+        config.replace(AppConfig {
+            telemetry_enabled: false,
+            telemetry_install_id: String::new(),
+            ..AppConfig::default()
+        });
+        config.replace(AppConfig {
+            telemetry_enabled: true,
+            telemetry_install_id: "123e4567-e89b-12d3-a456-426614174001".to_string(),
+            ..AppConfig::default()
+        });
+        release.notify_one();
+
+        assert_eq!(
+            refresh
+                .await
+                .expect("remote refresh task")
+                .expect("remote refresh result"),
+            RemoteFlagRefreshOutcome::Skipped
+        );
+        server.abort();
+        assert!(
+            store
+                .values_snapshot("123e4567-e89b-12d3-a456-426614174001")
+                .is_empty()
+        );
+        assert!(store.visible_snapshot_for_test().is_none());
+    }
+
+    #[tokio::test]
     async fn refresh_skips_when_install_id_is_empty_without_generating_one() {
         let root = test_root("empty-install-id");
         let paths = test_paths(&root);
         let config = Arc::new(
-            axial_config::ConfigStore::load_from(paths.clone()).expect("load config store"),
+            axial_config::ConfigStore::from_config(
+                paths.clone(),
+                AppConfig {
+                    telemetry_enabled: true,
+                    telemetry_install_id: String::new(),
+                    ..AppConfig::default()
+                },
+            )
+            .expect("seed config"),
         );
-        config
-            .replace_in_memory(AppConfig {
-                telemetry_enabled: true,
-                telemetry_install_id: String::new(),
-                ..AppConfig::default()
-            })
-            .expect("seed config");
         let telemetry = TelemetryHub::new(
             config.clone(),
             Some(POSTHOG_KEY.to_string()),
@@ -1095,6 +1259,24 @@ mod tests {
         )
     }
 
+    async fn delayed_flags(
+        State((entered, release)): State<(mpsc::UnboundedSender<()>, Arc<Notify>)>,
+    ) -> (StatusCode, Json<Value>) {
+        let _ = entered.send(());
+        release.notified().await;
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "flags": {
+                    (TEST_KEY): {
+                        "key": TEST_KEY,
+                        "enabled": false
+                    }
+                }
+            })),
+        )
+    }
+
     fn test_flag(default_enabled: bool) -> FeatureFlagDef {
         FeatureFlagDef {
             key: TEST_KEY,
@@ -1113,6 +1295,7 @@ mod tests {
         RemoteFlagCacheSnapshot {
             schema: REMOTE_FLAGS_CACHE_SCHEMA.to_string(),
             schema_version: REMOTE_FLAGS_CACHE_SCHEMA_VERSION,
+            distinct_id: INSTALL_ID.to_string(),
             fetched_at,
             values,
         }

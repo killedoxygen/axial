@@ -1,5 +1,7 @@
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_public_json_value};
-use axial_config::{AppConfig, ConfigStore, FEATURE_FLAGS};
+#[cfg(test)]
+use axial_config::ConfigStore;
+use axial_config::{AppConfig, FEATURE_FLAGS};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -414,24 +416,43 @@ impl QueuedTelemetryEvent {
 }
 
 pub struct TelemetryHub {
-    config: Arc<ConfigStore>,
+    config: Mutex<Arc<dyn TelemetryConfigSource>>,
     key: Option<String>,
     host: String,
+    consent_admission: Mutex<()>,
     queue: Mutex<VecDeque<QueuedTelemetryEvent>>,
     error_storm: Mutex<TelemetryErrorStormState>,
     failed_batches: AtomicU64,
 }
 
+pub trait TelemetryConfigSource: Send + Sync {
+    fn current(&self) -> AppConfig;
+}
+
+#[cfg(test)]
+impl TelemetryConfigSource for ConfigStore {
+    fn current(&self) -> AppConfig {
+        ConfigStore::current(self)
+    }
+}
+
 impl TelemetryHub {
-    pub fn from_env(config: Arc<ConfigStore>) -> Self {
+    pub fn from_env<Source>(config: Arc<Source>) -> Self
+    where
+        Source: TelemetryConfigSource + 'static,
+    {
         Self::new(config, configured_posthog_key(), configured_posthog_host())
     }
 
-    pub fn new(config: Arc<ConfigStore>, key: Option<String>, host: String) -> Self {
+    pub fn new<Source>(config: Arc<Source>, key: Option<String>, host: String) -> Self
+    where
+        Source: TelemetryConfigSource + 'static,
+    {
         Self {
-            config,
+            config: Mutex::new(config),
             key: key.and_then(|value| sanitize_posthog_key(&value).ok()),
             host: sanitize_posthog_host(&host).unwrap_or_else(|| DEFAULT_POSTHOG_HOST.to_string()),
+            consent_admission: Mutex::new(()),
             queue: Mutex::new(VecDeque::new()),
             error_storm: Mutex::new(TelemetryErrorStormState::default()),
             failed_batches: AtomicU64::new(0),
@@ -443,7 +464,7 @@ impl TelemetryHub {
             return;
         }
 
-        let config = self.config.current();
+        let config = self.current_config();
         if !config.telemetry_enabled {
             return;
         }
@@ -460,6 +481,10 @@ impl TelemetryHub {
             return;
         };
 
+        let _admission = self.consent_guard();
+        if !self.current_identity_matches(&distinct_id) {
+            return;
+        }
         let mut queue = self.queue_guard();
         while queue.len() >= TELEMETRY_QUEUE_CAP {
             queue.pop_front();
@@ -472,7 +497,7 @@ impl TelemetryHub {
             return false;
         }
 
-        let config = self.config.current();
+        let config = self.current_config();
         if !config.telemetry_enabled {
             return false;
         }
@@ -487,11 +512,25 @@ impl TelemetryHub {
             return false;
         };
 
+        if !self.export_is_admitted(&distinct_id) {
+            return false;
+        }
         self.send_single_event_sync_best_effort(queued)
     }
 
     pub fn export_configured(&self) -> bool {
         self.key.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_config_source<Source>(&self, config: Arc<Source>)
+    where
+        Source: TelemetryConfigSource + 'static,
+    {
+        *self
+            .config
+            .lock()
+            .expect("telemetry config source lock poisoned") = config;
     }
 
     pub fn configured_posthog_key(&self) -> Option<String> {
@@ -503,7 +542,7 @@ impl TelemetryHub {
     }
 
     pub fn current_telemetry_install_id(&self) -> Option<String> {
-        let config = self.config.current();
+        let config = self.current_config();
         if !config.telemetry_enabled {
             return None;
         }
@@ -511,21 +550,23 @@ impl TelemetryHub {
         self.canonicalize_existing_telemetry_install_id(config)
     }
 
+    pub(crate) fn export_identity_for_config(&self, config: &AppConfig) -> Option<String> {
+        if self.key.is_none() || !config.telemetry_enabled {
+            return None;
+        }
+        self.canonicalize_existing_telemetry_install_id(config.clone())
+    }
+
     pub fn clear_queue(&self) {
+        let _admission = self.consent_guard();
         self.queue_guard().clear();
     }
 
     pub async fn flush_once(&self) -> usize {
-        if !self.can_send_now() {
-            self.clear_queue();
+        let Some((batch, distinct_id)) = self.drain_admitted_batch(TELEMETRY_BATCH_CAP) else {
             return 0;
-        }
-
-        let batch = self.drain_batch(TELEMETRY_BATCH_CAP);
-        if batch.is_empty() {
-            return 0;
-        }
-        if !self.can_send_now() {
+        };
+        if !self.export_is_admitted(&distinct_id) {
             return 0;
         }
 
@@ -551,42 +592,61 @@ impl TelemetryHub {
         }
     }
 
-    fn telemetry_install_id(&self, mut config: AppConfig) -> Option<String> {
-        if let Some(install_id) = self.canonicalize_existing_telemetry_install_id(config.clone()) {
-            return Some(install_id);
-        }
-
-        let install_id = uuid::Uuid::new_v4().to_string();
-        config.telemetry_install_id = install_id.clone();
-        match self.config.update(config) {
-            Ok(_) => Some(install_id),
-            Err(_) => None,
-        }
+    fn telemetry_install_id(&self, config: AppConfig) -> Option<String> {
+        self.canonicalize_existing_telemetry_install_id(config)
     }
 
-    fn canonicalize_existing_telemetry_install_id(&self, mut config: AppConfig) -> Option<String> {
+    fn canonicalize_existing_telemetry_install_id(&self, config: AppConfig) -> Option<String> {
         let raw = config.telemetry_install_id.trim();
         if raw.is_empty() {
             return None;
         }
 
         let install_id = sanitize_distinct_id(raw)?;
-        if install_id != raw {
-            config.telemetry_install_id = install_id.clone();
-            let _ = self.config.update(config);
-        }
-
         Some(install_id)
     }
 
-    fn can_send_now(&self) -> bool {
-        self.key.is_some() && self.config.current().telemetry_enabled
+    fn current_config(&self) -> AppConfig {
+        self.config
+            .lock()
+            .expect("telemetry config source lock poisoned")
+            .current()
     }
 
-    fn drain_batch(&self, max: usize) -> Vec<QueuedTelemetryEvent> {
+    fn drain_admitted_batch(&self, max: usize) -> Option<(Vec<QueuedTelemetryEvent>, String)> {
+        let _admission = self.consent_guard();
+        let config = self.current_config();
+        if self.key.is_none() || !config.telemetry_enabled {
+            self.queue_guard().clear();
+            return None;
+        }
+        let Some(distinct_id) = self.telemetry_install_id(config) else {
+            self.queue_guard().clear();
+            return None;
+        };
         let mut queue = self.queue_guard();
         let count = queue.len().min(max);
-        queue.drain(..count).collect()
+        let batch = queue.drain(..count).collect::<Vec<_>>();
+        (!batch.is_empty()).then_some((batch, distinct_id))
+    }
+
+    pub(crate) fn export_is_admitted(&self, distinct_id: &str) -> bool {
+        let _admission = self.consent_guard();
+        self.key.is_some() && self.current_identity_matches(distinct_id)
+    }
+
+    fn current_identity_matches(&self, distinct_id: &str) -> bool {
+        let config = self.current_config();
+        config.telemetry_enabled
+            && self
+                .telemetry_install_id(config)
+                .is_some_and(|current| current == distinct_id)
+    }
+
+    fn consent_guard(&self) -> MutexGuard<'_, ()> {
+        self.consent_admission
+            .lock()
+            .expect("telemetry consent admission lock poisoned")
     }
 
     fn allow_event_for_export(&self, event: &TelemetryEvent) -> bool {
@@ -967,8 +1027,7 @@ mod tests {
             ));
             fs::create_dir_all(&root).expect("create telemetry test root");
             let paths = test_paths(&root);
-            let store = ConfigStore::load_from(paths.clone()).expect("load config store");
-            store.update(config).expect("seed config");
+            let store = ConfigStore::from_config(paths.clone(), config).expect("seed config");
 
             Self {
                 root,
@@ -1340,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn current_telemetry_install_id_canonicalizes_and_repairs_uppercase_uuid() {
+    fn current_telemetry_install_id_canonicalizes_without_mutating_config() {
         let fixture = TestConfig::new(
             "canonical-install-id",
             AppConfig {
@@ -1357,7 +1416,7 @@ mod tests {
         );
         assert_eq!(
             fixture.store.current().telemetry_install_id,
-            TEST_INSTALL_ID
+            TEST_INSTALL_ID.to_ascii_uppercase()
         );
 
         hub.emit(TelemetryEvent::launch_completed(
@@ -1370,7 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_assigns_and_persists_install_id_when_consent_is_on() {
+    fn emit_drops_event_when_coordinated_identity_is_unavailable() {
         let fixture = TestConfig::new(
             "assign-install-id",
             AppConfig {
@@ -1385,17 +1444,12 @@ mod tests {
             TelemetryLaunchOutcome::Success,
         ));
 
-        let config = fixture.store.current();
-        assert_eq!(hub.queue_len_for_test(), 1);
-        assert_eq!(config.telemetry_install_id.len(), 36);
-        assert_eq!(
-            hub.queued_batch_for_test()[0]["properties"][PROP_DISTINCT_ID],
-            config.telemetry_install_id
-        );
+        assert_eq!(hub.queue_len_for_test(), 0);
+        assert!(fixture.store.current().telemetry_install_id.is_empty());
     }
 
-    #[test]
-    fn consent_off_transition_clears_queue_and_persisted_install_id() {
+    #[tokio::test]
+    async fn consent_off_transition_clears_queue_and_persisted_install_id() {
         let fixture = TestConfig::new("consent-transition", enabled_config_with_install_id());
         let telemetry = Arc::new(test_hub(fixture.store.clone()));
         let state = test_state(&fixture, telemetry.clone());
@@ -1405,9 +1459,13 @@ mod tests {
         ));
         assert_eq!(telemetry.queue_len_for_test(), 1);
 
-        let mut next = state.config().current();
-        next.telemetry_enabled = false;
-        state.update_config(next).expect("disable telemetry");
+        state
+            .mutate_config(|config| {
+                config.telemetry_enabled = false;
+                Ok(())
+            })
+            .await
+            .expect("disable telemetry");
 
         assert_eq!(telemetry.queue_len_for_test(), 0);
         assert!(state.config().current().telemetry_install_id.is_empty());

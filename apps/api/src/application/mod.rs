@@ -10,7 +10,6 @@ pub mod auth;
 pub mod authority;
 pub mod commands;
 pub mod config;
-pub mod dev;
 pub mod flags;
 pub mod install;
 pub mod instances;
@@ -61,7 +60,6 @@ pub use commands::{
     phase_one_command_kinds,
 };
 pub use config::{ConfigPatch, current_config, update_config};
-pub use dev::{DevCleanupResponse, DevFlushResponse, dev_cleanup_versions, dev_flush};
 pub use flags::{
     FlagOverridePatch, FlagSource, FlagViewModel, FlagsResponse, list_flags, update_flag,
 };
