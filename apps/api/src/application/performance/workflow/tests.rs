@@ -35,6 +35,81 @@ type HealthQuery = PerformanceHealthRequest;
 type RollbackQuery = PerformanceRollbackListRequest;
 type InstallRequest = PerformanceInstallRequest;
 
+const MANAGED_STATE_FILE_NAME: &str = ".axial-lock.json";
+
+fn managed_state_fixture_bytes(state: &impl serde::Serialize) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "state": state,
+    }))
+    .expect("serialize managed state fixture")
+}
+
+fn write_managed_state_fixture(mods_dir: &FsPath, state: &impl serde::Serialize) -> PathBuf {
+    fs::create_dir_all(mods_dir).expect("create managed state fixture directory");
+    let path = mods_dir.join(MANAGED_STATE_FILE_NAME);
+    fs::write(&path, managed_state_fixture_bytes(state)).expect("write managed state fixture");
+    path
+}
+
+struct RollbackFixture {
+    id: String,
+}
+
+fn write_rollback_fixture(
+    mods_dir: &FsPath,
+    id: &str,
+    created_at: &str,
+    state: &CompositionState,
+    latest: bool,
+) -> RollbackFixture {
+    let rollback_dir = mods_dir.join(".axial-performance").join("rollback");
+    let files_dir = rollback_dir.join("files");
+    let history_dir = rollback_dir.join("history");
+    fs::create_dir_all(&files_dir).expect("create rollback artifact fixture directory");
+    fs::create_dir_all(&history_dir).expect("create rollback history fixture directory");
+    fs::create_dir_all(rollback_dir.join("tmp")).expect("create rollback temp fixture directory");
+
+    let artifacts = state
+        .installed_mods
+        .iter()
+        .enumerate()
+        .map(|(index, installed)| {
+            let stored_filename = format!("{id}-{index}.bin");
+            fs::copy(
+                mods_dir.join(&installed.filename),
+                files_dir.join(&stored_filename),
+            )
+            .expect("copy rollback artifact fixture");
+            serde_json::json!({
+                "filename": installed.filename,
+                "stored_filename": stored_filename,
+                "project_id": installed.project_id,
+                "version_id": installed.version_id,
+                "ownership_class": installed.ownership_class,
+                "sha512": installed.integrity.sha512,
+                "sha512_verified": installed.integrity.sha512_verified,
+            })
+        })
+        .collect::<Vec<_>>();
+    let snapshot = serde_json::json!({
+        "id": id,
+        "schema_version": 1,
+        "created_at": created_at,
+        "state": state,
+        "artifacts": artifacts,
+    });
+    let metadata = serde_json::to_vec_pretty(&snapshot).expect("serialize rollback fixture");
+    fs::write(history_dir.join(format!("{id}.json")), &metadata)
+        .expect("write rollback history fixture");
+    if latest {
+        fs::write(rollback_dir.join("latest.json"), metadata)
+            .expect("write latest rollback fixture");
+    }
+
+    RollbackFixture { id: id.to_string() }
+}
+
 fn router() -> axum::Router<AppState> {
     axum::Router::new()
         .route(
@@ -509,26 +584,6 @@ fn test_operation_payload() -> PerformanceOperationPayload {
         loader: None,
         mode: None,
         rollback_id: None,
-    }
-}
-
-fn test_performance_display() -> PerformanceInstanceDisplay {
-    PerformanceInstanceDisplay {
-        memory: PerformanceMemoryDisplay {
-            min_gb: 1.0,
-            max_gb: 4.0,
-            label: "1 to 4 GB".to_string(),
-        },
-        runtime: PerformanceRuntimeDisplay {
-            detected: true,
-            label: "Java 17".to_string(),
-        },
-        mode: PerformanceModeDisplay {
-            mode: "managed".to_string(),
-            label: "Managed".to_string(),
-            source: "global".to_string(),
-            source_label: "Global default".to_string(),
-        },
     }
 }
 

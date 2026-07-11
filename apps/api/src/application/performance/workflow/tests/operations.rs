@@ -2936,8 +2936,7 @@ fn seed_managed_lock(state: &AppState, instance_id: &str, composition_id: &str) 
         failure_count: 0,
         last_failure: String::new(),
     };
-    axial_performance::save_state(&mods_dir, &managed).expect("seed managed performance lock");
-    mods_dir.join(".axial-lock.json")
+    write_managed_state_fixture(&mods_dir, &managed)
 }
 
 fn test_mismatched_performance_journal(

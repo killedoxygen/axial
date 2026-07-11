@@ -22,11 +22,66 @@ pub struct PerformanceManager {
     pub(super) rules_mutation_allowed: bool,
     rules_cache_path: Option<PathBuf>,
     rules_authority_claimed: AtomicBool,
+    managed_authority_claimed: AtomicBool,
 }
 
 #[derive(Clone)]
 pub struct PerformanceRulesAuthority {
     pub(super) manager: Arc<PerformanceManager>,
+}
+
+#[derive(Clone)]
+pub struct ManagedCompositionAuthority {
+    pub(super) manager: Arc<PerformanceManager>,
+    instances_root: Arc<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ManagedInstanceIdentity {
+    instance_id: Arc<str>,
+    mods_dir: Arc<PathBuf>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ManagedIdentityError {
+    #[error("managed instance identity is not a canonical instance id")]
+    InvalidInstanceId,
+}
+
+impl ManagedCompositionAuthority {
+    pub fn identify(
+        &self,
+        instance_id: &str,
+    ) -> Result<ManagedInstanceIdentity, ManagedIdentityError> {
+        if !is_canonical_instance_id(instance_id) {
+            return Err(ManagedIdentityError::InvalidInstanceId);
+        }
+        Ok(ManagedInstanceIdentity {
+            instance_id: Arc::from(instance_id),
+            mods_dir: Arc::new(self.instances_root.join(instance_id).join("mods")),
+        })
+    }
+
+    pub(super) fn instances_root(&self) -> &Path {
+        &self.instances_root
+    }
+}
+
+impl ManagedInstanceIdentity {
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub(super) fn mods_dir(&self) -> &Path {
+        &self.mods_dir
+    }
+}
+
+fn is_canonical_instance_id(value: &str) -> bool {
+    value.len() == 16
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl PerformanceManager {
@@ -49,6 +104,7 @@ impl PerformanceManager {
             rules_mutation_allowed: true,
             rules_cache_path: None,
             rules_authority_claimed: AtomicBool::new(false),
+            managed_authority_claimed: AtomicBool::new(false),
         })
     }
 
@@ -102,6 +158,7 @@ impl PerformanceManager {
             rules_mutation_allowed: loaded.mutation_allowed,
             rules_cache_path: Some(crate::rules_cache::rules_cache_path(config_dir)),
             rules_authority_claimed: AtomicBool::new(false),
+            managed_authority_claimed: AtomicBool::new(false),
         })
     }
 
@@ -158,6 +215,41 @@ impl PerformanceManager {
             })?;
         Ok(PerformanceRulesAuthority {
             manager: self.clone(),
+        })
+    }
+
+    pub fn claim_managed_authority(
+        self: &Arc<Self>,
+        instances_root: &Path,
+    ) -> Result<ManagedCompositionAuthority, std::io::Error> {
+        if !instances_root.is_absolute() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "managed composition instances root must be absolute",
+            ));
+        }
+        match std::fs::symlink_metadata(instances_root) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "managed composition instances root must be a real directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.managed_authority_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "managed composition authority is already claimed",
+                )
+            })?;
+        Ok(ManagedCompositionAuthority {
+            manager: self.clone(),
+            instances_root: Arc::new(instances_root.to_path_buf()),
         })
     }
 }

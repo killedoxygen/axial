@@ -1,5 +1,6 @@
 use super::manager::PerformanceManager;
 use super::model::InstallError;
+use super::mutation::ManagedMutationError;
 use super::promotion::{promote_file_async, reconcile_managed_replace_backups};
 use crate::MANAGED_ARTIFACT_MAX_BYTES;
 use crate::modrinth::{ModrinthError, Version};
@@ -25,28 +26,35 @@ impl PerformanceManager {
         loader: &str,
         instance_mods_dir: &Path,
         previous_state: Option<&CompositionState>,
-    ) -> Result<InstalledMod, InstallError> {
+    ) -> Result<InstalledMod, ManagedMutationError> {
         let loaders = vec![loader.to_string()];
 
         let versions = self
             .resolve_managed_mod_versions(managed_mod, game_version, &loaders)
-            .await?;
-        let version = versions
-            .into_iter()
-            .next()
-            .ok_or_else(|| InstallError::NoCompatibleVersion(managed_mod.project_id.clone()))?;
-        let file = version
-            .primary_file()
-            .ok_or_else(|| InstallError::NoPrimaryFile(managed_mod.project_id.clone()))?;
-        let filename = sanitize_mod_filename(&file.filename)?;
+            .await
+            .map_err(ManagedMutationError::definite)?;
+        let version = versions.into_iter().next().ok_or_else(|| {
+            ManagedMutationError::definite(InstallError::NoCompatibleVersion(
+                managed_mod.project_id.clone(),
+            ))
+        })?;
+        let file = version.primary_file().ok_or_else(|| {
+            ManagedMutationError::definite(InstallError::NoPrimaryFile(
+                managed_mod.project_id.clone(),
+            ))
+        })?;
+        let filename =
+            sanitize_mod_filename(&file.filename).map_err(ManagedMutationError::definite)?;
         let expected_sha = file.hashes.get("sha512").cloned().unwrap_or_default();
         if let Some(size) = file.size
             && size > MANAGED_ARTIFACT_MAX_BYTES
         {
-            return Err(InstallError::Modrinth(ModrinthError::SizeExceeded {
-                expected: MANAGED_ARTIFACT_MAX_BYTES,
-                actual: size,
-            }));
+            return Err(ManagedMutationError::definite(InstallError::Modrinth(
+                ModrinthError::SizeExceeded {
+                    expected: MANAGED_ARTIFACT_MAX_BYTES,
+                    actual: size,
+                },
+            )));
         }
         let final_path = instance_mods_dir.join(&filename);
         let previously_tracked = tracked_artifact(previous_state, &filename);
@@ -56,18 +64,30 @@ impl PerformanceManager {
             &final_path,
             previously_tracked.map(|installed| installed.integrity.sha512.as_str()),
         )
-        .await?;
+        .await
+        .map_err(|error| ManagedMutationError::indeterminate("artifact_reconcile", error))?;
 
-        if tokio::fs::try_exists(&final_path).await? {
+        if tokio::fs::try_exists(&final_path)
+            .await
+            .map_err(ManagedMutationError::definite)?
+        {
             if let Some(previous) = previously_tracked
-                && !file_matches_sha512(&final_path, &previous.integrity.sha512, None).await?
+                && !file_matches_sha512(&final_path, &previous.integrity.sha512, None)
+                    .await
+                    .map_err(ManagedMutationError::definite)?
             {
-                return Err(InstallError::ManagedArtifactTargetExists(filename));
+                return Err(ManagedMutationError::definite(
+                    InstallError::ManagedArtifactTargetExists(filename),
+                ));
             }
             if !expected_sha.trim().is_empty()
                 && let Ok(true) = file_matches_sha512(&final_path, &expected_sha, file.size).await
             {
-                reconcile_promoted_temp(&temp_path, &final_path, &expected_sha, file.size).await?;
+                reconcile_promoted_temp(&temp_path, &final_path, &expected_sha, file.size)
+                    .await
+                    .map_err(|error| {
+                        ManagedMutationError::indeterminate("artifact_reconcile", error)
+                    })?;
                 return Ok(InstalledMod {
                     project_id: managed_mod.project_id.clone(),
                     version_id: version.id,
@@ -78,18 +98,30 @@ impl PerformanceManager {
                 });
             }
             if !was_previously_tracked {
-                return Err(InstallError::ManagedArtifactTargetExists(filename));
+                return Err(ManagedMutationError::definite(
+                    InstallError::ManagedArtifactTargetExists(filename),
+                ));
             }
         }
 
         let download = self
             .modrinth
             .download_file_to_path(&file.url, &expected_sha, file.size, &temp_path)
-            .await?;
+            .await
+            .map_err(ManagedMutationError::definite)?;
         let ownership_sha512 = download.sha512().to_string();
-        if tokio::fs::try_exists(&final_path).await? && !was_previously_tracked {
-            download.cleanup().await?;
-            return Err(InstallError::ManagedArtifactTargetExists(filename));
+        if tokio::fs::try_exists(&final_path)
+            .await
+            .map_err(ManagedMutationError::definite)?
+            && !was_previously_tracked
+        {
+            download
+                .cleanup()
+                .await
+                .map_err(|error| ManagedMutationError::indeterminate("artifact_cleanup", error))?;
+            return Err(ManagedMutationError::definite(
+                InstallError::ManagedArtifactTargetExists(filename),
+            ));
         }
         promote_file_async(
             download,
@@ -97,7 +129,8 @@ impl PerformanceManager {
             &filename,
             previously_tracked.map(|installed| installed.integrity.sha512.as_str()),
         )
-        .await?;
+        .await
+        .map_err(|error| ManagedMutationError::indeterminate("artifact_promote", error))?;
 
         Ok(InstalledMod {
             project_id: managed_mod.project_id.clone(),
@@ -119,7 +152,7 @@ impl PerformanceManager {
         game_version: &str,
         instance_mods_dir: &Path,
         previous_state: Option<&CompositionState>,
-    ) -> CompositionState {
+    ) -> Result<CompositionState, ManagedMutationError> {
         let mut state = CompositionState {
             composition_id: plan.composition_id.clone(),
             tier: plan.tier,
@@ -155,21 +188,32 @@ impl PerformanceManager {
         }))
         .buffer_unordered(managed_artifact_install_concurrency(plan.mods.len()));
 
+        let mut indeterminate = None;
         while let Some((project_id, result)) = installs.next().await {
             match result {
                 Ok(installed) => state.installed_mods.push(installed),
-                Err(error) => {
+                Err(ManagedMutationError::Definite(error)) => {
                     state.failure_count += 1;
                     state.last_failure = managed_artifact_failure_evidence();
                     warn!("performance install failed for {project_id}: {error}");
                 }
+                Err(error @ ManagedMutationError::Indeterminate(_)) => {
+                    warn!("performance install outcome is indeterminate for {project_id}: {error}");
+                    if indeterminate.is_none() {
+                        indeterminate = Some(error);
+                    }
+                }
             }
+        }
+
+        if let Some(error) = indeterminate {
+            return Err(error);
         }
 
         state
             .installed_mods
             .sort_by(|left, right| left.project_id.cmp(&right.project_id));
-        state
+        Ok(state)
     }
     pub(super) async fn resolve_managed_mod_versions(
         &self,

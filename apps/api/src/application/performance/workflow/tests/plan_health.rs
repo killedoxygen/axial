@@ -5,14 +5,6 @@ fn sha512(bytes: &[u8]) -> String {
     hex::encode(Sha512::digest(bytes))
 }
 
-fn persisted_state_bytes(state: &impl serde::Serialize) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
-        "state": state,
-    }))
-    .expect("serialize persisted state")
-}
-
 #[tokio::test]
 async fn plan_missing_game_version_returns_json_error() {
     let fixture = TestFixture::new("plan-missing-game-version");
@@ -194,7 +186,7 @@ async fn plan_missing_instance_returns_json_error() {
             game_version: Some("1.20.4".to_string()),
             loader: Some("fabric".to_string()),
             mode: None,
-            instance_id: Some("missing".to_string()),
+            instance_id: Some("0000000000000000".to_string()),
         }),
     )
     .await
@@ -204,6 +196,29 @@ async fn plan_missing_instance_returns_json_error() {
     assert_eq!(
         error.1.0,
         serde_json::json!({ "error": "instance not found" })
+    );
+}
+
+#[tokio::test]
+async fn plan_invalid_instance_id_returns_json_error() {
+    let fixture = TestFixture::new("plan-invalid-instance-id");
+
+    let error = handle_plan(
+        State(fixture.state.clone()),
+        Query(PlanQuery {
+            game_version: Some("1.20.4".to_string()),
+            loader: Some("fabric".to_string()),
+            mode: None,
+            instance_id: Some("invalid".to_string()),
+        }),
+    )
+    .await
+    .expect_err("invalid instance identity should fail");
+
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.1.0,
+        serde_json::json!({ "error": "instance identity is invalid" })
     );
 }
 
@@ -376,7 +391,7 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
         .join("mods");
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed file");
-    axial_performance::state::save_state(
+    write_managed_state_fixture(
         &mods_dir,
         &test_composition_state(
             "core",
@@ -392,8 +407,7 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
                 },
             }],
         ),
-    )
-    .expect("save state");
+    );
 
     let Json(response) = handle_health(
         State(fixture.state.clone()),
@@ -482,7 +496,7 @@ async fn health_response_bounds_public_composition_identifiers() {
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed file");
     let raw_composition_id = r"C:\Users\Alice\.minecraft\mods\secret.jar";
-    axial_performance::state::save_state(
+    write_managed_state_fixture(
         &mods_dir,
         &test_composition_state(
             raw_composition_id,
@@ -498,8 +512,7 @@ async fn health_response_bounds_public_composition_identifiers() {
                 },
             }],
         ),
-    )
-    .expect("save state");
+    );
 
     let Json(response) = handle_health(
         State(fixture.state.clone()),
@@ -565,10 +578,14 @@ async fn health_response_exposes_degraded_and_fallback_guardian_view_models_and_
     );
     degraded_state.failure_count = 1;
     degraded_state.last_failure = "managed artifact install failed".to_string();
-    axial_performance::state::save_state(&degraded_mods_dir, &degraded_state)
-        .expect("save degraded state");
-    axial_performance::state::save_rollback_snapshot(&degraded_mods_dir, &degraded_state)
-        .expect("save degraded rollback snapshot");
+    write_managed_state_fixture(&degraded_mods_dir, &degraded_state);
+    write_rollback_fixture(
+        &degraded_mods_dir,
+        "rb-health-degraded",
+        "2026-07-10T00:00:00Z",
+        &degraded_state,
+        true,
+    );
 
     let Json(degraded_response) = handle_health(
         State(degraded.state.clone()),
@@ -633,10 +650,14 @@ async fn health_response_exposes_degraded_and_fallback_guardian_view_models_and_
         failure_count: 0,
         last_failure: String::new(),
     };
-    axial_performance::state::save_state(&fallback_mods_dir, &fallback_state)
-        .expect("save fallback state");
-    axial_performance::state::save_rollback_snapshot(&fallback_mods_dir, &fallback_state)
-        .expect("save fallback rollback snapshot");
+    write_managed_state_fixture(&fallback_mods_dir, &fallback_state);
+    write_rollback_fixture(
+        &fallback_mods_dir,
+        "rb-health-fallback",
+        "2026-07-10T00:00:00Z",
+        &fallback_state,
+        true,
+    );
 
     let Json(fallback_response) = handle_health(
         State(fallback.state.clone()),
@@ -744,23 +765,6 @@ async fn health_plan_uses_user_installed_iris_file_for_nvidium_exclusion() {
     );
 }
 
-#[test]
-fn installed_mod_evidence_preserves_state_ids_and_jar_name_tokens() {
-    let mods_dir = test_root("installed-mod-evidence");
-    fs::write(mods_dir.join("iris-mc1.20.1-1.7.0.jar"), b"iris").expect("write iris jar");
-    fs::write(mods_dir.join("notes.txt"), b"not a jar").expect("write text file");
-    let state = test_composition_state("core", vec![test_installed_mod("sodium", "sodium.jar")]);
-
-    let evidence = installed_mod_evidence(&mods_dir, Some(&state));
-
-    assert!(evidence.contains(&"sodium".to_string()));
-    assert!(evidence.contains(&"iris".to_string()));
-    assert!(evidence.contains(&"iris-mc1.20.1-1.7.0".to_string()));
-    assert!(!evidence.contains(&"notes".to_string()));
-
-    let _ = fs::remove_dir_all(&mods_dir);
-}
-
 #[tokio::test]
 async fn health_invalidates_user_managed_artifact_in_tracked_state() {
     let fixture = TestFixture::new("health-user-managed-state");
@@ -773,7 +777,7 @@ async fn health_invalidates_user_managed_artifact_in_tracked_state() {
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(
         mods_dir.join(".axial-lock.json"),
-        persisted_state_bytes(&serde_json::json!({
+        managed_state_fixture_bytes(&serde_json::json!({
             "composition_id": "core",
             "tier": "core",
             "installed_mods": [{

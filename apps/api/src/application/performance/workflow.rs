@@ -43,10 +43,7 @@ async fn resume_pending_performance_operations(state: AppState) -> usize {
     operations::resume_pending_performance_operations_owned(state, &child_owner, shutdown).await
 }
 #[cfg(test)]
-use plan_health::{
-    PERFORMANCE_DATA_INTERNAL_ERROR, PERFORMANCE_STATE_PARSE_WARNING, bundle_health_token,
-    installed_mod_evidence, internal_error, invalid_health_response,
-};
+use plan_health::{PERFORMANCE_DATA_INTERNAL_ERROR, bundle_health_token, internal_error};
 pub use plan_health::{
     PerformanceHealthRequest, PerformanceHealthResponse, PerformanceInstanceDisplay,
     PerformanceManagedArtifactSummary, PerformanceMemoryDisplay, PerformanceModeDisplay,

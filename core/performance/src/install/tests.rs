@@ -1,3 +1,4 @@
+use super::ManagedMutationError;
 use super::artifact::{
     MANAGED_ARTIFACT_INSTALL_FAILURE, file_matches_sha512, managed_artifact_install_concurrency,
     managed_artifact_temp_path, modrinth_source,
@@ -30,6 +31,22 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const CURRENT_FAMILY_F_REPRESENTATIVE: &str = "1.21.1";
+
+fn managed_install_error(error: &ManagedMutationError) -> Option<&InstallError> {
+    match error {
+        ManagedMutationError::Definite(error) => Some(error),
+        ManagedMutationError::Indeterminate(outcome) => {
+            let mut source = std::error::Error::source(outcome);
+            while let Some(error) = source {
+                if let Some(error) = error.downcast_ref::<InstallError>() {
+                    return Some(error);
+                }
+                source = error.source();
+            }
+            None
+        }
+    }
+}
 
 #[test]
 fn managed_artifact_install_concurrency_is_bounded() {
@@ -1156,8 +1173,37 @@ async fn rollback_without_snapshot_is_predictable() {
         .await
         .expect_err("missing snapshot should fail");
 
-    assert!(matches!(error, InstallError::NoRollbackSnapshot));
+    assert!(matches!(
+        error,
+        ManagedMutationError::Definite(InstallError::NoRollbackSnapshot)
+    ));
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authority_inspection_classifies_invalid_admitted_state_as_definite() {
+    let instances_root = test_root("authority-invalid-admitted-state");
+    let instance_id = "0123456789abcdef";
+    let mods_dir = instances_root.join(instance_id).join("mods");
+    fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+    fs::write(crate::state::lock_file_path(&mods_dir), b"not-json")
+        .expect("write invalid admitted state");
+    let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
+    let authority = manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim managed authority");
+    let identity = authority.identify(instance_id).expect("identify instance");
+
+    let error = authority
+        .inspect(&identity, None)
+        .await
+        .expect_err("invalid admitted state should fail inspection");
+
+    assert!(matches!(
+        error,
+        ManagedMutationError::Definite(InstallError::State(StateError::Parse(_)))
+    ));
+    let _ = fs::remove_dir_all(instances_root);
 }
 
 #[tokio::test]
@@ -1199,8 +1245,12 @@ async fn remove_rejects_non_composition_owned_tracked_state_without_deleting_fil
         .expect_err("invalid ownership should stop removal");
 
     assert!(matches!(
-        error,
-        InstallError::State(StateError::InvalidOwnership { .. })
+        &error,
+        ManagedMutationError::Indeterminate(outcome) if outcome.operation() == "remove"
+    ));
+    assert!(matches!(
+        managed_install_error(&error),
+        Some(InstallError::State(StateError::InvalidOwnership { .. }))
     ));
     assert_eq!(fs::read(root.join("user.jar")).expect("read user"), b"user");
     assert!(root.join(".axial-lock.json").is_file());
@@ -1232,8 +1282,13 @@ async fn rollback_rejects_path_traversal_metadata() {
         .expect_err("traversal metadata should fail");
 
     assert!(matches!(
-        error,
-        InstallError::State(StateError::InvalidFilename(_))
+        &error,
+        ManagedMutationError::Indeterminate(outcome)
+            if outcome.operation() == "rollback_preflight"
+    ));
+    assert!(matches!(
+        managed_install_error(&error),
+        Some(InstallError::State(StateError::InvalidFilename(_)))
     ));
     assert!(!root.join("..").join("outside.jar").exists());
     let _ = fs::remove_dir_all(root);
@@ -1263,8 +1318,12 @@ async fn remove_rejects_nonregular_tracked_source_before_mutation() {
         .expect_err("directory removal should fail");
 
     assert!(matches!(
-        error,
-        InstallError::State(StateError::InvalidRollback(_))
+        &error,
+        ManagedMutationError::Indeterminate(outcome) if outcome.operation() == "remove"
+    ));
+    assert!(matches!(
+        managed_install_error(&error),
+        Some(InstallError::State(StateError::InvalidRollback(_)))
     ));
     assert_eq!(
         fs::read(root.join("managed.jar")).expect("read managed"),

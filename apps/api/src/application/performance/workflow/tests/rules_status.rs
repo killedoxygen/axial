@@ -837,20 +837,3 @@ fn bounded_install_errors_omit_raw_provider_artifact_and_os_details() {
         );
     }
 }
-
-#[test]
-fn health_parse_warning_omits_raw_parser_text() {
-    let raw_parser = serde_json::from_str::<serde_json::Value>("{not json")
-        .expect_err("invalid json")
-        .to_string();
-    let response = invalid_health_response(
-        PERFORMANCE_STATE_PARSE_WARNING,
-        Vec::new(),
-        test_performance_display(),
-    );
-    let warnings = response.warnings.join("\n");
-
-    assert_eq!(warnings, PERFORMANCE_STATE_PARSE_WARNING);
-    assert!(!warnings.contains(&raw_parser));
-    assert!(response.guardian_facts.is_empty());
-}

@@ -3898,18 +3898,27 @@ fn write_family_c_proof_record(
 
 fn write_family_c_managed_state(fixture: &RouteTestFixture, instance_id: &str) {
     let mods_dir = fixture.state.instances().game_dir(instance_id).join("mods");
-    axial_performance::save_state(&mods_dir, &family_c_managed_state())
-        .expect("write family c managed state");
+    std::fs::create_dir_all(&mods_dir).expect("create mods dir");
+    std::fs::write(
+        mods_dir.join(".axial-lock.json"),
+        managed_state_fixture_bytes(&family_c_managed_state()),
+    )
+    .expect("write family c managed state");
 }
 
 fn write_invalid_family_c_managed_state(fixture: &RouteTestFixture, instance_id: &str) {
     let mods_dir = fixture.state.instances().game_dir(instance_id).join("mods");
     std::fs::create_dir_all(&mods_dir).expect("create mods dir");
-    std::fs::write(
-        axial_performance::state::lock_file_path(&mods_dir),
-        "{ invalid",
-    )
-    .expect("write invalid managed state");
+    std::fs::write(mods_dir.join(".axial-lock.json"), "{ invalid")
+        .expect("write invalid managed state");
+}
+
+fn managed_state_fixture_bytes(state: &impl serde::Serialize) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "state": state,
+    }))
+    .expect("serialize managed state fixture")
 }
 
 fn family_c_managed_state() -> axial_performance::CompositionState {

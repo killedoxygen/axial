@@ -103,6 +103,7 @@ fn instance_write_error_response(
                     "an instance with this name already exists".to_string(),
                 ),
                 ErrorKind::InvalidInput => (StatusCode::BAD_REQUEST, error.to_string()),
+                ErrorKind::WouldBlock => (StatusCode::CONFLICT, error.to_string()),
                 _ => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     operation.internal_error_message().to_string(),
@@ -460,7 +461,6 @@ pub(crate) async fn handle_delete_instance(
     id: &str,
     query: std::collections::HashMap<String, String>,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    let _lifecycle = state.acquire_instance_lifecycle(id).await;
     if state.sessions().has_active_instance(id).await {
         return Err((
             StatusCode::CONFLICT,

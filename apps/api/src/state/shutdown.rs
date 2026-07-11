@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 const SHUTDOWN_LOCK_INVARIANT: &str =
     "application shutdown lock poisoned; completion state may be inconsistent";
-const SHUTDOWN_STEP_COUNT: usize = 17;
+const SHUTDOWN_STEP_COUNT: usize = 18;
 type ShutdownAttemptChannel = Arc<watch::Sender<Option<Result<(), AppShutdownError>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,6 +13,7 @@ pub enum AppShutdownStep {
     SessionSettlement,
     DriverSettlement,
     ProducerDrain,
+    ManagedCompositions,
     PerformanceRules,
     SkinFlush,
     DriverStore,
@@ -35,19 +36,20 @@ impl AppShutdownStep {
             Self::SessionSettlement => 1,
             Self::DriverSettlement => 2,
             Self::ProducerDrain => 3,
-            Self::PerformanceRules => 4,
-            Self::SkinFlush => 5,
-            Self::DriverStore => 6,
-            Self::LaunchReports => 7,
-            Self::BenchmarkSuites => 8,
-            Self::PerformanceOperations => 9,
-            Self::Journals => 10,
-            Self::FailureMemory => 11,
-            Self::Accounts => 12,
-            Self::SecureAuth => 13,
-            Self::RemoteFlags => 14,
-            Self::InstanceRegistry => 15,
-            Self::Config => 16,
+            Self::ManagedCompositions => 4,
+            Self::PerformanceRules => 5,
+            Self::SkinFlush => 6,
+            Self::DriverStore => 7,
+            Self::LaunchReports => 8,
+            Self::BenchmarkSuites => 9,
+            Self::PerformanceOperations => 10,
+            Self::Journals => 11,
+            Self::FailureMemory => 12,
+            Self::Accounts => 13,
+            Self::SecureAuth => 14,
+            Self::RemoteFlags => 15,
+            Self::InstanceRegistry => 16,
+            Self::Config => 17,
         }
     }
 
@@ -57,6 +59,7 @@ impl AppShutdownStep {
             Self::SessionSettlement => "session_settlement",
             Self::DriverSettlement => "driver_settlement",
             Self::ProducerDrain => "producer_drain",
+            Self::ManagedCompositions => "managed_compositions",
             Self::PerformanceRules => "performance_rules",
             Self::SkinFlush => "skin_flush",
             Self::DriverStore => "driver_store",
@@ -177,6 +180,11 @@ impl AppShutdownCoordinator {
                 .map_err(|_| AppShutdownError::at(AppShutdownStep::ProducerDrain))
         };
         let mut first_error = self.finish_producer_drain(settlement_error, producer_result)?;
+
+        retain_first_error(
+            &mut first_error,
+            self.close_managed_compositions(state).await,
+        );
 
         let skin_result = self.flush_skin(state).await;
         let (
@@ -451,6 +459,18 @@ impl AppShutdownCoordinator {
         Ok(())
     }
 
+    async fn close_managed_compositions(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if self.completed(AppShutdownStep::ManagedCompositions) {
+            return Ok(());
+        }
+        state
+            .close_managed_compositions()
+            .await
+            .map_err(|_| AppShutdownError::at(AppShutdownStep::ManagedCompositions))?;
+        self.mark_completed(AppShutdownStep::ManagedCompositions);
+        Ok(())
+    }
+
     async fn close_config(&self, state: &AppState) -> Result<(), AppShutdownError> {
         if self.completed(AppShutdownStep::Config) {
             return Ok(());
@@ -464,6 +484,9 @@ impl AppShutdownCoordinator {
     }
 
     async fn close_instance_registry(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if !self.completed(AppShutdownStep::ManagedCompositions) {
+            return Err(AppShutdownError::at(AppShutdownStep::ManagedCompositions));
+        }
         if self.completed(AppShutdownStep::InstanceRegistry) {
             return Ok(());
         }

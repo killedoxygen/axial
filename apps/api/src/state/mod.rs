@@ -13,6 +13,7 @@ mod journals;
 pub(crate) mod launch_reports;
 mod lifecycle;
 pub mod ownership;
+mod performance_managed;
 pub mod performance_operations;
 mod performance_rules;
 pub mod presence;
@@ -23,7 +24,7 @@ pub mod skins;
 
 use axial_config::{
     AppConfig, ConfigStore as StartupConfigStore, ConfigStoreError,
-    InstanceStore as StartupInstanceStore, InstanceStoreError, find_flag,
+    InstanceStore as StartupInstanceStore, InstanceStoreError, find_flag, is_canonical_instance_id,
 };
 pub use axial_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
 pub use axial_minecraft::download::DownloadProgress;
@@ -70,6 +71,10 @@ pub(crate) use lifecycle::{
 };
 #[cfg(test)]
 pub(crate) use lifecycle::{AppLifecyclePhase, LifecycleQuiesceError};
+pub(crate) use performance_managed::{
+    AppManagedCompositionAdmission, ManagedCompositionCloseError, ManagedInspectionError,
+    ManagedInstanceAdmissionError,
+};
 pub use performance_rules::AppPerformanceStore;
 pub(crate) use remote_flags::{
     RemoteFlagRefreshOutcome, RemoteFlagStore, ResolvedFlagSource, resolve_flag,
@@ -237,10 +242,14 @@ impl AppState {
             |error| panic!("failed to initialize instance registry persistence: {error}"),
         ));
         let performance = Arc::new(
-            AppPerformanceStore::claim(init.performance, &config.paths().config_dir)
-                .unwrap_or_else(|error| {
-                    panic!("failed to initialize performance rules persistence: {error}")
-                }),
+            AppPerformanceStore::claim(
+                init.performance,
+                &config.paths().config_dir,
+                &instances.paths().instances_dir,
+            )
+            .unwrap_or_else(|error| {
+                panic!("failed to initialize performance rules persistence: {error}")
+            }),
         );
         let benchmark_suite_retention_claims =
             benchmark_suites::BenchmarkSuiteRetentionClaims::default();
@@ -550,13 +559,45 @@ impl AppState {
         instance_id: String,
         delete_files: bool,
     ) -> Result<(), InstanceStoreError> {
+        if self.sessions.has_active_instance(&instance_id).await {
+            return Err(InstanceStoreError::Persistence(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "cannot delete a running instance; stop the game first",
+            )));
+        }
+        let lifecycle = self.acquire_instance_lifecycle(&instance_id).await;
+        if self.sessions.has_active_instance(&instance_id).await {
+            return Err(InstanceStoreError::Persistence(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "cannot delete a running instance; stop the game first",
+            )));
+        }
+        if self.instances.get(&instance_id).is_none() {
+            return Err(instance_not_found_error());
+        }
+        let retirement = self
+            .performance
+            .retire_managed(&instance_id)
+            .await
+            .map_err(|error| {
+                InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
+            })?;
         let instances = self.instances.clone();
-        let gate = instances.acquire_mutation().await?;
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let result = instances
-                .delete_with_gate(instance_id, delete_files, gate)
-                .await;
+            let _lifecycle = lifecycle;
+            let retained_instance_id = instance_id.clone();
+            let result = match instances.acquire_mutation().await {
+                Ok(gate) => {
+                    instances
+                        .delete_with_gate(instance_id, delete_files, gate)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            if result.is_ok() || instances.get(&retained_instance_id).is_none() {
+                retirement.commit();
+            }
             let _ = completed_tx.send(result);
         });
         completed_rx.await.map_err(|_| {
@@ -571,6 +612,79 @@ impl AppState {
         instance_id: &str,
     ) -> tokio::sync::OwnedMutexGuard<()> {
         self.instance_lifecycle_gates.acquire(instance_id).await
+    }
+
+    pub(crate) async fn admit_managed_instance(
+        &self,
+        instance_id: &str,
+        mutation: bool,
+    ) -> Result<AppManagedCompositionAdmission, ManagedInstanceAdmissionError> {
+        if !is_canonical_instance_id(instance_id) {
+            return Err(ManagedInstanceAdmissionError::InvalidInstanceIdentity);
+        }
+        if mutation && self.sessions.has_active_instance(instance_id).await {
+            return Err(ManagedInstanceAdmissionError::ActiveSession);
+        }
+        let lifecycle = if mutation {
+            Some(self.acquire_instance_lifecycle(instance_id).await)
+        } else {
+            None
+        };
+        let instance = self
+            .instances
+            .get(instance_id)
+            .ok_or(ManagedInstanceAdmissionError::InstanceNotFound)?;
+        if instance.id != instance_id || !is_canonical_instance_id(&instance.id) {
+            return Err(ManagedInstanceAdmissionError::InvalidInstanceIdentity);
+        }
+        if mutation && self.sessions.has_active_instance(instance_id).await {
+            return Err(ManagedInstanceAdmissionError::ActiveSession);
+        }
+        let managed = self.performance.admit_managed(instance_id).await?;
+        if self.instances.get(instance_id).as_ref() != Some(&instance) {
+            return Err(ManagedInstanceAdmissionError::InstanceNotFound);
+        }
+        Ok(AppManagedCompositionAdmission::bind(managed, lifecycle))
+    }
+
+    pub(crate) async fn inspect_managed_instance(
+        &self,
+        instance_id: &str,
+        plan: Option<axial_performance::CompositionPlan>,
+    ) -> Result<axial_performance::ManagedCompositionInspection, ManagedInspectionError> {
+        let admitted = self.admit_managed_instance(instance_id, false).await?;
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = admitted.inspect(plan.as_ref()).await;
+            let _ = completed_tx.send(result);
+        });
+        completed_rx
+            .await
+            .map_err(|_| ManagedInspectionError::OwnerStopped)?
+            .map_err(ManagedInspectionError::Operation)
+    }
+
+    pub(crate) async fn resolve_managed_instance(
+        &self,
+        instance_id: &str,
+        request: axial_performance::ResolutionRequest,
+    ) -> Result<axial_performance::ManagedResolvedInspection, ManagedInspectionError> {
+        let admitted = self.admit_managed_instance(instance_id, false).await?;
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = admitted.resolve_and_inspect(request).await;
+            let _ = completed_tx.send(result);
+        });
+        completed_rx
+            .await
+            .map_err(|_| ManagedInspectionError::OwnerStopped)?
+            .map_err(ManagedInspectionError::Operation)
+    }
+
+    pub(crate) async fn close_managed_compositions(
+        &self,
+    ) -> Result<(), ManagedCompositionCloseError> {
+        self.performance.close_managed().await
     }
 
     pub(crate) async fn close_instance_registry(&self) -> Result<(), InstanceStoreError> {

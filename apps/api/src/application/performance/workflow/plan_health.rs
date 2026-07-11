@@ -4,16 +4,16 @@ use crate::guardian::{
     performance_plan_guardian_facts, performance_state_error_guardian_fact,
 };
 use crate::observability::{PerformanceProofRecord, performance_health_proof_record};
-use crate::state::AppState;
 use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass as StateOwnershipClass, RollbackState,
     StabilizationSystem, TargetDescriptor, TargetKind,
 };
+use crate::state::{AppState, ManagedInspectionError, ManagedInstanceAdmissionError};
 use axial_minecraft::scan_versions;
 use axial_performance::{
-    BundleHealth, CompositionPlan, CompositionTier, ManagedArtifactProvider, OwnershipClass,
-    PerformanceMode, ResolutionRequest, StateError, derive_health_async,
-    effective_performance_plan, parse_mode, state::load_state_async,
+    BundleHealth, CompositionPlan, CompositionTier, InstallError, ManagedArtifactProvider,
+    ManagedMutationError, OwnershipClass, PerformanceMode, ResolutionRequest, StateError,
+    effective_performance_plan, parse_mode,
 };
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,6 @@ const PERFORMANCE_MANAGED_ARTIFACT_SUMMARY_LIMIT: usize = 50;
 const PERFORMANCE_GUARDIAN_FACT_LIMIT: usize = 16;
 pub(super) const PERFORMANCE_DATA_INTERNAL_ERROR: &str =
     "Could not load performance data. Check app data permissions and try again.";
-pub(super) const PERFORMANCE_STATE_PARSE_WARNING: &str = "failed to parse performance state";
 
 #[derive(Debug, Deserialize)]
 pub struct PerformancePlanRequest {
@@ -110,14 +109,23 @@ pub async fn performance_plan(
         "game_version query parameter is required",
     )?;
     let mode = resolve_config_mode(state, query.mode.as_deref())?;
-    let installed_mods = plan_installed_mod_evidence(state, query.instance_id.as_deref()).await?;
-    let plan = state.performance().get_plan(ResolutionRequest {
+    let request = ResolutionRequest {
         game_version,
         loader: optional_value(query.loader.as_deref()).unwrap_or_default(),
         mode,
         hardware: state.performance().hardware(),
-        installed_mods,
-    });
+        installed_mods: Vec::new(),
+    };
+    let plan = match optional_value(query.instance_id.as_deref()) {
+        Some(instance_id) => {
+            state
+                .resolve_managed_instance(&instance_id, request)
+                .await
+                .map_err(managed_inspection_error)?
+                .plan
+        }
+        None => state.performance().get_plan(request),
+    };
 
     let mut guardian_facts = performance_plan_guardian_facts(&plan, OperationPhase::Planning);
     append_performance_guardian_facts(
@@ -135,50 +143,6 @@ pub async fn performance_plan(
         guardian_facts,
         plan,
     })
-}
-
-async fn plan_installed_mod_evidence(
-    state: &AppState,
-    raw_instance_id: Option<&str>,
-) -> Result<Vec<String>, (StatusCode, Json<serde_json::Value>)> {
-    let Some(instance_id) = optional_value(raw_instance_id) else {
-        return Ok(Vec::new());
-    };
-    let instance = state.instances().get(&instance_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "instance not found" })),
-        )
-    })?;
-    let mods_dir = state.instances().game_dir(&instance.id).join("mods");
-    let state_file = match load_state_async(&mods_dir).await {
-        Ok(state_file) => state_file,
-        Err(StateError::Parse(_)) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "failed to parse performance state" })),
-            ));
-        }
-        Err(StateError::InvalidOwnership { .. }) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid performance artifact ownership metadata"
-                })),
-            ));
-        }
-        Err(StateError::InvalidIntegrity { .. }) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "invalid performance artifact integrity metadata"
-                })),
-            ));
-        }
-        Err(error) => return Err(internal_error(error)),
-    };
-
-    Ok(installed_mod_evidence_async(&mods_dir, state_file.as_ref()).await)
 }
 
 pub async fn performance_health(
@@ -202,44 +166,36 @@ pub async fn performance_health(
         return Ok(disabled_health_response(mode, display));
     }
 
-    let mods_dir = state.instances().game_dir(&instance.id).join("mods");
-    let state_file = match load_state_async(&mods_dir).await {
-        Ok(state_file) => state_file,
-        Err(StateError::Parse(_)) => {
-            return Ok(invalid_health_response(
-                PERFORMANCE_STATE_PARSE_WARNING,
-                Vec::new(),
+    if let Err(error) = state.inspect_managed_instance(&instance.id, None).await {
+        if let Some((warning, guardian_facts)) = managed_state_invalid_response(&error) {
+            return Ok(invalid_managed_health_response(
+                warning,
+                guardian_facts,
                 display,
             ));
         }
-        Err(error @ StateError::InvalidOwnership { .. }) => {
-            return Ok(invalid_health_response(
-                "invalid performance artifact ownership metadata",
-                performance_state_error_guardian_fact(&error, OperationPhase::Validating)
-                    .into_iter()
-                    .collect(),
-                display,
-            ));
-        }
-        Err(StateError::InvalidIntegrity { .. }) => {
-            return Ok(invalid_health_response(
-                "invalid performance artifact integrity metadata",
-                Vec::new(),
-                display,
-            ));
-        }
-        Err(error) => return Err(internal_error(error)),
-    };
+        return Err(managed_inspection_error(error));
+    }
+
     let (game_version, loader) = resolve_instance_version_target(state, &instance, None, None)?;
-    let plan = state.performance().get_plan(ResolutionRequest {
-        game_version,
-        loader,
-        mode,
-        hardware: state.performance().hardware(),
-        installed_mods: installed_mod_evidence_async(&mods_dir, state_file.as_ref()).await,
-    });
-    let (health, warnings) = derive_health_async(state_file.as_ref(), Some(&plan), &mods_dir).await;
-    let warnings = response_warnings(&plan, warnings);
+    let resolved = state
+        .resolve_managed_instance(
+            &instance.id,
+            ResolutionRequest {
+                game_version,
+                loader,
+                mode,
+                hardware: state.performance().hardware(),
+                installed_mods: Vec::new(),
+            },
+        )
+        .await
+        .map_err(managed_inspection_error)?;
+    let plan = resolved.plan;
+    let inspection = resolved.inspection;
+    let health = inspection.health;
+    let warnings = response_warnings(&plan, inspection.warnings);
+    let state_file = inspection.state;
     let composition_id = state_file
         .as_ref()
         .map(|value| value.composition_id.clone())
@@ -263,7 +219,11 @@ pub async fn performance_health(
         &mut guardian_facts,
         performance_failure_memory_facts(state, OperationPhase::Validating, Some(&composition_id)),
     );
-    let rollback = health_rollback_state(state, &mods_dir).await;
+    let rollback = if inspection.rollback_snapshots.is_empty() {
+        RollbackState::Unavailable
+    } else {
+        RollbackState::Available
+    };
     let proof = performance_health_proof(
         None,
         health,
@@ -346,17 +306,6 @@ fn append_performance_guardian_facts(facts: &mut Vec<GuardianFact>, more: Vec<Gu
     let remaining = PERFORMANCE_GUARDIAN_FACT_LIMIT.saturating_sub(facts.len());
     facts.extend(more.into_iter().take(remaining));
     facts.truncate(PERFORMANCE_GUARDIAN_FACT_LIMIT);
-}
-
-async fn health_rollback_state(state: &AppState, mods_dir: &std::path::Path) -> RollbackState {
-    match state
-        .performance()
-        .list_rollback_snapshots_async(mods_dir)
-        .await
-    {
-        Ok(snapshots) if !snapshots.is_empty() => RollbackState::Available,
-        _ => RollbackState::Unavailable,
-    }
 }
 
 fn performance_health_proof(
@@ -549,13 +498,37 @@ fn disabled_health_response(
     }
 }
 
-pub(super) fn invalid_health_response(
-    warning: impl Into<String>,
+fn managed_state_invalid_response(
+    error: &ManagedInspectionError,
+) -> Option<(&'static str, Vec<GuardianFact>)> {
+    let ManagedInspectionError::Operation(ManagedMutationError::Definite(InstallError::State(
+        state_error,
+    ))) = error
+    else {
+        return None;
+    };
+    match state_error {
+        StateError::Parse(_) => Some(("failed to parse performance state", Vec::new())),
+        StateError::InvalidOwnership { .. } => Some((
+            "invalid performance artifact ownership metadata",
+            performance_state_error_guardian_fact(state_error, OperationPhase::Validating)
+                .into_iter()
+                .collect(),
+        )),
+        StateError::InvalidIntegrity { .. } => Some((
+            "invalid performance artifact integrity metadata",
+            Vec::new(),
+        )),
+        _ => None,
+    }
+}
+
+fn invalid_managed_health_response(
+    warning: &'static str,
     guardian_facts: Vec<GuardianFact>,
     display: PerformanceInstanceDisplay,
 ) -> PerformanceHealthResponse {
-    let warning = warning.into();
-    let warnings = vec![warning];
+    let warnings = vec![warning.to_string()];
     PerformanceHealthResponse {
         active: true,
         health: BundleHealth::Invalid,
@@ -584,6 +557,56 @@ pub(super) fn invalid_health_response(
             &warnings,
         ),
         display,
+    }
+}
+
+fn managed_inspection_error(
+    error: ManagedInspectionError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        ManagedInspectionError::Admission(ManagedInstanceAdmissionError::InstanceNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "instance not found" })),
+        ),
+        ManagedInspectionError::Admission(
+            ManagedInstanceAdmissionError::InvalidInstanceIdentity,
+        ) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "instance identity is invalid" })),
+        ),
+        ManagedInspectionError::Admission(ManagedInstanceAdmissionError::ActiveSession) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "managed composition mutation is blocked while the instance is running"
+            })),
+        ),
+        ManagedInspectionError::Admission(ManagedInstanceAdmissionError::Owner(error)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        ),
+        ManagedInspectionError::Operation(ManagedMutationError::Definite(InstallError::State(
+            StateError::Parse(_),
+        ))) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "failed to parse performance state" })),
+        ),
+        ManagedInspectionError::Operation(ManagedMutationError::Definite(InstallError::State(
+            StateError::InvalidOwnership { .. },
+        ))) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid performance artifact ownership metadata"
+            })),
+        ),
+        ManagedInspectionError::Operation(ManagedMutationError::Definite(InstallError::State(
+            StateError::InvalidIntegrity { .. },
+        ))) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid performance artifact integrity metadata"
+            })),
+        ),
+        error => internal_error(error),
     }
 }
 
@@ -686,106 +709,6 @@ pub(super) fn resolve_instance_mode(
         return Ok(mode);
     }
     resolve_config_mode(state, None)
-}
-
-pub(super) fn installed_mod_evidence(
-    mods_dir: &std::path::Path,
-    state: Option<&axial_performance::CompositionState>,
-) -> Vec<String> {
-    let mut evidence = std::collections::BTreeSet::new();
-    if let Some(state) = state {
-        for installed in &state.installed_mods {
-            add_mod_evidence(&mut evidence, &installed.project_id);
-        }
-    }
-    for value in installed_mod_file_evidence(mods_dir) {
-        evidence.insert(value);
-    }
-    evidence.into_iter().collect()
-}
-
-async fn installed_mod_evidence_async(
-    mods_dir: &std::path::Path,
-    state: Option<&axial_performance::CompositionState>,
-) -> Vec<String> {
-    let mods_dir = mods_dir.to_path_buf();
-    let state = state.cloned();
-    tokio::task::spawn_blocking(move || installed_mod_evidence(&mods_dir, state.as_ref()))
-        .await
-        .unwrap_or_default()
-}
-
-pub(super) async fn installed_mod_evidence_from_mods_dir_async(
-    mods_dir: &std::path::Path,
-) -> Vec<String> {
-    let state = load_state_async(mods_dir).await.ok().flatten();
-    installed_mod_evidence_async(mods_dir, state.as_ref()).await
-}
-
-fn installed_mod_file_evidence(mods_dir: &std::path::Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(mods_dir) else {
-        return Vec::new();
-    };
-    let mut evidence = std::collections::BTreeSet::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if !path
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("jar"))
-        {
-            continue;
-        }
-        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
-            add_mod_evidence(&mut evidence, stem);
-        }
-    }
-    evidence.into_iter().collect()
-}
-
-fn add_mod_evidence(evidence: &mut std::collections::BTreeSet<String>, raw: &str) {
-    let normalized = raw.trim().to_lowercase();
-    if normalized.is_empty() {
-        return;
-    }
-    evidence.insert(normalized.clone());
-
-    let mut prefix = String::new();
-    for token in normalized
-        .split(|value: char| !value.is_ascii_alphanumeric())
-        .filter(|value| !value.is_empty())
-    {
-        if is_versionish_mod_filename_token(token) {
-            break;
-        }
-        if prefix.is_empty() {
-            prefix.push_str(token);
-        } else {
-            prefix.push('-');
-            prefix.push_str(token);
-        }
-        evidence.insert(prefix.clone());
-    }
-}
-
-fn is_versionish_mod_filename_token(token: &str) -> bool {
-    token.strip_prefix("mc").is_some_and(|suffix| {
-        suffix
-            .as_bytes()
-            .first()
-            .is_some_and(|value| value.is_ascii_digit())
-    }) || token.strip_prefix('v').is_some_and(|suffix| {
-        suffix
-            .as_bytes()
-            .first()
-            .is_some_and(|value| value.is_ascii_digit())
-    }) || token
-        .as_bytes()
-        .first()
-        .is_some_and(|value| value.is_ascii_digit())
 }
 
 pub(super) fn response_warnings(

@@ -1,12 +1,12 @@
 pub mod effective;
-pub mod health;
+mod health;
 pub mod install;
 pub mod modrinth;
 pub mod resolve;
 pub mod rules;
 pub mod rules_cache;
 pub mod signature;
-pub mod state;
+mod state;
 pub mod status;
 pub mod types;
 
@@ -19,10 +19,12 @@ pub use effective::{
     EffectivePerformanceComposition, EffectivePerformanceExplanation,
     EffectivePerformanceHealthRequirements, EffectivePerformancePlan, effective_performance_plan,
 };
-pub use health::{BundleHealth, derive_health_async};
+pub use health::BundleHealth;
 pub use install::{
-    InstallError, PERFORMANCE_RULES_URL_ENV, PerformanceManager, PerformanceRulesAuthority,
-    RulesRefreshError, VerifiedRemoteRules, remote_rules_refresh_warning,
+    InstallError, ManagedCompositionAuthority, ManagedCompositionInspection, ManagedIdentityError,
+    ManagedIndeterminate, ManagedInstanceIdentity, ManagedMutationError, ManagedResolvedInspection,
+    PERFORMANCE_RULES_URL_ENV, PerformanceManager, PerformanceRulesAuthority, RulesRefreshError,
+    VerifiedRemoteRules, remote_rules_refresh_warning,
 };
 pub use resolve::{ResolveError, builtin_manifest, detect_hardware, parse_mode, resolve_plan};
 pub use rules_cache::{
@@ -32,7 +34,7 @@ pub use signature::{
     PERFORMANCE_RULES_PUBLIC_KEY_ENV, RULES_KEY_ID_HEADER, RULES_SIGNATURE_HEADER,
     RemoteRulesVerifier, RulesSignatureError, RulesSignatureMetadata, canonical_manifest_payload,
 };
-pub use state::{RollbackSnapshotSummary, StateError, load_state, remove_state, save_state};
+pub use state::{RollbackSnapshotSummary, StateError};
 pub use status::{
     FamilyCoverage, PerformanceRulesStatus, RuleChannel, RuleSource, RulesValidation, rules_status,
     rules_status_for,

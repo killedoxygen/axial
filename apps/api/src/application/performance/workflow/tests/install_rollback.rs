@@ -1,14 +1,6 @@
 use super::*;
 use sha2::{Digest, Sha512};
 
-fn persisted_state_bytes(state: &impl serde::Serialize) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
-        "state": state,
-    }))
-    .expect("serialize persisted state")
-}
-
 fn test_installed_mod_for_bytes(project_id: &str, filename: &str, bytes: &[u8]) -> InstalledMod {
     let mut installed = test_installed_mod(project_id, filename);
     installed.integrity.sha512 = hex::encode(Sha512::digest(bytes));
@@ -148,28 +140,25 @@ async fn install_custom_mode_removes_only_managed_artifacts() {
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed mod");
     fs::write(mods_dir.join("user.jar"), b"user").expect("write user mod");
-    fs::write(
-        mods_dir.join(".axial-lock.json"),
-        persisted_state_bytes(&axial_performance::CompositionState {
-            composition_id: "core".to_string(),
-            tier: CompositionTier::Core,
-            installed_mods: vec![axial_performance::InstalledMod {
-                project_id: "sodium".to_string(),
-                version_id: "version".to_string(),
-                filename: "managed.jar".to_string(),
-                ownership_class: axial_performance::OwnershipClass::CompositionManaged,
-                source: test_modrinth_source(),
-                integrity: axial_performance::ManagedArtifactIntegrity {
-                    sha512: hex::encode(Sha512::digest(b"managed")),
-                    sha512_verified: false,
-                },
-            }],
-            installed_at: "2026-05-30T00:00:00Z".to_string(),
-            failure_count: 0,
-            last_failure: String::new(),
-        }),
-    )
-    .expect("write state");
+    let managed_state = axial_performance::CompositionState {
+        composition_id: "core".to_string(),
+        tier: CompositionTier::Core,
+        installed_mods: vec![axial_performance::InstalledMod {
+            project_id: "sodium".to_string(),
+            version_id: "version".to_string(),
+            filename: "managed.jar".to_string(),
+            ownership_class: axial_performance::OwnershipClass::CompositionManaged,
+            source: test_modrinth_source(),
+            integrity: axial_performance::ManagedArtifactIntegrity {
+                sha512: hex::encode(Sha512::digest(b"managed")),
+                sha512_verified: false,
+            },
+        }],
+        installed_at: "2026-05-30T00:00:00Z".to_string(),
+        failure_count: 0,
+        last_failure: String::new(),
+    };
+    write_managed_state_fixture(&mods_dir, &managed_state);
 
     let Json(response) = handle_install(
         State(fixture.state.clone()),
@@ -262,7 +251,7 @@ async fn install_remove_rejects_invalid_ownership_without_deleting_files() {
     fs::write(mods_dir.join("user.jar"), b"user").expect("write user file");
     fs::write(
         mods_dir.join(".axial-lock.json"),
-        persisted_state_bytes(&serde_json::json!({
+        managed_state_fixture_bytes(&serde_json::json!({
             "composition_id": "core",
             "tier": "core",
             "installed_mods": [{
@@ -322,7 +311,7 @@ async fn install_remove_rejects_invalid_integrity_without_deleting_files() {
     fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed file");
     fs::write(
         mods_dir.join(".axial-lock.json"),
-        persisted_state_bytes(&serde_json::json!({
+        managed_state_fixture_bytes(&serde_json::json!({
             "composition_id": "core",
             "tier": "core",
             "installed_mods": [{
@@ -408,30 +397,36 @@ async fn rollback_list_route_returns_snapshot_metadata() {
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed-a.jar"), b"managed-a").expect("write managed a");
     fs::write(mods_dir.join("managed-b.jar"), b"managed-b").expect("write managed b");
-    let first = axial_performance::state::save_rollback_snapshot(
+    let first_state = test_composition_state(
+        "core-a",
+        vec![test_installed_mod_for_bytes(
+            "sodium",
+            "managed-a.jar",
+            b"managed-a",
+        )],
+    );
+    let first = write_rollback_fixture(
         &mods_dir,
-        &test_composition_state(
-            "core-a",
-            vec![test_installed_mod_for_bytes(
-                "sodium",
-                "managed-a.jar",
-                b"managed-a",
-            )],
-        ),
-    )
-    .expect("save first snapshot");
-    let second = axial_performance::state::save_rollback_snapshot(
+        "rb-rollback-list-first",
+        "2026-07-10T00:00:00Z",
+        &first_state,
+        false,
+    );
+    let second_state = test_composition_state(
+        "core-b",
+        vec![test_installed_mod_for_bytes(
+            "lithium",
+            "managed-b.jar",
+            b"managed-b",
+        )],
+    );
+    let second = write_rollback_fixture(
         &mods_dir,
-        &test_composition_state(
-            "core-b",
-            vec![test_installed_mod_for_bytes(
-                "lithium",
-                "managed-b.jar",
-                b"managed-b",
-            )],
-        ),
-    )
-    .expect("save second snapshot");
+        "rb-rollback-list-second",
+        "2026-07-10T00:00:01Z",
+        &second_state,
+        true,
+    );
 
     let response = router()
         .with_state(fixture.state.clone())
@@ -483,18 +478,21 @@ async fn rollback_list_route_bounds_public_snapshot_descriptors() {
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed");
     let raw_composition_id = r"C:\Users\Alice\.minecraft\mods\secret.jar";
-    axial_performance::state::save_rollback_snapshot(
+    let state = test_composition_state(
+        raw_composition_id,
+        vec![test_installed_mod_for_bytes(
+            "sodium",
+            "managed.jar",
+            b"managed",
+        )],
+    );
+    write_rollback_fixture(
         &mods_dir,
-        &test_composition_state(
-            raw_composition_id,
-            vec![test_installed_mod_for_bytes(
-                "sodium",
-                "managed.jar",
-                b"managed",
-            )],
-        ),
-    )
-    .expect("save snapshot");
+        "rb-rollback-list-redaction",
+        "2026-07-10T00:00:00Z",
+        &state,
+        true,
+    );
 
     let response = router()
         .with_state(fixture.state.clone())
@@ -546,44 +544,39 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
         .join("mods");
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed-a.jar"), b"managed-a").expect("write managed a");
-    let older = axial_performance::state::save_rollback_snapshot(
+    let older_state = test_composition_state(
+        "core-a",
+        vec![test_installed_mod_for_bytes(
+            "sodium",
+            "managed-a.jar",
+            b"managed-a",
+        )],
+    );
+    let older = write_rollback_fixture(
         &mods_dir,
-        &test_composition_state(
-            "core-a",
-            vec![test_installed_mod_for_bytes(
-                "sodium",
-                "managed-a.jar",
-                b"managed-a",
-            )],
-        ),
-    )
-    .expect("save older snapshot");
+        "rb-rollback-specific-older",
+        "2026-07-10T00:00:00Z",
+        &older_state,
+        false,
+    );
     fs::remove_file(mods_dir.join("managed-a.jar")).expect("remove superseded managed a");
     fs::write(mods_dir.join("managed-b.jar"), b"managed-b").expect("write managed b");
-    axial_performance::state::save_state(
+    let newer_state = test_composition_state(
+        "core-b",
+        vec![test_installed_mod_for_bytes(
+            "lithium",
+            "managed-b.jar",
+            b"managed-b",
+        )],
+    );
+    write_managed_state_fixture(&mods_dir, &newer_state);
+    write_rollback_fixture(
         &mods_dir,
-        &test_composition_state(
-            "core-b",
-            vec![test_installed_mod_for_bytes(
-                "lithium",
-                "managed-b.jar",
-                b"managed-b",
-            )],
-        ),
-    )
-    .expect("save current state");
-    axial_performance::state::save_rollback_snapshot(
-        &mods_dir,
-        &test_composition_state(
-            "core-b",
-            vec![test_installed_mod_for_bytes(
-                "lithium",
-                "managed-b.jar",
-                b"managed-b",
-            )],
-        ),
-    )
-    .expect("save newer snapshot");
+        "rb-rollback-specific-newer",
+        "2026-07-10T00:00:01Z",
+        &newer_state,
+        true,
+    );
 
     let Json(response) = handle_install(
         State(fixture.state.clone()),
@@ -685,18 +678,21 @@ async fn rollback_rejects_untracked_same_name_target_without_overwriting() {
         .join("mods");
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed-a.jar"), b"snapshot-managed").expect("write managed a");
-    axial_performance::state::save_rollback_snapshot(
+    let snapshot_state = test_composition_state(
+        "core-a",
+        vec![test_installed_mod_for_bytes(
+            "sodium",
+            "managed-a.jar",
+            b"snapshot-managed",
+        )],
+    );
+    write_rollback_fixture(
         &mods_dir,
-        &test_composition_state(
-            "core-a",
-            vec![test_installed_mod_for_bytes(
-                "sodium",
-                "managed-a.jar",
-                b"snapshot-managed",
-            )],
-        ),
-    )
-    .expect("save snapshot");
+        "rb-rollback-untracked-target",
+        "2026-07-10T00:00:00Z",
+        &snapshot_state,
+        true,
+    );
     fs::write(mods_dir.join("managed-a.jar"), b"user-replacement").expect("replace target");
 
     let error = handle_install(

@@ -5,9 +5,8 @@ use super::operations::{
     record_performance_guardian_supervision, record_performance_operation_result,
 };
 use super::plan_health::{
-    PerformanceManagedArtifactSummary, installed_mod_evidence_from_mods_dir_async,
-    managed_artifact_summary, performance_composition_target, resolve_instance_mode,
-    resolve_instance_version_target, response_warnings, tier_name,
+    PerformanceManagedArtifactSummary, managed_artifact_summary, performance_composition_target,
+    resolve_instance_mode, resolve_instance_version_target, response_warnings, tier_name,
 };
 use super::{
     PerformanceInstallResponse, PerformanceOperation, PerformanceRollbackListRequest,
@@ -21,12 +20,11 @@ use crate::guardian::{
     performance_supervision_rejection_user_outcome, plan_performance_supervision,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
-use crate::state::AppState;
 use crate::state::contracts::{OperationId, OperationPhase, RollbackState};
+use crate::state::{AppManagedCompositionAdmission, AppState};
 use axial_performance::{
     BundleHealth, CompositionState, InstallError, PerformanceMode, ResolutionRequest,
-    RollbackSnapshotSummary as CoreRollbackSnapshotSummary, StateError, derive_health_async,
-    state::load_state_async,
+    RollbackSnapshotSummary as CoreRollbackSnapshotSummary, StateError,
 };
 use axum::{Json, http::StatusCode};
 use serde::Serialize;
@@ -67,18 +65,11 @@ pub async fn performance_rollback_list(
         query.instance_id.as_deref(),
         "instance_id query parameter is required",
     )?;
-    let instance = state.instances().get(&instance_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "instance not found" })),
-        )
-    })?;
-    let mods_dir = state.instances().game_dir(&instance.id).join("mods");
     let snapshots = state
-        .performance()
-        .list_rollback_snapshots_async(&mods_dir)
+        .inspect_managed_instance(&instance_id, None)
         .await
-        .map_err(performance_install_error)?
+        .map_err(internal_install_error)?
+        .rollback_snapshots
         .into_iter()
         .map(performance_rollback_snapshot_summary)
         .collect();
@@ -114,7 +105,6 @@ pub(super) async fn execute_performance_operation(
     state: &AppState,
     operation: &PerformanceOperation,
 ) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
-    let performance = state.performance().clone();
     let instance = state
         .instances()
         .get(&operation.instance_id)
@@ -124,17 +114,20 @@ pub(super) async fn execute_performance_operation(
                 Json(serde_json::json!({ "error": "instance not found" })),
             )
         })?;
-    let mods_dir = state.instances().game_dir(&instance.id).join("mods");
+    let admitted = state
+        .admit_managed_instance(&instance.id, true)
+        .await
+        .map_err(managed_admission_error)?;
 
     if matches!(operation.action, PerformanceInstallAction::Rollback) {
-        return execute_performance_rollback(state, &performance, &mods_dir, operation).await;
+        return execute_performance_rollback(state, &admitted, operation).await;
     }
 
     let mode = resolve_instance_mode(state, &instance, operation.mode.as_deref())?;
     if matches!(operation.action, PerformanceInstallAction::Remove)
         || !matches!(mode, PerformanceMode::Managed)
     {
-        return execute_performance_remove(state, &performance, &mods_dir, operation).await;
+        return execute_performance_remove(state, &admitted, operation).await;
     }
 
     let (game_version, loader) = resolve_instance_version_target(
@@ -143,16 +136,7 @@ pub(super) async fn execute_performance_operation(
         operation.game_version.as_deref(),
         operation.loader.as_deref(),
     )?;
-    execute_performance_install(
-        state,
-        &performance,
-        &mods_dir,
-        operation,
-        mode,
-        game_version,
-        loader,
-    )
-    .await
+    execute_performance_install(state, &admitted, operation, mode, game_version, loader).await
 }
 
 pub(super) async fn performance_operation_journal_identity(
@@ -168,11 +152,14 @@ pub(super) async fn performance_operation_journal_identity(
                 Json(serde_json::json!({ "error": "instance not found" })),
             )
         })?;
-    let mods_dir = state.instances().game_dir(&instance.id).join("mods");
+    let admitted = state
+        .admit_managed_instance(&instance.id, false)
+        .await
+        .map_err(managed_admission_error)?;
 
     if matches!(operation.action, PerformanceInstallAction::Rollback) {
         return Ok(
-            match rollback_preflight(&mods_dir, operation.rollback_id.as_deref()).await {
+            match rollback_preflight(&admitted, operation.rollback_id.as_deref()).await {
                 Ok((target_id, rollback)) => PerformanceJournalIdentity {
                     action: PerformanceInstallAction::Rollback,
                     target_id,
@@ -191,7 +178,7 @@ pub(super) async fn performance_operation_journal_identity(
     if matches!(operation.action, PerformanceInstallAction::Remove)
         || !matches!(mode, PerformanceMode::Managed)
     {
-        return Ok(match preflight_current_performance_state(&mods_dir).await {
+        return Ok(match preflight_current_performance_state(&admitted).await {
             Ok(current) => PerformanceJournalIdentity {
                 action: PerformanceInstallAction::Remove,
                 target_id: current
@@ -219,9 +206,13 @@ pub(super) async fn performance_operation_journal_identity(
         loader,
         mode,
         hardware: state.performance().hardware(),
-        installed_mods: installed_mod_evidence_from_mods_dir_async(&mods_dir).await,
+        installed_mods: admitted
+            .inspect(None)
+            .await
+            .map(|inspection| inspection.installed_mod_evidence)
+            .unwrap_or_default(),
     });
-    let rollback = preflight_current_performance_state(&mods_dir)
+    let rollback = preflight_current_performance_state(&admitted)
         .await
         .map(|current| rollback_state_for_current_state(current.as_ref()))
         .unwrap_or(RollbackState::Unavailable);
@@ -234,11 +225,10 @@ pub(super) async fn performance_operation_journal_identity(
 
 async fn execute_performance_rollback(
     state: &AppState,
-    performance: &crate::state::AppPerformanceStore,
-    mods_dir: &std::path::Path,
+    admitted: &AppManagedCompositionAdmission,
     operation: &PerformanceOperation,
 ) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
-    let preflight = rollback_preflight(mods_dir, operation.rollback_id.as_deref()).await;
+    let preflight = rollback_preflight(admitted, operation.rollback_id.as_deref()).await;
     let (target_id, rollback_state) = match &preflight {
         Ok((target_id, rollback_state)) => (target_id.clone(), *rollback_state),
         Err(_) => (
@@ -344,19 +334,17 @@ async fn execute_performance_rollback(
     .await?;
 
     let result = async {
-        let restored_state =
-            if let Some(rollback_id) = optional_value(operation.rollback_id.as_deref()) {
-                performance
-                    .rollback_managed_snapshot_async(mods_dir, &rollback_id)
-                    .await
-                    .map_err(performance_install_error)?
-            } else {
-                performance
-                    .rollback_managed_async(mods_dir)
-                    .await
-                    .map_err(performance_install_error)?
-            };
-        let (health, warnings) = derive_health_async(Some(&restored_state), None, mods_dir).await;
+        let rollback_id = optional_value(operation.rollback_id.as_deref());
+        let restored_state = admitted
+            .rollback_managed(rollback_id.as_deref())
+            .await
+            .map_err(managed_mutation_error)?;
+        let inspection = admitted
+            .inspect(None)
+            .await
+            .map_err(managed_mutation_error)?;
+        let health = inspection.health;
+        let warnings = inspection.warnings;
 
         Ok(PerformanceInstallResponse {
             active: true,
@@ -390,12 +378,11 @@ async fn execute_performance_rollback(
 
 async fn execute_performance_remove(
     state: &AppState,
-    performance: &crate::state::AppPerformanceStore,
-    mods_dir: &std::path::Path,
+    admitted: &AppManagedCompositionAdmission,
     operation: &PerformanceOperation,
 ) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
     let journal_action = PerformanceInstallAction::Remove;
-    let current_state = preflight_current_performance_state(mods_dir).await;
+    let current_state = preflight_current_performance_state(admitted).await;
     let (target_id, rollback_state) = match &current_state {
         Ok(state) => (
             state
@@ -506,11 +493,11 @@ async fn execute_performance_remove(
     )
     .await?;
 
-    let result = performance
-        .remove_managed_async(mods_dir)
+    let result = admitted
+        .remove_managed()
         .await
         .map(|_| removed_install_response())
-        .map_err(performance_install_error);
+        .map_err(managed_mutation_error);
     record_performance_operation_result(
         state,
         &operation_id,
@@ -527,8 +514,7 @@ async fn execute_performance_remove(
 
 async fn execute_performance_install(
     state: &AppState,
-    performance: &crate::state::AppPerformanceStore,
-    mods_dir: &std::path::Path,
+    admitted: &AppManagedCompositionAdmission,
     operation: &PerformanceOperation,
     mode: PerformanceMode,
     game_version: String,
@@ -539,9 +525,13 @@ async fn execute_performance_install(
         loader,
         mode,
         hardware: state.performance().hardware(),
-        installed_mods: installed_mod_evidence_from_mods_dir_async(mods_dir).await,
+        installed_mods: admitted
+            .inspect(None)
+            .await
+            .map(|inspection| inspection.installed_mod_evidence)
+            .unwrap_or_default(),
     });
-    let current_state = preflight_current_performance_state(mods_dir).await;
+    let current_state = preflight_current_performance_state(admitted).await;
     let rollback_state = match &current_state {
         Ok(state) => rollback_state_for_current_state(state.as_ref()),
         Err(_) => RollbackState::Unavailable,
@@ -649,14 +639,14 @@ async fn execute_performance_install(
     )
     .await?;
 
-    let result = match performance
-        .ensure_installed(&plan, &game_version, mods_dir)
-        .await
-    {
+    let result = match admitted.ensure_installed(&plan, &game_version).await {
         Ok(installed_state) => {
-            let (health, warnings) =
-                derive_health_async(Some(&installed_state), Some(&plan), mods_dir).await;
-            let warnings = response_warnings(&plan, warnings);
+            let inspection = admitted
+                .inspect(Some(&plan))
+                .await
+                .map_err(managed_mutation_error)?;
+            let health = inspection.health;
+            let warnings = response_warnings(&plan, inspection.warnings);
             Ok(PerformanceInstallResponse {
                 active: true,
                 status: "complete".to_string(),
@@ -672,7 +662,7 @@ async fn execute_performance_install(
                 warnings,
             })
         }
-        Err(error) => Err(performance_install_error(error)),
+        Err(error) => Err(managed_mutation_error(error)),
     };
     record_performance_operation_result(
         state,
@@ -736,29 +726,41 @@ fn performance_guardian_mode(state: &AppState) -> GuardianMode {
 }
 
 async fn preflight_current_performance_state(
-    mods_dir: &std::path::Path,
+    admitted: &AppManagedCompositionAdmission,
 ) -> Result<Option<CompositionState>, (StatusCode, Json<serde_json::Value>)> {
-    load_state_async(mods_dir)
+    admitted
+        .inspect(None)
         .await
-        .map_err(|error| performance_install_error(InstallError::State(error)))
+        .map(|inspection| inspection.state)
+        .map_err(managed_mutation_error)
 }
 
 async fn rollback_preflight(
-    mods_dir: &std::path::Path,
+    admitted: &AppManagedCompositionAdmission,
     rollback_id: Option<&str>,
 ) -> Result<(String, RollbackState), (StatusCode, Json<serde_json::Value>)> {
-    let snapshot = if let Some(rollback_id) = optional_value(rollback_id) {
-        axial_performance::state::load_rollback_snapshot_by_id_async(mods_dir, &rollback_id)
-            .await
-            .map_err(|error| performance_install_error(InstallError::State(error)))?
-    } else {
-        axial_performance::state::load_rollback_snapshot_async(mods_dir)
-            .await
-            .map_err(|error| performance_install_error(InstallError::State(error)))?
-    };
+    let rollback_id = optional_value(rollback_id);
+    let inspection = admitted
+        .inspect(None)
+        .await
+        .map_err(managed_mutation_error)?;
+    let snapshot = rollback_id.as_deref().map_or_else(
+        || {
+            inspection
+                .rollback_snapshots
+                .iter()
+                .find(|snapshot| snapshot.latest)
+        },
+        |rollback_id| {
+            inspection
+                .rollback_snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == rollback_id)
+        },
+    );
 
     Ok(match snapshot {
-        Some(snapshot) => (snapshot.state.composition_id, RollbackState::Available),
+        Some(snapshot) => (snapshot.composition_id.clone(), RollbackState::Available),
         None => (
             "performance_rollback_snapshot".to_string(),
             RollbackState::Unavailable,
@@ -799,7 +801,7 @@ fn performance_supervision_error(
     error: GuardianPerformanceSupervisionRejection,
     phase: OperationPhase,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let status = match error {
+    let status = match &error {
         GuardianPerformanceSupervisionRejection::UnsafeOwnership
         | GuardianPerformanceSupervisionRejection::GuardianBlocked
         | GuardianPerformanceSupervisionRejection::FallbackUnavailable
@@ -859,5 +861,36 @@ pub(super) fn performance_install_error(
             })),
         ),
         error => internal_install_error(error),
+    }
+}
+
+fn managed_admission_error(
+    error: crate::state::ManagedInstanceAdmissionError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let status = match error {
+        crate::state::ManagedInstanceAdmissionError::InstanceNotFound => StatusCode::NOT_FOUND,
+        crate::state::ManagedInstanceAdmissionError::InvalidInstanceIdentity => {
+            StatusCode::BAD_REQUEST
+        }
+        crate::state::ManagedInstanceAdmissionError::ActiveSession => StatusCode::CONFLICT,
+        crate::state::ManagedInstanceAdmissionError::Owner(_) => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+}
+
+fn managed_mutation_error(
+    error: axial_performance::ManagedMutationError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        axial_performance::ManagedMutationError::Definite(error) => {
+            performance_install_error(error)
+        }
+        axial_performance::ManagedMutationError::Indeterminate(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": PERFORMANCE_INSTALL_INTERNAL_ERROR })),
+        ),
     }
 }

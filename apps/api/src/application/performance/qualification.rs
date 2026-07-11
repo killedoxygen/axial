@@ -47,12 +47,15 @@ pub(crate) async fn family_c_qualification_payload(
     }
 
     let proofs = family_c_qualification_proofs(state, &manifest);
-    let state = state.clone();
+    let managed_target = family_c_qualification_targets()[1];
+    let managed_proof = family_c_qualification_target_proof(managed_target, &manifest, &proofs);
+    let managed_install =
+        family_c_qualification_managed_install_evidence(state, managed_target, managed_proof).await;
     tokio::task::spawn_blocking(move || {
         family_c_qualification_manifest_payload(
-            Some(&state),
             &manifest,
             &proofs,
+            Some(&managed_install),
             [Vec::new(), Vec::new()],
             true,
         )
@@ -64,9 +67,9 @@ pub(crate) async fn family_c_qualification_payload(
 pub(crate) fn family_c_qualification_preview_payload() -> Result<Value, (StatusCode, Json<Value>)> {
     let manifest = family_c_qualification_preview_manifest()?;
     let mut payload = family_c_qualification_manifest_payload(
-        None,
         &manifest,
         &[],
+        None,
         [
             vec!["suite_manifest_missing"],
             vec!["suite_manifest_missing", "managed_comparison_missing"],
@@ -118,9 +121,9 @@ fn family_c_qualification_preview_manifest()
 }
 
 fn family_c_qualification_manifest_payload(
-    state: Option<&AppState>,
     manifest: &crate::state::benchmark_suites::BenchmarkSuiteManifest,
     proofs: &[crate::state::launch_reports::LaunchProofRecord],
+    managed_install: Option<&FamilyCManagedInstallEvidence>,
     extra_missing: [Vec<&'static str>; 2],
     suite_present: bool,
 ) -> Value {
@@ -128,19 +131,19 @@ fn family_c_qualification_manifest_payload(
     let [baseline_extra_missing, managed_extra_missing] = extra_missing;
     let baseline_proof = family_c_qualification_target_proof(baseline_target, manifest, proofs);
     let baseline = family_c_qualification_target_payload(
-        state,
         baseline_target,
         manifest,
         proofs,
         baseline_proof,
+        managed_install,
         &baseline_extra_missing,
     );
     let managed = family_c_qualification_target_payload(
-        state,
         managed_target,
         manifest,
         proofs,
         baseline_proof,
+        managed_install,
         &managed_extra_missing,
     );
     let status = if family_c_qualification_target_ready(&baseline)
@@ -474,11 +477,11 @@ fn family_c_qualification_proofs(
 }
 
 fn family_c_qualification_target_payload(
-    state: Option<&AppState>,
     target: FamilyCQualificationTarget,
     manifest: &crate::state::benchmark_suites::BenchmarkSuiteManifest,
     proofs: &[crate::state::launch_reports::LaunchProofRecord],
     baseline_proof: Option<&crate::state::launch_reports::LaunchProofRecord>,
+    managed_install: Option<&FamilyCManagedInstallEvidence>,
     extra_missing: &[&'static str],
 ) -> Value {
     let mut missing = Vec::new();
@@ -600,7 +603,12 @@ fn family_c_qualification_target_payload(
         None => missing.push("proof_missing"),
     }
 
-    let managed_install = family_c_qualification_managed_install_evidence(state, target, proof);
+    let managed_install = managed_install
+        .filter(|_| {
+            target.target_id == FAMILY_C_MANAGED_TARGET_ID && target.performance_mode == "managed"
+        })
+        .cloned()
+        .unwrap_or_else(|| unobserved_managed_install_evidence(target));
     missing.extend(managed_install.missing.iter().copied());
     missing.sort_unstable();
     missing.dedup();
@@ -662,8 +670,8 @@ fn family_c_qualification_target_view_model(
     })
 }
 
-fn family_c_qualification_managed_install_evidence(
-    state: Option<&AppState>,
+async fn family_c_qualification_managed_install_evidence(
+    state: &AppState,
     target: FamilyCQualificationTarget,
     proof: Option<&crate::state::launch_reports::LaunchProofRecord>,
 ) -> FamilyCManagedInstallEvidence {
@@ -687,33 +695,21 @@ fn family_c_qualification_managed_install_evidence(
             "integrity": false,
         }),
     };
-    let (Some(state), Some(proof)) = (state, proof) else {
+    let Some(proof) = proof else {
         return evidence;
     };
     let Some(instance_id) = trimmed_string(&proof.instance_id) else {
         evidence.missing.push("managed_install_state_missing");
         return evidence;
     };
-    if state.instances().get(&instance_id).is_none() {
-        evidence.missing.push("managed_install_state_missing");
-        return evidence;
-    }
-
-    let mods_dir = state.instances().game_dir(&instance_id).join("mods");
-    let composition_state = match axial_performance::load_state(&mods_dir) {
-        Ok(Some(state)) => state,
-        Ok(None) => {
-            evidence.missing.push("managed_install_state_missing");
-            return evidence;
-        }
-        Err(axial_performance::StateError::InvalidOwnership { .. }) => {
-            evidence.missing.push("managed_install_ownership_missing");
-            return evidence;
-        }
-        Err(axial_performance::StateError::InvalidIntegrity { .. }) => {
-            evidence.missing.push("managed_install_integrity_missing");
-            return evidence;
-        }
+    let composition_state = match state.inspect_managed_instance(&instance_id, None).await {
+        Ok(inspection) => match inspection.state {
+            Some(state) => state,
+            None => {
+                evidence.missing.push("managed_install_state_missing");
+                return evidence;
+            }
+        },
         Err(_) => {
             evidence.missing.push("managed_install_state_invalid");
             return evidence;
@@ -767,6 +763,30 @@ fn family_c_qualification_managed_install_evidence(
         "integrity": integrity,
     });
     evidence
+}
+
+fn unobserved_managed_install_evidence(
+    target: FamilyCQualificationTarget,
+) -> FamilyCManagedInstallEvidence {
+    if target.target_id != FAMILY_C_MANAGED_TARGET_ID || target.performance_mode != "managed" {
+        return FamilyCManagedInstallEvidence {
+            missing: Vec::new(),
+            payload: json!({ "required": false }),
+        };
+    }
+    FamilyCManagedInstallEvidence {
+        missing: Vec::new(),
+        payload: json!({
+            "required": true,
+            "present": false,
+            "composition_id": null,
+            "installed_count": 0,
+            "expected_artifacts_present": false,
+            "ownership": false,
+            "source": false,
+            "integrity": false,
+        }),
+    }
 }
 
 fn family_c_managed_expected_artifacts_present(
@@ -1050,7 +1070,7 @@ struct FamilyCQualificationTarget {
     comparison_required: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct FamilyCManagedInstallEvidence {
     missing: Vec<&'static str>,
     payload: Value,

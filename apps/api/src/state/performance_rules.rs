@@ -1,12 +1,16 @@
 use super::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
+use super::performance_managed::{
+    ManagedCompositionAdmission, ManagedCompositionAdmissionError, ManagedCompositionCloseError,
+    ManagedCompositionOwner, ManagedCompositionRetirement, managed_authority_claim_error,
+};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
     PersistenceOwnerLease, WriteUrgency,
 };
 use axial_performance::{
-    CompositionPlan, CompositionState, HardwareProfile, InstallError, PerformanceManager,
-    PerformanceRulesAuthority, PerformanceRulesStatus, ResolutionRequest, RollbackSnapshotSummary,
-    RulesRefreshError, VerifiedRemoteRules, rules_cache_path,
+    CompositionPlan, HardwareProfile, PerformanceManager, PerformanceRulesAuthority,
+    PerformanceRulesStatus, ResolutionRequest, RulesRefreshError, VerifiedRemoteRules,
+    rules_cache_path,
 };
 use std::io;
 use std::path::Path;
@@ -60,17 +64,24 @@ pub struct AppPerformanceStore {
     mutation_gate: Arc<AsyncMutex<()>>,
     closed: AtomicBool,
     persistence: RulesPersistence,
+    managed: ManagedCompositionOwner,
 }
 
 impl AppPerformanceStore {
     pub(crate) fn claim(
         manager: Arc<PerformanceManager>,
         config_dir: &Path,
+        instances_root: &Path,
     ) -> Result<Self, RulesRefreshError> {
         let authority = manager
             .claim_rules_authority(config_dir)
             .map_err(RulesRefreshError::Cache)?;
         let mutation_allowed = authority.mutation_allowed();
+        let managed = ManagedCompositionOwner::claim(
+            manager
+                .claim_managed_authority(instances_root)
+                .map_err(managed_authority_claim_error)?,
+        );
         Ok(Self {
             manager,
             authority,
@@ -81,6 +92,7 @@ impl AppPerformanceStore {
             mutation_gate: Arc::new(AsyncMutex::new(())),
             closed: AtomicBool::new(false),
             persistence: RulesPersistence::claim(config_dir)?,
+            managed,
         })
     }
 
@@ -94,6 +106,11 @@ impl AppPerformanceStore {
             .claim_rules_authority(config_dir)
             .map_err(RulesRefreshError::Cache)?;
         let mutation_allowed = authority.mutation_allowed();
+        let managed = ManagedCompositionOwner::claim(
+            manager
+                .claim_managed_authority(&config_dir.join("instances"))
+                .map_err(managed_authority_claim_error)?,
+        );
         Ok(Self {
             manager,
             authority,
@@ -104,6 +121,7 @@ impl AppPerformanceStore {
             mutation_gate: Arc::new(AsyncMutex::new(())),
             closed: AtomicBool::new(false),
             persistence: RulesPersistence::claim_with_coordinator(config_dir, coordinator)?,
+            managed,
         })
     }
 
@@ -123,45 +141,22 @@ impl AppPerformanceStore {
         self.manager.hardware()
     }
 
-    pub async fn list_rollback_snapshots_async(
+    pub(crate) async fn admit_managed(
         &self,
-        instance_mods_dir: &Path,
-    ) -> Result<Vec<RollbackSnapshotSummary>, InstallError> {
-        self.manager
-            .list_rollback_snapshots_async(instance_mods_dir)
-            .await
+        instance_id: &str,
+    ) -> Result<ManagedCompositionAdmission, ManagedCompositionAdmissionError> {
+        self.managed.admit(instance_id).await
     }
 
-    pub async fn rollback_managed_async(
-        &self,
-        instance_mods_dir: &Path,
-    ) -> Result<CompositionState, InstallError> {
-        self.manager.rollback_managed_async(instance_mods_dir).await
+    pub(crate) async fn close_managed(&self) -> Result<(), ManagedCompositionCloseError> {
+        self.managed.close().await
     }
 
-    pub async fn rollback_managed_snapshot_async(
+    pub(crate) async fn retire_managed(
         &self,
-        instance_mods_dir: &Path,
-        snapshot_id: &str,
-    ) -> Result<CompositionState, InstallError> {
-        self.manager
-            .rollback_managed_snapshot_async(instance_mods_dir, snapshot_id)
-            .await
-    }
-
-    pub async fn remove_managed_async(&self, instance_mods_dir: &Path) -> Result<(), InstallError> {
-        self.manager.remove_managed_async(instance_mods_dir).await
-    }
-
-    pub async fn ensure_installed(
-        &self,
-        plan: &CompositionPlan,
-        game_version: &str,
-        instance_mods_dir: &Path,
-    ) -> Result<CompositionState, InstallError> {
-        self.manager
-            .ensure_installed(plan, game_version, instance_mods_dir)
-            .await
+        instance_id: &str,
+    ) -> Result<ManagedCompositionRetirement, ManagedCompositionAdmissionError> {
+        self.managed.retire(instance_id).await
     }
 
     pub(crate) async fn acquire_refresh(&self) -> Result<OwnedMutexGuard<()>, RulesRefreshError> {
