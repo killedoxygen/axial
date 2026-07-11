@@ -27,6 +27,22 @@ function displayReleaseVersion(version: string): string {
   return version.startsWith('v') || version.startsWith('V') ? version : `v${version}`;
 }
 
+function displayReleaseChannel(version: string): string {
+  const prerelease = version.replace(/^[vV]/, '').split('-', 2)[1]?.split('.', 1)[0];
+  switch (prerelease) {
+    case 'dev':
+      return 'Development';
+    case 'alpha':
+      return 'Alpha';
+    case 'beta':
+      return 'Beta';
+    case 'rc':
+      return 'Release candidate';
+    default:
+      return prerelease ? 'Prerelease' : 'Stable';
+  }
+}
+
 async function openHomepage(): Promise<void> {
   try {
     await openExternalURL('https://github.com/mateoltd/axial');
@@ -45,6 +61,7 @@ export function AboutSettingsSection(): JSX.Element {
   const flowBusy = flowState.phase === 'downloading' || flowState.phase === 'applying';
   const flowStaged = flowState.phase === 'ready' || flowState.phase === 'restart-pending';
   const latestVersion = flowState.version || info?.latest_version || appVersion.value;
+  const releaseChannel = displayReleaseChannel(appVersion.value);
   const status = flowBusy
     ? flowState.phase === 'applying'
       ? `Installing ${displayReleaseVersion(latestVersion)}...`
@@ -57,7 +74,7 @@ export function AboutSettingsSection(): JSX.Element {
         ? 'Checking for updates...'
         : info
           ? info.available
-            ? `Latest release: ${displayReleaseVersion(latestVersion)}`
+            ? `${displayReleaseChannel(latestVersion)} update available: ${displayReleaseVersion(info.current_version)} → ${displayReleaseVersion(latestVersion)}`
             : `Current release: ${displayReleaseVersion(info.current_version)}`
           : 'Updates have not been checked yet.';
   const visibleUpdate = hasVisibleUpdate() && !flowBusy && !flowStaged;
@@ -72,6 +89,7 @@ export function AboutSettingsSection(): JSX.Element {
   return (
     <SettingsSection>
       <SettingRow title="Axial" description={`Version ${appVersion.value}. A focused Minecraft launcher.`}>
+        <div style={{ color: 'var(--text-mute)', fontSize: 12 }}>Channel: {releaseChannel}</div>
         <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <Button variant="secondary" icon="globe" onClick={() => void openHomepage()}>
             Homepage
