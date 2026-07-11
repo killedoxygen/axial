@@ -19,6 +19,8 @@ pub mod preflight;
 pub mod repair_plan;
 pub mod state_evidence;
 
+#[cfg(test)]
+mod decision_snapshot;
 mod diagnosis;
 mod facts;
 mod inference_graph;

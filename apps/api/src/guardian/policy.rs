@@ -1238,99 +1238,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn graph_backed_policy_decisions_remain_stable() {
-        let runtime_repair = graph_backed_diagnosis(
-            GuardianFactId::ManagedRuntimeReadyMarkerMissing,
-            GuardianDomain::Runtime,
-            OperationPhase::Preparing,
-            OwnershipClass::LauncherManaged,
-        );
-        assert_eq!(
-            decide_guardian_policy(
-                &graph_safety_case(GuardianMode::Managed, runtime_repair),
-                GuardianPolicyContext::current_operation(),
-            )
-            .kind,
-            GuardianActionKind::Repair
-        );
-
-        let jvm_parse = graph_backed_diagnosis(
-            GuardianFactId::JvmArgsParseFailed,
-            GuardianDomain::Jvm,
-            OperationPhase::Validating,
-            OwnershipClass::UserOwned,
-        );
-        assert_eq!(
-            decide_guardian_policy(
-                &graph_safety_case(GuardianMode::Managed, jvm_parse.clone()),
-                GuardianPolicyContext::current_operation(),
-            )
-            .kind,
-            GuardianActionKind::Strip
-        );
-        assert_eq!(
-            decide_guardian_policy(
-                &graph_safety_case(GuardianMode::Custom, jvm_parse.clone()),
-                GuardianPolicyContext::current_operation().with_explicit_user_intent(),
-            )
-            .kind,
-            GuardianActionKind::AskUser
-        );
-        assert_eq!(
-            decide_guardian_policy(
-                &graph_safety_case(GuardianMode::Disabled, jvm_parse),
-                GuardianPolicyContext::current_operation(),
-            )
-            .kind,
-            GuardianActionKind::Block
-        );
-
-        let provider_retry = graph_backed_diagnosis(
-            GuardianFactId::DownloadProviderUnavailable,
-            GuardianDomain::Download,
-            OperationPhase::Downloading,
-            OwnershipClass::ExternalProviderDerived,
-        );
-        assert_eq!(
-            decide_guardian_policy(
-                &graph_safety_case(GuardianMode::Managed, provider_retry),
-                GuardianPolicyContext::current_operation().with_suppression(),
-            )
-            .kind,
-            GuardianActionKind::Block
-        );
-
-        let user_owned_artifact = graph_backed_diagnosis(
-            GuardianFactId::ArtifactChecksumMismatch,
-            GuardianDomain::Install,
-            OperationPhase::Downloading,
-            OwnershipClass::UserOwned,
-        );
-        assert_eq!(
-            decide_guardian_policy(
-                &graph_safety_case(GuardianMode::Managed, user_owned_artifact),
-                GuardianPolicyContext::current_operation(),
-            )
-            .kind,
-            GuardianActionKind::Block
-        );
-    }
-
     fn safety_case(mode: GuardianMode, diagnosis: Diagnosis) -> SafetyCase {
         SafetyCase {
             operation_id: None,
             mode,
             phase: OperationPhase::Preparing,
-            diagnoses: vec![diagnosis],
-        }
-    }
-
-    fn graph_safety_case(mode: GuardianMode, diagnosis: Diagnosis) -> SafetyCase {
-        SafetyCase {
-            operation_id: None,
-            mode,
-            phase: diagnosis.phase,
             diagnoses: vec![diagnosis],
         }
     }
