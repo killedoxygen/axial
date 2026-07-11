@@ -778,6 +778,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_coordinator_rejects_unfingerprintable_intent_without_side_effects() {
+        let root = unique_test_dir("runner-recovery-coordinator-rejected");
+        let state = test_app_state(&root);
+        let session_id = "runner-recovery-coordinator-rejected";
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let mut events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe to session events");
+        let mut intent = test_launch_intent(&root, session_id);
+        intent.target_version_id = "/invalid/version".to_string();
+        let mut recovery_attempts = 0;
+        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
+        let original_guardian = guardian.clone();
+
+        let outcome = handle_recovery_directive(RecoveryDirectiveRequest {
+            state: &state,
+            session_id,
+            intent: &intent,
+            directive: test_recovery_directive(GuardianLaunchRecoveryKind::StripRawJvmArgs),
+            mode: crate::guardian::GuardianMode::Managed,
+            failure_class: LaunchFailureClass::JvmUnsupportedOption,
+            recovery_attempts: &mut recovery_attempts,
+            max_recovery_attempts: 3,
+            guardian: &mut guardian,
+        })
+        .await
+        .expect("reject invalid recovery intent without a journal error");
+
+        assert!(matches!(outcome, RecoveryDirectiveOutcome::Rejected));
+        assert_eq!(recovery_attempts, 1);
+        assert_eq!(guardian, original_guardian);
+        assert!(state.journals().list().is_empty());
+        assert!(state.failure_memory().list().is_empty());
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn recovery_coordinator_returns_and_emits_suppression_outcome() {
+        let root = unique_test_dir("runner-recovery-coordinator-suppressed");
+        let state = test_app_state(&root);
+        let session_id = "runner-recovery-coordinator-suppressed";
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let intent = test_launch_intent(&root, session_id);
+        let failed_plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
+        record_guardian_launch_recovery_attempt(&state, session_id, &failed_plan)
+            .await
+            .expect("persist initial recovery attempt");
+        record_failed_self_healing_if_any(
+            &state,
+            session_id,
+            Some(&failed_plan),
+            LaunchFailureClass::JvmUnsupportedOption,
+        )
+        .await
+        .expect("persist failed recovery attempt");
+        assert_eq!(state.journals().list().len(), 1);
+
+        let mut events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe to session events");
+        let expected = suppressed_launch_recovery_outcome(&failed_plan);
+        let mut recovery_attempts = 0;
+        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
+
+        let outcome = handle_recovery_directive(RecoveryDirectiveRequest {
+            state: &state,
+            session_id,
+            intent: &intent,
+            directive: test_recovery_directive(GuardianLaunchRecoveryKind::StripRawJvmArgs),
+            mode: crate::guardian::GuardianMode::Managed,
+            failure_class: LaunchFailureClass::JvmUnsupportedOption,
+            recovery_attempts: &mut recovery_attempts,
+            max_recovery_attempts: 3,
+            guardian: &mut guardian,
+        })
+        .await
+        .expect("coordinate suppressed recovery");
+
+        let RecoveryDirectiveOutcome::Suppressed(returned) = outcome else {
+            panic!("expected suppressed recovery outcome");
+        };
+        assert_eq!(returned, expected);
+        assert_eq!(recovery_attempts, 1);
+        assert_eq!(guardian.decision, GuardianDecision::Blocked);
+        assert_eq!(
+            guardian.message.as_deref(),
+            Some("Guardian blocked an unsafe launch setup.")
+        );
+        assert!(
+            guardian
+                .details
+                .iter()
+                .any(|detail| detail == &expected.details[0])
+        );
+        assert!(guardian.guidance.iter().any(|detail| {
+            detail == "Review the latest game log or change the affected launch setting before retrying."
+        }));
+        let log = match events.try_recv().expect("suppression recovery log") {
+            axial_launcher::LaunchEvent::Log(log) => log,
+            event => panic!("expected suppression recovery log, got {event:?}"),
+        };
+        assert_eq!(log.source, "system");
+        assert_eq!(log.text, expected.summary);
+        assert_eq!(state.journals().list().len(), 2);
+        assert!(state.journals().list().iter().any(|journal| {
+            journal.status == OperationStatus::Blocked
+                && journal.outcome == Some(OperationOutcome::Suppressed)
+        }));
+        let memory = state.failure_memory().list();
+        assert_eq!(memory.len(), 1);
+        assert_eq!(
+            memory[0].last_action_outcome,
+            Some(FailureMemoryActionOutcome::Suppressed)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn launch_recovery_memory_records_redacted_attempt_failure_and_suppression() {
         let root = unique_test_dir("runner-launch-recovery-memory");
         let state = test_app_state(&root);
@@ -1254,7 +1392,29 @@ mod tests {
         intent: &axial_launcher::LaunchIntent,
         kind: GuardianLaunchRecoveryKind,
     ) -> GuardianLaunchRecoveryPlan {
-        let directive = match kind {
+        let directive = test_recovery_directive(kind);
+        plan_guardian_launch_recovery_directive(
+            intent,
+            directive,
+            crate::guardian::GuardianMode::Managed,
+            match kind {
+                GuardianLaunchRecoveryKind::SwitchManagedRuntime => {
+                    LaunchFailureClass::JavaRuntimeMismatch
+                }
+                GuardianLaunchRecoveryKind::StripRawJvmArgs
+                | GuardianLaunchRecoveryKind::DowngradePreset
+                | GuardianLaunchRecoveryKind::DisableCustomGc => {
+                    LaunchFailureClass::JvmUnsupportedOption
+                }
+            },
+        )
+        .expect("recovery plan")
+    }
+
+    fn test_recovery_directive(
+        kind: GuardianLaunchRecoveryKind,
+    ) -> GuardianLaunchRecoveryDirective {
+        match kind {
             GuardianLaunchRecoveryKind::SwitchManagedRuntime => GuardianLaunchRecoveryDirective {
                 kind,
                 effect: GuardianLaunchRecoveryEffect::ForceManagedRuntime,
@@ -1280,23 +1440,7 @@ mod tests {
                 description: "Automatic retry: disabled custom GC flags after startup failure"
                     .to_string(),
             },
-        };
-        plan_guardian_launch_recovery_directive(
-            intent,
-            directive,
-            crate::guardian::GuardianMode::Managed,
-            match kind {
-                GuardianLaunchRecoveryKind::SwitchManagedRuntime => {
-                    LaunchFailureClass::JavaRuntimeMismatch
-                }
-                GuardianLaunchRecoveryKind::StripRawJvmArgs
-                | GuardianLaunchRecoveryKind::DowngradePreset
-                | GuardianLaunchRecoveryKind::DisableCustomGc => {
-                    LaunchFailureClass::JvmUnsupportedOption
-                }
-            },
-        )
-        .expect("recovery plan")
+        }
     }
 
     fn test_app_state(root: &Path) -> AppState {
