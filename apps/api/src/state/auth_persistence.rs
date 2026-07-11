@@ -18,6 +18,8 @@ const AUTH_SNAPSHOT_CHUNK_USER_PREFIX: &str = "minecraft-auth-v3";
 const AUTH_SNAPSHOT_HEAD_SCHEMA: &str = "axial.auth.snapshot.head";
 const AUTH_SNAPSHOT_HEAD_VERSION: u8 = 1;
 const AUTH_SNAPSHOT_CHUNK_SLOT_COUNT: usize = 2;
+const AUTH_PERSISTENCE_LOCK_INVARIANT: &str =
+    "secure auth cleanup lock poisoned; persisted credential cleanup ownership may diverge";
 
 pub(crate) trait AuthSnapshotPersistence: Send + Sync {
     fn load_snapshot(&self) -> Result<Option<PersistedAuthSnapshot>, AuthPersistenceError>;
@@ -487,7 +489,7 @@ impl SecureAuthSnapshotPersistence {
     {
         self.cleanup
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect(AUTH_PERSISTENCE_LOCK_INVARIANT)
             .extend(users);
     }
 
@@ -507,7 +509,7 @@ impl SecureAuthSnapshotPersistence {
         let users = self
             .cleanup
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect(AUTH_PERSISTENCE_LOCK_INVARIANT)
             .iter()
             .cloned()
             .collect::<Vec<_>>();
@@ -516,7 +518,7 @@ impl SecureAuthSnapshotPersistence {
             if self.backend.delete(&user).is_ok() {
                 self.cleanup
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .expect(AUTH_PERSISTENCE_LOCK_INVARIANT)
                     .remove(&user);
             } else {
                 failed = true;
@@ -970,6 +972,30 @@ mod tests {
             restarted.load_snapshot().expect("reload live snapshot"),
             Some(committed)
         );
+    }
+
+    #[test]
+    fn poisoned_secure_auth_cleanup_lock_panics_before_deleting_credentials() {
+        let backend = Arc::new(MockCredentialBackend::default());
+        let store = secure_store(backend.clone());
+        let stale_user = SecureAuthSnapshotPersistence::chunk_user(1, 0);
+        backend.put(&stale_user, "stale-secret");
+        store.schedule_cleanup([stale_user.clone()]);
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cleanup = store.cleanup.lock().expect("cleanup lock");
+            panic!("inject secure auth cleanup lock poison");
+        }));
+        assert!(poison.is_err());
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.flush()))
+            .expect_err("poisoned cleanup must panic");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("string panic payload");
+        assert!(message.contains(AUTH_PERSISTENCE_LOCK_INVARIANT));
+        assert_eq!(backend.entry(&stale_user).as_deref(), Some("stale-secret"));
     }
 
     #[test]
