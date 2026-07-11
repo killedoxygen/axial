@@ -24,6 +24,8 @@ mod decision_snapshot;
 mod diagnosis;
 mod facts;
 mod inference_graph;
+#[cfg(test)]
+mod launch_decision_snapshot;
 mod model;
 mod repair_terminal;
 

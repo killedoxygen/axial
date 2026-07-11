@@ -91,6 +91,13 @@ pub fn guardian_prepare_failure_outcome(
 pub fn guardian_prelaunch_preset_adjustment_directive(
     request: GuardianPresetAdjustmentRequest<'_>,
 ) -> Option<GuardianLaunchRecoveryDirective> {
+    let (_, decision) = evaluate_preset_adjustment(&request)?;
+    preset_adjustment_directive(&request, &decision)
+}
+
+fn evaluate_preset_adjustment(
+    request: &GuardianPresetAdjustmentRequest<'_>,
+) -> Option<(SafetyCase, GuardianDecision)> {
     let requested = request.requested_preset.trim();
     let effective = request.effective_preset.trim();
     if requested.is_empty() || requested == effective {
@@ -128,7 +135,16 @@ pub fn guardian_prelaunch_preset_adjustment_directive(
         &safety_case,
         policy_context(request.explicit_jvm_preset_present),
     );
+    Some((safety_case, decision))
+}
+
+fn preset_adjustment_directive(
+    request: &GuardianPresetAdjustmentRequest<'_>,
+    decision: &GuardianDecision,
+) -> Option<GuardianLaunchRecoveryDirective> {
     (decision.kind == GuardianActionKind::Downgrade).then(|| {
+        let requested = request.requested_preset.trim();
+        let effective = request.effective_preset.trim();
         let requested = safe_preset_label(requested);
         let effective = safe_preset_label(effective);
         GuardianLaunchRecoveryDirective {
@@ -141,6 +157,19 @@ pub fn guardian_prelaunch_preset_adjustment_directive(
             ),
         }
     })
+}
+
+#[cfg(test)]
+pub(super) fn preset_adjustment_snapshot(
+    request: &GuardianPresetAdjustmentRequest<'_>,
+) -> Option<(
+    SafetyCase,
+    GuardianDecision,
+    Option<GuardianLaunchRecoveryDirective>,
+)> {
+    let (safety_case, decision) = evaluate_preset_adjustment(request)?;
+    let directive = preset_adjustment_directive(request, &decision);
+    Some((safety_case, decision, directive))
 }
 
 pub fn guardian_startup_failure_outcome(
@@ -1197,70 +1226,6 @@ mod tests {
     use axial_launcher::{CrashEvidence, LaunchFailureClass};
 
     #[test]
-    fn managed_prepare_java_mismatch_returns_managed_runtime_fallback_directive() {
-        let outcome = guardian_prepare_failure_outcome(GuardianPrepareFailureRequest {
-            mode: GuardianMode::Managed,
-            failure_class: LaunchFailureClass::JavaRuntimeMismatch,
-            public_error: "Java 8 cannot launch this version.",
-            requested_java_present: true,
-            explicit_java_override_present: true,
-            explicit_jvm_args_present: false,
-            runtime_intervention_applied: false,
-            raw_jvm_args_intervention_applied: false,
-        });
-
-        let directive = outcome.directive.expect("fallback directive");
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Fallback);
-        assert_eq!(
-            directive.kind,
-            GuardianLaunchRecoveryKind::SwitchManagedRuntime
-        );
-        assert_eq!(
-            directive.effect,
-            GuardianLaunchRecoveryEffect::ForceManagedRuntime
-        );
-    }
-
-    #[test]
-    fn managed_prepare_jvm_unsupported_option_returns_strip_directive() {
-        let outcome = guardian_prepare_failure_outcome(GuardianPrepareFailureRequest {
-            mode: GuardianMode::Managed,
-            failure_class: LaunchFailureClass::JvmUnsupportedOption,
-            public_error: "Unsupported VM option.",
-            requested_java_present: false,
-            explicit_java_override_present: false,
-            explicit_jvm_args_present: true,
-            runtime_intervention_applied: false,
-            raw_jvm_args_intervention_applied: false,
-        });
-
-        let directive = outcome.directive.expect("strip directive");
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Strip);
-        assert_eq!(directive.kind, GuardianLaunchRecoveryKind::StripRawJvmArgs);
-        assert_eq!(
-            directive.effect,
-            GuardianLaunchRecoveryEffect::StripRawJvmArgs
-        );
-    }
-
-    #[test]
-    fn custom_explicit_override_does_not_return_silent_mutation_directive() {
-        let outcome = guardian_prepare_failure_outcome(GuardianPrepareFailureRequest {
-            mode: GuardianMode::Custom,
-            failure_class: LaunchFailureClass::JvmUnsupportedOption,
-            public_error: "Unsupported VM option.",
-            requested_java_present: false,
-            explicit_java_override_present: false,
-            explicit_jvm_args_present: true,
-            runtime_intervention_applied: false,
-            raw_jvm_args_intervention_applied: false,
-        });
-
-        assert!(outcome.directive.is_none());
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::AskUser);
-    }
-
-    #[test]
     fn managed_prelaunch_preset_adjustment_returns_downgrade_directive() {
         let directive = guardian_prelaunch_preset_adjustment_directive(
             super::GuardianPresetAdjustmentRequest {
@@ -1282,108 +1247,6 @@ mod tests {
         assert_eq!(
             directive.description,
             "Guardian downgraded JVM preset from \"ultra_low_latency\" to \"performance\" before launch"
-        );
-    }
-
-    #[test]
-    fn custom_prelaunch_preset_adjustment_does_not_return_silent_directive() {
-        let directive = guardian_prelaunch_preset_adjustment_directive(
-            super::GuardianPresetAdjustmentRequest {
-                mode: GuardianMode::Custom,
-                requested_preset: "ultra_low_latency",
-                effective_preset: "performance",
-                explicit_jvm_preset_present: true,
-            },
-        );
-
-        assert!(directive.is_none());
-    }
-
-    #[test]
-    fn startup_jvm_unsupported_option_returns_downgrade_when_conservative_preset_differs() {
-        let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
-            mode: GuardianMode::Managed,
-            observation: GuardianStartupFailureObservation::Exited {
-                failure_class: LaunchFailureClass::JvmUnsupportedOption,
-            },
-            crash_evidence: None,
-            target_version_id: "1.21.1",
-            runtime_major: 21,
-            requested_java_present: false,
-            explicit_java_override_present: false,
-            explicit_jvm_args_present: false,
-            explicit_jvm_preset_present: false,
-            startup_recovery_applied: false,
-            disable_custom_gc: false,
-            effective_preset: "ultra_low_latency",
-        });
-
-        let directive = outcome.directive.expect("downgrade directive");
-        assert_eq!(
-            outcome.guardian_decision.kind,
-            GuardianActionKind::Downgrade
-        );
-        assert_eq!(directive.kind, GuardianLaunchRecoveryKind::DowngradePreset);
-        assert_eq!(
-            directive.effect,
-            GuardianLaunchRecoveryEffect::DowngradePreset {
-                preset: "performance".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn startup_jvm_unsupported_option_returns_disable_custom_gc_when_no_downgrade_exists() {
-        let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
-            mode: GuardianMode::Managed,
-            observation: GuardianStartupFailureObservation::Exited {
-                failure_class: LaunchFailureClass::JvmUnsupportedOption,
-            },
-            crash_evidence: None,
-            target_version_id: "1.21.1",
-            runtime_major: 21,
-            requested_java_present: false,
-            explicit_java_override_present: false,
-            explicit_jvm_args_present: false,
-            explicit_jvm_preset_present: false,
-            startup_recovery_applied: false,
-            disable_custom_gc: false,
-            effective_preset: "performance",
-        });
-
-        let directive = outcome.directive.expect("disable gc directive");
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Strip);
-        assert_eq!(directive.kind, GuardianLaunchRecoveryKind::DisableCustomGc);
-        assert_eq!(
-            directive.effect,
-            GuardianLaunchRecoveryEffect::DisableCustomGc
-        );
-    }
-
-    #[test]
-    fn startup_java_runtime_mismatch_returns_managed_runtime_switch_in_managed_mode() {
-        let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
-            mode: GuardianMode::Managed,
-            observation: GuardianStartupFailureObservation::Exited {
-                failure_class: LaunchFailureClass::JavaRuntimeMismatch,
-            },
-            crash_evidence: None,
-            target_version_id: "1.21.1",
-            runtime_major: 8,
-            requested_java_present: true,
-            explicit_java_override_present: true,
-            explicit_jvm_args_present: false,
-            explicit_jvm_preset_present: false,
-            startup_recovery_applied: false,
-            disable_custom_gc: false,
-            effective_preset: "performance",
-        });
-
-        let directive = outcome.directive.expect("runtime switch directive");
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Fallback);
-        assert_eq!(
-            directive.kind,
-            GuardianLaunchRecoveryKind::SwitchManagedRuntime
         );
     }
 

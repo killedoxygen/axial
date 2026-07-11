@@ -168,10 +168,10 @@ struct ModePolicyRow {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PolicyDecisionCell {
-    decision_kind: GuardianActionKind,
-    plan_present: bool,
-    plan_integrity: bool,
+pub(super) struct PolicyDecisionCell {
+    pub(super) decision_kind: GuardianActionKind,
+    pub(super) plan_present: bool,
+    pub(super) plan_integrity: bool,
 }
 
 #[test]
@@ -358,16 +358,24 @@ fn policy_matrix(
                 .iter()
                 .map(|context| {
                     let decision = decide_guardian_policy(&safety_case, context.policy_context());
-                    PolicyDecisionCell {
-                        decision_kind: decision.kind,
-                        plan_present: decision.action_plan.is_some(),
-                        plan_integrity: decision_plan_integrity(&decision, diagnosis, mode),
-                    }
+                    decision_projection(&decision, diagnosis, mode)
                 })
                 .collect();
             ModePolicyRow { mode, contexts }
         })
         .collect()
+}
+
+pub(super) fn decision_projection(
+    decision: &super::GuardianDecision,
+    diagnosis: &Diagnosis,
+    mode: GuardianMode,
+) -> PolicyDecisionCell {
+    PolicyDecisionCell {
+        decision_kind: decision.kind,
+        plan_present: decision.action_plan.is_some(),
+        plan_integrity: decision_plan_integrity(decision, diagnosis, mode),
+    }
 }
 
 fn decision_plan_integrity(

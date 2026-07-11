@@ -1,0 +1,1491 @@
+{
+  "schema": "axial.guardian.launch_boundary_snapshot.v1",
+  "cases": [
+    {
+      "id": "prepare--auth_mode_incompatible--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "auth_mode_incompatible",
+      "diagnosis": {
+        "id": "launch_prepare_failed",
+        "domain": "Launch",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "auth_mode_incompatible"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "launch_prepare_failed"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--classpath_module_conflict--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "classpath_module_conflict",
+      "diagnosis": {
+        "id": "launch_prepare_failed",
+        "domain": "Launch",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "classpath_module_conflict"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "launch_prepare_failed"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--graphics_driver_crash--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "graphics_driver_crash",
+      "diagnosis": {
+        "id": "launch_prepare_failed",
+        "domain": "Launch",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "graphics_driver_crash"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "launch_prepare_failed"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--java-runtime-mismatch--custom-explicit",
+      "surface": "prepare",
+      "mode": "Custom",
+      "applicable": true,
+      "failure_class": "java_runtime_mismatch",
+      "diagnosis": {
+        "id": "java_runtime_major_mismatch",
+        "domain": "Runtime",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "java_major_mismatch"
+        ],
+        "candidate_actions": [
+          "Fallback",
+          "AskUser",
+          "Block"
+        ],
+        "public_reason_template": "java_runtime_major_mismatch"
+      },
+      "decision": {
+        "decision_kind": "AskUser",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--java-runtime-mismatch--managed-already-applied",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "java_runtime_mismatch",
+      "diagnosis": {
+        "id": "java_runtime_major_mismatch",
+        "domain": "Runtime",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "java_major_mismatch"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "java_runtime_major_mismatch"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--java-runtime-mismatch--managed-recover",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "java_runtime_mismatch",
+      "diagnosis": {
+        "id": "java_runtime_major_mismatch",
+        "domain": "Runtime",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "java_major_mismatch"
+        ],
+        "candidate_actions": [
+          "Fallback",
+          "AskUser",
+          "Block"
+        ],
+        "public_reason_template": "java_runtime_major_mismatch"
+      },
+      "decision": {
+        "decision_kind": "Fallback",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "directive": {
+        "kind": "SwitchManagedRuntime",
+        "effect": "ForceManagedRuntime"
+      }
+    },
+    {
+      "id": "prepare--java_runtime_mismatch--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "java_runtime_mismatch",
+      "diagnosis": {
+        "id": "java_runtime_major_mismatch",
+        "domain": "Runtime",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "java_major_mismatch"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "java_runtime_major_mismatch"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--jvm-experimental-unlock--managed-recover",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_experimental_unlock",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "jvm_arg_experimental_unlock_missing"
+        ],
+        "candidate_actions": [
+          "Strip",
+          "AskUser",
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "directive": {
+        "kind": "StripRawJvmArgs",
+        "effect": "StripRawJvmArgs"
+      }
+    },
+    {
+      "id": "prepare--jvm-option-ordering--managed-recover",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_option_ordering",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "jvm_arg_unlock_order_invalid"
+        ],
+        "candidate_actions": [
+          "Strip",
+          "AskUser",
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "directive": {
+        "kind": "StripRawJvmArgs",
+        "effect": "StripRawJvmArgs"
+      }
+    },
+    {
+      "id": "prepare--jvm-unsupported-option--custom-explicit",
+      "surface": "prepare",
+      "mode": "Custom",
+      "applicable": true,
+      "failure_class": "jvm_unsupported_option",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "jvm_arg_unsupported"
+        ],
+        "candidate_actions": [
+          "Strip",
+          "AskUser",
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "AskUser",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--jvm-unsupported-option--disabled",
+      "surface": "prepare",
+      "mode": "Disabled",
+      "applicable": true,
+      "failure_class": "jvm_unsupported_option",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "jvm_arg_unsupported"
+        ],
+        "candidate_actions": [
+          "Strip",
+          "AskUser",
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--jvm-unsupported-option--managed-already-applied",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_unsupported_option",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "jvm_arg_unsupported"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--jvm-unsupported-option--managed-recover",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_unsupported_option",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "jvm_arg_unsupported"
+        ],
+        "candidate_actions": [
+          "Strip",
+          "AskUser",
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "directive": {
+        "kind": "StripRawJvmArgs",
+        "effect": "StripRawJvmArgs"
+      }
+    },
+    {
+      "id": "prepare--jvm_experimental_unlock--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_experimental_unlock",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "jvm_arg_experimental_unlock_missing"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--jvm_option_ordering--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_option_ordering",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "jvm_arg_unlock_order_invalid"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--jvm_unsupported_option--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_unsupported_option",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "jvm_arg_unsupported"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--launcher_managed_artifact_signature--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "launcher_managed_artifact_signature",
+      "diagnosis": {
+        "id": "launch_prepare_failed",
+        "domain": "Launch",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "launcher_managed_artifact_signature_corruption"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "launch_prepare_failed"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--loader_bootstrap_failure--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "loader_bootstrap_failure",
+      "diagnosis": {
+        "id": "launch_prepare_failed",
+        "domain": "Launch",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "loader_bootstrap_failure"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "launch_prepare_failed"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--missing_dependency--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "missing_dependency",
+      "diagnosis": {
+        "id": "launch_prepare_failed",
+        "domain": "Launch",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "missing_dependency"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "launch_prepare_failed"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--mod_attributed_crash--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "mod_attributed_crash",
+      "diagnosis": {
+        "id": "launch_prepare_failed",
+        "domain": "Launch",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "mod_attributed_crash"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "launch_prepare_failed"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--mod_transformation_failure--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "mod_transformation_failure",
+      "diagnosis": {
+        "id": "launch_prepare_failed",
+        "domain": "Launch",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "mod_transformation_failure"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "launch_prepare_failed"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--out_of_memory--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "out_of_memory",
+      "diagnosis": {
+        "id": "launch_prepare_failed",
+        "domain": "Launch",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "out_of_memory"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "launch_prepare_failed"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--startup_stalled--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "startup_stalled",
+      "diagnosis": {
+        "id": "launch_prepare_failed",
+        "domain": "Launch",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "startup_window_expired"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "launch_prepare_failed"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "prepare--unknown--managed-default",
+      "surface": "prepare",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "unknown",
+      "diagnosis": {
+        "id": "launch_prepare_failed",
+        "domain": "Launch",
+        "severity": "Blocking",
+        "confidence": "Low",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "unknown_launch_failure"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "launch_prepare_failed"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "preset--custom-explicit-changed",
+      "surface": "preset",
+      "mode": "Custom",
+      "applicable": true,
+      "diagnosis": {
+        "id": "jvm_preset_adjusted",
+        "domain": "Jvm",
+        "severity": "Recoverable",
+        "confidence": "Confirmed",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "jvm_preset_compatibility_adjusted"
+        ],
+        "candidate_actions": [
+          "Downgrade",
+          "AskUser",
+          "Block"
+        ],
+        "public_reason_template": "jvm_preset_adjusted"
+      },
+      "decision": {
+        "decision_kind": "AskUser",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "preset--disabled-explicit-changed",
+      "surface": "preset",
+      "mode": "Disabled",
+      "applicable": true,
+      "diagnosis": {
+        "id": "jvm_preset_adjusted",
+        "domain": "Jvm",
+        "severity": "Recoverable",
+        "confidence": "Confirmed",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "jvm_preset_compatibility_adjusted"
+        ],
+        "candidate_actions": [
+          "Downgrade",
+          "AskUser",
+          "Block"
+        ],
+        "public_reason_template": "jvm_preset_adjusted"
+      },
+      "decision": {
+        "decision_kind": "RecordOnly",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "preset--managed-empty-requested",
+      "surface": "preset",
+      "mode": "Managed",
+      "applicable": false
+    },
+    {
+      "id": "preset--managed-explicit-changed",
+      "surface": "preset",
+      "mode": "Managed",
+      "applicable": true,
+      "diagnosis": {
+        "id": "jvm_preset_adjusted",
+        "domain": "Jvm",
+        "severity": "Recoverable",
+        "confidence": "Confirmed",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "jvm_preset_compatibility_adjusted"
+        ],
+        "candidate_actions": [
+          "Downgrade",
+          "AskUser",
+          "Block"
+        ],
+        "public_reason_template": "jvm_preset_adjusted"
+      },
+      "decision": {
+        "decision_kind": "Downgrade",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "directive": {
+        "kind": "DowngradePreset",
+        "effect": {
+          "DowngradePreset": {
+            "preset": "performance"
+          }
+        }
+      }
+    },
+    {
+      "id": "preset--managed-owned-changed",
+      "surface": "preset",
+      "mode": "Managed",
+      "applicable": true,
+      "diagnosis": {
+        "id": "jvm_preset_adjusted",
+        "domain": "Jvm",
+        "severity": "Recoverable",
+        "confidence": "Confirmed",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "jvm_preset_compatibility_adjusted"
+        ],
+        "candidate_actions": [
+          "Downgrade",
+          "AskUser",
+          "Block"
+        ],
+        "public_reason_template": "jvm_preset_adjusted"
+      },
+      "decision": {
+        "decision_kind": "Downgrade",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "directive": {
+        "kind": "DowngradePreset",
+        "effect": {
+          "DowngradePreset": {
+            "preset": "performance"
+          }
+        }
+      }
+    },
+    {
+      "id": "preset--managed-unchanged",
+      "surface": "preset",
+      "mode": "Managed",
+      "applicable": false
+    },
+    {
+      "id": "startup--exited-auth_mode_incompatible--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "auth_mode_incompatible",
+      "diagnosis": {
+        "id": "auth_mode_incompatible",
+        "domain": "Startup",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "auth_mode_incompatible"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "auth_mode_incompatible"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-classpath_module_conflict--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "classpath_module_conflict",
+      "diagnosis": {
+        "id": "classpath_module_conflict",
+        "domain": "Startup",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "classpath_module_conflict"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "classpath_module_conflict"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-graphics_driver_crash--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "graphics_driver_crash",
+      "diagnosis": {
+        "id": "graphics_driver_crash",
+        "domain": "Startup",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "graphics_driver_crash"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "graphics_driver_crash"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-java_runtime_mismatch--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "java_runtime_mismatch",
+      "diagnosis": {
+        "id": "java_runtime_major_mismatch",
+        "domain": "Runtime",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "java_major_mismatch"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "java_runtime_major_mismatch"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-jvm_experimental_unlock--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_experimental_unlock",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "jvm_arg_experimental_unlock_missing"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-jvm_option_ordering--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_option_ordering",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "jvm_arg_unlock_order_invalid"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-jvm_unsupported_option--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_unsupported_option",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "jvm_arg_unsupported"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-launcher_managed_artifact_signature--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "launcher_managed_artifact_signature",
+      "diagnosis": {
+        "id": "launcher_managed_artifact_signature_corrupt",
+        "domain": "Download",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "launcher_managed_artifact_signature_corruption"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "launcher_managed_artifact_signature_corrupt"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-loader_bootstrap_failure--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "loader_bootstrap_failure",
+      "diagnosis": {
+        "id": "loader_bootstrap_failure",
+        "domain": "Startup",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "loader_bootstrap_failure"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "loader_bootstrap_failure"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-missing_dependency--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "missing_dependency",
+      "diagnosis": {
+        "id": "missing_dependency",
+        "domain": "Startup",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "missing_dependency"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "missing_dependency"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-mod_attributed_crash--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "mod_attributed_crash",
+      "diagnosis": {
+        "id": "mod_attributed_crash",
+        "domain": "Startup",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "mod_attributed_crash"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "mod_attributed_crash"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-mod_transformation_failure--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "mod_transformation_failure",
+      "diagnosis": {
+        "id": "mod_transformation_failure",
+        "domain": "Startup",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "mod_transformation_failure"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "mod_transformation_failure"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-out_of_memory--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "out_of_memory",
+      "diagnosis": {
+        "id": "out_of_memory",
+        "domain": "Startup",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "out_of_memory"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "out_of_memory"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-startup_stalled--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "startup_stalled",
+      "diagnosis": {
+        "id": "startup_stalled",
+        "domain": "Startup",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "startup_window_expired"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "startup_stalled"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--exited-unknown--managed-default",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "unknown",
+      "diagnosis": {
+        "id": "startup_failed_unknown",
+        "domain": "Startup",
+        "severity": "Blocking",
+        "confidence": "Low",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "unknown_launch_failure"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "startup_failed_unknown"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--java-runtime-mismatch--custom-explicit",
+      "surface": "startup",
+      "mode": "Custom",
+      "applicable": true,
+      "failure_class": "java_runtime_mismatch",
+      "diagnosis": {
+        "id": "java_runtime_major_mismatch",
+        "domain": "Runtime",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "java_major_mismatch"
+        ],
+        "candidate_actions": [
+          "Fallback",
+          "Block"
+        ],
+        "public_reason_template": "java_runtime_major_mismatch"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--java-runtime-mismatch--managed-already-applied",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "java_runtime_mismatch",
+      "diagnosis": {
+        "id": "java_runtime_major_mismatch",
+        "domain": "Runtime",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "java_major_mismatch"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "java_runtime_major_mismatch"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--java-runtime-mismatch--managed-recover",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "java_runtime_mismatch",
+      "diagnosis": {
+        "id": "java_runtime_major_mismatch",
+        "domain": "Runtime",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "java_major_mismatch"
+        ],
+        "candidate_actions": [
+          "Fallback",
+          "Block"
+        ],
+        "public_reason_template": "java_runtime_major_mismatch"
+      },
+      "decision": {
+        "decision_kind": "Fallback",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "directive": {
+        "kind": "SwitchManagedRuntime",
+        "effect": "ForceManagedRuntime"
+      }
+    },
+    {
+      "id": "startup--jvm-unsupported-option--custom-explicit",
+      "surface": "startup",
+      "mode": "Custom",
+      "applicable": true,
+      "failure_class": "jvm_unsupported_option",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "jvm_arg_unsupported"
+        ],
+        "candidate_actions": [
+          "Downgrade",
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--jvm-unsupported-option--disabled",
+      "surface": "startup",
+      "mode": "Disabled",
+      "applicable": true,
+      "failure_class": "jvm_unsupported_option",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "UserOwned",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "jvm_arg_unsupported"
+        ],
+        "candidate_actions": [
+          "Downgrade",
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--jvm-unsupported-option--managed-disable-gc",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_unsupported_option",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "jvm_arg_unsupported"
+        ],
+        "candidate_actions": [
+          "Strip",
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Strip",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "directive": {
+        "kind": "DisableCustomGc",
+        "effect": "DisableCustomGc"
+      }
+    },
+    {
+      "id": "startup--jvm-unsupported-option--managed-downgrade",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_unsupported_option",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "jvm_arg_unsupported"
+        ],
+        "candidate_actions": [
+          "Downgrade",
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Downgrade",
+        "plan_present": true,
+        "plan_integrity": true
+      },
+      "directive": {
+        "kind": "DowngradePreset",
+        "effect": {
+          "DowngradePreset": {
+            "preset": "performance"
+          }
+        }
+      }
+    },
+    {
+      "id": "startup--jvm-unsupported-option--managed-gc-already-disabled",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_unsupported_option",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "jvm_arg_unsupported"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--jvm-unsupported-option--managed-recovery-already-applied",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "jvm_unsupported_option",
+      "diagnosis": {
+        "id": "jvm_arg_unsupported",
+        "domain": "Jvm",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "process_exited_before_boot",
+          "jvm_arg_unsupported"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "jvm_arg_unsupported"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    },
+    {
+      "id": "startup--stalled-observation--managed",
+      "surface": "startup",
+      "mode": "Managed",
+      "applicable": true,
+      "failure_class": "startup_stalled",
+      "diagnosis": {
+        "id": "startup_stalled",
+        "domain": "Startup",
+        "severity": "Blocking",
+        "confidence": "High",
+        "ownership": "LauncherManaged",
+        "fact_ids": [
+          "startup_window_expired"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "startup_stalled"
+      },
+      "decision": {
+        "decision_kind": "Block",
+        "plan_present": true,
+        "plan_integrity": true
+      }
+    }
+  ]
+}
