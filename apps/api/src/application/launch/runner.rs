@@ -11,12 +11,12 @@ use crate::execution::launch::{
     LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
 };
 use crate::guardian::{
-    GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryStatus, GuardianPrepareFailureRequest,
-    GuardianPresetAdjustmentRequest, GuardianStartupFailureObservation,
-    GuardianStartupFailureRequest, GuardianUserOutcome, guardian_post_boot_launch_failure_outcome,
-    guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
-    guardian_startup_failure_outcome, is_guardian_launch_crash_class,
-    record_launch_failure_observation,
+    GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryStatus, GuardianObservedLaunchFailurePhase,
+    GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
+    GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianUserOutcome,
+    guardian_observed_launch_failure_outcome, guardian_prelaunch_preset_adjustment_directive,
+    guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
+    is_guardian_launch_crash_class, record_launch_failure_observation,
 };
 use crate::logging::{append_trace, timestamp_utc};
 use crate::observability::telemetry::{
@@ -225,44 +225,36 @@ async fn own_terminal_observation(
             .as_ref()
             .map(|failure| failure.class)
             .filter(|failure_class| is_guardian_launch_crash_class(*failure_class));
-        if record.boot_completed_at_ms.is_some()
-            && record
-                .outcome
-                .as_ref()
-                .is_some_and(|outcome| outcome.reason == LaunchSessionExitReason::CrashedAfterBoot)
-        {
-            if let Some(failure_class) = accepted_failure_class {
-                settle_post_boot_launch_failure(
-                    &state,
-                    &session_id,
-                    &instance_id,
-                    guardian_mode,
-                    failure_class,
-                    &launched_at,
-                    proof_context,
-                    record,
-                    guardian,
-                )
-                .await;
-            } else {
-                persist_post_boot_terminal_proof(
-                    &state,
-                    &session_id,
-                    &launched_at,
-                    proof_context,
-                    record,
-                )
-                .await;
+        let observed_phase = match (
+            record.boot_completed_at_ms,
+            record.outcome.as_ref().map(|outcome| outcome.reason),
+        ) {
+            (None, Some(LaunchSessionExitReason::StartupFailed)) => {
+                Some(GuardianObservedLaunchFailurePhase::BeforeBoot)
             }
-        } else {
-            persist_post_boot_terminal_proof(
+            (Some(_), Some(LaunchSessionExitReason::CrashedAfterBoot)) => {
+                Some(GuardianObservedLaunchFailurePhase::AfterBoot)
+            }
+            _ => None,
+        };
+        if let (Some(failure_class), Some(observed_phase)) =
+            (accepted_failure_class, observed_phase)
+        {
+            settle_observed_launch_failure(
                 &state,
                 &session_id,
+                &instance_id,
+                guardian_mode,
+                failure_class,
+                observed_phase,
                 &launched_at,
                 proof_context,
                 record,
+                guardian,
             )
             .await;
+        } else {
+            persist_terminal_proof(&state, &session_id, &launched_at, proof_context, record).await;
         }
     }
 
@@ -272,7 +264,7 @@ async fn own_terminal_observation(
         .await;
 }
 
-async fn persist_post_boot_terminal_proof(
+async fn persist_terminal_proof(
     state: &AppState,
     session_id: &str,
     launched_at: &str,
@@ -297,33 +289,40 @@ async fn persist_post_boot_terminal_proof(
         .await
         .is_err()
     {
-        tracing::warn!(
-            session_id,
-            "failed to persist post-boot terminal launch proof"
-        );
+        tracing::warn!(session_id, "failed to persist terminal launch proof");
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn settle_post_boot_launch_failure(
+async fn settle_observed_launch_failure(
     state: &AppState,
     session_id: &str,
     instance_id: &str,
     guardian_mode: crate::guardian::GuardianMode,
     failure_class: LaunchFailureClass,
+    observed_phase: GuardianObservedLaunchFailurePhase,
     launched_at: &str,
     proof_context: LaunchProofContext,
     record: crate::state::LaunchSessionRecord,
     mut guardian: GuardianSummary,
 ) {
-    let Some(user_outcome) =
-        guardian_post_boot_launch_failure_outcome(failure_class, record.crash_evidence.as_ref())
-    else {
-        persist_post_boot_terminal_proof(state, session_id, launched_at, proof_context, record)
-            .await;
+    let Some(user_outcome) = guardian_observed_launch_failure_outcome(
+        failure_class,
+        record.crash_evidence.as_ref(),
+        observed_phase,
+    ) else {
+        persist_terminal_proof(state, session_id, launched_at, proof_context, record).await;
         return;
     };
-    guardian.decision = axial_launcher::GuardianDecision::Warned;
+    let (guardian_decision, terminal_state) = match observed_phase {
+        GuardianObservedLaunchFailurePhase::BeforeBoot => {
+            (axial_launcher::GuardianDecision::Blocked, "failed")
+        }
+        GuardianObservedLaunchFailurePhase::AfterBoot => {
+            (axial_launcher::GuardianDecision::Warned, "exited")
+        }
+    };
+    guardian.decision = guardian_decision;
     guardian.message = Some(user_outcome.summary.clone());
     for detail in &user_outcome.details {
         push_unique_guardian_detail(&mut guardian.details, detail);
@@ -337,7 +336,7 @@ async fn settle_post_boot_launch_failure(
         .emit_status(
             session_id,
             LaunchStatusEvent {
-                state: "exited".to_string(),
+                state: terminal_state.to_string(),
                 benchmark: None,
                 pid: None,
                 exit_code: record.exit_code,
@@ -365,7 +364,7 @@ async fn settle_post_boot_launch_failure(
         tracing::warn!(
             error_kind = error.class(),
             failure_class = failure_class.as_str(),
-            "failed to record post-boot launch failure observation"
+            "failed to record observed launch failure"
         );
     }
 
@@ -385,7 +384,7 @@ async fn settle_post_boot_launch_failure(
     {
         tracing::warn!(
             failure_class = failure_class.as_str(),
-            "failed to persist post-boot launch failure proof"
+            "failed to persist observed launch failure proof"
         );
     }
 }
@@ -1582,7 +1581,7 @@ mod tests {
         AppConfig, AppPaths, ConfigStore, Instance, InstanceRegistrySnapshot, InstanceStore,
     };
     use axial_launcher::{
-        LaunchAuthContext, LaunchGuardianContext, LaunchIntent, LaunchSessionRecord,
+        CrashEvidence, LaunchAuthContext, LaunchGuardianContext, LaunchIntent, LaunchSessionRecord,
         OverrideOrigin, SessionId,
     };
     use axial_performance::PerformanceManager;
@@ -2153,6 +2152,124 @@ mod tests {
             Some(0)
         );
         assert!(state.failure_memory().list().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn accepted_startup_failure_settles_copy_memory_proof_and_hold() {
+        let root = unique_test_dir("accepted-startup-failure-terminal-observer");
+        let state = test_app_state(&root);
+        let session_id = "accepted-startup-failure-terminal-observer";
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert observed startup failure session");
+        let events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe observed startup failure");
+        let (handoff_tx, handoff_rx) = tokio::sync::oneshot::channel();
+        let task = test_recovery_launch_task(session_id, &root);
+        let proof_context = LaunchProofContext::from_intent(&task.intent);
+        let observer_state = state.clone();
+        let observer = tokio::spawn(own_terminal_observation(
+            observer_state,
+            session_id.to_string(),
+            "instance".to_string(),
+            GuardianMode::Managed,
+            "2026-01-01T00:00:00.000Z".to_string(),
+            proof_context,
+            events,
+            handoff_rx,
+        ));
+        assert!(
+            handoff_tx
+                .send(TerminalObservationHandoff::Observe {
+                    guardian: GuardianSummary::new(axial_launcher::GuardianMode::Managed),
+                })
+                .is_ok(),
+            "handoff observed startup failure"
+        );
+        let crash_evidence: CrashEvidence = serde_json::from_value(serde_json::json!({
+            "source": "minecraft_crash_report",
+            "truncated": false,
+            "exception_class": "net.minecraftforge.fml.common.MissingModsException",
+            "suspected_mods": [],
+            "names_out_of_memory": false
+        }))
+        .expect("typed missing dependency evidence");
+        state
+            .sessions()
+            .emit_status(
+                session_id,
+                LaunchStatusEvent {
+                    state: "exited".to_string(),
+                    benchmark: None,
+                    pid: None,
+                    exit_code: Some(1),
+                    failure_class: Some(LaunchFailureClass::MissingDependency.as_str().to_string()),
+                    failure_detail: Some("Minecraft failed during startup.".to_string()),
+                    crash_evidence: Some(crash_evidence),
+                    healing: None,
+                    guardian: None,
+                    outcome: Some(LaunchSessionOutcome::from_reason(
+                        LaunchSessionExitReason::StartupFailed,
+                    )),
+                    notice: None,
+                    evidence: Vec::new(),
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(2), observer)
+            .await
+            .expect("observed startup failure settlement deadline")
+            .expect("observed startup failure task");
+
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("settled startup failure session");
+        assert_eq!(record.state, LaunchState::Failed);
+        assert!(record.boot_completed_at_ms.is_none());
+        assert_eq!(
+            record.failure.as_ref().map(|failure| failure.class),
+            Some(LaunchFailureClass::MissingDependency)
+        );
+        let guardian = record.guardian.as_ref().expect("startup failure guardian");
+        assert_eq!(guardian["decision"], "blocked");
+        assert_eq!(guardian["message"], "Guardian blocked launch startup.");
+        assert_eq!(
+            record
+                .failure
+                .as_ref()
+                .and_then(|failure| failure.detail.as_deref()),
+            Some("Guardian blocked launch startup.")
+        );
+        let memory = state.failure_memory().list();
+        assert_eq!(memory.len(), 1);
+        assert_eq!(memory[0].diagnosis_id.as_str(), "missing_dependency");
+        assert_eq!(memory[0].target.id, "instance");
+        assert_eq!(memory[0].occurrence_count, 1);
+        let proof = state
+            .launch_reports()
+            .load(session_id)
+            .expect("observed startup failure proof");
+        assert_eq!(proof.outcome, "failed");
+        assert_eq!(proof.failure_class.as_deref(), Some("missing_dependency"));
+        assert_eq!(
+            proof.failure_detail.as_deref(),
+            Some("Guardian blocked launch startup.")
+        );
+        assert_eq!(
+            state.sessions().retention_hold_count(session_id).await,
+            Some(0)
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 

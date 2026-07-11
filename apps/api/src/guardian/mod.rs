@@ -56,10 +56,11 @@ pub use jvm_preset::{
     normalize_create_jvm_preset,
 };
 pub use launch_decision::{
-    GuardianPrepareFailureOutcome, GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
+    GuardianObservedLaunchFailurePhase, GuardianPrepareFailureOutcome,
+    GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
     GuardianStartupFailureObservation, GuardianStartupFailureOutcome,
     GuardianStartupFailureRequest, conservative_launch_recovery_preset,
-    guardian_post_boot_launch_failure_outcome, guardian_prelaunch_preset_adjustment_directive,
+    guardian_observed_launch_failure_outcome, guardian_prelaunch_preset_adjustment_directive,
     guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
     is_guardian_launch_crash_class,
 };

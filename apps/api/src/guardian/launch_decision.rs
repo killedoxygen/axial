@@ -191,38 +191,88 @@ pub fn is_guardian_launch_crash_class(failure_class: LaunchFailureClass) -> bool
     )
 }
 
-pub fn guardian_post_boot_launch_failure_outcome(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardianObservedLaunchFailurePhase {
+    BeforeBoot,
+    AfterBoot,
+}
+
+pub fn guardian_observed_launch_failure_outcome(
     failure_class: LaunchFailureClass,
     crash_evidence: Option<&CrashEvidence>,
+    observed_phase: GuardianObservedLaunchFailurePhase,
 ) -> Option<GuardianUserOutcome> {
-    let (summary, detail, guidance) = match failure_class {
+    let copy = accepted_launch_failure_copy(failure_class, crash_evidence)?;
+    let (decision, phase, summary, detail) = match observed_phase {
+        GuardianObservedLaunchFailurePhase::BeforeBoot => (
+            GuardianDecisionKind::Block,
+            OperationPhase::Launching,
+            "Guardian blocked launch startup.",
+            copy.startup_detail.as_str(),
+        ),
+        GuardianObservedLaunchFailurePhase::AfterBoot => (
+            GuardianDecisionKind::Warn,
+            OperationPhase::Running,
+            copy.running_summary.as_str(),
+            copy.running_detail.as_str(),
+        ),
+    };
+    Some(GuardianUserOutcome {
+        decision,
+        phase,
+        summary: public_summary(summary),
+        details: bounded_public_lines([detail]),
+        guidance: bounded_public_lines([copy.guidance.as_str()]),
+    })
+}
+
+struct AcceptedLaunchFailureCopy {
+    startup_detail: String,
+    running_summary: String,
+    running_detail: String,
+    guidance: String,
+}
+
+fn accepted_launch_failure_copy(
+    failure_class: LaunchFailureClass,
+    crash_evidence: Option<&CrashEvidence>,
+) -> Option<AcceptedLaunchFailureCopy> {
+    let copy = match failure_class {
         LaunchFailureClass::OutOfMemory => (
+            "Minecraft exited before startup completed after running out of memory.",
             "Minecraft stopped after running out of memory.",
             "Guardian detected an out-of-memory crash after startup completed.",
             "Review the instance memory allocation and close memory-heavy apps before retrying.",
         ),
         LaunchFailureClass::GraphicsDriverCrash => (
+            "Minecraft exited before startup completed with a detected graphics driver crash.",
             "Minecraft stopped after a graphics driver crash.",
             "Guardian detected a native graphics driver crash after startup completed.",
             "Update or reinstall the graphics driver, then retry without graphics overlays.",
         ),
         LaunchFailureClass::MissingDependency => (
+            "Minecraft exited before startup completed because a required dependency was missing.",
             "Minecraft stopped because a dependency was missing.",
             "Guardian detected a missing class or dependency after startup completed.",
             "Check the installed mods for missing or incompatible dependencies before retrying.",
         ),
         LaunchFailureClass::ModTransformationFailure => (
+            "Minecraft exited before startup completed with a detected mod transformation or mixin failure.",
             "Minecraft stopped during mod transformation.",
             "Guardian detected a mod transformation or mixin failure after startup completed.",
             "Update or remove the recently changed mod before retrying.",
         ),
         LaunchFailureClass::ModAttributedCrash => {
             let suspected_mod = suspected_mod_label(crash_evidence);
-            let summary = suspected_mod
+            let startup_detail = suspected_mod
+                .as_ref()
+                .map(|name| format!("Minecraft exited before startup completed with a crash attributed to {name}."))
+                .unwrap_or_else(|| "Minecraft exited before startup completed with a crash attributed to an installed mod.".to_string());
+            let running_summary = suspected_mod
                 .as_ref()
                 .map(|name| format!("Minecraft stopped in a crash attributed to {name}."))
                 .unwrap_or_else(|| "Minecraft stopped in a mod-attributed crash.".to_string());
-            let detail = suspected_mod
+            let running_detail = suspected_mod
                 .as_ref()
                 .map(|name| format!("Guardian attributes the crash to the installed mod {name}."))
                 .unwrap_or_else(|| {
@@ -235,23 +285,21 @@ pub fn guardian_post_boot_launch_failure_outcome(
                 .unwrap_or_else(|| {
                     "Update or remove the suspected mod before retrying.".to_string()
                 });
-            return Some(GuardianUserOutcome {
-                decision: GuardianDecisionKind::Warn,
-                phase: OperationPhase::Running,
-                summary: public_summary(&summary),
-                details: bounded_public_lines([detail.as_str()]),
-                guidance: bounded_public_lines([guidance.as_str()]),
+            return Some(AcceptedLaunchFailureCopy {
+                startup_detail,
+                running_summary,
+                running_detail,
+                guidance,
             });
         }
         _ => return None,
     };
 
-    Some(GuardianUserOutcome {
-        decision: GuardianDecisionKind::Warn,
-        phase: OperationPhase::Running,
-        summary: public_summary(summary),
-        details: bounded_public_lines([detail]),
-        guidance: bounded_public_lines([guidance]),
+    Some(AcceptedLaunchFailureCopy {
+        startup_detail: copy.0.to_string(),
+        running_summary: copy.1.to_string(),
+        running_detail: copy.2.to_string(),
+        guidance: copy.3.to_string(),
     })
 }
 
@@ -629,18 +677,8 @@ fn startup_failure_user_outcome(
     }
 
     let mut guidance = Vec::new();
-    if failure_class == LaunchFailureClass::ModAttributedCrash
-        && let Some(name) = suspected_mod_label(request.crash_evidence)
-    {
-        push_public_line(
-            &mut guidance,
-            &format!("Update or remove {name} before retrying."),
-        );
-    }
-    if guidance.is_empty() {
-        for line in startup_failure_guidance(request, failure_class) {
-            push_public_line(&mut guidance, line);
-        }
+    for line in startup_failure_guidance(request, failure_class) {
+        push_public_line(&mut guidance, &line);
     }
 
     let summary = match decision.kind {
@@ -959,6 +997,9 @@ fn startup_failure_reason(
     request: &GuardianStartupFailureRequest<'_>,
     failure_class: LaunchFailureClass,
 ) -> String {
+    if let Some(copy) = accepted_launch_failure_copy(failure_class, request.crash_evidence) {
+        return copy.startup_detail;
+    }
     let reason = match request.observation {
         GuardianStartupFailureObservation::Stalled => {
             "No startup activity was observed before the startup window ended."
@@ -972,21 +1013,6 @@ fn startup_failure_reason(
             LaunchFailureClass::JavaRuntimeMismatch => {
                 "Minecraft exited before startup completed with a detected Java runtime mismatch."
             }
-            LaunchFailureClass::OutOfMemory => {
-                "Minecraft exited before startup completed after running out of memory."
-            }
-            LaunchFailureClass::GraphicsDriverCrash => {
-                "Minecraft exited before startup completed with a detected graphics driver crash."
-            }
-            LaunchFailureClass::MissingDependency => {
-                "Minecraft exited before startup completed because a required dependency was missing."
-            }
-            LaunchFailureClass::ModTransformationFailure => {
-                "Minecraft exited before startup completed with a detected mod transformation or mixin failure."
-            }
-            LaunchFailureClass::ModAttributedCrash => return suspected_mod_label(request.crash_evidence)
-                .map(|name| format!("Minecraft exited before startup completed with a crash attributed to {name}."))
-                .unwrap_or_else(|| "Minecraft exited before startup completed with a crash attributed to an installed mod.".to_string()),
             LaunchFailureClass::ClasspathModuleConflict => {
                 "Minecraft exited before startup completed with a detected classpath or module conflict."
             }
@@ -1002,7 +1028,12 @@ fn startup_failure_reason(
             LaunchFailureClass::StartupStalled => {
                 "Minecraft exited before startup completed after startup activity stalled."
             }
-            LaunchFailureClass::Unknown => {
+            LaunchFailureClass::OutOfMemory
+            | LaunchFailureClass::GraphicsDriverCrash
+            | LaunchFailureClass::MissingDependency
+            | LaunchFailureClass::ModTransformationFailure
+            | LaunchFailureClass::ModAttributedCrash
+            | LaunchFailureClass::Unknown => {
                 "Minecraft exited before Guardian could verify a completed startup."
             }
         },
@@ -1043,25 +1074,6 @@ fn prepare_failure_guidance(
                 "Repair the installed version so Axial can replace the affected launcher-managed jars.",
             ]
         }
-        LaunchFailureClass::OutOfMemory => {
-            vec![
-                "Review the instance memory allocation and close memory-heavy apps before retrying.",
-            ]
-        }
-        LaunchFailureClass::GraphicsDriverCrash => {
-            vec!["Update or reinstall the graphics driver, then retry without graphics overlays."]
-        }
-        LaunchFailureClass::MissingDependency => {
-            vec![
-                "Check the installed mods for missing or incompatible dependencies before retrying.",
-            ]
-        }
-        LaunchFailureClass::ModTransformationFailure => {
-            vec!["Update or remove the recently changed mod before retrying."]
-        }
-        LaunchFailureClass::ModAttributedCrash => {
-            vec!["Update or remove the suspected mod before retrying."]
-        }
         _ => Vec::new(),
     }
 }
@@ -1069,12 +1081,18 @@ fn prepare_failure_guidance(
 fn startup_failure_guidance(
     request: &GuardianStartupFailureRequest<'_>,
     failure_class: LaunchFailureClass,
-) -> Vec<&'static str> {
+) -> Vec<String> {
+    if let Some(copy) = accepted_launch_failure_copy(failure_class, request.crash_evidence) {
+        return vec![copy.guidance];
+    }
     if failure_class == LaunchFailureClass::StartupStalled {
         return if request_has_explicit_startup_intent(request) {
-            vec!["Review recent Java, JVM preset, or JVM argument overrides before retrying."]
+            vec![
+                "Review recent Java, JVM preset, or JVM argument overrides before retrying."
+                    .to_string(),
+            ]
         } else {
-            vec!["Review the latest game log before retrying."]
+            vec!["Review the latest game log before retrying.".to_string()]
         };
     }
 
@@ -1083,14 +1101,20 @@ fn startup_failure_guidance(
         request.explicit_java_override_present,
         request.explicit_jvm_args_present,
         request.explicit_jvm_preset_present,
-    );
+    )
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
     if !guidance.is_empty() {
         return guidance;
     }
     if request_has_explicit_startup_intent(request) {
-        guidance.push("Review recent Java, JVM preset, or JVM argument overrides before retrying.");
+        guidance.push(
+            "Review recent Java, JVM preset, or JVM argument overrides before retrying."
+                .to_string(),
+        );
     } else {
-        guidance.push("Review the latest game log before retrying.");
+        guidance.push("Review the latest game log before retrying.".to_string());
     }
     guidance
 }
@@ -1176,10 +1200,11 @@ fn is_legacy_version_family(version_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardianLaunchRecoveryEffect, GuardianPrepareFailureRequest,
-        GuardianStartupFailureObservation, GuardianStartupFailureRequest,
-        guardian_post_boot_launch_failure_outcome, guardian_prelaunch_preset_adjustment_directive,
-        guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
+        GuardianLaunchRecoveryEffect, GuardianObservedLaunchFailurePhase,
+        GuardianPrepareFailureRequest, GuardianStartupFailureObservation,
+        GuardianStartupFailureRequest, guardian_observed_launch_failure_outcome,
+        guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
+        guardian_startup_failure_outcome,
     };
     use crate::guardian::{
         GuardianDecisionKind, GuardianLaunchRecoveryKind, GuardianMode,
@@ -1484,9 +1509,12 @@ mod tests {
             OwnershipClass::UserOwned
         );
 
-        let post_boot =
-            guardian_post_boot_launch_failure_outcome(LaunchFailureClass::OutOfMemory, None)
-                .expect("OOM is an accepted launch crash");
+        let post_boot = guardian_observed_launch_failure_outcome(
+            LaunchFailureClass::OutOfMemory,
+            None,
+            GuardianObservedLaunchFailurePhase::AfterBoot,
+        )
+        .expect("OOM is an accepted launch crash");
         assert_eq!(post_boot.decision, GuardianDecisionKind::Warn);
         assert_eq!(post_boot.phase, OperationPhase::Running);
         assert_eq!(
@@ -1546,8 +1574,23 @@ mod tests {
                     .all(|line| line.chars().count() <= super::MAX_LAUNCH_DECISION_DETAIL_CHARS)
             );
 
-            let post_boot = guardian_post_boot_launch_failure_outcome(failure_class, None)
-                .expect("accepted post-boot crash outcome");
+            let before_boot = guardian_observed_launch_failure_outcome(
+                failure_class,
+                None,
+                GuardianObservedLaunchFailurePhase::BeforeBoot,
+            )
+            .expect("accepted before-boot crash outcome");
+            assert_eq!(before_boot.decision, GuardianDecisionKind::Block);
+            assert_eq!(before_boot.phase, OperationPhase::Launching);
+            assert_eq!(before_boot.details, outcome.user_outcome.details);
+            assert_eq!(before_boot.guidance, outcome.user_outcome.guidance);
+
+            let post_boot = guardian_observed_launch_failure_outcome(
+                failure_class,
+                None,
+                GuardianObservedLaunchFailurePhase::AfterBoot,
+            )
+            .expect("accepted post-boot crash outcome");
             assert_eq!(post_boot.phase, OperationPhase::Running);
             assert!(!post_boot.details.is_empty());
             assert!(!post_boot.guidance.is_empty());
@@ -1579,9 +1622,10 @@ mod tests {
             disable_custom_gc: false,
             effective_preset: "performance",
         });
-        let post_boot = guardian_post_boot_launch_failure_outcome(
+        let post_boot = guardian_observed_launch_failure_outcome(
             LaunchFailureClass::ModAttributedCrash,
             Some(&crash_evidence),
+            GuardianObservedLaunchFailurePhase::AfterBoot,
         )
         .expect("mod-attributed post-boot outcome");
 
@@ -1591,7 +1635,12 @@ mod tests {
         assert!(post_boot.details[0].contains("Example Machines"));
         assert!(post_boot.guidance[0].contains("Example Machines"));
         assert!(
-            guardian_post_boot_launch_failure_outcome(LaunchFailureClass::Unknown, None).is_none()
+            guardian_observed_launch_failure_outcome(
+                LaunchFailureClass::Unknown,
+                None,
+                GuardianObservedLaunchFailurePhase::AfterBoot,
+            )
+            .is_none()
         );
     }
 
