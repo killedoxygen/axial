@@ -1,4 +1,5 @@
 use super::super::{ApplicationCommand, CommandResult, InstallVersionPayload};
+use crate::guardian::DiagnosisId;
 use crate::observability::OperationProofRecord;
 use crate::state::contracts::OperationId;
 use axial_minecraft::{DownloadProgress, LoaderComponentId};
@@ -13,7 +14,7 @@ pub struct InstallVersionStaging {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstallGuardianRepairSummary {
     pub repair_operation_id: OperationId,
-    pub diagnosis_id: String,
+    pub diagnosis_id: DiagnosisId,
     pub status: String,
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -22,7 +23,7 @@ pub struct InstallGuardianRepairSummary {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstallGuardianOutcomeSummary {
-    pub diagnosis_id: String,
+    pub diagnosis_id: DiagnosisId,
     pub decision: String,
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

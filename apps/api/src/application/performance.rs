@@ -1278,7 +1278,7 @@ mod tests {
         let manifest = builtin_manifest().expect("builtin manifest");
         let status = rules_status(&manifest);
         let mut entry = GuardianFailureMemoryEntry::observed(
-            DiagnosisId::new("performance_fallback_selected"),
+            DiagnosisId::PerformanceFallbackSelected,
             GuardianDomain::Performance,
             TargetDescriptor::new(
                 StabilizationSystem::Performance,

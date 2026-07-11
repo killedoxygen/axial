@@ -136,7 +136,7 @@ fn accepted_startup_failure_entry(
         && entry.ownership == OwnershipClass::UserOwned
         && entry.last_action_kind.is_none()
         && entry.last_action_outcome.is_none()
-        && LaunchFailureClass::from_name(entry.diagnosis_id.as_str())
+        && launch_failure_class_for_diagnosis(entry.diagnosis_id)
             .is_some_and(is_guardian_launch_crash_class)
 }
 
@@ -187,7 +187,7 @@ fn recent_startup_failure_fact(
     context: &IntakeContext,
     entry: &GuardianFailureMemoryEntry,
 ) -> GuardianFact {
-    let failure_class = LaunchFailureClass::from_name(entry.diagnosis_id.as_str())
+    let failure_class = launch_failure_class_for_diagnosis(entry.diagnosis_id)
         .expect("accepted launch crash class must remain parseable");
     let mut fields = vec![
         public_field("failure_class", failure_class.as_str()),
@@ -314,7 +314,7 @@ pub fn record_launch_failure_observation(
         return Ok(());
     }
     failure_memory.record(GuardianFailureMemoryEntry::observed(
-        DiagnosisId::new(failure_class.as_str()),
+        launch_failure_diagnosis_id(failure_class),
         GuardianDomain::Startup,
         TargetDescriptor::new(
             StabilizationSystem::Guardian,
@@ -326,6 +326,51 @@ pub fn record_launch_failure_observation(
         None,
         observed_at,
     ))
+}
+
+fn launch_failure_diagnosis_id(failure_class: LaunchFailureClass) -> DiagnosisId {
+    match failure_class {
+        LaunchFailureClass::Unknown => DiagnosisId::LaunchFailureUnknown,
+        LaunchFailureClass::JvmUnsupportedOption => DiagnosisId::JvmUnsupportedOption,
+        LaunchFailureClass::JvmExperimentalUnlock => DiagnosisId::JvmExperimentalUnlock,
+        LaunchFailureClass::JvmOptionOrdering => DiagnosisId::JvmOptionOrdering,
+        LaunchFailureClass::JavaRuntimeMismatch => DiagnosisId::JavaRuntimeMismatch,
+        LaunchFailureClass::OutOfMemory => DiagnosisId::OutOfMemory,
+        LaunchFailureClass::GraphicsDriverCrash => DiagnosisId::GraphicsDriverCrash,
+        LaunchFailureClass::MissingDependency => DiagnosisId::MissingDependency,
+        LaunchFailureClass::ModTransformationFailure => DiagnosisId::ModTransformationFailure,
+        LaunchFailureClass::ModAttributedCrash => DiagnosisId::ModAttributedCrash,
+        LaunchFailureClass::ClasspathModuleConflict => DiagnosisId::ClasspathModuleConflict,
+        LaunchFailureClass::LauncherManagedArtifactSignature => {
+            DiagnosisId::LauncherManagedArtifactSignature
+        }
+        LaunchFailureClass::AuthModeIncompatible => DiagnosisId::AuthModeIncompatible,
+        LaunchFailureClass::LoaderBootstrapFailure => DiagnosisId::LoaderBootstrapFailure,
+        LaunchFailureClass::StartupStalled => DiagnosisId::StartupStalled,
+    }
+}
+
+fn launch_failure_class_for_diagnosis(diagnosis_id: DiagnosisId) -> Option<LaunchFailureClass> {
+    Some(match diagnosis_id {
+        DiagnosisId::LaunchFailureUnknown => LaunchFailureClass::Unknown,
+        DiagnosisId::JvmUnsupportedOption => LaunchFailureClass::JvmUnsupportedOption,
+        DiagnosisId::JvmExperimentalUnlock => LaunchFailureClass::JvmExperimentalUnlock,
+        DiagnosisId::JvmOptionOrdering => LaunchFailureClass::JvmOptionOrdering,
+        DiagnosisId::JavaRuntimeMismatch => LaunchFailureClass::JavaRuntimeMismatch,
+        DiagnosisId::OutOfMemory => LaunchFailureClass::OutOfMemory,
+        DiagnosisId::GraphicsDriverCrash => LaunchFailureClass::GraphicsDriverCrash,
+        DiagnosisId::MissingDependency => LaunchFailureClass::MissingDependency,
+        DiagnosisId::ModTransformationFailure => LaunchFailureClass::ModTransformationFailure,
+        DiagnosisId::ModAttributedCrash => LaunchFailureClass::ModAttributedCrash,
+        DiagnosisId::ClasspathModuleConflict => LaunchFailureClass::ClasspathModuleConflict,
+        DiagnosisId::LauncherManagedArtifactSignature => {
+            LaunchFailureClass::LauncherManagedArtifactSignature
+        }
+        DiagnosisId::AuthModeIncompatible => LaunchFailureClass::AuthModeIncompatible,
+        DiagnosisId::LoaderBootstrapFailure => LaunchFailureClass::LoaderBootstrapFailure,
+        DiagnosisId::StartupStalled => LaunchFailureClass::StartupStalled,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -420,7 +465,7 @@ mod tests {
         let repair = repair_entry(
             "instance-a",
             GuardianMode::Managed,
-            "jvm_preset_recovery",
+            DiagnosisId::JvmPresetRecovery,
             GuardianActionKind::Downgrade,
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T10:00:00Z",
@@ -453,7 +498,7 @@ mod tests {
         );
         malformed.last_observed_at = "not-a-time".to_string();
         let unknown = GuardianFailureMemoryEntry::observed(
-            DiagnosisId::new("unknown_future_class"),
+            DiagnosisId::DownloadUnavailable,
             GuardianDomain::Startup,
             instance_target("instance-a", OwnershipClass::UserOwned),
             GuardianMode::Managed,
@@ -509,7 +554,7 @@ mod tests {
         let active = repair_entry(
             "instance-a",
             GuardianMode::Managed,
-            "jvm_arg_unsupported",
+            DiagnosisId::JvmArgUnsupported,
             GuardianActionKind::Strip,
             FailureMemoryActionOutcome::Suppressed,
             "2026-07-11T09:30:00Z",
@@ -519,7 +564,7 @@ mod tests {
         let expired = repair_entry(
             "instance-a",
             GuardianMode::Managed,
-            "jvm_arg_unsupported",
+            DiagnosisId::JvmArgUnsupported,
             GuardianActionKind::Strip,
             FailureMemoryActionOutcome::Suppressed,
             "2026-07-11T09:40:00Z",
@@ -551,7 +596,7 @@ mod tests {
         let raw_args_repair = repair_entry(
             "instance-a",
             GuardianMode::Managed,
-            "jvm_arg_unsupported",
+            DiagnosisId::JvmArgUnsupported,
             GuardianActionKind::Strip,
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
@@ -561,7 +606,7 @@ mod tests {
         let custom_gc_repair = repair_entry(
             "instance-a",
             GuardianMode::Managed,
-            "jvm_arg_unsupported",
+            DiagnosisId::JvmArgUnsupported,
             GuardianActionKind::Strip,
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
@@ -603,7 +648,7 @@ mod tests {
         let java_repair = repair_entry(
             "instance-a",
             GuardianMode::Managed,
-            "java_runtime_recovery",
+            DiagnosisId::JavaRuntimeRecovery,
             GuardianActionKind::Fallback,
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
@@ -613,7 +658,7 @@ mod tests {
         let preset_repair = repair_entry(
             "instance-a",
             GuardianMode::Managed,
-            "jvm_preset_recovery",
+            DiagnosisId::JvmPresetRecovery,
             GuardianActionKind::Downgrade,
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
@@ -623,7 +668,7 @@ mod tests {
         let args_repair = repair_entry(
             "instance-a",
             GuardianMode::Managed,
-            "jvm_arg_unsupported",
+            DiagnosisId::JvmArgUnsupported,
             GuardianActionKind::Strip,
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
@@ -751,7 +796,7 @@ mod tests {
         let repair = repair_entry(
             "instance-a",
             GuardianMode::Managed,
-            "jvm_preset_recovery",
+            DiagnosisId::JvmPresetRecovery,
             GuardianActionKind::Downgrade,
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
@@ -816,7 +861,7 @@ mod tests {
         observed_at: &str,
     ) -> GuardianFailureMemoryEntry {
         GuardianFailureMemoryEntry::observed(
-            DiagnosisId::new(failure_class.as_str()),
+            launch_failure_diagnosis_id(failure_class),
             GuardianDomain::Startup,
             instance_target(instance_id, OwnershipClass::UserOwned),
             mode,
@@ -829,7 +874,7 @@ mod tests {
     fn repair_entry(
         instance_id: &str,
         mode: GuardianMode,
-        diagnosis: &str,
+        diagnosis: DiagnosisId,
         action: GuardianActionKind,
         outcome: FailureMemoryActionOutcome,
         observed_at: &str,
@@ -837,7 +882,7 @@ mod tests {
         user_intent_hash: &str,
     ) -> GuardianFailureMemoryEntry {
         let mut entry = GuardianFailureMemoryEntry::observed(
-            DiagnosisId::new(diagnosis),
+            diagnosis,
             GuardianDomain::Launch,
             instance_target(instance_id, OwnershipClass::LauncherManaged),
             mode,

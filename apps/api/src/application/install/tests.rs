@@ -885,7 +885,7 @@ async fn install_status_exposes_backend_authored_guardian_repair_summary() {
             operation_id: OperationId::new(
                 "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174000",
             ),
-            diagnosis_id: DiagnosisId::new("launcher_managed_artifact_corrupt"),
+            diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
             action: GuardianActionKind::Repair,
             status: GuardianArtifactRepairStatus::Repaired,
             facts: vec!["https://example.invalid/client.jar?token=secret".to_string()],
@@ -981,7 +981,7 @@ async fn install_status_exposes_interrupted_install_as_redacted_terminal_state()
         Some(INSTALL_FAILURE_MESSAGE)
     );
     let guardian = response.guardian.as_ref().expect("guardian outcome");
-    assert_eq!(guardian.diagnosis_id, "download_unavailable");
+    assert_eq!(guardian.diagnosis_id, DiagnosisId::DownloadUnavailable);
     assert_eq!(guardian.decision, "retry");
     assert!(
         guardian
@@ -1066,7 +1066,7 @@ async fn restart_interrupted_install_retry_discards_stale_temp_without_promoting
         Some("install_worker_interrupted")
     );
     let guardian = response.guardian.as_ref().expect("guardian outcome");
-    assert_eq!(guardian.diagnosis_id, "download_unavailable");
+    assert_eq!(guardian.diagnosis_id, DiagnosisId::DownloadUnavailable);
     assert_eq!(guardian.decision, "retry");
     let failure_view_model = response
         .failure_view_model
@@ -1181,7 +1181,7 @@ async fn install_status_reconstructs_journal_progress_when_snapshot_is_missing()
         Some(INSTALL_FAILURE_MESSAGE)
     );
     let guardian = response.guardian.as_ref().expect("guardian outcome");
-    assert_eq!(guardian.diagnosis_id, "download_unavailable");
+    assert_eq!(guardian.diagnosis_id, DiagnosisId::DownloadUnavailable);
     assert_no_public_raw_fragments(&serde_json::to_string(&response).expect("status json"));
 
     let _ = fs::remove_dir_all(root);
@@ -1213,7 +1213,7 @@ async fn install_status_reconstructs_restart_loaded_journal_and_guardian_repair(
                 operation_id: OperationId::new(
                     "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174001",
                 ),
-                diagnosis_id: DiagnosisId::new("launcher_managed_artifact_corrupt"),
+                diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
                 action: GuardianActionKind::Repair,
                 status: GuardianArtifactRepairStatus::Suppressed,
                 facts: vec!["https://example.invalid/client.jar?token=secret".to_string()],
@@ -1413,7 +1413,7 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
     assert!(response.done);
     assert!(response.guardian_repair.is_none());
     let guardian = response.guardian.as_ref().expect("guardian outcome");
-    assert_eq!(guardian.diagnosis_id, "download_unavailable");
+    assert_eq!(guardian.diagnosis_id, DiagnosisId::DownloadUnavailable);
     assert_eq!(guardian.decision, "retry");
     assert!(
         guardian
@@ -1526,7 +1526,7 @@ async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
     let guardian = response.guardian.as_ref().expect("guardian outcome");
     assert_eq!(
         guardian.diagnosis_id,
-        "managed_runtime_unavailable_for_platform"
+        DiagnosisId::ManagedRuntimeUnavailableForPlatform
     );
     assert_eq!(guardian.decision, "block");
     assert_eq!(
@@ -1628,7 +1628,10 @@ async fn install_status_exposes_rosetta_required_failure_with_retry() {
                 && message.contains("softwareupdate --install-rosetta --agree-to-license"))
     );
     let guardian = response.guardian.as_ref().expect("guardian outcome");
-    assert_eq!(guardian.diagnosis_id, "managed_runtime_rosetta_required");
+    assert_eq!(
+        guardian.diagnosis_id,
+        DiagnosisId::ManagedRuntimeRosettaRequired
+    );
     assert_eq!(guardian.decision, "block");
     assert_eq!(
         guardian.label,
@@ -1721,7 +1724,7 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
         .expect("install status");
 
     let guardian = response.guardian.as_ref().expect("guardian outcome");
-    assert_eq!(guardian.diagnosis_id, "download_unavailable");
+    assert_eq!(guardian.diagnosis_id, DiagnosisId::DownloadUnavailable);
     assert_eq!(guardian.decision, "retry");
     assert!(
         guardian
@@ -1854,7 +1857,7 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
         (
             "metadata-invalid-status-install",
             ExecutionDownloadFactKind::MetadataInvalid,
-            "install_artifact_metadata_invalid",
+            DiagnosisId::InstallArtifactMetadataInvalid,
             "block",
             "provider metadata could not be trusted",
             "invalid provider metadata",
@@ -1863,7 +1866,7 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
         (
             "permission-denied-status-install",
             ExecutionDownloadFactKind::PermissionFailure,
-            "filesystem_permission_denied",
+            DiagnosisId::FilesystemPermissionDenied,
             "block",
             "could not write launcher-managed files safely",
             "filesystem refused",
@@ -1872,7 +1875,7 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
         (
             "temp-write-status-install",
             ExecutionDownloadFactKind::TempWriteFailed,
-            "temp_file_leftover",
+            DiagnosisId::TempFileLeftover,
             "block",
             "temporary download state could not be written safely",
             "temporary download state",
@@ -1881,7 +1884,7 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
         (
             "promote-failed-status-install",
             ExecutionDownloadFactKind::PromoteFailed,
-            "atomic_promotion_failed",
+            DiagnosisId::AtomicPromotionFailed,
             "block",
             "verified download data could not be promoted safely",
             "atomic promotion failed",
@@ -1890,7 +1893,7 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
         (
             "ownership-refused-status-install",
             ExecutionDownloadFactKind::OwnershipRefused,
-            "artifact_ownership_unsafe",
+            DiagnosisId::ArtifactOwnershipUnsafe,
             "block",
             "protect user-owned or unknown files",
             "ownership was unsafe",
@@ -2002,7 +2005,7 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
             journal
                 .guardian_diagnosis_ids
                 .iter()
-                .any(|id| id == diagnosis_id)
+                .any(|id| id == diagnosis_id.as_str())
         );
         assert_no_public_raw_fragments(&serde_json::to_string(&guardian).expect("guardian json"));
         assert_no_public_raw_fragments(
@@ -3285,7 +3288,7 @@ async fn install_journal_records_guardian_download_failure_outcome_without_raw_d
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
-    assert_eq!(summary.diagnosis_id, "download_unavailable");
+    assert_eq!(summary.diagnosis_id, DiagnosisId::DownloadUnavailable);
     assert_eq!(summary.decision, "retry");
     assert!(
         summary
@@ -3337,7 +3340,7 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
-    assert_eq!(summary.diagnosis_id, "download_unavailable");
+    assert_eq!(summary.diagnosis_id, DiagnosisId::DownloadUnavailable);
     assert_eq!(summary.decision, "retry");
     assert!(
         summary
@@ -3373,7 +3376,7 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     let suppressed_entry = journals.get(&suppressed_operation_id).expect("journal");
     let suppressed =
         install_guardian_outcome_summary_from_journal(&suppressed_entry).expect("guardian outcome");
-    assert_eq!(suppressed.diagnosis_id, "download_unavailable");
+    assert_eq!(suppressed.diagnosis_id, DiagnosisId::DownloadUnavailable);
     assert_eq!(suppressed.decision, "block");
     assert!(
         suppressed
@@ -3426,7 +3429,7 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
-    assert_eq!(summary.diagnosis_id, "download_unavailable");
+    assert_eq!(summary.diagnosis_id, DiagnosisId::DownloadUnavailable);
     assert_eq!(summary.decision, "retry");
     assert!(
         summary
@@ -3463,7 +3466,7 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
     let suppressed_entry = journals.get(&suppressed_operation_id).expect("journal");
     let suppressed =
         install_guardian_outcome_summary_from_journal(&suppressed_entry).expect("guardian outcome");
-    assert_eq!(suppressed.diagnosis_id, "download_unavailable");
+    assert_eq!(suppressed.diagnosis_id, DiagnosisId::DownloadUnavailable);
     assert_eq!(suppressed.decision, "block");
     assert!(
         suppressed
@@ -3510,7 +3513,7 @@ async fn loader_base_install_dependency_failure_records_guardian_block_without_r
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
     assert_eq!(entry.status, OperationStatus::Failed);
-    assert_eq!(summary.diagnosis_id, "install_dependency_failed");
+    assert_eq!(summary.diagnosis_id, DiagnosisId::InstallDependencyFailed);
     assert_eq!(summary.decision, "block");
     assert!(
         summary.label.contains("required base install failed"),
@@ -3558,7 +3561,7 @@ async fn install_journal_records_guardian_repair_summary_without_raw_details() {
             operation_id: OperationId::new(
                 "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174000",
             ),
-            diagnosis_id: DiagnosisId::new("launcher_managed_artifact_corrupt"),
+            diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
             action: GuardianActionKind::Repair,
             status: GuardianArtifactRepairStatus::Suppressed,
             facts: vec!["https://example.invalid/artifact.jar?token=secret".to_string()],
@@ -3577,7 +3580,7 @@ async fn install_journal_records_guardian_repair_summary_without_raw_details() {
     );
     assert_eq!(
         summary.diagnosis_id,
-        "launcher_managed_artifact_corrupt".to_string()
+        DiagnosisId::LauncherManagedArtifactCorrupt
     );
     assert!(summary.label.contains("paused automatic install repair"));
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));

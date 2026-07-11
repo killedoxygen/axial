@@ -411,7 +411,7 @@ async fn finish_artifact_repair(
         || {
             artifact_repair_outcome(
                 operation_id,
-                request.plan.diagnosis_id.clone(),
+                request.plan.diagnosis_id,
                 status,
                 facts,
                 summary,
@@ -548,7 +548,7 @@ fn planned_artifact_journal(
         .collect();
     entry
         .guardian_diagnosis_ids
-        .push(safe_id(plan.diagnosis_id.as_str(), "diagnosis"));
+        .push(plan.diagnosis_id.as_str().to_string());
     entry
 }
 
@@ -796,7 +796,7 @@ fn terminal_artifact_journal(
     ));
     entry
         .guardian_diagnosis_ids
-        .push(safe_id(plan.diagnosis_id.as_str(), "diagnosis"));
+        .push(plan.diagnosis_id.as_str().to_string());
     entry.outcome = Some(outcome);
     entry
 }
@@ -873,7 +873,7 @@ fn record_artifact_repair_memory(
     quarantined_target: Option<TargetDescriptor>,
 ) {
     let mut entry = GuardianFailureMemoryEntry::observed(
-        diagnosis_id.clone(),
+        *diagnosis_id,
         GuardianDomain::Install,
         target.clone(),
         mode,
@@ -949,7 +949,7 @@ fn artifact_repair_outcome(
 ) -> GuardianArtifactRepairOutcome {
     GuardianArtifactRepairOutcome {
         operation_id: OperationId::new(safe_id(operation_id.as_str(), "operation")),
-        diagnosis_id: DiagnosisId::new(safe_id(diagnosis_id.as_str(), "diagnosis")),
+        diagnosis_id,
         action: GuardianActionKind::Repair,
         status,
         facts,
@@ -1361,7 +1361,7 @@ mod tests {
             .failure_memory
             .record(
                 GuardianFailureMemoryEntry::observed(
-                    plan.diagnosis_id.clone(),
+                    plan.diagnosis_id,
                     crate::guardian::GuardianDomain::Install,
                     plan.target.clone(),
                     GuardianMode::Managed,
@@ -1422,7 +1422,7 @@ mod tests {
             .failure_memory
             .record(
                 GuardianFailureMemoryEntry::observed(
-                    plan.diagnosis_id.clone(),
+                    plan.diagnosis_id,
                     crate::guardian::GuardianDomain::Install,
                     plan.target.clone(),
                     GuardianMode::Managed,
@@ -1477,7 +1477,7 @@ mod tests {
             .failure_memory
             .record(
                 GuardianFailureMemoryEntry::observed(
-                    plan.diagnosis_id.clone(),
+                    plan.diagnosis_id,
                     crate::guardian::GuardianDomain::Install,
                     plan.target.clone(),
                     GuardianMode::Managed,
@@ -1536,7 +1536,7 @@ mod tests {
             .failure_memory
             .record(
                 GuardianFailureMemoryEntry::observed(
-                    plan.diagnosis_id.clone(),
+                    plan.diagnosis_id,
                     crate::guardian::GuardianDomain::Install,
                     plan.target.clone(),
                     GuardianMode::Managed,
@@ -1855,11 +1855,11 @@ mod tests {
             operation_id: Some(OperationId::new("operation-install-repair")),
             mode: GuardianMode::Managed,
             kind: GuardianActionKind::Repair,
-            diagnoses: vec![DiagnosisId::new("launcher_managed_artifact_corrupt")],
+            diagnoses: vec![DiagnosisId::LauncherManagedArtifactCorrupt],
             action_plan: Some(GuardianActionPlan::new(
                 StabilizationSystem::Guardian,
                 ActionPlanPrerequisite {
-                    diagnosis_id: DiagnosisId::new("launcher_managed_artifact_corrupt"),
+                    diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
                     ownership: OwnershipClass::LauncherManaged,
                     confidence: GuardianConfidence::Confirmed,
                     affected_targets: vec![target.clone()],
@@ -1872,7 +1872,7 @@ mod tests {
                 vec![GuardianAction {
                     kind: GuardianActionKind::Repair,
                     target: Some(target),
-                    reason: DiagnosisId::new("launcher_managed_artifact_corrupt"),
+                    reason: DiagnosisId::LauncherManagedArtifactCorrupt,
                 }],
             )),
         }

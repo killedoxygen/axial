@@ -1,5 +1,5 @@
 use super::{
-    GuardianActionKind, GuardianLaunchRecoveryKind, GuardianLaunchRecoveryPlan,
+    DiagnosisId, GuardianActionKind, GuardianLaunchRecoveryKind, GuardianLaunchRecoveryPlan,
     GuardianPerformanceSupervisionRejection, GuardianRepairOutcome, GuardianRepairStatus,
 };
 use crate::state::contracts::OperationPhase;
@@ -51,7 +51,7 @@ pub fn install_artifact_repair_user_outcome(status: &str) -> GuardianUserOutcome
 
 pub fn install_failure_user_outcome(
     decision: GuardianActionKind,
-    diagnosis_id: &str,
+    diagnosis_id: DiagnosisId,
 ) -> GuardianUserOutcome {
     let (summary, details, guidance) = install_failure_outcome_copy(diagnosis_id, decision);
     GuardianUserOutcome {
@@ -106,7 +106,7 @@ pub fn performance_supervision_rejection_user_outcome(
 
 pub fn persisted_state_load_user_outcome(
     decision: GuardianActionKind,
-    diagnosis_id: &str,
+    diagnosis_id: DiagnosisId,
 ) -> GuardianUserOutcome {
     let (summary, details, guidance) = persisted_state_load_outcome_copy(diagnosis_id);
     GuardianUserOutcome {
@@ -173,11 +173,11 @@ fn install_artifact_repair_outcome_copy(status: &str) -> (&'static str, Option<&
 }
 
 fn install_failure_outcome_copy(
-    diagnosis_id: &str,
+    diagnosis_id: DiagnosisId,
     decision: GuardianActionKind,
 ) -> (&'static str, Vec<&'static str>, Vec<&'static str>) {
     match diagnosis_id {
-        "download_unavailable" if decision == GuardianActionKind::Block => (
+        DiagnosisId::DownloadUnavailable if decision == GuardianActionKind::Block => (
             "Guardian paused install retry after repeated provider failure.",
             vec![
                 "The install stopped because the same provider or network download failure repeated within the retry cooldown.",
@@ -186,55 +186,55 @@ fn install_failure_outcome_copy(
                 "Wait a few minutes, then retry after checking connection and storage availability.",
             ],
         ),
-        "download_unavailable" => (
+        DiagnosisId::DownloadUnavailable => (
             "Guardian classified the install download failure as retryable.",
             vec![
                 "The install stopped because a provider or network download was unavailable or interrupted.",
             ],
             vec!["Retry the install after checking connection and storage availability."],
         ),
-        "install_artifact_metadata_invalid" => (
+        DiagnosisId::InstallArtifactMetadataInvalid => (
             "Guardian blocked install because provider metadata could not be trusted.",
             vec!["The install did not continue with invalid provider metadata."],
             vec!["Retry later or choose another version source."],
         ),
-        "install_dependency_failed" => (
+        DiagnosisId::InstallDependencyFailed => (
             "Guardian blocked loader install because the required base install failed.",
             vec!["The loader install did not continue after the base Minecraft install failed."],
             vec!["Retry the base version install, then retry the loader install."],
         ),
-        "managed_runtime_unavailable_for_platform" => (
+        DiagnosisId::ManagedRuntimeUnavailableForPlatform => (
             "This Minecraft version needs a Java runtime that is not available for this device.",
             vec!["The required managed Java runtime is not available for this device."],
             vec!["This version cannot be installed on this device."],
         ),
-        "managed_runtime_rosetta_required" => (
+        DiagnosisId::ManagedRuntimeRosettaRequired => (
             "This Minecraft version needs Rosetta 2 on Apple Silicon Macs.",
             vec!["The required managed Java runtime needs Rosetta 2 on this Mac."],
             vec![
                 "Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then retry.",
             ],
         ),
-        "filesystem_permission_denied" => (
+        DiagnosisId::FilesystemPermissionDenied => (
             "Guardian blocked install because Axial could not write launcher-managed files safely.",
             vec!["The install did not mutate files after the filesystem refused the operation."],
             vec!["Check app data permissions and retry the install."],
         ),
-        "temp_file_leftover" => (
+        DiagnosisId::TempFileLeftover => (
             "Guardian blocked install because temporary download state could not be written safely.",
             vec![
                 "The install did not continue after temporary download state could not be written or cleaned safely.",
             ],
             vec!["Check app data permissions and disk availability before retrying the install."],
         ),
-        "atomic_promotion_failed" => (
+        DiagnosisId::AtomicPromotionFailed => (
             "Guardian blocked install because verified download data could not be promoted safely.",
             vec![
                 "The install did not replace launcher-managed files after atomic promotion failed.",
             ],
             vec!["Check app data permissions and retry the install."],
         ),
-        "artifact_ownership_unsafe" => (
+        DiagnosisId::ArtifactOwnershipUnsafe => (
             "Guardian blocked install to protect user-owned or unknown files.",
             vec!["The install did not automatically mutate a target whose ownership was unsafe."],
             vec![
@@ -250,10 +250,10 @@ fn install_failure_outcome_copy(
 }
 
 fn persisted_state_load_outcome_copy(
-    diagnosis_id: &str,
+    diagnosis_id: DiagnosisId,
 ) -> (&'static str, Vec<&'static str>, Vec<&'static str>) {
     match diagnosis_id {
-        "persisted_state_schema_invalid" => (
+        DiagnosisId::PersistedStateSchemaInvalid => (
             "Guardian kept Axial running after persisted operation state could not be trusted.",
             vec!["Some restart-resume records were ignored instead of resuming unsafe work."],
             vec!["Retry the affected performance or benchmark operation if it is still needed."],
@@ -378,55 +378,55 @@ mod tests {
     fn install_failure_outcomes_author_public_copy() {
         let cases = [
             (
-                "download_unavailable",
+                DiagnosisId::DownloadUnavailable,
                 GuardianActionKind::Retry,
                 "Guardian classified the install download failure as retryable.",
                 "provider or network download",
             ),
             (
-                "install_artifact_metadata_invalid",
+                DiagnosisId::InstallArtifactMetadataInvalid,
                 GuardianActionKind::Block,
                 "Guardian blocked install because provider metadata could not be trusted.",
                 "invalid provider metadata",
             ),
             (
-                "install_dependency_failed",
+                DiagnosisId::InstallDependencyFailed,
                 GuardianActionKind::Block,
                 "Guardian blocked loader install because the required base install failed.",
                 "base Minecraft install failed",
             ),
             (
-                "managed_runtime_rosetta_required",
+                DiagnosisId::ManagedRuntimeRosettaRequired,
                 GuardianActionKind::Block,
                 "This Minecraft version needs Rosetta 2 on Apple Silicon Macs.",
                 "Rosetta 2",
             ),
             (
-                "managed_runtime_unavailable_for_platform",
+                DiagnosisId::ManagedRuntimeUnavailableForPlatform,
                 GuardianActionKind::Block,
                 "This Minecraft version needs a Java runtime that is not available for this device.",
                 "required managed Java runtime",
             ),
             (
-                "filesystem_permission_denied",
+                DiagnosisId::FilesystemPermissionDenied,
                 GuardianActionKind::Block,
                 "Guardian blocked install because Axial could not write launcher-managed files safely.",
                 "filesystem refused",
             ),
             (
-                "temp_file_leftover",
+                DiagnosisId::TempFileLeftover,
                 GuardianActionKind::Block,
                 "Guardian blocked install because temporary download state could not be written safely.",
                 "temporary download state",
             ),
             (
-                "atomic_promotion_failed",
+                DiagnosisId::AtomicPromotionFailed,
                 GuardianActionKind::Block,
                 "Guardian blocked install because verified download data could not be promoted safely.",
                 "atomic promotion failed",
             ),
             (
-                "artifact_ownership_unsafe",
+                DiagnosisId::ArtifactOwnershipUnsafe,
                 GuardianActionKind::Block,
                 "Guardian blocked install to protect user-owned or unknown files.",
                 "ownership was unsafe",
@@ -454,7 +454,7 @@ mod tests {
     fn persisted_state_load_outcome_authors_bounded_public_copy() {
         let outcome = persisted_state_load_user_outcome(
             GuardianActionKind::Warn,
-            "persisted_state_schema_invalid",
+            DiagnosisId::PersistedStateSchemaInvalid,
         );
 
         assert_eq!(outcome.decision, GuardianActionKind::Warn);
@@ -535,7 +535,7 @@ mod tests {
     fn repair_outcome(status: GuardianRepairStatus) -> GuardianRepairOutcome {
         GuardianRepairOutcome {
             operation_id: OperationId::new("repair-operation"),
-            diagnosis_id: Some(DiagnosisId::new("managed_runtime_corrupt")),
+            diagnosis_id: Some(DiagnosisId::ManagedRuntimeCorrupt),
             action: Some(GuardianActionKind::Repair),
             status,
             facts: Vec::new(),

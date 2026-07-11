@@ -44,7 +44,7 @@ fn diagnosis_for_fact(
     }
 
     Some(Diagnosis {
-        id: DiagnosisId::new(node.diagnosis_id(fact)),
+        id: node.diagnosis_id(fact),
         domain: node.domain(fact),
         severity: evaluation.resolved_severity,
         confidence: evaluation.resolved_confidence,
@@ -71,7 +71,7 @@ fn unknown_diagnosis(facts: &[GuardianFact], phase: OperationPhase) -> Diagnosis
         affected_targets.push(fallback_target(GuardianDomain::Unknown, ownership, phase));
     }
     Diagnosis {
-        id: DiagnosisId::new(format!("unknown_failure_{}", phase_name(phase))),
+        id: DiagnosisId::UnknownFailure(phase),
         domain: GuardianDomain::Unknown,
         severity: GuardianSeverity::Warning,
         confidence: GuardianConfidence::Low,

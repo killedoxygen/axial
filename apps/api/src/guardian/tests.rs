@@ -4,9 +4,9 @@ use super::inference_graph::{
     diagnosis_graph_nodes, diagnosis_node_for_fact,
 };
 use super::{
-    ActionPlanPrerequisite, Diagnosis, FactReliability, GuardianAction, GuardianActionKind,
-    GuardianActionPlan, GuardianConfidence, GuardianDecision, GuardianDomain, GuardianFact,
-    GuardianFactId, GuardianMode, GuardianSeverity, GuardianSeverity::Repairable,
+    ActionPlanPrerequisite, Diagnosis, DiagnosisId, FactReliability, GuardianAction,
+    GuardianActionKind, GuardianActionPlan, GuardianConfidence, GuardianDecision, GuardianDomain,
+    GuardianFact, GuardianFactId, GuardianMode, GuardianSeverity, GuardianSeverity::Repairable,
     build_safety_case, diagnose_facts, guardian_fact_from_execution,
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind};
@@ -372,7 +372,7 @@ fn diagnosis_inference_graph_declares_evidence_slots_and_target_strategy() {
 
     let node = diagnosis_node_for_fact(&fact).expect("graph node");
 
-    assert_eq!(node.diagnosis_id(&fact), "jvm_args_malformed");
+    assert_eq!(node.diagnosis_id(&fact), DiagnosisId::JvmArgsMalformed);
     assert!(diagnosis_graph_nodes().iter().any(|node| {
         node.required_facts
             .iter()
@@ -1303,7 +1303,7 @@ fn unknown_facts_produce_low_confidence_unknown_diagnosis() {
 #[test]
 fn action_prerequisite_requires_target_and_candidate_action() {
     let mut diagnosis = Diagnosis {
-        id: super::DiagnosisId::new("incomplete"),
+        id: super::DiagnosisId::InstallIncomplete,
         domain: GuardianDomain::Unknown,
         severity: GuardianSeverity::Warning,
         confidence: GuardianConfidence::Low,
@@ -1343,7 +1343,7 @@ fn action_plan_representation_carries_prerequisite_metadata() {
         OwnershipClass::LauncherManaged,
     );
     let diagnosis = Diagnosis {
-        id: super::DiagnosisId::new("managed_runtime_corrupt"),
+        id: super::DiagnosisId::ManagedRuntimeCorrupt,
         domain: GuardianDomain::Runtime,
         severity: GuardianSeverity::Repairable,
         confidence: GuardianConfidence::Confirmed,
@@ -1364,7 +1364,7 @@ fn action_plan_representation_carries_prerequisite_metadata() {
         vec![GuardianAction {
             kind: GuardianActionKind::Repair,
             target: Some(target),
-            reason: diagnosis.id.clone(),
+            reason: diagnosis.id,
         }],
     );
 

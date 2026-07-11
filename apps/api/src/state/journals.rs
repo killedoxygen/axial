@@ -1032,6 +1032,7 @@ mod tests {
     };
     use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
+    use crate::guardian::DiagnosisId;
     use crate::state::contracts::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
         OperationOutcome, OperationPhase, OperationStatus, OwnershipClass, RollbackState,
@@ -1359,15 +1360,19 @@ mod tests {
             .entries
             .iter()
             .flat_map(|entry| entry.guardian_diagnosis_ids.iter())
+            .map(|diagnosis_id| {
+                serde_json::from_value::<DiagnosisId>(serde_json::Value::String(
+                    diagnosis_id.clone(),
+                ))
+                .expect("typed Guardian diagnosis id")
+            })
             .collect::<Vec<_>>();
-        assert_eq!(diagnosis_ids.len(), 78);
-        assert_eq!(
-            diagnosis_ids
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            78
-        );
+        assert_eq!(diagnosis_ids.as_slice(), DiagnosisId::ALL.as_slice());
+
+        let error = serde_json::from_str::<DiagnosisId>(r#""future_diagnosis""#)
+            .expect_err("unknown diagnosis must be rejected")
+            .to_string();
+        assert!(!error.contains("future_diagnosis"));
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
         assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V1_FIXTURE);

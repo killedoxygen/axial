@@ -8,8 +8,8 @@ use crate::application::{
     InstallVersionPayload, OperationCommandCarrier,
 };
 use crate::guardian::{
-    GuardianActionKind, GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-    GuardianMode, GuardianPolicyContext, diagnose_facts,
+    DiagnosisId, GuardianActionKind, GuardianInstallArtifactFailureEvidence,
+    GuardianInstallArtifactFailureKind, GuardianMode, GuardianPolicyContext, diagnose_facts,
     install_artifact_failure_from_minecraft_download_fact, install_artifact_failure_guardian_fact,
     install_artifact_failure_guardian_outcome_with_context, install_artifact_failure_safety_case,
 };
@@ -458,10 +458,15 @@ pub fn install_guardian_outcome_summary_from_journal(
 ) -> Option<InstallGuardianOutcomeSummary> {
     let decision = latest_generated_fact_value(entry, GUARDIAN_OUTCOME_DECISION_PREFIX)?;
     let label = latest_generated_fact_value(entry, GUARDIAN_OUTCOME_SUMMARY_PREFIX)?;
-    let diagnosis_id =
-        entry.guardian_diagnosis_ids.iter().rev().find_map(|id| {
-            (id.as_str() != "launcher_managed_artifact_corrupt").then(|| id.clone())
-        })?;
+    let diagnosis_ids = entry
+        .guardian_diagnosis_ids
+        .iter()
+        .map(|id| serde_json::from_value::<DiagnosisId>(serde_json::Value::String(id.clone())).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let diagnosis_id = diagnosis_ids
+        .into_iter()
+        .rev()
+        .find(|id| *id != DiagnosisId::LauncherManagedArtifactCorrupt)?;
     let detail = latest_generated_fact_value(entry, GUARDIAN_OUTCOME_DETAIL_PREFIX);
     let guidance = latest_generated_fact_value(entry, GUARDIAN_OUTCOME_GUIDANCE_PREFIX)
         .map(expand_guardian_guidance_fact)
@@ -1376,7 +1381,7 @@ fn provider_failure_memory_entry(
     let diagnosis = safety_case
         .diagnoses
         .iter()
-        .find(|diagnosis| diagnosis.id.as_str() == "download_unavailable")?;
+        .find(|diagnosis| diagnosis.id == DiagnosisId::DownloadUnavailable)?;
     let target = diagnosis.affected_targets.first()?;
     let key = FailureMemoryKey::for_observation(
         diagnosis.domain,
@@ -1401,7 +1406,7 @@ fn record_provider_failure_memory_if_needed(
     outcome: &crate::guardian::GuardianInstallFailureOutcome,
     observed_at: &str,
 ) {
-    if outcome.diagnosis_id.as_str() != "download_unavailable" {
+    if outcome.diagnosis_id != DiagnosisId::DownloadUnavailable {
         return;
     }
     let Some(memory) = failure_memory else {
@@ -1411,7 +1416,7 @@ fn record_provider_failure_memory_if_needed(
     let Some(diagnosis) = safety_case
         .diagnoses
         .iter()
-        .find(|diagnosis| diagnosis.id.as_str() == outcome.diagnosis_id.as_str())
+        .find(|diagnosis| diagnosis.id == outcome.diagnosis_id)
     else {
         return;
     };
@@ -1426,7 +1431,7 @@ fn record_provider_failure_memory_if_needed(
         _ => return,
     };
     let entry = GuardianFailureMemoryEntry::observed(
-        diagnosis.id.clone(),
+        diagnosis.id,
         diagnosis.domain,
         target,
         mode,

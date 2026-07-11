@@ -1,6 +1,6 @@
 use super::{
-    Diagnosis, FactReliability, GuardianActionKind, GuardianConfidence, GuardianDomain,
-    GuardianFact, GuardianFactId, GuardianImpactVector, GuardianSeverity,
+    Diagnosis, DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence,
+    GuardianDomain, GuardianFact, GuardianFactId, GuardianImpactVector, GuardianSeverity,
 };
 use crate::state::contracts::{OperationPhase, OwnershipClass};
 
@@ -38,7 +38,7 @@ impl WeightedFact {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DiagnosisIdTemplate {
-    Static(&'static str),
+    Static(DiagnosisId),
     FactId,
     Readiness,
 }
@@ -203,13 +203,13 @@ impl DiagnosisGraphNode {
             .any(|required| required.matches_fact_id(fact.id))
     }
 
-    pub(super) fn diagnosis_id(&self, fact: &GuardianFact) -> String {
+    pub(super) fn diagnosis_id(&self, fact: &GuardianFact) -> DiagnosisId {
         match self.id {
-            DiagnosisIdTemplate::Static(id) => id.to_string(),
-            DiagnosisIdTemplate::FactId => fact.id.as_str().to_string(),
+            DiagnosisIdTemplate::Static(id) => id,
+            DiagnosisIdTemplate::FactId => fact_backed_diagnosis_id(fact.id)
+                .expect("fact-backed graph must admit only mapped fact ids"),
             DiagnosisIdTemplate::Readiness => readiness_diagnosis_id(fact.id)
-                .expect("readiness graph must admit only mapped fact ids")
-                .to_string(),
+                .expect("readiness graph must admit only mapped fact ids"),
         }
     }
 
@@ -573,7 +573,7 @@ const PERFORMANCE_USER_CONFLICT_ELIGIBILITY: ActionEligibility = ActionEligibili
 
 const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("java_override_unavailable"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::JavaOverrideUnavailable),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::JavaOverrideEmpty,
@@ -601,7 +601,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("selected_java_runtime_unavailable"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("java_probe_failed"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::JavaProbeFailed),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
         required_facts: &[FactRequirement::Any(&[GuardianFactId::JavaProbeFailed])],
         supporting_facts: &[WeightedFact::new(GuardianFactId::JavaProbeFailed, 1.0)],
@@ -617,7 +617,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("java_runtime_probe_failed"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("java_runtime_major_mismatch"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::JavaRuntimeMajorMismatch),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
         required_facts: &[FactRequirement::Any(&[GuardianFactId::JavaMajorMismatch])],
         supporting_facts: &[WeightedFact::new(GuardianFactId::JavaMajorMismatch, 1.0)],
@@ -633,7 +633,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("java_runtime_major_mismatch"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("java_runtime_update_too_old"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::JavaRuntimeUpdateTooOld),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
         required_facts: &[FactRequirement::Any(&[GuardianFactId::JavaUpdateTooOld])],
         supporting_facts: &[WeightedFact::new(GuardianFactId::JavaUpdateTooOld, 1.0)],
@@ -649,7 +649,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("java_update_too_old"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("managed_runtime_missing"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::ManagedRuntimeMissing),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::ManagedRuntimeMissing,
@@ -670,7 +670,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("managed_runtime_missing"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("managed_runtime_unavailable_for_platform"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::ManagedRuntimeUnavailableForPlatform),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::ManagedRuntimeUnavailableForPlatform,
@@ -691,7 +691,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("managed_runtime_unavailable_for_platform"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("managed_runtime_rosetta_required"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::ManagedRuntimeRosettaRequired),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::ManagedRuntimeRosettaRequired,
@@ -712,7 +712,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("managed_runtime_rosetta_required"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("managed_runtime_corrupt"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::ManagedRuntimeCorrupt),
         domain: DomainTemplate::Static(GuardianDomain::Runtime),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::ManagedRuntimeReadyMarkerMissing,
@@ -764,7 +764,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::FactId,
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("launch_command_invalid"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::LaunchCommandInvalid),
         domain: DomainTemplate::Static(GuardianDomain::Launch),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::LaunchCommandInvalid,
@@ -782,7 +782,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("launch_command_invalid"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("launch_command_prepared"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::LaunchCommandPrepared),
         domain: DomainTemplate::Static(GuardianDomain::Launch),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::LaunchCommandPrepared,
@@ -857,7 +857,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::FactId,
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("jvm_args_empty"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::JvmArgsEmpty),
         domain: DomainTemplate::Static(GuardianDomain::Jvm),
         required_facts: &[FactRequirement::Any(&[GuardianFactId::JvmArgsEmpty])],
         supporting_facts: &[WeightedFact::new(GuardianFactId::JvmArgsEmpty, 1.0)],
@@ -873,7 +873,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("jvm_args_empty"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("jvm_args_malformed"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::JvmArgsMalformed),
         domain: DomainTemplate::Static(GuardianDomain::Jvm),
         required_facts: &[FactRequirement::Any(&[GuardianFactId::JvmArgsParseFailed])],
         supporting_facts: &[WeightedFact::new(GuardianFactId::JvmArgsParseFailed, 1.0)],
@@ -893,7 +893,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("jvm_args_malformed"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("jvm_arg_unsupported"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::JvmArgUnsupported),
         domain: DomainTemplate::Static(GuardianDomain::Jvm),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::JvmArgUnsupportedGc,
@@ -919,7 +919,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("jvm_arg_unsupported"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("jvm_arg_unsafe_override"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::JvmArgUnsafeOverride),
         domain: DomainTemplate::Static(GuardianDomain::Jvm),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::JvmArgReservedLauncherFlag,
@@ -951,7 +951,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("jvm_arg_unsafe_override"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("launcher_managed_artifact_signature_corrupt"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::LauncherManagedArtifactSignatureCorrupt),
         domain: DomainTemplate::FactDomain,
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::LauncherManagedArtifactSignatureCorruption,
@@ -974,7 +974,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         ),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("launcher_managed_artifact_corrupt"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::LauncherManagedArtifactCorrupt),
         domain: DomainTemplate::FactDomain,
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::ArtifactChecksumMismatch,
@@ -1002,7 +1002,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("managed_artifact_corrupt"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("launcher_managed_artifact_corrupt"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::LauncherManagedArtifactCorrupt),
         domain: DomainTemplate::FactDomain,
         required_facts: &[FactRequirement::Any(&[GuardianFactId::ArtifactMissing])],
         supporting_facts: &[WeightedFact::new(GuardianFactId::ArtifactMissing, 0.80)],
@@ -1022,7 +1022,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("managed_artifact_corrupt"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("install_artifact_metadata_invalid"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::InstallArtifactMetadataInvalid),
         domain: DomainTemplate::Static(GuardianDomain::Install),
         required_facts: &[FactRequirement::Any(&[GuardianFactId::ProviderDataInvalid])],
         supporting_facts: &[WeightedFact::new(GuardianFactId::ProviderDataInvalid, 1.0)],
@@ -1038,7 +1038,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("install_artifact_metadata_invalid"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("install_dependency_failed"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::InstallDependencyFailed),
         domain: DomainTemplate::Static(GuardianDomain::Install),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::InstallDependencyFailed,
@@ -1059,7 +1059,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("install_dependency_failed"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("download_unavailable"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::DownloadUnavailable),
         domain: DomainTemplate::Static(GuardianDomain::Download),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::DownloadProviderUnavailable,
@@ -1085,7 +1085,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("download_unavailable"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("filesystem_permission_denied"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::FilesystemPermissionDenied),
         domain: DomainTemplate::Static(GuardianDomain::Filesystem),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::FilesystemPermissionDenied,
@@ -1106,7 +1106,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("filesystem_permission_denied"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("temp_file_leftover"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::TempFileLeftover),
         domain: DomainTemplate::Static(GuardianDomain::Filesystem),
         required_facts: &[FactRequirement::Any(&[GuardianFactId::TempFileLeftover])],
         supporting_facts: &[WeightedFact::new(GuardianFactId::TempFileLeftover, 1.0)],
@@ -1122,7 +1122,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("temp_file_leftover"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("atomic_promotion_failed"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::AtomicPromotionFailed),
         domain: DomainTemplate::Static(GuardianDomain::Filesystem),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::AtomicPromotionFailed,
@@ -1143,7 +1143,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("atomic_promotion_failed"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("artifact_ownership_unsafe"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::ArtifactOwnershipUnsafe),
         domain: DomainTemplate::Static(GuardianDomain::Filesystem),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::OwnershipUnknown,
@@ -1165,7 +1165,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("artifact_ownership_unsafe"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("performance_rules_invalid"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::PerformanceRulesInvalid),
         domain: DomainTemplate::Static(GuardianDomain::Performance),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::PerformanceRulesInvalid,
@@ -1208,7 +1208,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::FactId,
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("performance_fallback_selected"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::PerformanceFallbackSelected),
         domain: DomainTemplate::Static(GuardianDomain::Performance),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::PerformanceFallbackSelected,
@@ -1230,7 +1230,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("performance_fallback_selected"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("performance_repeated_failure_memory"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::PerformanceRepeatedFailureMemory),
         domain: DomainTemplate::Static(GuardianDomain::Performance),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::PerformanceRepeatedFailureMemory,
@@ -1251,7 +1251,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("performance_repeated_failure_memory"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("performance_user_owned_conflict"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::PerformanceUserOwnedConflict),
         domain: DomainTemplate::Static(GuardianDomain::Performance),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::PerformanceUserOwnedConflict,
@@ -1277,7 +1277,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("performance_user_owned_conflict"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("process_lifecycle_observed"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::ProcessLifecycleObserved),
         domain: DomainTemplate::Static(GuardianDomain::Session),
         required_facts: &[FactRequirement::ProcessLifecycle],
         supporting_facts: &[
@@ -1304,7 +1304,7 @@ const DIAGNOSIS_GRAPH: &[DiagnosisGraphNode] = &[
         public_reason_template: ReasonTemplate::Static("process_lifecycle_observed"),
     },
     DiagnosisGraphNode {
-        id: DiagnosisIdTemplate::Static("persisted_state_schema_invalid"),
+        id: DiagnosisIdTemplate::Static(DiagnosisId::PersistedStateSchemaInvalid),
         domain: DomainTemplate::Static(GuardianDomain::State),
         required_facts: &[FactRequirement::Any(&[
             GuardianFactId::PersistedStateSchemaInvalid,
@@ -1344,7 +1344,7 @@ pub(super) fn graph_policy_input_for_diagnosis(
             .iter()
             .find(|node| {
                 node.matches_fact(&fact)
-                    && node.diagnosis_id(&fact) == diagnosis.id.as_str()
+                    && node.diagnosis_id(&fact) == diagnosis.id
                     && node.domain(&fact) == diagnosis.domain
             })
             .map(|node| DiagnosisGraphPolicyInput {
@@ -1371,22 +1371,87 @@ fn synthetic_fact_for_diagnosis(diagnosis: &Diagnosis, fact_id: GuardianFactId) 
     }
 }
 
-const READINESS_DIAGNOSIS_IDS: &[(GuardianFactId, &str)] = &[
+const FACT_BACKED_DIAGNOSIS_IDS: &[(GuardianFactId, DiagnosisId)] = &[
+    (
+        GuardianFactId::LaunchMemoryMinClamped,
+        DiagnosisId::LaunchMemoryMinClamped,
+    ),
+    (
+        GuardianFactId::LaunchMemoryAllocationLow,
+        DiagnosisId::LaunchMemoryAllocationLow,
+    ),
+    (
+        GuardianFactId::LaunchResourceMemoryPressure,
+        DiagnosisId::LaunchResourceMemoryPressure,
+    ),
+    (
+        GuardianFactId::LaunchResourceCpuPressure,
+        DiagnosisId::LaunchResourceCpuPressure,
+    ),
+    (
+        GuardianFactId::LaunchResourceInstallPressure,
+        DiagnosisId::LaunchResourceInstallPressure,
+    ),
+    (
+        GuardianFactId::LaunchResourceDiskPressure,
+        DiagnosisId::LaunchResourceDiskPressure,
+    ),
+    (
+        GuardianFactId::CustomJavaOverridePresent,
+        DiagnosisId::CustomJavaOverridePresent,
+    ),
+    (
+        GuardianFactId::CustomJvmPresetPresent,
+        DiagnosisId::CustomJvmPresetPresent,
+    ),
+    (
+        GuardianFactId::CustomJvmArgsPresent,
+        DiagnosisId::CustomJvmArgsPresent,
+    ),
+    (
+        GuardianFactId::PerformanceHealthDegraded,
+        DiagnosisId::PerformanceHealthDegraded,
+    ),
+    (
+        GuardianFactId::PerformanceHealthInvalid,
+        DiagnosisId::PerformanceHealthInvalid,
+    ),
+];
+
+fn fact_backed_diagnosis_id(fact_id: GuardianFactId) -> Option<DiagnosisId> {
+    FACT_BACKED_DIAGNOSIS_IDS
+        .iter()
+        .find_map(|(candidate, diagnosis)| (*candidate == fact_id).then_some(*diagnosis))
+}
+
+const READINESS_DIAGNOSIS_IDS: &[(GuardianFactId, DiagnosisId)] = &[
     (
         GuardianFactId::VersionJsonMissing,
-        "installed_version_metadata_missing",
+        DiagnosisId::InstalledVersionMetadataMissing,
     ),
     (
         GuardianFactId::ParentVersionMissing,
-        "parent_version_metadata_missing",
+        DiagnosisId::ParentVersionMetadataMissing,
     ),
-    (GuardianFactId::IncompleteInstall, "install_incomplete"),
-    (GuardianFactId::ClientJarMissing, "client_jar_missing"),
-    (GuardianFactId::LibrariesMissing, "libraries_missing"),
-    (GuardianFactId::AssetIndexMissing, "asset_index_missing"),
+    (
+        GuardianFactId::IncompleteInstall,
+        DiagnosisId::InstallIncomplete,
+    ),
+    (
+        GuardianFactId::ClientJarMissing,
+        DiagnosisId::ClientJarMissing,
+    ),
+    (
+        GuardianFactId::LibrariesMissing,
+        DiagnosisId::LibrariesMissing,
+    ),
+    (
+        GuardianFactId::AssetIndexMissing,
+        DiagnosisId::AssetIndexMissing,
+    ),
 ];
 
-fn readiness_diagnosis_id(fact_id: GuardianFactId) -> Option<&'static str> {
+fn readiness_diagnosis_id(fact_id: GuardianFactId) -> Option<DiagnosisId> {
     READINESS_DIAGNOSIS_IDS
         .iter()
         .find_map(|(candidate, diagnosis)| (*candidate == fact_id).then_some(*diagnosis))

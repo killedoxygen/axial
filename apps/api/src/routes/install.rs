@@ -180,7 +180,7 @@ mod tests {
                 operation_id: crate::state::contracts::OperationId::new(
                     "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174002",
                 ),
-                diagnosis_id: DiagnosisId::new("launcher_managed_artifact_corrupt"),
+                diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
                 action: GuardianActionKind::Repair,
                 status: GuardianArtifactRepairStatus::Repaired,
                 facts: vec![

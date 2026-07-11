@@ -136,7 +136,7 @@ pub fn decide_guardian_policy(
     let diagnoses = safety_case
         .diagnoses
         .iter()
-        .map(|diagnosis| diagnosis.id.clone())
+        .map(|diagnosis| diagnosis.id)
         .collect::<Vec<_>>();
 
     if !context.public_redaction_ready {
@@ -179,7 +179,7 @@ pub fn decide_guardian_policy(
             vec![GuardianAction {
                 kind: selection.kind,
                 target: selection.prerequisite.affected_targets.first().cloned(),
-                reason: selection.prerequisite.diagnosis_id.clone(),
+                reason: selection.prerequisite.diagnosis_id,
             }],
         )),
     }
@@ -729,7 +729,7 @@ mod tests {
     #[test]
     fn managed_mode_repairs_launcher_managed_corruption() {
         let diagnosis = diagnosis(
-            "managed_runtime_corrupt",
+            DiagnosisId::ManagedRuntimeCorrupt,
             GuardianSeverity::Repairable,
             GuardianConfidence::Confirmed,
             OwnershipClass::LauncherManaged,
@@ -750,7 +750,7 @@ mod tests {
     #[test]
     fn malformed_diagnosis_blocks_without_action_plan() {
         let mut diagnosis = diagnosis(
-            "missing_target",
+            DiagnosisId::ManagedRuntimeCorrupt,
             GuardianSeverity::Repairable,
             GuardianConfidence::Confirmed,
             OwnershipClass::LauncherManaged,
@@ -769,7 +769,7 @@ mod tests {
     #[test]
     fn policy_action_plan_sanitizes_prerequisite_targets() {
         let mut diagnosis = diagnosis(
-            "managed_runtime_corrupt",
+            DiagnosisId::ManagedRuntimeCorrupt,
             GuardianSeverity::Repairable,
             GuardianConfidence::Confirmed,
             OwnershipClass::LauncherManaged,
@@ -807,7 +807,7 @@ mod tests {
     #[test]
     fn custom_explicit_intent_asks_before_silent_mutation() {
         let diagnosis = diagnosis(
-            "jvm_arg_unsupported",
+            DiagnosisId::JvmArgUnsupported,
             GuardianSeverity::Blocking,
             GuardianConfidence::Confirmed,
             OwnershipClass::UserOwned,
@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn disabled_mode_blocks_hard_invariant_even_when_guardian_is_disabled() {
         let diagnosis = diagnosis(
-            "user_owned_repair",
+            DiagnosisId::ManagedRuntimeCorrupt,
             GuardianSeverity::Repairable,
             GuardianConfidence::Confirmed,
             OwnershipClass::UserOwned,
@@ -847,7 +847,7 @@ mod tests {
     #[test]
     fn disabled_mode_records_non_blocking_cases_only() {
         let diagnosis = diagnosis(
-            "custom_override_present",
+            DiagnosisId::CustomJavaOverridePresent,
             GuardianSeverity::Warning,
             GuardianConfidence::Medium,
             OwnershipClass::UserOwned,
@@ -924,7 +924,7 @@ mod tests {
         for observed_at in ["2026-06-16T10:00:00Z", "2026-06-16T10:01:00Z"] {
             failure_memory
                 .record(GuardianFailureMemoryEntry::observed(
-                    diagnosis.id.clone(),
+                    diagnosis.id,
                     diagnosis.domain,
                     safe_target.clone(),
                     GuardianMode::Managed,
@@ -956,7 +956,7 @@ mod tests {
     #[test]
     fn hard_invariant_blocks_unjournaled_mutation() {
         let diagnosis = diagnosis(
-            "managed_runtime_corrupt",
+            DiagnosisId::ManagedRuntimeCorrupt,
             GuardianSeverity::Repairable,
             GuardianConfidence::Confirmed,
             OwnershipClass::LauncherManaged,
@@ -975,7 +975,7 @@ mod tests {
     #[test]
     fn unredacted_public_boundary_blocks_before_action_planning() {
         let diagnosis = diagnosis(
-            "managed_runtime_corrupt",
+            DiagnosisId::ManagedRuntimeCorrupt,
             GuardianSeverity::Repairable,
             GuardianConfidence::Confirmed,
             OwnershipClass::LauncherManaged,
@@ -995,7 +995,7 @@ mod tests {
     #[test]
     fn suppression_blocks_repeated_retry_loop() {
         let diagnosis = diagnosis(
-            "download_unavailable",
+            DiagnosisId::DownloadUnavailable,
             GuardianSeverity::Blocking,
             GuardianConfidence::Medium,
             OwnershipClass::ExternalProviderDerived,
@@ -1018,7 +1018,7 @@ mod tests {
     #[test]
     fn performance_fallback_is_preferred_over_block_when_safe() {
         let mut diagnosis = diagnosis(
-            "performance_plan_failed",
+            DiagnosisId::PerformanceFallbackSelected,
             GuardianSeverity::Degraded,
             GuardianConfidence::High,
             OwnershipClass::CompositionManaged,
@@ -1041,7 +1041,7 @@ mod tests {
     #[test]
     fn pressure_and_safety_scores_follow_method_weights() {
         let diagnosis = diagnosis(
-            "managed_runtime_corrupt",
+            DiagnosisId::ManagedRuntimeCorrupt,
             GuardianSeverity::Repairable,
             GuardianConfidence::Confirmed,
             OwnershipClass::LauncherManaged,
@@ -1367,14 +1367,14 @@ mod tests {
     }
 
     fn diagnosis(
-        id: &str,
+        id: DiagnosisId,
         severity: GuardianSeverity,
         confidence: GuardianConfidence,
         ownership: OwnershipClass,
         candidate_actions: Vec<GuardianActionKind>,
     ) -> Diagnosis {
         Diagnosis {
-            id: DiagnosisId::new(id),
+            id,
             domain: GuardianDomain::Runtime,
             severity,
             confidence,
@@ -1384,7 +1384,7 @@ mod tests {
             affected_targets: vec![TargetDescriptor::new(
                 StabilizationSystem::Guardian,
                 TargetKind::Runtime,
-                id,
+                id.as_str(),
                 ownership,
             )],
             impact: GuardianImpactVector {

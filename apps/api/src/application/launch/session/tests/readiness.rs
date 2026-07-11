@@ -185,7 +185,7 @@ async fn launch_preflight_surfaces_only_active_suppression_for_the_exact_current
             .failure_memory()
             .record(
                 GuardianFailureMemoryEntry::observed(
-                    DiagnosisId::new("jvm_preset_recovery"),
+                    DiagnosisId::JvmPresetRecovery,
                     GuardianDomain::Launch,
                     instance_target(&instance_id, OwnershipClass::LauncherManaged),
                     ApiGuardianMode::Managed,
@@ -1179,8 +1179,12 @@ fn startup_failure_memory_entry(
     failure_class: LaunchFailureClass,
     observed_at: &str,
 ) -> GuardianFailureMemoryEntry {
+    let diagnosis_id = serde_json::from_value::<DiagnosisId>(serde_json::Value::String(
+        failure_class.as_str().to_string(),
+    ))
+    .expect("launch failure diagnosis");
     GuardianFailureMemoryEntry::observed(
-        DiagnosisId::new(failure_class.as_str()),
+        diagnosis_id,
         GuardianDomain::Startup,
         instance_target(instance_id, OwnershipClass::UserOwned),
         mode,

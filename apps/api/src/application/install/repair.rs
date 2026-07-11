@@ -4,11 +4,12 @@ use super::{
     reconcile_install_journal_transition,
 };
 use crate::guardian::{
-    GuardianArtifactRepairMutation, GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest,
-    GuardianArtifactRepairStatus, GuardianInstallArtifactFailureEvidence,
-    GuardianInstallArtifactRepairPlanKind, GuardianMinecraftArtifactRepairDescriptor, GuardianMode,
-    execute_guardian_artifact_repair, install_artifact_failure_from_minecraft_download_fact,
-    install_artifact_repair_user_outcome, plan_install_artifact_failure_repair,
+    DiagnosisId, GuardianArtifactRepairMutation, GuardianArtifactRepairOutcome,
+    GuardianArtifactRepairRequest, GuardianArtifactRepairStatus,
+    GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactRepairPlanKind,
+    GuardianMinecraftArtifactRepairDescriptor, GuardianMode, execute_guardian_artifact_repair,
+    install_artifact_failure_from_minecraft_download_fact, install_artifact_repair_user_outcome,
+    plan_install_artifact_failure_repair,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
@@ -21,7 +22,6 @@ use axial_minecraft::download::{
 };
 use reqwest::Client;
 
-const LAUNCHER_MANAGED_ARTIFACT_CORRUPT_DIAGNOSIS: &str = "launcher_managed_artifact_corrupt";
 const REPAIR_OPERATION_FACT_PREFIX: &str = "guardian_repair_operation:";
 const REPAIR_STATUS_FACT_PREFIX: &str = "guardian_repair_status:";
 const REPAIR_SUMMARY_FACT_PREFIX: &str = "guardian_repair_summary:";
@@ -37,12 +37,7 @@ pub async fn record_install_operation_guardian_repair_outcome(
         96,
     )
     .unwrap_or_else(|| "guardian-repair".to_string());
-    let diagnosis_id = sanitize_evidence_token(
-        outcome.diagnosis_id.as_str(),
-        RedactionAudience::UserVisible,
-        96,
-    )
-    .unwrap_or_else(|| LAUNCHER_MANAGED_ARTIFACT_CORRUPT_DIAGNOSIS.to_string());
+    let diagnosis_id = outcome.diagnosis_id.as_str().to_string();
     let summary = sanitize_evidence_token(&outcome.summary, RedactionAudience::UserVisible, 96)
         .unwrap_or_else(|| "guardian_artifact_repair".to_string());
 
@@ -91,13 +86,18 @@ pub fn install_guardian_repair_summary_from_journal(
 ) -> Option<InstallGuardianRepairSummary> {
     let repair_operation_id = latest_generated_fact_value(entry, REPAIR_OPERATION_FACT_PREFIX)?;
     let status = latest_generated_fact_value(entry, REPAIR_STATUS_FACT_PREFIX)?;
-    let diagnosis_id = entry
+    let diagnosis_ids = entry
         .guardian_diagnosis_ids
         .iter()
+        .map(|diagnosis_id| {
+            serde_json::from_value::<DiagnosisId>(serde_json::Value::String(diagnosis_id.clone()))
+                .ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let diagnosis_id = diagnosis_ids
+        .into_iter()
         .rev()
-        .find(|diagnosis_id| diagnosis_id.as_str() == LAUNCHER_MANAGED_ARTIFACT_CORRUPT_DIAGNOSIS)
-        .cloned()
-        .unwrap_or_else(|| LAUNCHER_MANAGED_ARTIFACT_CORRUPT_DIAGNOSIS.to_string());
+        .find(|diagnosis_id| *diagnosis_id == DiagnosisId::LauncherManagedArtifactCorrupt)?;
     let outcome = install_artifact_repair_user_outcome(&status);
 
     Some(InstallGuardianRepairSummary {

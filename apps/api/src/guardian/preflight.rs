@@ -1,7 +1,8 @@
 use super::{
-    FactReliability, GuardianActionKind, GuardianConfidence, GuardianDecision, GuardianDomain,
-    GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianSeverity,
-    GuardianUserOutcome, SafetyCase, SafetyOutcome, build_safety_case, decide_guardian_policy,
+    DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence, GuardianDecision,
+    GuardianDomain, GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext,
+    GuardianSeverity, GuardianUserOutcome, SafetyCase, SafetyOutcome, build_safety_case,
+    decide_guardian_policy,
     launch_failure_memory::{
         RECENT_REPAIR_FAILED_FACT_ID, RECENT_STARTUP_FAILURE_FACT_ID,
         REPAIR_SUPPRESSED_UNTIL_FACT_ID,
@@ -215,8 +216,7 @@ fn preflight_decision_kind(
     if decision.kind == GuardianActionKind::AskUser {
         if decision
             .diagnoses
-            .iter()
-            .any(|diagnosis| diagnosis.as_str() == "java_override_unavailable")
+            .contains(&DiagnosisId::JavaOverrideUnavailable)
         {
             return GuardianActionKind::AskUser;
         }
@@ -240,15 +240,17 @@ fn preflight_directives(
         && safety_case
             .diagnoses
             .iter()
-            .any(|diagnosis| java_fallback_diagnosis(diagnosis.id.as_str()))
+            .any(|diagnosis| java_fallback_diagnosis(diagnosis.id))
     {
         directives.push(GuardianPreflightDirective::UseManagedJavaForAttempt);
     }
     if decision == GuardianActionKind::Strip
         && safety_case.diagnoses.iter().any(|diagnosis| {
             matches!(
-                diagnosis.id.as_str(),
-                "jvm_args_malformed" | "jvm_arg_unsupported" | "jvm_arg_unsafe_override"
+                diagnosis.id,
+                DiagnosisId::JvmArgsMalformed
+                    | DiagnosisId::JvmArgUnsupported
+                    | DiagnosisId::JvmArgUnsafeOverride
             )
         })
     {
@@ -257,13 +259,13 @@ fn preflight_directives(
     directives
 }
 
-fn java_fallback_diagnosis(diagnosis_id: &str) -> bool {
+fn java_fallback_diagnosis(diagnosis_id: DiagnosisId) -> bool {
     matches!(
         diagnosis_id,
-        "java_override_unavailable"
-            | "java_probe_failed"
-            | "java_runtime_major_mismatch"
-            | "java_runtime_update_too_old"
+        DiagnosisId::JavaOverrideUnavailable
+            | DiagnosisId::JavaProbeFailed
+            | DiagnosisId::JavaRuntimeMajorMismatch
+            | DiagnosisId::JavaRuntimeUpdateTooOld
     )
 }
 
@@ -355,10 +357,10 @@ fn preflight_copy(
         push_historical_launch_copy(facts, &mut details, &mut guidance);
     }
     for diagnosis in &safety_case.diagnoses {
-        if let Some(detail) = detail_for_diagnosis(diagnosis.id.as_str(), decision) {
+        if let Some(detail) = detail_for_diagnosis(diagnosis.id, decision) {
             push_unique_public(&mut details, detail, MAX_PREFLIGHT_DETAILS);
         }
-        if let Some(value) = guidance_for_diagnosis(diagnosis.id.as_str(), decision) {
+        if let Some(value) = guidance_for_diagnosis(diagnosis.id, decision) {
             push_unique_public(&mut guidance, value, MAX_PREFLIGHT_GUIDANCE);
         }
     }
@@ -564,15 +566,15 @@ fn launch_failure_plain_label(
 
 fn repair_failure_copy(fact: &GuardianFact) -> Option<(&'static str, &'static str)> {
     match fact_field(fact, "diagnosis")? {
-        "java_runtime_recovery" => Some((
+        value if value == DiagnosisId::JavaRuntimeRecovery.as_str() => Some((
             "The previous managed Java recovery attempt failed.",
             "Review the selected Java runtime before relaunching.",
         )),
-        "jvm_arg_unsupported" => Some((
+        value if value == DiagnosisId::JvmArgUnsupported.as_str() => Some((
             "The previous JVM argument recovery attempt failed.",
             "Review or remove explicit JVM arguments before relaunching.",
         )),
-        "jvm_preset_recovery" => Some((
+        value if value == DiagnosisId::JvmPresetRecovery.as_str() => Some((
             "The previous JVM preset recovery attempt failed.",
             "Review the JVM preset before relaunching.",
         )),
@@ -601,9 +603,12 @@ fn fact_field_u32(fact: &GuardianFact, key: &str) -> Option<u32> {
     fact_field(fact, key)?.parse().ok()
 }
 
-fn detail_for_diagnosis(diagnosis_id: &str, decision: GuardianActionKind) -> Option<&'static str> {
+fn detail_for_diagnosis(
+    diagnosis_id: DiagnosisId,
+    decision: GuardianActionKind,
+) -> Option<&'static str> {
     match diagnosis_id {
-        "java_override_unavailable" => match decision {
+        DiagnosisId::JavaOverrideUnavailable => match decision {
             GuardianActionKind::Fallback => Some(
                 "Guardian will ignore the unavailable Java override and use managed Java for this launch.",
             ),
@@ -617,7 +622,7 @@ fn detail_for_diagnosis(diagnosis_id: &str, decision: GuardianActionKind) -> Opt
                 "Guardian detected an unavailable Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
             ),
         },
-        "java_probe_failed" => match decision {
+        DiagnosisId::JavaProbeFailed => match decision {
             GuardianActionKind::Fallback => Some(
                 "Guardian will ignore the Java override that failed probing and use managed Java for this launch.",
             ),
@@ -631,7 +636,7 @@ fn detail_for_diagnosis(diagnosis_id: &str, decision: GuardianActionKind) -> Opt
                 "Guardian could not verify the selected Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
             ),
         },
-        "java_runtime_major_mismatch" => match decision {
+        DiagnosisId::JavaRuntimeMajorMismatch => match decision {
             GuardianActionKind::Fallback => Some(
                 "Guardian will ignore the incompatible Java override and use managed Java for this launch.",
             ),
@@ -645,7 +650,7 @@ fn detail_for_diagnosis(diagnosis_id: &str, decision: GuardianActionKind) -> Opt
                 "Guardian detected a Java override that does not match the version requirement.",
             ),
         },
-        "java_runtime_update_too_old" => match decision {
+        DiagnosisId::JavaRuntimeUpdateTooOld => match decision {
             GuardianActionKind::Fallback => Some(
                 "Guardian will ignore the outdated Java override and use managed Java for this launch.",
             ),
@@ -657,7 +662,7 @@ fn detail_for_diagnosis(diagnosis_id: &str, decision: GuardianActionKind) -> Opt
             }
             _ => Some("Guardian detected a Java 8 override that is too old for this launch."),
         },
-        "jvm_args_malformed" => match decision {
+        DiagnosisId::JvmArgsMalformed => match decision {
             GuardianActionKind::Strip => {
                 Some("Guardian removed malformed explicit JVM args for this launch.")
             }
@@ -665,7 +670,7 @@ fn detail_for_diagnosis(diagnosis_id: &str, decision: GuardianActionKind) -> Opt
                 "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
             ),
         },
-        "jvm_arg_unsupported" => match decision {
+        DiagnosisId::JvmArgUnsupported => match decision {
             GuardianActionKind::Strip => {
                 Some("Guardian removed unsupported explicit JVM args for this launch.")
             }
@@ -673,7 +678,7 @@ fn detail_for_diagnosis(diagnosis_id: &str, decision: GuardianActionKind) -> Opt
                 "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails.",
             ),
         },
-        "jvm_arg_unsafe_override" => match decision {
+        DiagnosisId::JvmArgUnsafeOverride => match decision {
             GuardianActionKind::Strip => Some(
                 "Guardian removed explicit JVM args that override launcher-owned settings for this launch.",
             ),
@@ -681,54 +686,58 @@ fn detail_for_diagnosis(diagnosis_id: &str, decision: GuardianActionKind) -> Opt
                 "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly.",
             ),
         },
-        "installed_version_metadata_missing" => {
+        DiagnosisId::InstalledVersionMetadataMissing => {
             Some("Guardian blocked launch because installed version metadata is missing.")
         }
-        "parent_version_metadata_missing" => {
+        DiagnosisId::ParentVersionMetadataMissing => {
             Some("Guardian blocked launch because parent version metadata is missing.")
         }
-        "install_incomplete" => Some("Guardian blocked launch because the install is incomplete."),
-        "client_jar_missing" => {
+        DiagnosisId::InstallIncomplete => {
+            Some("Guardian blocked launch because the install is incomplete.")
+        }
+        DiagnosisId::ClientJarMissing => {
             Some("Guardian blocked launch because client game files are missing.")
         }
-        "libraries_missing" => {
+        DiagnosisId::LibrariesMissing => {
             Some("Guardian blocked launch because required libraries are missing.")
         }
-        "asset_index_missing" => {
+        DiagnosisId::AssetIndexMissing => {
             Some("Guardian blocked launch because the asset index is missing.")
         }
-        "launcher_managed_artifact_corrupt" => {
+        DiagnosisId::LauncherManagedArtifactCorrupt => {
             Some("Guardian blocked launch because launcher-managed game files are corrupt.")
         }
-        "launcher_managed_artifact_signature_corrupt" => Some(
+        DiagnosisId::LauncherManagedArtifactSignatureCorrupt => Some(
             "Guardian blocked launch because launcher-managed jar signatures are inconsistent.",
         ),
-        "managed_runtime_missing" => {
+        DiagnosisId::ManagedRuntimeMissing => {
             Some("Managed Java runtime is missing and can be prepared before launch.")
         }
-        "launch_memory_min_clamped" => Some(
+        DiagnosisId::LaunchMemoryMinClamped => Some(
             "Minimum memory was higher than maximum memory, so Axial clamped the launch minimum to match the maximum allocation.",
         ),
-        "launch_memory_allocation_low" => {
+        DiagnosisId::LaunchMemoryAllocationLow => {
             Some("Launch memory allocation is very low for Minecraft.")
         }
-        "launch_resource_memory_pressure" => {
+        DiagnosisId::LaunchResourceMemoryPressure => {
             Some("Launch memory budget is tight for the current active sessions.")
         }
-        "launch_resource_cpu_pressure" => Some(
+        DiagnosisId::LaunchResourceCpuPressure => Some(
             "Launch concurrency may be tight: other active launch sessions can saturate low-end CPUs.",
         ),
-        "launch_resource_install_pressure" => {
+        DiagnosisId::LaunchResourceInstallPressure => {
             Some("Active install or download work may add pressure during startup.")
         }
-        "launch_resource_disk_pressure" => Some("Launch-relevant storage has low free space."),
-        "custom_java_override_present" => {
+        DiagnosisId::LaunchResourceDiskPressure => {
+            Some("Launch-relevant storage has low free space.")
+        }
+        DiagnosisId::CustomJavaOverridePresent => {
             Some("Guardian Custom mode will keep the selected Java override for this launch.")
         }
-        "custom_jvm_preset_present" => {
+        DiagnosisId::CustomJvmPresetPresent => {
             Some("Guardian Custom mode will keep the selected JVM preset for this launch.")
         }
-        "custom_jvm_args_present" => Some(
+        DiagnosisId::CustomJvmArgsPresent => Some(
             "Guardian Custom mode will keep explicit JVM args; remove them first if startup becomes unstable.",
         ),
         _ => None,
@@ -736,11 +745,11 @@ fn detail_for_diagnosis(diagnosis_id: &str, decision: GuardianActionKind) -> Opt
 }
 
 fn guidance_for_diagnosis(
-    diagnosis_id: &str,
+    diagnosis_id: DiagnosisId,
     decision: GuardianActionKind,
 ) -> Option<&'static str> {
     match diagnosis_id {
-        "java_override_unavailable" => match decision {
+        DiagnosisId::JavaOverrideUnavailable => match decision {
             GuardianActionKind::Fallback => Some(
                 "Update or remove the bad Java override after launch if you want to use Custom Java again.",
             ),
@@ -751,7 +760,7 @@ fn guidance_for_diagnosis(
                 "Guardian detected an unavailable Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
             ),
         },
-        "java_probe_failed" => match decision {
+        DiagnosisId::JavaProbeFailed => match decision {
             GuardianActionKind::Fallback => Some(
                 "Update or remove the Java override after launch if you want to use Custom Java again.",
             ),
@@ -762,7 +771,7 @@ fn guidance_for_diagnosis(
                 "Use a Java runtime that can run `java -version`, or switch back to Managed Java.",
             ),
         },
-        "java_runtime_major_mismatch" => match decision {
+        DiagnosisId::JavaRuntimeMajorMismatch => match decision {
             GuardianActionKind::Fallback => Some(
                 "Choose a Java runtime matching this Minecraft version before re-enabling the override.",
             ),
@@ -771,7 +780,7 @@ fn guidance_for_diagnosis(
             }
             _ => Some("Choose a Java runtime matching this Minecraft version requirement."),
         },
-        "java_runtime_update_too_old" => match decision {
+        DiagnosisId::JavaRuntimeUpdateTooOld => match decision {
             GuardianActionKind::Fallback => {
                 Some("Use Java 8u312 or newer before re-enabling this override.")
             }
@@ -780,13 +789,13 @@ fn guidance_for_diagnosis(
             }
             _ => Some("Use Java 8u312 or newer for this legacy launch."),
         },
-        "jvm_args_malformed" => match decision {
+        DiagnosisId::JvmArgsMalformed => match decision {
             GuardianActionKind::Strip => Some("Fix the saved JVM args before re-enabling them."),
             _ => Some(
                 "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
             ),
         },
-        "jvm_arg_unsupported" => match decision {
+        DiagnosisId::JvmArgUnsupported => match decision {
             GuardianActionKind::Strip => Some(
                 "Use JVM flags supported by the selected Java runtime before re-enabling them.",
             ),
@@ -794,7 +803,7 @@ fn guidance_for_diagnosis(
                 "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails.",
             ),
         },
-        "jvm_arg_unsafe_override" => match decision {
+        DiagnosisId::JvmArgUnsafeOverride => match decision {
             GuardianActionKind::Strip => Some(
                 "Remove memory, classpath, native-path, or agent overrides from saved JVM args before re-enabling them.",
             ),
@@ -802,40 +811,40 @@ fn guidance_for_diagnosis(
                 "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly.",
             ),
         },
-        "installed_version_metadata_missing"
-        | "parent_version_metadata_missing"
-        | "install_incomplete"
-        | "client_jar_missing"
-        | "libraries_missing"
-        | "asset_index_missing"
-        | "launcher_managed_artifact_corrupt"
-        | "launcher_managed_artifact_signature_corrupt" => {
+        DiagnosisId::InstalledVersionMetadataMissing
+        | DiagnosisId::ParentVersionMetadataMissing
+        | DiagnosisId::InstallIncomplete
+        | DiagnosisId::ClientJarMissing
+        | DiagnosisId::LibrariesMissing
+        | DiagnosisId::AssetIndexMissing
+        | DiagnosisId::LauncherManagedArtifactCorrupt
+        | DiagnosisId::LauncherManagedArtifactSignatureCorrupt => {
             Some("Install or repair the affected version before launching again.")
         }
-        "managed_runtime_missing" => {
+        DiagnosisId::ManagedRuntimeMissing => {
             Some("Let Axial prepare the managed Java runtime before launching.")
         }
-        "launch_memory_min_clamped" => Some(
+        DiagnosisId::LaunchMemoryMinClamped => Some(
             "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.",
         ),
-        "launch_memory_allocation_low" => Some(
+        DiagnosisId::LaunchMemoryAllocationLow => Some(
             "Raise the maximum memory allocation if Minecraft crashes during startup, stalls while loading, or exits with out-of-memory errors.",
         ),
-        "launch_resource_memory_pressure" => {
+        DiagnosisId::LaunchResourceMemoryPressure => {
             Some("Close another running session or lower memory allocation if startup is unstable.")
         }
-        "launch_resource_cpu_pressure" => Some(
+        DiagnosisId::LaunchResourceCpuPressure => Some(
             "Multiple launches can saturate low-end CPUs; wait for another launch to finish if startup feels sluggish.",
         ),
-        "launch_resource_install_pressure" => {
+        DiagnosisId::LaunchResourceInstallPressure => {
             Some("Wait for active install or download work to finish if startup feels slow.")
         }
-        "launch_resource_disk_pressure" => {
+        DiagnosisId::LaunchResourceDiskPressure => {
             Some("Free disk space before launching if caches or natives become unreliable.")
         }
-        "custom_java_override_present"
-        | "custom_jvm_preset_present"
-        | "custom_jvm_args_present" => {
+        DiagnosisId::CustomJavaOverridePresent
+        | DiagnosisId::CustomJvmPresetPresent
+        | DiagnosisId::CustomJvmArgsPresent => {
             Some("Switch Guardian back to Managed if you want Axial to adjust unsafe choices.")
         }
         _ => None,

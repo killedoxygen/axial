@@ -103,7 +103,7 @@ pub fn guardian_prelaunch_preset_adjustment_directive(
         OwnershipClass::LauncherManaged
     };
     let diagnosis = Diagnosis {
-        id: DiagnosisId::new("jvm_preset_adjusted"),
+        id: DiagnosisId::JvmPresetAdjusted,
         domain: GuardianDomain::Jvm,
         severity: GuardianSeverity::Recoverable,
         confidence: GuardianConfidence::Confirmed,
@@ -314,7 +314,7 @@ pub fn conservative_launch_recovery_preset(version_id: &str, runtime_major: u32)
 fn prepare_failure_diagnosis(request: &GuardianPrepareFailureRequest<'_>) -> Diagnosis {
     match request.failure_class {
         LaunchFailureClass::JavaRuntimeMismatch => Diagnosis {
-            id: DiagnosisId::new("java_runtime_major_mismatch"),
+            id: DiagnosisId::JavaRuntimeMajorMismatch,
             domain: GuardianDomain::Runtime,
             severity: GuardianSeverity::Blocking,
             confidence: GuardianConfidence::Confirmed,
@@ -333,7 +333,7 @@ fn prepare_failure_diagnosis(request: &GuardianPrepareFailureRequest<'_>) -> Dia
         LaunchFailureClass::JvmUnsupportedOption
         | LaunchFailureClass::JvmExperimentalUnlock
         | LaunchFailureClass::JvmOptionOrdering => Diagnosis {
-            id: DiagnosisId::new(jvm_failure_diagnosis_id(request.failure_class)),
+            id: DiagnosisId::JvmArgUnsupported,
             domain: GuardianDomain::Jvm,
             severity: GuardianSeverity::Blocking,
             confidence: GuardianConfidence::Confirmed,
@@ -350,7 +350,7 @@ fn prepare_failure_diagnosis(request: &GuardianPrepareFailureRequest<'_>) -> Dia
             public_reason_template: "jvm_arg_unsupported".to_string(),
         },
         failure_class => blocking_launch_diagnosis(
-            "launch_prepare_failed",
+            DiagnosisId::LaunchPrepareFailed,
             OperationPhase::Preparing,
             failure_class,
             "launch_prepare_failed",
@@ -365,7 +365,7 @@ fn startup_failure_diagnosis(
 ) -> Diagnosis {
     match request.observation {
         GuardianStartupFailureObservation::Stalled => Diagnosis {
-            id: DiagnosisId::new("startup_stalled"),
+            id: DiagnosisId::StartupStalled,
             domain: GuardianDomain::Startup,
             severity: GuardianSeverity::Blocking,
             confidence: GuardianConfidence::High,
@@ -388,7 +388,7 @@ fn startup_failure_diagnosis(
             LaunchFailureClass::JvmUnsupportedOption
             | LaunchFailureClass::JvmExperimentalUnlock
             | LaunchFailureClass::JvmOptionOrdering => Diagnosis {
-                id: DiagnosisId::new("jvm_arg_unsupported"),
+                id: DiagnosisId::JvmArgUnsupported,
                 domain: GuardianDomain::Jvm,
                 severity: GuardianSeverity::Blocking,
                 confidence: GuardianConfidence::High,
@@ -408,7 +408,7 @@ fn startup_failure_diagnosis(
                 public_reason_template: "jvm_arg_unsupported".to_string(),
             },
             LaunchFailureClass::JavaRuntimeMismatch => Diagnosis {
-                id: DiagnosisId::new("java_runtime_major_mismatch"),
+                id: DiagnosisId::JavaRuntimeMajorMismatch,
                 domain: GuardianDomain::Runtime,
                 severity: GuardianSeverity::Blocking,
                 confidence: GuardianConfidence::High,
@@ -428,37 +428,37 @@ fn startup_failure_diagnosis(
                 public_reason_template: "java_runtime_major_mismatch".to_string(),
             },
             LaunchFailureClass::OutOfMemory => blocking_user_owned_startup_diagnosis(
-                "out_of_memory",
+                DiagnosisId::OutOfMemory,
                 failure_class,
                 GuardianConfidence::High,
             ),
             LaunchFailureClass::GraphicsDriverCrash => blocking_user_owned_startup_diagnosis(
-                "graphics_driver_crash",
+                DiagnosisId::GraphicsDriverCrash,
                 failure_class,
                 GuardianConfidence::High,
             ),
             LaunchFailureClass::MissingDependency => blocking_user_owned_startup_diagnosis(
-                "missing_dependency",
+                DiagnosisId::MissingDependency,
                 failure_class,
                 GuardianConfidence::High,
             ),
             LaunchFailureClass::ModTransformationFailure => blocking_user_owned_startup_diagnosis(
-                "mod_transformation_failure",
+                DiagnosisId::ModTransformationFailure,
                 failure_class,
                 GuardianConfidence::High,
             ),
             LaunchFailureClass::ModAttributedCrash => blocking_user_owned_startup_diagnosis(
-                "mod_attributed_crash",
+                DiagnosisId::ModAttributedCrash,
                 failure_class,
                 GuardianConfidence::High,
             ),
             LaunchFailureClass::ClasspathModuleConflict => blocking_startup_diagnosis(
-                "classpath_module_conflict",
+                DiagnosisId::ClasspathModuleConflict,
                 failure_class,
                 GuardianConfidence::High,
             ),
             LaunchFailureClass::LauncherManagedArtifactSignature => Diagnosis {
-                id: DiagnosisId::new("launcher_managed_artifact_signature_corrupt"),
+                id: DiagnosisId::LauncherManagedArtifactSignatureCorrupt,
                 domain: GuardianDomain::Download,
                 severity: GuardianSeverity::Blocking,
                 confidence: GuardianConfidence::High,
@@ -478,22 +478,22 @@ fn startup_failure_diagnosis(
                 public_reason_template: "launcher_managed_artifact_signature_corrupt".to_string(),
             },
             LaunchFailureClass::AuthModeIncompatible => blocking_startup_diagnosis(
-                "auth_mode_incompatible",
+                DiagnosisId::AuthModeIncompatible,
                 failure_class,
                 GuardianConfidence::High,
             ),
             LaunchFailureClass::LoaderBootstrapFailure => blocking_startup_diagnosis(
-                "loader_bootstrap_failure",
+                DiagnosisId::LoaderBootstrapFailure,
                 failure_class,
                 GuardianConfidence::High,
             ),
             LaunchFailureClass::StartupStalled => blocking_startup_diagnosis(
-                "startup_stalled",
+                DiagnosisId::StartupStalled,
                 failure_class,
                 GuardianConfidence::High,
             ),
             LaunchFailureClass::Unknown => blocking_startup_diagnosis(
-                "startup_failed_unknown",
+                DiagnosisId::StartupFailedUnknown,
                 failure_class,
                 GuardianConfidence::Low,
             ),
@@ -799,13 +799,13 @@ fn safety_case(mode: GuardianMode, phase: OperationPhase, diagnosis: Diagnosis) 
 }
 
 fn blocking_launch_diagnosis(
-    id: &str,
+    id: DiagnosisId,
     phase: OperationPhase,
     failure_class: LaunchFailureClass,
     target_id: &str,
 ) -> Diagnosis {
     Diagnosis {
-        id: DiagnosisId::new(id),
+        id,
         domain: GuardianDomain::Launch,
         severity: GuardianSeverity::Blocking,
         confidence: if failure_class == LaunchFailureClass::Unknown {
@@ -823,12 +823,12 @@ fn blocking_launch_diagnosis(
         )],
         impact: GuardianImpactVector::launch_blocking(),
         candidate_actions: vec![GuardianActionKind::Block],
-        public_reason_template: id.to_string(),
+        public_reason_template: id.as_str().to_string(),
     }
 }
 
 fn blocking_startup_diagnosis(
-    id: &str,
+    id: DiagnosisId,
     failure_class: LaunchFailureClass,
     confidence: GuardianConfidence,
 ) -> Diagnosis {
@@ -842,7 +842,7 @@ fn blocking_startup_diagnosis(
 }
 
 fn blocking_user_owned_startup_diagnosis(
-    id: &str,
+    id: DiagnosisId,
     failure_class: LaunchFailureClass,
     confidence: GuardianConfidence,
 ) -> Diagnosis {
@@ -856,14 +856,14 @@ fn blocking_user_owned_startup_diagnosis(
 }
 
 fn blocking_startup_diagnosis_with_ownership(
-    id: &str,
+    id: DiagnosisId,
     failure_class: LaunchFailureClass,
     confidence: GuardianConfidence,
     ownership: OwnershipClass,
     target_id: &str,
 ) -> Diagnosis {
     Diagnosis {
-        id: DiagnosisId::new(id),
+        id,
         domain: GuardianDomain::Startup,
         severity: GuardianSeverity::Blocking,
         confidence,
@@ -876,7 +876,7 @@ fn blocking_startup_diagnosis_with_ownership(
         affected_targets: vec![target(GuardianDomain::Startup, target_id, ownership)],
         impact: GuardianImpactVector::launch_blocking(),
         candidate_actions: vec![GuardianActionKind::Block],
-        public_reason_template: id.to_string(),
+        public_reason_template: id.as_str().to_string(),
     }
 }
 
@@ -935,15 +935,6 @@ fn startup_failure_class(observation: GuardianStartupFailureObservation) -> Laun
     match observation {
         GuardianStartupFailureObservation::Stalled => LaunchFailureClass::StartupStalled,
         GuardianStartupFailureObservation::Exited { failure_class } => failure_class,
-    }
-}
-
-fn jvm_failure_diagnosis_id(failure_class: LaunchFailureClass) -> &'static str {
-    match failure_class {
-        LaunchFailureClass::JvmUnsupportedOption
-        | LaunchFailureClass::JvmExperimentalUnlock
-        | LaunchFailureClass::JvmOptionOrdering => "jvm_arg_unsupported",
-        _ => "jvm_failure",
     }
 }
 

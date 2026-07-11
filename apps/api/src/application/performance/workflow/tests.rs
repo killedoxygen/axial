@@ -596,7 +596,7 @@ fn seed_repeated_performance_memory(state: &AppState, composition_id: &str, coun
         crate::state::contracts::OwnershipClass::CompositionManaged,
     );
     let mut entry = crate::state::failure_memory::GuardianFailureMemoryEntry::observed(
-        crate::guardian::DiagnosisId::new("performance_fallback_selected"),
+        crate::guardian::DiagnosisId::PerformanceFallbackSelected,
         crate::guardian::GuardianDomain::Performance,
         target,
         crate::guardian::GuardianMode::Managed,

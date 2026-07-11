@@ -13,8 +13,6 @@ use crate::state::contracts::{
 };
 use serde::{Deserialize, Serialize};
 
-const CORRUPT_ARTIFACT_DIAGNOSIS: &str = "launcher_managed_artifact_corrupt";
-const MANAGED_RUNTIME_CORRUPT_DIAGNOSIS: &str = "managed_runtime_corrupt";
 const ARTIFACT_REPAIR_MAX_ATTEMPTS: u32 = 1;
 const ARTIFACT_REPAIR_MAX_DEPTH: u8 = 3;
 const ARTIFACT_REPAIR_SUPPRESSION_KEY: &str = "install:launcher_managed_artifact_corrupt";
@@ -208,7 +206,7 @@ pub fn plan_managed_runtime_ready_marker_repair(
     }
 
     Ok(GuardianRepairPlan {
-        diagnosis_id: diagnosis_id.clone(),
+        diagnosis_id,
         target: target.clone(),
         ownership: target.ownership,
         max_depth: RUNTIME_REPAIR_MAX_DEPTH,
@@ -259,7 +257,7 @@ fn plan_launcher_managed_artifact_repair_with_tasks(
     }
 
     Ok(GuardianRepairPlan {
-        diagnosis_id: diagnosis_id.clone(),
+        diagnosis_id,
         target: target.clone(),
         ownership: target.ownership,
         max_depth: ARTIFACT_REPAIR_MAX_DEPTH,
@@ -277,11 +275,10 @@ fn supported_artifact_diagnosis(
     decision: &GuardianDecision,
     plan: &GuardianActionPlan,
 ) -> Result<DiagnosisId, GuardianRepairPlanRejection> {
-    if plan.prerequisite.diagnosis_id.as_str() != CORRUPT_ARTIFACT_DIAGNOSIS
+    if plan.prerequisite.diagnosis_id != DiagnosisId::LauncherManagedArtifactCorrupt
         || !decision
             .diagnoses
-            .iter()
-            .any(|diagnosis| diagnosis.as_str() == CORRUPT_ARTIFACT_DIAGNOSIS)
+            .contains(&DiagnosisId::LauncherManagedArtifactCorrupt)
         || !plan
             .prerequisite
             .candidate_actions
@@ -289,7 +286,7 @@ fn supported_artifact_diagnosis(
     {
         return Err(GuardianRepairPlanRejection::UnsupportedDiagnosis);
     }
-    Ok(plan.prerequisite.diagnosis_id.clone())
+    Ok(plan.prerequisite.diagnosis_id)
 }
 
 fn supported_runtime_ready_marker_repair<'a>(
@@ -297,11 +294,10 @@ fn supported_runtime_ready_marker_repair<'a>(
     plan: &'a GuardianActionPlan,
 ) -> Result<(DiagnosisId, &'a GuardianAction), GuardianRepairPlanRejection> {
     if plan.owner != StabilizationSystem::Guardian
-        || plan.prerequisite.diagnosis_id.as_str() != MANAGED_RUNTIME_CORRUPT_DIAGNOSIS
+        || plan.prerequisite.diagnosis_id != DiagnosisId::ManagedRuntimeCorrupt
         || !decision
             .diagnoses
-            .iter()
-            .any(|diagnosis| diagnosis.as_str() == MANAGED_RUNTIME_CORRUPT_DIAGNOSIS)
+            .contains(&DiagnosisId::ManagedRuntimeCorrupt)
         || !plan
             .prerequisite
             .candidate_actions
@@ -318,7 +314,7 @@ fn supported_runtime_ready_marker_repair<'a>(
     if action.reason != plan.prerequisite.diagnosis_id {
         return Err(GuardianRepairPlanRejection::UnsupportedDiagnosis);
     }
-    Ok((plan.prerequisite.diagnosis_id.clone(), action))
+    Ok((plan.prerequisite.diagnosis_id, action))
 }
 
 fn repair_confidence_is_sufficient(confidence: GuardianConfidence) -> bool {
@@ -853,13 +849,13 @@ mod tests {
         );
 
         let mut unsupported = repair_decision(OwnershipClass::LauncherManaged);
-        unsupported.diagnoses = vec![DiagnosisId::new("managed_runtime_corrupt")];
+        unsupported.diagnoses = vec![DiagnosisId::ManagedRuntimeCorrupt];
         unsupported
             .action_plan
             .as_mut()
             .expect("plan")
             .prerequisite
-            .diagnosis_id = DiagnosisId::new("managed_runtime_corrupt");
+            .diagnosis_id = DiagnosisId::ManagedRuntimeCorrupt;
 
         assert_eq!(
             plan_launcher_managed_artifact_repair(
@@ -946,11 +942,11 @@ mod tests {
             operation_id: Some(OperationId::new("operation-install-repair")),
             mode: GuardianMode::Managed,
             kind: GuardianActionKind::Repair,
-            diagnoses: vec![DiagnosisId::new("launcher_managed_artifact_corrupt")],
+            diagnoses: vec![DiagnosisId::LauncherManagedArtifactCorrupt],
             action_plan: Some(GuardianActionPlan::new(
                 StabilizationSystem::Guardian,
                 ActionPlanPrerequisite {
-                    diagnosis_id: DiagnosisId::new("launcher_managed_artifact_corrupt"),
+                    diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
                     ownership,
                     confidence: GuardianConfidence::Confirmed,
                     affected_targets: vec![target.clone()],
@@ -963,7 +959,7 @@ mod tests {
                 vec![GuardianAction {
                     kind: GuardianActionKind::Repair,
                     target: Some(target),
-                    reason: DiagnosisId::new("launcher_managed_artifact_corrupt"),
+                    reason: DiagnosisId::LauncherManagedArtifactCorrupt,
                 }],
             )),
         }
@@ -981,16 +977,16 @@ mod tests {
     fn runtime_repair_decision_for_target(target: TargetDescriptor) -> GuardianDecision {
         let ownership = target.ownership;
         let operation_id = OperationId::new(format!("operation-runtime-{ownership:?}"));
-        let diagnosis_id = DiagnosisId::new("managed_runtime_corrupt");
+        let diagnosis_id = DiagnosisId::ManagedRuntimeCorrupt;
         GuardianDecision {
             operation_id: Some(operation_id),
             mode: GuardianMode::Managed,
             kind: GuardianActionKind::Repair,
-            diagnoses: vec![diagnosis_id.clone()],
+            diagnoses: vec![diagnosis_id],
             action_plan: Some(GuardianActionPlan::new(
                 StabilizationSystem::Guardian,
                 ActionPlanPrerequisite {
-                    diagnosis_id: diagnosis_id.clone(),
+                    diagnosis_id,
                     ownership,
                     confidence: GuardianConfidence::Confirmed,
                     affected_targets: vec![target.clone()],

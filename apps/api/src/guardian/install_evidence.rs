@@ -188,18 +188,18 @@ pub fn install_artifact_failure_guardian_outcome_with_context(
     let diagnosis_id = decision
         .action_plan
         .as_ref()
-        .map(|plan| plan.prerequisite.diagnosis_id.clone())
-        .or_else(|| decision.diagnoses.first().cloned())?;
-    if diagnosis_id.as_str() == "launcher_managed_artifact_corrupt" {
+        .map(|plan| plan.prerequisite.diagnosis_id)
+        .or_else(|| decision.diagnoses.first().copied())?;
+    if diagnosis_id == DiagnosisId::LauncherManagedArtifactCorrupt {
         return None;
     }
 
     Some(GuardianInstallFailureOutcome {
-        diagnosis_id: diagnosis_id.clone(),
+        diagnosis_id,
         decision: decision.kind,
         user_outcome: install_failure_user_outcome_from_evidence(
             decision.kind,
-            diagnosis_id.as_str(),
+            diagnosis_id,
             evidence,
         ),
     })
@@ -324,16 +324,16 @@ fn target_kind_for_install_failure(kind: GuardianInstallArtifactFailureKind) -> 
 
 fn install_failure_user_outcome_from_evidence(
     decision: GuardianActionKind,
-    diagnosis_id: &str,
+    diagnosis_id: DiagnosisId,
     evidence: &[GuardianInstallArtifactFailureEvidence],
 ) -> GuardianUserOutcome {
     let mut outcome = install_failure_user_outcome(decision, diagnosis_id);
     match diagnosis_id {
-        "managed_runtime_unavailable_for_platform" => {
+        DiagnosisId::ManagedRuntimeUnavailableForPlatform => {
             outcome.details = vec![runtime_unavailable_detail(evidence)];
             outcome.guidance = vec!["This version cannot be installed on this device.".to_string()];
         }
-        "managed_runtime_rosetta_required" => {
+        DiagnosisId::ManagedRuntimeRosettaRequired => {
             outcome.details = vec![runtime_rosetta_required_detail(evidence)];
             outcome.guidance = vec![
                 "Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then retry.".to_string(),

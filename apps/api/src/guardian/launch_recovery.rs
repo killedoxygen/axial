@@ -199,15 +199,15 @@ fn compatible_recovery_kinds(
     diagnosis_id: &DiagnosisId,
     action: Option<GuardianActionKind>,
 ) -> &'static [GuardianLaunchRecoveryKind] {
-    match (diagnosis_id.as_str(), action) {
-        ("java_runtime_recovery", Some(GuardianActionKind::Fallback)) => {
+    match (*diagnosis_id, action) {
+        (DiagnosisId::JavaRuntimeRecovery, Some(GuardianActionKind::Fallback)) => {
             &[GuardianLaunchRecoveryKind::SwitchManagedRuntime]
         }
-        ("jvm_arg_unsupported", Some(GuardianActionKind::Strip)) => &[
+        (DiagnosisId::JvmArgUnsupported, Some(GuardianActionKind::Strip)) => &[
             GuardianLaunchRecoveryKind::StripRawJvmArgs,
             GuardianLaunchRecoveryKind::DisableCustomGc,
         ],
-        ("jvm_preset_recovery", Some(GuardianActionKind::Downgrade)) => {
+        (DiagnosisId::JvmPresetRecovery, Some(GuardianActionKind::Downgrade)) => {
             &[GuardianLaunchRecoveryKind::DowngradePreset]
         }
         _ => &[],
@@ -318,7 +318,7 @@ pub async fn record_launch_recovery_attempt(
     request: GuardianLaunchRecoveryRecordRequest<'_>,
 ) -> Result<GuardianLaunchRecoveryOutcome, OperationJournalStoreError> {
     let plan = request.plan;
-    let diagnosis_id = plan.diagnosis_id.clone();
+    let diagnosis_id = plan.diagnosis_id;
     let operation_id = plan.operation_id.clone();
     let action = plan.directive.kind.action_kind();
     let memory_key = FailureMemoryKey::for_observation(
@@ -382,7 +382,7 @@ pub async fn record_launch_recovery_success(
     request: GuardianLaunchRecoveryRecordRequest<'_>,
 ) -> Result<GuardianLaunchRecoveryOutcome, OperationJournalStoreError> {
     let plan = request.plan;
-    let diagnosis_id = plan.diagnosis_id.clone();
+    let diagnosis_id = plan.diagnosis_id;
     let operation_id = plan.operation_id.clone();
     let action = plan.directive.kind.action_kind();
     match request.journals.get(&operation_id) {
@@ -427,7 +427,7 @@ pub async fn record_launch_recovery_failure(
     request: GuardianLaunchRecoveryRecordRequest<'_>,
 ) -> Result<GuardianLaunchRecoveryOutcome, OperationJournalStoreError> {
     let plan = request.plan;
-    let diagnosis_id = plan.diagnosis_id.clone();
+    let diagnosis_id = plan.diagnosis_id;
     let operation_id = plan.operation_id.clone();
     let action = plan.directive.kind.action_kind();
     let suppression_until = default_suppression_until(request.observed_at);
@@ -478,23 +478,23 @@ fn launch_recovery_diagnosis_id(
         (
             GuardianLaunchRecoveryKind::SwitchManagedRuntime,
             LaunchFailureClass::JavaRuntimeMismatch,
-        ) => "java_runtime_recovery",
+        ) => DiagnosisId::JavaRuntimeRecovery,
         (
             GuardianLaunchRecoveryKind::StripRawJvmArgs
             | GuardianLaunchRecoveryKind::DisableCustomGc,
             LaunchFailureClass::JvmUnsupportedOption
             | LaunchFailureClass::JvmExperimentalUnlock
             | LaunchFailureClass::JvmOptionOrdering,
-        ) => "jvm_arg_unsupported",
+        ) => DiagnosisId::JvmArgUnsupported,
         (
             GuardianLaunchRecoveryKind::DowngradePreset,
             LaunchFailureClass::JvmUnsupportedOption
             | LaunchFailureClass::JvmExperimentalUnlock
             | LaunchFailureClass::JvmOptionOrdering,
-        ) => "jvm_preset_recovery",
+        ) => DiagnosisId::JvmPresetRecovery,
         _ => return None,
     };
-    Some(DiagnosisId::new(id))
+    Some(id)
 }
 
 fn directive_kind_matches_effect(directive: &GuardianLaunchRecoveryDirective) -> bool {
@@ -540,7 +540,7 @@ async fn create_launch_recovery_planned_journal(
     entry.targets.push(plan.target.clone());
     entry
         .guardian_diagnosis_ids
-        .push(safe_id(plan.diagnosis_id.as_str(), "diagnosis"));
+        .push(plan.diagnosis_id.as_str().to_string());
     entry
         .planned_steps
         .push(launch_recovery_step(plan, OperationStepResult::Planned));
@@ -566,7 +566,7 @@ async fn create_launch_recovery_terminal_journal(
     entry.targets.push(plan.target.clone());
     entry
         .guardian_diagnosis_ids
-        .push(safe_id(plan.diagnosis_id.as_str(), "diagnosis"));
+        .push(plan.diagnosis_id.as_str().to_string());
     entry
         .planned_steps
         .push(launch_recovery_step(plan, OperationStepResult::Planned));
@@ -693,7 +693,7 @@ fn record_launch_recovery_memory(
     repair_attempt: bool,
 ) {
     let mut entry = GuardianFailureMemoryEntry::observed(
-        diagnosis_id.clone(),
+        *diagnosis_id,
         GuardianDomain::Launch,
         target.clone(),
         mode,
@@ -753,11 +753,6 @@ fn new_launch_recovery_operation_id(kind: GuardianLaunchRecoveryKind) -> Operati
         kind.step_id(),
         uuid::Uuid::new_v4()
     ))
-}
-
-fn safe_id(value: &str, fallback: &str) -> String {
-    sanitize_evidence_token(value, RedactionAudience::UserVisible, 96)
-        .unwrap_or_else(|| fallback.to_string())
 }
 
 #[cfg(test)]

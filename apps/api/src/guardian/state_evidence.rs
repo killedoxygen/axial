@@ -35,12 +35,12 @@ pub fn persisted_state_load_guardian_outcome(
         std::slice::from_ref(&fact),
     );
     let decision = decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
-    let diagnosis_id = safety_case.diagnoses.first()?.id.clone();
+    let diagnosis_id = safety_case.diagnoses.first()?.id;
 
     Some(GuardianStateLoadOutcome {
         decision: decision.kind,
-        diagnosis_id: diagnosis_id.clone(),
-        user_outcome: persisted_state_load_user_outcome(decision.kind, diagnosis_id.as_str()),
+        diagnosis_id,
+        user_outcome: persisted_state_load_user_outcome(decision.kind, diagnosis_id),
     })
 }
 

@@ -499,7 +499,7 @@ mod tests {
             OwnershipClass::CompositionManaged,
         );
         let mut entry = GuardianFailureMemoryEntry::observed(
-            crate::guardian::DiagnosisId::new("performance_fallback_selected"),
+            crate::guardian::DiagnosisId::PerformanceFallbackSelected,
             GuardianDomain::Performance,
             target,
             GuardianMode::Managed,

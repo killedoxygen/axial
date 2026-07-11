@@ -36,7 +36,7 @@ impl FailureMemoryKey {
         mode: GuardianMode,
         user_intent_hash: Option<&str>,
     ) -> Self {
-        let diagnosis = sanitize_target_id(diagnosis_id.as_str(), "diagnosis");
+        let diagnosis = diagnosis_id.as_str();
         let target_id = sanitize_target_id(&target.id, "target");
         let intent = user_intent_hash
             .map(|value| sanitize_target_id(value, "intent"))
@@ -84,7 +84,6 @@ impl GuardianFailureMemoryEntry {
         observed_at: impl Into<String>,
     ) -> Self {
         let observed_at = observed_at.into();
-        let diagnosis_id = DiagnosisId::new(sanitize_target_id(diagnosis_id.as_str(), "diagnosis"));
         let user_intent_hash = user_intent_hash
             .map(|value| sanitize_target_id(value, "intent"))
             .filter(|value| !value.is_empty());
@@ -164,9 +163,6 @@ impl GuardianFailureMemoryEntry {
             )
         {
             return Err(FailureMemoryValidationError::MemoryKeyMismatch);
-        }
-        if !is_safe_memory_fragment(self.diagnosis_id.as_str()) {
-            return Err(FailureMemoryValidationError::UnsafeDiagnosisId);
         }
         if !is_safe_memory_fragment(&self.target.id) {
             return Err(FailureMemoryValidationError::UnsafeTargetId);
@@ -281,7 +277,6 @@ impl From<FailureMemoryValidationError> for FailureMemoryLoadError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FailureMemoryValidationError {
     UnsafeKey,
-    UnsafeDiagnosisId,
     UnsafeTargetId,
     UnsafeTargetHash,
     UnsafeUserIntentHash,
@@ -829,8 +824,8 @@ mod tests {
         let value = serde_json::json!({
             "schema": super::FAILURE_MEMORY_SCHEMA,
             "entries": [{
-                "key": "Launch:bad_java_override:State.FilesystemPath.target:Managed:intent",
-                "diagnosis_id": "bad_java_override",
+                "key": "Launch:java_override_unavailable:State.FilesystemPath.target:Managed:intent",
+                "diagnosis_id": "java_override_unavailable",
                 "domain": "Launch",
                 "mode": "Managed",
                 "target": {
@@ -859,8 +854,8 @@ mod tests {
         let nested_unknown_field = serde_json::json!({
             "schema": super::FAILURE_MEMORY_SCHEMA,
             "entries": [{
-                "key": "Launch:bad_java_override:State.FilesystemPath.target:Managed:intent",
-                "diagnosis_id": "bad_java_override",
+                "key": "Launch:java_override_unavailable:State.FilesystemPath.target:Managed:intent",
+                "diagnosis_id": "java_override_unavailable",
                 "domain": "Launch",
                 "mode": "Managed",
                 "target": {
@@ -886,7 +881,7 @@ mod tests {
         assert!(FailureMemorySnapshot::from_json(&nested_unknown_field.to_string()).is_err());
 
         let unsafe_entry = GuardianFailureMemoryEntry::observed(
-            DiagnosisId::new("bad_java_override"),
+            DiagnosisId::JavaOverrideUnavailable,
             GuardianDomain::Launch,
             TargetDescriptor {
                 system: StabilizationSystem::State,
@@ -940,7 +935,7 @@ mod tests {
             classify_current_artifact(CurrentArtifact::ManagedRuntimeCache, "java_runtime_21")
                 .target;
         let repair = GuardianFailureMemoryEntry::observed(
-            DiagnosisId::new("managed_runtime_ready_marker_missing"),
+            DiagnosisId::ManagedRuntimeCorrupt,
             GuardianDomain::Runtime,
             managed_artifact.clone(),
             GuardianMode::Managed,
@@ -980,7 +975,7 @@ mod tests {
             .with_suppression_until("2026-06-15T11:00:00Z");
         let key = newer_action.key.clone();
         let stale_observation = GuardianFailureMemoryEntry::observed(
-            newer_action.diagnosis_id.clone(),
+            newer_action.diagnosis_id,
             newer_action.domain,
             newer_action.target.clone(),
             newer_action.mode,
@@ -1038,7 +1033,7 @@ mod tests {
         )
         .target;
         let entry = GuardianFailureMemoryEntry::observed(
-            DiagnosisId::new("remote_rules_signature_invalid"),
+            DiagnosisId::PerformanceRulesInvalid,
             GuardianDomain::Performance,
             target,
             GuardianMode::Managed,
@@ -1059,14 +1054,18 @@ mod tests {
     fn failure_memory_store_bounds_retention_to_recent_entries() {
         let store = GuardianFailureMemoryStore::with_max_entries(2);
         for (diagnosis, observed_at) in [
-            ("first_failure", "2026-06-15T10:00:00Z"),
-            ("second_failure", "2026-06-15T10:01:00Z"),
-            ("third_failure", "2026-06-15T10:02:00Z"),
+            (DiagnosisId::LaunchPrepareFailed, "2026-06-15T10:00:00Z"),
+            (DiagnosisId::StartupFailedUnknown, "2026-06-15T10:01:00Z"),
+            (DiagnosisId::OutOfMemory, "2026-06-15T10:02:00Z"),
         ] {
             let entry = GuardianFailureMemoryEntry::observed(
-                DiagnosisId::new(diagnosis),
+                diagnosis,
                 GuardianDomain::Launch,
-                classify_current_artifact(CurrentArtifact::UnknownFilesystemPath, diagnosis).target,
+                classify_current_artifact(
+                    CurrentArtifact::UnknownFilesystemPath,
+                    diagnosis.as_str(),
+                )
+                .target,
                 GuardianMode::Managed,
                 Some("intent"),
                 observed_at,
@@ -1079,7 +1078,7 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .all(|entry| entry.diagnosis_id.as_str() != "first_failure")
+                .all(|entry| entry.diagnosis_id != DiagnosisId::LaunchPrepareFailed)
         );
     }
 
@@ -1302,7 +1301,7 @@ mod tests {
 
     fn retry_entry(observed_at: &str) -> GuardianFailureMemoryEntry {
         GuardianFailureMemoryEntry::observed(
-            DiagnosisId::new("process_exited_before_boot_marker"),
+            DiagnosisId::StartupFailedUnknown,
             GuardianDomain::Launch,
             classify_current_artifact(CurrentArtifact::UserJvmArguments, "-Xmx16384M").target,
             GuardianMode::Managed,

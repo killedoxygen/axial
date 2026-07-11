@@ -13,7 +13,7 @@ mod repair;
 mod stream;
 
 use super::InstallVersionCommand;
-use crate::guardian::{GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus};
+use crate::guardian::{DiagnosisId, GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus};
 use crate::observability::{
     operation_journal_proof_record,
     telemetry::{
@@ -1551,7 +1551,7 @@ fn install_retry_action(
 }
 
 fn blocking_guardian_allows_retry(guardian: &InstallGuardianOutcomeSummary) -> bool {
-    guardian.diagnosis_id == "managed_runtime_rosetta_required"
+    guardian.diagnosis_id == DiagnosisId::ManagedRuntimeRosettaRequired
 }
 
 fn guardian_retry_disabled_reason(guardian: Option<&InstallGuardianOutcomeSummary>) -> String {

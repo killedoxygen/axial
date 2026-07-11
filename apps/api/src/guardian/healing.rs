@@ -378,7 +378,7 @@ async fn finish_runtime_repair(
         || {
             repair_outcome(
                 operation_id,
-                Some(context.diagnosis_id.clone()),
+                Some(*context.diagnosis_id),
                 action,
                 status,
                 facts,
@@ -410,7 +410,7 @@ fn planned_runtime_journal(
     ));
     entry
         .guardian_diagnosis_ids
-        .push(safe_id(diagnosis_id.as_str(), "diagnosis"));
+        .push(diagnosis_id.as_str().to_string());
     entry
 }
 
@@ -647,7 +647,7 @@ fn terminal_runtime_journal(
         .push(repair_step(step_result, Some(target.clone()), facts));
     entry
         .guardian_diagnosis_ids
-        .push(safe_id(diagnosis_id.as_str(), "diagnosis"));
+        .push(diagnosis_id.as_str().to_string());
     entry.outcome = Some(outcome);
     entry
 }
@@ -701,7 +701,7 @@ fn record_repair_memory(
     repair_attempt: bool,
 ) {
     let observation = GuardianFailureMemoryEntry::observed(
-        diagnosis_id.clone(),
+        *diagnosis_id,
         GuardianDomain::Runtime,
         target.clone(),
         mode,
@@ -746,7 +746,7 @@ fn repair_outcome(
 ) -> GuardianRepairOutcome {
     GuardianRepairOutcome {
         operation_id: safe_operation_id(&operation_id),
-        diagnosis_id: diagnosis_id.as_ref().map(safe_diagnosis_id),
+        diagnosis_id,
         action,
         status,
         facts,
@@ -771,7 +771,7 @@ fn repair_plan_block_reason(
     if mode == GuardianMode::Disabled {
         return Some("guardian_repair_blocked_by_policy");
     }
-    if plan.diagnosis_id.as_str() != "managed_runtime_corrupt" {
+    if plan.diagnosis_id != DiagnosisId::ManagedRuntimeCorrupt {
         return Some("guardian_repair_blocked_by_policy");
     }
     if plan.ownership != target.ownership {
@@ -824,10 +824,6 @@ fn default_suppression_until(observed_at: &str) -> Option<String> {
 
 fn safe_operation_id(operation_id: &OperationId) -> OperationId {
     OperationId::new(safe_id(operation_id.as_str(), "operation"))
-}
-
-fn safe_diagnosis_id(diagnosis_id: &DiagnosisId) -> DiagnosisId {
-    DiagnosisId::new(safe_id(diagnosis_id.as_str(), "diagnosis"))
 }
 
 fn safe_id(value: &str, fallback: &str) -> String {
@@ -1150,7 +1146,7 @@ mod tests {
             .failure_memory
             .record(
                 GuardianFailureMemoryEntry::observed(
-                    DiagnosisId::new("managed_runtime_corrupt"),
+                    DiagnosisId::ManagedRuntimeCorrupt,
                     crate::guardian::GuardianDomain::Runtime,
                     target.clone(),
                     GuardianMode::Managed,
@@ -1186,7 +1182,7 @@ mod tests {
         assert_eq!(journal.outcome, Some(OperationOutcome::Suppressed));
         let memory_key = FailureMemoryKey::for_observation(
             crate::guardian::GuardianDomain::Runtime,
-            &DiagnosisId::new("managed_runtime_corrupt"),
+            &DiagnosisId::ManagedRuntimeCorrupt,
             &target,
             GuardianMode::Managed,
             None,
@@ -1336,12 +1332,12 @@ mod tests {
         let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let target = decision_target(&decision);
-        let diagnosis_id = DiagnosisId::new("managed_runtime_corrupt");
+        let diagnosis_id = DiagnosisId::ManagedRuntimeCorrupt;
         stores
             .failure_memory
             .record(
                 GuardianFailureMemoryEntry::observed(
-                    diagnosis_id.clone(),
+                    diagnosis_id,
                     crate::guardian::GuardianDomain::Runtime,
                     target.clone(),
                     GuardianMode::Managed,
@@ -1413,7 +1409,7 @@ mod tests {
             {
                 let mut decision = repair_decision(OwnershipClass::LauncherManaged);
                 decision.action_plan.as_mut().expect("plan").actions[0].reason =
-                    DiagnosisId::new("other_diagnosis");
+                    DiagnosisId::DownloadUnavailable;
                 decision
             },
         ] {
@@ -1449,7 +1445,7 @@ mod tests {
             .failure_memory
             .record(
                 GuardianFailureMemoryEntry::observed(
-                    DiagnosisId::new("managed_runtime_corrupt"),
+                    DiagnosisId::ManagedRuntimeCorrupt,
                     crate::guardian::GuardianDomain::Runtime,
                     target,
                     GuardianMode::Managed,
@@ -1501,7 +1497,7 @@ mod tests {
             .failure_memory
             .record(
                 GuardianFailureMemoryEntry::observed(
-                    DiagnosisId::new("managed_runtime_corrupt"),
+                    DiagnosisId::ManagedRuntimeCorrupt,
                     crate::guardian::GuardianDomain::Runtime,
                     target,
                     GuardianMode::Managed,
@@ -1636,7 +1632,7 @@ mod tests {
         assert_eq!(journal.outcome, Some(OperationOutcome::Failed));
         let key = FailureMemoryKey::for_observation(
             crate::guardian::GuardianDomain::Runtime,
-            &DiagnosisId::new("managed_runtime_corrupt"),
+            &DiagnosisId::ManagedRuntimeCorrupt,
             &decision
                 .action_plan
                 .as_ref()
@@ -1743,9 +1739,9 @@ mod tests {
     fn repair_decision_for_target(target: TargetDescriptor) -> GuardianDecision {
         let ownership = target.ownership;
         let operation_id = OperationId::new(format!("operation-{ownership:?}"));
-        let diagnosis_id = DiagnosisId::new("managed_runtime_corrupt");
+        let diagnosis_id = DiagnosisId::ManagedRuntimeCorrupt;
         let prerequisite = ActionPlanPrerequisite {
-            diagnosis_id: diagnosis_id.clone(),
+            diagnosis_id,
             ownership,
             confidence: crate::guardian::GuardianConfidence::Confirmed,
             affected_targets: vec![target.clone()],
@@ -1755,7 +1751,7 @@ mod tests {
             operation_id: Some(operation_id),
             mode: GuardianMode::Managed,
             kind: GuardianActionKind::Repair,
-            diagnoses: vec![diagnosis_id.clone()],
+            diagnoses: vec![diagnosis_id],
             action_plan: Some(GuardianActionPlan::new(
                 StabilizationSystem::Guardian,
                 prerequisite,
