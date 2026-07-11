@@ -12,12 +12,13 @@ use super::{
     PerformanceInstallResponse, PerformanceOperation, PerformanceRollbackListRequest,
     optional_value, required_value,
 };
+use crate::application::guardian_conversion::api_guardian_mode_from_config;
 use crate::guardian::{
-    GuardianFact, GuardianMode, GuardianPerformanceOperationKind,
-    GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection,
-    GuardianPerformanceSupervisionRequest, GuardianPolicyContext,
-    performance_failure_memory_guardian_fact, performance_plan_guardian_facts,
-    performance_supervision_rejection_user_outcome, plan_performance_supervision,
+    GuardianFact, GuardianPerformanceOperationKind, GuardianPerformanceSupervisionPlan,
+    GuardianPerformanceSupervisionRejection, GuardianPerformanceSupervisionRequest,
+    GuardianPolicyContext, performance_failure_memory_guardian_fact,
+    performance_plan_guardian_facts, performance_supervision_rejection_user_outcome,
+    plan_performance_supervision,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{OperationId, OperationPhase, RollbackState};
@@ -689,7 +690,7 @@ fn supervise_performance_operation(
 ) -> Result<GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection> {
     plan_performance_supervision(GuardianPerformanceSupervisionRequest {
         operation_id: None,
-        mode: performance_guardian_mode(state),
+        mode: api_guardian_mode_from_config(&state.config().current().guardian_mode),
         phase,
         operation,
         target: performance_composition_target(target_id),
@@ -715,14 +716,6 @@ fn performance_install_guardian_facts(
             .filter_map(|entry| performance_failure_memory_guardian_fact(&entry, phase)),
     );
     facts
-}
-
-fn performance_guardian_mode(state: &AppState) -> GuardianMode {
-    match state.config().current().guardian_mode.trim() {
-        "custom" => GuardianMode::Custom,
-        "disabled" => GuardianMode::Disabled,
-        _ => GuardianMode::Managed,
-    }
 }
 
 async fn preflight_current_performance_state(

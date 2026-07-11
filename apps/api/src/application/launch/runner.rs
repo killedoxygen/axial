@@ -6,6 +6,7 @@ mod recovery;
 mod spawn;
 mod status;
 
+use crate::application::guardian_conversion::api_guardian_mode;
 use crate::application::launch_application_stage_evidence;
 use crate::execution::launch::{
     LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
@@ -111,7 +112,7 @@ pub(crate) async fn launch_session(
 ) -> Result<LaunchSuccess, LaunchRequestError> {
     let session_id = task.intent.session_id.clone();
     let instance_id = task.intent.instance_id.clone();
-    let guardian_mode = launch_policy_guardian_mode(task.intent.guardian.mode);
+    let guardian_mode = api_guardian_mode(task.intent.guardian.mode);
     let initial_guardian = task.guardian.clone();
     let launched_at = task.launched_at.clone();
     let proof_context = LaunchProofContext::from_intent(&task.intent)
@@ -615,7 +616,7 @@ async fn launch_session_inner_with_control(
                 trace_launch_event(&session_id, &format!("prepare failed: {}", error.message));
                 let prepare_outcome =
                     guardian_prepare_failure_outcome(GuardianPrepareFailureRequest {
-                        mode: launch_policy_guardian_mode(intent.guardian.mode),
+                        mode: api_guardian_mode(intent.guardian.mode),
                         failure_class,
                         public_error: &error.message,
                         requested_java_present: !intent.requested_java.trim().is_empty(),
@@ -633,7 +634,7 @@ async fn launch_session_inner_with_control(
                             session_id: &session_id,
                             intent: &intent,
                             directive,
-                            mode: launch_policy_guardian_mode(intent.guardian.mode),
+                            mode: api_guardian_mode(intent.guardian.mode),
                             failure_class,
                             recovery_attempts: &mut recovery_attempts,
                             max_recovery_attempts: MAX_RECOVERY_ATTEMPTS,
@@ -707,7 +708,7 @@ async fn launch_session_inner_with_control(
         };
         if let Some(directive) =
             guardian_prelaunch_preset_adjustment_directive(GuardianPresetAdjustmentRequest {
-                mode: launch_policy_guardian_mode(intent.guardian.mode),
+                mode: api_guardian_mode(intent.guardian.mode),
                 requested_preset: &intent.requested_preset,
                 effective_preset: &prepared.effective_preset,
                 explicit_jvm_preset_present: intent.guardian.has_named_preset(),
@@ -1069,7 +1070,7 @@ async fn launch_session_inner_with_control(
                             .unwrap_or(LaunchFailureClass::Unknown),
                     }
                 };
-                let guardian_mode = launch_policy_guardian_mode(intent.guardian.mode);
+                let guardian_mode = api_guardian_mode(intent.guardian.mode);
                 let startup_outcome =
                     guardian_startup_failure_outcome(GuardianStartupFailureRequest {
                         mode: guardian_mode,
@@ -1128,7 +1129,7 @@ async fn launch_session_inner_with_control(
                             session_id: &session_id,
                             intent: &intent,
                             directive,
-                            mode: launch_policy_guardian_mode(intent.guardian.mode),
+                            mode: api_guardian_mode(intent.guardian.mode),
                             failure_class,
                             recovery_attempts: &mut recovery_attempts,
                             max_recovery_attempts: MAX_RECOVERY_ATTEMPTS,
@@ -1370,15 +1371,6 @@ async fn repair_legacy_virtual_assets_before_launch(
         ));
     }
     Ok(LegacyVirtualAssetRepairOutcome::RepairedLegacy)
-}
-
-fn launch_policy_guardian_mode(
-    mode: axial_launcher::GuardianMode,
-) -> crate::guardian::GuardianMode {
-    match mode {
-        axial_launcher::GuardianMode::Managed => crate::guardian::GuardianMode::Managed,
-        axial_launcher::GuardianMode::Custom => crate::guardian::GuardianMode::Custom,
-    }
 }
 
 fn startup_failure_healing(

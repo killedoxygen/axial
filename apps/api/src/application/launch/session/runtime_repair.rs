@@ -1,8 +1,6 @@
 use super::readiness::readiness_has_managed_runtime_missing;
-use super::{
-    LaunchPreflightBuild, LaunchPreflightFacts, application_guardian_mode,
-    build_launch_preflight_facts,
-};
+use super::{LaunchPreflightBuild, LaunchPreflightFacts, build_launch_preflight_facts};
+use crate::application::guardian_conversion::api_guardian_mode;
 use crate::execution::runtime::{
     ManagedRuntimeRoot, ManagedRuntimeVerificationRequest, verify_managed_runtime,
 };
@@ -110,7 +108,7 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
         .map(|fact| guardian_fact_from_execution(fact, OperationPhase::Validating))
         .collect::<Vec<_>>();
     let repair_outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest::new(
-        application_guardian_mode(preflight.guardian.mode),
+        api_guardian_mode(preflight.guardian.mode),
         &guardian_facts,
     ));
     let Ok(repair_plan) = plan_managed_runtime_ready_marker_repair(

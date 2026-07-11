@@ -536,9 +536,9 @@ fn push_unique_detail(details: &mut Vec<String>, detail: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::launch_policy_guardian_mode;
     use super::super::status::serialize_guardian;
     use super::*;
+    use crate::application::guardian_conversion::api_guardian_mode;
     use crate::guardian::{
         GuardianStartupFailureObservation, GuardianStartupFailureRequest,
         guardian_startup_failure_outcome,
@@ -599,7 +599,7 @@ mod tests {
         let mut guardian = GuardianSummary::new(GuardianMode::Managed);
         guardian.warn_with_guidance(vec![warning.clone()]);
         let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
-            mode: launch_policy_guardian_mode(GuardianMode::Managed),
+            mode: api_guardian_mode(GuardianMode::Managed),
             observation: GuardianStartupFailureObservation::Stalled,
             crash_evidence: None,
             target_version_id: "1.21.1",
@@ -647,7 +647,7 @@ mod tests {
     fn startup_exited_blocks_with_observed_failure_guardian_summary() {
         let mut guardian = GuardianSummary::new(GuardianMode::Custom);
         let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
-            mode: launch_policy_guardian_mode(GuardianMode::Custom),
+            mode: api_guardian_mode(GuardianMode::Custom),
             observation: GuardianStartupFailureObservation::Exited {
                 failure_class: LaunchFailureClass::JvmUnsupportedOption,
             },
@@ -693,7 +693,7 @@ mod tests {
     fn custom_preset_startup_failure_blocks_without_recovery_directive() {
         let mut guardian = GuardianSummary::new(GuardianMode::Custom);
         let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
-            mode: launch_policy_guardian_mode(GuardianMode::Custom),
+            mode: api_guardian_mode(GuardianMode::Custom),
             observation: GuardianStartupFailureObservation::Exited {
                 failure_class: LaunchFailureClass::JvmUnsupportedOption,
             },

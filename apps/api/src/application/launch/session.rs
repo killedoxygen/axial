@@ -6,6 +6,7 @@ mod runtime_repair;
 
 use super::policy;
 use super::runner::trace_launch_event;
+use crate::application::guardian_conversion::{api_guardian_mode, launcher_guardian_decision};
 use crate::application::timing::{
     LaunchPreflightFactTiming, LaunchPreflightResponseTiming, LaunchSessionTiming,
     trace_launch_preflight_facts, trace_launch_preflight_response, trace_launch_session,
@@ -18,9 +19,9 @@ use crate::application::{
 use crate::guardian::{
     GuardianDecisionKind as ApiGuardianDecisionKind, GuardianFact,
     GuardianLaunchFailureMemoryIntakeRequest, GuardianLaunchRecoveryCurrentIntent,
-    GuardianMode as ApiGuardianMode, GuardianPreflightDirective, GuardianPreflightOutcome,
-    GuardianPreflightOutcomeRequest, GuardianPreflightReadiness, guardian_fact_from_execution,
-    guardian_preflight_outcome, launch_failure_memory_guardian_facts,
+    GuardianPreflightDirective, GuardianPreflightOutcome, GuardianPreflightOutcomeRequest,
+    GuardianPreflightReadiness, guardian_fact_from_execution, guardian_preflight_outcome,
+    launch_failure_memory_guardian_facts,
 };
 use crate::logging::timestamp_utc;
 use crate::state::contracts::OperationPhase;
@@ -29,8 +30,8 @@ use crate::state::{AppState, LaunchSessionRecord, ensure_instance_layout};
 use auth::{LaunchAuthRefreshOptions, resolve_launch_auth_context};
 use axial_config::{AppConfig, Instance};
 use axial_launcher::{
-    GuardianDecision, GuardianMode, GuardianSummary, LaunchGuardianContext, LaunchIntent,
-    LaunchReadiness, LaunchReadinessReason, LaunchReadinessReasonId, LaunchReadinessRequest,
+    GuardianMode, GuardianSummary, LaunchGuardianContext, LaunchIntent, LaunchReadiness,
+    LaunchReadinessReason, LaunchReadinessReasonId, LaunchReadinessRequest,
     LaunchReadinessSeverity, LaunchStageEvidence, LaunchState, inspect_launch_readiness,
     launch_notice,
 };
@@ -714,7 +715,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
         GuardianLaunchFailureMemoryIntakeRequest {
             entries: &failure_memory,
             instance_id: &instance.id,
-            mode: application_guardian_mode(guardian.mode),
+            mode: api_guardian_mode(guardian.mode),
             current_at: &current_at,
             current_intent: GuardianLaunchRecoveryCurrentIntent {
                 target_version_id: &target_version_id,
@@ -750,7 +751,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
     let guardian_started_at = Instant::now();
     let guardian_outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
         operation_id: None,
-        mode: application_guardian_mode(guardian.mode),
+        mode: api_guardian_mode(guardian.mode),
         phase: OperationPhase::Validating,
         facts: &guardian_facts,
         readiness: GuardianPreflightReadiness::from_facts(readiness.launchable, &readiness_facts),
@@ -830,13 +831,6 @@ fn apply_guardian_preflight_interventions(
     }
 }
 
-fn application_guardian_mode(mode: GuardianMode) -> ApiGuardianMode {
-    match mode {
-        GuardianMode::Managed => ApiGuardianMode::Managed,
-        GuardianMode::Custom => ApiGuardianMode::Custom,
-    }
-}
-
 fn guardian_preflight_blocks_launch(outcome: &GuardianPreflightOutcome) -> bool {
     matches!(
         outcome.user_outcome.decision,
@@ -872,19 +866,6 @@ fn launcher_guardian_public_lines(outcome: &GuardianPreflightOutcome) -> Vec<Str
         }
     }
     lines
-}
-
-fn launcher_guardian_decision(decision: ApiGuardianDecisionKind) -> GuardianDecision {
-    match decision {
-        ApiGuardianDecisionKind::Allow | ApiGuardianDecisionKind::RecordOnly => {
-            GuardianDecision::Allowed
-        }
-        ApiGuardianDecisionKind::Warn => GuardianDecision::Warned,
-        ApiGuardianDecisionKind::Block | ApiGuardianDecisionKind::AskUser => {
-            GuardianDecision::Blocked
-        }
-        _ => GuardianDecision::Intervened,
-    }
 }
 
 impl LaunchPreflightFacts {

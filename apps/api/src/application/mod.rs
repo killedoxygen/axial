@@ -11,6 +11,7 @@ pub mod authority;
 pub mod commands;
 pub mod config;
 pub mod flags;
+mod guardian_conversion;
 pub mod install;
 pub mod instances;
 pub mod java;
