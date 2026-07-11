@@ -992,7 +992,7 @@ mod tests {
     use crate::state::OperationJournalStore;
     use crate::state::contracts::{
         OperationId, OperationOutcome, OperationStatus, OperationStepResult, OwnershipClass,
-        StabilizationSystem, TargetDescriptor, TargetKind,
+        RollbackState, StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use crate::state::failure_memory::{
         FailureMemoryActionOutcome, FailureMemoryKey, GuardianFailureMemoryEntry,
@@ -1302,6 +1302,55 @@ mod tests {
             Some(FailureMemoryActionOutcome::Failed)
         );
         assert_eq!(memory[0].repair_attempt_count, 1);
+
+        server.stop();
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn missing_artifact_download_failure_records_unavailable_rollback() {
+        let root = test_root("missing-checksum-failure");
+        fs::create_dir_all(&root).expect("root");
+        let destination = root.join("missing.jar");
+        let replacement = b"fresh missing artifact".to_vec();
+        let server = TestByteServer::start(replacement);
+        let stores = stores();
+        let plan = missing_artifact_plan();
+
+        let outcome = execute_guardian_artifact_repair(missing_request_with_checksum(
+            &plan,
+            &destination,
+            &server.url,
+            "sha256",
+            &sha256_hex(b"different artifact"),
+            None,
+            &stores,
+            "2026-06-15T10:00:00Z",
+        ))
+        .await;
+
+        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Failed);
+        assert!(!destination.exists());
+        assert_eq!(server.request_count(), 1);
+        let journal = stores.journals.get(&outcome.operation_id).expect("journal");
+        assert_eq!(journal.status, OperationStatus::Failed);
+        assert_eq!(journal.outcome, Some(OperationOutcome::Failed));
+        let failure_step = journal.completed_steps.last().expect("failure step");
+        assert_eq!(failure_step.step_id, "download_artifact_to_temp");
+        assert_eq!(failure_step.result, OperationStepResult::Failed);
+        assert_eq!(failure_step.rollback, RollbackState::Unavailable);
+        assert!(
+            !journal
+                .completed_steps
+                .iter()
+                .any(|step| step.step_id == "quarantine_launcher_managed_target")
+        );
+        let memory = stores.failure_memory.list();
+        assert_eq!(
+            memory[0].last_action_outcome,
+            Some(FailureMemoryActionOutcome::Failed)
+        );
+        assert!(memory[0].quarantined_target.is_none());
 
         server.stop();
         cleanup(&root);
