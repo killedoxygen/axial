@@ -19,7 +19,6 @@ pub struct UpdateFlowSnapshot {
     pub version: String,
     pub received_bytes: u64,
     pub total_bytes: Option<u64>,
-    // Message must stay static, user-facing copy; never embed paths or URLs.
     pub message: String,
     pub staged_path: Option<PathBuf>,
 }
@@ -66,7 +65,6 @@ impl UpdaterStore {
         self.inner.lock().expect("updater lock").flow.clone()
     }
 
-    /// Transition into `Downloading`; refused while a download or apply is in flight.
     pub fn begin_download(&self, version: &str) -> Result<u64, &'static str> {
         let mut inner = self.inner.lock().expect("updater lock");
         match inner.flow.phase {
@@ -119,7 +117,6 @@ impl UpdaterStore {
         inner.flow.staged_path = None;
     }
 
-    /// Transition `Ready` -> `Applying`, handing back the staged binary path.
     pub fn begin_apply(&self) -> Result<PathBuf, &'static str> {
         let mut inner = self.inner.lock().expect("updater lock");
         if inner.flow.phase != UpdateFlowPhase::Ready {

@@ -18,7 +18,6 @@ const MAX_UPDATE_ASSET_BYTES: u64 = 256 << 20;
 const MAX_UPDATE_CHECKSUM_BYTES: u64 = 4 << 10;
 const MAX_STAGED_BINARY_BYTES: u64 = 256 << 20;
 
-// User-facing flow failure copy; keep static so no paths or URLs can leak.
 const DOWNLOAD_FAILED_MESSAGE: &str = "update download failed";
 const CHECKSUM_FAILED_MESSAGE: &str = "update checksum did not match";
 const ARCHIVE_FAILED_MESSAGE: &str = "update package could not be unpacked";
@@ -137,8 +136,6 @@ pub async fn apply_staged_update(
     }
 }
 
-/// Remove leftover staged updates from a previous run; they are only valid
-/// within the session that downloaded them.
 pub fn spawn_update_staging_cleanup(state: &AppState) {
     let staging_dir = state.updater().staging_dir().to_path_buf();
     tokio::spawn(async move {
@@ -255,7 +252,6 @@ fn parse_checksum_sidecar(body: &str, asset_name: &str) -> Option<String> {
         if hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
             continue;
         }
-        // sha256sum sidecars carry "<hash>  <name>"; a bare hash is accepted too.
         match parts.next() {
             Some(name) if name.trim_start_matches('*') != asset_name => continue,
             _ => return Some(hash.to_ascii_lowercase()),

@@ -180,9 +180,7 @@ async function pollUpdateFlow(): Promise<void> {
   try {
     const res = await api('GET', '/update/flow');
     setUpdateFlow(updateFlowFromResponse(res));
-  } catch {
-    // transient poll failure; keep the last known state and retry
-  }
+  } catch {}
   if (updateFlowPollActive(updateFlow.value.phase)) scheduleUpdateFlowPoll();
 }
 
