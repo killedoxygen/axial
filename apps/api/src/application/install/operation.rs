@@ -352,7 +352,7 @@ pub async fn record_install_operation_guardian_evidence(
         .collect::<Vec<_>>();
     let diagnosis_ids = diagnose_facts(&guardian_facts, OperationPhase::Downloading)
         .into_iter()
-        .map(|diagnosis| diagnosis.id.as_str().to_string())
+        .map(|diagnosis| diagnosis.id)
         .collect::<Vec<_>>();
     record_guardian_evidence_with_reconciliation(journals, operation_id, fact_ids, diagnosis_ids)
         .await
@@ -458,13 +458,10 @@ pub fn install_guardian_outcome_summary_from_journal(
 ) -> Option<InstallGuardianOutcomeSummary> {
     let decision = latest_generated_fact_value(entry, GUARDIAN_OUTCOME_DECISION_PREFIX)?;
     let label = latest_generated_fact_value(entry, GUARDIAN_OUTCOME_SUMMARY_PREFIX)?;
-    let diagnosis_ids = entry
+    let diagnosis_id = entry
         .guardian_diagnosis_ids
         .iter()
-        .map(|id| serde_json::from_value::<DiagnosisId>(serde_json::Value::String(id.clone())).ok())
-        .collect::<Option<Vec<_>>>()?;
-    let diagnosis_id = diagnosis_ids
-        .into_iter()
+        .copied()
         .rev()
         .find(|id| *id != DiagnosisId::LauncherManagedArtifactCorrupt)?;
     let detail = latest_generated_fact_value(entry, GUARDIAN_OUTCOME_DETAIL_PREFIX);
@@ -1130,7 +1127,7 @@ async fn record_guardian_evidence_with_reconciliation(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
     facts: Vec<String>,
-    diagnosis_ids: Vec<String>,
+    diagnosis_ids: Vec<DiagnosisId>,
 ) -> Result<(), OperationJournalStoreError> {
     loop {
         match journals
@@ -1202,7 +1199,7 @@ fn install_failure_with_evidence_matches(
     step: &OperationJournalStep,
     failure_point: &str,
     fact_ids: &[String],
-    diagnosis_ids: &[String],
+    diagnosis_ids: &[DiagnosisId],
 ) -> bool {
     let mut expected_step = step.clone();
     for fact_id in fact_ids {
@@ -1232,7 +1229,7 @@ fn install_guardian_evidence_update(
     operation_id: &OperationId,
     evidence: &[GuardianInstallArtifactFailureEvidence],
     observed_at: &str,
-) -> Option<(Vec<String>, Vec<String>)> {
+) -> Option<(Vec<String>, Vec<DiagnosisId>)> {
     let mode = GuardianMode::Managed;
     let phase = OperationPhase::Downloading;
     let context = failure_memory_suppression_context(
@@ -1287,7 +1284,7 @@ fn install_guardian_evidence_update(
         facts.push(prefixed_guardian_guidance_fact(guidance));
     }
 
-    Some((facts, vec![outcome.diagnosis_id.as_str().to_string()]))
+    Some((facts, vec![outcome.diagnosis_id]))
 }
 
 fn loader_error_guardian_failure_evidence(

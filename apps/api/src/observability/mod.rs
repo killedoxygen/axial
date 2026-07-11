@@ -5,6 +5,7 @@
 
 pub mod telemetry;
 
+use crate::guardian::DiagnosisId;
 use crate::state::contracts::{
     CommandKind, OperationId, OperationJournalEntry, OperationOutcome, OperationStatus,
     RollbackState, StabilizationSystem, TargetDescriptor,
@@ -109,7 +110,7 @@ pub struct OperationProofRecord {
     pub outcome: Option<OperationOutcome>,
     pub targets: Vec<TargetDescriptor>,
     pub failure_point: Option<String>,
-    pub guardian_diagnosis_ids: Vec<String>,
+    pub guardian_diagnosis_ids: Vec<DiagnosisId>,
     pub rollback: RollbackState,
     pub fields: Vec<EvidenceField>,
     pub retention: RetentionClass,
@@ -198,7 +199,7 @@ pub fn operation_journal_proof_record(entry: &OperationJournalEntry) -> Operatio
         guardian_diagnosis_ids: entry
             .guardian_diagnosis_ids
             .iter()
-            .filter_map(|value| sanitize_proof_identifier(value, 96))
+            .copied()
             .take(16)
             .collect(),
         rollback: entry.rollback,
@@ -761,6 +762,7 @@ mod tests {
         sanitize_evidence_text, sanitize_evidence_token, sanitize_public_diagnostic_text,
         sanitize_public_json_value, sanitize_public_log_line,
     };
+    use crate::guardian::DiagnosisId;
     use crate::state::contracts::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
         OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
@@ -1013,10 +1015,7 @@ mod tests {
         });
         entry
             .guardian_diagnosis_ids
-            .push("download_unavailable".to_string());
-        entry
-            .guardian_diagnosis_ids
-            .push("token-secret-diagnosis".to_string());
+            .push(DiagnosisId::DownloadUnavailable);
         let mut step = OperationJournalStep::new("install_progress_error", OperationPhase::Failed);
         step.result = OperationStepResult::Failed;
         step.generated_facts
@@ -1039,7 +1038,11 @@ mod tests {
             proof.failure_point.as_deref(),
             Some("install_worker_interrupted")
         );
-        assert_eq!(proof.guardian_diagnosis_ids, vec!["download_unavailable"]);
+        assert_eq!(
+            proof.guardian_diagnosis_ids,
+            vec![DiagnosisId::DownloadUnavailable]
+        );
+        assert!(encoded.contains(r#""guardian_diagnosis_ids":["download_unavailable"]"#));
         assert!(proof.fields.iter().any(|field| {
             field.key == "generated_fact" && field.value == "guardian_outcome_decision:retry"
         }));
@@ -1057,7 +1060,6 @@ mod tests {
         assert!(!encoded.contains("secret.jar"));
         assert!(!encoded.contains("accessToken"));
         assert!(!encoded.contains("-Xmx"));
-        assert!(!encoded.contains("token-secret-diagnosis"));
     }
 
     #[test]
@@ -1076,10 +1078,7 @@ mod tests {
         entry.failure_point = Some("install_progress_error".to_string());
         entry
             .guardian_diagnosis_ids
-            .push("download-123e4567-e89b-12d3-a456-426614174000".to_string());
-        entry
-            .guardian_diagnosis_ids
-            .push("123e4567-e89b-12d3-a456-426614174000".to_string());
+            .push(DiagnosisId::DownloadUnavailable);
         entry.targets.push(TargetDescriptor::new(
             StabilizationSystem::Application,
             TargetKind::Version,
@@ -1092,7 +1091,7 @@ mod tests {
         assert_eq!(proof.operation_id, OperationId::new(operation_id));
         assert_eq!(
             proof.guardian_diagnosis_ids,
-            vec!["download-123e4567-e89b-12d3-a456-426614174000"]
+            vec![DiagnosisId::DownloadUnavailable]
         );
         assert!(proof.fields.iter().any(|field| {
             field.key == "journal_id" && field.value == format!("journal-{operation_id}")

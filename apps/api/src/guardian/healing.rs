@@ -408,9 +408,7 @@ fn planned_runtime_journal(
         Some(target.clone()),
         Vec::new(),
     ));
-    entry
-        .guardian_diagnosis_ids
-        .push(diagnosis_id.as_str().to_string());
+    entry.guardian_diagnosis_ids.push(*diagnosis_id);
     entry
 }
 
@@ -645,9 +643,7 @@ fn terminal_runtime_journal(
     entry
         .completed_steps
         .push(repair_step(step_result, Some(target.clone()), facts));
-    entry
-        .guardian_diagnosis_ids
-        .push(diagnosis_id.as_str().to_string());
+    entry.guardian_diagnosis_ids.push(*diagnosis_id);
     entry.outcome = Some(outcome);
     entry
 }

@@ -546,9 +546,7 @@ fn planned_artifact_journal(
             )
         })
         .collect();
-    entry
-        .guardian_diagnosis_ids
-        .push(plan.diagnosis_id.as_str().to_string());
+    entry.guardian_diagnosis_ids.push(plan.diagnosis_id);
     entry
 }
 
@@ -794,9 +792,7 @@ fn terminal_artifact_journal(
         facts,
         RollbackState::Available,
     ));
-    entry
-        .guardian_diagnosis_ids
-        .push(plan.diagnosis_id.as_str().to_string());
+    entry.guardian_diagnosis_ids.push(plan.diagnosis_id);
     entry.outcome = Some(outcome);
     entry
 }

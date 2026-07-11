@@ -1068,7 +1068,7 @@ mod tests {
             ));
             assert_eq!(
                 journal.guardian_diagnosis_ids,
-                vec!["jvm_arg_unsupported".to_string()]
+                vec![crate::guardian::DiagnosisId::JvmArgUnsupported]
             );
             assert_eq!(state.journals().list().len(), 1);
             let memory = state.failure_memory().list();

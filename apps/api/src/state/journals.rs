@@ -8,6 +8,7 @@ use crate::execution::persistence::PersistenceCoordinator;
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceOwnerLease, WriteUrgency,
 };
+use crate::guardian::DiagnosisId;
 use crate::observability::{
     RedactionAudience, evidence_text_looks_sensitive, sanitize_evidence_text,
 };
@@ -384,7 +385,7 @@ impl OperationJournalStore {
         failure_point: impl Into<String>,
         outcome: OperationOutcome,
         fact_ids: Vec<String>,
-        diagnosis_ids: Vec<String>,
+        diagnosis_ids: Vec<DiagnosisId>,
     ) -> Result<(), OperationJournalStoreError> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
         let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
@@ -439,7 +440,7 @@ impl OperationJournalStore {
         &self,
         operation_id: &OperationId,
         fact_ids: Vec<String>,
-        diagnosis_ids: Vec<String>,
+        diagnosis_ids: Vec<DiagnosisId>,
     ) -> Result<(), OperationJournalStoreError> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
         let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
@@ -724,7 +725,7 @@ impl OperationJournalStore {
 fn apply_guardian_evidence(
     entry: &mut OperationJournalEntry,
     fact_ids: Vec<String>,
-    diagnosis_ids: Vec<String>,
+    diagnosis_ids: Vec<DiagnosisId>,
 ) {
     if !fact_ids.is_empty() && entry.completed_steps.is_empty() {
         let mut step = OperationJournalStep::new("guardian_evidence", OperationPhase::Running);
@@ -820,7 +821,6 @@ pub enum OperationJournalValidationError {
     UnsafeStepId,
     UnsafeGeneratedFact,
     UnsafeFailurePoint,
-    UnsafeDiagnosisId,
     EmptyJournal,
     TooManyTargets,
     TooManyPlannedSteps,
@@ -861,11 +861,6 @@ fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalV
     }
     if entry.guardian_diagnosis_ids.len() > 32 {
         return Err(OperationJournalValidationError::TooManyDiagnoses);
-    }
-    for diagnosis_id in &entry.guardian_diagnosis_ids {
-        if !safe_token(diagnosis_id, 96) {
-            return Err(OperationJournalValidationError::UnsafeDiagnosisId);
-        }
     }
     Ok(())
 }
@@ -1360,18 +1355,18 @@ mod tests {
             .entries
             .iter()
             .flat_map(|entry| entry.guardian_diagnosis_ids.iter())
-            .map(|diagnosis_id| {
-                serde_json::from_value::<DiagnosisId>(serde_json::Value::String(
-                    diagnosis_id.clone(),
-                ))
-                .expect("typed Guardian diagnosis id")
-            })
+            .copied()
             .collect::<Vec<_>>();
         assert_eq!(diagnosis_ids.as_slice(), DiagnosisId::ALL.as_slice());
 
-        let error = serde_json::from_str::<DiagnosisId>(r#""future_diagnosis""#)
-            .expect_err("unknown diagnosis must be rejected")
-            .to_string();
+        let mut unknown_snapshot =
+            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V1_FIXTURE)
+                .expect("fixture value");
+        unknown_snapshot["entries"][0]["guardian_diagnosis_ids"][0] =
+            serde_json::Value::String("future_diagnosis".to_string());
+        let error = OperationJournalSnapshot::from_json(&unknown_snapshot.to_string())
+            .expect_err("embedded unknown diagnosis must be rejected");
+        let error = format!("{error:?}");
         assert!(!error.contains("future_diagnosis"));
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
@@ -1448,11 +1443,11 @@ mod tests {
             .record_guardian_evidence(
                 &operation_id,
                 vec![
-                "guardian_outcome_decision:retry".to_string(),
-                "guardian_outcome_summary:Guardian treated install download failure as retryable."
-                    .to_string(),
-            ],
-                vec!["download_unavailable".to_string()],
+                    "guardian_outcome_decision:retry".to_string(),
+                    "guardian_outcome_summary:Guardian treated install download failure as retryable."
+                        .to_string(),
+                ],
+                vec![DiagnosisId::DownloadUnavailable],
             )
             .await
             .expect("record Guardian evidence");
@@ -1474,8 +1469,7 @@ mod tests {
         assert!(
             loaded
                 .guardian_diagnosis_ids
-                .iter()
-                .any(|id| id == "download_unavailable")
+                .contains(&DiagnosisId::DownloadUnavailable)
         );
 
         cleanup(&root);

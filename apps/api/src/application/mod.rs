@@ -244,7 +244,6 @@ pub struct ApplicationViewModel {
 pub enum ViewModelKind {
     InstanceDetail,
     LaunchActionState,
-    GuardianSafetyState,
     PerformancePlanSummary,
     OperationProgress,
     RepairOffer,
@@ -259,7 +258,6 @@ pub enum ViewModelKind {
 pub enum ApplicationViewModelPayload {
     InstanceDetail(InstanceDetailViewModel),
     LaunchActionState(LaunchActionStateViewModel),
-    GuardianSafetyState(GuardianSafetyStateViewModel),
     PerformancePlanSummary(PerformancePlanSummaryViewModel),
     OperationProgress(OperationProgressViewModel),
     RepairOffer(RepairOfferViewModel),
@@ -307,19 +305,6 @@ pub struct LaunchActionStateViewModel {
     pub launchable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
-    #[serde(default)]
-    pub actions: Vec<ViewModelAction>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GuardianSafetyStateViewModel {
-    pub state_id: String,
-    pub label: String,
-    pub tone: ViewModelTone,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    #[serde(default)]
-    pub diagnosis_ids: Vec<String>,
     #[serde(default)]
     pub actions: Vec<ViewModelAction>,
 }

@@ -538,9 +538,7 @@ async fn create_launch_recovery_planned_journal(
         RollbackState::NotApplicable,
     );
     entry.targets.push(plan.target.clone());
-    entry
-        .guardian_diagnosis_ids
-        .push(plan.diagnosis_id.as_str().to_string());
+    entry.guardian_diagnosis_ids.push(plan.diagnosis_id);
     entry
         .planned_steps
         .push(launch_recovery_step(plan, OperationStepResult::Planned));
@@ -564,9 +562,7 @@ async fn create_launch_recovery_terminal_journal(
     );
     entry.status = status;
     entry.targets.push(plan.target.clone());
-    entry
-        .guardian_diagnosis_ids
-        .push(plan.diagnosis_id.as_str().to_string());
+    entry.guardian_diagnosis_ids.push(plan.diagnosis_id);
     entry
         .planned_steps
         .push(launch_recovery_step(plan, OperationStepResult::Planned));
@@ -641,7 +637,7 @@ fn launch_recovery_journal_identity_matches(
         && entry.planned_steps == [launch_recovery_step(plan, OperationStepResult::Planned)]
         && entry.rollback == RollbackState::NotApplicable
         && entry.guardian_diagnosis_ids.len() == 1
-        && entry.guardian_diagnosis_ids[0] == plan.diagnosis_id.as_str()
+        && entry.guardian_diagnosis_ids[0] == plan.diagnosis_id
 }
 
 pub fn launch_recovery_journal_transition_conflicts(
@@ -1065,9 +1061,7 @@ mod tests {
                 RollbackState::NotApplicable,
             );
             foreign.targets.push(plan.target.clone());
-            foreign
-                .guardian_diagnosis_ids
-                .push(plan.diagnosis_id.as_str().to_string());
+            foreign.guardian_diagnosis_ids.push(plan.diagnosis_id);
             foreign
                 .planned_steps
                 .push(launch_recovery_step(&plan, OperationStepResult::Planned));

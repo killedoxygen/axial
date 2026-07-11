@@ -1,7 +1,7 @@
 use super::PerformanceInstallResponse;
 use super::mutation::{execute_performance_operation, performance_operation_journal_identity};
 use super::plan_health::{performance_artifacts_target, performance_composition_target};
-use crate::guardian::GuardianPerformanceSupervisionPlan;
+use crate::guardian::{DiagnosisId, GuardianPerformanceSupervisionPlan};
 use crate::observability::{
     OperationProofRecord, RedactionAudience, operation_journal_proof_record,
     sanitize_evidence_token,
@@ -109,7 +109,7 @@ pub(super) enum PerformanceJournalTransition {
         target_id: String,
         rollback: RollbackState,
         fact_ids: Vec<String>,
-        diagnosis_ids: Vec<String>,
+        diagnosis_ids: Vec<DiagnosisId>,
     },
     EffectStarted {
         action: PerformanceInstallAction,
@@ -160,12 +160,7 @@ impl PerformanceJournalTransition {
                 .iter()
                 .map(|fact_id| fact_id.as_str().to_string())
                 .collect(),
-            diagnosis_ids: supervision
-                .decision
-                .diagnoses
-                .iter()
-                .map(|diagnosis| diagnosis.as_str().to_string())
-                .collect(),
+            diagnosis_ids: supervision.decision.diagnoses.to_vec(),
         }
     }
 
@@ -3214,12 +3209,7 @@ pub(super) async fn record_performance_guardian_supervision(
                 .iter()
                 .map(|fact_id| fact_id.as_str().to_string())
                 .collect(),
-            supervision
-                .decision
-                .diagnoses
-                .iter()
-                .map(|diagnosis| diagnosis.as_str().to_string())
-                .collect(),
+            supervision.decision.diagnoses.to_vec(),
         )
         .await
 }

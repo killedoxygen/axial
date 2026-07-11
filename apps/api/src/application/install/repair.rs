@@ -37,7 +37,7 @@ pub async fn record_install_operation_guardian_repair_outcome(
         96,
     )
     .unwrap_or_else(|| "guardian-repair".to_string());
-    let diagnosis_id = outcome.diagnosis_id.as_str().to_string();
+    let diagnosis_id = outcome.diagnosis_id;
     let summary = sanitize_evidence_token(&outcome.summary, RedactionAudience::UserVisible, 96)
         .unwrap_or_else(|| "guardian_artifact_repair".to_string());
 
@@ -51,7 +51,7 @@ pub async fn record_install_operation_guardian_repair_outcome(
     ];
     loop {
         match journals
-            .record_guardian_evidence(operation_id, facts.clone(), vec![diagnosis_id.clone()])
+            .record_guardian_evidence(operation_id, facts.clone(), vec![diagnosis_id])
             .await
         {
             Ok(()) => return Ok(()),
@@ -86,16 +86,10 @@ pub fn install_guardian_repair_summary_from_journal(
 ) -> Option<InstallGuardianRepairSummary> {
     let repair_operation_id = latest_generated_fact_value(entry, REPAIR_OPERATION_FACT_PREFIX)?;
     let status = latest_generated_fact_value(entry, REPAIR_STATUS_FACT_PREFIX)?;
-    let diagnosis_ids = entry
+    let diagnosis_id = entry
         .guardian_diagnosis_ids
         .iter()
-        .map(|diagnosis_id| {
-            serde_json::from_value::<DiagnosisId>(serde_json::Value::String(diagnosis_id.clone()))
-                .ok()
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let diagnosis_id = diagnosis_ids
-        .into_iter()
+        .copied()
         .rev()
         .find(|diagnosis_id| *diagnosis_id == DiagnosisId::LauncherManagedArtifactCorrupt)?;
     let outcome = install_artifact_repair_user_outcome(&status);

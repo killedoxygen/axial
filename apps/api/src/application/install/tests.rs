@@ -1256,8 +1256,7 @@ async fn install_status_reconstructs_restart_loaded_journal_and_guardian_repair(
     assert!(
         proof
             .guardian_diagnosis_ids
-            .iter()
-            .any(|id| id == "launcher_managed_artifact_corrupt")
+            .contains(&DiagnosisId::LauncherManagedArtifactCorrupt)
     );
     assert!(proof.fields.iter().any(|field| {
         field.key == "generated_fact" && field.value == "guardian_repair_status:suppressed"
@@ -2001,12 +2000,7 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
         );
 
         let journal = state.journals().get(&operation_id).expect("journal");
-        assert!(
-            journal
-                .guardian_diagnosis_ids
-                .iter()
-                .any(|id| id == diagnosis_id.as_str())
-        );
+        assert!(journal.guardian_diagnosis_ids.contains(&diagnosis_id));
         assert_no_public_raw_fragments(&serde_json::to_string(&guardian).expect("guardian json"));
         assert_no_public_raw_fragments(
             &serde_json::to_string(&failure_view_model).expect("failure view model json"),
@@ -3186,7 +3180,7 @@ async fn install_journal_records_guardian_evidence_from_core_download_facts() {
     assert_eq!(entry.status, OperationStatus::Failed);
     assert_eq!(
         entry.guardian_diagnosis_ids,
-        vec!["launcher_managed_artifact_corrupt".to_string()]
+        vec![DiagnosisId::LauncherManagedArtifactCorrupt]
     );
     let terminal_step = entry.completed_steps.last().expect("terminal step");
     assert!(

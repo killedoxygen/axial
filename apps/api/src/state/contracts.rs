@@ -4,6 +4,7 @@
 //! This submodule exposes the durable vocabulary for journals, ownership,
 //! snapshots, and persistence boundaries used by the target systems.
 
+use crate::guardian::DiagnosisId;
 use crate::observability::evidence_text_looks_sensitive;
 use serde::{Deserialize, Serialize};
 
@@ -180,7 +181,7 @@ pub struct OperationJournalEntry {
     pub completed_steps: Vec<OperationJournalStep>,
     pub failure_point: Option<String>,
     pub rollback: RollbackState,
-    pub guardian_diagnosis_ids: Vec<String>,
+    pub guardian_diagnosis_ids: Vec<DiagnosisId>,
     pub outcome: Option<OperationOutcome>,
 }
 
