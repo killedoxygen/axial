@@ -29,8 +29,8 @@ pub(crate) use super::performance::BenchmarkMatrix;
 pub(crate) use benchmark::*;
 #[cfg(test)]
 pub(crate) use reports::{
-    LAUNCH_COMMAND_REDACTED_VALUE, LAUNCH_KILL_INTERNAL_ERROR_MESSAGE, launch_kill_error_response,
-    sanitize_launch_command,
+    LAUNCH_COMMAND_REDACTED_VALUE, LAUNCH_KILL_INTERNAL_ERROR_MESSAGE,
+    LAUNCH_KILL_NO_PROCESS_MESSAGE, launch_kill_error_response, sanitize_launch_command,
 };
 pub use reports::{LaunchStatusViewModel, public_launch_status_json};
 pub(crate) use reports::{

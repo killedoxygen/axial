@@ -3,7 +3,7 @@ use super::trace_launch_event;
 use crate::observability::{
     RedactionAudience, sanitize_public_diagnostic_text, sanitize_public_json_value,
 };
-use crate::state::{AppState, LaunchStatusEvent};
+use crate::state::{AppState, LaunchStatusEvent, SessionStopError};
 use axial_launcher::{
     GuardianDecision, GuardianSummary, LaunchHealingSummary, LaunchSessionRecord, snapshot_status,
 };
@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 pub(crate) const LAUNCH_COMMAND_REDACTED_VALUE: &str = "<redacted>";
 pub(crate) const LAUNCH_KILL_INTERNAL_ERROR_MESSAGE: &str =
     "Could not stop the launch session. Try again from the launcher.";
+pub(crate) const LAUNCH_KILL_NO_PROCESS_MESSAGE: &str = "session has no running process";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LaunchStatusViewModel {
@@ -589,23 +590,29 @@ pub(crate) async fn stop_launch_session(
     Ok(json!({ "status": "killed" }))
 }
 
-pub(crate) fn launch_kill_error_response(error: std::io::Error) -> super::LaunchApplicationError {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        return (
+pub(crate) fn launch_kill_error_response(error: SessionStopError) -> super::LaunchApplicationError {
+    match error {
+        SessionStopError::SessionNotFound => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "session not found" })),
-        );
+        ),
+        SessionStopError::NoLiveProcess => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": LAUNCH_KILL_NO_PROCESS_MESSAGE })),
+        ),
+        SessionStopError::Process(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": LAUNCH_KILL_INTERNAL_ERROR_MESSAGE })),
+        ),
     }
-
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": LAUNCH_KILL_INTERNAL_ERROR_MESSAGE })),
-    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LaunchStatusViewModel, public_launch_status_json, stop_launch_session};
+    use super::{
+        LAUNCH_KILL_NO_PROCESS_MESSAGE, LaunchStatusViewModel, public_launch_status_json,
+        stop_launch_session,
+    };
     use crate::state::{AppState, AppStateInit, InstallStore, LaunchStatusEvent, SessionStore};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
@@ -617,7 +624,25 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
-    async fn stop_launch_session_releases_its_retention_hold_when_kill_fails() {
+    async fn stop_launch_session_reports_missing_session() {
+        let root = unique_test_dir("stop-launch-missing-session");
+        let state = test_app_state(&root);
+        let producer = state.try_claim_producer().expect("claim stop producer");
+
+        let error = stop_launch_session(&state, "missing-session", &producer)
+            .await
+            .expect_err("missing session should fail stop");
+
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": "session not found" })
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stop_launch_session_reports_existing_session_without_live_process() {
         let root = unique_test_dir("stop-launch-retention-error");
         let state = test_app_state(&root);
         let session_id = "stop-kill-error";
@@ -635,7 +660,11 @@ mod tests {
         let error = stop_launch_session(&state, session_id, &producer)
             .await
             .expect_err("missing child should fail stop");
-        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(
+            error.1.0,
+            serde_json::json!({ "error": LAUNCH_KILL_NO_PROCESS_MESSAGE })
+        );
 
         state
             .sessions()

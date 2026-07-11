@@ -170,6 +170,16 @@ pub struct SessionStore {
 #[error("launch session store is shutting down")]
 pub struct SessionAdmissionError;
 
+#[derive(Debug, thiserror::Error)]
+pub enum SessionStopError {
+    #[error("session not found")]
+    SessionNotFound,
+    #[error("session has no running process")]
+    NoLiveProcess,
+    #[error("launch process stop failed")]
+    Process(#[source] std::io::Error),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupOutcome {
     Stable,
@@ -997,33 +1007,30 @@ impl SessionStore {
         Ok(record)
     }
 
-    pub async fn kill(&self, session_id: &str) -> std::io::Result<()> {
+    pub async fn kill(&self, session_id: &str) -> Result<(), SessionStopError> {
         let lifecycle_transition = self.lifecycle_transition.lock().await;
         let process = {
             let mut sessions = self.sessions.write().await;
             let Some(entry) = sessions.get_mut(session_id) else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "session not found",
-                ));
+                return Err(SessionStopError::SessionNotFound);
+            };
+            let Some(process) = entry.process.clone() else {
+                return Err(SessionStopError::NoLiveProcess);
             };
             entry.stop_requested = true;
             let evidence =
                 process_stop_stage_evidence(session_id, ProcessStopIntent::UserRequested);
             ensure_stage_started(&mut entry.record, now_ms());
             apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
-            entry.process.clone()
+            process
         };
-        let mut request = if let Some(process) = process {
-            process.terminate(supervisor::ProcessTerminalCause::UserStop)
-        } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "session not found",
-            ));
-        };
+        let mut request = process.terminate(supervisor::ProcessTerminalCause::UserStop);
         drop(lifecycle_transition);
-        request.reaped().await.map(|_| ())
+        request
+            .reaped()
+            .await
+            .map(|_| ())
+            .map_err(SessionStopError::Process)
     }
 
     pub(crate) async fn terminate_for_launch_failure(
@@ -1132,21 +1139,15 @@ impl SessionStore {
     pub(crate) async fn begin_user_stop(
         self: &Arc<Self>,
         session_id: &str,
-    ) -> std::io::Result<UserStopLease> {
+    ) -> Result<UserStopLease, SessionStopError> {
         let lifecycle_guard = self.lifecycle_transition.clone().lock_owned().await;
         let (attempt, process, record) = {
             let mut sessions = self.sessions.write().await;
             let Some(entry) = sessions.get_mut(session_id) else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "session not found",
-                ));
+                return Err(SessionStopError::SessionNotFound);
             };
             let Some(process) = entry.process.clone() else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "session not found",
-                ));
+                return Err(SessionStopError::NoLiveProcess);
             };
             entry.retention_holds = entry
                 .retention_holds
@@ -1172,7 +1173,7 @@ impl SessionStore {
         if let Err(error) = request.reaped().await {
             lease.release_hold().await;
             drop(lease.lifecycle_guard.take());
-            return Err(error);
+            return Err(SessionStopError::Process(error));
         }
         Ok(lease)
     }
@@ -2688,6 +2689,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kill_distinguishes_missing_session_from_session_without_live_process() {
+        let store = Arc::new(SessionStore::new());
+
+        assert!(matches!(
+            store.kill("missing-session").await,
+            Err(SessionStopError::SessionNotFound)
+        ));
+
+        let session_id = "session-without-process";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        assert!(matches!(
+            store.kill(session_id).await,
+            Err(SessionStopError::NoLiveProcess)
+        ));
+        let entry = store.sessions.read().await;
+        assert!(!entry.get(session_id).expect("session entry").stop_requested);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_process_reuse_resets_watchdog_and_attempt_state() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "reused-process-entry";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let stale_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("stale attempt");
+        {
+            let mut sessions = store.sessions.write().await;
+            let entry = sessions.get_mut(session_id).expect("session entry");
+            entry.stop_requested = true;
+            entry.observed_failure = Some(ObservedFailureSignal {
+                class: LaunchFailureClass::JvmUnsupportedOption,
+                observed_at_ms: now_ms(),
+            });
+            entry.log_count = 7;
+            entry.terminal_sequence = Some(11);
+            entry.record.state = LaunchState::Exited;
+            entry.record.boot_completed_at_ms = Some(now_ms());
+            entry.record.boot_duration_ms = Some(10);
+        }
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec sleep 30");
+
+        let relaunched = store
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("relaunch reused session");
+        let current_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("current attempt");
+
+        assert_ne!(current_attempt.id, stale_attempt.id);
+        assert_eq!(relaunched.state, LaunchState::Starting);
+        assert_eq!(relaunched.boot_completed_at_ms, None);
+        assert_eq!(relaunched.boot_duration_ms, None);
+        {
+            let sessions = store.sessions.read().await;
+            let entry = sessions.get(session_id).expect("reused session entry");
+            assert!(!entry.stop_requested);
+            assert_eq!(entry.observed_failure, None);
+            assert_eq!(entry.log_count, 0);
+            assert_eq!(entry.terminal_sequence, None);
+            assert_eq!(entry.record.state, LaunchState::Starting);
+            assert_eq!(entry.record.boot_completed_at_ms, None);
+            assert_eq!(entry.record.boot_duration_ms, None);
+        }
+        assert!(
+            store
+                .startup_watchdog_process_for_attempt(session_id, &current_attempt)
+                .await
+                .is_some()
+        );
+        store.terminate_all().await.expect("terminate relaunch");
+    }
+
+    #[tokio::test]
     async fn concurrent_and_repeated_shutdown_calls_are_idempotent() {
         let store = Arc::new(SessionStore::new());
         store
@@ -3949,7 +4035,11 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(matches!(
+            error,
+            SessionStopError::Process(error)
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+        ));
         assert_eq!(
             store
                 .sessions

@@ -8,7 +8,7 @@ use crate::application::performance::{
 use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
 use crate::state::contracts::TargetDescriptor;
-use crate::state::{AppStateInit, InstallStore, SessionStore};
+use crate::state::{AppStateInit, InstallStore, SessionStopError, SessionStore};
 use axial_config::{AppPaths, ConfigStore, Instance, InstanceStore};
 use axial_launcher::{
     GuardianDecision, GuardianMode, GuardianSummary, LaunchAuthContext, LaunchGuardianContext,
@@ -163,10 +163,7 @@ fn launch_request_error_response_sanitizes_public_error_payload() {
 
 #[test]
 fn launch_kill_not_found_error_response_uses_session_not_found() {
-    let response = launch_kill_error_response(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "failed to kill process 4242 at /home/alice/.axial/secret",
-    ));
+    let response = launch_kill_error_response(SessionStopError::SessionNotFound);
 
     assert_eq!(response.0, StatusCode::NOT_FOUND);
     assert_eq!(
@@ -176,8 +173,20 @@ fn launch_kill_not_found_error_response_uses_session_not_found() {
 }
 
 #[test]
+fn launch_kill_no_process_error_response_distinguishes_existing_session() {
+    let response = launch_kill_error_response(SessionStopError::NoLiveProcess);
+
+    assert_eq!(response.0, StatusCode::CONFLICT);
+    assert_eq!(
+        response.1.0,
+        serde_json::json!({ "error": LAUNCH_KILL_NO_PROCESS_MESSAGE })
+    );
+}
+
+#[test]
 fn launch_kill_internal_error_response_hides_raw_io_details() {
-    let response = launch_kill_error_response(raw_launch_control_io_error());
+    let response =
+        launch_kill_error_response(SessionStopError::Process(raw_launch_control_io_error()));
 
     assert_public_error_excludes_raw_launch_control_fragments(
         response,

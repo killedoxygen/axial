@@ -87,7 +87,7 @@ pub(crate) use remote_flags::{
     RemoteFlagRefreshOutcome, RemoteFlagStore, ResolvedFlagSource, resolve_flag,
 };
 pub(crate) use sessions::{LaunchFailureTermination, LaunchFailureTerminationErrorClass};
-pub use sessions::{SessionAdmissionError, SessionStore, StartupOutcome};
+pub use sessions::{SessionAdmissionError, SessionStopError, SessionStore, StartupOutcome};
 use shutdown::AppShutdownCoordinator;
 pub use shutdown::{AppShutdownError, AppShutdownStep};
 
