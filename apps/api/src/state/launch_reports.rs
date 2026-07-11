@@ -11,7 +11,7 @@ use crate::state::benchmark_suites::{
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use axial_config::AppPaths;
 use axial_launcher::{
-    GuardianSummary, LaunchHealingSummary, LaunchIntent, LaunchPriorityEvidence,
+    CrashEvidence, GuardianSummary, LaunchHealingSummary, LaunchIntent, LaunchPriorityEvidence,
     LaunchSessionOutcome, LaunchSessionOutcomeKind, LaunchSessionRecord, LaunchStageEvidence,
     LaunchStageRecord, launch_state_name,
 };
@@ -27,7 +27,7 @@ use sysinfo::System;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 const LAUNCH_PROOF_SCHEMA: &str = "axial.launch.proof";
-const LAUNCH_PROOF_SCHEMA_VERSION: u32 = 2;
+const LAUNCH_PROOF_SCHEMA_VERSION: u32 = 3;
 const LAUNCH_STAGE_COMPARISON_METRIC_NAME: &str = "total_completed_stage_duration_ms";
 const LAUNCH_BOOT_COMPARISON_METRIC_NAME: &str = "boot_duration_ms";
 const MAX_REPORT_FILENAME_STEM: usize = 96;
@@ -75,6 +75,8 @@ pub(crate) struct LaunchProofRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub crash_evidence: Option<CrashEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub guardian: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub healing: Option<Value>,
@@ -107,6 +109,8 @@ pub(crate) struct LaunchProofExport {
     pub boot_duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crash_evidence: Option<CrashEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guardian: Option<GuardianSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -769,6 +773,7 @@ impl LaunchProofExport {
                 .failure_class
                 .as_deref()
                 .and_then(sanitized_optional_token),
+            crash_evidence: record.crash_evidence.clone(),
             guardian: record.guardian.as_ref().and_then(sanitized_guardian),
             healing: record.healing.as_ref().and_then(sanitized_healing),
             stages: record
@@ -1025,6 +1030,7 @@ fn build_record(
             .as_ref()
             .and_then(|failure| failure.detail.as_deref())
             .and_then(sanitized_bounded_text),
+        crash_evidence: record.crash_evidence.clone(),
         guardian: record
             .guardian
             .as_ref()
@@ -1754,6 +1760,7 @@ fn validate_admitted_report(report: &LaunchProofRecord, file_name: &str) -> io::
         })
         || !optional_bounded_text_is_canonical(report.failure_detail.as_deref())
         || !optional_token_is_canonical(report.failure_class.as_deref())
+        || !crash_evidence_matches_report(report)
         || !optional_priority_is_canonical(report.priority.as_ref())
         || !optional_guardian_is_canonical(report.guardian.as_ref())
         || !optional_healing_is_canonical(report.healing.as_ref())
@@ -1765,6 +1772,17 @@ fn validate_admitted_report(report: &LaunchProofRecord, file_name: &str) -> io::
         return Err(invalid_report("launch report semantics are not current"));
     }
     Ok(())
+}
+
+fn crash_evidence_matches_report(report: &LaunchProofRecord) -> bool {
+    report.crash_evidence.is_none()
+        || (matches!(report.outcome.as_str(), "failed" | "exited")
+            && report.session_outcome.as_ref().is_some_and(|outcome| {
+                matches!(
+                    outcome.kind,
+                    LaunchSessionOutcomeKind::Failed | LaunchSessionOutcomeKind::Unknown
+                )
+            }))
 }
 
 fn comparison_is_coherent(report: &LaunchProofRecord, comparison: &LaunchProofComparison) -> bool {
@@ -2880,6 +2898,10 @@ mod tests {
             class: LaunchFailureClass::StartupStalled,
             detail: Some("no startup activity observed".to_string()),
         });
+        first.crash_evidence = axial_launcher::parse_crash_evidence(
+            axial_launcher::CrashArtifactKind::MinecraftCrashReport,
+            b"Description: Mod loading error\njava.lang.IllegalStateException: failed\nSuspected Mods: Example Machines (examplemachines) version 3.2.1\nJVM Flags: -Duser.home=/home/alice -Dtoken=raw-secret-token",
+        );
 
         let first_proof =
             persist_test_report(&paths, &first, Some("2026-01-02T03:04:05.000Z"), "failed")
@@ -2905,6 +2927,7 @@ mod tests {
         );
         assert_eq!(first_proof.pid, Some(11));
         assert_eq!(first_proof.boot_duration_ms, None);
+        assert_eq!(first_proof.crash_evidence, first.crash_evidence);
         assert_eq!(first_proof.launched_at, "2026-01-02T03:04:05.000Z");
         assert_eq!(first_proof.guardian, None);
         assert_eq!(first_proof.scenario.scenario_id, "unknown_launch");
@@ -2931,12 +2954,16 @@ mod tests {
         assert!(!persisted_json.contains("boot_duration_ms"));
         assert!(!persisted_json.contains("-Xmx2048M"));
         assert!(!persisted_json.contains("java_path"));
+        assert!(persisted_json.contains("Example Machines"));
+        assert!(!persisted_json.contains("/home/alice"));
+        assert!(!persisted_json.contains("raw-secret-token"));
 
         let loaded = load_test_report(&paths, "first")
             .expect("load report")
             .expect("report exists");
         assert_eq!(loaded.session_id, "first");
         assert_eq!(loaded.outcome, "failed");
+        assert_eq!(loaded.crash_evidence, first.crash_evidence);
 
         let recent = list_test_reports(&paths, 10).expect("list reports");
         assert_eq!(recent.len(), 2);
@@ -3206,6 +3233,23 @@ mod tests {
             }
             assert!(serde_json::from_value::<LaunchProofRecord>(candidate).is_err());
         }
+    }
+
+    #[test]
+    fn launch_report_rejects_legacy_schema_and_crash_evidence_on_nonfailure() {
+        let mut report = comparison_report("crash-coherence", "2026-01-01T00:00:00.000Z", 90);
+        let file_name = report_filename(&report.session_id);
+        assert!(validate_admitted_report(&report, &file_name).is_ok());
+
+        report.crash_evidence = axial_launcher::parse_crash_evidence(
+            axial_launcher::CrashArtifactKind::MinecraftCrashReport,
+            b"Description: Rendering game\njava.lang.IllegalStateException: failed",
+        );
+        assert!(validate_admitted_report(&report, &file_name).is_err());
+
+        report.crash_evidence = None;
+        report.schema_version = 2;
+        assert!(validate_admitted_report(&report, &file_name).is_err());
     }
 
     #[test]
@@ -4016,6 +4060,7 @@ mod tests {
             priority: None,
             failure_class: None,
             failure_detail: None,
+            crash_evidence: None,
             guardian: None,
             healing: None,
             stages: vec![LaunchStageRecord {

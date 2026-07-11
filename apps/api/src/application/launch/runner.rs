@@ -29,7 +29,8 @@ use crate::state::{
 };
 use axial_launcher::{
     GuardianSummary, LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome,
-    LaunchState, PreparedLaunchAttempt, build_healing_summary, prepare_launch_attempt_with_events,
+    LaunchSessionOutcomeKind, LaunchState, PreparedLaunchAttempt, build_healing_summary,
+    prepare_launch_attempt_with_events,
 };
 use axial_minecraft::download::repair_virtual_assets_from_index;
 use axial_minecraft::paths::assets_dir;
@@ -217,34 +218,76 @@ async fn own_terminal_observation(
         }
     };
 
-    if let Some(record) = terminal
-        && record.boot_completed_at_ms.is_some()
-        && record
-            .failure
-            .as_ref()
-            .is_some_and(|failure| failure.class == LaunchFailureClass::OutOfMemory)
-        && record
-            .outcome
-            .as_ref()
-            .is_some_and(|outcome| outcome.reason == LaunchSessionExitReason::CrashedAfterBoot)
-    {
-        settle_post_boot_out_of_memory(
-            &state,
-            &session_id,
-            &instance_id,
-            guardian_mode,
-            &launched_at,
-            proof_context,
-            record,
-            guardian,
-        )
-        .await;
+    if let Some(record) = terminal {
+        if record.boot_completed_at_ms.is_some()
+            && record
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.class == LaunchFailureClass::OutOfMemory)
+            && record
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.reason == LaunchSessionExitReason::CrashedAfterBoot)
+        {
+            settle_post_boot_out_of_memory(
+                &state,
+                &session_id,
+                &instance_id,
+                guardian_mode,
+                &launched_at,
+                proof_context,
+                record,
+                guardian,
+            )
+            .await;
+        } else {
+            persist_post_boot_terminal_proof(
+                &state,
+                &session_id,
+                &launched_at,
+                proof_context,
+                record,
+            )
+            .await;
+        }
     }
 
     state
         .sessions()
         .release_terminal_retention_hold(&session_id)
         .await;
+}
+
+async fn persist_post_boot_terminal_proof(
+    state: &AppState,
+    session_id: &str,
+    launched_at: &str,
+    proof_context: LaunchProofContext,
+    record: crate::state::LaunchSessionRecord,
+) {
+    let outcome = match record.outcome.as_ref().map(|outcome| outcome.kind) {
+        Some(LaunchSessionOutcomeKind::Clean) => "completed",
+        Some(LaunchSessionOutcomeKind::Stopped) => return,
+        Some(LaunchSessionOutcomeKind::Failed | LaunchSessionOutcomeKind::Unknown) => "failed",
+        None if record.state == LaunchState::Failed => "failed",
+        None => "exited",
+    };
+    if state
+        .launch_reports()
+        .persist(
+            record,
+            Some(launched_at.to_string()),
+            outcome.to_string(),
+            Some(proof_context),
+        )
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            session_id,
+            "failed to persist post-boot terminal launch proof"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1695,6 +1738,12 @@ mod tests {
             proof.failure_detail.as_deref(),
             Some("Guardian blocked launch startup.")
         );
+        assert!(
+            proof
+                .crash_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.names_out_of_memory)
+        );
         let report_payload = super::super::reports::launch_report_payload(&state, session_id)
             .expect("OOM report payload");
         assert_eq!(report_payload["failure_class"], "out_of_memory");
@@ -1878,6 +1927,12 @@ mod tests {
             proof.failure_detail.as_deref(),
             Some("Minecraft stopped after running out of memory.")
         );
+        assert!(
+            proof
+                .crash_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.names_out_of_memory)
+        );
 
         let memory = state.failure_memory().list();
         assert_eq!(memory.len(), 1);
@@ -1901,6 +1956,112 @@ mod tests {
         ] {
             assert_no_out_of_memory_sensitive_decoys(payload);
         }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_boot_mod_crash_persists_typed_evidence_without_guardian_policy() {
+        let root = unique_test_dir("launch-post-boot-mod-crash-e2e");
+        let state = test_app_state(&root);
+        let session_id = "launch-post-boot-mod-crash-e2e";
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert mod crash session");
+        let mut events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe mod crash session");
+        let java_path = write_post_boot_mod_crash_launch_fixture(&root);
+        let mut task = test_recovery_launch_task(session_id, &root);
+        task.instance.java_path = java_path.clone();
+        task.intent.requested_java = java_path;
+        task.intent.game_dir = Some(root.join("instance"));
+        task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
+        let producer = state
+            .try_claim_producer()
+            .expect("claim mod crash producer");
+
+        let launched = tokio::time::timeout(
+            Duration::from_secs(10),
+            launch_session(state.clone(), task, producer),
+        )
+        .await
+        .expect("mod crash launch deadline")
+        .unwrap_or_else(|error| panic!("launch must reach running: {}", error.message));
+        assert_eq!(launched.session_id, session_id);
+
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.expect("mod crash event") {
+                    LaunchEvent::Status(status) if status.state == "exited" => break status,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("mod crash terminal deadline");
+        assert_eq!(
+            terminal.outcome.as_ref().expect("mod crash outcome").reason,
+            LaunchSessionExitReason::CrashedAfterBoot
+        );
+        let evidence = terminal
+            .crash_evidence
+            .as_ref()
+            .expect("mod crash evidence");
+        assert_eq!(evidence.suspected_mods.len(), 1);
+        assert_eq!(evidence.suspected_mods[0].name.as_str(), "Example Machines");
+        assert!(terminal.guardian.is_some());
+        let status_payload = super::super::reports::launch_status_payload(&state, session_id)
+            .await
+            .expect("mod crash status payload");
+        assert_eq!(
+            status_payload["crash_evidence"]["suspected_mods"][0]["name"],
+            "Example Machines"
+        );
+        assert!(!status_payload.to_string().contains("/home/alice"));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.sessions().retention_hold_count(session_id).await == Some(0)
+                    && state
+                        .launch_reports()
+                        .load(session_id)
+                        .is_some_and(|proof| proof.outcome == "failed")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mod crash proof settlement");
+
+        let proof = state
+            .launch_reports()
+            .load(session_id)
+            .expect("mod crash proof");
+        let proof_evidence = proof
+            .crash_evidence
+            .as_ref()
+            .expect("persisted mod crash evidence");
+        assert_eq!(proof_evidence.suspected_mods.len(), 1);
+        assert_eq!(
+            proof_evidence.suspected_mods[0]
+                .version
+                .as_ref()
+                .map(|version| version.as_str()),
+            Some("3.2.1")
+        );
+        let proof_json = serde_json::to_string(&proof).expect("serialize mod crash proof");
+        for private in ["/home/alice", "raw-secret-token", "-Duser.home"] {
+            assert!(!proof_json.contains(private));
+        }
+        assert!(state.failure_memory().list().is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2624,41 +2785,43 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_out_of_memory_launch_fixture_with_boot(root: &Path, boot_first: bool) -> String {
-        use std::os::unix::fs::PermissionsExt;
-
-        let version_dir = root.join("library").join("versions").join("1.21.1");
-        fs::create_dir_all(&version_dir).expect("OOM version directory");
-        fs::write(
-            version_dir.join("1.21.1.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "id": "1.21.1",
-                "type": "release",
-                "mainClass": "net.minecraft.client.main.Main",
-                "assetIndex": {},
-                "javaVersion": {
-                    "component": "java-runtime-delta",
-                    "majorVersion": 21
-                },
-                "libraries": []
-            }))
-            .expect("encode OOM version"),
+    fn write_post_boot_mod_crash_launch_fixture(root: &Path) -> String {
+        write_crashing_java_fixture(
+            root,
+            "mod-crash-java",
+            r#"#!/bin/sh
+if [ "$1" = "-XshowSettings:property" ]; then
+  echo 'openjdk version "21.0.3"' >&2
+  exit 0
+fi
+printf '%s\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atlas/blocks.png-atlas' >&2
+mkdir -p crash-reports
+cat > crash-reports/crash-guardian-mod.txt <<'CRASH'
+---- Minecraft Crash Report ----
+Description: Mod loading error has occurred
+java.lang.IllegalStateException: registry failed
+-- MOD examplemachines --
+Failure message: Example Machines (examplemachines) encountered an error
+Mod Version: 3.2.1
+JVM Flags: -Duser.home=/home/alice -Dtoken=raw-secret-token
+CRASH
+printf '%s\n' 'java.lang.IllegalStateException: registry failed' >&2
+exit 1
+"#,
         )
-        .expect("write OOM version");
-        fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("write OOM client jar");
-        fs::create_dir_all(root.join("instance")).expect("OOM game directory");
+    }
 
-        let bin_dir = root.join("oom-java").join("bin");
-        fs::create_dir_all(&bin_dir).expect("OOM Java bin directory");
-        let java_path = bin_dir.join("java");
+    #[cfg(unix)]
+    fn write_out_of_memory_launch_fixture_with_boot(root: &Path, boot_first: bool) -> String {
         let boot_marker = if boot_first {
             "printf '%s\\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atlas/blocks.png-atlas' >&2\nsleep 0.1\n"
         } else {
             ""
         };
-        fs::write(
-            &java_path,
-            format!(
+        write_crashing_java_fixture(
+            root,
+            "oom-java",
+            &format!(
                 r#"#!/bin/sh
 if [ "$1" = "-XshowSettings:property" ]; then
   echo 'openjdk version "21.0.3"' >&2
@@ -2679,12 +2842,40 @@ exit 1
 "#
             ),
         )
-        .expect("write OOM Java");
+    }
+
+    #[cfg(unix)]
+    fn write_crashing_java_fixture(root: &Path, runtime_dir: &str, script: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let version_dir = root.join("library").join("versions").join("1.21.1");
+        fs::create_dir_all(&version_dir).expect("crash fixture version directory");
+        fs::write(
+            version_dir.join("1.21.1.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "1.21.1",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": {},
+                "javaVersion": { "component": "java-runtime-delta", "majorVersion": 21 },
+                "libraries": []
+            }))
+            .expect("encode crash fixture version"),
+        )
+        .expect("write crash fixture version");
+        fs::write(version_dir.join("1.21.1.jar"), b"client jar")
+            .expect("write crash fixture client jar");
+        fs::create_dir_all(root.join("instance")).expect("crash fixture game directory");
+
+        let bin_dir = root.join(runtime_dir).join("bin");
+        fs::create_dir_all(&bin_dir).expect("crash fixture Java bin directory");
+        let java_path = bin_dir.join("java");
+        fs::write(&java_path, script).expect("write crash fixture Java");
         let mut permissions = fs::metadata(&java_path)
-            .expect("OOM Java metadata")
+            .expect("crash fixture Java metadata")
             .permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&java_path, permissions).expect("make OOM Java executable");
+        fs::set_permissions(&java_path, permissions).expect("make crash fixture Java executable");
         java_path.to_string_lossy().to_string()
     }
 

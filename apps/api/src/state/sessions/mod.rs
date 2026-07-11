@@ -167,7 +167,7 @@ pub struct SessionStore {
     changes: broadcast::Sender<()>,
     next_attempt_id: AtomicU64,
     next_terminal_sequence: AtomicU64,
-    crash_collection_permits: Semaphore,
+    crash_collection_permits: Arc<Semaphore>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -489,7 +489,7 @@ impl SessionStore {
             changes,
             next_attempt_id: AtomicU64::new(0),
             next_terminal_sequence: AtomicU64::new(0),
-            crash_collection_permits: Semaphore::new(MAX_CONCURRENT_CRASH_COLLECTIONS),
+            crash_collection_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_CRASH_COLLECTIONS)),
         }
     }
 
@@ -1097,6 +1097,7 @@ impl SessionStore {
             .await
             .get(&session_id)
             .and_then(|entry| entry.process.clone());
+        let process_started_at_ms = now_ms();
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -1109,7 +1110,6 @@ impl SessionStore {
         };
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let process_started_at_ms = now_ms();
         record.pid = child.id();
         record.process_started_at_ms = Some(process_started_at_ms);
         record.boot_completed_at_ms = None;

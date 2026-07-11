@@ -780,20 +780,27 @@ async fn settle_process_exit(
     {
         return;
     }
-    let should_collect_crash = requested_cause.is_none()
-        && (output_processor_error.is_some()
-            || exit_context.observed_failure.is_some()
-            || status.as_ref().map_or(true, |status| !status.success()));
+    let should_collect_crash = should_collect_crash_artifact(
+        requested_cause,
+        output_processor_error.is_some(),
+        exit_context.observed_failure.is_some(),
+        status.as_ref().map_or(true, |status| !status.success()),
+    );
     let crash_evidence = if should_collect_crash {
         match (
             exit_context.crash_artifact_game_dir.clone(),
-            store.crash_collection_permits.try_acquire(),
+            exit_context.record.process_started_at_ms,
+            store.crash_collection_permits.clone().try_acquire_owned(),
         ) {
-            (Some(game_dir), Ok(_permit)) => {
-                collect_crash_evidence(CrashArtifactCollectionRequest::new(
-                    game_dir,
-                    exit_observed_at_ms,
-                ))
+            (Some(game_dir), Some(process_started_at_ms), Ok(permit)) => {
+                collect_crash_evidence(
+                    CrashArtifactCollectionRequest::new(
+                        game_dir,
+                        process_started_at_ms,
+                        exit_observed_at_ms,
+                    ),
+                    permit,
+                )
                 .await
             }
             _ => None,
@@ -869,6 +876,15 @@ async fn settle_process_exit(
             },
         )
         .await;
+}
+
+fn should_collect_crash_artifact(
+    requested_cause: Option<ProcessTerminalCause>,
+    output_processor_failed: bool,
+    observed_failure: bool,
+    process_failed: bool,
+) -> bool {
+    requested_cause.is_none() && (output_processor_failed || observed_failure || process_failed)
 }
 
 async fn settle_watchdog_exit(
@@ -975,6 +991,28 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
     use tokio::sync::Notify;
+
+    #[test]
+    fn crash_collection_is_limited_to_natural_failure_candidates() {
+        assert!(should_collect_crash_artifact(None, false, false, true));
+        assert!(should_collect_crash_artifact(None, true, false, false));
+        assert!(should_collect_crash_artifact(None, false, true, false));
+        assert!(!should_collect_crash_artifact(None, false, false, false));
+        for cause in [
+            ProcessTerminalCause::UserStop,
+            ProcessTerminalCause::StartupWatchdog,
+            ProcessTerminalCause::LaunchFailure,
+            ProcessTerminalCause::Replacement,
+            ProcessTerminalCause::Shutdown,
+        ] {
+            assert!(!should_collect_crash_artifact(
+                Some(cause),
+                true,
+                true,
+                true
+            ));
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

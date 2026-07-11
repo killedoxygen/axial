@@ -289,6 +289,7 @@ dependencies = [
  "png",
  "rand 0.8.5",
  "reqwest 0.12.28",
+ "rustix",
  "serde",
  "serde_json",
  "sha1",

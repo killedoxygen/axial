@@ -3293,7 +3293,7 @@ fn benchmark_status_payload_drops_sensitive_client_metadata() {
 fn sensitive_launch_proof_record() -> crate::state::launch_reports::LaunchProofRecord {
     crate::state::launch_reports::LaunchProofRecord {
             schema: "axial.launch.proof".to_string(),
-            schema_version: 2,
+            schema_version: 3,
             session_id: "sensitive-proof".to_string(),
             instance_id: "instance-safe".to_string(),
             version_id: "1.21.1".to_string(),
@@ -3333,6 +3333,7 @@ fn sensitive_launch_proof_record() -> crate::state::launch_reports::LaunchProofR
             failure_detail: Some(
                 "Java failed in /home/alice/.minecraft with --accessToken raw-secret -Xmx8192M username=SecretPlayer account_id=abc provider_payload={} eyJheader123456789.eyJpayload123456789.signature123456789".to_string(),
             ),
+            crash_evidence: None,
             guardian: Some(json!({
                 "mode": "managed",
                 "decision": "warned",
@@ -4007,7 +4008,7 @@ fn family_c_proof_record(
 
     crate::state::launch_reports::LaunchProofRecord {
         schema: "axial.launch.proof".to_string(),
-        schema_version: 2,
+        schema_version: 3,
         session_id,
         instance_id: instance_id.to_string(),
         version_id: "1.12.2".to_string(),
@@ -4037,6 +4038,7 @@ fn family_c_proof_record(
         priority: None,
         failure_class: None,
         failure_detail: None,
+        crash_evidence: None,
         guardian: Some(json!({
             "mode": "managed",
             "decision": "allowed",
