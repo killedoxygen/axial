@@ -35,12 +35,13 @@ pub(super) fn plan_guardian_launch_recovery_directive(
     let user_intent_hash = launch_recovery_user_intent_fingerprint(
         GuardianLaunchRecoveryCurrentIntent {
             target_version_id: &intent.target_version_id,
-            explicit_java_override_present: intent.guardian.has_java_override(),
-            explicit_jvm_args_present: intent.guardian.has_raw_jvm_args(),
-            explicit_jvm_preset_present: intent.guardian.has_named_preset(),
+            requested_java: &intent.requested_java,
+            explicit_jvm_args: &intent.extra_jvm_args,
+            requested_preset: &intent.requested_preset,
         },
         directive.kind,
-    );
+    )
+    .ok_or(GuardianLaunchRecoveryPlanRejection::InvalidUserIntentFingerprint)?;
     plan_launch_recovery_directive(GuardianLaunchRecoveryPlanRequest {
         instance_id: &intent.instance_id,
         mode,
@@ -926,8 +927,12 @@ mod tests {
         assert!(memory[0].suppression_until.is_some());
 
         let memory_json = serde_json::to_string(&memory).expect("memory json");
-        assert!(memory_json.contains("raw_jvm_args_present"));
-        assert!(memory_json.contains("1.21.1"));
+        assert!(
+            memory[0]
+                .user_intent_hash
+                .as_deref()
+                .is_some_and(|value| { value.len() == 78 && value.starts_with("sha256.") })
+        );
         for fragment in ["-Dtoken", "raw-secret-token", "-XX:+UseZGC", "/home/alice"] {
             assert!(
                 !memory_json.contains(fragment),
@@ -1092,8 +1097,12 @@ mod tests {
         assert!(memory[0].suppression_until.is_some());
 
         let memory_json = serde_json::to_string(&memory).expect("memory json");
-        assert!(memory_json.contains("jvm_preset_present"));
-        assert!(memory_json.contains("1.21.1"));
+        assert!(
+            memory[0]
+                .user_intent_hash
+                .as_deref()
+                .is_some_and(|value| { value.len() == 78 && value.starts_with("sha256.") })
+        );
         for fragment in [
             "-Dtoken",
             "raw-secret-token",
@@ -1309,6 +1318,36 @@ mod tests {
         assert!(guardian.guidance.iter().any(|detail| {
             detail == "Review the latest game log or change the affected launch setting before retrying."
         }));
+    }
+
+    #[test]
+    fn application_recovery_planning_rejects_unfingerprintable_intent() {
+        for mut intent in [
+            test_launch_intent(Path::new("/tmp/axial-test"), "invalid-version"),
+            test_launch_intent(Path::new("/tmp/axial-test"), "oversized-args"),
+        ] {
+            if intent.session_id == "invalid-version" {
+                intent.target_version_id = "/invalid/version".to_string();
+            } else {
+                intent.extra_jvm_args = vec!["x".repeat(4_097)];
+            }
+            let rejection = plan_guardian_launch_recovery_directive(
+                &intent,
+                GuardianLaunchRecoveryDirective {
+                    kind: GuardianLaunchRecoveryKind::StripRawJvmArgs,
+                    effect: GuardianLaunchRecoveryEffect::StripRawJvmArgs,
+                    description: "Guardian removed incompatible explicit JVM args before launch"
+                        .to_string(),
+                },
+                crate::guardian::GuardianMode::Managed,
+                LaunchFailureClass::JvmUnsupportedOption,
+            )
+            .expect_err("unfingerprintable launch intent rejected");
+            assert_eq!(
+                rejection,
+                GuardianLaunchRecoveryPlanRejection::InvalidUserIntentFingerprint
+            );
+        }
     }
 
     fn test_recovery_plan(

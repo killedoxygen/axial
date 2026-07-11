@@ -171,14 +171,15 @@ async fn launch_preflight_surfaces_only_active_suppression_for_the_exact_current
         });
         let stored_intent = GuardianLaunchRecoveryCurrentIntent {
             target_version_id: "1.21.1",
-            explicit_java_override_present: false,
-            explicit_jvm_args_present: false,
-            explicit_jvm_preset_present: true,
+            requested_java: "",
+            explicit_jvm_args: &[],
+            requested_preset: "performance",
         };
         let intent_hash = launch_recovery_user_intent_fingerprint(
             stored_intent,
             GuardianLaunchRecoveryKind::DowngradePreset,
-        );
+        )
+        .expect("valid stored recovery intent");
         fixture
             .state
             .failure_memory()

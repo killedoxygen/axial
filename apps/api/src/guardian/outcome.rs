@@ -514,6 +514,8 @@ mod tests {
 
     #[test]
     fn launch_recovery_suppression_outcome_authors_public_copy() {
+        let intent_fingerprint =
+            "sha256.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa";
         let plan = plan_launch_recovery_directive(GuardianLaunchRecoveryPlanRequest {
             instance_id: "instance-1",
             mode: crate::guardian::GuardianMode::Managed,
@@ -524,7 +526,7 @@ mod tests {
                     .to_string(),
             },
             failure_class: axial_launcher::LaunchFailureClass::JvmUnsupportedOption,
-            user_intent_hash: Some("raw_jvm_args_present:1.21.1"),
+            user_intent_hash: Some(intent_fingerprint),
         })
         .expect("recovery plan");
 

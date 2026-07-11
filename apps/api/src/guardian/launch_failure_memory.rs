@@ -31,7 +31,7 @@ pub struct GuardianLaunchFailureMemoryIntakeRequest<'a> {
     pub current_at: &'a str,
     pub current_intent: GuardianLaunchRecoveryCurrentIntent<'a>,
     pub runtime_major: Option<u32>,
-    pub effective_preset: &'a str,
+    pub known_effective_preset: Option<&'a str>,
     pub current_memory_mb: i32,
     pub suggested_memory_mb: Option<i32>,
 }
@@ -241,12 +241,13 @@ fn recent_repair_failed_fact(
     let mut fields = vec![public_field("diagnosis", entry.diagnosis_id.as_str())];
     if entry.diagnosis_id.as_str() == "jvm_preset_recovery"
         && let Some(runtime_major) = request.runtime_major.filter(|major| *major > 0)
+        && let Some(effective_preset) = request.known_effective_preset
     {
         let preset = conservative_launch_recovery_preset(
             request.current_intent.target_version_id,
             runtime_major,
         );
-        if preset != request.effective_preset.trim() {
+        if preset != effective_preset.trim() {
             fields.push(public_field("recovery_preset", preset));
         }
     }
@@ -344,7 +345,9 @@ pub fn record_launch_failure_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guardian::GuardianActionKind;
+    use crate::guardian::{
+        GuardianActionKind, GuardianLaunchRecoveryKind, launch_recovery_user_intent_fingerprint,
+    };
     use crate::observability::RedactionAudience;
 
     #[test]
@@ -436,7 +439,7 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T10:00:00Z",
             Some("2026-07-11T11:00:00Z"),
-            "jvm_preset_present:1.21.1",
+            &intent_fingerprint(GuardianLaunchRecoveryKind::DowngradePreset),
         );
         let entries = vec![startup, repair];
 
@@ -525,7 +528,7 @@ mod tests {
             FailureMemoryActionOutcome::Suppressed,
             "2026-07-11T09:30:00Z",
             Some("2026-07-11T11:00:00Z"),
-            "raw_jvm_args_present:1.21.1",
+            &intent_fingerprint(GuardianLaunchRecoveryKind::StripRawJvmArgs),
         );
         let expired = repair_entry(
             "instance-a",
@@ -535,7 +538,7 @@ mod tests {
             FailureMemoryActionOutcome::Suppressed,
             "2026-07-11T09:40:00Z",
             Some("2026-07-11T09:59:00Z"),
-            "jvm_preset_present:1.21.1",
+            &intent_fingerprint(GuardianLaunchRecoveryKind::DisableCustomGc),
         );
 
         let active_facts =
@@ -543,7 +546,7 @@ mod tests {
         let wrong_intent_facts =
             launch_failure_memory_guardian_facts(GuardianLaunchFailureMemoryIntakeRequest {
                 current_intent: GuardianLaunchRecoveryCurrentIntent {
-                    explicit_jvm_args_present: false,
+                    explicit_jvm_args: &["-XX:+UseG1GC".to_string()],
                     ..current_intent()
                 },
                 ..intake_request(std::slice::from_ref(&active))
@@ -567,7 +570,7 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
             None,
-            "raw_jvm_args_present:1.21.1",
+            &intent_fingerprint(GuardianLaunchRecoveryKind::StripRawJvmArgs),
         );
         let custom_gc_repair = repair_entry(
             "instance-a",
@@ -577,7 +580,7 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
             None,
-            "jvm_preset_present:1.21.1",
+            &intent_fingerprint(GuardianLaunchRecoveryKind::DisableCustomGc),
         );
 
         let raw_match = launch_failure_memory_guardian_facts(intake_request(std::slice::from_ref(
@@ -589,7 +592,7 @@ mod tests {
         let raw_mismatch =
             launch_failure_memory_guardian_facts(GuardianLaunchFailureMemoryIntakeRequest {
                 current_intent: GuardianLaunchRecoveryCurrentIntent {
-                    explicit_jvm_args_present: false,
+                    explicit_jvm_args: &["-XX:+UseG1GC".to_string()],
                     ..current_intent()
                 },
                 ..intake_request(std::slice::from_ref(&raw_args_repair))
@@ -597,7 +600,7 @@ mod tests {
         let gc_mismatch =
             launch_failure_memory_guardian_facts(GuardianLaunchFailureMemoryIntakeRequest {
                 current_intent: GuardianLaunchRecoveryCurrentIntent {
-                    explicit_jvm_preset_present: false,
+                    requested_preset: "performance",
                     ..current_intent()
                 },
                 ..intake_request(std::slice::from_ref(&custom_gc_repair))
@@ -607,6 +610,86 @@ mod tests {
         assert_eq!(gc_match[0].id.as_str(), RECENT_REPAIR_FAILED_FACT);
         assert!(raw_mismatch.is_empty());
         assert!(gc_mismatch.is_empty());
+    }
+
+    #[test]
+    fn intake_rejects_changed_or_unfingerprintable_repair_intent() {
+        let java_repair = repair_entry(
+            "instance-a",
+            GuardianMode::Managed,
+            "java_runtime_recovery",
+            GuardianActionKind::Fallback,
+            FailureMemoryActionOutcome::Failed,
+            "2026-07-11T09:00:00Z",
+            Some("2026-07-11T11:00:00Z"),
+            &intent_fingerprint(GuardianLaunchRecoveryKind::SwitchManagedRuntime),
+        );
+        let preset_repair = repair_entry(
+            "instance-a",
+            GuardianMode::Managed,
+            "jvm_preset_recovery",
+            GuardianActionKind::Downgrade,
+            FailureMemoryActionOutcome::Failed,
+            "2026-07-11T09:00:00Z",
+            Some("2026-07-11T11:00:00Z"),
+            &intent_fingerprint(GuardianLaunchRecoveryKind::DowngradePreset),
+        );
+        let args_repair = repair_entry(
+            "instance-a",
+            GuardianMode::Managed,
+            "jvm_arg_unsupported",
+            GuardianActionKind::Strip,
+            FailureMemoryActionOutcome::Failed,
+            "2026-07-11T09:00:00Z",
+            Some("2026-07-11T11:00:00Z"),
+            &intent_fingerprint(GuardianLaunchRecoveryKind::StripRawJvmArgs),
+        );
+        let changed_args = vec!["-XX:+UseG1GC".to_string()];
+        let changed_cases = [
+            (
+                &java_repair,
+                GuardianLaunchRecoveryCurrentIntent {
+                    requested_java: "/opt/other-java/bin/java",
+                    ..current_intent()
+                },
+            ),
+            (
+                &args_repair,
+                GuardianLaunchRecoveryCurrentIntent {
+                    explicit_jvm_args: &changed_args,
+                    ..current_intent()
+                },
+            ),
+            (
+                &preset_repair,
+                GuardianLaunchRecoveryCurrentIntent {
+                    requested_preset: "performance",
+                    ..current_intent()
+                },
+            ),
+            (
+                &java_repair,
+                GuardianLaunchRecoveryCurrentIntent {
+                    target_version_id: "1.20.1",
+                    ..current_intent()
+                },
+            ),
+            (
+                &preset_repair,
+                GuardianLaunchRecoveryCurrentIntent {
+                    target_version_id: "/invalid/version",
+                    ..current_intent()
+                },
+            ),
+        ];
+        for (entry, current_intent) in changed_cases {
+            let facts =
+                launch_failure_memory_guardian_facts(GuardianLaunchFailureMemoryIntakeRequest {
+                    current_intent,
+                    ..intake_request(std::slice::from_ref(entry))
+                });
+            assert!(facts.is_empty());
+        }
     }
 
     #[test]
@@ -687,11 +770,11 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
             Some("2026-07-11T11:00:00Z"),
-            "jvm_preset_present:1.21.1",
+            &intent_fingerprint(GuardianLaunchRecoveryKind::DowngradePreset),
         );
         let facts =
             launch_failure_memory_guardian_facts(GuardianLaunchFailureMemoryIntakeRequest {
-                effective_preset: "/home/alice/-Dtoken=secret-token",
+                known_effective_preset: Some("/home/alice/-Dtoken=secret-token"),
                 ..intake_request(std::slice::from_ref(&repair))
             });
 
@@ -723,7 +806,7 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
             None,
-            "jvm_preset_present:1.21.1",
+            &intent_fingerprint(GuardianLaunchRecoveryKind::DowngradePreset),
         );
         let strip_repair = repair_entry(
             "instance-a",
@@ -733,12 +816,12 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
             None,
-            "jvm_preset_present:1.21.1",
+            &intent_fingerprint(GuardianLaunchRecoveryKind::DisableCustomGc),
         );
 
         let same_preset =
             launch_failure_memory_guardian_facts(GuardianLaunchFailureMemoryIntakeRequest {
-                effective_preset: "performance",
+                known_effective_preset: Some("performance"),
                 ..intake_request(std::slice::from_ref(&preset_repair))
             });
         let inapplicable = launch_failure_memory_guardian_facts(intake_request(
@@ -749,10 +832,16 @@ mod tests {
                 runtime_major: None,
                 ..intake_request(std::slice::from_ref(&preset_repair))
             });
+        let unknown_effective_preset =
+            launch_failure_memory_guardian_facts(GuardianLaunchFailureMemoryIntakeRequest {
+                known_effective_preset: None,
+                ..intake_request(std::slice::from_ref(&preset_repair))
+            });
 
         assert_eq!(field(&same_preset[0], "recovery_preset"), None);
         assert_eq!(field(&inapplicable[0], "recovery_preset"), None);
         assert_eq!(field(&unknown_runtime[0], "recovery_preset"), None);
+        assert_eq!(field(&unknown_effective_preset[0], "recovery_preset"), None);
     }
 
     #[test]
@@ -850,7 +939,7 @@ mod tests {
             current_at: "2026-07-11T10:00:00Z",
             current_intent: current_intent(),
             runtime_major: Some(21),
-            effective_preset: "graalvm",
+            known_effective_preset: Some("graalvm"),
             current_memory_mb: 1024,
             suggested_memory_mb: Some(2048),
         }
@@ -859,10 +948,15 @@ mod tests {
     fn current_intent() -> GuardianLaunchRecoveryCurrentIntent<'static> {
         GuardianLaunchRecoveryCurrentIntent {
             target_version_id: "1.21.1",
-            explicit_java_override_present: true,
-            explicit_jvm_args_present: true,
-            explicit_jvm_preset_present: true,
+            requested_java: "/opt/java/bin/java",
+            explicit_jvm_args: &[],
+            requested_preset: "graalvm",
         }
+    }
+
+    fn intent_fingerprint(kind: GuardianLaunchRecoveryKind) -> String {
+        launch_recovery_user_intent_fingerprint(current_intent(), kind)
+            .expect("valid test recovery intent")
     }
 
     fn field<'a>(fact: &'a GuardianFact, key: &str) -> Option<&'a str> {
