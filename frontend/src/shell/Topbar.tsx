@@ -4,9 +4,11 @@ import { Icon } from '../ui/Icons';
 import { IconButton } from '../ui/Atoms';
 import { WindowControls } from './WindowControls';
 import { MusicWidget } from './MusicWidget';
+import { UpdateWidget } from './UpdateWidget';
 import { goBack, goForward, navigate, route } from '../ui-state';
 import { runningSessions, instances, versionById, launchState } from '../store';
 import { activeDownload, downloadFailure, downloadQueue } from '../machines/downloads';
+import { hasVisibleUpdate, updateFlowActive } from '../updater';
 import { minecraftVersionLabel } from '../version-display';
 import { hasCustomDragRegion, windowStartDragging, windowToggleMaximize } from '../native';
 
@@ -177,6 +179,7 @@ export function Topbar(): JSX.Element {
   };
 
   const crumbs = crumbsFor();
+  const hasUpdate = hasVisibleUpdate() || updateFlowActive();
   return (
     <div
       class={`cp-topbar${usesCustomDrag ? ' cp-drag' : ''}`}
@@ -211,8 +214,11 @@ export function Topbar(): JSX.Element {
       </div>
       <div class="cp-topbar-spacer" />
       <div class="cp-topbar-actions cp-nodrag">
-        <StatusPill />
         <MusicWidget />
+        <div class="cp-status-slot" data-update={hasUpdate}>
+          <StatusPill />
+          {hasUpdate && <UpdateWidget />}
+        </div>
       </div>
       <WindowControls />
     </div>
