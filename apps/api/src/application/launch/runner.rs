@@ -33,7 +33,7 @@ use axial_launcher::{
 };
 use axial_minecraft::download::repair_virtual_assets_from_index;
 use axial_minecraft::paths::assets_dir;
-use failure::{fail_launch, fail_launch_for_journal, fail_launch_with_outcome};
+use failure::{LaunchFailure, fail_launch, fail_launch_for_journal};
 use metadata::persist_launch_metadata;
 use prewarm::{format_prewarm_run_summary, prewarm_launch_plan};
 use proof::persist_launch_proof_with_context_owned as persist_launch_proof_with_context;
@@ -348,10 +348,12 @@ async fn launch_session_inner(
                                 &state,
                                 producer,
                                 &session_id,
-                                Some(&proof_context),
-                                failure_class,
-                                &prepare_outcome.user_outcome,
-                                error.healing.clone(),
+                                RejectedLaunchRecovery {
+                                    proof_context: Some(&proof_context),
+                                    failure_class,
+                                    user_outcome: &prepare_outcome.user_outcome,
+                                    healing: error.healing.clone(),
+                                },
                                 &mut guardian,
                             )
                             .await);
@@ -382,11 +384,14 @@ async fn launch_session_inner(
                             &state,
                             producer,
                             &session_id,
-                            Some(&proof_context),
-                            failure_class,
-                            &message,
-                            error.healing,
-                            Some(guardian.clone()),
+                            LaunchFailure {
+                                proof_context: Some(&proof_context),
+                                class: failure_class,
+                                message: &message,
+                                healing: error.healing,
+                                guardian: Some(guardian.clone()),
+                                outcome: None,
+                            },
                         )
                         .await);
                     }
@@ -408,11 +413,14 @@ async fn launch_session_inner(
                     &state,
                     producer,
                     &session_id,
-                    Some(&proof_context),
-                    failure_class,
-                    &error.message,
-                    error.healing,
-                    Some(guardian.clone()),
+                    LaunchFailure {
+                        proof_context: Some(&proof_context),
+                        class: failure_class,
+                        message: &error.message,
+                        healing: error.healing,
+                        guardian: Some(guardian.clone()),
+                        outcome: None,
+                    },
                 )
                 .await);
             }
@@ -520,11 +528,14 @@ async fn launch_session_inner(
                     &state,
                     producer,
                     &session_id,
-                    Some(&proof_context),
-                    LaunchFailureClass::Unknown,
-                    &error.to_string(),
-                    prepared.healing.clone(),
-                    Some(guardian.clone()),
+                    LaunchFailure {
+                        proof_context: Some(&proof_context),
+                        class: LaunchFailureClass::Unknown,
+                        message: &error.to_string(),
+                        healing: prepared.healing.clone(),
+                        guardian: Some(guardian.clone()),
+                        outcome: None,
+                    },
                 )
                 .await);
             }
@@ -550,11 +561,14 @@ async fn launch_session_inner(
                 &state,
                 producer,
                 &session_id,
-                Some(&proof_context),
-                LaunchFailureClass::Unknown,
-                &error.to_string(),
-                prepared.healing.clone(),
-                Some(guardian.clone()),
+                LaunchFailure {
+                    proof_context: Some(&proof_context),
+                    class: LaunchFailureClass::Unknown,
+                    message: &error.to_string(),
+                    healing: prepared.healing.clone(),
+                    guardian: Some(guardian.clone()),
+                    outcome: None,
+                },
             )
             .await);
         }
@@ -655,18 +669,20 @@ async fn launch_session_inner(
                     LaunchSessionExitReason::SpawnFailed.summary(),
                 ));
                 trace_launch_event(&session_id, &format!("spawn failed: {error}"));
-                return Err(fail_launch_with_outcome(
+                return Err(fail_launch(
                     &state,
                     producer,
                     &session_id,
-                    Some(&proof_context),
-                    LaunchFailureClass::Unknown,
-                    &format!("failed to start launch process: {error}"),
-                    prepared.healing.clone(),
-                    Some(guardian.clone()),
-                    Some(LaunchSessionOutcome::from_reason(
-                        LaunchSessionExitReason::SpawnFailed,
-                    )),
+                    LaunchFailure {
+                        proof_context: Some(&proof_context),
+                        class: LaunchFailureClass::Unknown,
+                        message: &format!("failed to start launch process: {error}"),
+                        healing: prepared.healing.clone(),
+                        guardian: Some(guardian.clone()),
+                        outcome: Some(LaunchSessionOutcome::from_reason(
+                            LaunchSessionExitReason::SpawnFailed,
+                        )),
+                    },
                 )
                 .await);
             }
@@ -816,10 +832,12 @@ async fn launch_session_inner(
                                 &state,
                                 producer,
                                 &session_id,
-                                Some(&proof_context),
-                                failure_class,
-                                &startup_outcome.user_outcome,
-                                healing,
+                                RejectedLaunchRecovery {
+                                    proof_context: Some(&proof_context),
+                                    failure_class,
+                                    user_outcome: &startup_outcome.user_outcome,
+                                    healing,
+                                },
                                 &mut guardian,
                             )
                             .await);
@@ -856,11 +874,14 @@ async fn launch_session_inner(
                             &state,
                             producer,
                             &session_id,
-                            Some(&proof_context),
-                            failure_class,
-                            &message,
-                            healing,
-                            Some(guardian.clone()),
+                            LaunchFailure {
+                                proof_context: Some(&proof_context),
+                                class: failure_class,
+                                message: &message,
+                                healing,
+                                guardian: Some(guardian.clone()),
+                                outcome: None,
+                            },
                         )
                         .await);
                     }
@@ -888,11 +909,14 @@ async fn launch_session_inner(
                     &state,
                     producer,
                     &session_id,
-                    Some(&proof_context),
-                    failure_class,
-                    &startup_outcome.user_outcome.summary,
-                    healing,
-                    Some(guardian.clone()),
+                    LaunchFailure {
+                        proof_context: Some(&proof_context),
+                        class: failure_class,
+                        message: &startup_outcome.user_outcome.summary,
+                        healing,
+                        guardian: Some(guardian.clone()),
+                        outcome: None,
+                    },
                 )
                 .await);
             }
@@ -910,26 +934,33 @@ fn guardian_journal_error(_error: OperationJournalStoreError) -> LaunchRequestEr
     }
 }
 
+struct RejectedLaunchRecovery<'a> {
+    proof_context: Option<&'a LaunchProofContext>,
+    failure_class: LaunchFailureClass,
+    user_outcome: &'a GuardianUserOutcome,
+    healing: Option<axial_launcher::LaunchHealingSummary>,
+}
+
 async fn fail_rejected_launch_recovery_plan(
     state: &AppState,
     producer: &crate::state::ProducerLease,
     session_id: &str,
-    proof_context: Option<&LaunchProofContext>,
-    failure_class: LaunchFailureClass,
-    user_outcome: &GuardianUserOutcome,
-    healing: Option<axial_launcher::LaunchHealingSummary>,
+    failure: RejectedLaunchRecovery<'_>,
     guardian: &mut GuardianSummary,
 ) -> LaunchRequestError {
-    block_guardian_with_user_outcome(guardian, user_outcome);
+    block_guardian_with_user_outcome(guardian, failure.user_outcome);
     fail_launch(
         state,
         producer,
         session_id,
-        proof_context,
-        failure_class,
-        &user_outcome.summary,
-        healing,
-        Some(guardian.clone()),
+        LaunchFailure {
+            proof_context: failure.proof_context,
+            class: failure.failure_class,
+            message: &failure.user_outcome.summary,
+            healing: failure.healing,
+            guardian: Some(guardian.clone()),
+            outcome: None,
+        },
     )
     .await
 }
@@ -1064,10 +1095,12 @@ mod tests {
             &state,
             &state.try_claim_producer().expect("claim failure producer"),
             session_id,
-            None,
-            LaunchFailureClass::Unknown,
-            &user_outcome,
-            None,
+            RejectedLaunchRecovery {
+                proof_context: None,
+                failure_class: LaunchFailureClass::Unknown,
+                user_outcome: &user_outcome,
+                healing: None,
+            },
             &mut guardian,
         )
         .await;

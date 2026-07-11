@@ -345,14 +345,21 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
         preflight.readiness.reasons
     );
 
-    let repaired = maybe_repair_managed_runtime_before_launch(
+    let producer = fixture
+        .state
+        .try_claim_producer()
+        .expect("claim runtime repair producer");
+    let repaired = maybe_repair_managed_runtime_before_launch_owned(
         &fixture.state,
+        &producer,
         preflight,
-        &instance,
-        &fixture.paths.library_dir,
-        &game_dir,
-        None,
-        None,
+        ManagedRuntimeRepairLaunch {
+            instance: &instance,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
     )
     .await
     .expect("persist managed-runtime repair journal");
@@ -420,14 +427,21 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
         preflight.readiness.reasons
     );
 
-    let repaired = maybe_repair_managed_runtime_before_launch(
+    let producer = fixture
+        .state
+        .try_claim_producer()
+        .expect("claim runtime repair producer");
+    let repaired = maybe_repair_managed_runtime_before_launch_owned(
         &fixture.state,
+        &producer,
         preflight,
-        &instance,
-        &fixture.paths.library_dir,
-        &game_dir,
-        None,
-        None,
+        ManagedRuntimeRepairLaunch {
+            instance: &instance,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
     )
     .await
     .expect("persist managed-runtime repair journal");
@@ -635,14 +649,21 @@ async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
     )
     .await;
 
-    let repaired = maybe_repair_managed_runtime_before_launch(
+    let producer = fixture
+        .state
+        .try_claim_producer()
+        .expect("claim runtime repair producer");
+    let repaired = maybe_repair_managed_runtime_before_launch_owned(
         &fixture.state,
+        &producer,
         preflight,
-        &instance,
-        &fixture.paths.library_dir,
-        &game_dir,
-        None,
-        None,
+        ManagedRuntimeRepairLaunch {
+            instance: &instance,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
     )
     .await
     .expect("persist managed-runtime repair journal");

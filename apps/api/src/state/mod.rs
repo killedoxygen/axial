@@ -14,6 +14,7 @@ pub mod performance_operations;
 pub mod presence;
 mod remote_flags;
 mod sessions;
+mod shutdown;
 pub mod skins;
 
 use axial_config::{AppConfig, ConfigStore, ConfigStoreError, InstanceStore, find_flag};
@@ -51,17 +52,18 @@ pub(crate) use journals::{
     operation_journal_plan_is_visible, operation_journal_terminal_is_visible,
 };
 pub use journals::{OperationJournalStore, OperationJournalStoreError};
-#[cfg(test)]
-pub(crate) use lifecycle::AppLifecyclePhase;
 pub(crate) use lifecycle::{
-    AppLifecycle, LifecycleAdmissionError, LifecycleQuiesceError, ProducerLease, RequestLease,
-    RequestProducerHandoff,
+    AppLifecycle, LifecycleAdmissionError, ProducerLease, RequestLease, RequestProducerHandoff,
 };
+#[cfg(test)]
+pub(crate) use lifecycle::{AppLifecyclePhase, LifecycleQuiesceError};
 pub(crate) use remote_flags::{
     RemoteFlagRefreshOutcome, RemoteFlagStore, ResolvedFlagSource, resolve_flag,
 };
 pub(crate) use sessions::{LaunchFailureTermination, LaunchFailureTerminationErrorClass};
 pub use sessions::{SessionAdmissionError, SessionStore, StartupOutcome};
+use shutdown::AppShutdownCoordinator;
+pub use shutdown::{AppShutdownError, AppShutdownStep};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -84,6 +86,7 @@ pub struct AppState {
     remote_flags: Arc<RemoteFlagStore>,
     launch_reports: Arc<launch_reports::LaunchReportStore>,
     lifecycle: AppLifecycle,
+    shutdown_coordinator: AppShutdownCoordinator,
     startup_warnings: Arc<Vec<String>>,
     config_changes: Arc<broadcast::Sender<()>>,
     library_dir: Arc<RwLock<Option<String>>>,
@@ -103,18 +106,6 @@ pub struct AppStateInit {
     pub startup_warnings: Vec<String>,
     pub frontend_dir: PathBuf,
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("secure authentication cleanup is incomplete")]
-pub struct SecureAuthCloseError;
-
-#[derive(Debug, thiserror::Error)]
-#[error("remote feature flag persistence is incomplete")]
-pub struct RemoteFlagCloseError;
-
-#[derive(Debug, thiserror::Error)]
-#[error("launch report persistence is incomplete")]
-pub struct LaunchReportCloseError;
 
 impl AppState {
     #[cfg(test)]
@@ -145,27 +136,6 @@ impl AppState {
         })
         .await
         .unwrap_or_else(|_| panic!("persisted state startup task stopped"))
-    }
-
-    pub async fn close_secure_auth(&self) -> Result<(), SecureAuthCloseError> {
-        self.auth_logins
-            .close()
-            .await
-            .map_err(|_| SecureAuthCloseError)
-    }
-
-    pub async fn close_remote_flags(&self) -> Result<(), RemoteFlagCloseError> {
-        self.remote_flags
-            .close()
-            .await
-            .map_err(|_| RemoteFlagCloseError)
-    }
-
-    pub async fn close_launch_reports(&self) -> Result<(), LaunchReportCloseError> {
-        self.launch_reports
-            .close()
-            .await
-            .map_err(|_| LaunchReportCloseError)
     }
 
     #[cfg(test)]
@@ -261,6 +231,7 @@ impl AppState {
             remote_flags,
             launch_reports,
             lifecycle: AppLifecycle::new(),
+            shutdown_coordinator: AppShutdownCoordinator::new(),
             startup_warnings: Arc::new(bound_startup_warnings(init.startup_warnings)),
             config_changes: Arc::new(config_changes),
             library_dir: Arc::new(RwLock::new(if library_dir.is_empty() {
@@ -362,8 +333,14 @@ impl AppState {
         self.lifecycle.subscribe_shutdown()
     }
 
+    #[cfg(test)]
     pub(crate) async fn quiesce(&self) -> Result<(), LifecycleQuiesceError> {
         self.lifecycle.quiesce().await
+    }
+
+    pub async fn shutdown(&self) -> Result<(), AppShutdownError> {
+        self.lifecycle.begin_quiesce();
+        self.shutdown_coordinator.start(self.clone()).wait().await
     }
 
     #[cfg(test)]

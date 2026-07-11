@@ -70,29 +70,62 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn serve_api(state: AppState, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let serve_result: Result<(), Box<dyn std::error::Error>> = async {
-        let listener = TcpListener::bind(addr).await?;
-        let addr = listener.local_addr()?;
-        info!("axial api listening on http://{addr}");
+    let listener = match TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(error) => return Err(listener_startup_error(&state, error).await),
+    };
+    let addr = match listener.local_addr() {
+        Ok(addr) => addr,
+        Err(error) => return Err(listener_startup_error(&state, error).await),
+    };
+    info!("axial api listening on http://{addr}");
 
-        axum::serve(listener, build_router(state.clone()))
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
+    let (stop_ingress, mut ingress_stopping) = tokio::sync::watch::channel(false);
+    let server_state = state.clone();
+    let mut server = std::pin::pin!(async move {
+        axum::serve(listener, build_router(server_state))
+            .with_graceful_shutdown(async move {
+                while !*ingress_stopping.borrow_and_update() {
+                    if ingress_stopping.changed().await.is_err() {
+                        break;
+                    }
+                }
             })
-            .await?;
-        Ok(())
-    }
-    .await;
-    let _ = axial_api::routes::flush_pending_saved_skin_applies_for_shutdown(&state).await;
-    let auth_close_result = state.close_secure_auth().await;
-    let remote_flags_close_result = state.close_remote_flags().await;
-    let launch_reports_close_result = state.close_launch_reports().await;
+            .await
+    });
+    let shutdown_state = state.clone();
+    let mut shutdown = std::pin::pin!(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        stop_ingress.send_replace(true);
+        shutdown_state.shutdown().await
+    });
 
-    serve_result?;
-    auth_close_result?;
-    remote_flags_close_result?;
-    launch_reports_close_result?;
+    tokio::select! {
+        serve_result = &mut server => {
+            let shutdown_result = state.shutdown().await;
+            serve_result?;
+            shutdown_result?;
+        }
+        shutdown_result = &mut shutdown => {
+            let serve_result = server.await;
+            serve_result?;
+            shutdown_result?;
+        }
+    }
     Ok(())
+}
+
+async fn listener_startup_error(
+    state: &AppState,
+    error: std::io::Error,
+) -> Box<dyn std::error::Error> {
+    if let Err(shutdown_error) = state.shutdown().await {
+        tracing::warn!(
+            step = shutdown_error.step().as_str(),
+            "application shutdown remained incomplete after API listener startup failed"
+        );
+    }
+    Box::new(error)
 }
 
 fn emit_startup_failed(telemetry: &Arc<TelemetryHub>) {

@@ -4,7 +4,6 @@ use axial_api::application::launch::public_launch_status_json;
 use axial_api::application::{
     public_loader_install_progress_json, public_vanilla_install_progress_json,
 };
-use axial_api::routes::flush_pending_saved_skin_applies_for_shutdown;
 use axial_api::state::{AppState, LaunchEvent, LaunchSessionRecord, LaunchStatusEvent};
 use axial_launcher::{LaunchState, launch_notice_from_values};
 use serde::Serialize;
@@ -20,12 +19,8 @@ const RESTART_BUSY_MESSAGE: &str = "Restart is blocked while installs or launche
 const CLOSE_BUSY_MESSAGE: &str = "Close is blocked while installs or launches are active.";
 const API_CLOSE_FAILED_MESSAGE: &str =
     "Close is blocked because the local API did not stop cleanly.";
-const AUTH_CLOSE_FAILED_MESSAGE: &str =
-    "Close is blocked because secure authentication cleanup is incomplete.";
-const REMOTE_FLAGS_CLOSE_FAILED_MESSAGE: &str =
-    "Close is blocked because remote feature flag persistence is incomplete.";
-const LAUNCH_REPORTS_CLOSE_FAILED_MESSAGE: &str =
-    "Close is blocked because launch report persistence is incomplete.";
+const STATE_CLOSE_FAILED_MESSAGE: &str =
+    "Close is blocked because application shutdown is incomplete.";
 const SKIN_FILE_MAX_BYTES: u64 = 256 * 1024;
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 const MICROSOFT_SIGN_IN_WINDOW_LABEL: &str = "microsoft-signin";
@@ -208,10 +203,12 @@ pub async fn app_restart(
     state: State<'_, AppState>,
     api: State<'_, ApiRuntimeState>,
 ) -> Result<(), String> {
-    let active_installs = state.installs().active_install_count().await;
-    let active_sessions = state.sessions().active_session_count().await;
-    restart_readiness(active_installs, active_sessions)?;
-    prepare_for_exit_with_api("restart", state.inner(), api.inner()).await?;
+    if !api.exit_started() {
+        let active_installs = state.installs().active_install_count().await;
+        let active_sessions = state.sessions().active_session_count().await;
+        restart_readiness(active_installs, active_sessions)?;
+    }
+    prepare_for_exit_with_api(state.inner(), api.inner()).await?;
     app.request_restart();
     Ok(())
 }
@@ -265,11 +262,11 @@ pub async fn window_close(
     state: State<'_, AppState>,
     api: State<'_, ApiRuntimeState>,
 ) -> Result<(), String> {
-    if let Some(error) = close_blocking_error(state.inner()).await {
+    if let Some(error) = close_blocking_error(state.inner(), api.inner()).await {
         return Err(error);
     }
 
-    prepare_for_exit_with_api("desktop close", state.inner(), api.inner()).await?;
+    prepare_for_exit_with_api(state.inner(), api.inner()).await?;
 
     let window = app
         .get_webview_window("main")
@@ -277,50 +274,30 @@ pub async fn window_close(
     window.destroy().map_err(|e| e.to_string())
 }
 
-pub async fn close_blocking_error(state: &AppState) -> Option<String> {
+pub async fn close_blocking_error(state: &AppState, api: &ApiRuntimeState) -> Option<String> {
+    if api.exit_started() {
+        return None;
+    }
     let active_installs = state.installs().active_install_count().await;
     let active_sessions = state.sessions().active_session_count().await;
     close_readiness(active_installs, active_sessions).err()
 }
 
-pub async fn flush_pending_saved_skin_applies(action: &str, state: &AppState) {
-    if let Err((status, _)) = flush_pending_saved_skin_applies_for_shutdown(state).await {
-        tracing::warn!(
-            "failed to flush pending skin changes before {action}: HTTP {}",
-            status
-        );
-    }
-}
-
-pub async fn prepare_for_exit(action: &str, state: &AppState) -> Result<(), String> {
-    flush_pending_saved_skin_applies(action, state).await;
-    let auth_result = state
-        .close_secure_auth()
+pub async fn prepare_for_exit(state: &AppState) -> Result<(), String> {
+    state
+        .shutdown()
         .await
-        .map_err(|_| AUTH_CLOSE_FAILED_MESSAGE.to_string());
-    let remote_flags_result = state
-        .close_remote_flags()
-        .await
-        .map_err(|_| REMOTE_FLAGS_CLOSE_FAILED_MESSAGE.to_string());
-    let launch_reports_result = state
-        .close_launch_reports()
-        .await
-        .map_err(|_| LAUNCH_REPORTS_CLOSE_FAILED_MESSAGE.to_string());
-    auth_result?;
-    remote_flags_result?;
-    launch_reports_result
+        .map_err(|_| STATE_CLOSE_FAILED_MESSAGE.to_string())
 }
 
 pub async fn prepare_for_exit_with_api(
-    action: &str,
     state: &AppState,
     api: &ApiRuntimeState,
 ) -> Result<(), String> {
-    let api_result = api
-        .shutdown()
-        .await
-        .map_err(|_| API_CLOSE_FAILED_MESSAGE.to_string());
-    let state_result = prepare_for_exit(action, state).await;
+    api.mark_exit_started();
+    let (api_result, state_result) = tokio::join!(api.shutdown(), state.shutdown());
+    let api_result = api_result.map_err(|_| API_CLOSE_FAILED_MESSAGE.to_string());
+    let state_result = state_result.map_err(|_| STATE_CLOSE_FAILED_MESSAGE.to_string());
     api_result?;
     state_result
 }

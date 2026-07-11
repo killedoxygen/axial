@@ -46,9 +46,9 @@ use resources::{
 };
 #[cfg(test)]
 use resources::{LaunchCpuLoadEvidence, LaunchDiskEvidence, LaunchMemoryEvidence, load_to_x100};
-#[cfg(test)]
-use runtime_repair::maybe_repair_managed_runtime_before_launch;
-use runtime_repair::maybe_repair_managed_runtime_before_launch_owned;
+use runtime_repair::{
+    ManagedRuntimeRepairLaunch, maybe_repair_managed_runtime_before_launch_owned,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -229,11 +229,13 @@ async fn prepare_launch_session_with_auth_refresh(
         state,
         producer,
         preflight,
-        &instance,
-        &library_dir,
-        &game_dir,
-        payload.max_memory_mb,
-        payload.min_memory_mb,
+        ManagedRuntimeRepairLaunch {
+            instance: &instance,
+            library_dir: &library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: payload.max_memory_mb,
+            requested_min_memory_mb: payload.min_memory_mb,
+        },
     )
     .await
     .map_err(launch_journal_error_response)?;

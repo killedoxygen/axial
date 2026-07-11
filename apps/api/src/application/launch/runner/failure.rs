@@ -17,28 +17,49 @@ const LIVE_LAUNCH_FAILURE_SAFE_FALLBACK: &str = "Launch failed before Minecraft 
 const ROSETTA_REQUIRED_LAUNCH_MESSAGE_PREFIX: &str = "resolve java: java runtime ";
 const ROSETTA_REQUIRED_LAUNCH_MESSAGE_SUFFIX: &str = " needs Rosetta 2 on this Mac: run `softwareupdate --install-rosetta --agree-to-license` in Terminal";
 
+pub(super) struct LaunchFailure<'a> {
+    pub(super) proof_context: Option<&'a LaunchProofContext>,
+    pub(super) class: LaunchFailureClass,
+    pub(super) message: &'a str,
+    pub(super) healing: Option<axial_launcher::LaunchHealingSummary>,
+    pub(super) guardian: Option<GuardianSummary>,
+    pub(super) outcome: Option<LaunchSessionOutcome>,
+}
+
 pub(super) async fn fail_launch(
     state: &AppState,
     producer: &crate::state::ProducerLease,
     session_id: &str,
-    proof_context: Option<&LaunchProofContext>,
-    failure_class: LaunchFailureClass,
-    message: &str,
-    healing: Option<axial_launcher::LaunchHealingSummary>,
-    guardian: Option<GuardianSummary>,
+    failure: LaunchFailure<'_>,
 ) -> LaunchRequestError {
-    fail_launch_with_outcome(
+    let public_message = sanitize_live_launch_failure_message(failure.message);
+    emit_terminal_failure(
+        state,
+        session_id,
+        TerminalFailureEvent {
+            state: "exited",
+            class: failure.class,
+            message: &public_message,
+            healing: failure.healing.clone(),
+            guardian: failure.guardian.clone(),
+            outcome: failure.outcome,
+        },
+    )
+    .await;
+    persist_launch_proof_with_context(
         state,
         producer,
         session_id,
-        proof_context,
-        failure_class,
-        message,
-        healing,
-        guardian,
         None,
+        "failed",
+        failure.proof_context,
     )
-    .await
+    .await;
+    LaunchRequestError {
+        message: public_message,
+        healing: failure.healing,
+        guardian: failure.guardian,
+    }
 }
 
 pub(super) async fn fail_launch_for_journal(
@@ -64,42 +85,6 @@ pub(super) async fn fail_launch_for_journal(
     )
     .await;
     persist_launch_proof_with_context(state, producer, session_id, None, "failed", None).await;
-    LaunchRequestError {
-        message: public_message,
-        healing,
-        guardian,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn fail_launch_with_outcome(
-    state: &AppState,
-    producer: &crate::state::ProducerLease,
-    session_id: &str,
-    proof_context: Option<&LaunchProofContext>,
-    failure_class: LaunchFailureClass,
-    message: &str,
-    healing: Option<axial_launcher::LaunchHealingSummary>,
-    guardian: Option<GuardianSummary>,
-    outcome: Option<LaunchSessionOutcome>,
-) -> LaunchRequestError {
-    // Live failure details are sanitized before they enter status events or API responses.
-    let public_message = sanitize_live_launch_failure_message(message);
-    emit_terminal_failure(
-        state,
-        session_id,
-        TerminalFailureEvent {
-            state: "exited",
-            class: failure_class,
-            message: &public_message,
-            healing: healing.clone(),
-            guardian: guardian.clone(),
-            outcome,
-        },
-    )
-    .await;
-    persist_launch_proof_with_context(state, producer, session_id, None, "failed", proof_context)
-        .await;
     LaunchRequestError {
         message: public_message,
         healing,
@@ -243,11 +228,14 @@ mod tests {
             &state,
             &producer,
             session_id,
-            None,
-            LaunchFailureClass::Unknown,
-            unsafe_message,
-            None,
-            None,
+            LaunchFailure {
+                proof_context: None,
+                class: LaunchFailureClass::Unknown,
+                message: unsafe_message,
+                healing: None,
+                guardian: None,
+                outcome: None,
+            },
         )
         .await;
 
@@ -294,7 +282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fail_launch_with_outcome_records_spawn_failure_in_session_and_proof() {
+    async fn fail_launch_records_spawn_failure_in_session_and_proof() {
         let root = unique_test_dir("spawn-failed-outcome");
         let state = test_app_state(&root);
         let session_id = "spawn-failed-outcome";
@@ -306,16 +294,18 @@ mod tests {
 
         let expected = LaunchSessionOutcome::from_reason(LaunchSessionExitReason::SpawnFailed);
         let producer = state.try_claim_producer().expect("claim failure producer");
-        let _ = fail_launch_with_outcome(
+        let _ = fail_launch(
             &state,
             &producer,
             session_id,
-            None,
-            LaunchFailureClass::Unknown,
-            "failed to start launch process: program not found",
-            None,
-            None,
-            Some(expected.clone()),
+            LaunchFailure {
+                proof_context: None,
+                class: LaunchFailureClass::Unknown,
+                message: "failed to start launch process: program not found",
+                healing: None,
+                guardian: None,
+                outcome: Some(expected.clone()),
+            },
         )
         .await;
 

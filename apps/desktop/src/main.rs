@@ -69,9 +69,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => {
             emit_startup_failed(&telemetry);
             discord_presence.shutdown_blocking();
-            commands::prepare_for_exit("API startup failure", &state)
-                .await
-                .map_err(std::io::Error::other)?;
+            if let Err(shutdown_error) = commands::prepare_for_exit(&state).await {
+                tracing::warn!(
+                    error = shutdown_error,
+                    "application shutdown remained incomplete after embedded API startup failed"
+                );
+            }
             return Err(Box::new(error));
         }
     };
@@ -114,17 +117,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let api = close_event_api.clone();
                 let discord_presence = close_event_presence.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Some(error) = commands::close_blocking_error(&state).await {
+                    if let Some(error) = commands::close_blocking_error(&state, &api).await {
                         let _ = window.emit(
                             events::DESKTOP_CLOSE_BLOCKED,
                             serde_json::json!({ "error": error }),
                         );
                         return;
                     }
-                    if let Err(error) =
-                        commands::prepare_for_exit_with_api("window close request", &state, &api)
-                            .await
-                    {
+                    if let Err(error) = commands::prepare_for_exit_with_api(&state, &api).await {
                         let _ = window.emit(
                             events::DESKTOP_CLOSE_BLOCKED,
                             serde_json::json!({ "error": error }),
@@ -156,14 +156,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(error) = run_result {
         emit_startup_failed(&telemetry);
         discord_presence.shutdown_blocking();
-        commands::prepare_for_exit_with_api("desktop event loop failure", &state, &api_runtime)
-            .await
-            .map_err(std::io::Error::other)?;
+        if let Err(shutdown_error) = commands::prepare_for_exit_with_api(&state, &api_runtime).await
+        {
+            tracing::warn!(
+                error = shutdown_error,
+                "application shutdown remained incomplete after the desktop event loop failed"
+            );
+        }
         return Err(Box::new(error));
     }
 
     discord_presence.shutdown_blocking();
-    commands::prepare_for_exit_with_api("desktop shutdown", &state, &api_runtime)
+    commands::prepare_for_exit_with_api(&state, &api_runtime)
         .await
         .map_err(std::io::Error::other)?;
 

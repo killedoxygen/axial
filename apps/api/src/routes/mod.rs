@@ -32,7 +32,6 @@ use axum::{
 use http_body_util::BodyExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-pub use crate::application::flush_pending_saved_skin_applies_for_shutdown;
 pub fn router(state: AppState) -> Router {
     let admission_state = state.clone();
     Router::new()

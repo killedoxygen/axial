@@ -26,6 +26,7 @@ pub(crate) struct LifecycleQuiesceError;
 #[derive(Clone)]
 pub(crate) struct AppLifecycle {
     shared: Arc<AppLifecycleShared>,
+    quiesce_deadline: Duration,
 }
 
 struct AppLifecycleShared {
@@ -77,6 +78,10 @@ pub(crate) struct RequestProducerHandoff {
 
 impl AppLifecycle {
     pub(crate) fn new() -> Self {
+        Self::new_with_deadline(LIFECYCLE_QUIESCE_DEADLINE)
+    }
+
+    pub(super) fn new_with_deadline(quiesce_deadline: Duration) -> Self {
         let (shutdown, _) = watch::channel(false);
         let state = AppLifecycleState {
             phase: AppLifecyclePhase::Running,
@@ -91,6 +96,7 @@ impl AppLifecycle {
                 changed,
                 shutdown,
             }),
+            quiesce_deadline,
         }
     }
 
@@ -122,11 +128,20 @@ impl AppLifecycle {
         self.shared.shutdown.subscribe()
     }
 
+    #[cfg(test)]
     pub(crate) async fn quiesce(&self) -> Result<(), LifecycleQuiesceError> {
-        self.quiesce_with_deadline(LIFECYCLE_QUIESCE_DEADLINE).await
+        self.begin_quiesce();
+        self.wait_for_quiesced().await
     }
 
+    #[cfg(test)]
     async fn quiesce_with_deadline(&self, deadline: Duration) -> Result<(), LifecycleQuiesceError> {
+        self.begin_quiesce();
+        self.wait_for_phase_with_deadline(AppLifecyclePhase::Quiesced, deadline)
+            .await
+    }
+
+    pub(crate) fn begin_quiesce(&self) {
         let should_spawn = {
             let mut state = self.shared.state.lock().expect(LIFECYCLE_LOCK_INVARIANT);
             if state.phase == AppLifecyclePhase::Running {
@@ -148,8 +163,27 @@ impl AppLifecycle {
                 lifecycle.coordinate_quiesce().await;
             });
         }
+    }
 
-        tokio::time::timeout(deadline, self.wait_for_phase(AppLifecyclePhase::Quiesced))
+    pub(crate) async fn wait_for_shutdown_started(&self) -> Result<(), LifecycleQuiesceError> {
+        self.wait_for_phase_with_deadline(
+            AppLifecyclePhase::QuiescingProducers,
+            self.quiesce_deadline,
+        )
+        .await
+    }
+
+    pub(crate) async fn wait_for_quiesced(&self) -> Result<(), LifecycleQuiesceError> {
+        self.wait_for_phase_with_deadline(AppLifecyclePhase::Quiesced, self.quiesce_deadline)
+            .await
+    }
+
+    async fn wait_for_phase_with_deadline(
+        &self,
+        phase: AppLifecyclePhase,
+        deadline: Duration,
+    ) -> Result<(), LifecycleQuiesceError> {
+        tokio::time::timeout(deadline, self.wait_for_phase(phase))
             .await
             .map_err(|_| LifecycleQuiesceError)
     }

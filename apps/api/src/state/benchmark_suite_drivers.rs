@@ -228,9 +228,12 @@ impl BenchmarkSuiteDriverEffectOwners {
     }
 }
 
+type BenchmarkSuiteDriverShutdownAttempt =
+    Arc<watch::Sender<Option<Result<(), BenchmarkSuiteDriverShutdownError>>>>;
+
 #[derive(Debug, Default)]
 struct BenchmarkSuiteDriverShutdownState {
-    in_flight: Option<Arc<watch::Sender<Option<Result<(), BenchmarkSuiteDriverShutdownError>>>>>,
+    in_flight: Option<BenchmarkSuiteDriverShutdownAttempt>,
     complete: bool,
 }
 

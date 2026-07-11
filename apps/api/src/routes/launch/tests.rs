@@ -2734,7 +2734,7 @@ async fn benchmark_suite_driver_startup_resume_starts_fresh_driver_from_restart_
     let interrupted = fixture
         .active_driver(&suite_id, "development", 45_000)
         .await;
-    let reloaded = fixture.reload().await;
+    let reloaded = fixture.reload_after_simulated_crash().await;
     reloaded
         .state
         .sessions()
@@ -2800,7 +2800,7 @@ async fn benchmark_suite_driver_startup_resume_missing_manifest_fails_boundedly(
     let interrupted = fixture
         .active_driver(&suite_id, "development", 30_000)
         .await;
-    let reloaded = fixture.reload().await;
+    let reloaded = fixture.reload_after_simulated_crash().await;
 
     let summary = resume_restart_interrupted_benchmark_suite_drivers(
         reloaded.state.clone(),
@@ -2840,7 +2840,7 @@ async fn benchmark_suite_driver_startup_resume_complete_manifest_fails_boundedly
     let interrupted = fixture
         .active_driver(&suite_id, "development", 30_000)
         .await;
-    let reloaded = fixture.reload().await;
+    let reloaded = fixture.reload_after_simulated_crash().await;
 
     let summary = resume_restart_interrupted_benchmark_suite_drivers(
         reloaded.state.clone(),
@@ -3528,22 +3528,29 @@ impl RouteTestFixture {
         Self::from_root_paths(root, paths)
     }
 
-    async fn reload(&self) -> Self {
+    async fn reload_after_simulated_crash(&self) -> Self {
+        // Graceful AppState shutdown terminalizes drivers. These restart tests must preserve the
+        // interrupted record while releasing exact persistence paths for the replacement state.
         self.state
             .accounts()
             .close()
             .await
             .expect("close account store before reload");
         self.state
-            .benchmark_suites()
-            .close()
-            .await
-            .expect("close benchmark suite store before reload");
-        self.state
             .benchmark_suite_drivers()
             .close()
             .await
             .expect("close benchmark suite driver store before reload");
+        self.state
+            .launch_reports()
+            .close()
+            .await
+            .expect("close launch report store before reload");
+        self.state
+            .benchmark_suites()
+            .close()
+            .await
+            .expect("close benchmark suite store before reload");
         self.state
             .performance_operations()
             .close()
@@ -3559,10 +3566,6 @@ impl RouteTestFixture {
             .close()
             .await
             .expect("close failure memory store before reload");
-        self.state
-            .close_launch_reports()
-            .await
-            .expect("close launch report store before reload");
         Self::from_root_paths(self.root.clone(), self.paths.clone())
     }
 

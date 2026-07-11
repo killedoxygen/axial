@@ -415,12 +415,14 @@ pub(crate) async fn start_benchmark_suite_driver(
     start_owned_benchmark_suite_driver(
         producer,
         state,
-        input.suite_id,
-        input.mode,
-        summary,
-        driver_payload,
-        interval_ms,
-        None,
+        BenchmarkSuiteDriverStart {
+            suite_id: input.suite_id,
+            mode: input.mode,
+            summary,
+            request: driver_payload,
+            interval_ms,
+            resumed_from: None,
+        },
     )
     .await
 }
@@ -497,13 +499,13 @@ pub(crate) fn family_c_qualification_preview() -> Result<serde_json::Value, Laun
     performance::family_c_qualification_preview_payload()
 }
 
-struct PreparedBenchmarkSuiteDriverResume {
-    previous_id: String,
+struct BenchmarkSuiteDriverStart {
     suite_id: String,
     mode: String,
     summary: crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary,
     request: BenchmarkLaunchRequest,
     interval_ms: u64,
+    resumed_from: Option<String>,
 }
 
 pub(crate) async fn resume_benchmark_suite_driver(
@@ -512,23 +514,13 @@ pub(crate) async fn resume_benchmark_suite_driver(
     producer: crate::state::ProducerLease,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
     let prepared = prepare_benchmark_suite_driver_resume(&state, &id).await?;
-    start_owned_benchmark_suite_driver(
-        producer,
-        state,
-        prepared.suite_id,
-        prepared.mode,
-        prepared.summary,
-        prepared.request,
-        prepared.interval_ms,
-        Some(prepared.previous_id),
-    )
-    .await
+    start_owned_benchmark_suite_driver(producer, state, prepared).await
 }
 
 async fn prepare_benchmark_suite_driver_resume(
     state: &AppState,
     id: &str,
-) -> Result<PreparedBenchmarkSuiteDriverResume, LaunchApplicationError> {
+) -> Result<BenchmarkSuiteDriverStart, LaunchApplicationError> {
     let status = state
         .benchmark_suite_drivers()
         .get(id)
@@ -580,26 +572,29 @@ async fn prepare_benchmark_suite_driver_resume(
 
     payload.suite_id = Some(input.suite_id.clone());
     payload.suite_mode = Some(input.mode.clone());
-    Ok(PreparedBenchmarkSuiteDriverResume {
-        previous_id: status.id,
+    Ok(BenchmarkSuiteDriverStart {
         suite_id: input.suite_id,
         mode: input.mode,
         summary,
         request: payload,
         interval_ms: status.interval_ms,
+        resumed_from: Some(status.id),
     })
 }
 
 async fn start_owned_benchmark_suite_driver(
     producer: crate::state::ProducerLease,
     state: AppState,
-    suite_id: String,
-    mode: String,
-    summary: crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary,
-    request: BenchmarkLaunchRequest,
-    interval_ms: u64,
-    resumed_from: Option<String>,
+    start: BenchmarkSuiteDriverStart,
 ) -> Result<serde_json::Value, LaunchApplicationError> {
+    let BenchmarkSuiteDriverStart {
+        suite_id,
+        mode,
+        summary,
+        request,
+        interval_ms,
+        resumed_from,
+    } = start;
     let (ownership_tx, ownership_rx) = tokio::sync::oneshot::channel();
     let driver_owner = producer.claim_child();
     producer.spawn(async move {
@@ -2389,29 +2384,31 @@ mod tests {
         let mut waiter = Box::pin(start_owned_benchmark_suite_driver(
             producer,
             state.clone(),
-            suite_id.clone(),
-            "development".to_string(),
-            crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary {
-                run_count: 2,
-                launched_run_count: 0,
-                pending_run_index: Some(0),
+            BenchmarkSuiteDriverStart {
+                suite_id: suite_id.clone(),
+                mode: "development".to_string(),
+                summary: crate::state::benchmark_suite_drivers::BenchmarkSuiteDriverSuiteSummary {
+                    run_count: 2,
+                    launched_run_count: 0,
+                    pending_run_index: Some(0),
+                },
+                request: BenchmarkLaunchRequest {
+                    instance_id: Some("missing-instance".to_string()),
+                    username: None,
+                    max_memory_mb: None,
+                    min_memory_mb: None,
+                    client_started_at_ms: None,
+                    profile: None,
+                    run_type: None,
+                    benchmark_mode: None,
+                    suite_mode: Some("development".to_string()),
+                    suite_id: Some(suite_id.clone()),
+                    run_index: None,
+                    interval_ms: Some(30_000),
+                },
+                interval_ms: 30_000,
+                resumed_from: None,
             },
-            BenchmarkLaunchRequest {
-                instance_id: Some("missing-instance".to_string()),
-                username: None,
-                max_memory_mb: None,
-                min_memory_mb: None,
-                client_started_at_ms: None,
-                profile: None,
-                run_type: None,
-                benchmark_mode: None,
-                suite_mode: Some("development".to_string()),
-                suite_id: Some(suite_id.clone()),
-                run_index: None,
-                interval_ms: Some(30_000),
-            },
-            30_000,
-            None,
         ));
         let waker = futures_util::task::noop_waker();
         let mut context = Context::from_waker(&waker);

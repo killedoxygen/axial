@@ -59,15 +59,19 @@ impl Drop for RuntimeRepairRequestGuard {
     }
 }
 
+pub(super) struct ManagedRuntimeRepairLaunch<'a> {
+    pub(super) instance: &'a Instance,
+    pub(super) library_dir: &'a Path,
+    pub(super) game_dir: &'a Path,
+    pub(super) requested_max_memory_mb: Option<i32>,
+    pub(super) requested_min_memory_mb: Option<i32>,
+}
+
 pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
     state: &AppState,
     producer: &crate::state::ProducerLease,
     mut preflight: LaunchPreflightFacts,
-    instance: &Instance,
-    library_dir: &Path,
-    game_dir: &Path,
-    requested_max_memory_mb: Option<i32>,
-    requested_min_memory_mb: Option<i32>,
+    launch: ManagedRuntimeRepairLaunch<'_>,
 ) -> Result<LaunchPreflightFacts, OperationJournalStoreError> {
     if preflight.guardian.mode != GuardianMode::Managed
         || !readiness_has_managed_runtime_missing(&preflight.readiness)
@@ -77,8 +81,8 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
 
     let Some(candidate) = managed_runtime_ready_marker_repair_candidate(
         state.config().paths(),
-        library_dir,
-        instance,
+        launch.library_dir,
+        launch.instance,
     ) else {
         return Ok(preflight);
     };
@@ -103,7 +107,7 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
         .iter()
         .map(|fact| guardian_fact_from_execution(fact, OperationPhase::Validating))
         .collect::<Vec<_>>();
-    let performance_mode = policy::selected_performance_mode(instance, &preflight.config);
+    let performance_mode = policy::selected_performance_mode(launch.instance, &preflight.config);
     let repair_boundary = stage_launch_boundary(LaunchBoundaryStagingRequest::new(
         application_guardian_mode(preflight.guardian.mode),
         OperationPhase::Validating,
@@ -215,12 +219,12 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
         GuardianRepairStatus::Repaired => {
             let mut repaired = build_launch_preflight_facts(
                 state,
-                instance,
+                launch.instance,
                 &preflight.config,
-                library_dir,
-                game_dir,
-                requested_max_memory_mb,
-                requested_min_memory_mb,
+                launch.library_dir,
+                launch.game_dir,
+                launch.requested_max_memory_mb,
+                launch.requested_min_memory_mb,
             )
             .await;
             mark_guardian_runtime_repair_success(
@@ -244,34 +248,6 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
         }
         GuardianRepairStatus::NotNeeded => Ok(preflight),
     }
-}
-
-#[cfg(test)]
-pub(super) async fn maybe_repair_managed_runtime_before_launch(
-    state: &AppState,
-    preflight: LaunchPreflightFacts,
-    instance: &Instance,
-    library_dir: &Path,
-    game_dir: &Path,
-    requested_max_memory_mb: Option<i32>,
-    requested_min_memory_mb: Option<i32>,
-) -> Result<LaunchPreflightFacts, OperationJournalStoreError> {
-    let producer = state.try_claim_producer().map_err(|_| {
-        OperationJournalStoreError::Persistence(std::io::Error::other(
-            "application shutdown is in progress",
-        ))
-    })?;
-    maybe_repair_managed_runtime_before_launch_owned(
-        state,
-        &producer,
-        preflight,
-        instance,
-        library_dir,
-        game_dir,
-        requested_max_memory_mb,
-        requested_min_memory_mb,
-    )
-    .await
 }
 
 struct ManagedRuntimeRepairCandidate {

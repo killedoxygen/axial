@@ -872,12 +872,11 @@ impl PerformanceOperationStore {
             .keys()
             .cloned()
             .collect::<HashSet<_>>();
-        if let Some(persistence) = &self.persistence {
-            if let Err(error) = persistence.settle_writers(&retry_ids).await
-                && first_retry_error.is_none()
-            {
-                first_retry_error = Some(error);
-            }
+        if let Some(persistence) = &self.persistence
+            && let Err(error) = persistence.settle_writers(&retry_ids).await
+            && first_retry_error.is_none()
+        {
+            first_retry_error = Some(error);
         }
         if !self.retention_issues().is_empty() {
             first_retry_error.get_or_insert_with(|| {
@@ -2152,7 +2151,7 @@ mod tests {
                 .record_progress(id, "applying")
                 .await
                 .expect("accept latest progress");
-            assert!(matches!(
+            assert!(
                 store
                     .persistence
                     .as_ref()
@@ -2160,9 +2159,9 @@ mod tests {
                     .writer(id)
                     .expect("writer")
                     .flush()
-                    .await,
-                Err(_)
-            ));
+                    .await
+                    .is_err()
+            );
             assert!(!store.has_retry_candidate(id));
         }
 
