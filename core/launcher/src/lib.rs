@@ -1,4 +1,5 @@
 pub mod build;
+pub mod crash;
 pub mod guardian;
 pub mod healing;
 pub mod jvm;
@@ -13,6 +14,11 @@ pub mod types;
 pub use build::{
     LaunchAuthContext, VanillaLaunchPlan, VanillaLaunchPlanError, VanillaLaunchRequest,
     cleanup_natives_dir, plan_resolved_launch, plan_vanilla_launch,
+};
+pub use crash::{
+    CrashEvidence, CrashEvidenceToken, CrashFailurePhase, CrashModEvidence,
+    MAX_CRASH_ARTIFACT_BYTES, MAX_CRASH_EVIDENCE_LINE_BYTES, MAX_CRASH_EVIDENCE_LINES,
+    MAX_CRASH_EVIDENCE_MODS, MAX_CRASH_EVIDENCE_TOKEN_CHARS, parse_crash_evidence,
 };
 pub use guardian::{
     GuardianDecision, GuardianIntervention, GuardianInterventionKind, GuardianMode,

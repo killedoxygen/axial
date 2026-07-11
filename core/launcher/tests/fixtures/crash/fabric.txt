@@ -1,0 +1,12 @@
+---- Minecraft Crash Report ----
+
+Description: Initializing game
+
+Caused by: net.fabricmc.loader.api.EntrypointException: Exception while loading entries
+Suspected Mod: Canvas Renderer (canvas) version 1.4.2
+	at net.fabricmc.loader.impl.FabricLoaderImpl.invokeEntrypoints(FabricLoaderImpl.java:384)
+
+System Details:
+	Fabric Mods: canvas: Canvas Renderer 1.4.2
+	User: alice
+	JVM Flags: -Duser.home=/home/alice

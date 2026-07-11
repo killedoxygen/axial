@@ -1,0 +1,11 @@
+---- Minecraft Crash Report ----
+// This report includes local diagnostics that must not be exported.
+
+Description: Rendering game
+
+java.lang.OutOfMemoryError: Java heap space
+	at com.mojang.blaze3d.systems.RenderSystem.replayQueue(RenderSystem.java:211)
+	at net.minecraft.client.Minecraft.runTick(Minecraft.java:1234)
+
+JVM Flags: -Duser.home=/home/alice -Dsession.token=access-token
+Player: alice

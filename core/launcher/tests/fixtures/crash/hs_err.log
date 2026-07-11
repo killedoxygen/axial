@@ -1,0 +1,9 @@
+# A fatal error has been detected by the Java Runtime Environment:
+#
+#  SIGSEGV (0xb) at pc=0x00007f00, pid=1234, tid=1235
+#
+# Problematic frame:
+# C  [libGLX_nvidia.so.0+0x5a13f]  glXSwapBuffers+0x2f
+#
+# Command Line: -Duser.home=/home/alice -Dsession.token=access-token
+# User: alice
