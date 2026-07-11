@@ -128,6 +128,20 @@ impl<'de> Deserialize<'de> for CrashEvidence {
         {
             return Err(de::Error::custom("duplicate suspected mod"));
         }
+        let source_is_coherent = match wire.source {
+            CrashArtifactKind::MinecraftCrashReport => {
+                wire.problematic_frame.is_none()
+                    && wire.failure_phase != Some(CrashFailurePhase::Native)
+            }
+            CrashArtifactKind::JvmFatalError => {
+                wire.exception_class.is_none()
+                    && wire.suspected_mods.is_empty()
+                    && matches!(wire.failure_phase, None | Some(CrashFailurePhase::Native))
+            }
+        };
+        if !source_is_coherent {
+            return Err(de::Error::custom("incoherent crash evidence source"));
+        }
         if wire.failure_phase.is_none()
             && wire.exception_class.is_none()
             && wire.suspected_mods.is_empty()
@@ -164,6 +178,7 @@ struct CrashEvidenceBuilder {
     problematic_frame: Option<CrashProblematicFrame>,
     names_out_of_memory: bool,
     expect_problematic_frame: bool,
+    expect_root_throwable: bool,
     current_failed_mod_id: Option<String>,
 }
 
@@ -178,6 +193,7 @@ impl CrashEvidenceBuilder {
             problematic_frame: None,
             names_out_of_memory: false,
             expect_problematic_frame: false,
+            expect_root_throwable: false,
             current_failed_mod_id: None,
         }
     }
@@ -215,17 +231,20 @@ impl CrashEvidenceBuilder {
         }
 
         self.names_out_of_memory |= is_out_of_memory_failure_line(line);
-        if self.expect_problematic_frame {
-            self.expect_problematic_frame = false;
-            if let Some(frame) = parse_problematic_frame(line) {
-                self.problematic_frame = Some(frame);
-                self.failure_phase.get_or_insert(CrashFailurePhase::Native);
+        if self.source == CrashArtifactKind::JvmFatalError {
+            if self.expect_problematic_frame {
+                self.expect_problematic_frame = false;
+                if let Some(frame) = parse_problematic_frame(line) {
+                    self.problematic_frame = Some(frame);
+                    self.failure_phase.get_or_insert(CrashFailurePhase::Native);
+                }
             }
-        }
-        if line.eq_ignore_ascii_case("# Problematic frame:") {
-            self.expect_problematic_frame = true;
+            if line.eq_ignore_ascii_case("# Problematic frame:") {
+                self.expect_problematic_frame = true;
+            }
             return;
         }
+
         if let Some(section) = line
             .strip_prefix("-- ")
             .and_then(|value| value.strip_suffix(" --"))
@@ -234,12 +253,15 @@ impl CrashEvidenceBuilder {
             return;
         }
 
-        if self.failure_phase.is_none() {
-            self.failure_phase = parse_failure_phase(line);
+        if let Some(phase) = parse_failure_phase(line) {
+            self.failure_phase.get_or_insert(phase);
+            self.expect_root_throwable = true;
+            return;
         }
         if self.exception_class.is_none() {
-            self.exception_class = parse_exception_class(line);
+            self.exception_class = parse_exception_class(line, self.expect_root_throwable);
         }
+        self.expect_root_throwable = false;
         if let Some(value) = line.strip_prefix("Suspected Mods:") {
             self.add_suspected_mod_list(value);
         } else if let Some(value) = line.strip_prefix("Suspected Mod:") {
@@ -364,10 +386,21 @@ pub fn parse_crash_evidence(source: CrashArtifactKind, raw: &[u8]) -> Option<Cra
 
 pub(crate) fn is_out_of_memory_failure_line(line: &str) -> bool {
     let lower = line.trim().to_ascii_lowercase();
-    let throwable = lower.starts_with("java.lang.outofmemoryerror")
-        || lower.starts_with("caused by: java.lang.outofmemoryerror")
-        || (lower.starts_with("exception in thread ")
-            && lower.contains(" java.lang.outofmemoryerror"));
+    let marker = "java.lang.outofmemoryerror";
+    let throwable = lower
+        .strip_prefix(marker)
+        .is_some_and(has_throwable_boundary)
+        || lower
+            .strip_prefix("caused by: ")
+            .and_then(|value| value.strip_prefix(marker))
+            .is_some_and(has_throwable_boundary)
+        || lower
+            .strip_prefix("exception in thread ")
+            .is_some_and(|value| {
+                value.find(marker).is_some_and(|index| {
+                    index > 0 && has_throwable_boundary(&value[index + marker.len()..])
+                })
+            });
     throwable
         || lower == "gc overhead limit exceeded"
         || lower == "# there is insufficient memory for the java runtime environment to continue."
@@ -380,6 +413,13 @@ pub(crate) fn is_out_of_memory_failure_line(line: &str) -> bool {
         || lower
             .strip_prefix("# out of memory error (")
             .is_some_and(|detail| detail.ends_with(')'))
+}
+
+fn has_throwable_boundary(remainder: &str) -> bool {
+    remainder
+        .chars()
+        .next()
+        .is_none_or(|character| character == ':' || character.is_ascii_whitespace())
 }
 
 fn parse_failure_phase(line: &str) -> Option<CrashFailurePhase> {
@@ -405,17 +445,19 @@ fn parse_failure_phase(line: &str) -> Option<CrashFailurePhase> {
     }
 }
 
-fn parse_exception_class(line: &str) -> Option<CrashExceptionClass> {
-    let value = line
+fn parse_exception_class(line: &str, allow_bare: bool) -> Option<CrashExceptionClass> {
+    let explicit = line
         .strip_prefix("Exception:")
         .or_else(|| line.strip_prefix("Caused by:"))
-        .or_else(|| line.strip_prefix("Exception message:"))
-        .map(str::trim)
-        .unwrap_or(line);
+        .or_else(|| line.strip_prefix("Exception message:"));
+    if explicit.is_none() && !allow_bare {
+        return None;
+    }
+    let value = explicit.map(str::trim).unwrap_or(line);
     let (candidate, remainder) = value
         .split_once(':')
         .map_or((value, ""), |(candidate, remainder)| (candidate, remainder));
-    if value == line && remainder.is_empty() {
+    if explicit.is_none() && remainder.is_empty() {
         return None;
     }
     CrashExceptionClass::checked(candidate.trim())
@@ -480,6 +522,7 @@ fn is_safe_mod_name(value: &str) -> bool {
         && !lower.ends_with(".dll")
         && !lower.contains(".so")
         && !lower.ends_with(".dylib")
+        && !looks_like_sensitive_public_value(value)
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric()
                 || matches!(
@@ -500,6 +543,7 @@ fn is_safe_mod_version(value: &str) -> bool {
         && value == value.trim()
         && !value.starts_with("-D")
         && !value.contains("..")
+        && !looks_like_sensitive_public_value(value)
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '+')
         })
@@ -511,8 +555,45 @@ fn is_safe_native_identifier(value: &str) -> bool {
         && value.len() <= 96
         && !lower.contains("token")
         && !lower.contains("bearer")
+        && !looks_like_sensitive_public_value(value)
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '$' | ':')
+        })
+}
+
+fn looks_like_sensitive_public_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "authorization",
+        "account_id",
+        "account-id",
+        "username",
+        "xuid",
+        "bearer",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || looks_like_jwt(value)
+        || (value.len() >= 48
+            && !value.contains(' ')
+            && value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            }))
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && value.len() >= 12
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
         })
 }
 
@@ -644,6 +725,42 @@ mod tests {
             parse_report(b"Suspected Mods: Native memory allocation helper (memoryhelper)")
                 .expect("safe suspected mod");
         assert!(!evidence.names_out_of_memory);
+
+        let evidence = parse_report(
+            b"com.attacker.FakeException: decoy\nDescription: Rendering game\njava.lang.IllegalStateException: real",
+        )
+        .expect("root throwable");
+        assert_eq!(
+            evidence
+                .exception_class
+                .as_ref()
+                .map(|value| value.as_str()),
+            Some("java.lang.IllegalStateException")
+        );
+
+        for helper in [
+            "java.lang.OutOfMemoryErrorHelper: decoy",
+            "Caused by: java.lang.OutOfMemoryErrorGuide: decoy",
+            "Exception in thread main java.lang.OutOfMemoryErrorHelper: decoy",
+        ] {
+            assert!(!is_out_of_memory_failure_line(helper));
+        }
+    }
+
+    #[test]
+    fn artifact_kind_gates_extractors_and_wire_contract() {
+        let spoofed_report = b"# Problematic frame:\n# C  [private.dll+0x12] secret+0x1";
+        assert!(parse_report(spoofed_report).is_none());
+
+        let spoofed_hs_err = b"Suspected Mods: Secret Mod (secretmod)\nDescription: Loading game";
+        assert!(parse_crash_evidence(CrashArtifactKind::JvmFatalError, spoofed_hs_err).is_none());
+
+        for incoherent in [
+            r#"{"source":"minecraft_crash_report","truncated":false,"failure_phase":"native","exception_class":null,"suspected_mods":[],"problematic_frame":{"kind":"native","module":"nvoglv64","symbol":null},"names_out_of_memory":false}"#,
+            r#"{"source":"jvm_fatal_error","truncated":false,"failure_phase":null,"exception_class":null,"suspected_mods":[{"name":"Example Mod"}],"problematic_frame":null,"names_out_of_memory":false}"#,
+        ] {
+            assert!(serde_json::from_str::<CrashEvidence>(incoherent).is_err());
+        }
     }
 
     #[test]
@@ -665,7 +782,8 @@ mod tests {
 
     #[test]
     fn truncation_is_explicit_and_work_is_bounded() {
-        let mut before_cap = b"java.lang.IllegalStateException: first\n".to_vec();
+        let mut before_cap =
+            b"Description: Rendering game\njava.lang.IllegalStateException: first\n".to_vec();
         before_cap.resize(MAX_CRASH_ARTIFACT_BYTES + 32, b'x');
         let evidence = parse_report(&before_cap).expect("prefix evidence");
         assert!(evidence.truncated);
@@ -708,11 +826,29 @@ mod tests {
             base("null", r#"[{"name":"Bearer raw-secret-token"}]"#, "null"),
             base("null", r#"[{"name":"alice@example.com"}]"#, "null"),
             base("null", r#"[{"name":"mod","version":"-Dtoken"}]"#, "null"),
+            base("null", r#"[{"name":"SecretPlayer"}]"#, "null"),
+            base("null", r#"[{"name":"account_id abc"}]"#, "null"),
+            base("null", r#"[{"name":"Password credential"}]"#, "null"),
+            base(
+                "null",
+                r#"[{"name":"mod","version":"access-token"}]"#,
+                "null",
+            ),
+            base(
+                "null",
+                r#"[{"name":"mod","version":"abc.def.ghi123"}]"#,
+                "null",
+            ),
             base("null", r#"[{"name":"mod"},{"name":"mod"}]"#, "null"),
             base(
                 "null",
                 "[]",
                 r#"{"kind":"native","module":"access-token","symbol":"secret"}"#,
+            ),
+            base(
+                "null",
+                "[]",
+                r#"{"kind":"native","module":"raw_secret_value","symbol":null}"#,
             ),
         ] {
             assert!(serde_json::from_str::<CrashEvidence>(&invalid).is_err());
