@@ -72,6 +72,7 @@ pub(super) async fn persist_launch_proof_for_reservation_failure(
 }
 
 const STARTUP_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_RECOVERY_ATTEMPTS: u8 = 3;
 
 pub struct LaunchSuccess {
     pub session_id: String,
@@ -214,6 +215,15 @@ async fn launch_session_inner(
     task: super::session::LaunchSessionTask,
     producer: &crate::state::ProducerLease,
 ) -> Result<LaunchSuccess, LaunchRequestError> {
+    launch_session_inner_with_control(state, task, producer, &LaunchLoopControl::default()).await
+}
+
+async fn launch_session_inner_with_control(
+    state: AppState,
+    task: super::session::LaunchSessionTask,
+    producer: &crate::state::ProducerLease,
+    control: &LaunchLoopControl,
+) -> Result<LaunchSuccess, LaunchRequestError> {
     let super::session::LaunchSessionTask {
         application,
         boundary,
@@ -257,6 +267,7 @@ async fn launch_session_inner(
         .with_resource_budget(resource_budget);
     let mut attempt = axial_launcher::service::AttemptOverrides::default();
     let mut last_recovery_plan: Option<GuardianLaunchRecoveryPlan> = None;
+    let mut recovery_attempts = 0_u8;
     let mut launch_completion_pending = false;
     emit_launch_started(
         &state,
@@ -298,15 +309,20 @@ async fn launch_session_inner(
             }
             let _ = preparation_status_done_tx.send(());
         });
-        let prepared_result = prepare_launch_attempt_with_events(
-            &intent,
-            &attempt,
-            java_probe_receipt.as_ref(),
-            move |event| {
-                let _ = preparation_event_sender.send(event);
-            },
-        )
-        .await;
+        let prepared_result = if let Some(error) = control.forced_prepare_failure() {
+            drop(preparation_event_sender);
+            Err(error)
+        } else {
+            prepare_launch_attempt_with_events(
+                &intent,
+                &attempt,
+                java_probe_receipt.as_ref(),
+                move |event| {
+                    let _ = preparation_event_sender.send(event);
+                },
+            )
+            .await
+        };
         drop(preparation_event_tx);
         let _ = preparation_status_done_rx.await;
 
@@ -339,12 +355,35 @@ async fn launch_session_inner(
                             .raw_jvm_args_intervention_applied,
                     });
                 if let Some(directive) = prepare_outcome.directive.clone() {
-                    let recovery_plan = match plan_guardian_launch_recovery_directive(
+                    let Some(reservation) = reserve_recovery_attempt(&mut recovery_attempts) else {
+                        control.record_capped_prepare_failure(&error);
+                        block_guardian_with_user_outcome(
+                            &mut guardian,
+                            &prepare_outcome.user_outcome,
+                        );
+                        emit_pending_launch_failure(&state, &mut launch_completion_pending);
+                        return Err(fail_launch(
+                            &state,
+                            producer,
+                            &session_id,
+                            LaunchFailure {
+                                proof_context: Some(&proof_context),
+                                class: failure_class,
+                                message: &prepare_outcome.user_outcome.summary,
+                                healing: error.healing,
+                                guardian: Some(guardian.clone()),
+                                outcome: None,
+                            },
+                        )
+                        .await);
+                    };
+                    let recovery_plan = match plan_budgeted_guardian_launch_recovery_directive(
                         &session_id,
                         &intent,
                         directive,
                         launch_policy_guardian_mode(intent.guardian.mode),
                         failure_class,
+                        reservation,
                     ) {
                         Ok(recovery_plan) => recovery_plan,
                         Err(_) => {
@@ -408,8 +447,13 @@ async fn launch_session_inner(
                             recovery_plan.directive.description.clone(),
                         )
                         .await;
-                    apply_prepare_recovery_directive(&mut guardian, &mut attempt, &recovery_plan);
-                    last_recovery_plan = Some(recovery_plan);
+                    if control.apply_prepare_recovery_directive(
+                        &mut guardian,
+                        &mut attempt,
+                        &recovery_plan,
+                    ) {
+                        last_recovery_plan = Some(recovery_plan);
+                    }
                     continue;
                 }
                 block_guardian_with_user_outcome(&mut guardian, &prepare_outcome.user_outcome);
@@ -832,12 +876,40 @@ async fn launch_session_inner(
                     failure_class.as_str(),
                 ));
                 if let Some(directive) = startup_outcome.directive.clone() {
-                    let recovery_plan = match plan_guardian_launch_recovery_directive(
+                    let Some(reservation) = reserve_recovery_attempt(&mut recovery_attempts) else {
+                        let healing =
+                            startup_failure_healing(&intent, &prepared, &attempt, failure_class);
+                        block_guardian_with_user_outcome(
+                            &mut guardian,
+                            &startup_outcome.user_outcome,
+                        );
+                        emit_launch_completed(
+                            &state,
+                            &mut launch_completion_pending,
+                            TelemetryLaunchOutcome::Failure,
+                        );
+                        return Err(fail_launch(
+                            &state,
+                            producer,
+                            &session_id,
+                            LaunchFailure {
+                                proof_context: Some(&proof_context),
+                                class: failure_class,
+                                message: &startup_outcome.user_outcome.summary,
+                                healing,
+                                guardian: Some(guardian.clone()),
+                                outcome: None,
+                            },
+                        )
+                        .await);
+                    };
+                    let recovery_plan = match plan_budgeted_guardian_launch_recovery_directive(
                         &session_id,
                         &intent,
                         directive,
                         launch_policy_guardian_mode(intent.guardian.mode),
                         failure_class,
+                        reservation,
                     ) {
                         Ok(recovery_plan) => recovery_plan,
                         Err(_) => {
@@ -945,6 +1017,93 @@ async fn launch_session_inner(
                 .await);
             }
         }
+    }
+}
+
+struct RecoveryAttemptReservation;
+
+fn reserve_recovery_attempt(recovery_attempts: &mut u8) -> Option<RecoveryAttemptReservation> {
+    if *recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+        return None;
+    }
+    *recovery_attempts += 1;
+    Some(RecoveryAttemptReservation)
+}
+
+fn plan_budgeted_guardian_launch_recovery_directive(
+    session_id: &str,
+    intent: &axial_launcher::LaunchIntent,
+    directive: crate::guardian::GuardianLaunchRecoveryDirective,
+    mode: crate::guardian::GuardianMode,
+    failure_class: LaunchFailureClass,
+    _reservation: RecoveryAttemptReservation,
+) -> Result<GuardianLaunchRecoveryPlan, crate::guardian::GuardianLaunchRecoveryPlanRejection> {
+    plan_guardian_launch_recovery_directive(session_id, intent, directive, mode, failure_class)
+}
+
+#[derive(Default)]
+struct LaunchLoopControl {
+    #[cfg(test)]
+    forced_prepare_failure: Option<std::sync::Arc<ForcedPrepareFailure>>,
+}
+
+impl LaunchLoopControl {
+    fn forced_prepare_failure(&self) -> Option<axial_launcher::LaunchPreparationError> {
+        #[cfg(test)]
+        if let Some(failure) = self.forced_prepare_failure.as_ref() {
+            return Some(failure.next());
+        }
+        None
+    }
+
+    fn apply_prepare_recovery_directive(
+        &self,
+        guardian: &mut GuardianSummary,
+        attempt: &mut axial_launcher::service::AttemptOverrides,
+        recovery_plan: &GuardianLaunchRecoveryPlan,
+    ) -> bool {
+        #[cfg(test)]
+        if self.forced_prepare_failure.is_some() {
+            return false;
+        }
+        apply_prepare_recovery_directive(guardian, attempt, recovery_plan);
+        true
+    }
+
+    fn record_capped_prepare_failure(&self, _error: &axial_launcher::LaunchPreparationError) {
+        #[cfg(test)]
+        if let Some(failure) = self.forced_prepare_failure.as_ref() {
+            failure.record_capped(&_error.message);
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ForcedPrepareFailure {
+    observed: std::sync::atomic::AtomicU8,
+    capped_message: std::sync::Mutex<Option<String>>,
+}
+
+#[cfg(test)]
+impl ForcedPrepareFailure {
+    fn next(&self) -> axial_launcher::LaunchPreparationError {
+        let ordinal = self
+            .observed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        axial_launcher::LaunchPreparationError {
+            message: format!("forced prepare failure {ordinal}"),
+            failure_class: Some(LaunchFailureClass::JavaRuntimeMismatch),
+            healing: None,
+        }
+    }
+
+    fn record_capped(&self, message: &str) {
+        *self
+            .capped_message
+            .lock()
+            .expect("forced prepare failure lock poisoned") = Some(message.to_string());
     }
 }
 
@@ -1111,8 +1270,13 @@ mod tests {
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
     use crate::state::contracts::OperationPhase;
     use crate::state::{AppStateInit, InstallStore, LaunchEvent, SessionStore};
-    use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
-    use axial_launcher::{LaunchSessionRecord, SessionId};
+    use axial_config::{
+        AppConfig, AppPaths, ConfigStore, Instance, InstanceRegistrySnapshot, InstanceStore,
+    };
+    use axial_launcher::{
+        LaunchAuthContext, LaunchGuardianContext, LaunchIntent, LaunchSessionRecord,
+        OverrideOrigin, SessionId,
+    };
     use axial_performance::PerformanceManager;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1122,6 +1286,74 @@ mod tests {
 
     const TEST_TELEMETRY_INSTALL_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
     const TEST_TELEMETRY_KEY: &str = "phc_test";
+
+    #[tokio::test]
+    async fn launch_loop_caps_a_prepare_directive_that_never_marks_itself_applied() {
+        let root = unique_test_dir("launch-recovery-cap");
+        let state = test_app_state(&root);
+        let session_id = "launch-recovery-cap";
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let forced_failure = Arc::new(ForcedPrepareFailure::default());
+        let control = LaunchLoopControl {
+            forced_prepare_failure: Some(forced_failure.clone()),
+        };
+        let producer = state.try_claim_producer().expect("claim launch producer");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            launch_session_inner_with_control(
+                state.clone(),
+                test_recovery_launch_task(session_id, &root),
+                &producer,
+                &control,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "launch recovery loop stalled after {} forced failures",
+                forced_failure
+                    .observed
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            )
+        });
+        let error = match result {
+            Ok(_) => panic!("non-applying recovery must fail at the cap"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            forced_failure
+                .observed
+                .load(std::sync::atomic::Ordering::SeqCst),
+            MAX_RECOVERY_ATTEMPTS + 1
+        );
+        assert_eq!(
+            forced_failure
+                .capped_message
+                .lock()
+                .expect("forced prepare failure lock")
+                .as_deref(),
+            Some("forced prepare failure 4")
+        );
+        let final_outcome = guardian_prepare_failure_outcome(GuardianPrepareFailureRequest {
+            mode: crate::guardian::GuardianMode::Managed,
+            failure_class: LaunchFailureClass::JavaRuntimeMismatch,
+            public_error: "forced prepare failure 4",
+            requested_java_present: true,
+            explicit_java_override_present: true,
+            explicit_jvm_args_present: false,
+            runtime_intervention_applied: false,
+            raw_jvm_args_intervention_applied: false,
+        });
+        assert_eq!(error.message, final_outcome.user_outcome.summary);
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[tokio::test]
     async fn modern_plan_skips_repair_stage_full_asset_index_parse() {
@@ -1549,6 +1781,83 @@ mod tests {
         assert_no_sensitive_stage_evidence(&status_json);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_recovery_launch_task(
+        session_id: &str,
+        root: &Path,
+    ) -> super::super::session::LaunchSessionTask {
+        super::super::session::LaunchSessionTask {
+            application: crate::application::stage_launch_instance_command(
+                crate::application::LaunchInstanceCommand {
+                    instance_id: "instance".to_string(),
+                    username: None,
+                    max_memory_mb: None,
+                    min_memory_mb: None,
+                    client_started_at_ms: None,
+                },
+                Some(session_id.to_string()),
+            ),
+            boundary: crate::application::stage_launch_boundary(
+                crate::application::LaunchBoundaryStagingRequest::new(
+                    crate::guardian::GuardianMode::Managed,
+                    OperationPhase::Validating,
+                    &[],
+                    "managed",
+                ),
+            ),
+            instance: Instance {
+                id: "instance".to_string(),
+                name: "Recovery cap".to_string(),
+                version_id: "1.21.1".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_played_at: String::new(),
+                art_seed: 0,
+                max_memory_mb: 4096,
+                min_memory_mb: 1024,
+                java_path: String::new(),
+                window_width: 0,
+                window_height: 0,
+                jvm_preset: String::new(),
+                performance_mode: "managed".to_string(),
+                extra_jvm_args: String::new(),
+                auto_optimize: false,
+                icon: String::new(),
+                accent: String::new(),
+            },
+            intent: LaunchIntent {
+                session_id: session_id.to_string(),
+                library_dir: root.join("library"),
+                instance_id: "instance".to_string(),
+                version_id: "1.21.1".to_string(),
+                target_version_id: "1.21.1".to_string(),
+                loader: "vanilla".to_string(),
+                is_modded: false,
+                username: "Player".to_string(),
+                auth: LaunchAuthContext::offline("Player"),
+                requested_java: "configured-java".to_string(),
+                requested_preset: String::new(),
+                extra_jvm_args: Vec::new(),
+                max_memory_mb: 4096,
+                min_memory_mb: 1024,
+                resolution: None,
+                launcher_name: "axial".to_string(),
+                launcher_version: "test".to_string(),
+                game_dir: None,
+                guardian: LaunchGuardianContext {
+                    mode: axial_launcher::GuardianMode::Managed,
+                    java_override_origin: Some(OverrideOrigin::Instance),
+                    preset_override_origin: None,
+                    raw_jvm_args_origin: None,
+                },
+                performance_mode: "managed".to_string(),
+            },
+            guardian: GuardianSummary::new(axial_launcher::GuardianMode::Managed),
+            launched_at: "2026-01-01T00:00:00Z".to_string(),
+            benchmark: None,
+            resource_budget: None,
+            java_probe_receipt: None,
+        }
     }
 
     fn test_app_state(root: &Path) -> AppState {
