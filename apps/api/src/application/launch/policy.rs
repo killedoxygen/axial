@@ -1,12 +1,11 @@
 use axial_config::{AppConfig, Instance};
-use axial_launcher::{GuardianMode, OverrideOrigin, SessionId};
+use axial_launcher::{GuardianMode, LAUNCH_MEMORY_HEADROOM_MB, OverrideOrigin, SessionId};
 use axial_minecraft::{VersionEntry, compare_version_like};
 use std::cmp::Ordering;
 use std::time::SystemTime;
 
 const BUILT_IN_MAX_MEMORY_MB: i32 = 4096;
 const BUILT_IN_MIN_MEMORY_MB: i32 = 512;
-const OS_MEMORY_HEADROOM_MB: u64 = 2048;
 const MIN_DERIVED_MAX_MEMORY_MB: i32 = 1024;
 const LEGACY_MAX_MEMORY_TARGET_MB: i32 = 2048;
 const MODERN_VANILLA_MAX_MEMORY_TARGET_MB: i32 = 4096;
@@ -141,7 +140,7 @@ fn launch_memory_defaults_for_host_version(
     version_id: &str,
     is_modded: bool,
 ) -> Option<LaunchMemoryDefaults> {
-    let host_budget_mb = host_total_memory_mb.saturating_sub(OS_MEMORY_HEADROOM_MB);
+    let host_budget_mb = host_total_memory_mb.saturating_sub(LAUNCH_MEMORY_HEADROOM_MB);
     if host_budget_mb == 0 {
         return None;
     }
@@ -163,6 +162,36 @@ fn launch_memory_defaults_for_host_version(
         max_memory_mb,
         min_memory_mb,
     })
+}
+
+pub(super) fn suggested_max_memory_after_recent_oom(
+    current_max_memory_mb: i32,
+    host_total_memory_mb: Option<u64>,
+    active_memory_allocation_mb: u64,
+    version_id: &str,
+    is_modded: bool,
+) -> Option<i32> {
+    if current_max_memory_mb <= 0 || version_id.trim().is_empty() {
+        return None;
+    }
+
+    let host_after_active_memory_mb =
+        host_total_memory_mb?.checked_sub(active_memory_allocation_mb)?;
+    let safe_max_memory_mb = host_after_active_memory_mb.checked_sub(LAUNCH_MEMORY_HEADROOM_MB)?;
+    if safe_max_memory_mb < u64::try_from(MIN_DERIVED_MAX_MEMORY_MB).ok()? {
+        return None;
+    }
+
+    let target = launch_memory_defaults_for_host_version(
+        host_after_active_memory_mb,
+        version_id.trim(),
+        is_modded,
+    )?;
+    let suggested_max_memory_mb = u64::try_from(target.max_memory_mb)
+        .ok()?
+        .min(safe_max_memory_mb);
+    let suggested_max_memory_mb = i32::try_from(suggested_max_memory_mb).ok()?;
+    (suggested_max_memory_mb > current_max_memory_mb).then_some(suggested_max_memory_mb)
 }
 
 fn version_base_id(instance: &Instance, version: Option<&VersionEntry>) -> String {
@@ -400,6 +429,89 @@ mod tests {
                 min_memory_mb: 1024,
             }
         );
+    }
+
+    #[test]
+    fn recent_oom_suggestion_uses_safe_low_end_and_modded_targets() {
+        assert_eq!(
+            suggested_max_memory_after_recent_oom(1024, Some(4096), 0, "1.21.1", false),
+            Some(2048)
+        );
+        assert_eq!(
+            suggested_max_memory_after_recent_oom(4096, Some(16_384), 0, "1.21.1", true),
+            Some(6144)
+        );
+    }
+
+    #[test]
+    fn recent_oom_suggestion_retains_version_family_caps() {
+        for (version_id, is_modded, expected) in [
+            ("1.12.2", false, 2048),
+            ("1.21.1", false, 4096),
+            ("1.21.1", true, 6144),
+        ] {
+            assert_eq!(
+                suggested_max_memory_after_recent_oom(1024, Some(16_384), 0, version_id, is_modded),
+                Some(expected),
+                "version={version_id}, modded={is_modded}",
+            );
+        }
+    }
+
+    #[test]
+    fn recent_oom_suggestion_reserves_active_allocations_and_os_headroom() {
+        assert_eq!(
+            suggested_max_memory_after_recent_oom(1024, Some(8192), 3072, "1.21.1", true),
+            Some(3072)
+        );
+        assert_eq!(
+            suggested_max_memory_after_recent_oom(1024, Some(4096), 2048, "1.21.1", false),
+            None
+        );
+        assert_eq!(
+            suggested_max_memory_after_recent_oom(512, Some(2560), 0, "1.21.1", false),
+            None
+        );
+        assert_eq!(
+            suggested_max_memory_after_recent_oom(512, Some(3072), 0, "1.21.1", false),
+            Some(1024)
+        );
+    }
+
+    #[test]
+    fn recent_oom_suggestion_requires_a_strict_increase() {
+        assert_eq!(
+            suggested_max_memory_after_recent_oom(4096, Some(6144), 0, "1.21.1", true),
+            None
+        );
+        assert_eq!(
+            suggested_max_memory_after_recent_oom(4096, Some(6145), 0, "1.21.1", true),
+            Some(4097)
+        );
+        assert_eq!(
+            suggested_max_memory_after_recent_oom(6144, Some(u64::MAX), 0, "1.21.1", true),
+            None
+        );
+    }
+
+    #[test]
+    fn recent_oom_suggestion_fails_silent_for_missing_invalid_or_overflowing_facts() {
+        for suggestion in [
+            suggested_max_memory_after_recent_oom(1024, None, 0, "1.21.1", false),
+            suggested_max_memory_after_recent_oom(0, Some(16_384), 0, "1.21.1", false),
+            suggested_max_memory_after_recent_oom(-1, Some(16_384), 0, "1.21.1", false),
+            suggested_max_memory_after_recent_oom(1024, Some(16_384), 0, " ", false),
+            suggested_max_memory_after_recent_oom(
+                1024,
+                Some(u64::MAX - 1),
+                u64::MAX,
+                "1.21.1",
+                true,
+            ),
+            suggested_max_memory_after_recent_oom(i32::MAX, Some(u64::MAX), 0, "1.21.1", true),
+        ] {
+            assert_eq!(suggestion, None);
+        }
     }
 
     fn test_instance(version_id: &str) -> Instance {

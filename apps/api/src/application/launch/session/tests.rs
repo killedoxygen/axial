@@ -1,7 +1,6 @@
 use super::*;
 use crate::guardian::GuardianSeverity;
 use crate::state::contracts::{CommandKind, OperationOutcome, OperationStatus, OwnershipClass};
-use crate::state::failure_memory::FailureMemoryActionOutcome;
 use crate::state::{
     AppStateInit, AuthLoginMinecraftProfile, InstallStore, NewAuthLoginMinecraftAccount,
     NewAuthLoginMsaToken, SessionStore,

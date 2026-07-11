@@ -1,4 +1,13 @@
 use super::*;
+use crate::guardian::{
+    DiagnosisId, GuardianActionKind, GuardianDomain, GuardianLaunchRecoveryCurrentIntent,
+    GuardianLaunchRecoveryKind, GuardianMode as ApiGuardianMode,
+    launch_recovery_user_intent_fingerprint,
+};
+use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
+use crate::state::failure_memory::{FailureMemoryActionOutcome, GuardianFailureMemoryEntry};
+use axial_launcher::LaunchFailureClass;
+use chrono::{Duration, SecondsFormat, Utc};
 use sha1::Sha1;
 
 #[tokio::test]
@@ -32,6 +41,191 @@ async fn launch_preflight_ready_payload_for_managed_instance_does_not_create_ses
             .has_active_instance(&instance_id)
             .await
     );
+}
+
+#[tokio::test]
+async fn launch_preflight_surfaces_current_instance_crash_memory_without_creating_sessions() {
+    for (name, failure_class, expected_guidance) in [
+        ("oom", LaunchFailureClass::OutOfMemory, "memory"),
+        (
+            "mod",
+            LaunchFailureClass::ModAttributedCrash,
+            "disable the suspected mod",
+        ),
+    ] {
+        let fixture = TestFixture::new(&format!("preflight-failure-memory-{name}"));
+        fixture.write_ready_install("1.21.1");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| instance.max_memory_mb = 1024);
+        fixture
+            .state
+            .failure_memory()
+            .record(startup_failure_memory_entry(
+                &instance_id,
+                ApiGuardianMode::Managed,
+                failure_class,
+                &relative_timestamp(Duration::minutes(-5)),
+            ))
+            .expect("record current launch failure memory");
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id.clone())
+            .await
+            .expect("prepare preflight");
+
+        assert_eq!(preflight.status, "ready");
+        let fact = guardian_fact(&preflight, "recent_startup_failure");
+        assert_eq!(
+            fact_field(fact, "failure_class"),
+            Some(failure_class.as_str())
+        );
+        assert!(preflight.guardian.details.iter().any(|line| {
+            line.contains(if failure_class == LaunchFailureClass::OutOfMemory {
+                "out-of-memory crash"
+            } else {
+                "mod-attributed crash"
+            })
+        }));
+        assert!(
+            preflight
+                .guardian
+                .guidance
+                .iter()
+                .any(|line| line.contains(expected_guidance))
+        );
+        assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+        assert!(
+            !fixture
+                .state
+                .sessions()
+                .has_active_instance(&instance_id)
+                .await
+        );
+    }
+}
+
+#[tokio::test]
+async fn launch_preflight_ignores_unrelated_mode_instance_and_stale_crash_memory() {
+    let fixture = TestFixture::new("preflight-failure-memory-filtering");
+    fixture.write_ready_install("1.21.1");
+    let instance_id = fixture.add_instance("Survival", "1.21.1");
+    for entry in [
+        startup_failure_memory_entry(
+            "another-instance",
+            ApiGuardianMode::Managed,
+            LaunchFailureClass::OutOfMemory,
+            &relative_timestamp(Duration::minutes(-5)),
+        ),
+        startup_failure_memory_entry(
+            &instance_id,
+            ApiGuardianMode::Custom,
+            LaunchFailureClass::ModAttributedCrash,
+            &relative_timestamp(Duration::minutes(-4)),
+        ),
+        startup_failure_memory_entry(
+            &instance_id,
+            ApiGuardianMode::Managed,
+            LaunchFailureClass::MissingDependency,
+            &relative_timestamp(Duration::hours(-25)),
+        ),
+    ] {
+        fixture
+            .state
+            .failure_memory()
+            .record(entry)
+            .expect("record filtered launch failure memory");
+    }
+
+    let preflight = prepare_launch_preflight(&fixture.state, instance_id.clone())
+        .await
+        .expect("prepare preflight");
+
+    assert_eq!(preflight.status, "ready");
+    assert!(
+        preflight
+            .guardian_facts
+            .iter()
+            .all(|fact| fact.id.as_str() != "recent_startup_failure")
+    );
+    assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+    assert!(
+        !fixture
+            .state
+            .sessions()
+            .has_active_instance(&instance_id)
+            .await
+    );
+}
+
+#[tokio::test]
+async fn launch_preflight_surfaces_only_active_suppression_for_the_exact_current_intent() {
+    for (name, preset, suppression_offset, expected_visible) in [
+        ("active", "performance", Duration::minutes(30), true),
+        ("expired", "performance", Duration::minutes(-1), false),
+        ("wrong-intent", "", Duration::minutes(30), false),
+    ] {
+        let fixture = TestFixture::new(&format!("preflight-repair-suppression-{name}"));
+        fixture.write_ready_install("1.21.1");
+        let instance_id = fixture.add_instance("Survival", "1.21.1");
+        fixture.update_instance(&instance_id, |instance| {
+            instance.jvm_preset = preset.to_string()
+        });
+        let stored_intent = GuardianLaunchRecoveryCurrentIntent {
+            target_version_id: "1.21.1",
+            explicit_java_override_present: false,
+            explicit_jvm_args_present: false,
+            explicit_jvm_preset_present: true,
+        };
+        let intent_hash = launch_recovery_user_intent_fingerprint(
+            stored_intent,
+            GuardianLaunchRecoveryKind::DowngradePreset,
+        );
+        fixture
+            .state
+            .failure_memory()
+            .record(
+                GuardianFailureMemoryEntry::observed(
+                    DiagnosisId::new("jvm_preset_recovery"),
+                    GuardianDomain::Launch,
+                    instance_target(&instance_id, OwnershipClass::LauncherManaged),
+                    ApiGuardianMode::Managed,
+                    Some(&intent_hash),
+                    relative_timestamp(Duration::minutes(-5)),
+                )
+                .with_action(
+                    GuardianActionKind::Downgrade,
+                    FailureMemoryActionOutcome::Suppressed,
+                )
+                .with_repair_attempt()
+                .with_suppression_until(relative_timestamp(suppression_offset)),
+            )
+            .expect("record launch repair suppression");
+
+        let preflight = prepare_launch_preflight(&fixture.state, instance_id.clone())
+            .await
+            .expect("prepare preflight");
+        assert_eq!(preflight.status, "ready");
+        let suppression_fact = preflight
+            .guardian_facts
+            .iter()
+            .find(|fact| fact.id.as_str() == "repair_suppressed_until");
+
+        assert_eq!(suppression_fact.is_some(), expected_visible);
+        assert_eq!(
+            preflight.guardian.details.iter().any(|line| {
+                line.contains("Guardian will not auto-repair this launch again until")
+                    && line.ends_with(" UTC.")
+            }),
+            expected_visible
+        );
+        assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+        assert!(
+            !fixture
+                .state
+                .sessions()
+                .has_active_instance(&instance_id)
+                .await
+        );
+    }
 }
 
 #[tokio::test]
@@ -976,4 +1170,40 @@ async fn prepare_launch_session_rejects_incomplete_parent_without_session() {
             .has_active_instance(&instance_id)
             .await
     );
+}
+
+fn startup_failure_memory_entry(
+    instance_id: &str,
+    mode: ApiGuardianMode,
+    failure_class: LaunchFailureClass,
+    observed_at: &str,
+) -> GuardianFailureMemoryEntry {
+    GuardianFailureMemoryEntry::observed(
+        DiagnosisId::new(failure_class.as_str()),
+        GuardianDomain::Startup,
+        instance_target(instance_id, OwnershipClass::UserOwned),
+        mode,
+        None,
+        observed_at,
+    )
+}
+
+fn instance_target(instance_id: &str, ownership: OwnershipClass) -> TargetDescriptor {
+    TargetDescriptor::new(
+        StabilizationSystem::Guardian,
+        TargetKind::Instance,
+        instance_id,
+        ownership,
+    )
+}
+
+fn relative_timestamp(offset: Duration) -> String {
+    (Utc::now() + offset).to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn fact_field<'a>(fact: &'a GuardianFact, key: &str) -> Option<&'a str> {
+    fact.fields
+        .iter()
+        .find(|field| field.key == key)
+        .map(|field| field.value.as_str())
 }

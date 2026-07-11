@@ -17,9 +17,11 @@ use crate::application::{
     stage_launch_instance_command,
 };
 use crate::guardian::{
-    GuardianDecisionKind as ApiGuardianDecisionKind, GuardianFact, GuardianMode as ApiGuardianMode,
-    GuardianPreflightDirective, GuardianPreflightOutcome, GuardianPreflightOutcomeRequest,
-    GuardianPreflightReadiness, guardian_fact_from_execution, guardian_preflight_outcome,
+    GuardianDecisionKind as ApiGuardianDecisionKind, GuardianFact,
+    GuardianLaunchFailureMemoryIntakeRequest, GuardianLaunchRecoveryCurrentIntent,
+    GuardianMode as ApiGuardianMode, GuardianPreflightDirective, GuardianPreflightOutcome,
+    GuardianPreflightOutcomeRequest, GuardianPreflightReadiness, guardian_fact_from_execution,
+    guardian_preflight_outcome, launch_failure_memory_guardian_facts,
 };
 use crate::logging::timestamp_utc;
 use crate::state::contracts::OperationPhase;
@@ -639,6 +641,33 @@ async fn build_launch_preflight_facts(
         max_memory_mb,
     );
     let resources_elapsed = resources_started_at.elapsed();
+    let failure_memory = state.failure_memory().list();
+    let current_at = timestamp_utc();
+    let suggested_memory_mb = policy::suggested_max_memory_after_recent_oom(
+        max_memory_mb,
+        resource_budget.host_total_memory_mb,
+        resource_budget.active_memory_allocation_mb,
+        &target_version_id,
+        is_modded,
+    );
+    guardian_facts.extend(launch_failure_memory_guardian_facts(
+        GuardianLaunchFailureMemoryIntakeRequest {
+            entries: &failure_memory,
+            instance_id: &instance.id,
+            mode: application_guardian_mode(guardian.mode),
+            current_at: &current_at,
+            current_intent: GuardianLaunchRecoveryCurrentIntent {
+                target_version_id: &target_version_id,
+                explicit_java_override_present: guardian.has_java_override(),
+                explicit_jvm_args_present: guardian.has_raw_jvm_args(),
+                explicit_jvm_preset_present: guardian.has_named_preset(),
+            },
+            runtime_major: required_java_major,
+            effective_preset: &requested_preset,
+            current_memory_mb: max_memory_mb,
+            suggested_memory_mb,
+        },
+    ));
     let readiness_started_at = Instant::now();
     let readiness = if version_scan_degraded {
         LaunchReadiness {
@@ -765,10 +794,10 @@ fn guardian_summary_from_preflight_outcome(
     mode: GuardianMode,
     outcome: &GuardianPreflightOutcome,
 ) -> GuardianSummary {
-    let public_details = legacy_preflight_public_lines(outcome);
+    let public_details = launcher_guardian_public_lines(outcome);
     GuardianSummary {
         mode,
-        decision: legacy_preflight_decision(outcome.user_outcome.decision),
+        decision: launcher_guardian_decision(outcome.user_outcome.decision),
         message: Some(outcome.user_outcome.summary.clone()),
         details: public_details.clone(),
         guidance: public_details,
@@ -776,7 +805,7 @@ fn guardian_summary_from_preflight_outcome(
     }
 }
 
-fn legacy_preflight_public_lines(outcome: &GuardianPreflightOutcome) -> Vec<String> {
+fn launcher_guardian_public_lines(outcome: &GuardianPreflightOutcome) -> Vec<String> {
     let mut lines = Vec::new();
     for value in outcome
         .user_outcome
@@ -791,7 +820,7 @@ fn legacy_preflight_public_lines(outcome: &GuardianPreflightOutcome) -> Vec<Stri
     lines
 }
 
-fn legacy_preflight_decision(decision: ApiGuardianDecisionKind) -> GuardianDecision {
+fn launcher_guardian_decision(decision: ApiGuardianDecisionKind) -> GuardianDecision {
     match decision {
         ApiGuardianDecisionKind::Allow | ApiGuardianDecisionKind::RecordOnly => {
             GuardianDecision::Allowed
