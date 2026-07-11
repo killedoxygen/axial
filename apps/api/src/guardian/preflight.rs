@@ -10,6 +10,8 @@ use crate::observability::{
 use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
+use axial_launcher::LaunchFailureClass;
+use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 
 const MAX_PREFLIGHT_DETAILS: usize = 6;
@@ -106,7 +108,7 @@ pub fn guardian_preflight_outcome(
         decide_guardian_policy(&safety_case, preflight_policy_context(&request, &facts));
     let preflight_decision = preflight_decision_kind(&request, &facts, &guardian_decision);
     let directives = preflight_directives(preflight_decision, &safety_case);
-    let (details, guidance) = preflight_copy(preflight_decision, &safety_case);
+    let (details, guidance) = preflight_copy(preflight_decision, &safety_case, &facts);
     let summary = public_text(
         preflight_summary(preflight_decision),
         MAX_PREFLIGHT_SUMMARY_CHARS,
@@ -331,12 +333,16 @@ fn is_preflight_warning_fact(fact: &GuardianFact) -> bool {
             | "custom_java_override_present"
             | "custom_jvm_preset_present"
             | "custom_jvm_args_present"
+            | "recent_startup_failure"
+            | "recent_repair_failed"
+            | "repair_suppressed_until"
     )
 }
 
 fn preflight_copy(
     decision: GuardianDecisionKind,
     safety_case: &SafetyCase,
+    facts: &[GuardianFact],
 ) -> (Vec<String>, Vec<String>) {
     let mut details = Vec::new();
     let mut guidance = Vec::new();
@@ -348,6 +354,14 @@ fn preflight_copy(
             push_unique_public(&mut guidance, value, MAX_PREFLIGHT_GUIDANCE);
         }
     }
+    for fact in facts.iter().filter(|fact| is_historical_launch_fact(fact)) {
+        if let Some(detail) = historical_launch_detail(fact) {
+            push_unique_public(&mut details, &detail, MAX_PREFLIGHT_DETAILS);
+        }
+        if let Some(value) = historical_launch_guidance(fact) {
+            push_unique_public(&mut guidance, &value, MAX_PREFLIGHT_GUIDANCE);
+        }
+    }
     if details.is_empty() && decision == GuardianDecisionKind::Block {
         push_unique_public(
             &mut details,
@@ -356,6 +370,223 @@ fn preflight_copy(
         );
     }
     (details, guidance)
+}
+
+fn is_historical_launch_fact(fact: &GuardianFact) -> bool {
+    matches!(
+        fact.id.as_str(),
+        "recent_startup_failure" | "recent_repair_failed" | "repair_suppressed_until"
+    )
+}
+
+fn historical_launch_detail(fact: &GuardianFact) -> Option<String> {
+    match fact.id.as_str() {
+        "recent_startup_failure" => recent_startup_failure_detail(fact),
+        "recent_repair_failed" => repair_failure_copy(fact).map(|copy| copy.0.to_string()),
+        "repair_suppressed_until" => suppression_time_utc(fact)
+            .map(|time| format!("Guardian will not auto-repair this launch again until {time}.")),
+        _ => None,
+    }
+}
+
+fn historical_launch_guidance(fact: &GuardianFact) -> Option<String> {
+    match fact.id.as_str() {
+        "recent_startup_failure" => recent_startup_failure_guidance(fact),
+        "recent_repair_failed" => repair_failure_copy(fact).map(|copy| copy.1.to_string()),
+        "repair_suppressed_until" => suppression_time_utc(fact).map(|time| {
+            format!(
+                "Review the launch settings before retrying; unchanged settings will not trigger another automatic repair before {time}."
+            )
+        }),
+        _ => None,
+    }
+}
+
+fn recent_startup_failure_detail(fact: &GuardianFact) -> Option<String> {
+    let failure_class =
+        fact_field(fact, "failure_class").and_then(LaunchFailureClass::from_name)?;
+    let label = launch_failure_plain_label(failure_class)?;
+    let occurrences = fact_field_u32(fact, "occurrences").filter(|count| *count > 0);
+    let latest_today = fact_field(fact, "latest_observed_today") == Some("true");
+    let occurrences_today = latest_today
+        .then(|| fact_field_u32(fact, "occurrences_today"))
+        .flatten()
+        .filter(|count| *count > 0)
+        .filter(|count| occurrences.is_none_or(|total| *count <= total));
+
+    Some(if let Some(count) = occurrences_today {
+        counted_failure_copy("had", count, label, " today")
+    } else if let Some(count) = occurrences {
+        let recency = if latest_today {
+            "; the latest was today"
+        } else {
+            "; the latest was within the past 24 hours"
+        };
+        counted_failure_copy("has recorded", count, label, recency)
+    } else {
+        format!("A recent launch ended with {}.", label.with_article)
+    })
+}
+
+fn counted_failure_copy(
+    verb: &str,
+    count: u32,
+    label: LaunchFailurePlainLabel,
+    suffix: &str,
+) -> String {
+    if count == 1 {
+        format!("This instance {verb} one {}{suffix}.", label.singular)
+    } else {
+        format!("This instance {verb} {count} {}{suffix}.", label.plural)
+    }
+}
+
+fn recent_startup_failure_guidance(fact: &GuardianFact) -> Option<String> {
+    let failure_class =
+        fact_field(fact, "failure_class").and_then(LaunchFailureClass::from_name)?;
+    match failure_class {
+        LaunchFailureClass::OutOfMemory => {
+            let current = fact_field_u32(fact, "current_memory_mb").filter(|value| *value > 0);
+            let suggested = fact_field_u32(fact, "suggested_memory_mb").filter(|value| *value > 0);
+            match (current, suggested) {
+                (Some(current), Some(suggested)) if suggested > current => Some(format!(
+                    "Increase this instance's maximum memory from {current} MB to {suggested} MB before relaunching."
+                )),
+                _ => Some(
+                    "Guardian could not verify safe headroom for a larger memory allocation. Close another session or free memory before relaunching."
+                        .to_string(),
+                ),
+            }
+        }
+        LaunchFailureClass::GraphicsDriverCrash => Some(
+            "Update the graphics driver and remove graphics overrides before relaunching."
+                .to_string(),
+        ),
+        LaunchFailureClass::MissingDependency => {
+            Some("Repair the instance dependencies before relaunching.".to_string())
+        }
+        LaunchFailureClass::ModTransformationFailure => Some(
+            "Review recently changed mods and their loader compatibility before relaunching."
+                .to_string(),
+        ),
+        LaunchFailureClass::ModAttributedCrash => Some(
+            "Review recently changed mods and disable the suspected mod before relaunching."
+                .to_string(),
+        ),
+        LaunchFailureClass::Unknown
+        | LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering
+        | LaunchFailureClass::JavaRuntimeMismatch
+        | LaunchFailureClass::ClasspathModuleConflict
+        | LaunchFailureClass::LauncherManagedArtifactSignature
+        | LaunchFailureClass::AuthModeIncompatible
+        | LaunchFailureClass::LoaderBootstrapFailure
+        | LaunchFailureClass::StartupStalled => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LaunchFailurePlainLabel {
+    singular: &'static str,
+    plural: &'static str,
+    with_article: &'static str,
+}
+
+fn launch_failure_plain_label(
+    failure_class: LaunchFailureClass,
+) -> Option<LaunchFailurePlainLabel> {
+    let label = match failure_class {
+        LaunchFailureClass::OutOfMemory => LaunchFailurePlainLabel {
+            singular: "out-of-memory crash",
+            plural: "out-of-memory crashes",
+            with_article: "an out-of-memory crash",
+        },
+        LaunchFailureClass::GraphicsDriverCrash => LaunchFailurePlainLabel {
+            singular: "graphics driver crash",
+            plural: "graphics driver crashes",
+            with_article: "a graphics driver crash",
+        },
+        LaunchFailureClass::MissingDependency => LaunchFailurePlainLabel {
+            singular: "missing-dependency crash",
+            plural: "missing-dependency crashes",
+            with_article: "a missing-dependency crash",
+        },
+        LaunchFailureClass::ModTransformationFailure => LaunchFailurePlainLabel {
+            singular: "mod transformation crash",
+            plural: "mod transformation crashes",
+            with_article: "a mod transformation crash",
+        },
+        LaunchFailureClass::ModAttributedCrash => LaunchFailurePlainLabel {
+            singular: "mod-attributed crash",
+            plural: "mod-attributed crashes",
+            with_article: "a mod-attributed crash",
+        },
+        LaunchFailureClass::Unknown
+        | LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering
+        | LaunchFailureClass::JavaRuntimeMismatch
+        | LaunchFailureClass::ClasspathModuleConflict
+        | LaunchFailureClass::LauncherManagedArtifactSignature
+        | LaunchFailureClass::AuthModeIncompatible
+        | LaunchFailureClass::LoaderBootstrapFailure
+        | LaunchFailureClass::StartupStalled => return None,
+    };
+    Some(label)
+}
+
+fn repair_failure_copy(fact: &GuardianFact) -> Option<(&'static str, &'static str)> {
+    match fact_field(fact, "diagnosis")? {
+        "java_runtime_recovery" => Some((
+            "The previous managed Java recovery attempt failed.",
+            "Review the selected Java runtime before relaunching.",
+        )),
+        "jvm_arg_unsupported" => Some((
+            "The previous JVM argument recovery attempt failed.",
+            "Review or remove explicit JVM arguments before relaunching.",
+        )),
+        "jvm_preset_recovery" => match fact_field(fact, "recovery_preset") {
+            Some("legacy") => Some((
+                "The previous JVM preset recovery attempt failed.",
+                "Try the Legacy JVM preset before relaunching.",
+            )),
+            Some("performance") => Some((
+                "The previous JVM preset recovery attempt failed.",
+                "Try the Performance JVM preset before relaunching.",
+            )),
+            _ => Some((
+                "The previous JVM preset recovery attempt failed.",
+                "Review the JVM preset before relaunching.",
+            )),
+        },
+        "launch_startup_recovery" => Some((
+            "The previous automatic startup recovery attempt failed.",
+            "Review the launch settings before relaunching.",
+        )),
+        _ => None,
+    }
+}
+
+fn suppression_time_utc(fact: &GuardianFact) -> Option<String> {
+    let timestamp = fact_field(fact, "suppression_until")?;
+    let timestamp = DateTime::parse_from_rfc3339(timestamp).ok()?;
+    let utc = timestamp.with_timezone(&Utc);
+    Some(format!("{:02}:{:02} UTC", utc.hour(), utc.minute()))
+}
+
+fn fact_field<'a>(fact: &'a GuardianFact, key: &str) -> Option<&'a str> {
+    let mut values = fact
+        .fields
+        .iter()
+        .filter(|field| field.key == key)
+        .filter_map(|field| field.value_for(RedactionAudience::UserVisible));
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn fact_field_u32(fact: &GuardianFact, key: &str) -> Option<u32> {
+    fact_field(fact, key)?.parse().ok()
 }
 
 fn detail_for_diagnosis(
@@ -816,16 +1047,18 @@ fn push_unique_public(values: &mut Vec<String>, value: &str, max_values: usize) 
 mod tests {
     use super::{
         GuardianPreflightOutcomeRequest, GuardianPreflightReadiness,
-        GuardianPreflightResourceSignals, guardian_preflight_outcome,
+        GuardianPreflightResourceSignals, guardian_preflight_outcome, launch_failure_plain_label,
     };
     use crate::guardian::{
         FactReliability, GuardianConfidence, GuardianDecisionKind, GuardianDomain, GuardianFact,
         GuardianFactId, GuardianMode, GuardianPreflightDirective, GuardianSeverity,
+        is_guardian_launch_crash_class,
     };
     use crate::observability::{EvidenceField, EvidenceSensitivity};
     use crate::state::contracts::{
         OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
     };
+    use axial_launcher::LaunchFailureClass;
 
     #[test]
     fn java_override_unavailable_blocks_when_readiness_says_launch_is_impossible() {
@@ -1037,6 +1270,276 @@ mod tests {
         assert!(!lower.contains("secret"));
     }
 
+    #[test]
+    fn historical_launch_facts_only_warn_and_never_direct_launch_actions() {
+        let historical_facts = [
+            fact_with_fields(
+                "recent_startup_failure",
+                "instance-a",
+                [
+                    ("failure_class", "out_of_memory"),
+                    ("occurrences", "1"),
+                    ("latest_observed_today", "true"),
+                ],
+            ),
+            fact_with_fields(
+                "recent_repair_failed",
+                "instance-a",
+                [("diagnosis", "java_runtime_recovery")],
+            ),
+            fact_with_fields(
+                "repair_suppressed_until",
+                "instance-a",
+                [("suppression_until", "2026-07-11T11:05:00Z")],
+            ),
+        ];
+
+        for mode in [
+            GuardianMode::Managed,
+            GuardianMode::Custom,
+            GuardianMode::Disabled,
+        ] {
+            for historical_fact in &historical_facts {
+                let mut historical_fact = historical_fact.clone();
+                historical_fact.severity = Some(GuardianSeverity::Blocking);
+                let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
+                    explicit_user_intent: true,
+                    ..GuardianPreflightOutcomeRequest::new(mode, &[historical_fact])
+                });
+
+                assert_eq!(outcome.user_outcome.decision, GuardianDecisionKind::Warn);
+                assert!(outcome.directives.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn recent_startup_failure_copy_uses_truthful_occurrence_windows() {
+        let today = fact_with_fields(
+            "recent_startup_failure",
+            "instance-a",
+            [
+                ("failure_class", "mod_attributed_crash"),
+                ("occurrences", "4"),
+                ("latest_observed_today", "true"),
+                ("occurrences_today", "3"),
+            ],
+        );
+        let recorded = fact_with_fields(
+            "recent_startup_failure",
+            "instance-b",
+            [
+                ("failure_class", "missing_dependency"),
+                ("occurrences", "4"),
+                ("latest_observed_today", "true"),
+            ],
+        );
+        let recent = fact_with_fields(
+            "recent_startup_failure",
+            "instance-c",
+            [
+                ("failure_class", "graphics_driver_crash"),
+                ("occurrences", "1"),
+                ("latest_observed_today", "false"),
+            ],
+        );
+
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest::new(
+            GuardianMode::Managed,
+            &[today, recorded, recent],
+        ));
+
+        assert!(
+            outcome
+                .user_outcome
+                .details
+                .contains(&"This instance had 3 mod-attributed crashes today.".to_string())
+        );
+        assert!(
+            outcome.user_outcome.details.contains(
+                &"This instance has recorded 4 missing-dependency crashes; the latest was today."
+                    .to_string()
+            )
+        );
+        assert!(outcome.user_outcome.details.contains(
+            &"This instance has recorded one graphics driver crash; the latest was within the past 24 hours."
+                .to_string()
+        ));
+    }
+
+    #[test]
+    fn launch_failure_plain_labels_cover_exactly_guardian_crash_classes() {
+        for failure_class in [
+            LaunchFailureClass::Unknown,
+            LaunchFailureClass::JvmUnsupportedOption,
+            LaunchFailureClass::JvmExperimentalUnlock,
+            LaunchFailureClass::JvmOptionOrdering,
+            LaunchFailureClass::JavaRuntimeMismatch,
+            LaunchFailureClass::OutOfMemory,
+            LaunchFailureClass::GraphicsDriverCrash,
+            LaunchFailureClass::MissingDependency,
+            LaunchFailureClass::ModTransformationFailure,
+            LaunchFailureClass::ModAttributedCrash,
+            LaunchFailureClass::ClasspathModuleConflict,
+            LaunchFailureClass::LauncherManagedArtifactSignature,
+            LaunchFailureClass::AuthModeIncompatible,
+            LaunchFailureClass::LoaderBootstrapFailure,
+            LaunchFailureClass::StartupStalled,
+        ] {
+            assert_eq!(
+                launch_failure_plain_label(failure_class).is_some(),
+                is_guardian_launch_crash_class(failure_class),
+                "plain label coverage diverged for {}",
+                failure_class.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn oom_history_gives_concrete_budgeted_or_unverified_headroom_guidance() {
+        let suggested = fact_with_fields(
+            "recent_startup_failure",
+            "instance-a",
+            [
+                ("failure_class", "out_of_memory"),
+                ("occurrences", "1"),
+                ("latest_observed_today", "true"),
+                ("current_memory_mb", "4096"),
+                ("suggested_memory_mb", "6144"),
+            ],
+        );
+        let unverified_headroom = fact_with_fields(
+            "recent_startup_failure",
+            "instance-b",
+            [
+                ("failure_class", "out_of_memory"),
+                ("occurrences", "1"),
+                ("latest_observed_today", "true"),
+                ("current_memory_mb", "4096"),
+            ],
+        );
+
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest::new(
+            GuardianMode::Managed,
+            &[suggested, unverified_headroom],
+        ));
+
+        assert!(outcome.user_outcome.guidance.contains(
+            &"Increase this instance's maximum memory from 4096 MB to 6144 MB before relaunching."
+                .to_string()
+        ));
+        assert!(outcome.user_outcome.guidance.contains(
+            &"Guardian could not verify safe headroom for a larger memory allocation. Close another session or free memory before relaunching."
+                .to_string()
+        ));
+    }
+
+    #[test]
+    fn failed_repair_and_active_suppression_have_closed_copy() {
+        let repair = fact_with_fields(
+            "recent_repair_failed",
+            "instance-a",
+            [
+                ("diagnosis", "jvm_preset_recovery"),
+                ("recovery_preset", "legacy"),
+            ],
+        );
+        let suppression = fact_with_fields(
+            "repair_suppressed_until",
+            "instance-a",
+            [
+                ("diagnosis", "jvm_preset_recovery"),
+                ("suppression_until", "2026-07-11T13:45:00+02:00"),
+            ],
+        );
+
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest::new(
+            GuardianMode::Managed,
+            &[repair, suppression],
+        ));
+
+        assert!(
+            outcome
+                .user_outcome
+                .details
+                .contains(&"The previous JVM preset recovery attempt failed.".to_string())
+        );
+        assert!(
+            outcome
+                .user_outcome
+                .guidance
+                .contains(&"Try the Legacy JVM preset before relaunching.".to_string())
+        );
+        assert!(outcome.user_outcome.details.contains(
+            &"Guardian will not auto-repair this launch again until 11:45 UTC.".to_string()
+        ));
+    }
+
+    #[test]
+    fn historical_copy_is_redacted_and_bounded_under_hostile_fields() {
+        let mut facts = [
+            "out_of_memory",
+            "graphics_driver_crash",
+            "missing_dependency",
+            "mod_transformation_failure",
+            "mod_attributed_crash",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, failure_class)| {
+            fact_with_fields(
+                "recent_startup_failure",
+                &format!("instance-{index}"),
+                [
+                    ("failure_class", failure_class),
+                    ("occurrences", "4294967295"),
+                    ("latest_observed_today", "true"),
+                    ("raw", "/home/alice/java -Xmx8192M --accessToken secret"),
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+        for (index, diagnosis) in [
+            "java_runtime_recovery",
+            "jvm_arg_unsupported",
+            "jvm_preset_recovery",
+            "launch_startup_recovery",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            facts.push(fact_with_fields(
+                "recent_repair_failed",
+                &format!("repair-{index}"),
+                [
+                    ("diagnosis", diagnosis),
+                    ("recovery_preset", "/home/alice/secret-token"),
+                ],
+            ));
+        }
+
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest::new(
+            GuardianMode::Managed,
+            &facts,
+        ));
+        let encoded = serde_json::to_string(&outcome).expect("historical outcome json");
+        let lower = encoded.to_ascii_lowercase();
+
+        assert!(outcome.user_outcome.details.len() <= 6);
+        assert!(outcome.user_outcome.guidance.len() <= 6);
+        assert!(
+            outcome
+                .user_outcome
+                .details
+                .iter()
+                .chain(&outcome.user_outcome.guidance)
+                .all(|line| line.chars().count() <= 240)
+        );
+        for sensitive in ["/home", "alice", "-xmx", "accesstoken", "secret"] {
+            assert!(!lower.contains(sensitive), "leaked {sensitive}: {encoded}");
+        }
+    }
+
     fn fact(
         id: &str,
         domain: GuardianDomain,
@@ -1062,5 +1565,25 @@ mod tests {
             )),
             fields: Vec::new(),
         }
+    }
+
+    fn fact_with_fields<const N: usize>(
+        id: &str,
+        target_id: &str,
+        fields: [(&str, &str); N],
+    ) -> GuardianFact {
+        let mut fact = fact(
+            id,
+            GuardianDomain::Launch,
+            GuardianSeverity::Warning,
+            OwnershipClass::LauncherManaged,
+            TargetKind::Instance,
+            target_id,
+        );
+        fact.fields = fields
+            .into_iter()
+            .map(|(key, value)| EvidenceField::new(key, value, EvidenceSensitivity::Public))
+            .collect();
+        fact
     }
 }
