@@ -346,6 +346,9 @@ fn preflight_copy(
 ) -> (Vec<String>, Vec<String>) {
     let mut details = Vec::new();
     let mut guidance = Vec::new();
+    if decision == GuardianDecisionKind::Warn {
+        push_historical_launch_copy(facts, &mut details, &mut guidance);
+    }
     for diagnosis in &safety_case.diagnoses {
         if let Some(detail) = detail_for_diagnosis(diagnosis.id.as_str(), decision) {
             push_unique_public(&mut details, detail, MAX_PREFLIGHT_DETAILS);
@@ -354,13 +357,8 @@ fn preflight_copy(
             push_unique_public(&mut guidance, value, MAX_PREFLIGHT_GUIDANCE);
         }
     }
-    for fact in facts.iter().filter(|fact| is_historical_launch_fact(fact)) {
-        if let Some(detail) = historical_launch_detail(fact) {
-            push_unique_public(&mut details, &detail, MAX_PREFLIGHT_DETAILS);
-        }
-        if let Some(value) = historical_launch_guidance(fact) {
-            push_unique_public(&mut guidance, &value, MAX_PREFLIGHT_GUIDANCE);
-        }
+    if decision != GuardianDecisionKind::Warn {
+        push_historical_launch_copy(facts, &mut details, &mut guidance);
     }
     if details.is_empty() && decision == GuardianDecisionKind::Block {
         push_unique_public(
@@ -370,6 +368,21 @@ fn preflight_copy(
         );
     }
     (details, guidance)
+}
+
+fn push_historical_launch_copy(
+    facts: &[GuardianFact],
+    details: &mut Vec<String>,
+    guidance: &mut Vec<String>,
+) {
+    for fact in facts.iter().filter(|fact| is_historical_launch_fact(fact)) {
+        if let Some(detail) = historical_launch_detail(fact) {
+            push_unique_public(details, &detail, MAX_PREFLIGHT_DETAILS);
+        }
+        if let Some(value) = historical_launch_guidance(fact) {
+            push_unique_public(guidance, &value, MAX_PREFLIGHT_GUIDANCE);
+        }
+    }
 }
 
 fn is_historical_launch_fact(fact: &GuardianFact) -> bool {
@@ -1473,6 +1486,69 @@ mod tests {
         assert!(outcome.user_outcome.details.contains(
             &"Guardian will not auto-repair this launch again until 11:45 UTC.".to_string()
         ));
+    }
+
+    #[test]
+    fn warn_copy_keeps_historical_advisories_when_detail_caps_are_saturated() {
+        let historical_facts = [
+            fact_with_fields(
+                "recent_startup_failure",
+                "instance-a",
+                [
+                    ("failure_class", "out_of_memory"),
+                    ("occurrences", "2"),
+                    ("latest_observed_today", "true"),
+                    ("occurrences_today", "2"),
+                    ("current_memory_mb", "4096"),
+                    ("suggested_memory_mb", "6144"),
+                ],
+            ),
+            fact_with_fields(
+                "repair_suppressed_until",
+                "instance-a",
+                [("suppression_until", "2026-07-11T13:45:00+02:00")],
+            ),
+        ];
+        let resources = GuardianPreflightResourceSignals {
+            memory_clamped: true,
+            low_memory_allocation: true,
+            memory_pressure: true,
+            cpu_pressure: true,
+            install_pressure: true,
+            disk_pressure: true,
+        };
+
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
+            resources,
+            ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &historical_facts)
+        });
+
+        assert_eq!(outcome.user_outcome.decision, GuardianDecisionKind::Warn);
+        assert_eq!(outcome.user_outcome.details.len(), 6);
+        assert_eq!(outcome.user_outcome.guidance.len(), 6);
+        assert!(
+            outcome
+                .user_outcome
+                .details
+                .contains(&"This instance had 2 out-of-memory crashes today.".to_string())
+        );
+        assert!(outcome.user_outcome.details.contains(
+            &"Guardian will not auto-repair this launch again until 11:45 UTC.".to_string()
+        ));
+        assert!(outcome.user_outcome.guidance.contains(
+            &"Increase this instance's maximum memory from 4096 MB to 6144 MB before relaunching."
+                .to_string()
+        ));
+        assert!(outcome.user_outcome.guidance.contains(
+            &"Review the launch settings before retrying; unchanged settings will not trigger another automatic repair before 11:45 UTC."
+                .to_string()
+        ));
+        assert!(
+            !outcome
+                .user_outcome
+                .details
+                .contains(&"Launch-relevant storage has low free space.".to_string())
+        );
     }
 
     #[test]
