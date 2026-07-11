@@ -12,9 +12,6 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  AXIAL_MSA_CLIENT_ID: ${{ vars.AXIAL_MSA_CLIENT_ID }}
-
 jobs:
   verify:
     runs-on: ubuntu-24.04
@@ -55,13 +52,6 @@ jobs:
 
           if [ "$TAURI_VERSION" != "$TAG_VERSION" ]; then
             echo "Release tag version '$TAG_VERSION' does not match Tauri config version '$TAURI_VERSION'." >&2
-            exit 1
-          fi
-
-      - name: Verify Microsoft auth client id provisioning
-        run: |
-          if [ -z "${AXIAL_MSA_CLIENT_ID//[[:space:]]/}" ]; then
-            echo "::error::Release builds require repository variable AXIAL_MSA_CLIENT_ID with the public Microsoft application client id."
             exit 1
           fi
 
