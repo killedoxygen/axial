@@ -27,7 +27,11 @@ pub use model::{
     RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride,
     RuntimeProbeSource, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource,
 };
-pub use probe::{JavaRuntimeProbeReceipt, probe_java_runtime_info, probe_java_runtime_receipt};
+pub use probe::{
+    JavaRuntimeProbeReceipt, JavaRuntimeProbeResolution, JavaRuntimeProbeResolutionError,
+    JavaRuntimeProbeSnapshot, probe_java_runtime_receipt, resolve_java_runtime_probe,
+    snapshot_java_runtime,
+};
 
 #[cfg(test)]
 use discovery::{detect_runtime_state, resolve_component_runtime_from_roots};

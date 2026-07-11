@@ -4295,5 +4295,6 @@ fn test_launch_session_task() -> launch_app::LaunchSessionTask {
         launched_at: "2026-05-30T00:00:00Z".to_string(),
         benchmark: None,
         resource_budget: None,
+        java_probe_receipt: None,
     }
 }

@@ -1,5 +1,8 @@
 use super::readiness::readiness_has_managed_runtime_missing;
-use super::{LaunchPreflightFacts, application_guardian_mode, build_launch_preflight_facts};
+use super::{
+    LaunchPreflightBuild, LaunchPreflightFacts, application_guardian_mode,
+    build_launch_preflight_facts,
+};
 use crate::application::launch::policy;
 use crate::application::{LaunchBoundaryStagingRequest, stage_launch_boundary};
 use crate::execution::runtime::{
@@ -217,14 +220,19 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
     let repair_user_outcome = runtime_repair_user_outcome(&outcome);
     match outcome.status {
         GuardianRepairStatus::Repaired => {
+            let prior_java_probe_receipt = preflight.java_probe_receipt.take();
             let mut repaired = build_launch_preflight_facts(
                 state,
-                launch.instance,
-                &preflight.config,
-                launch.library_dir,
-                launch.game_dir,
-                launch.requested_max_memory_mb,
-                launch.requested_min_memory_mb,
+                producer,
+                LaunchPreflightBuild {
+                    instance: launch.instance,
+                    config: &preflight.config,
+                    library_dir: launch.library_dir,
+                    game_dir: launch.game_dir,
+                    requested_max_memory_mb: launch.requested_max_memory_mb,
+                    requested_min_memory_mb: launch.requested_min_memory_mb,
+                },
+                prior_java_probe_receipt,
             )
             .await;
             mark_guardian_runtime_repair_success(

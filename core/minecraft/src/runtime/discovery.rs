@@ -11,7 +11,9 @@ use super::model::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeId, RuntimeInstallState,
     RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource,
 };
-use super::probe::{JavaRuntimeProbeReceipt, probe_java_runtime_info, probe_java_runtime_receipt};
+use super::probe::{
+    JavaRuntimeProbeValidation, probe_java_runtime_info, probe_java_runtime_receipt,
+};
 use super::rosetta::rosetta_required_error_for_current_host;
 use crate::launch::{JavaVersion, java_component_for_major};
 use crate::paths::runtime_dirs;
@@ -238,7 +240,7 @@ pub(super) struct ResolvedOverrideRuntime {
 pub(super) fn resolve_override_runtime(
     path: &Path,
     preferred_component: &RuntimeId,
-    receipt: Option<JavaRuntimeProbeReceipt>,
+    receipt: Option<JavaRuntimeProbeValidation>,
 ) -> Result<ResolvedOverrideRuntime, JavaRuntimeLookupError> {
     if !runtime_filesystem_path(path).as_ref().is_file() {
         return Err(JavaRuntimeLookupError::NotFound {

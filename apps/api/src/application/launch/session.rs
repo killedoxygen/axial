@@ -32,6 +32,7 @@ use axial_launcher::{
     LaunchReadiness, LaunchReadinessReason, LaunchReadinessReasonId, LaunchReadinessRequest,
     LaunchReadinessSeverity, LaunchState, inspect_launch_readiness, launch_notice,
 };
+use axial_minecraft::JavaRuntimeProbeReceipt;
 use axum::{Json, http::StatusCode};
 use overrides::{
     inspect_explicit_java_override, inspect_explicit_jvm_args, preflight_override_signals,
@@ -74,13 +75,13 @@ pub(crate) struct LaunchSessionTask {
     pub launched_at: String,
     pub benchmark: Option<LaunchBenchmarkMetadata>,
     pub resource_budget: Option<LaunchProofResourceBudget>,
+    pub java_probe_receipt: Option<JavaRuntimeProbeReceipt>,
 }
 
 pub(crate) struct PreparedLaunch {
     pub task: LaunchSessionTask,
 }
 
-#[derive(Clone, Debug)]
 struct LaunchPreflightFacts {
     config: AppConfig,
     max_memory_mb: i32,
@@ -99,6 +100,7 @@ struct LaunchPreflightFacts {
     boundary: LaunchBoundaryStaging,
     readiness: LaunchReadiness,
     resource_budget: LaunchProofResourceBudget,
+    java_probe_receipt: Option<JavaRuntimeProbeReceipt>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -218,12 +220,16 @@ async fn prepare_launch_session_with_auth_refresh(
     let preflight_started_at = Instant::now();
     let mut preflight = build_launch_preflight_facts(
         state,
-        &instance,
-        &config,
-        &library_dir,
-        &game_dir,
-        payload.max_memory_mb,
-        payload.min_memory_mb,
+        producer,
+        LaunchPreflightBuild {
+            instance: &instance,
+            config: &config,
+            library_dir: &library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: payload.max_memory_mb,
+            requested_min_memory_mb: payload.min_memory_mb,
+        },
+        None,
     )
     .await;
     let preflight_elapsed = preflight_started_at.elapsed();
@@ -368,6 +374,7 @@ async fn prepare_launch_session_with_auth_refresh(
             launched_at,
             benchmark: None,
             resource_budget: Some(preflight.resource_budget),
+            java_probe_receipt: preflight.java_probe_receipt,
         },
     })
 }
@@ -432,6 +439,9 @@ pub async fn prepare_launch_preflight(
     instance_id: String,
 ) -> Result<LaunchPreflightResponse, (StatusCode, Json<serde_json::Value>)> {
     let started_at = Instant::now();
+    let producer = state
+        .try_claim_producer()
+        .map_err(super::launch_shutdown_error_response)?;
     let library_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
@@ -450,11 +460,15 @@ pub async fn prepare_launch_preflight(
     let config = state.config().current();
     let facts = build_launch_preflight_facts(
         state,
-        &instance,
-        &config,
-        &library_dir,
-        &game_dir,
-        None,
+        &producer,
+        LaunchPreflightBuild {
+            instance: &instance,
+            config: &config,
+            library_dir: &library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
         None,
     )
     .await;
@@ -472,15 +486,29 @@ pub async fn prepare_launch_preflight(
     Ok(facts.into_response())
 }
 
-async fn build_launch_preflight_facts(
-    state: &AppState,
-    instance: &Instance,
-    config: &AppConfig,
-    library_dir: &Path,
-    game_dir: &Path,
+struct LaunchPreflightBuild<'a> {
+    instance: &'a Instance,
+    config: &'a AppConfig,
+    library_dir: &'a Path,
+    game_dir: &'a Path,
     requested_max_memory_mb: Option<i32>,
     requested_min_memory_mb: Option<i32>,
+}
+
+async fn build_launch_preflight_facts(
+    state: &AppState,
+    producer: &crate::state::ProducerLease,
+    request: LaunchPreflightBuild<'_>,
+    prior_java_probe_receipt: Option<JavaRuntimeProbeReceipt>,
 ) -> LaunchPreflightFacts {
+    let LaunchPreflightBuild {
+        instance,
+        config,
+        library_dir,
+        game_dir,
+        requested_max_memory_mb,
+        requested_min_memory_mb,
+    } = request;
     let started_at = Instant::now();
     // Preflight is read-only: no session creation, installs, or raw path exposure.
     let memory_started_at = Instant::now();
@@ -531,10 +559,34 @@ async fn build_launch_preflight_facts(
     let required_java_major = version_record
         .and_then(|version| (version.java_major > 0).then_some(version.java_major as u32));
     let overrides_started_at = Instant::now();
-    let mut execution_facts = inspect_explicit_java_override(instance, config, required_java_major)
-        .into_iter()
-        .flat_map(|inspection| inspection.facts)
-        .collect::<Vec<_>>();
+    let java_inspection = inspect_explicit_java_override(
+        state,
+        producer,
+        instance,
+        config,
+        required_java_major,
+        prior_java_probe_receipt,
+    )
+    .await;
+    let (mut execution_facts, mut java_probe_receipt, java_probe_count, java_probe_source) =
+        java_inspection.map_or_else(
+            || {
+                (
+                    Vec::new(),
+                    None,
+                    0,
+                    overrides::PreflightJavaProbeSource::None,
+                )
+            },
+            |inspection| {
+                (
+                    inspection.facts,
+                    inspection.receipt,
+                    inspection.probe_count,
+                    inspection.probe_source,
+                )
+            },
+        );
     let jvm_args_inspection = inspect_explicit_jvm_args(&instance.extra_jvm_args);
     let mut extra_jvm_args = jvm_args_inspection.args;
     execution_facts.extend(jvm_args_inspection.facts.iter().cloned());
@@ -606,6 +658,7 @@ async fn build_launch_preflight_facts(
         &guardian_outcome,
         &mut requested_java,
         &mut extra_jvm_args,
+        &mut java_probe_receipt,
     );
     let guardian_summary =
         guardian_summary_from_preflight_outcome(guardian.mode, &guardian_outcome);
@@ -626,6 +679,8 @@ async fn build_launch_preflight_facts(
         reason_count: readiness.reasons.len(),
         fact_count: guardian_facts.len(),
         guardian_decision: guardian_outcome.user_outcome.decision,
+        java_probe_count,
+        java_probe_source: java_probe_source.as_str(),
     });
 
     LaunchPreflightFacts {
@@ -646,6 +701,7 @@ async fn build_launch_preflight_facts(
         boundary,
         readiness,
         resource_budget,
+        java_probe_receipt,
     }
 }
 
@@ -653,10 +709,14 @@ fn apply_guardian_preflight_interventions(
     outcome: &GuardianPreflightOutcome,
     requested_java: &mut String,
     extra_jvm_args: &mut Vec<String>,
+    java_probe_receipt: &mut Option<JavaRuntimeProbeReceipt>,
 ) {
     for directive in &outcome.directives {
         match directive {
-            GuardianPreflightDirective::UseManagedJavaForAttempt => requested_java.clear(),
+            GuardianPreflightDirective::UseManagedJavaForAttempt => {
+                requested_java.clear();
+                *java_probe_receipt = None;
+            }
             GuardianPreflightDirective::StripExplicitJvmArgsForAttempt => extra_jvm_args.clear(),
         }
     }

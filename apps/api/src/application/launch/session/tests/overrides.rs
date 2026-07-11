@@ -1,5 +1,150 @@
 use super::*;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn direct_launch_receipt_keeps_preparation_retries_to_one_probe_spawn() {
+    let fixture = TestFixture::new("direct-java-receipt-one-spawn");
+    fixture.set_guardian_mode("custom");
+    fixture.write_ready_install("1.21.1");
+    let instance_id = fixture.add_instance("Survival", "1.21.1");
+    let (java_path, count_file) = write_counted_probe_java(&fixture, "java21");
+    fixture.update_instance(&instance_id, |instance| {
+        instance.java_path = java_path;
+    });
+
+    let prepared = prepare_launch_session(
+        &fixture.state,
+        LaunchRequest {
+            instance_id,
+            username: None,
+            max_memory_mb: None,
+            min_memory_mb: None,
+            client_started_at_ms: None,
+        },
+    )
+    .await
+    .expect("prepare launch session");
+    assert_eq!(read_probe_count(&count_file), 1);
+    let receipt = prepared
+        .task
+        .java_probe_receipt
+        .as_ref()
+        .expect("flow-local receipt");
+
+    for retry_count in [0, 1] {
+        let attempt = axial_launcher::service::AttemptOverrides {
+            retry_count,
+            ..Default::default()
+        };
+        let core_prepared = axial_launcher::prepare_launch_attempt_with_events(
+            &prepared.task.intent,
+            &attempt,
+            Some(receipt),
+            |_| {},
+        )
+        .await
+        .expect("receipt-backed preparation");
+        assert_eq!(core_prepared.metrics.java_probe_count, 0);
+        assert_eq!(core_prepared.metrics.java_probe_source, "receipt");
+    }
+    assert_eq!(read_probe_count(&count_file), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn standalone_preflight_does_not_cache_success_for_later_launch() {
+    let fixture = TestFixture::new("standalone-java-success-not-cached");
+    fixture.set_guardian_mode("custom");
+    fixture.write_ready_install("1.21.1");
+    let instance_id = fixture.add_instance("Survival", "1.21.1");
+    let (java_path, count_file) = write_counted_probe_java(&fixture, "java21");
+    fixture.update_instance(&instance_id, |instance| {
+        instance.java_path = java_path;
+    });
+
+    let preflight = prepare_launch_preflight(&fixture.state, instance_id.clone())
+        .await
+        .expect("standalone preflight");
+    assert_eq!(read_probe_count(&count_file), 1);
+    assert!(
+        !serde_json::to_string(&preflight)
+            .expect("preflight json")
+            .contains("receipt")
+    );
+
+    let prepared = prepare_launch_session(
+        &fixture.state,
+        LaunchRequest {
+            instance_id,
+            username: None,
+            max_memory_mb: None,
+            min_memory_mb: None,
+            client_started_at_ms: None,
+        },
+    )
+    .await
+    .expect("launch preflight");
+    assert!(prepared.task.java_probe_receipt.is_some());
+    assert_eq!(read_probe_count(&count_file), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_repreflight_shape_reuses_the_flow_receipt() {
+    let fixture = TestFixture::new("runtime-repreflight-java-receipt");
+    fixture.set_guardian_mode("custom");
+    fixture.write_ready_install("1.21.1");
+    let instance_id = fixture.add_instance("Survival", "1.21.1");
+    let (java_path, count_file) = write_counted_probe_java(&fixture, "java21");
+    fixture.update_instance(&instance_id, |instance| {
+        instance.java_path = java_path;
+    });
+    let instance = fixture
+        .state
+        .instances()
+        .get(&instance_id)
+        .expect("instance");
+    let config = fixture.state.config().current();
+    let game_dir = fixture.state.instances().game_dir(&instance_id);
+    let producer = fixture
+        .state
+        .try_claim_producer()
+        .expect("claim preflight producer");
+
+    let mut initial = build_launch_preflight_facts(
+        &fixture.state,
+        &producer,
+        LaunchPreflightBuild {
+            instance: &instance,
+            config: &config,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
+        None,
+    )
+    .await;
+    let receipt = initial.java_probe_receipt.take().expect("initial receipt");
+    let rebuilt = build_launch_preflight_facts(
+        &fixture.state,
+        &producer,
+        LaunchPreflightBuild {
+            instance: &instance,
+            config: &config,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
+        Some(receipt),
+    )
+    .await;
+
+    assert!(rebuilt.java_probe_receipt.is_some());
+    assert_eq!(read_probe_count(&count_file), 1);
+}
+
 #[tokio::test]
 async fn launch_preflight_custom_override_warns_with_bounded_override_payload() {
     let fixture = TestFixture::new("preflight-custom-bounded");
@@ -754,6 +899,41 @@ fn write_probe_java(
         fs::set_permissions(&java_path, permissions).expect("fake java executable");
     }
     java_path.to_string_lossy().to_string()
+}
+
+#[cfg(unix)]
+fn write_counted_probe_java(fixture: &TestFixture, name: &str) -> (String, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = fixture.root.join(name).join("bin");
+    fs::create_dir_all(&bin_dir).expect("fake java bin");
+    let java_path = bin_dir.join("java");
+    let count_file = fixture.root.join(format!("{name}-probe-count"));
+    fs::write(&count_file, b"0").expect("probe count");
+    fs::write(
+        &java_path,
+        format!(
+            "#!/bin/sh\ncount=$(cat '{}')\necho $((count + 1)) > '{}'\necho 'openjdk version \"21.0.3\"' >&2\n",
+            count_file.display(),
+            count_file.display()
+        ),
+    )
+    .expect("counted fake java script");
+    let mut permissions = fs::metadata(&java_path)
+        .expect("fake java metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&java_path, permissions).expect("fake java executable");
+    (java_path.to_string_lossy().to_string(), count_file)
+}
+
+#[cfg(unix)]
+fn read_probe_count(path: &Path) -> u32 {
+    fs::read_to_string(path)
+        .expect("probe count")
+        .trim()
+        .parse()
+        .expect("numeric probe count")
 }
 
 #[cfg(unix)]

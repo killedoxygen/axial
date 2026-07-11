@@ -223,6 +223,7 @@ async fn launch_session_inner(
         launched_at,
         benchmark,
         resource_budget,
+        java_probe_receipt,
     } = task;
     let session_id = intent.session_id.clone();
     trace_launch_event(
@@ -297,11 +298,15 @@ async fn launch_session_inner(
             }
             let _ = preparation_status_done_tx.send(());
         });
-        let prepared_result =
-            prepare_launch_attempt_with_events(&intent, &attempt, None, move |event| {
+        let prepared_result = prepare_launch_attempt_with_events(
+            &intent,
+            &attempt,
+            java_probe_receipt.as_ref(),
+            move |event| {
                 let _ = preparation_event_sender.send(event);
-            })
-            .await;
+            },
+        )
+        .await;
         drop(preparation_event_tx);
         let _ = preparation_status_done_rx.await;
 
@@ -446,11 +451,13 @@ async fn launch_session_inner(
         trace_launch_event(
             &session_id,
             &format!(
-                "prepare finished total={}ms version={}ms runtime={}ms planning={}ms",
+                "prepare finished total={}ms version={}ms runtime={}ms planning={}ms java_probe_count={} java_probe_source={}",
                 prepared.metrics.total_ms,
                 prepared.metrics.version_ms,
                 prepared.metrics.runtime_ms,
                 prepared.metrics.planning_ms,
+                prepared.metrics.java_probe_count,
+                prepared.metrics.java_probe_source,
             ),
         );
 

@@ -331,11 +331,18 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
 
     let preflight = build_launch_preflight_facts(
         &fixture.state,
-        &instance,
-        &config,
-        &fixture.paths.library_dir,
-        &game_dir,
-        None,
+        &fixture
+            .state
+            .try_claim_producer()
+            .expect("claim preflight producer"),
+        LaunchPreflightBuild {
+            instance: &instance,
+            config: &config,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
         None,
     )
     .await;
@@ -413,11 +420,18 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
 
     let preflight = build_launch_preflight_facts(
         &fixture.state,
-        &instance,
-        &config,
-        &fixture.paths.library_dir,
-        &game_dir,
-        None,
+        &fixture
+            .state
+            .try_claim_producer()
+            .expect("claim preflight producer"),
+        LaunchPreflightBuild {
+            instance: &instance,
+            config: &config,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
         None,
     )
     .await;
@@ -640,11 +654,18 @@ async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
     let game_dir = fixture.state.instances().game_dir(&instance.id);
     let preflight = build_launch_preflight_facts(
         &fixture.state,
-        &instance,
-        &config,
-        &fixture.paths.library_dir,
-        &game_dir,
-        None,
+        &fixture
+            .state
+            .try_claim_producer()
+            .expect("claim preflight producer"),
+        LaunchPreflightBuild {
+            instance: &instance,
+            config: &config,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
         None,
     )
     .await;

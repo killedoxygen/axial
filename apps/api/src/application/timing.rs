@@ -123,6 +123,8 @@ pub(crate) struct LaunchPreflightFactTiming<'a> {
     pub reason_count: usize,
     pub fact_count: usize,
     pub guardian_decision: GuardianDecisionKind,
+    pub java_probe_count: u8,
+    pub java_probe_source: &'a str,
 }
 
 pub(crate) fn trace_launch_preflight_facts(timing: LaunchPreflightFactTiming<'_>) {
@@ -143,6 +145,8 @@ pub(crate) fn trace_launch_preflight_facts(timing: LaunchPreflightFactTiming<'_>
         reason_count = timing.reason_count,
         fact_count = timing.fact_count,
         guardian_decision = ?timing.guardian_decision,
+        java_probe_count = timing.java_probe_count,
+        java_probe_source = timing.java_probe_source,
         "launch preflight fact timing"
     );
 }

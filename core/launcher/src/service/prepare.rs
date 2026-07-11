@@ -25,7 +25,7 @@ pub enum LaunchPreparationEvent {
 pub async fn prepare_launch_attempt_with_events<F>(
     intent: &LaunchIntent,
     attempt: &AttemptOverrides,
-    probe_receipt: Option<JavaRuntimeProbeReceipt>,
+    probe_receipt: Option<&JavaRuntimeProbeReceipt>,
     mut observer: F,
 ) -> Result<PreparedLaunchAttempt, LaunchPreparationError>
 where
@@ -827,7 +827,7 @@ mod tests {
         let prepared = prepare_launch_attempt_with_events(
             &intent,
             &AttemptOverrides::default(),
-            Some(receipt),
+            Some(&receipt),
             |_| {},
         )
         .await
@@ -859,7 +859,7 @@ mod tests {
         let error = prepare_launch_attempt_with_events(
             &intent,
             &AttemptOverrides::default(),
-            Some(receipt),
+            Some(&receipt),
             |_| {},
         )
         .await
@@ -901,7 +901,7 @@ mod tests {
         let prepared = prepare_launch_attempt_with_events(
             &intent,
             &AttemptOverrides::default(),
-            Some(receipt),
+            Some(&receipt),
             |_| {},
         )
         .await
@@ -940,7 +940,7 @@ mod tests {
         let error = prepare_launch_attempt_with_events(
             &intent,
             &AttemptOverrides::default(),
-            Some(receipt),
+            Some(&receipt),
             |_| {},
         )
         .await

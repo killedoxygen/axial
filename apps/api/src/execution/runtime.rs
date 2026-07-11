@@ -11,8 +11,8 @@ use crate::state::contracts::{OperationId, StabilizationSystem, TargetDescriptor
 use crate::state::ownership::{classify_managed_runtime_root, protection_for};
 use axial_config::AppPaths;
 use axial_minecraft::{
-    JavaRuntimeLookupError, RuntimeOverride, managed_runtime_contents_verified_without_probe,
-    parse_runtime_override, runtime_executable_ready_without_probe,
+    RuntimeOverride, managed_runtime_contents_verified_without_probe, parse_runtime_override,
+    runtime_executable_ready_without_probe,
 };
 use std::fmt;
 use std::fs;
@@ -284,29 +284,6 @@ pub enum RuntimeProbeFailure {
     Unknown,
 }
 
-pub struct CoreJavaProbeRunner;
-
-impl JavaProbeRunner for CoreJavaProbeRunner {
-    fn probe(
-        &self,
-        java_path: &Path,
-        id_hint: Option<&str>,
-    ) -> Result<RuntimeProbeInfo, RuntimeProbeFailure> {
-        axial_minecraft::probe_java_runtime_info(java_path, id_hint)
-            .map(|info| RuntimeProbeInfo::new(info.id, info.major, info.update, info.distribution))
-            .map_err(|error| match error {
-                JavaRuntimeLookupError::ProbeTimedOut => RuntimeProbeFailure::TimedOut,
-                _ => RuntimeProbeFailure::SpawnFailed,
-            })
-    }
-}
-
-pub fn probe_java_runtime(
-    request: RuntimeProbeRequest<'_>,
-) -> Result<RuntimeCapabilityReport, RuntimeCapabilityError> {
-    probe_java_runtime_with_runner(request, &CoreJavaProbeRunner)
-}
-
 pub fn inspect_java_override_value(
     operation_id: Option<OperationId>,
     target: TargetDescriptor,
@@ -344,6 +321,21 @@ pub fn inspect_java_override_value(
     }
 
     JavaOverrideInspection { target, facts }
+}
+
+pub fn missing_java_override(
+    operation_id: Option<OperationId>,
+    target: TargetDescriptor,
+) -> JavaOverrideInspection {
+    JavaOverrideInspection {
+        facts: vec![runtime_fact(
+            ExecutionFactKind::RuntimeMissingExecutable,
+            operation_id,
+            &target,
+            Vec::new(),
+        )],
+        target,
+    }
 }
 
 pub fn java_override_is_undefined_sentinel(value: &str) -> bool {

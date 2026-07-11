@@ -42,7 +42,7 @@ pub async fn ensure_runtime_with_events<F>(
     java_version: &JavaVersion,
     override_path: &str,
     force_managed: bool,
-    probe_receipt: Option<JavaRuntimeProbeReceipt>,
+    probe_receipt: Option<&JavaRuntimeProbeReceipt>,
     mut observer: F,
 ) -> Result<RuntimeEnsureResult, JavaRuntimeLookupError>
 where
@@ -67,8 +67,9 @@ where
             RuntimeOverride::ExecutablePath(path) => {
                 let path = path.clone();
                 let preferred_component = requirement.preferred_component.clone();
+                let probe_validation = probe_receipt.map(JavaRuntimeProbeReceipt::validation);
                 let resolved = tokio::task::spawn_blocking(move || {
-                    resolve_override_runtime(&path, &preferred_component, probe_receipt)
+                    resolve_override_runtime(&path, &preferred_component, probe_validation)
                 })
                 .await
                 .map_err(|_| {

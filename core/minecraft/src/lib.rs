@@ -46,15 +46,16 @@ pub use rules::{
     is_native_library, native_classifier_key,
 };
 pub use runtime::{
-    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeProbeReceipt, JavaRuntimeResult,
+    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeProbeReceipt, JavaRuntimeProbeResolution,
+    JavaRuntimeProbeResolutionError, JavaRuntimeProbeSnapshot, JavaRuntimeResult,
     RuntimeEnsureAction, RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeInstallState,
     RuntimeOverride, RuntimeProbeSource, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement,
     RuntimeSource, ensure_java_runtime, ensure_runtime_with_events, find_java_runtime,
     is_known_runtime_component, list_java_runtimes, list_runtime_records,
     managed_runtime_contents_verified_without_probe, parse_runtime_override,
-    preferred_runtime_component, probe_java_runtime_info, probe_java_runtime_receipt,
+    preferred_runtime_component, probe_java_runtime_receipt, resolve_java_runtime_probe,
     runtime_component_executable_present_without_probe, runtime_component_ready_without_probe,
-    runtime_executable_ready_without_probe, runtime_requirement,
+    runtime_executable_ready_without_probe, runtime_requirement, snapshot_java_runtime,
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 pub use version::{

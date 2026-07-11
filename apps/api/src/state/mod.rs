@@ -9,6 +9,7 @@ pub mod failure_memory;
 mod installs;
 mod instance_lifecycle;
 mod instance_registry;
+mod java_probe_failures;
 mod journals;
 pub(crate) mod launch_reports;
 mod lifecycle;
@@ -61,6 +62,10 @@ pub use installs::{
 pub use instance_registry::AppInstanceStore;
 pub(crate) use instance_registry::new_instance;
 pub(crate) use instance_registry::{ensure_instance_layout, instance_not_found_error};
+pub(crate) use java_probe_failures::{
+    JavaProbeFailureCache, JavaProbeFailureClaim, JavaProbeFailureKey, JavaProbeFailureKind,
+    JavaProbeFailureOwner,
+};
 pub(crate) use journals::{
     OperationJournalReconciliation, operation_journal_completed_step_is_visible,
     operation_journal_plan_is_visible, operation_journal_terminal_is_visible,
@@ -95,6 +100,7 @@ pub struct AppState {
     installs: Arc<InstallStore>,
     failure_memory: Arc<GuardianFailureMemoryStore>,
     journals: Arc<OperationJournalStore>,
+    java_probe_failures: Arc<JavaProbeFailureCache>,
     sessions: Arc<SessionStore>,
     skins: Arc<skins::SavedSkinStore>,
     benchmark_suites: Arc<benchmark_suites::BenchmarkSuiteStore>,
@@ -289,6 +295,7 @@ impl AppState {
             installs: init.installs,
             failure_memory,
             journals,
+            java_probe_failures: Arc::new(JavaProbeFailureCache::default()),
             sessions: init.sessions,
             skins,
             benchmark_suites,
@@ -367,6 +374,10 @@ impl AppState {
 
     pub fn journals(&self) -> &Arc<OperationJournalStore> {
         &self.journals
+    }
+
+    pub(crate) fn java_probe_failures(&self) -> &Arc<JavaProbeFailureCache> {
+        &self.java_probe_failures
     }
 
     pub fn performance(&self) -> &Arc<AppPerformanceStore> {
