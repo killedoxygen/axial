@@ -51,6 +51,7 @@ pub enum LaunchFailureClass {
     JvmExperimentalUnlock,
     JvmOptionOrdering,
     JavaRuntimeMismatch,
+    OutOfMemory,
     ClasspathModuleConflict,
     LauncherManagedArtifactSignature,
     AuthModeIncompatible,
@@ -66,6 +67,7 @@ impl LaunchFailureClass {
             Self::JvmExperimentalUnlock => "jvm_experimental_unlock",
             Self::JvmOptionOrdering => "jvm_option_ordering",
             Self::JavaRuntimeMismatch => "java_runtime_mismatch",
+            Self::OutOfMemory => "out_of_memory",
             Self::ClasspathModuleConflict => "classpath_module_conflict",
             Self::LauncherManagedArtifactSignature => "launcher_managed_artifact_signature",
             Self::AuthModeIncompatible => "auth_mode_incompatible",
@@ -81,6 +83,7 @@ impl LaunchFailureClass {
             "jvm_experimental_unlock" => Self::JvmExperimentalUnlock,
             "jvm_option_ordering" => Self::JvmOptionOrdering,
             "java_runtime_mismatch" => Self::JavaRuntimeMismatch,
+            "out_of_memory" => Self::OutOfMemory,
             "classpath_module_conflict" => Self::ClasspathModuleConflict,
             "launcher_managed_artifact_signature" => Self::LauncherManagedArtifactSignature,
             "auth_mode_incompatible" => Self::AuthModeIncompatible,
@@ -118,6 +121,7 @@ mod tests {
             LaunchFailureClass::JvmExperimentalUnlock,
             LaunchFailureClass::JvmOptionOrdering,
             LaunchFailureClass::JavaRuntimeMismatch,
+            LaunchFailureClass::OutOfMemory,
             LaunchFailureClass::ClasspathModuleConflict,
             LaunchFailureClass::LauncherManagedArtifactSignature,
             LaunchFailureClass::AuthModeIncompatible,
@@ -126,6 +130,11 @@ mod tests {
         ] {
             let serialized = serde_json::to_string(&class).expect("serialize");
             assert_eq!(serialized.trim_matches('"'), class.as_str());
+            assert_eq!(
+                serde_json::from_str::<LaunchFailureClass>(&serialized).expect("deserialize"),
+                class
+            );
+            assert_eq!(LaunchFailureClass::from_name(class.as_str()), Some(class));
         }
     }
 }

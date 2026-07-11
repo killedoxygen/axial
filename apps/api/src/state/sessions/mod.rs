@@ -1416,16 +1416,6 @@ impl SessionStore {
             .map(|entry| entry.retention_holds)
     }
 
-    pub async fn observed_failure_for_exit(&self, session_id: &str) -> Option<LaunchFailureClass> {
-        let exit_observed_at_ms = now_ms();
-        self.sessions
-            .read()
-            .await
-            .get(session_id)
-            .and_then(|entry| entry.observed_failure)
-            .and_then(|signal| signal.fresh_for_exit(exit_observed_at_ms))
-    }
-
     pub async fn terminate_all(self: &Arc<Self>) -> std::io::Result<()> {
         self.shutdown_started.store(true, Ordering::Release);
         let store = self.clone();
@@ -3446,10 +3436,6 @@ mod tests {
             terminal.failure.map(|failure| failure.class),
             Some(LaunchFailureClass::JvmUnsupportedOption)
         );
-        assert_eq!(
-            store.observed_failure_for_exit(session_id).await,
-            Some(LaunchFailureClass::JvmUnsupportedOption)
-        );
     }
 
     #[tokio::test]
@@ -5006,6 +4992,10 @@ mod tests {
             .insert(terminal_record(session_id, LaunchState::Running, true))
             .await
             .expect("insert session");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("process attempt");
 
         {
             let mut sessions = store.sessions.write().await;
@@ -5020,7 +5010,10 @@ mod tests {
             store.observed_failure(session_id).await,
             Some(LaunchFailureClass::JvmUnsupportedOption)
         );
-        let exit_failure = store.observed_failure_for_exit(session_id).await;
+        let exit_failure = store
+            .process_exit_context(session_id, &attempt, now_ms())
+            .await
+            .and_then(|context| context.observed_failure);
         assert_eq!(exit_failure, None);
 
         let mut receiver = store.subscribe(session_id).await.expect("subscribe");

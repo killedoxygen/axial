@@ -66,6 +66,7 @@ pub fn format_failure_class(class: LaunchFailureClass) -> &'static str {
         LaunchFailureClass::JvmExperimentalUnlock => "experimental JVM option requires unlock",
         LaunchFailureClass::JvmOptionOrdering => "JVM option ordering conflict",
         LaunchFailureClass::JavaRuntimeMismatch => "Java runtime mismatch",
+        LaunchFailureClass::OutOfMemory => "out of memory",
         LaunchFailureClass::ClasspathModuleConflict => "classpath or module conflict",
         LaunchFailureClass::LauncherManagedArtifactSignature => {
             "launcher-managed artifact signature corruption"

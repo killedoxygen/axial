@@ -179,6 +179,20 @@ pub fn guardian_startup_failure_outcome(
     }
 }
 
+pub fn guardian_post_boot_out_of_memory_outcome() -> GuardianUserOutcome {
+    GuardianUserOutcome {
+        decision: GuardianDecisionKind::Warn,
+        phase: OperationPhase::Running,
+        summary: public_summary("Minecraft stopped after running out of memory."),
+        details: bounded_public_lines([
+            "Guardian detected an out-of-memory crash after startup completed.",
+        ]),
+        guidance: bounded_public_lines([
+            "Review the instance memory allocation and close memory-heavy apps before retrying.",
+        ]),
+    }
+}
+
 pub fn conservative_launch_recovery_preset(version_id: &str, runtime_major: u32) -> String {
     if runtime_major <= 8 || is_legacy_version_family(version_id) {
         "legacy".to_string()
@@ -303,6 +317,9 @@ fn startup_failure_diagnosis(
                 candidate_actions: startup_java_candidate_actions(recovery_template),
                 public_reason_template: "java_runtime_major_mismatch".to_string(),
             },
+            LaunchFailureClass::OutOfMemory => {
+                blocking_startup_diagnosis("out_of_memory", failure_class, GuardianConfidence::High)
+            }
             LaunchFailureClass::ClasspathModuleConflict => blocking_startup_diagnosis(
                 "classpath_module_conflict",
                 failure_class,
@@ -457,6 +474,7 @@ fn startup_recovery_template(
                     .to_string(),
             })
         }
+        LaunchFailureClass::OutOfMemory => None,
         _ => None,
     }
 }
@@ -787,6 +805,7 @@ fn failure_class_fact_id(failure_class: LaunchFailureClass) -> &'static str {
         LaunchFailureClass::JvmUnsupportedOption => "jvm_arg_unsupported",
         LaunchFailureClass::JvmExperimentalUnlock => "jvm_arg_experimental_unlock_missing",
         LaunchFailureClass::JvmOptionOrdering => "jvm_arg_unlock_order_invalid",
+        LaunchFailureClass::OutOfMemory => "out_of_memory",
         LaunchFailureClass::ClasspathModuleConflict => "classpath_module_conflict",
         LaunchFailureClass::LauncherManagedArtifactSignature => {
             "launcher_managed_artifact_signature_corruption"
@@ -828,6 +847,9 @@ fn startup_failure_reason(
             }
             LaunchFailureClass::JavaRuntimeMismatch => {
                 "Minecraft exited before startup completed with a detected Java runtime mismatch."
+            }
+            LaunchFailureClass::OutOfMemory => {
+                "Minecraft exited before startup completed after running out of memory."
             }
             LaunchFailureClass::ClasspathModuleConflict => {
                 "Minecraft exited before startup completed with a detected classpath or module conflict."
@@ -884,6 +906,11 @@ fn prepare_failure_guidance(
                 "Repair the installed version so Axial can replace the affected launcher-managed jars.",
             ]
         }
+        LaunchFailureClass::OutOfMemory => {
+            vec![
+                "Review the instance memory allocation and close memory-heavy apps before retrying.",
+            ]
+        }
         _ => Vec::new(),
     }
 }
@@ -923,6 +950,14 @@ fn bounded_public_text(value: &str) -> Option<String> {
         RedactionAudience::UserVisible,
         MAX_LAUNCH_DECISION_DETAIL_CHARS,
     )
+}
+
+fn bounded_public_lines<const N: usize>(values: [&str; N]) -> Vec<String> {
+    values
+        .into_iter()
+        .filter_map(bounded_public_text)
+        .take(MAX_LAUNCH_DECISION_LINES)
+        .collect()
 }
 
 fn public_summary(value: &str) -> String {
@@ -986,13 +1021,14 @@ mod tests {
     use super::{
         GuardianLaunchRecoveryEffect, GuardianPrepareFailureRequest,
         GuardianStartupFailureObservation, GuardianStartupFailureRequest,
-        guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
-        guardian_startup_failure_outcome,
+        guardian_post_boot_out_of_memory_outcome, guardian_prelaunch_preset_adjustment_directive,
+        guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
     };
     use crate::guardian::{
         GuardianDecisionKind, GuardianLaunchRecoveryKind, GuardianMode,
         conservative_launch_recovery_preset,
     };
+    use crate::state::contracts::OperationPhase;
     use axial_launcher::LaunchFailureClass;
 
     #[test]
@@ -1222,6 +1258,80 @@ mod tests {
         assert!(outcome.user_outcome.guidance.contains(
             &"Repair the installed version so Axial can replace the affected launcher-managed jars.".to_string()
         ));
+    }
+
+    #[test]
+    fn startup_out_of_memory_blocks_with_bounded_copy_and_no_recovery() {
+        let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
+            mode: GuardianMode::Managed,
+            observation: GuardianStartupFailureObservation::Exited {
+                failure_class: LaunchFailureClass::OutOfMemory,
+            },
+            target_version_id: "1.21.1",
+            runtime_major: 21,
+            requested_java_present: false,
+            explicit_java_override_present: false,
+            explicit_jvm_args_present: false,
+            explicit_jvm_preset_present: false,
+            startup_recovery_applied: false,
+            disable_custom_gc: false,
+            effective_preset: "performance",
+        });
+
+        assert_eq!(outcome.failure_class, LaunchFailureClass::OutOfMemory);
+        assert_eq!(outcome.guardian_decision.kind, GuardianDecisionKind::Block);
+        assert_eq!(outcome.user_outcome.decision, GuardianDecisionKind::Block);
+        assert_eq!(
+            outcome.safety_case.diagnoses[0].id.as_str(),
+            "out_of_memory"
+        );
+        assert!(
+            outcome.safety_case.diagnoses[0]
+                .fact_ids
+                .iter()
+                .any(|fact_id| fact_id == "out_of_memory")
+        );
+        assert!(outcome.directive.is_none());
+        assert_eq!(
+            outcome.user_outcome.summary,
+            "Guardian blocked launch startup."
+        );
+        assert_eq!(
+            outcome.user_outcome.details,
+            ["Minecraft exited before startup completed after running out of memory."]
+        );
+        assert_eq!(
+            outcome.user_outcome.guidance,
+            ["Review the instance memory allocation and close memory-heavy apps before retrying."]
+        );
+        assert!(
+            outcome.user_outcome.summary.chars().count()
+                <= super::MAX_LAUNCH_DECISION_SUMMARY_CHARS
+        );
+        assert!(
+            outcome
+                .user_outcome
+                .details
+                .iter()
+                .chain(&outcome.user_outcome.guidance)
+                .all(|line| line.chars().count() <= super::MAX_LAUNCH_DECISION_DETAIL_CHARS)
+        );
+
+        let post_boot = guardian_post_boot_out_of_memory_outcome();
+        assert_eq!(post_boot.decision, GuardianDecisionKind::Warn);
+        assert_eq!(post_boot.phase, OperationPhase::Running);
+        assert_eq!(
+            post_boot.summary,
+            "Minecraft stopped after running out of memory."
+        );
+        assert!(post_boot.summary.chars().count() <= super::MAX_LAUNCH_DECISION_SUMMARY_CHARS);
+        assert!(
+            post_boot
+                .details
+                .iter()
+                .chain(&post_boot.guidance)
+                .all(|line| line.chars().count() <= super::MAX_LAUNCH_DECISION_DETAIL_CHARS)
+        );
     }
 
     #[test]

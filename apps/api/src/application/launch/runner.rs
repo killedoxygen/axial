@@ -13,19 +13,19 @@ use crate::execution::launch::{
 use crate::guardian::{
     GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryStatus, GuardianPrepareFailureRequest,
     GuardianPresetAdjustmentRequest, GuardianStartupFailureObservation,
-    GuardianStartupFailureRequest, GuardianUserOutcome,
+    GuardianStartupFailureRequest, GuardianUserOutcome, guardian_post_boot_out_of_memory_outcome,
     guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
-    guardian_startup_failure_outcome,
+    guardian_startup_failure_outcome, record_out_of_memory_observation,
 };
-use crate::logging::append_trace;
+use crate::logging::{append_trace, timestamp_utc};
 use crate::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
     TelemetryLaunchOutcome,
 };
 use crate::state::launch_reports::LaunchProofContext;
 use crate::state::{
-    AppState, LaunchFailureTermination, LaunchFailureTerminationErrorClass,
-    OperationJournalStoreError, StartupOutcome,
+    AppState, LaunchEvent, LaunchFailureTermination, LaunchFailureTerminationErrorClass,
+    LaunchStatusEvent, OperationJournalStoreError, StartupOutcome,
 };
 use axial_launcher::{
     GuardianSummary, LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome,
@@ -98,21 +98,231 @@ enum LaunchTerminalizationDisposition {
     Settled(Result<LaunchSuccess, LaunchRequestError>),
 }
 
+enum TerminalObservationHandoff {
+    Observe { guardian: GuardianSummary },
+    Preserve,
+}
+
 pub(crate) async fn launch_session(
     state: AppState,
     task: super::session::LaunchSessionTask,
     producer: crate::state::ProducerLease,
 ) -> Result<LaunchSuccess, LaunchRequestError> {
     let session_id = task.intent.session_id.clone();
+    let instance_id = task.intent.instance_id.clone();
+    let guardian_mode = launch_policy_guardian_mode(task.intent.guardian.mode);
+    let initial_guardian = task.guardian.clone();
+    let launched_at = task.launched_at.clone();
+    let proof_context = LaunchProofContext::from_intent(&task.intent)
+        .with_benchmark(task.benchmark.clone())
+        .with_resource_budget(task.resource_budget.clone());
     let sessions = state.sessions().clone();
+    let observer_handoff = if let Some(events) = sessions.subscribe(&session_id).await {
+        let (handoff_tx, handoff_rx) = tokio::sync::oneshot::channel();
+        let observer_state = state.clone();
+        let observer_session_id = session_id.clone();
+        producer.spawn_child(async move {
+            own_terminal_observation(
+                observer_state,
+                observer_session_id,
+                instance_id,
+                guardian_mode,
+                launched_at,
+                proof_context,
+                events,
+                handoff_rx,
+            )
+            .await;
+        });
+        Some(handoff_tx)
+    } else {
+        None
+    };
     let result = launch_session_inner(state.clone(), task, &producer).await;
-    match terminalize_unhandled_launch_error(&state, &producer, &session_id, result).await {
+    let disposition =
+        terminalize_unhandled_launch_error(&state, &producer, &session_id, result).await;
+    let (handoff, transfer_hold) = match &disposition {
+        LaunchTerminalizationDisposition::Complete(Ok(success)) => (
+            TerminalObservationHandoff::Observe {
+                guardian: success.guardian.clone().unwrap_or(initial_guardian),
+            },
+            true,
+        ),
+        LaunchTerminalizationDisposition::Complete(Err(_)) => {
+            (TerminalObservationHandoff::Preserve, false)
+        }
+        LaunchTerminalizationDisposition::Retained(_)
+        | LaunchTerminalizationDisposition::Settled(_) => {
+            (TerminalObservationHandoff::Preserve, false)
+        }
+    };
+    let handoff_succeeded =
+        observer_handoff.is_some_and(|handoff_tx| handoff_tx.send(handoff).is_ok());
+    let observer_owns_hold = transfer_hold && handoff_succeeded;
+
+    match disposition {
         LaunchTerminalizationDisposition::Complete(result) => {
-            sessions.release_terminal_retention_hold(&session_id).await;
+            if !observer_owns_hold {
+                sessions.release_terminal_retention_hold(&session_id).await;
+            }
             result
         }
         LaunchTerminalizationDisposition::Retained(result)
         | LaunchTerminalizationDisposition::Settled(result) => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn own_terminal_observation(
+    state: AppState,
+    session_id: String,
+    instance_id: String,
+    guardian_mode: crate::guardian::GuardianMode,
+    launched_at: String,
+    proof_context: LaunchProofContext,
+    mut events: tokio::sync::broadcast::Receiver<LaunchEvent>,
+    handoff: tokio::sync::oneshot::Receiver<TerminalObservationHandoff>,
+) {
+    let guardian = match handoff.await {
+        Ok(TerminalObservationHandoff::Observe { guardian }) => guardian,
+        Ok(TerminalObservationHandoff::Preserve) => return,
+        Err(_) => {
+            state
+                .sessions()
+                .release_terminal_retention_hold(&session_id)
+                .await;
+            return;
+        }
+    };
+
+    let terminal = loop {
+        match events.recv().await {
+            Ok(LaunchEvent::Status(status))
+                if matches!(status.state.as_str(), "failed" | "exited") =>
+            {
+                break state.sessions().get(&session_id).await;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let record = state.sessions().get(&session_id).await;
+                if record.as_ref().is_some_and(|record| {
+                    matches!(record.state, LaunchState::Failed | LaunchState::Exited)
+                }) {
+                    break record;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                break state.sessions().get(&session_id).await;
+            }
+        }
+    };
+
+    if let Some(record) = terminal
+        && record.boot_completed_at_ms.is_some()
+        && record
+            .failure
+            .as_ref()
+            .is_some_and(|failure| failure.class == LaunchFailureClass::OutOfMemory)
+        && record
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.reason == LaunchSessionExitReason::CrashedAfterBoot)
+    {
+        settle_post_boot_out_of_memory(
+            &state,
+            &session_id,
+            &instance_id,
+            guardian_mode,
+            &launched_at,
+            proof_context,
+            record,
+            guardian,
+        )
+        .await;
+    }
+
+    state
+        .sessions()
+        .release_terminal_retention_hold(&session_id)
+        .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn settle_post_boot_out_of_memory(
+    state: &AppState,
+    session_id: &str,
+    instance_id: &str,
+    guardian_mode: crate::guardian::GuardianMode,
+    launched_at: &str,
+    proof_context: LaunchProofContext,
+    record: crate::state::LaunchSessionRecord,
+    mut guardian: GuardianSummary,
+) {
+    let user_outcome = guardian_post_boot_out_of_memory_outcome();
+    guardian.decision = axial_launcher::GuardianDecision::Warned;
+    guardian.message = Some(user_outcome.summary.clone());
+    for detail in &user_outcome.details {
+        push_unique_guardian_detail(&mut guardian.details, detail);
+    }
+    for guidance in &user_outcome.guidance {
+        push_unique_guardian_detail(&mut guardian.guidance, guidance);
+    }
+
+    state
+        .sessions()
+        .emit_status(
+            session_id,
+            LaunchStatusEvent {
+                state: "exited".to_string(),
+                benchmark: None,
+                pid: None,
+                exit_code: record.exit_code,
+                failure_class: Some(LaunchFailureClass::OutOfMemory.as_str().to_string()),
+                failure_detail: Some(user_outcome.summary.clone()),
+                healing: record.healing.clone(),
+                guardian: serialize_guardian(Some(guardian)),
+                outcome: record.outcome.clone(),
+                notice: None,
+                evidence: Vec::new(),
+                stages: Vec::new(),
+            },
+        )
+        .await;
+
+    let observed_at = timestamp_utc();
+    if let Err(error) = record_out_of_memory_observation(
+        state.failure_memory(),
+        instance_id,
+        guardian_mode,
+        &observed_at,
+    ) {
+        tracing::warn!(
+            error_kind = error.class(),
+            "failed to record post-boot out-of-memory observation"
+        );
+    }
+
+    let Some(updated) = state.sessions().get(session_id).await else {
+        return;
+    };
+    if state
+        .launch_reports()
+        .persist(
+            updated,
+            Some(launched_at.to_string()),
+            "failed".to_string(),
+            Some(proof_context),
+        )
+        .await
+        .is_err()
+    {
+        tracing::warn!("failed to persist post-boot out-of-memory launch proof");
+    }
+}
+
+fn push_unique_guardian_detail(target: &mut Vec<String>, value: &str) {
+    if !target.iter().any(|existing| existing == value) {
+        target.push(value.to_string());
     }
 }
 
@@ -838,14 +1048,16 @@ async fn launch_session_inner_with_control(
                     GuardianStartupFailureObservation::Exited {
                         failure_class: state
                             .sessions()
-                            .observed_failure_for_exit(&session_id)
+                            .get(&session_id)
                             .await
+                            .and_then(|record| record.failure.map(|failure| failure.class))
                             .unwrap_or(LaunchFailureClass::Unknown),
                     }
                 };
+                let guardian_mode = launch_policy_guardian_mode(intent.guardian.mode);
                 let startup_outcome =
                     guardian_startup_failure_outcome(GuardianStartupFailureRequest {
-                        mode: launch_policy_guardian_mode(intent.guardian.mode),
+                        mode: guardian_mode,
                         observation,
                         target_version_id: &intent.target_version_id,
                         runtime_major: prepared.runtime.effective_info.major,
@@ -859,6 +1071,20 @@ async fn launch_session_inner_with_control(
                         effective_preset: &prepared.effective_preset,
                     });
                 let failure_class = startup_outcome.failure_class;
+                if failure_class == LaunchFailureClass::OutOfMemory {
+                    let observed_at = timestamp_utc();
+                    if let Err(error) = record_out_of_memory_observation(
+                        state.failure_memory(),
+                        &intent.instance_id,
+                        guardian_mode,
+                        &observed_at,
+                    ) {
+                        tracing::warn!(
+                            error_kind = error.class(),
+                            "failed to record out-of-memory startup observation"
+                        );
+                    }
+                }
                 if let Some(recovery_plan) = last_recovery_plan.take() {
                     record_failed_self_healing_if_any(
                         &state,
@@ -1266,9 +1492,12 @@ pub fn trace_launch_event(session_id: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guardian::GuardianDecisionKind;
+    use crate::guardian::{GuardianDecisionKind, GuardianDomain, GuardianMode};
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
-    use crate::state::contracts::OperationPhase;
+    use crate::state::contracts::{
+        OperationPhase, OwnershipClass, StabilizationSystem, TargetKind,
+    };
+    use crate::state::failure_memory::{FailureMemorySnapshot, failure_memory_path};
     use crate::state::{AppStateInit, InstallStore, LaunchEvent, SessionStore};
     use axial_config::{
         AppConfig, AppPaths, ConfigStore, Instance, InstanceRegistrySnapshot, InstanceStore,
@@ -1352,6 +1581,341 @@ mod tests {
         });
         assert_eq!(error.message, final_outcome.user_outcome.summary);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn out_of_memory_startup_exit_persists_bounded_proof_and_failure_memory() {
+        let root = unique_test_dir("launch-out-of-memory-e2e");
+        let paths = test_paths(&root);
+        let state = test_app_state(&root);
+        let session_id = "launch-out-of-memory-e2e";
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert OOM session");
+        let mut events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe to OOM session");
+        let java_path = write_out_of_memory_launch_fixture(&root);
+        let mut task = test_recovery_launch_task(session_id, &root);
+        task.instance.java_path = java_path.clone();
+        task.intent.requested_java = java_path;
+        task.intent.game_dir = Some(root.join("instance"));
+        task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
+        let producer = state.try_claim_producer().expect("claim OOM producer");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            launch_session_inner(state.clone(), task, &producer),
+        )
+        .await
+        .expect("OOM launch deadline");
+        let error = match result {
+            Ok(_) => panic!("OOM launch must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.message, "Guardian blocked launch startup.");
+        assert!(error.message.chars().count() <= 180);
+        let guardian = error.guardian.as_ref().expect("OOM Guardian summary");
+        assert_eq!(guardian.decision, axial_launcher::GuardianDecision::Blocked);
+        assert_eq!(guardian.message.as_deref(), Some(error.message.as_str()));
+        assert!(guardian.details.iter().any(|detail| {
+            detail == "Minecraft exited before startup completed after running out of memory."
+        }));
+        assert!(guardian.guidance.iter().any(|detail| {
+            detail
+                == "Review the instance memory allocation and close memory-heavy apps before retrying."
+        }));
+
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("terminal OOM session");
+        assert_eq!(record.state, LaunchState::Exited);
+        assert_eq!(
+            record.failure.as_ref().map(|failure| failure.class),
+            Some(LaunchFailureClass::OutOfMemory)
+        );
+        assert_eq!(
+            record
+                .failure
+                .as_ref()
+                .and_then(|failure| failure.detail.as_deref()),
+            Some("Guardian blocked launch startup.")
+        );
+        assert_eq!(
+            record.outcome.as_ref().expect("OOM session outcome").reason,
+            LaunchSessionExitReason::StartupFailed
+        );
+
+        let status_payload = super::super::reports::launch_status_payload(&state, session_id)
+            .await
+            .expect("OOM status payload");
+        assert_eq!(status_payload["failure_class"], "out_of_memory");
+        assert_eq!(
+            status_payload["failure_detail"],
+            "Guardian blocked launch startup."
+        );
+        assert_eq!(status_payload["guardian"]["decision"], "blocked");
+
+        let proof = state
+            .launch_reports()
+            .load(session_id)
+            .expect("OOM proof persisted");
+        assert_eq!(proof.outcome, "failed");
+        assert_eq!(proof.failure_class.as_deref(), Some("out_of_memory"));
+        assert_eq!(
+            proof
+                .session_outcome
+                .as_ref()
+                .expect("OOM proof outcome")
+                .reason,
+            LaunchSessionExitReason::StartupFailed
+        );
+        assert_eq!(
+            proof.failure_detail.as_deref(),
+            Some("Guardian blocked launch startup.")
+        );
+        let report_payload = super::super::reports::launch_report_payload(&state, session_id)
+            .expect("OOM report payload");
+        assert_eq!(report_payload["failure_class"], "out_of_memory");
+
+        let memory = state.failure_memory().list();
+        assert_eq!(memory.len(), 1);
+        assert_out_of_memory_observation(&memory[0]);
+        state
+            .failure_memory()
+            .flush()
+            .await
+            .expect("flush OOM failure memory");
+        let memory_json = fs::read_to_string(failure_memory_path(&paths))
+            .expect("read persisted OOM failure memory");
+        let persisted = FailureMemorySnapshot::from_json(&memory_json)
+            .expect("strict persisted OOM failure memory");
+        assert_eq!(persisted.entries.len(), 1);
+        assert_out_of_memory_observation(&persisted.entries[0]);
+
+        let mut event_payloads = String::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                LaunchEvent::Status(status) => event_payloads.push_str(
+                    &super::super::reports::public_launch_status_json(&status).to_string(),
+                ),
+                LaunchEvent::Log(log) => event_payloads.push_str(
+                    &serde_json::to_string(&log).expect("serialize public OOM log event"),
+                ),
+            }
+        }
+        let status_json = status_payload.to_string();
+        let report_json = report_payload.to_string();
+        for payload in [
+            error.message.as_str(),
+            status_json.as_str(),
+            report_json.as_str(),
+            memory_json.as_str(),
+            event_payloads.as_str(),
+        ] {
+            assert_no_out_of_memory_sensitive_decoys(payload);
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_boot_out_of_memory_updates_guardian_proof_and_failure_memory() {
+        let root = unique_test_dir("launch-post-boot-out-of-memory-e2e");
+        let paths = test_paths(&root);
+        let state = test_app_state(&root);
+        let session_id = "launch-post-boot-out-of-memory-e2e";
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert post-boot OOM session");
+        let mut events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe to post-boot OOM session");
+        let java_path = write_post_boot_out_of_memory_launch_fixture(&root);
+        let mut task = test_recovery_launch_task(session_id, &root);
+        task.instance.java_path = java_path.clone();
+        task.intent.requested_java = java_path;
+        task.intent.game_dir = Some(root.join("instance"));
+        task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
+        let producer = state
+            .try_claim_producer()
+            .expect("claim post-boot OOM producer");
+
+        let launched = tokio::time::timeout(
+            Duration::from_secs(10),
+            launch_session(state.clone(), task, producer),
+        )
+        .await
+        .expect("post-boot OOM launch deadline")
+        .unwrap_or_else(|error| panic!("launch must reach running before OOM: {}", error.message));
+        assert_eq!(launched.session_id, session_id);
+
+        let terminal_status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.expect("post-boot OOM event") {
+                    LaunchEvent::Status(status)
+                        if status.failure_detail.as_deref()
+                            == Some("Minecraft stopped after running out of memory.") =>
+                    {
+                        break status;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("post-boot OOM observer deadline");
+        assert_eq!(terminal_status.state, "exited");
+        assert_eq!(
+            terminal_status.failure_class.as_deref(),
+            Some("out_of_memory")
+        );
+        assert_eq!(
+            terminal_status
+                .outcome
+                .as_ref()
+                .expect("post-boot OOM outcome")
+                .reason,
+            LaunchSessionExitReason::CrashedAfterBoot
+        );
+        assert_eq!(
+            terminal_status
+                .guardian
+                .as_ref()
+                .and_then(|guardian| guardian.get("decision")),
+            Some(&serde_json::json!("warned"))
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.sessions().retention_hold_count(session_id).await == Some(0) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-boot OOM observer settlement");
+
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("post-boot OOM record");
+        assert!(record.boot_completed_at_ms.is_some());
+        assert_eq!(
+            record.failure.as_ref().map(|failure| failure.class),
+            Some(LaunchFailureClass::OutOfMemory)
+        );
+        assert_eq!(
+            record
+                .outcome
+                .as_ref()
+                .expect("post-boot record outcome")
+                .reason,
+            LaunchSessionExitReason::CrashedAfterBoot
+        );
+        assert_eq!(
+            state.sessions().retention_hold_count(session_id).await,
+            Some(0)
+        );
+
+        let proof = state
+            .launch_reports()
+            .load(session_id)
+            .expect("post-boot OOM proof");
+        assert_eq!(proof.outcome, "failed");
+        assert_eq!(proof.failure_class.as_deref(), Some("out_of_memory"));
+        assert_eq!(
+            proof
+                .session_outcome
+                .as_ref()
+                .expect("post-boot proof outcome")
+                .reason,
+            LaunchSessionExitReason::CrashedAfterBoot
+        );
+        assert_eq!(
+            proof.failure_detail.as_deref(),
+            Some("Minecraft stopped after running out of memory.")
+        );
+
+        let memory = state.failure_memory().list();
+        assert_eq!(memory.len(), 1);
+        assert_out_of_memory_observation(&memory[0]);
+        state
+            .failure_memory()
+            .flush()
+            .await
+            .expect("flush post-boot OOM memory");
+        let memory_json =
+            fs::read_to_string(failure_memory_path(&paths)).expect("read post-boot OOM memory");
+        let report_json = super::super::reports::launch_report_payload(&state, session_id)
+            .expect("post-boot OOM report payload")
+            .to_string();
+        let status_json = serde_json::to_string(&terminal_status)
+            .expect("serialize post-boot OOM terminal status");
+        for payload in [
+            memory_json.as_str(),
+            report_json.as_str(),
+            status_json.as_str(),
+        ] {
+            assert_no_out_of_memory_sensitive_decoys(payload);
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancelled_launch_handoff_releases_terminal_observer_hold() {
+        let root = unique_test_dir("cancelled-terminal-observer-handoff");
+        let state = test_app_state(&root);
+        let session_id = "cancelled-terminal-observer-handoff";
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert observer handoff session");
+        let events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe observer handoff");
+        let (handoff_tx, handoff_rx) = tokio::sync::oneshot::channel();
+        drop(handoff_tx);
+        let task = test_recovery_launch_task(session_id, &root);
+        let proof_context = LaunchProofContext::from_intent(&task.intent);
+
+        own_terminal_observation(
+            state.clone(),
+            session_id.to_string(),
+            "instance".to_string(),
+            GuardianMode::Managed,
+            "2026-01-01T00:00:00.000Z".to_string(),
+            proof_context,
+            events,
+            handoff_rx,
+        )
+        .await;
+
+        assert_eq!(
+            state.sessions().retention_hold_count(session_id).await,
+            Some(0)
+        );
+        assert!(state.failure_memory().list().is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2020,6 +2584,117 @@ mod tests {
         fs::create_dir_all(&indexes_dir).expect("asset indexes directory");
         fs::write(indexes_dir.join(format!("{asset_index_id}.json")), contents)
             .expect("asset index");
+    }
+
+    #[cfg(unix)]
+    fn write_out_of_memory_launch_fixture(root: &Path) -> String {
+        write_out_of_memory_launch_fixture_with_boot(root, false)
+    }
+
+    #[cfg(unix)]
+    fn write_post_boot_out_of_memory_launch_fixture(root: &Path) -> String {
+        write_out_of_memory_launch_fixture_with_boot(root, true)
+    }
+
+    #[cfg(unix)]
+    fn write_out_of_memory_launch_fixture_with_boot(root: &Path, boot_first: bool) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let version_dir = root.join("library").join("versions").join("1.21.1");
+        fs::create_dir_all(&version_dir).expect("OOM version directory");
+        fs::write(
+            version_dir.join("1.21.1.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "1.21.1",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": {},
+                "javaVersion": {
+                    "component": "java-runtime-delta",
+                    "majorVersion": 21
+                },
+                "libraries": []
+            }))
+            .expect("encode OOM version"),
+        )
+        .expect("write OOM version");
+        fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("write OOM client jar");
+        fs::create_dir_all(root.join("instance")).expect("OOM game directory");
+
+        let bin_dir = root.join("oom-java").join("bin");
+        fs::create_dir_all(&bin_dir).expect("OOM Java bin directory");
+        let java_path = bin_dir.join("java");
+        let boot_marker = if boot_first {
+            "printf '%s\\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atlas/blocks.png-atlas' >&2\nsleep 0.1\n"
+        } else {
+            ""
+        };
+        fs::write(
+            &java_path,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "-XshowSettings:property" ]; then
+  echo 'openjdk version "21.0.3"' >&2
+  exit 0
+fi
+{boot_marker}
+printf '%s\n' 'java.lang.OutOfMemoryError: Java heap space /home/alice/.axial/secret --accessToken raw-secret-token -Xmx8192M -Dtoken=raw provider_payload=provider-secret account_id=account-secret username=SecretPlayer eyJheader123456789.abcdEFGH12345678.ijklMNOP12345678' >&2
+printf '%s\n' 'at SecretMod.crash(/home/alice/SecretMod.java:42)' >&2
+exit 1
+"#
+            ),
+        )
+        .expect("write OOM Java");
+        let mut permissions = fs::metadata(&java_path)
+            .expect("OOM Java metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&java_path, permissions).expect("make OOM Java executable");
+        java_path.to_string_lossy().to_string()
+    }
+
+    fn assert_out_of_memory_observation(
+        entry: &crate::state::failure_memory::GuardianFailureMemoryEntry,
+    ) {
+        assert_eq!(entry.diagnosis_id.as_str(), "out_of_memory");
+        assert_eq!(entry.domain, GuardianDomain::Startup);
+        assert_eq!(entry.mode, GuardianMode::Managed);
+        assert_eq!(entry.target.system, StabilizationSystem::Guardian);
+        assert_eq!(entry.target.kind, TargetKind::Instance);
+        assert_eq!(entry.target.id, "instance");
+        assert_eq!(entry.ownership, OwnershipClass::UserOwned);
+        assert_eq!(entry.occurrence_count, 1);
+        assert_eq!(entry.last_action_kind, None);
+        assert_eq!(entry.last_action_outcome, None);
+        assert_eq!(entry.repair_attempt_count, 0);
+        assert_eq!(entry.suppression_until, None);
+        assert_eq!(entry.safe_fallback, None);
+        assert_eq!(entry.user_decision, None);
+        assert_eq!(entry.target_content_hash, None);
+        assert_eq!(entry.user_intent_hash, None);
+    }
+
+    fn assert_no_out_of_memory_sensitive_decoys(payload: &str) {
+        for fragment in [
+            "/home/alice",
+            "C:\\Users\\Alice",
+            "--accessToken",
+            "raw-secret-token",
+            "-Xmx8192M",
+            "-Dtoken=raw",
+            "provider_payload",
+            "provider-secret",
+            "account_id=account-secret",
+            "username=SecretPlayer",
+            "SecretPlayer",
+            "SecretMod.crash",
+            "eyJheader123456789",
+        ] {
+            assert!(
+                !payload.contains(fragment),
+                "OOM public or persisted payload leaked {fragment:?}: {payload}"
+            );
+        }
     }
 
     fn assert_no_sensitive_stage_evidence(text: &str) {
