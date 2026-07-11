@@ -1,20 +1,33 @@
+use crate::execution::file::{DeleteFileRequest, delete_launcher_managed_file};
+use crate::execution::persistence::{
+    AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
+    WriteUrgency,
+};
 use crate::logging::timestamp_utc;
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
+use crate::state::benchmark_suites::{
+    BenchmarkProofRetentionHandle, MAX_BENCHMARK_PROOF_SESSION_IDS,
+};
+use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use axial_config::AppPaths;
 use axial_launcher::{
     GuardianSummary, LaunchHealingSummary, LaunchIntent, LaunchPriorityEvidence,
-    LaunchSessionOutcome, LaunchSessionRecord, LaunchStageEvidence, LaunchStageRecord,
-    launch_state_name,
+    LaunchSessionOutcome, LaunchSessionOutcomeKind, LaunchSessionRecord, LaunchStageEvidence,
+    LaunchStageRecord, launch_state_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fs::{self, File};
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 use sysinfo::System;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 const LAUNCH_PROOF_SCHEMA: &str = "axial.launch.proof";
-const LAUNCH_PROOF_SCHEMA_VERSION: u32 = 1;
+const LAUNCH_PROOF_SCHEMA_VERSION: u32 = 2;
 const LAUNCH_STAGE_COMPARISON_METRIC_NAME: &str = "total_completed_stage_duration_ms";
 const LAUNCH_BOOT_COMPARISON_METRIC_NAME: &str = "boot_duration_ms";
 const MAX_REPORT_FILENAME_STEM: usize = 96;
@@ -23,14 +36,18 @@ const MAX_EXPORT_TOKEN_CHARS: usize = 96;
 const MAX_EXPORT_DETAIL_CHARS: usize = 180;
 const MAX_EXPORT_DETAILS: usize = 8;
 const MAX_EXPORT_STAGES: usize = 32;
-// Conservative free-space warning threshold for launch caches, natives, and prewarm writes.
-pub const LAUNCH_DISK_HEADROOM_MB: u64 = 2048;
-
+const MAX_REPORT_STAGE_EVIDENCE: usize = 4;
+const MAX_REPORT_EVIDENCE_DETAILS: usize = 4;
+const MAX_REPORT_BYTES: u64 = 256 * 1024;
+const MAX_STARTUP_REPORTS: usize = MAX_BENCHMARK_PROOF_SESSION_IDS;
+const MAX_LOAD_ISSUES: usize = 8;
+const LAUNCH_REPORT_STORE_LOCK_INVARIANT: &str =
+    "launch report store lock poisoned; committed and persisted state may diverge";
 type LaunchComparisonMetric = (&'static str, u64, fn(&LaunchProofRecord) -> Option<u64>);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct LaunchProofRecord {
+pub(crate) struct LaunchProofRecord {
     pub schema: String,
     pub schema_version: u32,
     pub session_id: String,
@@ -67,7 +84,7 @@ pub struct LaunchProofRecord {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct LaunchProofExport {
+pub(crate) struct LaunchProofExport {
     pub schema: String,
     pub schema_version: u32,
     pub session_id: String,
@@ -101,7 +118,7 @@ pub struct LaunchProofExport {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct LaunchProofStageExport {
+pub(crate) struct LaunchProofStageExport {
     pub stage: String,
     pub label: String,
     pub started_at_ms: u64,
@@ -120,7 +137,7 @@ pub struct LaunchProofStageExport {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct LaunchProofStageEvidenceExport {
+pub(crate) struct LaunchProofStageEvidenceExport {
     pub id: String,
     pub system: String,
     pub summary: String,
@@ -130,7 +147,7 @@ pub struct LaunchProofStageEvidenceExport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct LaunchProofScenario {
+pub(crate) struct LaunchProofScenario {
     pub scenario_id: String,
     pub performance_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,7 +181,7 @@ impl Default for LaunchProofScenario {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct LaunchProofDevice {
+pub(crate) struct LaunchProofDevice {
     pub tier: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_memory_mb: Option<u64>,
@@ -184,9 +201,10 @@ impl Default for LaunchProofDevice {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct LaunchProofComparison {
+pub(crate) struct LaunchProofComparison {
     pub baseline_session_id: String,
     pub baseline_recorded_at: String,
+    pub baseline: LaunchProofComparisonBaseline,
     pub matched_sample_count: usize,
     pub metric_name: String,
     pub current_value_ms: u64,
@@ -197,7 +215,23 @@ pub struct LaunchProofComparison {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct LaunchProofResourceBudget {
+pub(crate) struct LaunchProofComparisonBaseline {
+    pub performance_mode: String,
+    pub version_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_memory_mb: Option<i32>,
+    pub device_tier: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub benchmark_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub benchmark_run_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub benchmark_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LaunchProofResourceBudget {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_total_memory_mb: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -233,7 +267,7 @@ pub struct LaunchProofResourceBudget {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct LaunchProofPriority {
+pub(crate) struct LaunchProofPriority {
     pub start_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_error: Option<String>,
@@ -243,19 +277,8 @@ pub struct LaunchProofPriority {
     pub promotion_error: Option<String>,
 }
 
-impl From<&LaunchPriorityEvidence> for LaunchProofPriority {
-    fn from(value: &LaunchPriorityEvidence) -> Self {
-        Self {
-            start_mode: value.start_mode.clone(),
-            start_error: value.start_error.clone(),
-            promotion: value.promotion.clone(),
-            promotion_error: value.promotion_error.clone(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct LaunchBenchmarkMetadata {
+pub(crate) struct LaunchBenchmarkMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub benchmark_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -267,7 +290,7 @@ pub struct LaunchBenchmarkMetadata {
 }
 
 impl LaunchBenchmarkMetadata {
-    pub fn new(
+    pub(crate) fn new(
         benchmark_id: Option<&str>,
         profile: Option<&str>,
         run_type: Option<&str>,
@@ -283,7 +306,7 @@ impl LaunchBenchmarkMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaunchProofContext {
+pub(crate) struct LaunchProofContext {
     pub performance_mode: String,
     pub requested_memory_mb: Option<i32>,
     pub version_id: Option<String>,
@@ -292,7 +315,7 @@ pub struct LaunchProofContext {
 }
 
 impl LaunchProofContext {
-    pub fn from_intent(intent: &LaunchIntent) -> Self {
+    pub(crate) fn from_intent(intent: &LaunchIntent) -> Self {
         Self {
             performance_mode: trimmed_or_unknown(&intent.performance_mode),
             requested_memory_mb: positive_i32(intent.max_memory_mb),
@@ -302,12 +325,12 @@ impl LaunchProofContext {
         }
     }
 
-    pub fn with_benchmark(mut self, benchmark: Option<LaunchBenchmarkMetadata>) -> Self {
+    pub(crate) fn with_benchmark(mut self, benchmark: Option<LaunchBenchmarkMetadata>) -> Self {
         self.benchmark = benchmark;
         self
     }
 
-    pub fn with_resource_budget(
+    pub(crate) fn with_resource_budget(
         mut self,
         resource_budget: Option<LaunchProofResourceBudget>,
     ) -> Self {
@@ -316,104 +339,413 @@ impl LaunchProofContext {
     }
 }
 
-pub fn persist_record(
-    paths: &AppPaths,
-    record: &LaunchSessionRecord,
-    launched_at: Option<&str>,
-    outcome: &str,
-) -> io::Result<LaunchProofRecord> {
-    persist_record_with_context(paths, record, launched_at, outcome, None)
+pub(crate) struct LaunchReportStore {
+    state: Arc<Mutex<LaunchReportState>>,
+    mutation_gate: Arc<AsyncMutex<()>>,
+    persistence: Option<Arc<LaunchReportPersistence>>,
+    proof_retention: Arc<RwLock<BenchmarkProofRetentionHandle>>,
 }
 
-pub fn persist_record_with_context(
-    paths: &AppPaths,
-    record: &LaunchSessionRecord,
-    launched_at: Option<&str>,
-    outcome: &str,
-    context: Option<&LaunchProofContext>,
-) -> io::Result<LaunchProofRecord> {
-    let mut proof = build_record(record, launched_at, outcome, context);
-    proof.comparison = build_local_comparison(paths, &proof)?;
-    let path = report_path(paths, &record.session_id.0);
-    write_json_file(&path, &proof)?;
-    Ok(proof)
+struct LaunchReportState {
+    reports: BTreeMap<String, LaunchProofRecord>,
+    order: BTreeSet<(String, String)>,
+    writers: BTreeMap<String, AtomicSnapshotWriter>,
+    retry_candidate: Option<PendingLaunchReport>,
+    cleanup_candidate: Option<String>,
+    load_issue_count: usize,
+    mutation_latched: bool,
 }
 
-fn write_json_file<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let data = serde_json::to_string_pretty(value)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let temp_path = path.with_extension("json.tmp");
-    fs::write(&temp_path, data)?;
-    replace_file(&temp_path, path)
+struct LaunchReportPersistence {
+    owner: PersistenceOwnerLease,
+    directory: PathBuf,
 }
 
-fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
-    if fs::rename(source, destination).is_ok() {
-        return Ok(());
+#[derive(Clone)]
+struct PendingLaunchReport {
+    revision: u64,
+    record: LaunchProofRecord,
+}
+
+struct AcceptedLaunchReport {
+    ticket: AcceptedWrite,
+    pending: PendingLaunchReport,
+}
+
+impl LaunchReportStore {
+    pub(crate) fn load_from_paths(
+        paths: &AppPaths,
+        proof_retention: BenchmarkProofRetentionHandle,
+    ) -> Self {
+        Self::load_from_paths_with_coordinator_and_retention(
+            paths,
+            PersistenceCoordinator::global(),
+            proof_retention,
+        )
+        .unwrap_or_else(|_| panic!("failed to initialize launch report persistence"))
     }
-    if destination.exists() {
-        let _ = fs::remove_file(destination);
+
+    #[cfg(test)]
+    pub(crate) fn load_from_paths_for_test(paths: &AppPaths) -> Self {
+        Self::load_from_paths(paths, BenchmarkProofRetentionHandle::empty())
     }
-    match fs::rename(source, destination) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(source);
-            Err(error)
+
+    #[cfg(test)]
+    fn load_from_paths_with_coordinator(
+        paths: &AppPaths,
+        coordinator: PersistenceCoordinator,
+    ) -> io::Result<Self> {
+        Self::load_from_paths_with_coordinator_and_retention(
+            paths,
+            coordinator,
+            BenchmarkProofRetentionHandle::empty(),
+        )
+    }
+
+    fn load_from_paths_with_coordinator_and_retention(
+        paths: &AppPaths,
+        coordinator: PersistenceCoordinator,
+        proof_retention: BenchmarkProofRetentionHandle,
+    ) -> io::Result<Self> {
+        let directory = report_dir(paths);
+        let owner = coordinator
+            .claim_owner(&directory)
+            .map_err(io::Error::from)?;
+        let (reports, load_issue_count) = match proof_retention
+            .retained_session_ids(MAX_STARTUP_REPORTS)
+        {
+            Some(protected_session_ids) => load_report_index(&directory, &protected_session_ids),
+            None => (BTreeMap::new(), 1),
+        };
+        let order = report_order(&reports);
+        Ok(Self {
+            state: Arc::new(Mutex::new(LaunchReportState {
+                reports,
+                order,
+                writers: BTreeMap::new(),
+                retry_candidate: None,
+                cleanup_candidate: None,
+                load_issue_count,
+                mutation_latched: load_issue_count != 0,
+            })),
+            mutation_gate: Arc::new(AsyncMutex::new(())),
+            persistence: Some(Arc::new(LaunchReportPersistence { owner, directory })),
+            proof_retention: Arc::new(RwLock::new(proof_retention)),
+        })
+    }
+
+    #[cfg(test)]
+    fn in_memory() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(LaunchReportState {
+                reports: BTreeMap::new(),
+                order: BTreeSet::new(),
+                writers: BTreeMap::new(),
+                retry_candidate: None,
+                cleanup_candidate: None,
+                load_issue_count: 0,
+                mutation_latched: false,
+            })),
+            mutation_gate: Arc::new(AsyncMutex::new(())),
+            persistence: None,
+            proof_retention: Arc::new(RwLock::new(BenchmarkProofRetentionHandle::empty())),
         }
     }
-}
 
-pub fn list_recent(paths: &AppPaths, limit: usize) -> io::Result<Vec<LaunchProofRecord>> {
-    let dir = report_dir(paths);
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
+    #[cfg(test)]
+    pub(crate) fn bind_proof_retention(&self, proof_retention: BenchmarkProofRetentionHandle) {
+        *self
+            .proof_retention
+            .write()
+            .expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT) = proof_retention;
+    }
 
-    let mut reports = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
-        .filter_map(|entry| load_file(&entry.path()).ok())
-        .collect::<Vec<_>>();
+    pub(crate) fn load_issue_count(&self) -> usize {
+        self.state
+            .lock()
+            .expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT)
+            .load_issue_count
+    }
 
-    reports.sort_by(|left, right| {
-        right
-            .recorded_at
-            .cmp(&left.recorded_at)
-            .then_with(|| right.session_id.cmp(&left.session_id))
-    });
-    reports.truncate(limit);
-    Ok(reports)
-}
+    pub(crate) fn list_recent(&self, limit: usize) -> Vec<LaunchProofRecord> {
+        let state = self.state.lock().expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT);
+        list_recent_from_state(&state, limit)
+    }
 
-pub fn list_recent_exports(paths: &AppPaths, limit: usize) -> io::Result<Vec<LaunchProofExport>> {
-    list_recent(paths, limit)
-        .map(|reports| reports.iter().map(LaunchProofExport::from_record).collect())
-}
+    pub(crate) fn list_recent_exports(&self, limit: usize) -> Vec<LaunchProofExport> {
+        self.list_recent(limit)
+            .iter()
+            .map(LaunchProofExport::from_record)
+            .collect()
+    }
 
-pub fn load(paths: &AppPaths, session_id: &str) -> io::Result<Option<LaunchProofRecord>> {
-    let path = report_path(paths, session_id);
-    match load_file(&path) {
-        Ok(report) => Ok(Some(report)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
+    pub(crate) fn load(&self, session_id: &str) -> Option<LaunchProofRecord> {
+        self.state
+            .lock()
+            .expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT)
+            .reports
+            .get(session_id)
+            .cloned()
+    }
+
+    pub(crate) fn load_export(&self, session_id: &str) -> Option<LaunchProofExport> {
+        self.load(session_id)
+            .as_ref()
+            .map(LaunchProofExport::from_record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_unchecked_for_test(&self, report: LaunchProofRecord) {
+        insert_committed_report(
+            &mut self.state.lock().expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT),
+            report,
+        );
+    }
+
+    pub(crate) async fn persist(
+        &self,
+        record: LaunchSessionRecord,
+        launched_at: Option<String>,
+        outcome: String,
+        context: Option<LaunchProofContext>,
+    ) -> io::Result<LaunchProofRecord> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let mutation = self.reconcile_retry_holding_gate(mutation).await?;
+        let mutation = self.reconcile_cleanup_holding_gate(mutation).await?;
+        if self
+            .state
+            .lock()
+            .expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT)
+            .mutation_latched
+        {
+            return Err(invalid_report(
+                "launch report mutation is unavailable after startup rejection",
+            ));
+        }
+        let report_state = self.state.clone();
+        let candidate = tokio::task::spawn_blocking(move || {
+            let candidates = list_recent_from_state(
+                &report_state
+                    .lock()
+                    .expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT),
+                MAX_STARTUP_REPORTS,
+            );
+            let mut proof =
+                build_record(&record, launched_at.as_deref(), &outcome, context.as_ref());
+            proof.comparison = build_comparison_from_candidates(&proof, &candidates);
+            proof
+        })
+        .await
+        .map_err(|_| io::Error::other("launch report construction task stopped"))?;
+        validate_admitted_report(&candidate, &report_filename(&candidate.session_id))?;
+
+        if let Some(current) = self.load(&candidate.session_id)
+            && report_is_terminal(&current.outcome)
+            && !report_is_terminal(&candidate.outcome)
+        {
+            return Ok(current);
+        }
+        self.commit(candidate, mutation).await
+    }
+
+    pub(crate) async fn close(&self) -> io::Result<()> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let mutation = self.reconcile_retry_holding_gate(mutation).await?;
+        let mutation = self.reconcile_cleanup_holding_gate(mutation).await?;
+        if let Some(persistence) = &self.persistence {
+            persistence.owner.close().await.map_err(io::Error::from)?;
+        }
+        drop(mutation);
+        Ok(())
+    }
+
+    async fn reconcile_retry_holding_gate(
+        &self,
+        mutation: OwnedMutexGuard<()>,
+    ) -> io::Result<OwnedMutexGuard<()>> {
+        let retry = self
+            .state
+            .lock()
+            .expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT)
+            .retry_candidate
+            .clone();
+        let Some(retry) = retry else {
+            return Ok(mutation);
+        };
+        let writer = self.writer_for(&retry.record.session_id)?;
+        let ticket = writer.retry().map_err(io::Error::from)?;
+        assert_eq!(ticket.revision().get(), retry.revision);
+        let (_, mutation) = self
+            .await_commit_holding_gate(
+                AcceptedLaunchReport {
+                    ticket,
+                    pending: retry,
+                },
+                mutation,
+            )
+            .await?;
+        Ok(mutation)
+    }
+
+    async fn reconcile_cleanup_holding_gate(
+        &self,
+        mutation: OwnedMutexGuard<()>,
+    ) -> io::Result<OwnedMutexGuard<()>> {
+        let (result, mutation) = reconcile_launch_report_cleanup(
+            self.state.clone(),
+            self.persistence.clone(),
+            self.proof_retention.clone(),
+            mutation,
+        )
+        .await;
+        result?;
+        Ok(mutation)
+    }
+
+    async fn commit(
+        &self,
+        candidate: LaunchProofRecord,
+        mutation: OwnedMutexGuard<()>,
+    ) -> io::Result<LaunchProofRecord> {
+        let Some(_) = &self.persistence else {
+            insert_committed_report(
+                &mut self.state.lock().expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT),
+                candidate.clone(),
+            );
+            let mutation = self.reconcile_cleanup_holding_gate(mutation).await?;
+            drop(mutation);
+            return Ok(candidate);
+        };
+        let writer = self.writer_for(&candidate.session_id)?;
+        let ticket = writer
+            .accept(
+                candidate.clone(),
+                WriteUrgency::Immediate,
+                encode_launch_report,
+            )
+            .map_err(io::Error::from)?;
+        let pending = PendingLaunchReport {
+            revision: ticket.revision().get(),
+            record: candidate,
+        };
+        let (record, _) = self
+            .await_commit_holding_gate(AcceptedLaunchReport { ticket, pending }, mutation)
+            .await?;
+        Ok(record)
+    }
+
+    fn writer_for(&self, session_id: &str) -> io::Result<AtomicSnapshotWriter> {
+        let mut state = self.state.lock().expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT);
+        if let Some(writer) = state.writers.get(session_id) {
+            return Ok(writer.clone());
+        }
+        let persistence = self
+            .persistence
+            .as_ref()
+            .ok_or_else(|| io::Error::other("launch report persistence unavailable"))?;
+        let writer = persistence
+            .owner
+            .writer(
+                report_path_in(&persistence.directory, session_id),
+                launch_report_target(session_id),
+            )
+            .map_err(io::Error::from)?;
+        state.writers.insert(session_id.to_string(), writer.clone());
+        Ok(writer)
+    }
+
+    async fn await_commit_holding_gate(
+        &self,
+        accepted: AcceptedLaunchReport,
+        mutation: OwnedMutexGuard<()>,
+    ) -> io::Result<(LaunchProofRecord, OwnedMutexGuard<()>)> {
+        let state = self.state.clone();
+        let returned = accepted.pending.record.clone();
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        accepted.ticket.observe(move |result| {
+            let result = match result {
+                Ok(_) => {
+                    let mut state = state.lock().expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT);
+                    let PendingLaunchReport { revision, record } = accepted.pending;
+                    let session_id = record.session_id.clone();
+                    insert_committed_report(&mut state, record);
+                    if state
+                        .retry_candidate
+                        .as_ref()
+                        .is_some_and(|pending| pending.revision == revision)
+                    {
+                        state.retry_candidate = None;
+                    }
+                    state.writers.remove(&session_id);
+                    Ok(())
+                }
+                Err(error) => {
+                    state
+                        .lock()
+                        .expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT)
+                        .retry_candidate = Some(accepted.pending);
+                    Err(io::Error::from(error))
+                }
+            };
+            let _ = observed_tx.send((result, mutation));
+        });
+        let cleanup_state = self.state.clone();
+        let cleanup_persistence = self.persistence.clone();
+        let cleanup_retention = self.proof_retention.clone();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Some((result, mutation)) = observed_rx.await.ok() else {
+                return;
+            };
+            let settled = if result.is_ok() {
+                reconcile_launch_report_cleanup(
+                    cleanup_state,
+                    cleanup_persistence,
+                    cleanup_retention,
+                    mutation,
+                )
+                .await
+            } else {
+                (result, mutation)
+            };
+            let _ = completed_tx.send(settled);
+        });
+        let (result, mutation) = completed_rx
+            .await
+            .map_err(|_| io::Error::other("launch report commit observer stopped"))?;
+        result?;
+        Ok((returned, mutation))
     }
 }
 
-pub fn load_export(paths: &AppPaths, session_id: &str) -> io::Result<Option<LaunchProofExport>> {
-    load(paths, session_id).map(|report| report.as_ref().map(LaunchProofExport::from_record))
+#[cfg(test)]
+impl Default for LaunchReportStore {
+    fn default() -> Self {
+        Self::in_memory()
+    }
 }
 
-pub fn report_path(paths: &AppPaths, session_id: &str) -> PathBuf {
-    report_dir(paths).join(safe_report_filename(session_id))
+fn launch_report_target(session_id: &str) -> TargetDescriptor {
+    TargetDescriptor::new(
+        StabilizationSystem::State,
+        TargetKind::Session,
+        session_id,
+        OwnershipClass::LauncherManaged,
+    )
+}
+
+fn encode_launch_report(report: LaunchProofRecord) -> io::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(&report)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_REPORT_BYTES {
+        return Err(invalid_report("launch report is too large"));
+    }
+    Ok(bytes)
 }
 
 impl LaunchProofExport {
-    pub fn from_record(record: &LaunchProofRecord) -> Self {
+    fn from_record(record: &LaunchProofRecord) -> Self {
         Self {
             schema: sanitized_required_token(&record.schema, LAUNCH_PROOF_SCHEMA),
             schema_version: record.schema_version,
@@ -423,7 +755,10 @@ impl LaunchProofExport {
             launched_at: sanitized_required_token(&record.launched_at, "unknown"),
             recorded_at: sanitized_required_token(&record.recorded_at, "unknown"),
             outcome: sanitized_required_token(&record.outcome, "unknown"),
-            session_outcome: record.session_outcome.clone(),
+            session_outcome: record
+                .session_outcome
+                .as_ref()
+                .map(|outcome| LaunchSessionOutcome::from_reason(outcome.reason)),
             scenario: sanitized_export_scenario(&record.scenario),
             device: sanitized_export_device(&record.device),
             resource_budget: record.resource_budget.clone(),
@@ -593,6 +928,30 @@ fn sanitized_comparison(comparison: &LaunchProofComparison) -> LaunchProofCompar
     LaunchProofComparison {
         baseline_session_id: sanitized_required_token(&comparison.baseline_session_id, "redacted"),
         baseline_recorded_at: sanitized_required_token(&comparison.baseline_recorded_at, "unknown"),
+        baseline: LaunchProofComparisonBaseline {
+            performance_mode: sanitized_required_token(
+                &comparison.baseline.performance_mode,
+                "unknown",
+            ),
+            version_id: sanitized_required_token(&comparison.baseline.version_id, "unknown"),
+            requested_memory_mb: comparison.baseline.requested_memory_mb,
+            device_tier: sanitized_required_token(&comparison.baseline.device_tier, "unknown"),
+            benchmark_profile: comparison
+                .baseline
+                .benchmark_profile
+                .as_deref()
+                .and_then(sanitize_benchmark_metadata),
+            benchmark_run_type: comparison
+                .baseline
+                .benchmark_run_type
+                .as_deref()
+                .and_then(sanitize_benchmark_metadata),
+            benchmark_mode: comparison
+                .baseline
+                .benchmark_mode
+                .as_deref()
+                .and_then(sanitize_benchmark_mode_metadata),
+        },
         matched_sample_count: comparison.matched_sample_count,
         metric_name: sanitized_required_token(&comparison.metric_name, "unknown"),
         current_value_ms: comparison.current_value_ms,
@@ -637,15 +996,15 @@ fn build_record(
     let outcome = if outcome.trim().is_empty() {
         launch_state_name(record.state).to_string()
     } else {
-        outcome.to_string()
+        outcome.trim().to_ascii_lowercase()
     };
 
     LaunchProofRecord {
         schema: LAUNCH_PROOF_SCHEMA.to_string(),
         schema_version: LAUNCH_PROOF_SCHEMA_VERSION,
         session_id: record.session_id.0.clone(),
-        instance_id: record.instance_id.clone(),
-        version_id: record.version_id.clone(),
+        instance_id: sanitized_required_token(&record.instance_id, "redacted"),
+        version_id: sanitized_required_token(&record.version_id, "unknown"),
         launched_at,
         recorded_at,
         outcome,
@@ -656,17 +1015,26 @@ fn build_record(
         pid: record.pid,
         exit_code: record.exit_code,
         boot_duration_ms: record.boot_duration_ms,
-        priority: record.priority.as_ref().map(LaunchProofPriority::from),
+        priority: record.priority.as_ref().map(sanitized_priority),
         failure_class: record
             .failure
             .as_ref()
-            .map(|failure| failure.class.as_str().to_string()),
+            .and_then(|failure| sanitized_optional_token(failure.class.as_str())),
         failure_detail: record
             .failure
             .as_ref()
-            .and_then(|failure| failure.detail.clone()),
-        guardian: record.guardian.clone(),
-        healing: record.healing.clone(),
+            .and_then(|failure| failure.detail.as_deref())
+            .and_then(sanitized_bounded_text),
+        guardian: record
+            .guardian
+            .as_ref()
+            .and_then(sanitized_guardian)
+            .and_then(|guardian| serde_json::to_value(guardian).ok()),
+        healing: record
+            .healing
+            .as_ref()
+            .and_then(sanitized_healing)
+            .and_then(|healing| serde_json::to_value(healing).ok()),
         stages: record
             .stages
             .iter()
@@ -674,6 +1042,24 @@ fn build_record(
             .map(sanitized_stage_record)
             .collect(),
         comparison: None,
+    }
+}
+
+fn sanitized_priority(priority: &LaunchPriorityEvidence) -> LaunchProofPriority {
+    LaunchProofPriority {
+        start_mode: sanitized_required_token(&priority.start_mode, "unknown"),
+        start_error: priority
+            .start_error
+            .as_deref()
+            .and_then(sanitized_bounded_text),
+        promotion: priority
+            .promotion
+            .as_deref()
+            .and_then(sanitized_optional_token),
+        promotion_error: priority
+            .promotion_error
+            .as_deref()
+            .and_then(sanitized_bounded_text),
     }
 }
 
@@ -700,7 +1086,7 @@ fn sanitized_stage_record(stage: &LaunchStageRecord) -> LaunchStageRecord {
             .evidence
             .iter()
             .filter_map(sanitized_stage_evidence_record)
-            .take(MAX_EXPORT_DETAILS)
+            .take(MAX_REPORT_STAGE_EVIDENCE)
             .collect(),
     }
 }
@@ -714,35 +1100,9 @@ fn sanitized_stage_evidence_record(evidence: &LaunchStageEvidence) -> Option<Lau
             .details
             .iter()
             .filter_map(|detail| sanitized_bounded_text(detail))
-            .take(MAX_EXPORT_DETAILS)
+            .take(MAX_REPORT_EVIDENCE_DETAILS)
             .collect(),
     })
-}
-
-fn build_local_comparison(
-    paths: &AppPaths,
-    current: &LaunchProofRecord,
-) -> io::Result<Option<LaunchProofComparison>> {
-    let dir = report_dir(paths);
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let mut candidates = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
-        .filter_map(|entry| load_file(&entry.path()).ok())
-        .collect::<Vec<_>>();
-
-    candidates.sort_by(|left, right| {
-        right
-            .recorded_at
-            .cmp(&left.recorded_at)
-            .then_with(|| right.session_id.cmp(&left.session_id))
-    });
-
-    Ok(build_comparison_from_candidates(current, &candidates))
 }
 
 fn build_comparison_from_candidates(
@@ -757,6 +1117,7 @@ fn build_comparison_from_candidates(
         launch_comparison_metric_for_current(current)?;
     let mut matches = candidates
         .iter()
+        .filter(|candidate| report_precedes(candidate, current))
         .filter(|candidate| launch_proof_outcome_is_comparable(&candidate.outcome))
         .filter(|candidate| comparison_dimensions_match(current, candidate))
         .filter_map(|candidate| {
@@ -781,6 +1142,7 @@ fn build_comparison_from_candidates(
     Some(LaunchProofComparison {
         baseline_session_id: baseline.session_id.clone(),
         baseline_recorded_at: baseline.recorded_at.clone(),
+        baseline: comparison_baseline_snapshot(baseline)?,
         matched_sample_count,
         metric_name: metric_name.to_string(),
         current_value_ms,
@@ -790,11 +1152,60 @@ fn build_comparison_from_candidates(
     })
 }
 
+fn comparison_baseline_snapshot(
+    report: &LaunchProofRecord,
+) -> Option<LaunchProofComparisonBaseline> {
+    Some(LaunchProofComparisonBaseline {
+        performance_mode: known_launch_mode(report)?.to_string(),
+        version_id: normalized_version_target(report)?.to_string(),
+        requested_memory_mb: report.scenario.requested_memory_mb,
+        device_tier: normalized_dimension(&report.device.tier)?.to_string(),
+        benchmark_profile: report
+            .scenario
+            .benchmark_profile
+            .as_deref()
+            .and_then(normalized_dimension)
+            .map(str::to_string),
+        benchmark_run_type: report
+            .scenario
+            .benchmark_run_type
+            .as_deref()
+            .and_then(normalized_dimension)
+            .map(str::to_string),
+        benchmark_mode: report
+            .scenario
+            .benchmark_mode
+            .as_deref()
+            .and_then(normalized_dimension)
+            .map(str::to_string),
+    })
+}
+
+pub(crate) fn comparison_baseline_matches_report(
+    comparison: &LaunchProofComparison,
+    baseline: &LaunchProofRecord,
+) -> bool {
+    let metric_value = match comparison.metric_name.as_str() {
+        LAUNCH_STAGE_COMPARISON_METRIC_NAME => launch_total_completed_stage_duration_ms(baseline),
+        LAUNCH_BOOT_COMPARISON_METRIC_NAME => baseline.boot_duration_ms,
+        _ => None,
+    };
+    launch_proof_outcome_is_comparable(&baseline.outcome)
+        && comparison.baseline_session_id == baseline.session_id
+        && comparison.baseline_recorded_at == baseline.recorded_at
+        && comparison_baseline_snapshot(baseline).as_ref() == Some(&comparison.baseline)
+        && metric_value == Some(comparison.baseline_value_ms)
+}
+
 fn comparison_baseline_mode_rank(current: &LaunchProofRecord, candidate: &LaunchProofRecord) -> u8 {
     match (known_launch_mode(current), known_launch_mode(candidate)) {
         (Some("managed"), Some("vanilla")) => 0,
         _ => 1,
     }
+}
+
+fn report_precedes(candidate: &LaunchProofRecord, current: &LaunchProofRecord) -> bool {
+    (&candidate.recorded_at, &candidate.session_id) < (&current.recorded_at, &current.session_id)
 }
 
 fn launch_proof_outcome_is_comparable(outcome: &str) -> bool {
@@ -951,7 +1362,8 @@ fn build_scenario(
         .unwrap_or_else(|| "unknown".to_string());
     let version_id = context
         .and_then(|value| value.version_id.clone())
-        .or_else(|| non_empty_string(&record.version_id));
+        .or_else(|| non_empty_string(&record.version_id))
+        .and_then(|value| sanitized_optional_token(&value));
     let benchmark = context.and_then(|value| value.benchmark.as_ref());
 
     LaunchProofScenario {
@@ -1044,13 +1456,11 @@ fn non_empty_string(value: &str) -> Option<String> {
 }
 
 fn sanitize_benchmark_metadata(value: &str) -> Option<String> {
-    let sanitized = value
-        .trim()
-        .chars()
-        .filter(|value| !value.is_control())
-        .take(MAX_BENCHMARK_METADATA_CHARS)
-        .collect::<String>();
-    non_empty_string(&sanitized)
+    sanitize_evidence_token(
+        value,
+        RedactionAudience::ExportableProof,
+        MAX_BENCHMARK_METADATA_CHARS,
+    )
 }
 
 fn sanitize_benchmark_mode_metadata(value: &str) -> Option<String> {
@@ -1068,61 +1478,1300 @@ fn positive_i32(value: i32) -> Option<i32> {
     (value > 0).then_some(value)
 }
 
-fn load_file(path: &Path) -> io::Result<LaunchProofRecord> {
-    let data = fs::read_to_string(path)?;
-    serde_json::from_str(&data).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
 fn report_dir(paths: &AppPaths) -> PathBuf {
     paths.config_dir.join("benchmarks").join("launch")
 }
 
-fn safe_report_filename(session_id: &str) -> String {
-    let mut stem = session_id
-        .chars()
-        .map(|value| {
-            if value.is_ascii_alphanumeric() || matches!(value, '-' | '_') {
-                value
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    stem.truncate(MAX_REPORT_FILENAME_STEM);
-    let stem = stem.trim_matches('_');
-    if stem.is_empty() {
-        "session.json".to_string()
-    } else {
-        format!("{stem}.json")
+fn report_path_in(directory: &Path, session_id: &str) -> PathBuf {
+    directory.join(report_filename(session_id))
+}
+
+#[cfg(test)]
+pub(crate) fn report_path(paths: &AppPaths, session_id: &str) -> PathBuf {
+    report_path_in(&report_dir(paths), session_id)
+}
+
+fn load_report_index(
+    directory: &Path,
+    protected_session_ids: &HashSet<String>,
+) -> (BTreeMap<String, LaunchProofRecord>, usize) {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return (BTreeMap::new(), 1);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return (BTreeMap::new(), 0),
+        Err(_) => return (BTreeMap::new(), 1),
     }
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(_) => return (BTreeMap::new(), 1),
+    };
+    let mut paths = BTreeSet::new();
+    let mut issues = 0usize;
+    for session_id in protected_session_ids {
+        if !canonical_session_id(session_id) {
+            issues = bounded_issue_count(issues);
+            continue;
+        }
+        let path = report_path_in(directory, session_id);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                paths.insert(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => issues = bounded_issue_count(issues),
+        }
+    }
+    for entry in entries.take(MAX_STARTUP_REPORTS.saturating_add(1)) {
+        let Ok(entry) = entry else {
+            issues = bounded_issue_count(issues);
+            continue;
+        };
+        let path = entry.path();
+        if paths.contains(&path) {
+            continue;
+        }
+        if paths.len() == MAX_STARTUP_REPORTS {
+            issues = bounded_issue_count(issues);
+            break;
+        }
+        paths.insert(path);
+    }
+
+    let mut reports = BTreeMap::new();
+    for path in paths {
+        match load_admitted_report(&path) {
+            Ok(report) => {
+                reports.insert(report.session_id.clone(), report);
+            }
+            Err(_) => issues = bounded_issue_count(issues),
+        }
+    }
+    let mut ordinary = reports
+        .values()
+        .filter(|report| !protected_session_ids.contains(&report.session_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_reports(&mut ordinary);
+    let protected_report_count = reports
+        .keys()
+        .filter(|session_id| protected_session_ids.contains(*session_id))
+        .count();
+    let ordinary_limit = MAX_STARTUP_REPORTS.saturating_sub(protected_report_count);
+    for report in ordinary.into_iter().skip(ordinary_limit) {
+        reports.remove(&report.session_id);
+        issues = bounded_issue_count(issues);
+    }
+    (reports, issues)
+}
+
+fn bounded_issue_count(current: usize) -> usize {
+    current.saturating_add(1).min(MAX_LOAD_ISSUES)
+}
+
+fn load_admitted_report(path: &Path) -> io::Result<LaunchProofRecord> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| invalid_report("launch report filename is not UTF-8"))?;
+    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        return Err(invalid_report("launch report filename is not canonical"));
+    }
+    let metadata_before = fs::symlink_metadata(path)?;
+    if metadata_before.file_type().is_symlink()
+        || !metadata_before.is_file()
+        || metadata_before.len() > MAX_REPORT_BYTES
+    {
+        return Err(invalid_report("launch report file is not admissible"));
+    }
+    let file = File::open(path)?;
+    let opened_metadata = file.metadata()?;
+    let metadata_after = fs::symlink_metadata(path)?;
+    if metadata_after.file_type().is_symlink()
+        || !metadata_after.is_file()
+        || !opened_file_identity_matches(&metadata_before, &opened_metadata, &metadata_after)
+        || opened_metadata.len() > MAX_REPORT_BYTES
+    {
+        return Err(invalid_report(
+            "launch report file identity changed during admission",
+        ));
+    }
+    let capacity = usize::try_from(opened_metadata.len())
+        .map_err(|_| invalid_report("launch report file is too large"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(MAX_REPORT_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_REPORT_BYTES {
+        return Err(invalid_report("launch report file is too large"));
+    }
+    let report: LaunchProofRecord = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid_report("launch report schema is malformed"))?;
+    validate_admitted_report(&report, file_name)?;
+    Ok(report)
+}
+
+#[cfg(unix)]
+fn opened_file_identity_matches(
+    before: &fs::Metadata,
+    opened: &fs::Metadata,
+    after: &fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    before.dev() == opened.dev()
+        && before.ino() == opened.ino()
+        && opened.dev() == after.dev()
+        && opened.ino() == after.ino()
+}
+
+#[cfg(windows)]
+fn opened_file_identity_matches(
+    before: &fs::Metadata,
+    opened: &fs::Metadata,
+    after: &fs::Metadata,
+) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    before.volume_serial_number().is_some()
+        && before.volume_serial_number() == opened.volume_serial_number()
+        && opened.volume_serial_number() == after.volume_serial_number()
+        && before.file_index().is_some()
+        && before.file_index() == opened.file_index()
+        && opened.file_index() == after.file_index()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn opened_file_identity_matches(
+    before: &fs::Metadata,
+    opened: &fs::Metadata,
+    after: &fs::Metadata,
+) -> bool {
+    before.len() == opened.len()
+        && opened.len() == after.len()
+        && before.modified().ok() == opened.modified().ok()
+        && opened.modified().ok() == after.modified().ok()
+}
+
+fn validate_admitted_report(report: &LaunchProofRecord, file_name: &str) -> io::Result<()> {
+    if report.schema != LAUNCH_PROOF_SCHEMA
+        || report.schema_version != LAUNCH_PROOF_SCHEMA_VERSION
+        || report_filename(&report.session_id) != file_name
+        || !canonical_session_id(&report.session_id)
+        || sanitized_optional_token(&report.instance_id).as_deref()
+            != Some(report.instance_id.as_str())
+        || sanitized_optional_token(&report.version_id).as_deref()
+            != Some(report.version_id.as_str())
+        || !known_report_outcome(&report.outcome)
+        || !optional_session_outcome_is_canonical(report.session_outcome.as_ref())
+        || !session_outcome_matches_report_outcome(&report.outcome, report.session_outcome.as_ref())
+        || !canonical_report_timestamp(&report.launched_at)
+        || !canonical_report_timestamp(&report.recorded_at)
+        || report.recorded_at < report.launched_at
+        || report.scenario.scenario_id
+            != scenario_id_for_performance_mode(&report.scenario.performance_mode)
+        || !report_scenario_is_canonical(&report.scenario)
+        || !matches!(
+            report.device.tier.as_str(),
+            "low" | "mid" | "high" | "unknown"
+        )
+        || report.device.total_memory_mb == Some(0)
+        || report.device.cpu_threads == Some(0)
+        || report.stages.len() > MAX_EXPORT_STAGES
+        || report.stages.iter().any(|stage| {
+            sanitized_stage_record(stage) != *stage || !stage_timing_is_coherent(stage)
+        })
+        || !optional_bounded_text_is_canonical(report.failure_detail.as_deref())
+        || !optional_token_is_canonical(report.failure_class.as_deref())
+        || !optional_priority_is_canonical(report.priority.as_ref())
+        || !optional_guardian_is_canonical(report.guardian.as_ref())
+        || !optional_healing_is_canonical(report.healing.as_ref())
+        || report
+            .comparison
+            .as_ref()
+            .is_some_and(|comparison| !comparison_is_coherent(report, comparison))
+    {
+        return Err(invalid_report("launch report semantics are not current"));
+    }
+    Ok(())
+}
+
+fn comparison_is_coherent(report: &LaunchProofRecord, comparison: &LaunchProofComparison) -> bool {
+    let expected_percent =
+        (comparison.delta_ms as f64 / comparison.baseline_value_ms as f64) * 100.0;
+    comparison.baseline_session_id != report.session_id
+        && canonical_session_id(&comparison.baseline_session_id)
+        && canonical_report_timestamp(&comparison.baseline_recorded_at)
+        && (
+            &comparison.baseline_recorded_at,
+            &comparison.baseline_session_id,
+        ) < (&report.recorded_at, &report.session_id)
+        && comparison_baseline_is_compatible(report, &comparison.baseline)
+        && comparison.matched_sample_count > 0
+        && comparison.matched_sample_count <= MAX_STARTUP_REPORTS
+        && comparison.current_value_ms > 0
+        && comparison.baseline_value_ms > 0
+        && comparison.delta_ms
+            == metric_delta_ms(comparison.current_value_ms, comparison.baseline_value_ms)
+        && comparison.delta_percent.is_finite()
+        && (comparison.delta_percent - expected_percent).abs()
+            <= f64::EPSILON * expected_percent.abs().max(1.0) * 4.0
+        && matches!(
+            comparison.metric_name.as_str(),
+            LAUNCH_STAGE_COMPARISON_METRIC_NAME | LAUNCH_BOOT_COMPARISON_METRIC_NAME
+        )
+        && match comparison.metric_name.as_str() {
+            LAUNCH_STAGE_COMPARISON_METRIC_NAME => {
+                launch_total_completed_stage_duration_ms(report)
+                    == Some(comparison.current_value_ms)
+            }
+            LAUNCH_BOOT_COMPARISON_METRIC_NAME => {
+                report.boot_duration_ms == Some(comparison.current_value_ms)
+            }
+            _ => false,
+        }
+}
+
+fn comparison_baseline_is_compatible(
+    current: &LaunchProofRecord,
+    baseline: &LaunchProofComparisonBaseline,
+) -> bool {
+    matches!(
+        (
+            known_launch_mode(current),
+            baseline.performance_mode.as_str()
+        ),
+        (Some("managed"), "vanilla" | "managed")
+            | (Some("vanilla"), "vanilla")
+            | (Some("custom"), "custom")
+    ) && normalized_version_target(current) == Some(baseline.version_id.as_str())
+        && current.scenario.requested_memory_mb == baseline.requested_memory_mb
+        && normalized_dimension(&current.device.tier) == Some(baseline.device_tier.as_str())
+        && optional_benchmark_dimensions_match(
+            current.scenario.benchmark_profile.as_deref(),
+            baseline.benchmark_profile.as_deref(),
+        )
+        && optional_benchmark_dimensions_match(
+            current.scenario.benchmark_run_type.as_deref(),
+            baseline.benchmark_run_type.as_deref(),
+        )
+        && optional_benchmark_dimensions_match(
+            current.scenario.benchmark_mode.as_deref(),
+            baseline.benchmark_mode.as_deref(),
+        )
+        && sanitized_optional_token(&baseline.performance_mode).as_deref()
+            == Some(baseline.performance_mode.as_str())
+        && sanitized_optional_token(&baseline.version_id).as_deref()
+            == Some(baseline.version_id.as_str())
+        && sanitized_optional_token(&baseline.device_tier).as_deref()
+            == Some(baseline.device_tier.as_str())
+        && optional_benchmark_value_is_canonical(baseline.benchmark_profile.as_deref())
+        && optional_benchmark_value_is_canonical(baseline.benchmark_run_type.as_deref())
+        && baseline.benchmark_mode.as_deref().is_none_or(|value| {
+            matches!(
+                value,
+                "development" | "qualification" | "release_validation"
+            )
+        })
+}
+
+fn known_report_outcome(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        "running"
+            | "degraded"
+            | "failed"
+            | "exited"
+            | "completed"
+            | "stopped"
+            | "cancelled"
+            | "canceled"
+            | "unknown"
+    )
+}
+
+fn canonical_report_timestamp(value: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(value).is_ok_and(|timestamp| {
+        timestamp
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            == value
+    })
+}
+
+async fn reconcile_launch_report_cleanup(
+    state: Arc<Mutex<LaunchReportState>>,
+    persistence: Option<Arc<LaunchReportPersistence>>,
+    proof_retention: Arc<RwLock<BenchmarkProofRetentionHandle>>,
+    mutation: OwnedMutexGuard<()>,
+) -> (io::Result<()>, OwnedMutexGuard<()>) {
+    loop {
+        let retention = proof_retention
+            .read()
+            .expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT)
+            .clone();
+        let Some(protected_session_ids) = retention.retained_session_ids(MAX_STARTUP_REPORTS)
+        else {
+            return (
+                Err(invalid_report(
+                    "launch report retention claims exceed the current bound",
+                )),
+                mutation,
+            );
+        };
+        let selection_state = state.clone();
+        let selected = tokio::task::spawn_blocking(move || {
+            select_report_cleanup_candidate(&selection_state, &protected_session_ids)
+        })
+        .await;
+        let session_id = match selected {
+            Ok(Some(session_id)) => session_id,
+            Ok(None) => return (Ok(()), mutation),
+            Err(_) => {
+                return (
+                    Err(io::Error::other(
+                        "launch report retention selection task stopped",
+                    )),
+                    mutation,
+                );
+            }
+        };
+        let Some(_proof_prune) = retention.try_begin_prune(&session_id).await else {
+            let mut report_state = state.lock().expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT);
+            if report_state.cleanup_candidate.as_deref() == Some(session_id.as_str()) {
+                report_state.cleanup_candidate = None;
+            }
+            continue;
+        };
+
+        if let Some(persistence) = &persistence {
+            let path = report_path_in(&persistence.directory, &session_id);
+            let delete_session_id = session_id.clone();
+            let deletion = tokio::task::spawn_blocking(move || {
+                delete_launcher_managed_file(DeleteFileRequest::new(
+                    launch_report_target(&delete_session_id),
+                    &path,
+                ))
+            })
+            .await;
+            match deletion {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return (Err(io::Error::new(error.io_kind(), error)), mutation);
+                }
+                Err(_) => {
+                    return (
+                        Err(io::Error::other(
+                            "launch report retention deletion task stopped",
+                        )),
+                        mutation,
+                    );
+                }
+            }
+        }
+
+        let mut report_state = state.lock().expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT);
+        if report_state.cleanup_candidate.as_deref() == Some(session_id.as_str()) {
+            remove_committed_report(&mut report_state, &session_id);
+            report_state.cleanup_candidate = None;
+        }
+    }
+}
+
+fn select_report_cleanup_candidate(
+    state: &Arc<Mutex<LaunchReportState>>,
+    protected_session_ids: &HashSet<String>,
+) -> Option<String> {
+    let mut state = state.lock().expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT);
+    let protected_report_count = state
+        .reports
+        .keys()
+        .filter(|session_id| protected_session_ids.contains(*session_id))
+        .count();
+    let ordinary_limit = MAX_STARTUP_REPORTS.saturating_sub(protected_report_count);
+    let ordinary_count = state
+        .reports
+        .keys()
+        .filter(|session_id| !protected_session_ids.contains(*session_id))
+        .count();
+    if ordinary_count <= ordinary_limit {
+        state.cleanup_candidate = None;
+        return None;
+    }
+    if let Some(session_id) = state.cleanup_candidate.as_ref()
+        && state.reports.contains_key(session_id)
+        && !protected_session_ids.contains(session_id)
+    {
+        return Some(session_id.clone());
+    }
+    let selected = state.order.iter().find_map(|(_, session_id)| {
+        (!protected_session_ids.contains(session_id)).then(|| session_id.clone())
+    });
+    state.cleanup_candidate = selected.clone();
+    selected
+}
+
+fn report_scenario_is_canonical(scenario: &LaunchProofScenario) -> bool {
+    matches!(
+        scenario.performance_mode.as_str(),
+        "managed" | "vanilla" | "custom" | "unknown"
+    ) && scenario.requested_memory_mb.is_none_or(|value| value > 0)
+        && optional_token_is_canonical(scenario.version_id.as_deref())
+        && optional_benchmark_value_is_canonical(scenario.benchmark_profile.as_deref())
+        && optional_benchmark_value_is_canonical(scenario.benchmark_run_type.as_deref())
+        && optional_benchmark_value_is_canonical(scenario.benchmark_id.as_deref())
+        && scenario.benchmark_mode.as_deref().is_none_or(|value| {
+            matches!(
+                value,
+                "development" | "qualification" | "release_validation"
+            )
+        })
+}
+
+fn optional_benchmark_value_is_canonical(value: Option<&str>) -> bool {
+    value.is_none_or(|value| sanitize_benchmark_metadata(value).as_deref() == Some(value))
+}
+
+fn optional_token_is_canonical(value: Option<&str>) -> bool {
+    value.is_none_or(|value| sanitized_optional_token(value).as_deref() == Some(value))
+}
+
+fn optional_bounded_text_is_canonical(value: Option<&str>) -> bool {
+    value.is_none_or(|value| sanitized_bounded_text(value).as_deref() == Some(value))
+}
+
+fn optional_session_outcome_is_canonical(outcome: Option<&LaunchSessionOutcome>) -> bool {
+    outcome.is_none_or(|outcome| LaunchSessionOutcome::from_reason(outcome.reason) == *outcome)
+}
+
+fn session_outcome_matches_report_outcome(
+    report_outcome: &str,
+    session_outcome: Option<&LaunchSessionOutcome>,
+) -> bool {
+    let Some(session_outcome) = session_outcome else {
+        return true;
+    };
+    match report_outcome {
+        "running" | "degraded" => false,
+        "failed" => matches!(
+            session_outcome.kind,
+            LaunchSessionOutcomeKind::Failed | LaunchSessionOutcomeKind::Unknown
+        ),
+        "exited" => true,
+        "completed" => matches!(session_outcome.kind, LaunchSessionOutcomeKind::Clean),
+        "stopped" | "cancelled" | "canceled" => {
+            matches!(session_outcome.kind, LaunchSessionOutcomeKind::Stopped)
+        }
+        "unknown" => matches!(session_outcome.kind, LaunchSessionOutcomeKind::Unknown),
+        _ => false,
+    }
+}
+
+fn optional_priority_is_canonical(priority: Option<&LaunchProofPriority>) -> bool {
+    priority.is_none_or(|priority| {
+        sanitized_optional_token(&priority.start_mode).as_deref()
+            == Some(priority.start_mode.as_str())
+            && optional_bounded_text_is_canonical(priority.start_error.as_deref())
+            && optional_token_is_canonical(priority.promotion.as_deref())
+            && optional_bounded_text_is_canonical(priority.promotion_error.as_deref())
+    })
+}
+
+fn optional_guardian_is_canonical(guardian: Option<&Value>) -> bool {
+    guardian.is_none_or(|guardian| {
+        sanitized_guardian(guardian)
+            .and_then(|guardian| serde_json::to_value(guardian).ok())
+            .as_ref()
+            == Some(guardian)
+    })
+}
+
+fn optional_healing_is_canonical(healing: Option<&Value>) -> bool {
+    healing.is_none_or(|healing| {
+        sanitized_healing(healing)
+            .and_then(|healing| serde_json::to_value(healing).ok())
+            .as_ref()
+            == Some(healing)
+    })
+}
+
+fn stage_timing_is_coherent(stage: &LaunchStageRecord) -> bool {
+    match (stage.ended_at_ms, stage.duration_ms) {
+        (Some(ended_at), Some(duration)) => {
+            ended_at >= stage.started_at_ms
+                && ended_at.saturating_sub(stage.started_at_ms) == duration
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn canonical_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= MAX_REPORT_FILENAME_STEM
+        && session_id.bytes().all(|value| {
+            value.is_ascii_lowercase() || value.is_ascii_digit() || matches!(value, b'-' | b'_')
+        })
+}
+
+fn invalid_report(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn sort_reports(reports: &mut [LaunchProofRecord]) {
+    reports.sort_by(|left, right| {
+        right
+            .recorded_at
+            .cmp(&left.recorded_at)
+            .then_with(|| right.session_id.cmp(&left.session_id))
+    });
+}
+
+fn report_order(reports: &BTreeMap<String, LaunchProofRecord>) -> BTreeSet<(String, String)> {
+    reports
+        .values()
+        .map(|report| (report.recorded_at.clone(), report.session_id.clone()))
+        .collect()
+}
+
+fn insert_committed_report(state: &mut LaunchReportState, report: LaunchProofRecord) {
+    if let Some(previous) = state
+        .reports
+        .insert(report.session_id.clone(), report.clone())
+    {
+        state
+            .order
+            .remove(&(previous.recorded_at, previous.session_id));
+    }
+    state.order.insert((report.recorded_at, report.session_id));
+}
+
+fn remove_committed_report(state: &mut LaunchReportState, session_id: &str) {
+    if let Some(report) = state.reports.remove(session_id) {
+        state.order.remove(&(report.recorded_at, report.session_id));
+    }
+}
+
+fn list_recent_from_state(state: &LaunchReportState, limit: usize) -> Vec<LaunchProofRecord> {
+    state
+        .order
+        .iter()
+        .rev()
+        .take(limit)
+        .filter_map(|(_, session_id)| state.reports.get(session_id).cloned())
+        .collect()
+}
+
+fn report_is_terminal(outcome: &str) -> bool {
+    matches!(
+        outcome.trim(),
+        "failed" | "exited" | "completed" | "stopped" | "cancelled" | "canceled"
+    )
+}
+
+fn report_filename(session_id: &str) -> String {
+    format!("{session_id}.json")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::persistence::AtomicWriteBackend;
     use axial_config::AppPaths;
     use axial_launcher::service::HealingSummaryInput;
     use axial_launcher::{
-        LaunchFailure, LaunchFailureClass, LaunchState, SessionId, build_healing_summary,
-        launch_stage_label,
+        LaunchFailure, LaunchFailureClass, LaunchSessionExitReason, LaunchState, SessionId,
+        build_healing_summary, launch_stage_label,
     };
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::Notify;
+
+    struct RecordingBackend {
+        attempts: AtomicUsize,
+        failures: AtomicUsize,
+        committed: Mutex<Vec<Vec<u8>>>,
+        started: Notify,
+        gate: Mutex<Option<Arc<WriteGate>>>,
+    }
+
+    struct WriteGate {
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    struct WriteGateHandle(Arc<WriteGate>);
+
+    impl RecordingBackend {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                failures: AtomicUsize::new(0),
+                committed: Mutex::new(Vec::new()),
+                started: Notify::new(),
+                gate: Mutex::new(None),
+            }
+        }
+
+        fn fail_next(&self) {
+            self.failures.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn gate_next(&self) -> WriteGateHandle {
+            let gate = Arc::new(WriteGate {
+                released: Mutex::new(false),
+                changed: Condvar::new(),
+            });
+            *self.gate.lock().expect("backend gate lock") = Some(gate.clone());
+            WriteGateHandle(gate)
+        }
+
+        async fn wait_for_attempt(&self, expected: usize) {
+            loop {
+                let started = self.started.notified();
+                if self.attempts.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                started.await;
+            }
+        }
+
+        fn committed_reports(&self) -> Vec<LaunchProofRecord> {
+            self.committed
+                .lock()
+                .expect("committed report lock")
+                .iter()
+                .map(|contents| {
+                    serde_json::from_slice(contents).expect("decode committed launch report")
+                })
+                .collect()
+        }
+    }
+
+    impl AtomicWriteBackend for RecordingBackend {
+        fn write(
+            &self,
+            _target: &TargetDescriptor,
+            _destination: &Path,
+            contents: &[u8],
+        ) -> io::Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            if let Some(gate) = self.gate.lock().expect("backend gate lock").take() {
+                gate.wait();
+            }
+            if self
+                .failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |failures| {
+                    (failures > 0).then(|| failures - 1)
+                })
+                .is_ok()
+            {
+                return Err(io::Error::other("injected launch report write failure"));
+            }
+            self.committed
+                .lock()
+                .expect("committed report lock")
+                .push(contents.to_vec());
+            Ok(())
+        }
+    }
+
+    impl WriteGate {
+        fn release(&self) {
+            *self.released.lock().expect("write gate lock") = true;
+            self.changed.notify_all();
+        }
+
+        fn wait(&self) {
+            let mut released = self.released.lock().expect("write gate lock");
+            while !*released {
+                released = self.changed.wait(released).expect("wait on write gate");
+            }
+        }
+    }
+
+    impl WriteGateHandle {
+        fn release(&self) {
+            self.0.release();
+        }
+    }
+
+    impl Drop for WriteGateHandle {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    fn persist_test_report(
+        paths: &AppPaths,
+        record: &LaunchSessionRecord,
+        launched_at: Option<&str>,
+        outcome: &str,
+    ) -> io::Result<LaunchProofRecord> {
+        persist_test_report_with_context(paths, record, launched_at, outcome, None)
+    }
+
+    fn persist_test_report_with_context(
+        paths: &AppPaths,
+        record: &LaunchSessionRecord,
+        launched_at: Option<&str>,
+        outcome: &str,
+        context: Option<&LaunchProofContext>,
+    ) -> io::Result<LaunchProofRecord> {
+        let store = LaunchReportStore::load_from_paths_for_test(paths);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build launch report test runtime")
+            .block_on(store.persist(
+                record.clone(),
+                launched_at.map(str::to_string),
+                outcome.to_string(),
+                context.cloned(),
+            ))
+    }
+
+    fn load_test_report(
+        paths: &AppPaths,
+        session_id: &str,
+    ) -> io::Result<Option<LaunchProofRecord>> {
+        match load_admitted_report(&report_path(paths, session_id)) {
+            Ok(report) => Ok(Some(report)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn list_test_reports(paths: &AppPaths, limit: usize) -> io::Result<Vec<LaunchProofRecord>> {
+        let (reports, issues) = load_report_index(&report_dir(paths), &HashSet::new());
+        if issues != 0 {
+            return Err(invalid_report(
+                "launch report index contains rejected input",
+            ));
+        }
+        let mut reports = reports.into_values().collect::<Vec<_>>();
+        sort_reports(&mut reports);
+        reports.truncate(limit);
+        Ok(reports)
+    }
 
     #[test]
-    fn launch_report_path_sanitizes_session_id_to_config_subdirectory() {
+    fn launch_report_path_requires_canonical_session_id() {
         let root = test_root("safe-path");
         let paths = test_paths(&root);
 
-        let path = report_path(&paths, "../bad/session\\id:?");
+        let path = report_path(&paths, "canonical-session_1");
 
         assert_eq!(path.parent(), Some(report_dir(&paths).as_path()));
         assert_eq!(
             path.file_name().and_then(|value| value.to_str()),
-            Some("bad_session_id.json")
+            Some("canonical-session_1.json")
         );
         assert!(path.starts_with(paths.config_dir.join("benchmarks").join("launch")));
+        assert!(!canonical_session_id("../bad/session\\id:?"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancelled_report_commit_stays_hidden_then_publishes_and_releases_writer() {
+        let (root, backend, store) = persistence_fixture("cancelled-commit");
+        let store = Arc::new(store);
+        let gate = backend.gate_next();
+        let task_store = store.clone();
+        let task = tokio::spawn(async move {
+            task_store
+                .persist(
+                    test_record("cancelled-commit"),
+                    None,
+                    "running".to_string(),
+                    None,
+                )
+                .await
+        });
+
+        backend.wait_for_attempt(1).await;
+        assert!(store.load("cancelled-commit").is_none());
+        task.abort();
+        assert!(task.await.expect_err("caller cancelled").is_cancelled());
+        gate.release();
+        store.close().await.expect("observer settles before close");
+
+        assert_eq!(store.load("cancelled-commit").unwrap().outcome, "running");
+        assert_eq!(backend.committed_reports().len(), 1);
+        assert!(
+            store
+                .state
+                .lock()
+                .expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT)
+                .writers
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancelled_over_capacity_commit_still_finishes_retention_cleanup() {
+        let (root, backend, store) = persistence_fixture("cancelled-retention");
+        let store = Arc::new(store);
+        let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00.000Z")
+            .expect("parse start timestamp")
+            .with_timezone(&chrono::Utc);
+        for index in 0..MAX_STARTUP_REPORTS {
+            let timestamp = (start + chrono::Duration::milliseconds(index as i64))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            store.insert_unchecked_for_test(comparison_report(
+                &format!("retained-{index}"),
+                &timestamp,
+                90,
+            ));
+        }
+        let gate = backend.gate_next();
+        let task_store = store.clone();
+        let task = tokio::spawn(async move {
+            task_store
+                .persist(
+                    test_record("cancelled-retention"),
+                    None,
+                    "running".to_string(),
+                    None,
+                )
+                .await
+        });
+
+        backend.wait_for_attempt(1).await;
+        task.abort();
+        assert!(task.await.expect_err("caller cancelled").is_cancelled());
+        gate.release();
+        store
+            .close()
+            .await
+            .expect("close waits for detached retention");
+
+        assert!(store.load("cancelled-retention").is_some());
+        assert!(store.load("retained-0").is_none());
+        assert_eq!(
+            store.list_recent(MAX_STARTUP_REPORTS + 1).len(),
+            MAX_STARTUP_REPORTS
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failed_retention_delete_blocks_then_retries_exact_oldest_report_on_close() {
+        let (root, _backend, store) = persistence_fixture("retention-delete-retry");
+        let paths = test_paths(&root);
+        let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00.000Z")
+            .expect("parse start timestamp")
+            .with_timezone(&chrono::Utc);
+        for index in 0..MAX_STARTUP_REPORTS {
+            let timestamp = (start + chrono::Duration::milliseconds(index as i64))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            store.insert_unchecked_for_test(comparison_report(
+                &format!("retained-{index}"),
+                &timestamp,
+                90,
+            ));
+        }
+        let blocked_path = report_path(&paths, "retained-0");
+        fs::create_dir_all(&blocked_path).expect("block retention deletion with directory");
+
+        assert!(
+            store
+                .persist(
+                    test_record("retention-delete-retry"),
+                    None,
+                    "running".to_string(),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert!(store.load("retention-delete-retry").is_some());
+        assert!(store.load("retained-0").is_some());
+        assert_eq!(
+            store
+                .state
+                .lock()
+                .expect(LAUNCH_REPORT_STORE_LOCK_INVARIANT)
+                .cleanup_candidate
+                .as_deref(),
+            Some("retained-0")
+        );
+
+        fs::remove_dir(&blocked_path).expect("unblock retention deletion");
+        store.close().await.expect("close retries exact cleanup");
+
+        assert!(store.load("retained-0").is_none());
+        assert_eq!(
+            store.list_recent(MAX_STARTUP_REPORTS + 1).len(),
+            MAX_STARTUP_REPORTS
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ordered_index_selects_oldest_unprotected_report_at_absolute_capacity() {
+        let store = LaunchReportStore::in_memory();
+        let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00.000Z")
+            .expect("parse start timestamp")
+            .with_timezone(&chrono::Utc);
+        for index in 0..=MAX_STARTUP_REPORTS {
+            let timestamp = (start + chrono::Duration::milliseconds(index as i64))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            store.insert_unchecked_for_test(comparison_report(
+                &format!("report-{index}"),
+                &timestamp,
+                90,
+            ));
+        }
+        let protected = HashSet::from(["report-0".to_string()]);
+
+        let selected = select_report_cleanup_candidate(&store.state, &protected)
+            .expect("over-capacity index selects cleanup");
+
+        assert_eq!(selected, "report-1");
+        assert_eq!(store.list_recent(1)[0].session_id, "report-1024");
+        assert!(store.load("report-0").is_some());
+    }
+
+    #[tokio::test]
+    async fn committed_suite_claim_protects_proof_before_report_retention_runs() {
+        let suites = crate::state::benchmark_suites::BenchmarkSuiteStore::new();
+        let mode = "development";
+        let suite_id = crate::state::benchmark_suites::derive_suite_id("instance", mode);
+        let plan = crate::application::performance::benchmark_suite_plan(mode)
+            .expect("development suite plan");
+        let runs =
+            crate::application::performance::benchmark_suite_manifest_run_inputs(mode, &plan);
+        let selection = suites
+            .select_reservation(&suite_id, "instance", mode, &runs, Some(0))
+            .await
+            .expect("select suite reservation");
+        suites
+            .reserve(selection, "report-0", "2026-01-01T00:00:00.000Z", false)
+            .await
+            .expect("commit suite claim before proof");
+        let store = LaunchReportStore::in_memory();
+        store.bind_proof_retention(suites.proof_retention_handle());
+        let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00.000Z")
+            .expect("parse start timestamp")
+            .with_timezone(&chrono::Utc);
+        for index in 0..=MAX_STARTUP_REPORTS {
+            let timestamp = (start + chrono::Duration::milliseconds(index as i64))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            store.insert_unchecked_for_test(comparison_report(
+                &format!("report-{index}"),
+                &timestamp,
+                90,
+            ));
+        }
+
+        let mutation = store.mutation_gate.clone().lock_owned().await;
+        let mutation = store
+            .reconcile_cleanup_holding_gate(mutation)
+            .await
+            .expect("retention cleanup succeeds");
+        drop(mutation);
+
+        assert!(store.load("report-0").is_some());
+        assert!(store.load("report-1").is_none());
+        assert_eq!(
+            store.list_recent(MAX_STARTUP_REPORTS + 1).len(),
+            MAX_STARTUP_REPORTS
+        );
+    }
+
+    #[tokio::test]
+    async fn later_report_retries_exact_failed_revision_before_terminal_candidate() {
+        let (root, backend, store) = persistence_fixture("exact-retry");
+        backend.fail_next();
+        assert!(
+            store
+                .persist(
+                    test_record("exact-retry"),
+                    None,
+                    "running".to_string(),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert!(store.load("exact-retry").is_none());
+
+        store
+            .persist(test_record("exact-retry"), None, "failed".to_string(), None)
+            .await
+            .expect("retry running then commit failed");
+
+        assert_eq!(
+            backend
+                .committed_reports()
+                .iter()
+                .map(|report| report.outcome.as_str())
+                .collect::<Vec<_>>(),
+            vec!["running", "failed"]
+        );
+        assert_eq!(store.load("exact-retry").unwrap().outcome, "failed");
+        store.close().await.expect("close report store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn terminal_report_cannot_be_downgraded_by_late_running_revision() {
+        let (root, backend, store) = persistence_fixture("terminal-downgrade");
+        let terminal = store
+            .persist(
+                test_record("terminal-downgrade"),
+                None,
+                "failed".to_string(),
+                None,
+            )
+            .await
+            .expect("commit terminal report");
+
+        let observed = store
+            .persist(
+                test_record("terminal-downgrade"),
+                None,
+                "running".to_string(),
+                None,
+            )
+            .await
+            .expect("late running is a no-op");
+
+        assert_eq!(observed, terminal);
+        assert_eq!(backend.committed_reports().len(), 1);
+        assert_eq!(store.load("terminal-downgrade"), Some(terminal));
+        store.close().await.expect("close report store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn close_retries_exact_failed_report_and_is_idempotent() {
+        let (root, backend, store) = persistence_fixture("close-retry");
+        backend.fail_next();
+        assert!(
+            store
+                .persist(test_record("close-retry"), None, "failed".to_string(), None,)
+                .await
+                .is_err()
+        );
+
+        store.close().await.expect("close retries exact report");
+        store.close().await.expect("close is idempotent");
+
+        assert_eq!(backend.committed_reports().len(), 1);
+        assert_eq!(store.load("close-retry").unwrap().outcome, "failed");
+        assert!(
+            store
+                .persist(test_record("post-close"), None, "running".to_string(), None,)
+                .await
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_hostile_and_forged_reports_without_rewrite() {
+        let root = test_root("hostile-startup");
+        let paths = test_paths(&root);
+        let directory = report_dir(&paths);
+        fs::create_dir_all(&directory).expect("create report directory");
+        let baseline = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 100);
+        seed_report(&directory, &baseline);
+        let mut forged = comparison_report("forged", "2026-01-02T00:00:00.000Z", 120);
+        forged.comparison =
+            build_comparison_from_candidates(&forged, std::slice::from_ref(&baseline));
+        forged
+            .comparison
+            .as_mut()
+            .expect("comparison")
+            .delta_percent += 1.0;
+        seed_report(&directory, &forged);
+        let mut forged_outcome =
+            comparison_report("forged-outcome", "2026-01-03T00:00:00.000Z", 130);
+        forged_outcome.session_outcome = Some(LaunchSessionOutcome::from_reason(
+            LaunchSessionExitReason::CrashedAfterBoot,
+        ));
+        forged_outcome
+            .session_outcome
+            .as_mut()
+            .expect("session outcome")
+            .summary = "/home/Secret --access-token raw-secret".to_string();
+        seed_report(&directory, &forged_outcome);
+        let mut forged_dimensions =
+            comparison_report("forged-dimensions", "2026-01-04T00:00:00.000Z", 140);
+        forged_dimensions.comparison =
+            build_comparison_from_candidates(&forged_dimensions, std::slice::from_ref(&baseline));
+        forged_dimensions
+            .comparison
+            .as_mut()
+            .expect("comparison")
+            .baseline
+            .version_id = "1.20.1".to_string();
+        seed_report(&directory, &forged_dimensions);
+        let mut future_baseline =
+            comparison_report("future-baseline", "2026-01-05T00:00:00.000Z", 150);
+        future_baseline.comparison =
+            build_comparison_from_candidates(&future_baseline, std::slice::from_ref(&baseline));
+        future_baseline
+            .comparison
+            .as_mut()
+            .expect("comparison")
+            .baseline_recorded_at = "2027-01-01T00:00:00.000Z".to_string();
+        seed_report(&directory, &future_baseline);
+        let mut contradictory = comparison_report("contradictory", "2026-01-06T00:00:00.000Z", 160);
+        contradictory.outcome = "running".to_string();
+        contradictory.session_outcome = Some(LaunchSessionOutcome::from_reason(
+            LaunchSessionExitReason::CrashedAfterBoot,
+        ));
+        seed_report(&directory, &contradictory);
+        let hostile_path = directory.join("hostile.json");
+        fs::write(
+            &hostile_path,
+            br#"{"schema":"foreign","secret":"preserve"}"#,
+        )
+        .expect("seed hostile report");
+        let hostile_bytes = fs::read(&hostile_path).expect("read hostile report");
+
+        let store = LaunchReportStore::load_from_paths_for_test(&paths);
+
+        assert_eq!(store.list_recent(10), vec![baseline]);
+        assert_eq!(store.load_issue_count(), 6);
+        assert!(
+            store
+                .persist(
+                    test_record("new-after-rejection"),
+                    None,
+                    "running".to_string(),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(hostile_path).expect("reread hostile"),
+            hostile_bytes
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_rejects_symlinked_report_without_following_or_rewriting_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("symlink-startup");
+        let paths = test_paths(&root);
+        let directory = report_dir(&paths);
+        fs::create_dir_all(&directory).expect("create report directory");
+        let outside = root.join("outside.json");
+        fs::write(&outside, b"preserve-outside").expect("seed outside file");
+        symlink(&outside, directory.join("linked.json")).expect("create report symlink");
+
+        let store = LaunchReportStore::load_from_paths_for_test(&paths);
+
+        assert!(store.list_recent(10).is_empty());
+        assert_eq!(store.load_issue_count(), 1);
+        assert_eq!(
+            fs::read(outside).expect("reread outside"),
+            b"preserve-outside"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_rejects_symlinked_report_directory_and_latches_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("symlinked-directory-startup");
+        let paths = test_paths(&root);
+        let directory = report_dir(&paths);
+        fs::create_dir_all(directory.parent().expect("report directory parent"))
+            .expect("create report directory parent");
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).expect("create outside directory");
+        let sentinel = outside.join("sentinel");
+        fs::write(&sentinel, b"preserve-outside").expect("seed outside file");
+        symlink(&outside, &directory).expect("create report directory symlink");
+
+        let store = LaunchReportStore::load_from_paths_for_test(&paths);
+
+        assert!(store.list_recent(10).is_empty());
+        assert_eq!(store.load_issue_count(), 1);
+        assert!(
+            store
+                .persist(
+                    test_record("new-after-symlink"),
+                    None,
+                    "running".to_string(),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(sentinel).expect("reread outside"),
+            b"preserve-outside"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_load_issue_count_is_bounded() {
+        let root = test_root("bounded-issues");
+        let paths = test_paths(&root);
+        let directory = report_dir(&paths);
+        fs::create_dir_all(&directory).expect("create report directory");
+        for index in 0..(MAX_LOAD_ISSUES + 4) {
+            fs::write(directory.join(format!("invalid-{index}.json")), b"not-json")
+                .expect("seed invalid report");
+        }
+
+        let store = LaunchReportStore::load_from_paths_for_test(&paths);
+
+        assert_eq!(store.load_issue_count(), MAX_LOAD_ISSUES);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn startup_file_count_overflow_latches_without_rewriting_input() {
+        let root = test_root("startup-file-count-overflow");
+        let paths = test_paths(&root);
+        let directory = report_dir(&paths);
+        fs::create_dir_all(&directory).expect("create report directory");
+        for index in 0..=MAX_STARTUP_REPORTS {
+            fs::write(
+                directory.join(format!("overflow-{index}.json")),
+                b"preserve",
+            )
+            .expect("seed overflow input");
+        }
+        let sentinel = directory.join(format!("overflow-{MAX_STARTUP_REPORTS}.json"));
+
+        let store = LaunchReportStore::load_from_paths_for_test(&paths);
+
+        assert!(store.load_issue_count() > 0);
+        assert!(store.list_recent(1).is_empty());
+        assert!(
+            store
+                .persist(
+                    test_record("blocked-after-overflow"),
+                    None,
+                    "running".to_string(),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(sentinel).expect("reread overflow input"),
+            b"preserve"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1138,9 +2787,9 @@ mod tests {
         });
 
         let first_proof =
-            persist_record(&paths, &first, Some("2026-01-02T03:04:05.000Z"), "failed")
+            persist_test_report(&paths, &first, Some("2026-01-02T03:04:05.000Z"), "failed")
                 .expect("persist first report");
-        let second = persist_record(&paths, &test_record("second"), None, "running")
+        let second = persist_test_report(&paths, &test_record("second"), None, "running")
             .expect("persist second report");
 
         assert!(
@@ -1162,7 +2811,7 @@ mod tests {
         assert_eq!(first_proof.pid, Some(11));
         assert_eq!(first_proof.boot_duration_ms, None);
         assert_eq!(first_proof.launched_at, "2026-01-02T03:04:05.000Z");
-        assert_eq!(first_proof.guardian, Some(json!({ "mode": "managed" })));
+        assert_eq!(first_proof.guardian, None);
         assert_eq!(first_proof.scenario.scenario_id, "unknown_launch");
         assert_eq!(first_proof.scenario.performance_mode, "unknown");
         assert_eq!(first_proof.scenario.version_id.as_deref(), Some("1.21.1"));
@@ -1188,13 +2837,13 @@ mod tests {
         assert!(!persisted_json.contains("-Xmx2048M"));
         assert!(!persisted_json.contains("java_path"));
 
-        let loaded = load(&paths, "first")
+        let loaded = load_test_report(&paths, "first")
             .expect("load report")
             .expect("report exists");
         assert_eq!(loaded.session_id, "first");
         assert_eq!(loaded.outcome, "failed");
 
-        let recent = list_recent(&paths, 10).expect("list reports");
+        let recent = list_test_reports(&paths, 10).expect("list reports");
         assert_eq!(recent.len(), 2);
         assert!(
             recent
@@ -1229,7 +2878,7 @@ mod tests {
             },
         ];
 
-        let proof = persist_record(&paths, &record, None, "running")
+        let proof = persist_test_report(&paths, &record, None, "running")
             .expect("persist stage evidence report");
         assert_eq!(proof.stages[0].evidence.len(), 1);
         assert_eq!(
@@ -1270,7 +2919,7 @@ mod tests {
         )
         .expect("write report");
 
-        let error = load(&paths, "missing-current-fields")
+        let error = load_test_report(&paths, "missing-current-fields")
             .expect_err("missing scenario/device/stages should be invalid");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
@@ -1286,7 +2935,7 @@ mod tests {
         record.boot_completed_at_ms = Some(5_250);
         record.boot_duration_ms = Some(4_250);
 
-        let proof = persist_record(&paths, &record, None, "running")
+        let proof = persist_test_report(&paths, &record, None, "running")
             .expect("persist report with boot duration");
 
         assert_eq!(proof.boot_duration_ms, Some(4_250));
@@ -1296,7 +2945,7 @@ mod tests {
         assert!(!persisted_json.contains("process_started_at_ms"));
         assert!(!persisted_json.contains("boot_completed_at_ms"));
 
-        let loaded = load(&paths, "boot-duration")
+        let loaded = load_test_report(&paths, "boot-duration")
             .expect("load report")
             .expect("report exists");
         assert_eq!(loaded.boot_duration_ms, Some(4_250));
@@ -1316,8 +2965,8 @@ mod tests {
             promotion_error: None,
         });
 
-        let proof =
-            persist_record(&paths, &record, None, "running").expect("persist priority evidence");
+        let proof = persist_test_report(&paths, &record, None, "running")
+            .expect("persist priority evidence");
 
         assert_eq!(
             proof.priority,
@@ -1338,7 +2987,7 @@ mod tests {
         assert!(!persisted_json.contains("process_started_at_ms"));
         assert!(!persisted_json.contains("boot_completed_at_ms"));
 
-        let loaded = load(&paths, "priority-evidence")
+        let loaded = load_test_report(&paths, "priority-evidence")
             .expect("load report")
             .expect("report exists");
         assert_eq!(loaded.priority, proof.priority);
@@ -1379,7 +3028,7 @@ mod tests {
         )
         .expect("write report");
 
-        let loaded = load(&paths, "benchmark-free")
+        let loaded = load_test_report(&paths, "benchmark-free")
             .expect("load report")
             .expect("report exists");
 
@@ -1429,11 +3078,39 @@ mod tests {
         )
         .expect("write report");
 
-        let error = load(&paths, "priority-unknown-field")
+        let error = load_test_report(&paths, "priority-unknown-field")
             .expect_err("unknown priority field should be invalid");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_report_nested_current_types_reject_unknown_fields() {
+        let mut report = comparison_report("nested-fields", "2026-01-01T00:00:00.000Z", 90);
+        report.session_outcome = Some(LaunchSessionOutcome::from_reason(
+            LaunchSessionExitReason::CrashedAfterBoot,
+        ));
+        report.stages[0].evidence.push(LaunchStageEvidence {
+            id: "process_exit".to_string(),
+            system: "execution".to_string(),
+            summary: "The process exited.".to_string(),
+            details: Vec::new(),
+        });
+        let value = serde_json::to_value(report).expect("serialize report");
+
+        for path in ["session_outcome", "stage", "evidence"] {
+            let mut candidate = value.clone();
+            match path {
+                "session_outcome" => {
+                    candidate["session_outcome"]["legacy"] = json!(true);
+                }
+                "stage" => candidate["stages"][0]["legacy"] = json!(true),
+                "evidence" => candidate["stages"][0]["evidence"][0]["legacy"] = json!(true),
+                _ => unreachable!(),
+            }
+            assert!(serde_json::from_value::<LaunchProofRecord>(candidate).is_err());
+        }
     }
 
     #[test]
@@ -1452,6 +3129,62 @@ mod tests {
         assert_eq!(comparison.baseline_value_ms, 120);
         assert_eq!(comparison.delta_ms, -30);
         assert_eq!(comparison.delta_percent, -25.0);
+    }
+
+    #[test]
+    fn qualification_baseline_check_rejects_mutated_baseline_revision() {
+        let current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        let mut baseline = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 120);
+        let comparison = build_comparison_from_candidates(&current, &[baseline.clone()])
+            .expect("matching report comparison");
+        assert!(comparison_baseline_matches_report(&comparison, &baseline));
+
+        baseline.stages[0].duration_ms = Some(121);
+        baseline.stages[0].ended_at_ms = Some(1_121);
+
+        assert!(!comparison_baseline_matches_report(&comparison, &baseline));
+    }
+
+    #[test]
+    fn self_contained_comparison_survives_missing_baseline_and_restart() {
+        let root = test_root("comparison-with-pruned-baseline");
+        let paths = test_paths(&root);
+        let directory = report_dir(&paths);
+        fs::create_dir_all(&directory).expect("create report directory");
+        let baseline = comparison_report("baseline", "2026-01-01T00:00:00.000Z", 120);
+        let mut current = comparison_report("current", "2026-01-02T00:00:00.000Z", 90);
+        current.comparison =
+            build_comparison_from_candidates(&current, std::slice::from_ref(&baseline));
+        seed_report(&directory, &current);
+
+        let store = LaunchReportStore::load_from_paths_for_test(&paths);
+
+        assert_eq!(store.load_issue_count(), 0);
+        assert_eq!(store.load("current"), Some(current));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn three_report_history_remains_current_after_restart() {
+        let root = test_root("comparison-history-restart");
+        let paths = test_paths(&root);
+        let directory = report_dir(&paths);
+        fs::create_dir_all(&directory).expect("create report directory");
+        let first = comparison_report("first", "2026-01-01T00:00:00.000Z", 120);
+        let mut second = comparison_report("second", "2026-01-02T00:00:00.000Z", 100);
+        second.comparison = build_comparison_from_candidates(&second, std::slice::from_ref(&first));
+        let mut third = comparison_report("third", "2026-01-03T00:00:00.000Z", 90);
+        third.comparison =
+            build_comparison_from_candidates(&third, &[first.clone(), second.clone()]);
+        for report in [&first, &second, &third] {
+            seed_report(&directory, report);
+        }
+
+        let store = LaunchReportStore::load_from_paths_for_test(&paths);
+
+        assert_eq!(store.load_issue_count(), 0);
+        assert_eq!(store.list_recent(3), vec![third, second, first]);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1739,10 +3472,12 @@ mod tests {
         let baseline = test_record_with_stage_duration("baseline", 120);
         let current = test_record_with_stage_duration("current", 90);
 
-        let first = persist_record_with_context(&paths, &baseline, None, "exited", Some(&context))
-            .expect("persist baseline report");
-        let second = persist_record_with_context(&paths, &current, None, "exited", Some(&context))
-            .expect("persist current report");
+        let first =
+            persist_test_report_with_context(&paths, &baseline, None, "exited", Some(&context))
+                .expect("persist baseline report");
+        let second =
+            persist_test_report_with_context(&paths, &current, None, "exited", Some(&context))
+                .expect("persist current report");
 
         assert_eq!(first.comparison, None);
         let comparison = second.comparison.expect("persisted comparison");
@@ -1780,7 +3515,7 @@ mod tests {
             resource_budget: None,
         };
 
-        let proof = persist_record_with_context(
+        let proof = persist_test_report_with_context(
             &paths,
             &record,
             Some("2026-01-02T03:04:05.000Z"),
@@ -1843,7 +3578,7 @@ mod tests {
             cpu_pressure: true,
             install_pressure: true,
             launch_disk_available_mb: Some(1536),
-            launch_disk_headroom_mb: LAUNCH_DISK_HEADROOM_MB,
+            launch_disk_headroom_mb: axial_launcher::LAUNCH_DISK_HEADROOM_MB,
             disk_pressure: true,
         };
         let context = LaunchProofContext {
@@ -1854,8 +3589,9 @@ mod tests {
             resource_budget: Some(resource_budget.clone()),
         };
 
-        let proof = persist_record_with_context(&paths, &record, None, "running", Some(&context))
-            .expect("persist report");
+        let proof =
+            persist_test_report_with_context(&paths, &record, None, "running", Some(&context))
+                .expect("persist report");
 
         assert_eq!(proof.resource_budget, Some(resource_budget));
         let persisted_json = fs::read_to_string(report_path(&paths, "resource-budget"))
@@ -1901,7 +3637,7 @@ mod tests {
         .expect("build healing");
         record.healing = serde_json::to_value(healing).ok();
 
-        let proof = persist_record(&paths, &record, None, "running").expect("persist report");
+        let proof = persist_test_report(&paths, &record, None, "running").expect("persist report");
 
         assert!(proof.healing.is_some());
         let persisted_json = fs::read_to_string(report_path(&paths, "healing-privacy"))
@@ -1978,7 +3714,7 @@ mod tests {
         )
         .expect("write report");
 
-        let error = load(&paths, "resource-budget-missing-current-fields")
+        let error = load_test_report(&paths, "resource-budget-missing-current-fields")
             .expect_err("missing current resource budget pressure fields should be invalid");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
@@ -1994,6 +3730,87 @@ mod tests {
         assert_eq!(development.mode.as_deref(), Some("development"));
         assert_eq!(qualification.mode.as_deref(), Some("qualification"));
         assert_eq!(release.mode.as_deref(), Some("release_validation"));
+    }
+
+    #[test]
+    fn benchmark_metadata_drops_sensitive_client_controlled_values() {
+        let metadata = LaunchBenchmarkMetadata::new(
+            Some("/home/alice/token=secret"),
+            Some("C:\\Users\\Alice\\profile"),
+            Some("--access-token raw-secret"),
+            Some("release_validation"),
+        );
+
+        assert_eq!(metadata.benchmark_id, None);
+        assert_eq!(metadata.profile, None);
+        assert_eq!(metadata.run_type, None);
+        assert_eq!(metadata.mode.as_deref(), Some("release_validation"));
+
+        let context = LaunchProofContext {
+            performance_mode: "managed".to_string(),
+            requested_memory_mb: Some(4096),
+            version_id: Some("1.21.4".to_string()),
+            benchmark: Some(metadata),
+            resource_budget: None,
+        };
+        let proof = build_record(
+            &test_record("sensitive-benchmark"),
+            None,
+            "running",
+            Some(&context),
+        );
+        let serialized = serde_json::to_string(&proof).expect("serialize proof");
+        assert_eq!(proof.scenario.benchmark_id, None);
+        assert_eq!(proof.scenario.benchmark_profile, None);
+        assert_eq!(proof.scenario.benchmark_run_type, None);
+        assert!(!serialized.contains("alice"));
+        assert!(!serialized.contains("secret"));
+    }
+
+    #[test]
+    fn launch_report_size_bound_fits_maximum_sanitized_stage_shape() {
+        let mut report = comparison_report("maximum-shape", "2026-01-01T00:00:00.000Z", 90);
+        let detail = "a".repeat(MAX_EXPORT_DETAIL_CHARS);
+        let evidence = LaunchStageEvidence {
+            id: "bounded_evidence".to_string(),
+            system: "execution".to_string(),
+            summary: detail.clone(),
+            details: vec![detail.clone(); MAX_REPORT_EVIDENCE_DETAILS],
+        };
+        report.stages = (0..MAX_EXPORT_STAGES)
+            .map(|index| LaunchStageRecord {
+                stage: format!("stage_{index}"),
+                label: "Bounded stage".to_string(),
+                started_at_ms: index as u64,
+                ended_at_ms: Some(index as u64 + 1),
+                duration_ms: Some(1),
+                result: Some("completed".to_string()),
+                warnings: vec![detail.clone(); MAX_EXPORT_DETAILS],
+                fallback_reason: Some(detail.clone()),
+                evidence: vec![evidence.clone(); MAX_REPORT_STAGE_EVIDENCE],
+            })
+            .collect();
+
+        let bytes = encode_launch_report(report).expect("maximum sanitized report fits");
+        assert!(bytes.len() as u64 <= MAX_REPORT_BYTES);
+    }
+
+    #[test]
+    fn launch_report_loader_rejects_file_over_size_bound() {
+        let root = test_root("oversized-report");
+        let paths = test_paths(&root);
+        let directory = report_dir(&paths);
+        fs::create_dir_all(&directory).expect("create report directory");
+        fs::write(
+            report_path(&paths, "oversized-report"),
+            vec![b'x'; MAX_REPORT_BYTES as usize + 1],
+        )
+        .expect("seed oversized report");
+
+        let error = load_test_report(&paths, "oversized-report")
+            .expect_err("oversized report must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2028,8 +3845,9 @@ mod tests {
         assert_eq!(context.benchmark, None);
         assert_eq!(context.resource_budget, None);
 
-        let proof = persist_record_with_context(&paths, &record, None, "running", Some(&context))
-            .expect("persist report");
+        let proof =
+            persist_test_report_with_context(&paths, &record, None, "running", Some(&context))
+                .expect("persist report");
 
         assert_eq!(proof.scenario.benchmark_profile, None);
         assert_eq!(proof.scenario.benchmark_run_type, None);
@@ -2177,6 +3995,35 @@ mod tests {
         record.stages[0].ended_at_ms = Some(1_000 + duration_ms);
         record.stages[0].duration_ms = Some(duration_ms);
         record
+    }
+
+    fn seed_report(directory: &Path, report: &LaunchProofRecord) {
+        fs::write(
+            directory.join(report_filename(&report.session_id)),
+            encode_launch_report(report.clone()).expect("encode report fixture"),
+        )
+        .expect("write report fixture");
+    }
+
+    fn test_store_with_recording_backend(
+        paths: &AppPaths,
+    ) -> (Arc<RecordingBackend>, LaunchReportStore) {
+        let backend = Arc::new(RecordingBackend::new());
+        let coordinator = PersistenceCoordinator::for_test(
+            backend.clone(),
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
+        let store = LaunchReportStore::load_from_paths_with_coordinator(paths, coordinator)
+            .expect("load launch report store");
+        (backend, store)
+    }
+
+    fn persistence_fixture(name: &str) -> (PathBuf, Arc<RecordingBackend>, LaunchReportStore) {
+        let root = test_root(name);
+        let paths = test_paths(&root);
+        let (backend, store) = test_store_with_recording_backend(&paths);
+        (root, backend, store)
     }
 
     fn test_root(name: &str) -> PathBuf {

@@ -86,10 +86,12 @@ async fn serve_api(state: AppState, addr: SocketAddr) -> Result<(), Box<dyn std:
     let _ = axial_api::routes::flush_pending_saved_skin_applies_for_shutdown(&state).await;
     let auth_close_result = state.close_secure_auth().await;
     let remote_flags_close_result = state.close_remote_flags().await;
+    let launch_reports_close_result = state.close_launch_reports().await;
 
     serve_result?;
     auth_close_result?;
     remote_flags_close_result?;
+    launch_reports_close_result?;
     Ok(())
 }
 

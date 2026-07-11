@@ -36,7 +36,7 @@ use axial_minecraft::paths::assets_dir;
 use failure::{fail_launch, fail_launch_for_journal, fail_launch_with_outcome};
 use metadata::persist_launch_metadata;
 use prewarm::{format_prewarm_run_summary, prewarm_launch_plan};
-use proof::persist_launch_proof_best_effort_with_context;
+use proof::persist_launch_proof_with_context;
 use recovery::{
     apply_prepare_recovery_directive, apply_startup_recovery_directive,
     block_guardian_for_suppressed_launch_recovery, block_guardian_with_user_outcome,
@@ -51,7 +51,7 @@ use status::{emit_status, launch_state_for_preparation_event, serialize_guardian
 use tokio::process::Command;
 
 pub use failure::sanitize_live_launch_failure_message;
-pub use proof::persist_launch_proof_best_effort;
+pub(in crate::application::launch) use proof::persist_launch_proof;
 
 pub(super) async fn persist_launch_proof_for_reservation_failure(
     state: &AppState,
@@ -59,7 +59,7 @@ pub(super) async fn persist_launch_proof_for_reservation_failure(
     launched_at: Option<&str>,
     proof_context: &LaunchProofContext,
 ) {
-    persist_launch_proof_best_effort_with_context(
+    persist_launch_proof_with_context(
         state,
         session_id,
         launched_at,
@@ -95,7 +95,7 @@ enum LaunchTerminalizationDisposition {
     Settled(Result<LaunchSuccess, LaunchRequestError>),
 }
 
-pub async fn launch_session(
+pub(crate) async fn launch_session(
     state: AppState,
     task: super::session::LaunchSessionTask,
 ) -> Result<LaunchSuccess, LaunchRequestError> {
@@ -694,7 +694,7 @@ async fn launch_session_inner(
                     Some(guardian.clone()),
                 )
                 .await;
-                persist_launch_proof_best_effort_with_context(
+                persist_launch_proof_with_context(
                     &state,
                     &session_id,
                     Some(launched_at.as_str()),
@@ -1050,8 +1050,9 @@ mod tests {
             .await
             .expect("terminal session");
         assert_eq!(record.state, LaunchState::Exited);
-        let proof = crate::state::launch_reports::load(state.config().paths(), session_id)
-            .expect("load proof")
+        let proof = state
+            .launch_reports()
+            .load(session_id)
             .expect("proof persisted");
         assert_eq!(proof.session_id, session_id);
 

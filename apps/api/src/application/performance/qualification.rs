@@ -27,8 +27,6 @@ const FAMILY_C_MANAGED_EXPECTED_ARTIFACTS: [(&str, &str, &str); 3] = [
 ];
 const BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE: &str =
     "Could not load benchmark suite data. Check app data permissions and try again.";
-const LAUNCH_REPORT_STORAGE_ERROR_MESSAGE: &str =
-    "Could not load launch reports. Check app data permissions and try again.";
 
 pub(crate) async fn family_c_qualification_payload(
     state: &AppState,
@@ -48,7 +46,7 @@ pub(crate) async fn family_c_qualification_payload(
         ));
     }
 
-    let proofs = family_c_qualification_proofs(state.config().paths(), &manifest)?;
+    let proofs = family_c_qualification_proofs(state, &manifest);
     Ok(family_c_qualification_manifest_payload(
         Some(state),
         &manifest,
@@ -123,15 +121,13 @@ fn family_c_qualification_manifest_payload(
 ) -> Value {
     let [baseline_target, managed_target] = family_c_qualification_targets();
     let [baseline_extra_missing, managed_extra_missing] = extra_missing;
-    let baseline_proof_session_id =
-        family_c_qualification_target_proof(baseline_target, manifest, proofs)
-            .map(|proof| proof.session_id.as_str());
+    let baseline_proof = family_c_qualification_target_proof(baseline_target, manifest, proofs);
     let baseline = family_c_qualification_target_payload(
         state,
         baseline_target,
         manifest,
         proofs,
-        baseline_proof_session_id,
+        baseline_proof,
         &baseline_extra_missing,
     );
     let managed = family_c_qualification_target_payload(
@@ -139,7 +135,7 @@ fn family_c_qualification_manifest_payload(
         managed_target,
         manifest,
         proofs,
-        baseline_proof_session_id,
+        baseline_proof,
         &managed_extra_missing,
     );
     let status = if family_c_qualification_target_ready(&baseline)
@@ -449,12 +445,12 @@ fn family_c_qualification_targets() -> [FamilyCQualificationTarget; 2] {
 }
 
 fn family_c_qualification_proofs(
-    paths: &axial_config::AppPaths,
+    state: &AppState,
     manifest: &crate::state::benchmark_suites::BenchmarkSuiteManifest,
-) -> Result<Vec<crate::state::launch_reports::LaunchProofRecord>, (StatusCode, Json<Value>)> {
-    let mut proofs =
-        crate::state::launch_reports::list_recent(paths, FAMILY_C_QUALIFICATION_PROOF_SCAN_LIMIT)
-            .map_err(launch_report_storage_error_response)?;
+) -> Vec<crate::state::launch_reports::LaunchProofRecord> {
+    let mut proofs = state
+        .launch_reports()
+        .list_recent(FAMILY_C_QUALIFICATION_PROOF_SCAN_LIMIT);
     for session_id in manifest
         .runs
         .iter()
@@ -464,14 +460,12 @@ fn family_c_qualification_proofs(
         if already_loaded {
             continue;
         }
-        if let Some(proof) = crate::state::launch_reports::load(paths, session_id)
-            .map_err(launch_report_storage_error_response)?
-        {
+        if let Some(proof) = state.launch_reports().load(session_id) {
             proofs.push(proof);
         }
     }
 
-    Ok(proofs)
+    proofs
 }
 
 fn family_c_qualification_target_payload(
@@ -479,7 +473,7 @@ fn family_c_qualification_target_payload(
     target: FamilyCQualificationTarget,
     manifest: &crate::state::benchmark_suites::BenchmarkSuiteManifest,
     proofs: &[crate::state::launch_reports::LaunchProofRecord],
-    baseline_proof_session_id: Option<&str>,
+    baseline_proof: Option<&crate::state::launch_reports::LaunchProofRecord>,
     extra_missing: &[&'static str],
 ) -> Value {
     let mut missing = Vec::new();
@@ -551,7 +545,7 @@ fn family_c_qualification_target_payload(
                     Some(comparison) => {
                         let evidence = family_c_qualification_managed_comparison_evidence(
                             comparison,
-                            baseline_proof_session_id,
+                            baseline_proof,
                         );
                         if !evidence.baseline_matches {
                             missing.push("managed_comparison_baseline_mismatch");
@@ -613,8 +607,7 @@ fn family_c_qualification_target_payload(
         "performance_mode": target.performance_mode,
     });
     let suite_run = family_c_qualification_suite_run_payload(run);
-    let proof_payload =
-        family_c_qualification_proof_payload(proof, target, baseline_proof_session_id);
+    let proof_payload = family_c_qualification_proof_payload(proof, target, baseline_proof);
     let view_model = family_c_qualification_target_view_model(
         target,
         &required,
@@ -802,10 +795,8 @@ fn family_c_qualification_matching_proof<'a>(
     run: &crate::state::benchmark_suites::BenchmarkSuiteManifestRun,
     proofs: &'a [crate::state::launch_reports::LaunchProofRecord],
 ) -> Option<&'a crate::state::launch_reports::LaunchProofRecord> {
-    if let Some(session_id) = run.session_id.as_deref().and_then(trimmed_string)
-        && let Some(proof) = proofs.iter().find(|proof| proof.session_id == session_id)
-    {
-        return Some(proof);
+    if let Some(session_id) = run.session_id.as_deref().and_then(trimmed_string) {
+        return proofs.iter().find(|proof| proof.session_id == session_id);
     }
 
     proofs
@@ -815,11 +806,12 @@ fn family_c_qualification_matching_proof<'a>(
 
 fn family_c_qualification_managed_comparison_evidence(
     comparison: &crate::state::launch_reports::LaunchProofComparison,
-    baseline_proof_session_id: Option<&str>,
+    baseline_proof: Option<&crate::state::launch_reports::LaunchProofRecord>,
 ) -> FamilyCManagedComparisonEvidence {
     FamilyCManagedComparisonEvidence {
-        baseline_matches: baseline_proof_session_id
-            .is_some_and(|session_id| comparison.baseline_session_id == session_id),
+        baseline_matches: baseline_proof.is_some_and(|baseline| {
+            crate::state::launch_reports::comparison_baseline_matches_report(comparison, baseline)
+        }),
         metric_valid: matches!(
             comparison.metric_name.as_str(),
             FAMILY_C_COMPARISON_STAGE_METRIC_NAME | FAMILY_C_COMPARISON_BOOT_METRIC_NAME
@@ -851,7 +843,7 @@ fn family_c_qualification_suite_run_payload(
 fn family_c_qualification_proof_payload(
     proof: Option<&crate::state::launch_reports::LaunchProofRecord>,
     target: FamilyCQualificationTarget,
-    baseline_proof_session_id: Option<&str>,
+    baseline_proof: Option<&crate::state::launch_reports::LaunchProofRecord>,
 ) -> Value {
     let Some(proof) = proof else {
         return json!({ "present": false });
@@ -867,10 +859,8 @@ fn family_c_qualification_proof_payload(
             "matched_sample_count": comparison.matched_sample_count,
         });
         if target.comparison_required {
-            let evidence = family_c_qualification_managed_comparison_evidence(
-                comparison,
-                baseline_proof_session_id,
-            );
+            let evidence =
+                family_c_qualification_managed_comparison_evidence(comparison, baseline_proof);
             payload["baseline_matches"] = json!(evidence.baseline_matches);
             payload["metric_valid"] = json!(evidence.metric_valid);
             payload["samples_present"] = json!(evidence.samples_present);
@@ -1041,13 +1031,6 @@ fn benchmark_suite_storage_error_response() -> (StatusCode, Json<Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE })),
-    )
-}
-
-fn launch_report_storage_error_response(_error: std::io::Error) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": LAUNCH_REPORT_STORAGE_ERROR_MESSAGE })),
     )
 }
 

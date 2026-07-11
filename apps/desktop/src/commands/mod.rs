@@ -22,6 +22,8 @@ const AUTH_CLOSE_FAILED_MESSAGE: &str =
     "Close is blocked because secure authentication cleanup is incomplete.";
 const REMOTE_FLAGS_CLOSE_FAILED_MESSAGE: &str =
     "Close is blocked because remote feature flag persistence is incomplete.";
+const LAUNCH_REPORTS_CLOSE_FAILED_MESSAGE: &str =
+    "Close is blocked because launch report persistence is incomplete.";
 const SKIN_FILE_MAX_BYTES: u64 = 256 * 1024;
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 const MICROSOFT_SIGN_IN_WINDOW_LABEL: &str = "microsoft-signin";
@@ -290,8 +292,13 @@ pub async fn prepare_for_exit(action: &str, state: &AppState) -> Result<(), Stri
         .close_remote_flags()
         .await
         .map_err(|_| REMOTE_FLAGS_CLOSE_FAILED_MESSAGE.to_string());
+    let launch_reports_result = state
+        .close_launch_reports()
+        .await
+        .map_err(|_| LAUNCH_REPORTS_CLOSE_FAILED_MESSAGE.to_string());
     auth_result?;
-    remote_flags_result
+    remote_flags_result?;
+    launch_reports_result
 }
 
 #[tauri::command]

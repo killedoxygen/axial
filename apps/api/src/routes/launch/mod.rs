@@ -196,10 +196,8 @@ async fn handle_family_c_qualification_preview()
     launch_app::family_c_qualification_preview().map(Json)
 }
 
-async fn handle_launch_reports(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    launch_app::launch_reports_payload(&state).map(Json)
+async fn handle_launch_reports(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(launch_app::launch_reports_payload(&state))
 }
 
 async fn handle_launch_report(

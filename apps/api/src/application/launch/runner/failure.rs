@@ -1,5 +1,5 @@
 use super::LaunchRequestError;
-use super::proof::persist_launch_proof_best_effort_with_context;
+use super::proof::persist_launch_proof_with_context;
 use super::status::{serialize_guardian, serialize_healing};
 use crate::observability::{
     RedactionAudience, sanitize_evidence_token, sanitize_public_diagnostic_text,
@@ -60,7 +60,7 @@ pub(super) async fn fail_launch_for_journal(
         },
     )
     .await;
-    persist_launch_proof_best_effort_with_context(state, session_id, None, "failed", None).await;
+    persist_launch_proof_with_context(state, session_id, None, "failed", None).await;
     LaunchRequestError {
         message: public_message,
         healing,
@@ -94,8 +94,7 @@ pub(super) async fn fail_launch_with_outcome(
         },
     )
     .await;
-    persist_launch_proof_best_effort_with_context(state, session_id, None, "failed", proof_context)
-        .await;
+    persist_launch_proof_with_context(state, session_id, None, "failed", proof_context).await;
     LaunchRequestError {
         message: public_message,
         healing,
@@ -310,8 +309,9 @@ mod tests {
             .expect("terminal failure session record");
         assert_eq!(record.outcome.as_ref(), Some(&expected));
 
-        let proof = crate::state::launch_reports::load(state.config().paths(), session_id)
-            .expect("load proof")
+        let proof = state
+            .launch_reports()
+            .load(session_id)
             .expect("proof exists");
         assert_eq!(proof.session_outcome.as_ref(), Some(&expected));
 

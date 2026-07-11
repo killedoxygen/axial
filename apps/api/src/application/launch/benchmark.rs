@@ -1053,6 +1053,7 @@ impl BenchmarkSuiteReservationFailure {
             },
             BenchmarkSuiteStoreError::RejectedManifest
             | BenchmarkSuiteStoreError::MutationLatched
+            | BenchmarkSuiteStoreError::ProofCapacity
             | BenchmarkSuiteStoreError::RetryRequired
             | BenchmarkSuiteStoreError::Closed
             | BenchmarkSuiteStoreError::GenerationOverflow
@@ -1905,8 +1906,7 @@ mod tests {
             error.1.0,
             json!({ "error": "benchmark suite has active run" })
         );
-        let proofs = crate::state::launch_reports::list_recent(&fixture.paths, 5)
-            .expect("list launch proofs");
+        let proofs = fixture.state.launch_reports().list_recent(5);
         assert_eq!(proofs.len(), 1);
         let proof = &proofs[0];
         assert_eq!(proof.outcome, "failed");

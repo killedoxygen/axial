@@ -7,7 +7,7 @@ pub mod contracts;
 pub mod failure_memory;
 mod installs;
 mod journals;
-pub mod launch_reports;
+pub(crate) mod launch_reports;
 pub mod ownership;
 pub mod performance_operations;
 pub mod presence;
@@ -75,6 +75,7 @@ pub struct AppState {
     performance: Arc<PerformanceManager>,
     telemetry: Arc<TelemetryHub>,
     remote_flags: Arc<RemoteFlagStore>,
+    launch_reports: Arc<launch_reports::LaunchReportStore>,
     startup_warnings: Arc<Vec<String>>,
     config_changes: Arc<broadcast::Sender<()>>,
     library_dir: Arc<RwLock<Option<String>>>,
@@ -103,6 +104,10 @@ pub struct SecureAuthCloseError;
 #[error("remote feature flag persistence is incomplete")]
 pub struct RemoteFlagCloseError;
 
+#[derive(Debug, thiserror::Error)]
+#[error("launch report persistence is incomplete")]
+pub struct LaunchReportCloseError;
+
 impl AppState {
     #[cfg(test)]
     pub fn new(init: AppStateInit) -> Self {
@@ -120,14 +125,18 @@ impl AppState {
         let remote_flags_config_dir = init.config.paths().config_dir.clone();
         let (auth_logins, remote_flags) = tokio::join!(
             AuthLoginStore::load_from_secure_store(),
-            RemoteFlagStore::load_from_config_dir(remote_flags_config_dir)
+            RemoteFlagStore::load_from_config_dir(remote_flags_config_dir),
         );
-        Self::new_with_telemetry_inner(
-            init,
-            telemetry,
-            Arc::new(auth_logins),
-            Arc::new(remote_flags),
-        )
+        tokio::task::spawn_blocking(move || {
+            Self::new_with_telemetry_inner(
+                init,
+                telemetry,
+                Arc::new(auth_logins),
+                Arc::new(remote_flags),
+            )
+        })
+        .await
+        .unwrap_or_else(|_| panic!("persisted state startup task stopped"))
     }
 
     pub async fn close_secure_auth(&self) -> Result<(), SecureAuthCloseError> {
@@ -142,6 +151,13 @@ impl AppState {
             .close()
             .await
             .map_err(|_| RemoteFlagCloseError)
+    }
+
+    pub async fn close_launch_reports(&self) -> Result<(), LaunchReportCloseError> {
+        self.launch_reports
+            .close()
+            .await
+            .map_err(|_| LaunchReportCloseError)
     }
 
     #[cfg(test)]
@@ -176,6 +192,8 @@ impl AppState {
         mut self,
         benchmark_suites: Arc<benchmark_suites::BenchmarkSuiteStore>,
     ) -> Self {
+        self.launch_reports
+            .bind_proof_retention(benchmark_suites.proof_retention_handle());
         self.benchmark_suites = benchmark_suites;
         self
     }
@@ -197,6 +215,10 @@ impl AppState {
         let benchmark_suites = Arc::new(benchmark_suites::BenchmarkSuiteStore::load_from_paths(
             init.config.paths(),
             benchmark_suite_retention_claims,
+        ));
+        let launch_reports = Arc::new(launch_reports::LaunchReportStore::load_from_paths(
+            init.config.paths(),
+            benchmark_suites.proof_retention_handle(),
         ));
         let benchmark_suite_drivers =
             Arc::new(benchmark_suite_drivers.bind(benchmark_suites.retention_handle()));
@@ -229,6 +251,7 @@ impl AppState {
             performance: init.performance,
             telemetry,
             remote_flags,
+            launch_reports,
             startup_warnings: Arc::new(bound_startup_warnings(init.startup_warnings)),
             config_changes: Arc::new(config_changes),
             library_dir: Arc::new(RwLock::new(if library_dir.is_empty() {
@@ -312,6 +335,10 @@ impl AppState {
 
     pub(crate) fn remote_flags(&self) -> &Arc<RemoteFlagStore> {
         &self.remote_flags
+    }
+
+    pub(crate) fn launch_reports(&self) -> &Arc<launch_reports::LaunchReportStore> {
+        &self.launch_reports
     }
 
     pub(crate) fn remote_flags_active_for(&self, config: &AppConfig) -> bool {

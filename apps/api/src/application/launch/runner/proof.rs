@@ -2,47 +2,83 @@ use super::trace_launch_event;
 use crate::state::AppState;
 use crate::state::launch_reports::LaunchProofContext;
 
-pub async fn persist_launch_proof_best_effort(
+pub(in crate::application::launch) async fn persist_launch_proof(
     state: &AppState,
     session_id: &str,
     launched_at: Option<&str>,
     outcome: &str,
 ) {
-    persist_launch_proof_best_effort_with_context(state, session_id, launched_at, outcome, None)
-        .await;
+    persist_launch_proof_with_context(state, session_id, launched_at, outcome, None).await;
 }
 
-pub(super) async fn persist_launch_proof_best_effort_with_context(
+pub(super) async fn persist_launch_proof_with_context(
     state: &AppState,
     session_id: &str,
     launched_at: Option<&str>,
     outcome: &str,
     proof_context: Option<&LaunchProofContext>,
 ) {
-    let Some(record) = state.sessions().get(session_id).await else {
-        trace_launch_event(session_id, "launch proof skipped: session record missing");
+    let completed_rx =
+        spawn_launch_proof_owner(state, session_id, launched_at, outcome, proof_context);
+    let _ = completed_rx.await;
+}
+
+fn spawn_launch_proof_owner(
+    state: &AppState,
+    session_id: &str,
+    launched_at: Option<&str>,
+    outcome: &str,
+    proof_context: Option<&LaunchProofContext>,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let state = state.clone();
+    let session_id = session_id.to_string();
+    let launched_at = launched_at.map(str::to_string);
+    let outcome = outcome.to_string();
+    let proof_context = proof_context.cloned();
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        own_launch_proof_and_benchmark_outcome(
+            state,
+            session_id,
+            launched_at,
+            outcome,
+            proof_context,
+        )
+        .await;
+        let _ = completed_tx.send(());
+    });
+    completed_rx
+}
+
+async fn own_launch_proof_and_benchmark_outcome(
+    state: AppState,
+    session_id: String,
+    launched_at: Option<String>,
+    outcome: String,
+    proof_context: Option<LaunchProofContext>,
+) {
+    let Some(record) = state.sessions().get(&session_id).await else {
+        trace_launch_event(&session_id, "launch proof skipped: session record missing");
         return;
     };
-    match crate::state::launch_reports::persist_record_with_context(
-        state.config().paths(),
-        &record,
-        launched_at,
-        outcome,
-        proof_context,
-    ) {
-        Ok(_) => trace_launch_event(session_id, "launch proof persisted"),
-        Err(_) => trace_launch_event(session_id, "launch proof persistence failed"),
-    }
-    if let Err(error) = state
+    let report =
+        state
+            .launch_reports()
+            .persist(record, launched_at, outcome.clone(), proof_context);
+    let benchmark = state
         .benchmark_suites()
-        .update_run_state_for_session(session_id, outcome)
-        .await
-    {
+        .update_run_state_for_session(&session_id, &outcome);
+    let (report_result, benchmark_result) = tokio::join!(report, benchmark);
+    match report_result {
+        Ok(_) => trace_launch_event(&session_id, "launch proof persisted"),
+        Err(_) => trace_launch_event(&session_id, "launch proof persistence failed"),
+    }
+    if let Err(error) = benchmark_result {
         tracing::warn!(
             error_class = error.class(),
             "benchmark suite outcome persistence failed"
         );
-        trace_launch_event(session_id, "benchmark suite outcome persistence failed");
+        trace_launch_event(&session_id, "benchmark suite outcome persistence failed");
     }
 }
 
@@ -68,7 +104,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
-    async fn persist_launch_proof_best_effort_records_stage_evidence_and_updates_benchmark_run() {
+    async fn persist_launch_proof_records_stage_evidence_and_updates_benchmark_run() {
         let root = unique_test_dir("launch-proof-persistence");
         let state = test_app_state(&root);
         let session_id = "launch-proof-persistence";
@@ -109,10 +145,11 @@ mod tests {
             .await
             .expect("persist benchmark suite run");
 
-        persist_launch_proof_best_effort(&state, session_id, None, "running").await;
+        persist_launch_proof(&state, session_id, None, "running").await;
 
-        let proof = crate::state::launch_reports::load(state.config().paths(), session_id)
-            .expect("load proof")
+        let proof = state
+            .launch_reports()
+            .load(session_id)
             .expect("proof exists");
         let proof_json = serde_json::to_string(&proof).expect("proof json");
         assert!(proof_json.contains("execution_launch_command_prepared"));
@@ -126,6 +163,50 @@ mod tests {
             .expect("suite exists");
         assert_eq!(manifest.runs[0].session_id.as_deref(), Some(session_id));
         assert_eq!(manifest.runs[0].state, "running");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dropped_proof_waiter_cannot_cancel_report_or_benchmark_outcome() {
+        let root = unique_test_dir("launch-proof-dropped-waiter");
+        let state = test_app_state(&root);
+        let session_id = "launch-proof-dropped-waiter";
+        state.sessions().insert(test_record(session_id)).await;
+        let instance_id = "instance";
+        let suite_id = crate::state::benchmark_suites::derive_suite_id(instance_id, "development");
+        let plan = development_suite_plan();
+        let selection = state
+            .benchmark_suites()
+            .select_reservation(&suite_id, instance_id, "development", &plan, Some(0))
+            .await
+            .expect("select benchmark suite run");
+        state
+            .benchmark_suites()
+            .reserve(selection, session_id, "2026-01-01T00:00:00.000Z", false)
+            .await
+            .expect("persist benchmark suite run");
+
+        drop(spawn_launch_proof_owner(
+            &state, session_id, None, "running", None,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let report_done = state.launch_reports().load(session_id).is_some();
+                let benchmark_done = state
+                    .benchmark_suites()
+                    .get(&suite_id)
+                    .expect("load suite")
+                    .is_some_and(|manifest| manifest.runs[0].state == "running");
+                if report_done && benchmark_done {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached proof owner settles both outcomes");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -159,7 +240,7 @@ mod tests {
             .expect("create report parent");
         fs::write(&report_dir, b"not a directory").expect("block report directory");
 
-        persist_launch_proof_best_effort(&state, session_id, None, "running").await;
+        persist_launch_proof(&state, session_id, None, "running").await;
 
         let manifest = state
             .benchmark_suites()

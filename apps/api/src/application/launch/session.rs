@@ -63,7 +63,7 @@ pub struct LaunchRequest {
     pub client_started_at_ms: Option<i64>,
 }
 
-pub struct LaunchSessionTask {
+pub(crate) struct LaunchSessionTask {
     pub application: LaunchInstanceStaging,
     pub boundary: LaunchBoundaryStaging,
     pub instance: Instance,
@@ -75,7 +75,7 @@ pub struct LaunchSessionTask {
     pub resource_budget: Option<LaunchProofResourceBudget>,
 }
 
-pub struct PreparedLaunch {
+pub(crate) struct PreparedLaunch {
     pub task: LaunchSessionTask,
 }
 
@@ -146,7 +146,7 @@ pub struct LaunchPreflightResourceBudget {
     pub disk_pressure: bool,
 }
 
-pub async fn prepare_launch_session(
+pub(crate) async fn prepare_launch_session(
     state: &AppState,
     payload: LaunchRequest,
 ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {

@@ -28,6 +28,7 @@ const MAX_ORDINARY_TERMINAL_SUITES: usize = 32;
 const MAX_MANIFEST_FIELD_CHARS: usize = 96;
 const MAX_MANIFEST_RUNS: usize = 64;
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+pub(crate) const MAX_BENCHMARK_PROOF_SESSION_IDS: usize = 1024;
 const RETRY_INITIAL_DELAY: Duration = Duration::from_millis(20);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const SUITE_STORE_LOCK_INVARIANT: &str =
@@ -135,6 +136,8 @@ pub enum BenchmarkSuiteStoreError {
     MutationLatched,
     #[error("benchmark suite session id is already assigned")]
     SessionConflict,
+    #[error("benchmark suite proof retention capacity is exhausted")]
+    ProofCapacity,
     #[error("benchmark suite has an exact failed write that must be reconciled")]
     RetryRequired,
     #[error("benchmark suite store is closed")]
@@ -162,6 +165,7 @@ impl BenchmarkSuiteStoreError {
             Self::RejectedManifest => "rejected_manifest",
             Self::MutationLatched => "mutation_latched",
             Self::SessionConflict => "session_conflict",
+            Self::ProofCapacity => "proof_capacity",
             Self::RetryRequired => "retry_required",
             Self::Closed => "closed",
             Self::GenerationOverflow => "generation_overflow",
@@ -546,6 +550,53 @@ struct BenchmarkSuiteRetention {
 pub(crate) struct BenchmarkSuiteRetentionHandle {
     mutation_gate: Arc<AsyncMutex<()>>,
     retention: BenchmarkSuiteRetention,
+}
+
+#[derive(Clone)]
+pub(crate) struct BenchmarkProofRetentionHandle {
+    inner: Arc<RwLock<BenchmarkSuiteInner>>,
+    mutation_gate: Arc<AsyncMutex<()>>,
+}
+
+pub(crate) struct BenchmarkProofPruneGuard {
+    _mutation: OwnedMutexGuard<()>,
+}
+
+impl BenchmarkProofRetentionHandle {
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(BenchmarkSuiteInner::default())),
+            mutation_gate: Arc::new(AsyncMutex::new(())),
+        }
+    }
+
+    pub(crate) fn retained_session_ids(&self, limit: usize) -> Option<HashSet<String>> {
+        let inner = self.inner.read().expect(SUITE_STORE_LOCK_INVARIANT);
+        if inner.session_index.len() > limit {
+            return None;
+        }
+        Some(inner.session_index.keys().cloned().collect())
+    }
+
+    pub(crate) async fn try_begin_prune(
+        &self,
+        session_id: &str,
+    ) -> Option<BenchmarkProofPruneGuard> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        if self
+            .inner
+            .read()
+            .expect(SUITE_STORE_LOCK_INVARIANT)
+            .session_index
+            .contains_key(session_id)
+        {
+            return None;
+        }
+        Some(BenchmarkProofPruneGuard {
+            _mutation: mutation,
+        })
+    }
 }
 
 impl BenchmarkSuiteRetentionHandle {
@@ -961,6 +1012,13 @@ impl BenchmarkSuiteStore {
         }
     }
 
+    pub(crate) fn proof_retention_handle(&self) -> BenchmarkProofRetentionHandle {
+        BenchmarkProofRetentionHandle {
+            inner: self.inner.clone(),
+            mutation_gate: self.mutation_gate.clone(),
+        }
+    }
+
     pub fn get(
         &self,
         suite_id: &str,
@@ -1116,6 +1174,7 @@ impl BenchmarkSuiteStore {
             session_conflict,
             live_conflict,
             selected_mapping_live,
+            proof_session_count,
         ) = {
             let inner = self.inner.read().expect(SUITE_STORE_LOCK_INVARIANT);
             let current = inner.suites.get(&selection.suite_id);
@@ -1148,6 +1207,7 @@ impl BenchmarkSuiteStore {
                     .previous_mapping
                     .as_ref()
                     .is_some_and(|mapping| inner.live_reservations.contains(&mapping.session_id)),
+                inner.session_index.len(),
             )
         };
         if generation != selection.generation {
@@ -1187,6 +1247,9 @@ impl BenchmarkSuiteStore {
         }
         if session_conflict.is_some() {
             return Err(BenchmarkSuiteStoreError::SessionConflict.into());
+        }
+        if current_mapping.is_none() && proof_session_count >= MAX_BENCHMARK_PROOF_SESSION_IDS {
+            return Err(BenchmarkSuiteStoreError::ProofCapacity.into());
         }
         if let Some(manifest) = &current_manifest
             && (manifest.instance_id != selection.instance_id || manifest.mode != selection.mode)
@@ -3182,6 +3245,40 @@ mod tests {
                 .await,
             Err(BenchmarkSuiteStoreError::InvalidSuiteId)
         ));
+    }
+
+    #[tokio::test]
+    async fn reservation_rejects_before_accepting_more_proof_claims_than_report_capacity() {
+        let store = BenchmarkSuiteStore::new();
+        {
+            let mut inner = store.inner.write().expect(SUITE_STORE_LOCK_INVARIANT);
+            for index in 0..MAX_BENCHMARK_PROOF_SESSION_IDS {
+                let session_id = format!("claimed-session-{index}");
+                inner.session_index.insert(
+                    session_id.clone(),
+                    SuiteSessionMapping {
+                        suite_id: test_suite_id(&format!("claimed-suite-{index}")),
+                        run_index: 0,
+                        session_id,
+                    },
+                );
+            }
+        }
+        let suite_id = test_suite_id("proof-capacity");
+        let selection = store
+            .select_reservation(&suite_id, "instance", "development", &test_plan(), Some(0))
+            .await
+            .expect("select reservation before capacity check");
+
+        assert!(matches!(
+            store
+                .reserve(selection, "new-proof-session", test_timestamp(), false)
+                .await,
+            Err(BenchmarkSuiteReserveError::PreAccept(
+                BenchmarkSuiteStoreError::ProofCapacity
+            ))
+        ));
+        assert!(store.get(&suite_id).expect("suite lookup").is_none());
     }
 
     #[tokio::test]

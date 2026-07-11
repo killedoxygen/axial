@@ -2,6 +2,7 @@ use crate::types::{LaunchFailure, LaunchState, SessionId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchStageRecord {
     pub stage: String,
     pub label: String,
@@ -21,6 +22,7 @@ pub struct LaunchStageRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchStageEvidence {
     pub id: String,
     pub system: String,
@@ -85,6 +87,7 @@ impl LaunchSessionExitReason {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchSessionOutcome {
     pub reason: LaunchSessionExitReason,
     pub kind: LaunchSessionOutcomeKind,

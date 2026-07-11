@@ -1,4 +1,5 @@
-use super::{persist_launch_proof_best_effort, trace_launch_event};
+use super::runner::persist_launch_proof;
+use super::trace_launch_event;
 use crate::observability::{
     RedactionAudience, sanitize_public_diagnostic_text, sanitize_public_json_value,
 };
@@ -14,8 +15,6 @@ use serde_json::{Value, json};
 pub(crate) const LAUNCH_COMMAND_REDACTED_VALUE: &str = "<redacted>";
 pub(crate) const LAUNCH_KILL_INTERNAL_ERROR_MESSAGE: &str =
     "Could not stop the launch session. Try again from the launcher.";
-pub(crate) const LAUNCH_REPORT_STORAGE_ERROR_MESSAGE: &str =
-    "Could not load launch reports. Check app data permissions and try again.";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LaunchStatusViewModel {
@@ -56,32 +55,27 @@ fn launch_status_view_fields(state: &str) -> (&'static str, &'static str, u8, bo
     }
 }
 
-pub(crate) fn launch_reports_payload(
-    state: &AppState,
-) -> Result<serde_json::Value, super::LaunchApplicationError> {
-    let reports = crate::state::launch_reports::list_recent_exports(state.config().paths(), 25)
-        .map_err(launch_report_storage_error_response)?;
+pub(crate) fn launch_reports_payload(state: &AppState) -> serde_json::Value {
+    let reports = state.launch_reports().list_recent_exports(25);
 
-    Ok(json!({
+    json!({
         "reports": reports
             .iter()
             .map(launch_proof_export_payload)
             .collect::<Vec<_>>(),
-    }))
+    })
 }
 
 pub(crate) fn launch_report_payload(
     state: &AppState,
     id: &str,
 ) -> Result<serde_json::Value, super::LaunchApplicationError> {
-    let report = crate::state::launch_reports::load_export(state.config().paths(), id)
-        .map_err(launch_report_storage_error_response)?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "launch report not found" })),
-            )
-        })?;
+    let report = state.launch_reports().load_export(id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "launch report not found" })),
+        )
+    })?;
 
     Ok(launch_proof_export_payload(&report))
 }
@@ -581,7 +575,7 @@ pub(crate) async fn stop_launch_session(
         stages: Vec::new(),
     })
     .await;
-    persist_launch_proof_best_effort(state, id, record.launched_at.as_deref(), "stopped").await;
+    persist_launch_proof(state, id, record.launched_at.as_deref(), "stopped").await;
     stop.release().await;
 
     Ok(json!({ "status": "killed" }))
@@ -598,15 +592,6 @@ pub(crate) fn launch_kill_error_response(error: std::io::Error) -> super::Launch
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": LAUNCH_KILL_INTERNAL_ERROR_MESSAGE })),
-    )
-}
-
-pub(crate) fn launch_report_storage_error_response(
-    _error: std::io::Error,
-) -> super::LaunchApplicationError {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": LAUNCH_REPORT_STORAGE_ERROR_MESSAGE })),
     )
 }
 

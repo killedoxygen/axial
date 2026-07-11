@@ -29,24 +29,24 @@ pub(crate) use super::performance::BenchmarkMatrix;
 pub(crate) use benchmark::*;
 #[cfg(test)]
 pub(crate) use reports::{
-    LAUNCH_COMMAND_REDACTED_VALUE, LAUNCH_KILL_INTERNAL_ERROR_MESSAGE,
-    LAUNCH_REPORT_STORAGE_ERROR_MESSAGE, launch_kill_error_response,
-    launch_report_storage_error_response, sanitize_launch_command,
+    LAUNCH_COMMAND_REDACTED_VALUE, LAUNCH_KILL_INTERNAL_ERROR_MESSAGE, launch_kill_error_response,
+    sanitize_launch_command,
 };
 pub use reports::{LaunchStatusViewModel, public_launch_status_json};
 pub(crate) use reports::{
     launch_command_payload, launch_report_payload, launch_reports_payload, launch_status_payload,
     stop_launch_session,
 };
+pub(crate) use runner::launch_session;
 pub use runner::{
-    LaunchRequestError, LaunchSuccess, launch_session, persist_launch_proof_best_effort,
-    sanitize_live_launch_failure_message, trace_launch_event,
+    LaunchRequestError, LaunchSuccess, sanitize_live_launch_failure_message, trace_launch_event,
 };
 pub use session::{
     LaunchPreflightMemory, LaunchPreflightOverride, LaunchPreflightOverrides,
-    LaunchPreflightResourceBudget, LaunchPreflightResponse, LaunchRequest, LaunchSessionTask,
-    PreparedLaunch, prepare_launch_preflight, prepare_launch_session,
+    LaunchPreflightResourceBudget, LaunchPreflightResponse, LaunchRequest,
+    prepare_launch_preflight,
 };
+pub(crate) use session::{LaunchSessionTask, prepare_launch_session};
 
 pub type LaunchApplicationError = (StatusCode, Json<Value>);
 
@@ -186,7 +186,7 @@ pub fn launch_boundary_stage_evidence(staging: &LaunchBoundaryStaging) -> Vec<La
     ]
 }
 
-pub fn launch_benchmark_status_payload(
+pub(crate) fn launch_benchmark_status_payload(
     benchmark: &crate::state::launch_reports::LaunchBenchmarkMetadata,
 ) -> Value {
     let mut payload = json!({
@@ -224,7 +224,7 @@ pub fn launch_success_response_payload(launched: &LaunchSuccess) -> Value {
     })
 }
 
-pub fn launch_prepared_response_payload(task: &LaunchSessionTask) -> Value {
+pub(crate) fn launch_prepared_response_payload(task: &LaunchSessionTask) -> Value {
     let view_model = LaunchStatusViewModel::for_state("queued");
     json!({
         "status": "launching",

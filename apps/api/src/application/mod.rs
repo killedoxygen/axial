@@ -84,11 +84,9 @@ pub use launch::{
     LaunchBoundaryStaging, LaunchBoundaryStagingRequest, LaunchInstanceStaging,
     LaunchPreflightMemory, LaunchPreflightOverride, LaunchPreflightOverrides,
     LaunchPreflightResourceBudget, LaunchPreflightResponse, LaunchRequest, LaunchRequestError,
-    LaunchSessionTask, LaunchSuccess, PreparedLaunch, launch_application_stage_evidence,
-    launch_benchmark_status_payload, launch_boundary_stage_evidence,
-    launch_prepared_response_payload, launch_request_error_response_payload, launch_session,
-    launch_success_response_payload, persist_launch_proof_best_effort, prepare_launch_preflight,
-    prepare_launch_session, sanitize_live_launch_failure_message, stage_launch_boundary,
+    LaunchSuccess, launch_application_stage_evidence, launch_boundary_stage_evidence,
+    launch_request_error_response_payload, launch_success_response_payload,
+    prepare_launch_preflight, sanitize_live_launch_failure_message, stage_launch_boundary,
     stage_launch_instance_command, trace_launch_event,
 };
 pub use music::{
