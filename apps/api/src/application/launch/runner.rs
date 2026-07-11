@@ -1590,6 +1590,7 @@ mod tests {
 
     const TEST_TELEMETRY_INSTALL_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
     const TEST_TELEMETRY_KEY: &str = "phc_test";
+    const CRASH_E2E_INSTANCE_ID: &str = "0123456789abcdef";
 
     #[tokio::test]
     async fn launch_loop_caps_a_prepare_directive_that_never_marks_itself_applied() {
@@ -1664,11 +1665,22 @@ mod tests {
     async fn out_of_memory_startup_exit_persists_bounded_proof_and_failure_memory() {
         let root = unique_test_dir("launch-out-of-memory-e2e");
         let paths = test_paths(&root);
-        let state = test_app_state(&root);
         let session_id = "launch-out-of-memory-e2e";
+        let java_path = write_out_of_memory_launch_fixture(&root);
+        let mut task = test_recovery_launch_task(session_id, &root);
+        retarget_test_launch_task(&mut task, CRASH_E2E_INSTANCE_ID);
+        task.instance.java_path = java_path.clone();
+        task.instance.max_memory_mb = 1024;
+        task.intent.requested_java = java_path;
+        task.intent.max_memory_mb = 1024;
+        let state = test_app_state_with_registered_launch_instance(&root, &task.instance);
+        task.intent.game_dir = Some(state.instances().game_dir(&task.instance.id));
+        task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
+        let mut session = test_record(session_id);
+        session.instance_id = CRASH_E2E_INSTANCE_ID.to_string();
         state
             .sessions()
-            .insert(test_record(session_id))
+            .insert(session)
             .await
             .expect("insert OOM session");
         let mut events = state
@@ -1676,12 +1688,6 @@ mod tests {
             .subscribe(session_id)
             .await
             .expect("subscribe to OOM session");
-        let java_path = write_out_of_memory_launch_fixture(&root);
-        let mut task = test_recovery_launch_task(session_id, &root);
-        task.instance.java_path = java_path.clone();
-        task.intent.requested_java = java_path;
-        task.intent.game_dir = Some(root.join("instance"));
-        task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
         let producer = state.try_claim_producer().expect("claim OOM producer");
 
         let result = tokio::time::timeout(
@@ -1780,7 +1786,7 @@ mod tests {
 
         let memory = state.failure_memory().list();
         assert_eq!(memory.len(), 1);
-        assert_out_of_memory_observation(&memory[0]);
+        assert_out_of_memory_observation(&memory[0], CRASH_E2E_INSTANCE_ID);
         state
             .failure_memory()
             .flush()
@@ -1791,7 +1797,52 @@ mod tests {
         let persisted = FailureMemorySnapshot::from_json(&memory_json)
             .expect("strict persisted OOM failure memory");
         assert_eq!(persisted.entries.len(), 1);
-        assert_out_of_memory_observation(&persisted.entries[0]);
+        assert_out_of_memory_observation(&persisted.entries[0], CRASH_E2E_INSTANCE_ID);
+        let preflight = super::super::session::prepare_launch_preflight(
+            &state,
+            CRASH_E2E_INSTANCE_ID.to_string(),
+        )
+        .await
+        .expect("prepare next preflight after OOM crash");
+        assert_eq!(preflight.status, "ready");
+        assert_eq!(
+            preflight.guardian.decision,
+            axial_launcher::GuardianDecision::Warned
+        );
+        let recent_failure = preflight
+            .guardian_facts
+            .iter()
+            .find(|fact| fact.id.as_str() == "recent_startup_failure")
+            .expect("OOM crash memory reaches actual next preflight");
+        assert!(
+            recent_failure
+                .fields
+                .iter()
+                .any(|field| { field.key == "failure_class" && field.value == "out_of_memory" })
+        );
+        assert!(
+            preflight.guardian.details.iter().any(|detail| {
+                detail.contains("out-of-memory crash") && detail.contains("today")
+            })
+        );
+        assert_oom_preflight_guidance(&preflight, recent_failure);
+        assert_eq!(state.sessions().active_session_count().await, 0);
+        assert!(
+            !state
+                .sessions()
+                .has_active_instance(CRASH_E2E_INSTANCE_ID)
+                .await
+        );
+        assert_eq!(
+            state
+                .sessions()
+                .get(session_id)
+                .await
+                .expect("original OOM session remains")
+                .state,
+            LaunchState::Exited
+        );
+        let preflight_json = serde_json::to_string(&preflight).expect("OOM preflight json");
 
         let mut event_payloads = String::new();
         while let Ok(event) = events.try_recv() {
@@ -1812,6 +1863,7 @@ mod tests {
             report_json.as_str(),
             memory_json.as_str(),
             event_payloads.as_str(),
+            preflight_json.as_str(),
         ] {
             assert_no_out_of_memory_sensitive_decoys(payload);
         }
@@ -1966,7 +2018,7 @@ mod tests {
 
         let memory = state.failure_memory().list();
         assert_eq!(memory.len(), 1);
-        assert_out_of_memory_observation(&memory[0]);
+        assert_out_of_memory_observation(&memory[0], "instance");
         state
             .failure_memory()
             .flush()
@@ -1994,11 +2046,20 @@ mod tests {
     #[tokio::test]
     async fn post_boot_mod_crash_settles_guardian_copy_proof_and_failure_memory() {
         let root = unique_test_dir("launch-post-boot-mod-crash-e2e");
-        let state = test_app_state(&root);
         let session_id = "launch-post-boot-mod-crash-e2e";
+        let java_path = write_post_boot_mod_crash_launch_fixture(&root);
+        let mut task = test_recovery_launch_task(session_id, &root);
+        retarget_test_launch_task(&mut task, CRASH_E2E_INSTANCE_ID);
+        task.instance.java_path = java_path.clone();
+        task.intent.requested_java = java_path;
+        let state = test_app_state_with_registered_launch_instance(&root, &task.instance);
+        task.intent.game_dir = Some(state.instances().game_dir(&task.instance.id));
+        task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
+        let mut session = test_record(session_id);
+        session.instance_id = CRASH_E2E_INSTANCE_ID.to_string();
         state
             .sessions()
-            .insert(test_record(session_id))
+            .insert(session)
             .await
             .expect("insert mod crash session");
         let mut events = state
@@ -2006,12 +2067,6 @@ mod tests {
             .subscribe(session_id)
             .await
             .expect("subscribe mod crash session");
-        let java_path = write_post_boot_mod_crash_launch_fixture(&root);
-        let mut task = test_recovery_launch_task(session_id, &root);
-        task.instance.java_path = java_path.clone();
-        task.intent.requested_java = java_path;
-        task.intent.game_dir = Some(root.join("instance"));
-        task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
         let producer = state
             .try_claim_producer()
             .expect("claim mod crash producer");
@@ -2106,8 +2161,56 @@ mod tests {
         let memory = state.failure_memory().list();
         assert_eq!(memory.len(), 1);
         assert_eq!(memory[0].diagnosis_id.as_str(), "mod_attributed_crash");
-        assert_eq!(memory[0].target.id, "instance");
+        assert_eq!(memory[0].target.id, CRASH_E2E_INSTANCE_ID);
         assert_eq!(memory[0].occurrence_count, 1);
+        let preflight = super::super::session::prepare_launch_preflight(
+            &state,
+            CRASH_E2E_INSTANCE_ID.to_string(),
+        )
+        .await
+        .expect("prepare next preflight after mod crash");
+        assert_eq!(preflight.status, "ready");
+        assert_eq!(
+            preflight.guardian.decision,
+            axial_launcher::GuardianDecision::Warned
+        );
+        let recent_failure = preflight
+            .guardian_facts
+            .iter()
+            .find(|fact| fact.id.as_str() == "recent_startup_failure")
+            .expect("mod crash memory reaches actual next preflight");
+        assert!(recent_failure.fields.iter().any(|field| {
+            field.key == "failure_class" && field.value == "mod_attributed_crash"
+        }));
+        assert!(
+            preflight.guardian.details.iter().any(|detail| {
+                detail.contains("mod-attributed crash") && detail.contains("today")
+            })
+        );
+        assert!(preflight.guardian.guidance.iter().any(|guidance| {
+            guidance
+                == "Review recently changed mods and disable the suspected mod before relaunching."
+        }));
+        assert_eq!(state.sessions().active_session_count().await, 0);
+        assert!(
+            !state
+                .sessions()
+                .has_active_instance(CRASH_E2E_INSTANCE_ID)
+                .await
+        );
+        assert_eq!(
+            state
+                .sessions()
+                .get(session_id)
+                .await
+                .expect("original mod crash session remains")
+                .state,
+            LaunchState::Exited
+        );
+        let preflight_json = serde_json::to_string(&preflight).expect("mod preflight json");
+        for private in ["/home/alice", "raw-secret-token", "-Duser.home"] {
+            assert!(!preflight_json.contains(private));
+        }
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2781,12 +2884,70 @@ mod tests {
         }
     }
 
+    fn retarget_test_launch_task(
+        task: &mut super::super::session::LaunchSessionTask,
+        instance_id: &str,
+    ) {
+        task.instance.id = instance_id.to_string();
+        task.intent.instance_id = instance_id.to_string();
+        task.application = crate::application::stage_launch_instance_command(
+            crate::application::LaunchInstanceCommand {
+                instance_id: instance_id.to_string(),
+                username: None,
+                max_memory_mb: None,
+                min_memory_mb: None,
+                client_started_at_ms: None,
+            },
+            Some(task.intent.session_id.clone()),
+        );
+    }
+
     fn test_app_state(root: &Path) -> AppState {
         let paths = test_paths(root);
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(
             InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
                 .expect("load instances"),
+        );
+        AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("performance manager"),
+            ),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        })
+    }
+
+    fn test_app_state_with_registered_launch_instance(
+        root: &Path,
+        instance: &Instance,
+    ) -> AppState {
+        let paths = test_paths(root);
+        fs::create_dir_all(paths.instances_dir.join(&instance.id))
+            .expect("registered launch instance directory");
+        let config = Arc::new(
+            ConfigStore::from_config(
+                paths.clone(),
+                AppConfig {
+                    library_dir: root.join("library").to_string_lossy().to_string(),
+                    ..AppConfig::default()
+                },
+            )
+            .expect("configure registered launch library"),
+        );
+        let snapshot =
+            InstanceRegistrySnapshot::new(vec![instance.clone()], instance.id.clone(), Vec::new())
+                .expect("registered launch instance snapshot");
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(paths.clone(), snapshot)
+                .expect("load registered launch instance"),
         );
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
@@ -3051,13 +3212,14 @@ exit 1
 
     fn assert_out_of_memory_observation(
         entry: &crate::state::failure_memory::GuardianFailureMemoryEntry,
+        expected_instance_id: &str,
     ) {
         assert_eq!(entry.diagnosis_id.as_str(), "out_of_memory");
         assert_eq!(entry.domain, GuardianDomain::Startup);
         assert_eq!(entry.mode, GuardianMode::Managed);
         assert_eq!(entry.target.system, StabilizationSystem::Guardian);
         assert_eq!(entry.target.kind, TargetKind::Instance);
-        assert_eq!(entry.target.id, "instance");
+        assert_eq!(entry.target.id, expected_instance_id);
         assert_eq!(entry.ownership, OwnershipClass::UserOwned);
         assert_eq!(entry.occurrence_count, 1);
         assert_eq!(entry.last_action_kind, None);
@@ -3068,6 +3230,42 @@ exit 1
         assert_eq!(entry.user_decision, None);
         assert_eq!(entry.target_content_hash, None);
         assert_eq!(entry.user_intent_hash, None);
+    }
+
+    fn assert_oom_preflight_guidance(
+        preflight: &super::super::session::LaunchPreflightResponse,
+        fact: &crate::guardian::GuardianFact,
+    ) {
+        let current_memory_mb = fact
+            .fields
+            .iter()
+            .find(|field| field.key == "current_memory_mb")
+            .map(|field| field.value.as_str())
+            .expect("OOM fact current memory");
+        let suggested_memory_mb = fact
+            .fields
+            .iter()
+            .find(|field| field.key == "suggested_memory_mb")
+            .map(|field| field.value.as_str());
+        let expected = suggested_memory_mb.map_or_else(
+            || {
+                "Guardian could not verify safe headroom for a larger memory allocation. Close another session or free memory before relaunching."
+                    .to_string()
+            },
+            |suggested| {
+                format!(
+                    "Increase this instance's maximum memory from {current_memory_mb} MB to {suggested} MB before relaunching."
+                )
+            },
+        );
+        assert!(
+            preflight
+                .guardian
+                .guidance
+                .iter()
+                .any(|guidance| guidance == &expected),
+            "missing OOM next-launch guidance: {expected}"
+        );
     }
 
     fn assert_no_out_of_memory_sensitive_decoys(payload: &str) {
