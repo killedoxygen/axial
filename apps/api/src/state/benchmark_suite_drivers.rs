@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as SyncMutex, RwLock};
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tracing::warn;
@@ -51,6 +52,8 @@ pub enum BenchmarkSuiteDriverStoreError {
     RetryUnavailable,
     #[error("benchmark suite retention is changing")]
     RetentionConflict,
+    #[error("benchmark suite driver shutdown has started")]
+    ShuttingDown,
     #[error("benchmark suite driver persistence failed: {0}")]
     Persistence(#[source] io::Error),
 }
@@ -63,6 +66,7 @@ impl BenchmarkSuiteDriverStoreError {
             Self::RetryRequired => "retry_required",
             Self::RetryUnavailable => "retry_unavailable",
             Self::RetentionConflict => "retention_conflict",
+            Self::ShuttingDown => "shutting_down",
             Self::Persistence(_) => "persistence",
         }
     }
@@ -72,12 +76,28 @@ impl BenchmarkSuiteDriverStoreError {
 pub enum BenchmarkSuiteDriverStartError {
     #[error("a benchmark suite driver is already active")]
     Conflict,
+    #[error("benchmark suite driver shutdown has started")]
+    ShuttingDown,
     #[error("benchmark suite driver {driver_id} could not start: {source}")]
     Store {
         driver_id: String,
         #[source]
         source: BenchmarkSuiteDriverStoreError,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BenchmarkSuiteDriverShutdownError {
+    #[error("benchmark suite driver shutdown transition is incomplete")]
+    Transition,
+}
+
+impl BenchmarkSuiteDriverShutdownError {
+    pub const fn class(self) -> &'static str {
+        match self {
+            Self::Transition => "transition",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,7 +142,7 @@ pub struct BenchmarkSuiteDriverEffectOwner {
     driver_id: String,
     suite_id: String,
     stop_rx: watch::Receiver<bool>,
-    owners: Arc<SyncMutex<HashMap<String, String>>>,
+    owners: Arc<BenchmarkSuiteDriverEffectOwners>,
 }
 
 impl BenchmarkSuiteDriverEffectOwner {
@@ -133,14 +153,85 @@ impl BenchmarkSuiteDriverEffectOwner {
 
 impl Drop for BenchmarkSuiteDriverEffectOwner {
     fn drop(&mut self) {
-        let mut owners = self.owners.lock().expect(DRIVER_STORE_LOCK_INVARIANT);
-        if owners
-            .get(&self.suite_id)
-            .is_some_and(|driver_id| driver_id == &self.driver_id)
-        {
-            owners.remove(&self.suite_id);
+        self.owners.release(&self.suite_id, &self.driver_id);
+    }
+}
+
+#[derive(Debug, Default)]
+struct BenchmarkSuiteDriverEffectOwnerState {
+    active_by_suite: HashMap<String, String>,
+    live_driver_ids: HashSet<String>,
+}
+
+#[derive(Debug)]
+struct BenchmarkSuiteDriverEffectOwners {
+    state: SyncMutex<BenchmarkSuiteDriverEffectOwnerState>,
+    changed: watch::Sender<u64>,
+}
+
+impl BenchmarkSuiteDriverEffectOwners {
+    fn new() -> Self {
+        let (changed, _) = watch::channel(0);
+        Self {
+            state: SyncMutex::new(BenchmarkSuiteDriverEffectOwnerState::default()),
+            changed,
         }
     }
+
+    fn contains_suite(&self, suite_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect(DRIVER_STORE_LOCK_INVARIANT)
+            .active_by_suite
+            .contains_key(suite_id)
+    }
+
+    fn register(&self, suite_id: String, driver_id: String) {
+        let mut state = self.state.lock().expect(DRIVER_STORE_LOCK_INVARIANT);
+        state.active_by_suite.insert(suite_id, driver_id.clone());
+        state.live_driver_ids.insert(driver_id);
+    }
+
+    fn release(&self, suite_id: &str, driver_id: &str) {
+        let mut state = self.state.lock().expect(DRIVER_STORE_LOCK_INVARIANT);
+        if state
+            .active_by_suite
+            .get(suite_id)
+            .is_some_and(|active_id| active_id == driver_id)
+        {
+            state.active_by_suite.remove(suite_id);
+        }
+        if state.live_driver_ids.remove(driver_id) {
+            self.changed.send_modify(|generation| {
+                *generation = generation.wrapping_add(1);
+            });
+        }
+    }
+
+    async fn wait_until_empty(&self) {
+        let mut changed = self.changed.subscribe();
+        loop {
+            if self
+                .state
+                .lock()
+                .expect(DRIVER_STORE_LOCK_INVARIANT)
+                .live_driver_ids
+                .is_empty()
+            {
+                return;
+            }
+            changed
+                .changed()
+                .await
+                .expect("benchmark suite effect-owner notifier remains owned by the store");
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct BenchmarkSuiteDriverShutdownState {
+    in_flight: Option<Arc<watch::Sender<Option<Result<(), BenchmarkSuiteDriverShutdownError>>>>>,
+    complete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +384,7 @@ impl BenchmarkSuiteDriverPersistence {
     }
 }
 
+#[derive(Clone)]
 pub struct BenchmarkSuiteDriverStore {
     inner: Arc<RwLock<BenchmarkSuiteDriverInner>>,
     mutation_gate: Arc<AsyncMutex<()>>,
@@ -300,7 +392,10 @@ pub struct BenchmarkSuiteDriverStore {
     retry_candidates: Arc<SyncMutex<HashMap<String, BenchmarkSuiteDriverEntry>>>,
     retention_issues: Arc<SyncMutex<HashMap<String, BenchmarkSuiteDriverRetentionIssue>>>,
     handoff_obligation_ids: Arc<SyncMutex<HashSet<String>>>,
-    effect_owners: Arc<SyncMutex<HashMap<String, String>>>,
+    effect_owners: Arc<BenchmarkSuiteDriverEffectOwners>,
+    shutdown_admission_closed: Arc<AtomicBool>,
+    shutdown_requested: Arc<watch::Sender<bool>>,
+    shutdown_state: Arc<SyncMutex<BenchmarkSuiteDriverShutdownState>>,
     retention_excluded_ids: Arc<HashSet<String>>,
     suite_retention_claims: BenchmarkSuiteRetentionClaims,
     suite_retention: BenchmarkSuiteRetentionHandle,
@@ -330,6 +425,11 @@ impl PreparedBenchmarkSuiteDriverStore {
 }
 
 impl BenchmarkSuiteDriverStore {
+    fn shutdown_requested_sender() -> Arc<watch::Sender<bool>> {
+        let (sender, _) = watch::channel(false);
+        Arc::new(sender)
+    }
+
     #[cfg(test)]
     pub fn new() -> Self {
         Self::new_with_retention_claims(BenchmarkSuiteRetentionClaims::default())
@@ -357,7 +457,10 @@ impl BenchmarkSuiteDriverStore {
             retry_candidates: Arc::new(SyncMutex::new(HashMap::new())),
             retention_issues: Arc::new(SyncMutex::new(HashMap::new())),
             handoff_obligation_ids: Arc::new(SyncMutex::new(HashSet::new())),
-            effect_owners: Arc::new(SyncMutex::new(HashMap::new())),
+            effect_owners: Arc::new(BenchmarkSuiteDriverEffectOwners::new()),
+            shutdown_admission_closed: Arc::new(AtomicBool::new(false)),
+            shutdown_requested: Self::shutdown_requested_sender(),
+            shutdown_state: Arc::new(SyncMutex::new(BenchmarkSuiteDriverShutdownState::default())),
             retention_excluded_ids: Arc::new(HashSet::new()),
             suite_retention_claims,
             suite_retention,
@@ -464,7 +567,10 @@ impl BenchmarkSuiteDriverStore {
             retry_candidates: Arc::new(SyncMutex::new(HashMap::new())),
             retention_issues: Arc::new(SyncMutex::new(HashMap::new())),
             handoff_obligation_ids: Arc::new(SyncMutex::new(HashSet::new())),
-            effect_owners: Arc::new(SyncMutex::new(HashMap::new())),
+            effect_owners: Arc::new(BenchmarkSuiteDriverEffectOwners::new()),
+            shutdown_admission_closed: Arc::new(AtomicBool::new(false)),
+            shutdown_requested: Self::shutdown_requested_sender(),
+            shutdown_state: Arc::new(SyncMutex::new(BenchmarkSuiteDriverShutdownState::default())),
             retention_excluded_ids: Arc::new(load_state.retention_excluded_ids),
             suite_retention_claims,
             suite_retention,
@@ -479,7 +585,13 @@ impl BenchmarkSuiteDriverStore {
         interval_ms: u64,
         summary: BenchmarkSuiteDriverSuiteSummary,
     ) -> Result<BenchmarkSuiteDriverStart, BenchmarkSuiteDriverStartError> {
+        if self.shutdown_admission_closed.load(Ordering::Acquire) {
+            return Err(BenchmarkSuiteDriverStartError::ShuttingDown);
+        }
         let mutation = self.mutation_gate.clone().lock_owned().await;
+        if self.shutdown_admission_closed.load(Ordering::Acquire) {
+            return Err(BenchmarkSuiteDriverStartError::ShuttingDown);
+        }
         let (candidate, effect_owner) = {
             let mut inner = self.inner.write().expect(DRIVER_STORE_LOCK_INVARIANT);
             if let Some(existing_id) = inner.active_by_suite.get(&suite_id)
@@ -501,11 +613,7 @@ impl BenchmarkSuiteDriverStore {
                     .expect(DRIVER_STORE_LOCK_INVARIANT)
                     .values()
                     .any(|candidate| candidate.status.suite_id == suite_id)
-                || self
-                    .effect_owners
-                    .lock()
-                    .expect(DRIVER_STORE_LOCK_INVARIANT)
-                    .contains_key(&suite_id)
+                || self.effect_owners.contains_suite(&suite_id)
             {
                 return Err(BenchmarkSuiteDriverStartError::Conflict);
             }
@@ -530,10 +638,7 @@ impl BenchmarkSuiteDriverStore {
                 created_at: now.clone(),
                 updated_at: now,
             };
-            self.effect_owners
-                .lock()
-                .expect(DRIVER_STORE_LOCK_INVARIANT)
-                .insert(suite_id.clone(), id.clone());
+            self.effect_owners.register(suite_id.clone(), id.clone());
             let effect_owner = BenchmarkSuiteDriverEffectOwner {
                 driver_id: id,
                 suite_id,
@@ -587,8 +692,14 @@ impl BenchmarkSuiteDriverStore {
     pub async fn take_restart_interrupted_resumable_drivers(
         &self,
     ) -> Result<Vec<BenchmarkSuiteDriverStatus>, BenchmarkSuiteDriverStoreError> {
+        if self.shutdown_admission_closed.load(Ordering::Acquire) {
+            return Err(BenchmarkSuiteDriverStoreError::ShuttingDown);
+        }
         loop {
             let mutation = self.mutation_gate.clone().lock_owned().await;
+            if self.shutdown_admission_closed.load(Ordering::Acquire) {
+                return Err(BenchmarkSuiteDriverStoreError::ShuttingDown);
+            }
             let candidate = self
                 .inner
                 .read()
@@ -604,6 +715,9 @@ impl BenchmarkSuiteDriverStore {
         }
 
         let _mutation = self.mutation_gate.lock().await;
+        if self.shutdown_admission_closed.load(Ordering::Acquire) {
+            return Err(BenchmarkSuiteDriverStoreError::ShuttingDown);
+        }
         self.prune_terminal_drivers().await;
         let mut inner = self.inner.write().expect(DRIVER_STORE_LOCK_INVARIANT);
         let ids = std::mem::take(&mut inner.ready_resume_ids);
@@ -617,8 +731,12 @@ impl BenchmarkSuiteDriverStore {
         &self,
         id: &str,
     ) -> Result<(), BenchmarkSuiteDriverStoreError> {
-        self.update_restart_resume_consumed_error(id, AUTOMATIC_RESUME_STARTED_ERROR.to_string())
-            .await
+        self.update_restart_resume_consumed_error(
+            id,
+            AUTOMATIC_RESUME_STARTED_ERROR.to_string(),
+            false,
+        )
+        .await
     }
 
     pub(crate) async fn consume_restart_handoff_started(
@@ -646,6 +764,7 @@ impl BenchmarkSuiteDriverStore {
         self.update_restart_resume_consumed_error(
             id,
             format!("driver automatic resume failed: {error}"),
+            true,
         )
         .await
     }
@@ -666,6 +785,186 @@ impl BenchmarkSuiteDriverStore {
         let status = candidate.status.clone();
         self.commit_transition(candidate, mutation).await?;
         Ok(status)
+    }
+
+    pub async fn stop_all_and_join(&self) -> Result<(), BenchmarkSuiteDriverShutdownError> {
+        self.shutdown_admission_closed
+            .store(true, Ordering::Release);
+        self.shutdown_requested.send_replace(true);
+        let (attempt, owns_attempt) = {
+            let mut state = self
+                .shutdown_state
+                .lock()
+                .expect(DRIVER_STORE_LOCK_INVARIANT);
+            if state.complete {
+                return Ok(());
+            }
+            match state.in_flight.as_ref() {
+                Some(attempt) => (attempt.clone(), false),
+                None => {
+                    let (attempt, _) = watch::channel(None);
+                    let attempt = Arc::new(attempt);
+                    state.in_flight = Some(attempt.clone());
+                    (attempt, true)
+                }
+            }
+        };
+        let mut result = attempt.subscribe();
+        if owns_attempt {
+            let store = self.clone();
+            let owned_attempt = attempt.clone();
+            tokio::spawn(async move {
+                let shutdown_result = store.stop_all_and_join_owned().await;
+                {
+                    let mut state = store
+                        .shutdown_state
+                        .lock()
+                        .expect(DRIVER_STORE_LOCK_INVARIANT);
+                    if state
+                        .in_flight
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &owned_attempt))
+                    {
+                        state.in_flight = None;
+                        state.complete = shutdown_result.is_ok();
+                    }
+                }
+                owned_attempt.send_replace(Some(shutdown_result));
+            });
+        }
+
+        loop {
+            if let Some(result) = *result.borrow_and_update() {
+                return result;
+            }
+            result
+                .changed()
+                .await
+                .expect("benchmark suite driver shutdown result remains owned by the store");
+        }
+    }
+
+    async fn stop_all_and_join_owned(&self) -> Result<(), BenchmarkSuiteDriverShutdownError> {
+        let transition = self.stop_all_drivers_once().await;
+        self.effect_owners.wait_until_empty().await;
+        transition
+    }
+
+    async fn stop_all_drivers_once(&self) -> Result<(), BenchmarkSuiteDriverShutdownError> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        {
+            let inner = self.inner.read().expect(DRIVER_STORE_LOCK_INVARIANT);
+            for entry in inner.drivers.values() {
+                let _ = entry.stop_tx.send(true);
+            }
+        }
+        {
+            let retry_candidates = self
+                .retry_candidates
+                .lock()
+                .expect(DRIVER_STORE_LOCK_INVARIANT);
+            for entry in retry_candidates.values() {
+                let _ = entry.stop_tx.send(true);
+            }
+        }
+        let mut retry_ids = self.retry_candidate_ids();
+        drop(mutation);
+
+        retry_ids.sort();
+        let mut failed = false;
+        for id in retry_ids {
+            if self.retry_critical(&id).await.is_err() {
+                failed = true;
+            }
+        }
+
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let mut driver_ids = self
+            .inner
+            .read()
+            .expect(DRIVER_STORE_LOCK_INVARIANT)
+            .drivers
+            .values()
+            .filter(|entry| is_non_terminal(&entry.status.state))
+            .map(|entry| entry.status.id.clone())
+            .collect::<Vec<_>>();
+        driver_ids.sort();
+        drop(mutation);
+        for id in driver_ids {
+            if self.stop_driver_once_for_shutdown(&id).await.is_err() {
+                failed = true;
+            }
+        }
+
+        if failed {
+            Err(BenchmarkSuiteDriverShutdownError::Transition)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn stop_driver_once_for_shutdown(
+        &self,
+        id: &str,
+    ) -> Result<(), BenchmarkSuiteDriverStoreError> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let mut candidate = self.visible_entry_for_update(id)?;
+        if !is_non_terminal(&candidate.status.state) {
+            return Ok(());
+        }
+        let _ = candidate.stop_tx.send(true);
+        candidate.status.state = "stopped".to_string();
+        candidate.status.active_session_id = None;
+        candidate.status.updated_at = timestamp_utc();
+        self.commit_shutdown_transition_once(candidate, mutation)
+            .await
+    }
+
+    async fn commit_shutdown_transition_once(
+        &self,
+        candidate: BenchmarkSuiteDriverEntry,
+        mutation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<(), BenchmarkSuiteDriverStoreError> {
+        let Some(persistence) = &self.persistence else {
+            let mutation = self
+                .commit_transition_once_holding_gate(candidate, mutation)
+                .await?;
+            drop(mutation);
+            return Ok(());
+        };
+        let driver_id = candidate.status.id.clone();
+        if self.has_retry_candidate(&driver_id) {
+            return Err(BenchmarkSuiteDriverStoreError::RetryRequired);
+        }
+        let writer = match persistence.writer(&driver_id) {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.retry_candidates
+                    .lock()
+                    .expect(DRIVER_STORE_LOCK_INVARIANT)
+                    .insert(driver_id, candidate);
+                return Err(error);
+            }
+        };
+        let ticket = match writer.accept(
+            candidate.status.clone(),
+            WriteUrgency::Immediate,
+            encode_driver_status,
+        ) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.retry_candidates
+                    .lock()
+                    .expect(DRIVER_STORE_LOCK_INVARIANT)
+                    .insert(driver_id, candidate);
+                return Err(driver_persistence_error(error));
+            }
+        };
+        let mutation = self
+            .await_commit_holding_gate(candidate, ticket, mutation)
+            .await?;
+        drop(mutation);
+        Ok(())
     }
 
     pub async fn list_recent(&self, limit: usize) -> Vec<BenchmarkSuiteDriverStatus> {
@@ -738,6 +1037,7 @@ impl BenchmarkSuiteDriverStore {
             .await
     }
 
+    #[cfg(test)]
     pub async fn record_stopped(&self, id: &str) -> Result<(), BenchmarkSuiteDriverStoreError> {
         self.update_terminal(id, "stopped", None, None).await
     }
@@ -783,8 +1083,12 @@ impl BenchmarkSuiteDriverStore {
         &self,
         id: &str,
         error: String,
+        reject_during_shutdown: bool,
     ) -> Result<(), BenchmarkSuiteDriverStoreError> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
+        if reject_during_shutdown && self.shutdown_admission_closed.load(Ordering::Acquire) {
+            return Err(BenchmarkSuiteDriverStoreError::ShuttingDown);
+        }
         let mut candidate = self.visible_entry_for_update(id)?;
         if candidate.status.state != "interrupted"
             || !matches!(
@@ -865,6 +1169,18 @@ impl BenchmarkSuiteDriverStore {
         candidate: BenchmarkSuiteDriverEntry,
         mutation: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<(), BenchmarkSuiteDriverStoreError> {
+        let mutation = self
+            .commit_transition_once_holding_gate(candidate, mutation)
+            .await?;
+        drop(mutation);
+        Ok(())
+    }
+
+    async fn commit_transition_once_holding_gate(
+        &self,
+        candidate: BenchmarkSuiteDriverEntry,
+        mutation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, BenchmarkSuiteDriverStoreError> {
         let driver_id = candidate.status.id.clone();
         if self
             .retry_candidates
@@ -888,8 +1204,7 @@ impl BenchmarkSuiteDriverStore {
             if terminal {
                 self.prune_terminal_drivers().await;
             }
-            drop(mutation);
-            return Ok(());
+            return Ok(mutation);
         };
         let ticket = persistence
             .writer(&driver_id)?
@@ -899,7 +1214,8 @@ impl BenchmarkSuiteDriverStore {
                 encode_driver_status,
             )
             .map_err(driver_persistence_error)?;
-        self.await_commit(candidate, ticket, mutation).await
+        self.await_commit_holding_gate(candidate, ticket, mutation)
+            .await
     }
 
     async fn reconcile_critical_transition(
@@ -908,6 +1224,7 @@ impl BenchmarkSuiteDriverStore {
         mut error: BenchmarkSuiteDriverStoreError,
     ) -> Result<(), BenchmarkSuiteDriverStoreError> {
         let mut delay = CRITICAL_RETRY_INITIAL_DELAY;
+        let mut shutdown = self.shutdown_requested.subscribe();
         loop {
             if self.transition_matches(expected) {
                 return Ok(());
@@ -915,12 +1232,22 @@ impl BenchmarkSuiteDriverStore {
             if !self.has_retry_candidate(&expected.id) {
                 return Err(error);
             }
+            if *shutdown.borrow_and_update() {
+                return Err(error);
+            }
 
             warn!(
                 error_class = error.class(),
                 "benchmark suite driver critical transition reconciliation failed; retrying"
             );
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow_and_update() {
+                        return Err(error);
+                    }
+                }
+            }
             delay = delay.saturating_mul(2).min(CRITICAL_RETRY_MAX_DELAY);
 
             match self.retry_critical(&expected.id).await {
@@ -1162,7 +1489,6 @@ impl BenchmarkSuiteDriverStore {
         Ok(mutation)
     }
 
-    #[cfg(test)]
     fn retry_candidate_ids(&self) -> Vec<String> {
         self.retry_candidates
             .lock()
@@ -2270,6 +2596,408 @@ mod tests {
             .start(suite_id, "development".to_string(), 30_000, summary)
             .await
             .expect("terminal driver should not conflict");
+    }
+
+    #[tokio::test]
+    async fn exact_effect_owner_wait_survives_suite_successor_registration() {
+        let owners = Arc::new(BenchmarkSuiteDriverEffectOwners::new());
+        let suite_id = test_suite_id("owner-successor", "development");
+        let (first_stop_tx, first_stop_rx) = watch::channel(false);
+        let (second_stop_tx, second_stop_rx) = watch::channel(false);
+        owners.register(suite_id.clone(), "driver-first".to_string());
+        let first = BenchmarkSuiteDriverEffectOwner {
+            driver_id: "driver-first".to_string(),
+            suite_id: suite_id.clone(),
+            stop_rx: first_stop_rx,
+            owners: owners.clone(),
+        };
+        owners.register(suite_id.clone(), "driver-second".to_string());
+        let second = BenchmarkSuiteDriverEffectOwner {
+            driver_id: "driver-second".to_string(),
+            suite_id: suite_id.clone(),
+            stop_rx: second_stop_rx,
+            owners: owners.clone(),
+        };
+        drop((first_stop_tx, second_stop_tx));
+
+        let wait_owners = owners.clone();
+        let waiter = tokio::spawn(async move { wait_owners.wait_until_empty().await });
+        drop(first);
+        tokio::task::yield_now().await;
+
+        assert!(owners.contains_suite(&suite_id));
+        assert!(!waiter.is_finished());
+        drop(second);
+        waiter.await.expect("exact owner waiter joins");
+        assert!(!owners.contains_suite(&suite_id));
+    }
+
+    #[tokio::test]
+    async fn stop_all_blocks_admission_and_waits_for_exact_effect_owner_drop() {
+        let store = Arc::new(BenchmarkSuiteDriverStore::new());
+        let started = store
+            .start(
+                test_suite_id("stop-all-owner", "development"),
+                "development".to_string(),
+                30_000,
+                test_summary(),
+            )
+            .await
+            .expect("driver starts");
+        let stop_rx = started.effect_owner.stop_receiver();
+        let shutdown_store = store.clone();
+        let shutdown = tokio::spawn(async move { shutdown_store.stop_all_and_join().await });
+        let concurrent_store = store.clone();
+        let concurrent = tokio::spawn(async move { concurrent_store.stop_all_and_join().await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !*stop_rx.borrow() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown signals driver");
+        assert!(!shutdown.is_finished());
+        assert!(matches!(
+            store
+                .start(
+                    test_suite_id("late-start", "development"),
+                    "development".to_string(),
+                    30_000,
+                    test_summary(),
+                )
+                .await,
+            Err(BenchmarkSuiteDriverStartError::ShuttingDown)
+        ));
+        assert!(matches!(
+            store.take_restart_interrupted_resumable_drivers().await,
+            Err(BenchmarkSuiteDriverStoreError::ShuttingDown)
+        ));
+
+        drop(started.effect_owner);
+        shutdown
+            .await
+            .expect("shutdown task joins")
+            .expect("shutdown succeeds");
+        concurrent
+            .await
+            .expect("concurrent shutdown task joins")
+            .expect("concurrent shutdown succeeds");
+        assert_eq!(
+            store
+                .get(&started.status.id)
+                .await
+                .expect("driver remains visible")
+                .state,
+            "stopped"
+        );
+        store
+            .stop_all_and_join()
+            .await
+            .expect("repeated shutdown is idempotent");
+    }
+
+    #[tokio::test]
+    async fn canceled_stop_all_waiter_does_not_cancel_owned_coordinator() {
+        let store = Arc::new(BenchmarkSuiteDriverStore::new());
+        let started = store
+            .start(
+                test_suite_id("stop-all-cancel", "development"),
+                "development".to_string(),
+                30_000,
+                test_summary(),
+            )
+            .await
+            .expect("driver starts");
+        let stop_rx = started.effect_owner.stop_receiver();
+        let shutdown_store = store.clone();
+        let waiter = tokio::spawn(async move { shutdown_store.stop_all_and_join().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !*stop_rx.borrow() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown signals driver");
+
+        waiter.abort();
+        let _ = waiter.await;
+        drop(started.effect_owner);
+        tokio::time::timeout(Duration::from_secs(2), store.stop_all_and_join())
+            .await
+            .expect("owned coordinator completes after waiter cancellation")
+            .expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn start_racing_stop_all_is_rejected_or_joined() {
+        for index in 0..16 {
+            let store = Arc::new(BenchmarkSuiteDriverStore::new());
+            let start_store = store.clone();
+            let start = tokio::spawn(async move {
+                start_store
+                    .start(
+                        test_suite_id(&format!("start-shutdown-race-{index}"), "development"),
+                        "development".to_string(),
+                        30_000,
+                        test_summary(),
+                    )
+                    .await
+            });
+            let shutdown_store = store.clone();
+            let shutdown = tokio::spawn(async move { shutdown_store.stop_all_and_join().await });
+
+            match start.await.expect("start task joins") {
+                Ok(started) => {
+                    let stop_rx = started.effect_owner.stop_receiver();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while !*stop_rx.borrow() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("admitted racing driver is signaled");
+                    drop(started.effect_owner);
+                }
+                Err(BenchmarkSuiteDriverStartError::ShuttingDown) => {}
+                Err(error) => panic!("unexpected racing start error: {error}"),
+            }
+            shutdown
+                .await
+                .expect("shutdown task joins")
+                .expect("shutdown succeeds");
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_all_reports_bounded_transition_failure_after_owner_join() {
+        let root = test_root("stop-all-failure");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        let store = Arc::new(
+            BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(
+                &paths,
+                backend.coordinator(),
+            )
+            .expect("store"),
+        );
+        let started = store
+            .start(
+                test_suite_id("stop-all-failure", "development"),
+                "development".to_string(),
+                30_000,
+                test_summary(),
+            )
+            .await
+            .expect("driver starts");
+        let stop_rx = started.effect_owner.stop_receiver();
+        backend.fail_next();
+        let shutdown_store = store.clone();
+        let shutdown = tokio::spawn(async move { shutdown_store.stop_all_and_join().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !*stop_rx.borrow() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown signals driver before failed transition");
+        drop(started.effect_owner);
+
+        let error = shutdown
+            .await
+            .expect("shutdown task joins")
+            .expect_err("failed transition is reported");
+        assert_eq!(error, BenchmarkSuiteDriverShutdownError::Transition);
+        assert_eq!(error.class(), "transition");
+        store
+            .stop_all_and_join()
+            .await
+            .expect("later shutdown retries the exact retained transition");
+        assert_eq!(
+            store
+                .get(&started.status.id)
+                .await
+                .expect("retried driver remains visible")
+                .state,
+            "stopped"
+        );
+        store.close().await.expect("store closes after exact retry");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_critical_reconciliation_without_losing_retry() {
+        let root = test_root("shutdown-critical-reconciliation");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        backend.set_fail_writes(true);
+        let store = Arc::new(
+            BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(
+                &paths,
+                backend.coordinator(),
+            )
+            .expect("store"),
+        );
+        let start_store = store.clone();
+        let start = tokio::spawn(async move {
+            start_store
+                .start(
+                    test_suite_id("shutdown-critical-reconciliation", "development"),
+                    "development".to_string(),
+                    30_000,
+                    test_summary(),
+                )
+                .await
+        });
+        let driver_id = "benchmark-suite-driver-0000000000000001";
+        wait_for_retry_candidate(&store, driver_id).await;
+
+        let shutdown_store = store.clone();
+        let shutdown = tokio::spawn(async move { shutdown_store.stop_all_and_join().await });
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), start)
+                .await
+                .expect("critical reconciliation observes shutdown")
+                .expect("start task joins"),
+            Err(BenchmarkSuiteDriverStartError::Store { .. })
+        ));
+        assert_eq!(
+            shutdown.await.expect("shutdown task joins"),
+            Err(BenchmarkSuiteDriverShutdownError::Transition)
+        );
+        assert_eq!(store.retry_candidate_ids(), vec![driver_id.to_string()]);
+
+        backend.set_fail_writes(false);
+        store
+            .stop_all_and_join()
+            .await
+            .expect("later shutdown retries retained start and stop");
+        assert_eq!(
+            store.get(driver_id).await.expect("retried driver").state,
+            "stopped"
+        );
+        store.close().await.expect("store closes");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn stop_all_attempts_every_driver_after_one_transition_fails() {
+        let root = test_root("stop-all-full-pass");
+        let paths = test_paths(&root);
+        let backend = Arc::new(ControlledBackend::default());
+        let store = Arc::new(
+            BenchmarkSuiteDriverStore::try_load_from_paths_with_coordinator(
+                &paths,
+                backend.coordinator(),
+            )
+            .expect("store"),
+        );
+        let first = store
+            .start(
+                test_suite_id("stop-all-full-pass-first", "development"),
+                "development".to_string(),
+                30_000,
+                test_summary(),
+            )
+            .await
+            .expect("first driver starts");
+        let second = store
+            .start(
+                test_suite_id("stop-all-full-pass-second", "development"),
+                "development".to_string(),
+                30_000,
+                test_summary(),
+            )
+            .await
+            .expect("second driver starts");
+        let first_stop = first.effect_owner.stop_receiver();
+        let second_stop = second.effect_owner.stop_receiver();
+        backend.set_fail_destination(Some(driver_path(&driver_dir(&paths), &first.status.id)));
+        let shutdown_store = store.clone();
+        let shutdown = tokio::spawn(async move { shutdown_store.stop_all_and_join().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !*first_stop.borrow() || !*second_stop.borrow() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every driver is signaled");
+        drop((first.effect_owner, second.effect_owner));
+
+        assert_eq!(
+            shutdown.await.expect("shutdown task joins"),
+            Err(BenchmarkSuiteDriverShutdownError::Transition)
+        );
+        assert_eq!(store.retry_candidate_ids(), vec![first.status.id.clone()]);
+        assert_eq!(
+            store
+                .get(&second.status.id)
+                .await
+                .expect("second driver")
+                .state,
+            "stopped"
+        );
+        assert_eq!(
+            load_status_file(&driver_path(&driver_dir(&paths), &second.status.id))
+                .expect("second stopped status")
+                .state,
+            "stopped"
+        );
+
+        backend.set_fail_destination(None);
+        store
+            .stop_all_and_join()
+            .await
+            .expect("retry commits the exact failed driver");
+        assert!(store.retry_candidate_ids().is_empty());
+        assert_eq!(
+            store
+                .get(&first.status.id)
+                .await
+                .expect("first driver")
+                .state,
+            "stopped"
+        );
+        store.close().await.expect("close after full retry");
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn shutdown_prevents_restart_failure_checkpoint_after_resume_admission() {
+        let root = test_root("resume-failure-shutdown-race");
+        let paths = test_paths(&root);
+        let dir = driver_dir(&paths);
+        fs::create_dir_all(&dir).expect("create driver dir");
+        let queued = status_fixture(1, "interrupted", Some(AUTOMATIC_RESUME_QUEUED_ERROR));
+        write_status_fixture(&dir, &queued);
+        let store = BenchmarkSuiteDriverStore::load_from_paths(&paths);
+        let pending = store
+            .take_restart_interrupted_resumable_drivers()
+            .await
+            .expect("resume is admitted before shutdown");
+        assert_eq!(pending.len(), 1);
+
+        store
+            .stop_all_and_join()
+            .await
+            .expect("shutdown has no live effect owners");
+        assert!(matches!(
+            store
+                .record_restart_resume_failed(&queued.id, "late resume failure")
+                .await,
+            Err(BenchmarkSuiteDriverStoreError::ShuttingDown)
+        ));
+        assert_eq!(
+            store
+                .get(&queued.id)
+                .await
+                .expect("queued handoff remains visible")
+                .error
+                .as_deref(),
+            Some(AUTOMATIC_RESUME_QUEUED_ERROR)
+        );
+        store.close().await.expect("store closes");
+        cleanup(&root);
     }
 
     #[tokio::test]

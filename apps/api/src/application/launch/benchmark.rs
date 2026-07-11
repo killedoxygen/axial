@@ -167,6 +167,9 @@ pub(crate) async fn resume_restart_interrupted_benchmark_suite_drivers(
             .await
         {
             Ok(started) => started,
+            Err(BenchmarkSuiteDriverStartError::ShuttingDown) => {
+                return Err(BenchmarkSuiteDriverStoreError::ShuttingDown);
+            }
             Err(error) => {
                 summary.failed += 1;
                 let error = benchmark_suite_driver_start_error_response(error);
@@ -1417,6 +1420,10 @@ fn benchmark_suite_driver_start_error_response(
 ) -> (StatusCode, Json<serde_json::Value>) {
     match error {
         BenchmarkSuiteDriverStartError::Conflict => benchmark_suite_driver_already_active_error(),
+        BenchmarkSuiteDriverStartError::ShuttingDown => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "benchmark suite drivers are shutting down" })),
+        ),
         BenchmarkSuiteDriverStartError::Store { source, .. } => {
             benchmark_suite_driver_store_error_response(source)
         }
@@ -1437,6 +1444,10 @@ fn benchmark_suite_driver_store_error_response(
             Json(json!({
                 "error": "benchmark suite driver state could not be persisted"
             })),
+        ),
+        BenchmarkSuiteDriverStoreError::ShuttingDown => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "benchmark suite drivers are shutting down" })),
         ),
     }
 }
