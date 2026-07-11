@@ -168,8 +168,15 @@ impl ProcessTerminationRequest {
         if let Some(acceptance) = self.acceptance {
             return Ok(acceptance);
         }
-        let acceptance = match self.accepted.take() {
-            Some(accepted) => match accepted.await {
+        let accepted = match self.accepted.as_mut() {
+            Some(accepted) => Some(accepted.await),
+            None => None,
+        };
+        if accepted.is_some() {
+            self.accepted = None;
+        }
+        let acceptance = match accepted {
+            Some(accepted) => match accepted {
                 Ok(accepted) => accepted?,
                 Err(_) => {
                     return self.acceptance_after_owner_closed().await;
@@ -338,6 +345,72 @@ pub(super) fn rejected_process_control_handle() -> ProcessControlHandle {
         terminal_settled: terminal_settled_rx,
         reject_next_start_kill: Arc::new(AtomicBool::new(false)),
         completed: completed_rx,
+    }
+}
+
+#[cfg(test)]
+pub(super) struct GatedTerminationControl {
+    pub(super) handle: ProcessControlHandle,
+    commands: mpsc::UnboundedReceiver<ProcessControl>,
+    pending_acceptance: Option<oneshot::Sender<io::Result<ProcessTerminationAcceptance>>>,
+    reaped: watch::Sender<Option<ProcessReap>>,
+    terminal_settled: watch::Sender<bool>,
+    completed: watch::Sender<bool>,
+}
+
+#[cfg(test)]
+impl GatedTerminationControl {
+    pub(super) async fn capture_user_stop_request(&mut self) {
+        let control = self.commands.recv().await.expect("termination request");
+        let ProcessControl::Terminate { cause, accepted } = control else {
+            panic!("expected termination request");
+        };
+        assert_eq!(cause, ProcessTerminalCause::UserStop);
+        self.pending_acceptance = Some(accepted);
+    }
+
+    pub(super) fn accept_user_stop(&mut self) {
+        self.pending_acceptance
+            .take()
+            .expect("captured termination acceptance")
+            .send(Ok(ProcessTerminationAcceptance::Accepted(
+                ProcessTerminalCause::UserStop,
+            )))
+            .ok();
+    }
+
+    pub(super) fn publish_user_stop_reap(&self, result: io::Result<()>) {
+        self.reaped.send_replace(Some(ProcessReap {
+            cause: Some(ProcessTerminalCause::UserStop),
+            result: result
+                .as_ref()
+                .map(|_| ())
+                .map_err(ProcessOwnerError::from_io),
+        }));
+        self.terminal_settled.send_replace(true);
+        self.completed.send_replace(true);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn gated_termination_control() -> GatedTerminationControl {
+    let (commands, command_rx) = mpsc::unbounded_channel();
+    let (reaped, reaped_rx) = watch::channel(None);
+    let (terminal_settled, terminal_settled_rx) = watch::channel(false);
+    let (completed, completed_rx) = watch::channel(false);
+    GatedTerminationControl {
+        handle: ProcessControlHandle {
+            commands,
+            reaped: reaped_rx,
+            terminal_settled: terminal_settled_rx,
+            reject_next_start_kill: Arc::new(AtomicBool::new(false)),
+            completed: completed_rx,
+        },
+        commands: command_rx,
+        pending_acceptance: None,
+        reaped,
+        terminal_settled,
+        completed,
     }
 }
 
@@ -756,7 +829,9 @@ async fn settle_process_exit(
                 failure_detail,
                 healing: exit_context.record.healing.clone(),
                 guardian: exit_context.record.guardian.clone(),
-                outcome: None,
+                outcome: (requested_cause == Some(ProcessTerminalCause::UserStop)).then(|| {
+                    LaunchSessionOutcome::from_reason(LaunchSessionExitReason::LauncherStopped)
+                }),
                 notice: None,
                 evidence,
                 stages: Vec::new(),

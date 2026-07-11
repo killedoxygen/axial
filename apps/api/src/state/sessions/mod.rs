@@ -267,6 +267,131 @@ pub(crate) struct UserStopLease {
     retention_hold_active: bool,
 }
 
+struct PendingUserStop {
+    store: Arc<SessionStore>,
+    session_id: String,
+    attempt: Arc<ProcessAttemptScope>,
+    request: Option<supervisor::ProcessTerminationRequest>,
+    lifecycle_guard: Option<OwnedMutexGuard<()>>,
+    prior_terminal_sequence: Option<Option<u64>>,
+}
+
+impl PendingUserStop {
+    async fn accepted(&mut self) -> std::io::Result<supervisor::ProcessTerminationAcceptance> {
+        self.request
+            .as_mut()
+            .expect("pending user stop request was already settled")
+            .accepted()
+            .await
+    }
+
+    async fn publish_intent(
+        &self,
+        acceptance: supervisor::ProcessTerminationAcceptance,
+    ) -> Option<LaunchSessionRecord> {
+        if !user_stop_was_accepted(acceptance) {
+            return None;
+        }
+        self.store
+            .record_user_stop_intent_for_attempt(&self.session_id, &self.attempt)
+            .await
+    }
+
+    async fn reaped(&mut self) -> std::io::Result<supervisor::ProcessTerminationAcceptance> {
+        self.request
+            .as_mut()
+            .expect("pending user stop request was already settled")
+            .reaped()
+            .await
+    }
+
+    fn release_lifecycle_guard(&mut self) {
+        drop(self.lifecycle_guard.take());
+    }
+
+    fn disarm_request(&mut self) {
+        self.request.take();
+    }
+
+    async fn rollback_rejection(&mut self) {
+        if let Some(prior_terminal_sequence) = self.prior_terminal_sequence.take() {
+            self.store
+                .rollback_user_stop_retention_for_attempt(
+                    &self.session_id,
+                    &self.attempt,
+                    prior_terminal_sequence,
+                )
+                .await;
+        }
+        self.disarm_request();
+        self.release_lifecycle_guard();
+    }
+
+    async fn release_retention(&mut self) {
+        if self.prior_terminal_sequence.take().is_some() {
+            self.store
+                .release_terminal_retention_hold_for_attempt(&self.session_id, &self.attempt)
+                .await;
+        }
+    }
+
+    fn into_lease(mut self, record: LaunchSessionRecord) -> UserStopLease {
+        self.disarm_request();
+        self.prior_terminal_sequence.take();
+        UserStopLease {
+            store: self.store.clone(),
+            lifecycle_guard: self.lifecycle_guard.take(),
+            attempt: self.attempt.clone(),
+            session_id: self.session_id.clone(),
+            record,
+            retention_hold_active: true,
+        }
+    }
+}
+
+impl Drop for PendingUserStop {
+    fn drop(&mut self) {
+        let Some(mut request) = self.request.take() else {
+            return;
+        };
+        let store = self.store.clone();
+        let session_id = self.session_id.clone();
+        let attempt = self.attempt.clone();
+        let lifecycle_guard = self.lifecycle_guard.take();
+        let prior_terminal_sequence = self.prior_terminal_sequence.take();
+        tokio::spawn(async move {
+            match request.accepted().await {
+                Ok(acceptance) => {
+                    if user_stop_was_accepted(acceptance) {
+                        store
+                            .record_user_stop_intent_for_attempt(&session_id, &attempt)
+                            .await;
+                    }
+                    let _ = request.reaped().await;
+                    if prior_terminal_sequence.is_some() {
+                        store
+                            .release_terminal_retention_hold_for_attempt(&session_id, &attempt)
+                            .await;
+                    }
+                    drop(lifecycle_guard);
+                }
+                Err(_) => {
+                    if let Some(prior_terminal_sequence) = prior_terminal_sequence {
+                        store
+                            .rollback_user_stop_retention_for_attempt(
+                                &session_id,
+                                &attempt,
+                                prior_terminal_sequence,
+                            )
+                            .await;
+                    }
+                    drop(lifecycle_guard);
+                }
+            }
+        });
+    }
+}
+
 impl UserStopLease {
     pub(crate) fn record(&self) -> &LaunchSessionRecord {
         &self.record
@@ -569,6 +694,41 @@ impl SessionStore {
         if evicted {
             self.notify_changed();
         }
+    }
+
+    async fn rollback_user_stop_retention_for_attempt(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
+        prior_terminal_sequence: Option<u64>,
+    ) {
+        let mut sessions = self.sessions.write().await;
+        let Some(entry) = sessions
+            .get_mut(session_id)
+            .filter(|entry| attempt_scopes_match(&entry.attempt, attempt))
+        else {
+            return;
+        };
+        entry.retention_holds = entry
+            .retention_holds
+            .checked_sub(1)
+            .expect("released a user-stop retention hold that was not acquired");
+        if entry.terminal_sequence.is_none() {
+            entry.terminal_sequence = prior_terminal_sequence;
+        }
+    }
+
+    async fn record_user_stop_intent_for_attempt(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
+    ) -> Option<LaunchSessionRecord> {
+        let mut sessions = self.sessions.write().await;
+        let entry = sessions
+            .get_mut(session_id)
+            .filter(|entry| attempt_scopes_match(&entry.attempt, attempt))?;
+        record_user_stop_intent(entry, session_id);
+        Some(entry.record.clone())
     }
 
     pub async fn emit_log(
@@ -1007,30 +1167,44 @@ impl SessionStore {
         Ok(record)
     }
 
-    pub async fn kill(&self, session_id: &str) -> Result<(), SessionStopError> {
-        let lifecycle_transition = self.lifecycle_transition.lock().await;
-        let process = {
-            let mut sessions = self.sessions.write().await;
-            let Some(entry) = sessions.get_mut(session_id) else {
+    pub async fn kill(self: &Arc<Self>, session_id: &str) -> Result<(), SessionStopError> {
+        let lifecycle_guard = self.lifecycle_transition.clone().lock_owned().await;
+        let (attempt, process) = {
+            let sessions = self.sessions.read().await;
+            let Some(entry) = sessions.get(session_id) else {
                 return Err(SessionStopError::SessionNotFound);
             };
             let Some(process) = entry.process.clone() else {
                 return Err(SessionStopError::NoLiveProcess);
             };
-            entry.stop_requested = true;
-            let evidence =
-                process_stop_stage_evidence(session_id, ProcessStopIntent::UserRequested);
-            ensure_stage_started(&mut entry.record, now_ms());
-            apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
-            process
+            (entry.attempt.clone(), process)
         };
-        let mut request = process.terminate(supervisor::ProcessTerminalCause::UserStop);
-        drop(lifecycle_transition);
-        request
-            .reaped()
-            .await
-            .map(|_| ())
-            .map_err(SessionStopError::Process)
+        let mut stop = PendingUserStop {
+            store: self.clone(),
+            session_id: session_id.to_string(),
+            attempt,
+            request: Some(process.terminate(supervisor::ProcessTerminalCause::UserStop)),
+            lifecycle_guard: Some(lifecycle_guard),
+            prior_terminal_sequence: None,
+        };
+        let acceptance = match stop.accepted().await {
+            Ok(acceptance) => acceptance,
+            Err(error) => {
+                stop.rollback_rejection().await;
+                return Err(SessionStopError::Process(error));
+            }
+        };
+        if !user_stop_was_accepted(acceptance) {
+            stop.release_lifecycle_guard();
+            let _ = stop.reaped().await;
+            stop.disarm_request();
+            return Err(SessionStopError::NoLiveProcess);
+        }
+        stop.publish_intent(acceptance).await;
+        stop.release_lifecycle_guard();
+        let reaped = stop.reaped().await;
+        stop.disarm_request();
+        reaped.map(|_| ()).map_err(SessionStopError::Process)
     }
 
     pub(crate) async fn terminate_for_launch_failure(
@@ -1141,7 +1315,7 @@ impl SessionStore {
         session_id: &str,
     ) -> Result<UserStopLease, SessionStopError> {
         let lifecycle_guard = self.lifecycle_transition.clone().lock_owned().await;
-        let (attempt, process, record) = {
+        let (attempt, process, prior_terminal_sequence) = {
             let mut sessions = self.sessions.write().await;
             let Some(entry) = sessions.get_mut(session_id) else {
                 return Err(SessionStopError::SessionNotFound);
@@ -1153,29 +1327,39 @@ impl SessionStore {
                 .retention_holds
                 .checked_add(1)
                 .expect("session retention hold count overflowed");
+            let prior_terminal_sequence = entry.terminal_sequence;
             entry.terminal_sequence = None;
-            entry.stop_requested = true;
-            let evidence =
-                process_stop_stage_evidence(session_id, ProcessStopIntent::UserRequested);
-            ensure_stage_started(&mut entry.record, now_ms());
-            apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
-            (entry.attempt.clone(), process, entry.record.clone())
+            (entry.attempt.clone(), process, prior_terminal_sequence)
         };
-        let mut lease = UserStopLease {
+        let mut stop = PendingUserStop {
             store: self.clone(),
-            lifecycle_guard: Some(lifecycle_guard),
-            attempt,
             session_id: session_id.to_string(),
-            record,
-            retention_hold_active: true,
+            attempt,
+            request: Some(process.terminate(supervisor::ProcessTerminalCause::UserStop)),
+            lifecycle_guard: Some(lifecycle_guard),
+            prior_terminal_sequence: Some(prior_terminal_sequence),
         };
-        let mut request = process.terminate(supervisor::ProcessTerminalCause::UserStop);
-        if let Err(error) = request.reaped().await {
-            lease.release_hold().await;
-            drop(lease.lifecycle_guard.take());
+        let acceptance = match stop.accepted().await {
+            Ok(acceptance) => acceptance,
+            Err(error) => {
+                stop.rollback_rejection().await;
+                return Err(SessionStopError::Process(error));
+            }
+        };
+        let Some(record) = stop.publish_intent(acceptance).await else {
+            stop.release_lifecycle_guard();
+            let _ = stop.reaped().await;
+            stop.disarm_request();
+            stop.release_retention().await;
+            return Err(SessionStopError::NoLiveProcess);
+        };
+        if let Err(error) = stop.reaped().await {
+            stop.disarm_request();
+            stop.release_retention().await;
+            stop.release_lifecycle_guard();
             return Err(SessionStopError::Process(error));
         }
-        Ok(lease)
+        Ok(stop.into_lease(record))
     }
 
     #[cfg(test)]
@@ -1616,6 +1800,27 @@ fn process_stop_stage_evidence(
         intent,
     ));
     process_stage_evidence(&report.facts)
+}
+
+fn record_user_stop_intent(entry: &mut SessionEntry, session_id: &str) {
+    if entry.stop_requested {
+        return;
+    }
+    entry.stop_requested = true;
+    let evidence = process_stop_stage_evidence(session_id, ProcessStopIntent::UserRequested);
+    ensure_stage_started(&mut entry.record, now_ms());
+    apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
+}
+
+fn user_stop_was_accepted(acceptance: supervisor::ProcessTerminationAcceptance) -> bool {
+    matches!(
+        acceptance,
+        supervisor::ProcessTerminationAcceptance::Accepted(
+            supervisor::ProcessTerminalCause::UserStop
+        ) | supervisor::ProcessTerminationAcceptance::Joined(
+            supervisor::ProcessTerminalCause::UserStop
+        )
+    )
 }
 
 fn platform_default_start_mode() -> &'static str {
@@ -2708,6 +2913,98 @@ mod tests {
         ));
         let entry = store.sessions.read().await;
         assert!(!entry.get(session_id).expect("session entry").stop_requested);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_kill_preserves_live_attempt_watchdog_state() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "rejected-user-kill";
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec sleep 30");
+        store
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("start kill target");
+        let before = store.get(session_id).await.expect("record before kill");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("current attempt");
+        assert!(store.reject_next_process_start_kill(session_id).await);
+
+        let error = store
+            .kill(session_id)
+            .await
+            .expect_err("injected kill rejection");
+
+        assert!(matches!(
+            error,
+            SessionStopError::Process(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        {
+            let sessions = store.sessions.read().await;
+            let entry = sessions.get(session_id).expect("live session");
+            assert!(!entry.stop_requested);
+            assert_eq!(entry.record.stages, before.stages);
+        }
+        assert!(
+            store
+                .startup_watchdog_process_for_attempt(session_id, &attempt)
+                .await
+                .is_some()
+        );
+        store.terminate_all().await.expect("terminate kill target");
+    }
+
+    #[tokio::test]
+    async fn cancelled_kill_pending_acceptance_preserves_accepted_user_stop() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "cancelled-kill-acceptance";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("attempt");
+        let mut gated = supervisor::gated_termination_control();
+        store
+            .sessions
+            .write()
+            .await
+            .get_mut(session_id)
+            .expect("session")
+            .process = Some(gated.handle.clone());
+        let kill_store = store.clone();
+        let kill = tokio::spawn(async move { kill_store.kill(session_id).await });
+        gated.capture_user_stop_request().await;
+
+        kill.abort();
+        assert!(kill.await.expect_err("cancelled kill").is_cancelled());
+        gated.accept_user_stop();
+        wait_for_user_stop_intent(&store, session_id).await;
+        assert_eq!(user_stop_evidence_count(&store, session_id).await, 1);
+        store
+            .emit_status_for_attempt(session_id, &attempt, terminal_status(Some(-9), None, None))
+            .await;
+        assert_eq!(
+            store
+                .get(session_id)
+                .await
+                .and_then(|record| record.outcome)
+                .map(|outcome| outcome.reason),
+            Some(LaunchSessionExitReason::LauncherStopped)
+        );
+        gated.publish_user_stop_reap(Ok(()));
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            store.lifecycle_transition.clone().lock_owned(),
+        )
+        .await
+        .expect("detached kill settlement");
     }
 
     #[cfg(unix)]
@@ -4029,6 +4326,10 @@ mod tests {
             .get_mut(session_id)
             .expect("stop session")
             .process = Some(supervisor::rejected_process_control_handle());
+        let before = store
+            .get(session_id)
+            .await
+            .expect("record before rejected stop");
 
         let error = match store.begin_user_stop(session_id).await {
             Ok(_) => panic!("rejected owner must fail stop"),
@@ -4040,16 +4341,12 @@ mod tests {
             SessionStopError::Process(error)
                 if error.kind() == std::io::ErrorKind::BrokenPipe
         ));
-        assert_eq!(
-            store
-                .sessions
-                .read()
-                .await
-                .get(session_id)
-                .expect("stop session")
-                .retention_holds,
-            1
-        );
+        let sessions = store.sessions.read().await;
+        let entry = sessions.get(session_id).expect("stop session");
+        assert_eq!(entry.retention_holds, 1);
+        assert!(!entry.stop_requested);
+        assert_eq!(entry.record.stages, before.stages);
+        drop(sessions);
         assert!(store.lifecycle_transition.try_lock().is_ok());
     }
 
@@ -4142,6 +4439,61 @@ mod tests {
                 .expect("owner completion deadline")
                 .expect("owner completion");
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_begin_user_stop_pending_acceptance_releases_retention_after_acceptance() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "cancelled-stop-acceptance";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("attempt");
+        let mut gated = supervisor::gated_termination_control();
+        store
+            .sessions
+            .write()
+            .await
+            .get_mut(session_id)
+            .expect("session")
+            .process = Some(gated.handle.clone());
+        let stop_store = store.clone();
+        let stop = tokio::spawn(async move { stop_store.begin_user_stop(session_id).await });
+        gated.capture_user_stop_request().await;
+        assert_eq!(store.retention_hold_count(session_id).await, Some(2));
+
+        stop.abort();
+        match stop.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("stop task was not cancelled"),
+        }
+        gated.accept_user_stop();
+        wait_for_user_stop_intent(&store, session_id).await;
+        assert_eq!(user_stop_evidence_count(&store, session_id).await, 1);
+        store
+            .emit_status_for_attempt(session_id, &attempt, terminal_status(Some(-9), None, None))
+            .await;
+        gated.publish_user_stop_reap(Ok(()));
+        let guard = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.lifecycle_transition.clone().lock_owned(),
+        )
+        .await
+        .expect("detached stop settlement");
+        assert_eq!(store.retention_hold_count(session_id).await, Some(1));
+        assert_eq!(
+            store
+                .get(session_id)
+                .await
+                .and_then(|record| record.outcome)
+                .map(|outcome| outcome.reason),
+            Some(LaunchSessionExitReason::LauncherStopped)
+        );
+        drop(guard);
     }
 
     #[cfg(unix)]
@@ -5135,6 +5487,37 @@ mod tests {
             .get_mut(session_id)
             .expect("session should exist for stop intent");
         entry.stop_requested = true;
+    }
+
+    async fn wait_for_user_stop_intent(store: &SessionStore, session_id: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store
+                    .sessions
+                    .read()
+                    .await
+                    .get(session_id)
+                    .is_some_and(|entry| entry.stop_requested)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("user-stop intent publication");
+    }
+
+    async fn user_stop_evidence_count(store: &SessionStore, session_id: &str) -> usize {
+        store
+            .get(session_id)
+            .await
+            .expect("session")
+            .stages
+            .iter()
+            .flat_map(|stage| &stage.evidence)
+            .filter(|evidence| evidence.id.contains("process_stop_requested"))
+            .count()
     }
 
     fn terminal_record(
