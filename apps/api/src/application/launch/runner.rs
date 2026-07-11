@@ -686,7 +686,6 @@ async fn launch_session_inner_with_control(
                         &state,
                         &session_id,
                         &recovery_plan,
-                        failure_class,
                     )
                     .await
                     .map_err(guardian_journal_error)?;
@@ -760,14 +759,8 @@ async fn launch_session_inner_with_control(
                 effective_preset: &prepared.effective_preset,
                 explicit_jvm_preset_present: intent.guardian.has_named_preset(),
             })
-            && let Ok(plan) = plan_guardian_launch_recovery_directive(
-                &intent,
-                directive,
-                launch_policy_guardian_mode(intent.guardian.mode),
-                LaunchFailureClass::Unknown,
-            )
         {
-            record_prelaunch_preset_adjustment_directive(&mut guardian, &plan);
+            record_prelaunch_preset_adjustment_directive(&mut guardian, &directive);
         }
 
         trace_launch_event(
@@ -1245,7 +1238,6 @@ async fn launch_session_inner_with_control(
                         &state,
                         &session_id,
                         &recovery_plan,
-                        failure_class,
                     )
                     .await
                     .map_err(guardian_journal_error)?;
@@ -1848,6 +1840,10 @@ mod tests {
             .await
             .expect("prepare low-end preflight after Fabric OOM crash");
         assert!(low_end_preflight.readiness.launchable);
+        assert_eq!(
+            low_end_preflight.guardian.decision,
+            axial_launcher::GuardianDecision::Warned
+        );
         assert_eq!(low_end_preflight.memory.max_memory_mb, 1024);
         assert_eq!(
             low_end_preflight
@@ -1868,6 +1864,11 @@ mod tests {
         assert_eq!(
             guardian_fact_field(low_end_failure, "suggested_memory_mb"),
             Some("2048")
+        );
+        assert!(
+            low_end_preflight.guardian.details.iter().any(|detail| {
+                detail.contains("out-of-memory crash") && detail.contains("today")
+            })
         );
         assert!(low_end_preflight.guardian.guidance.iter().any(|guidance| {
             guidance
@@ -2270,6 +2271,10 @@ mod tests {
             .await
             .expect("prepare normal-host preflight after Fabric mod crash");
         assert!(normal_preflight.readiness.launchable);
+        assert_eq!(
+            normal_preflight.guardian.decision,
+            axial_launcher::GuardianDecision::Warned
+        );
         assert_eq!(normal_preflight.memory.max_memory_mb, 4096);
         assert_eq!(
             normal_preflight
@@ -2287,6 +2292,15 @@ mod tests {
             guardian_fact_field(normal_failure, "failure_class"),
             Some("mod_attributed_crash")
         );
+        assert!(
+            normal_preflight.guardian.details.iter().any(|detail| {
+                detail.contains("mod-attributed crash") && detail.contains("today")
+            })
+        );
+        assert!(normal_preflight.guardian.guidance.iter().any(|guidance| {
+            guidance
+                == "Review recently changed mods and disable the suspected mod before relaunching."
+        }));
         assert_eq!(state.sessions().active_session_count().await, 0);
         assert!(
             !state

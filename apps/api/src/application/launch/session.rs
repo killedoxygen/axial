@@ -722,8 +722,6 @@ async fn build_launch_preflight_facts_with_memory_capture(
                 explicit_jvm_args: &extra_jvm_args,
                 requested_preset: &requested_preset,
             },
-            runtime_major: required_java_major,
-            known_effective_preset: None,
             current_memory_mb: max_memory_mb,
             suggested_memory_mb,
         },

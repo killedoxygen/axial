@@ -2,6 +2,10 @@ use super::{
     FactReliability, GuardianConfidence, GuardianDecision, GuardianDecisionKind, GuardianDomain,
     GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianSeverity,
     GuardianUserOutcome, SafetyCase, SafetyOutcome, build_safety_case, decide_guardian_policy,
+    launch_failure_memory::{
+        RECENT_REPAIR_FAILED_FACT_ID, RECENT_STARTUP_FAILURE_FACT_ID,
+        REPAIR_SUPPRESSED_UNTIL_FACT_ID,
+    },
 };
 use crate::observability::{
     EvidenceField, EvidenceSensitivity, RedactionAudience, sanitize_evidence_text,
@@ -333,9 +337,9 @@ fn is_preflight_warning_fact(fact: &GuardianFact) -> bool {
             | "custom_java_override_present"
             | "custom_jvm_preset_present"
             | "custom_jvm_args_present"
-            | "recent_startup_failure"
-            | "recent_repair_failed"
-            | "repair_suppressed_until"
+            | RECENT_STARTUP_FAILURE_FACT_ID
+            | RECENT_REPAIR_FAILED_FACT_ID
+            | REPAIR_SUPPRESSED_UNTIL_FACT_ID
     )
 }
 
@@ -388,15 +392,17 @@ fn push_historical_launch_copy(
 fn is_historical_launch_fact(fact: &GuardianFact) -> bool {
     matches!(
         fact.id.as_str(),
-        "recent_startup_failure" | "recent_repair_failed" | "repair_suppressed_until"
+        RECENT_STARTUP_FAILURE_FACT_ID
+            | RECENT_REPAIR_FAILED_FACT_ID
+            | REPAIR_SUPPRESSED_UNTIL_FACT_ID
     )
 }
 
 fn historical_launch_detail(fact: &GuardianFact) -> Option<String> {
     match fact.id.as_str() {
-        "recent_startup_failure" => recent_startup_failure_detail(fact),
-        "recent_repair_failed" => repair_failure_copy(fact).map(|copy| copy.0.to_string()),
-        "repair_suppressed_until" => suppression_time_utc(fact)
+        RECENT_STARTUP_FAILURE_FACT_ID => recent_startup_failure_detail(fact),
+        RECENT_REPAIR_FAILED_FACT_ID => repair_failure_copy(fact).map(|copy| copy.0.to_string()),
+        REPAIR_SUPPRESSED_UNTIL_FACT_ID => suppression_time_utc(fact)
             .map(|time| format!("Guardian will not auto-repair this launch again until {time}.")),
         _ => None,
     }
@@ -404,9 +410,9 @@ fn historical_launch_detail(fact: &GuardianFact) -> Option<String> {
 
 fn historical_launch_guidance(fact: &GuardianFact) -> Option<String> {
     match fact.id.as_str() {
-        "recent_startup_failure" => recent_startup_failure_guidance(fact),
-        "recent_repair_failed" => repair_failure_copy(fact).map(|copy| copy.1.to_string()),
-        "repair_suppressed_until" => suppression_time_utc(fact).map(|time| {
+        RECENT_STARTUP_FAILURE_FACT_ID => recent_startup_failure_guidance(fact),
+        RECENT_REPAIR_FAILED_FACT_ID => repair_failure_copy(fact).map(|copy| copy.1.to_string()),
+        REPAIR_SUPPRESSED_UNTIL_FACT_ID => suppression_time_utc(fact).map(|time| {
             format!(
                 "Review the launch settings before retrying; unchanged settings will not trigger another automatic repair before {time}."
             )
@@ -559,23 +565,9 @@ fn repair_failure_copy(fact: &GuardianFact) -> Option<(&'static str, &'static st
             "The previous JVM argument recovery attempt failed.",
             "Review or remove explicit JVM arguments before relaunching.",
         )),
-        "jvm_preset_recovery" => match fact_field(fact, "recovery_preset") {
-            Some("legacy") => Some((
-                "The previous JVM preset recovery attempt failed.",
-                "Try the Legacy JVM preset before relaunching.",
-            )),
-            Some("performance") => Some((
-                "The previous JVM preset recovery attempt failed.",
-                "Try the Performance JVM preset before relaunching.",
-            )),
-            _ => Some((
-                "The previous JVM preset recovery attempt failed.",
-                "Review the JVM preset before relaunching.",
-            )),
-        },
-        "launch_startup_recovery" => Some((
-            "The previous automatic startup recovery attempt failed.",
-            "Review the launch settings before relaunching.",
+        "jvm_preset_recovery" => Some((
+            "The previous JVM preset recovery attempt failed.",
+            "Review the JVM preset before relaunching.",
         )),
         _ => None,
     }
@@ -1060,7 +1052,9 @@ fn push_unique_public(values: &mut Vec<String>, value: &str, max_values: usize) 
 mod tests {
     use super::{
         GuardianPreflightOutcomeRequest, GuardianPreflightReadiness,
-        GuardianPreflightResourceSignals, guardian_preflight_outcome, launch_failure_plain_label,
+        GuardianPreflightResourceSignals, RECENT_REPAIR_FAILED_FACT_ID,
+        RECENT_STARTUP_FAILURE_FACT_ID, REPAIR_SUPPRESSED_UNTIL_FACT_ID,
+        guardian_preflight_outcome, launch_failure_plain_label,
     };
     use crate::guardian::{
         FactReliability, GuardianConfidence, GuardianDecisionKind, GuardianDomain, GuardianFact,
@@ -1287,7 +1281,7 @@ mod tests {
     fn historical_launch_facts_only_warn_and_never_direct_launch_actions() {
         let historical_facts = [
             fact_with_fields(
-                "recent_startup_failure",
+                RECENT_STARTUP_FAILURE_FACT_ID,
                 "instance-a",
                 [
                     ("failure_class", "out_of_memory"),
@@ -1296,12 +1290,12 @@ mod tests {
                 ],
             ),
             fact_with_fields(
-                "recent_repair_failed",
+                RECENT_REPAIR_FAILED_FACT_ID,
                 "instance-a",
                 [("diagnosis", "java_runtime_recovery")],
             ),
             fact_with_fields(
-                "repair_suppressed_until",
+                REPAIR_SUPPRESSED_UNTIL_FACT_ID,
                 "instance-a",
                 [("suppression_until", "2026-07-11T11:05:00Z")],
             ),
@@ -1329,7 +1323,7 @@ mod tests {
     #[test]
     fn recent_startup_failure_copy_uses_truthful_occurrence_windows() {
         let today = fact_with_fields(
-            "recent_startup_failure",
+            RECENT_STARTUP_FAILURE_FACT_ID,
             "instance-a",
             [
                 ("failure_class", "mod_attributed_crash"),
@@ -1339,7 +1333,7 @@ mod tests {
             ],
         );
         let recorded = fact_with_fields(
-            "recent_startup_failure",
+            RECENT_STARTUP_FAILURE_FACT_ID,
             "instance-b",
             [
                 ("failure_class", "missing_dependency"),
@@ -1348,7 +1342,7 @@ mod tests {
             ],
         );
         let recent = fact_with_fields(
-            "recent_startup_failure",
+            RECENT_STARTUP_FAILURE_FACT_ID,
             "instance-c",
             [
                 ("failure_class", "graphics_driver_crash"),
@@ -1411,7 +1405,7 @@ mod tests {
     #[test]
     fn oom_history_gives_concrete_budgeted_or_unverified_headroom_guidance() {
         let suggested = fact_with_fields(
-            "recent_startup_failure",
+            RECENT_STARTUP_FAILURE_FACT_ID,
             "instance-a",
             [
                 ("failure_class", "out_of_memory"),
@@ -1422,7 +1416,7 @@ mod tests {
             ],
         );
         let unverified_headroom = fact_with_fields(
-            "recent_startup_failure",
+            RECENT_STARTUP_FAILURE_FACT_ID,
             "instance-b",
             [
                 ("failure_class", "out_of_memory"),
@@ -1450,15 +1444,12 @@ mod tests {
     #[test]
     fn failed_repair_and_active_suppression_have_closed_copy() {
         let repair = fact_with_fields(
-            "recent_repair_failed",
+            RECENT_REPAIR_FAILED_FACT_ID,
             "instance-a",
-            [
-                ("diagnosis", "jvm_preset_recovery"),
-                ("recovery_preset", "legacy"),
-            ],
+            [("diagnosis", "jvm_preset_recovery")],
         );
         let suppression = fact_with_fields(
-            "repair_suppressed_until",
+            REPAIR_SUPPRESSED_UNTIL_FACT_ID,
             "instance-a",
             [
                 ("diagnosis", "jvm_preset_recovery"),
@@ -1481,7 +1472,7 @@ mod tests {
             outcome
                 .user_outcome
                 .guidance
-                .contains(&"Try the Legacy JVM preset before relaunching.".to_string())
+                .contains(&"Review the JVM preset before relaunching.".to_string())
         );
         assert!(outcome.user_outcome.details.contains(
             &"Guardian will not auto-repair this launch again until 11:45 UTC.".to_string()
@@ -1492,7 +1483,7 @@ mod tests {
     fn warn_copy_keeps_historical_advisories_when_detail_caps_are_saturated() {
         let historical_facts = [
             fact_with_fields(
-                "recent_startup_failure",
+                RECENT_STARTUP_FAILURE_FACT_ID,
                 "instance-a",
                 [
                     ("failure_class", "out_of_memory"),
@@ -1504,7 +1495,7 @@ mod tests {
                 ],
             ),
             fact_with_fields(
-                "repair_suppressed_until",
+                REPAIR_SUPPRESSED_UNTIL_FACT_ID,
                 "instance-a",
                 [("suppression_until", "2026-07-11T13:45:00+02:00")],
             ),
@@ -1564,7 +1555,7 @@ mod tests {
         .enumerate()
         .map(|(index, failure_class)| {
             fact_with_fields(
-                "recent_startup_failure",
+                RECENT_STARTUP_FAILURE_FACT_ID,
                 &format!("instance-{index}"),
                 [
                     ("failure_class", failure_class),
@@ -1579,18 +1570,14 @@ mod tests {
             "java_runtime_recovery",
             "jvm_arg_unsupported",
             "jvm_preset_recovery",
-            "launch_startup_recovery",
         ]
         .into_iter()
         .enumerate()
         {
             facts.push(fact_with_fields(
-                "recent_repair_failed",
+                RECENT_REPAIR_FAILED_FACT_ID,
                 &format!("repair-{index}"),
-                [
-                    ("diagnosis", diagnosis),
-                    ("recovery_preset", "/home/alice/secret-token"),
-                ],
+                [("diagnosis", diagnosis)],
             ));
         }
 

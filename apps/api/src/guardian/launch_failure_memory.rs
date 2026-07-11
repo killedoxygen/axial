@@ -1,7 +1,7 @@
 use super::{
     DiagnosisId, FactReliability, GuardianConfidence, GuardianDomain, GuardianFact, GuardianFactId,
     GuardianMode, GuardianSeverity,
-    launch_decision::{conservative_launch_recovery_preset, is_guardian_launch_crash_class},
+    launch_decision::is_guardian_launch_crash_class,
     launch_recovery::{
         GuardianLaunchRecoveryCurrentIntent, launch_recovery_intent_fingerprint_matches,
     },
@@ -19,9 +19,9 @@ use axial_launcher::LaunchFailureClass;
 use chrono::{DateTime, Duration, FixedOffset, SecondsFormat, Utc};
 
 const RECENT_FAILURE_WINDOW_HOURS: i64 = 24;
-const RECENT_STARTUP_FAILURE_FACT: &str = "recent_startup_failure";
-const RECENT_REPAIR_FAILED_FACT: &str = "recent_repair_failed";
-const REPAIR_SUPPRESSED_UNTIL_FACT: &str = "repair_suppressed_until";
+pub(crate) const RECENT_STARTUP_FAILURE_FACT_ID: &str = "recent_startup_failure";
+pub(crate) const RECENT_REPAIR_FAILED_FACT_ID: &str = "recent_repair_failed";
+pub(crate) const REPAIR_SUPPRESSED_UNTIL_FACT_ID: &str = "repair_suppressed_until";
 
 #[derive(Clone, Copy, Debug)]
 pub struct GuardianLaunchFailureMemoryIntakeRequest<'a> {
@@ -30,8 +30,6 @@ pub struct GuardianLaunchFailureMemoryIntakeRequest<'a> {
     pub mode: GuardianMode,
     pub current_at: &'a str,
     pub current_intent: GuardianLaunchRecoveryCurrentIntent<'a>,
-    pub runtime_major: Option<u32>,
-    pub known_effective_preset: Option<&'a str>,
     pub current_memory_mb: i32,
     pub suggested_memory_mb: Option<i32>,
 }
@@ -51,7 +49,7 @@ pub fn launch_failure_memory_guardian_facts(
         facts.push(recent_startup_failure_fact(&request, &context, entry));
     }
     if let Some(entry) = newest_entry(&request, &context, accepted_failed_repair_entry) {
-        facts.push(recent_repair_failed_fact(&request, &context, entry));
+        facts.push(recent_repair_failed_fact(&context, entry));
     }
     if let Some(entry) = newest_entry(&request, &context, active_repair_suppression_entry) {
         facts.push(repair_suppressed_until_fact(&context, entry));
@@ -225,7 +223,7 @@ fn recent_startup_failure_fact(
         }
     }
     memory_fact(
-        RECENT_STARTUP_FAILURE_FACT,
+        RECENT_STARTUP_FAILURE_FACT_ID,
         GuardianDomain::Startup,
         OwnershipClass::UserOwned,
         &context.instance_id,
@@ -234,29 +232,15 @@ fn recent_startup_failure_fact(
 }
 
 fn recent_repair_failed_fact(
-    request: &GuardianLaunchFailureMemoryIntakeRequest<'_>,
     context: &IntakeContext,
     entry: &GuardianFailureMemoryEntry,
 ) -> GuardianFact {
-    let mut fields = vec![public_field("diagnosis", entry.diagnosis_id.as_str())];
-    if entry.diagnosis_id.as_str() == "jvm_preset_recovery"
-        && let Some(runtime_major) = request.runtime_major.filter(|major| *major > 0)
-        && let Some(effective_preset) = request.known_effective_preset
-    {
-        let preset = conservative_launch_recovery_preset(
-            request.current_intent.target_version_id,
-            runtime_major,
-        );
-        if preset != effective_preset.trim() {
-            fields.push(public_field("recovery_preset", preset));
-        }
-    }
     memory_fact(
-        RECENT_REPAIR_FAILED_FACT,
+        RECENT_REPAIR_FAILED_FACT_ID,
         GuardianDomain::Launch,
         OwnershipClass::LauncherManaged,
         &context.instance_id,
-        fields,
+        vec![public_field("diagnosis", entry.diagnosis_id.as_str())],
     )
 }
 
@@ -272,7 +256,7 @@ fn repair_suppressed_until_fact(
         .with_timezone(&Utc)
         .to_rfc3339_opts(SecondsFormat::Secs, true);
     memory_fact(
-        REPAIR_SUPPRESSED_UNTIL_FACT,
+        REPAIR_SUPPRESSED_UNTIL_FACT_ID,
         GuardianDomain::Launch,
         OwnershipClass::LauncherManaged,
         &context.instance_id,
@@ -446,11 +430,11 @@ mod tests {
         let facts = launch_failure_memory_guardian_facts(intake_request(&entries));
 
         assert_eq!(facts.len(), 3);
-        assert_eq!(facts[0].id.as_str(), RECENT_STARTUP_FAILURE_FACT);
-        assert_eq!(facts[1].id.as_str(), RECENT_REPAIR_FAILED_FACT);
-        assert_eq!(facts[2].id.as_str(), REPAIR_SUPPRESSED_UNTIL_FACT);
+        assert_eq!(facts[0].id.as_str(), RECENT_STARTUP_FAILURE_FACT_ID);
+        assert_eq!(facts[1].id.as_str(), RECENT_REPAIR_FAILED_FACT_ID);
+        assert_eq!(facts[2].id.as_str(), REPAIR_SUPPRESSED_UNTIL_FACT_ID);
         assert_eq!(field(&facts[0], "occurrences_today"), Some("2"));
-        assert_eq!(field(&facts[1], "recovery_preset"), Some("performance"));
+        assert_eq!(field(&facts[1], "diagnosis"), Some("jvm_preset_recovery"));
         assert_eq!(
             field(&facts[2], "suppression_until"),
             Some("2026-07-11T11:00:00Z")
@@ -555,7 +539,7 @@ mod tests {
             launch_failure_memory_guardian_facts(intake_request(std::slice::from_ref(&expired)));
 
         assert_eq!(active_facts.len(), 1);
-        assert_eq!(active_facts[0].id.as_str(), REPAIR_SUPPRESSED_UNTIL_FACT);
+        assert_eq!(active_facts[0].id.as_str(), REPAIR_SUPPRESSED_UNTIL_FACT_ID);
         assert!(wrong_intent_facts.is_empty());
         assert!(expired_facts.is_empty());
     }
@@ -606,8 +590,8 @@ mod tests {
                 ..intake_request(std::slice::from_ref(&custom_gc_repair))
             });
 
-        assert_eq!(raw_match[0].id.as_str(), RECENT_REPAIR_FAILED_FACT);
-        assert_eq!(gc_match[0].id.as_str(), RECENT_REPAIR_FAILED_FACT);
+        assert_eq!(raw_match[0].id.as_str(), RECENT_REPAIR_FAILED_FACT_ID);
+        assert_eq!(gc_match[0].id.as_str(), RECENT_REPAIR_FAILED_FACT_ID);
         assert!(raw_mismatch.is_empty());
         assert!(gc_mismatch.is_empty());
     }
@@ -773,10 +757,7 @@ mod tests {
             &intent_fingerprint(GuardianLaunchRecoveryKind::DowngradePreset),
         );
         let facts =
-            launch_failure_memory_guardian_facts(GuardianLaunchFailureMemoryIntakeRequest {
-                known_effective_preset: Some("/home/alice/-Dtoken=secret-token"),
-                ..intake_request(std::slice::from_ref(&repair))
-            });
+            launch_failure_memory_guardian_facts(intake_request(std::slice::from_ref(&repair)));
 
         assert_eq!(facts.len(), 2);
         for fact in &facts {
@@ -790,58 +771,7 @@ mod tests {
                 );
             }
         }
-        let encoded = serde_json::to_string(&facts).expect("serialize memory intake facts");
-        for sensitive in ["/home/alice", "-Dtoken", "secret-token"] {
-            assert!(!encoded.contains(sensitive));
-        }
-    }
-
-    #[test]
-    fn intake_exposes_recovery_preset_only_for_applicable_different_preset() {
-        let preset_repair = repair_entry(
-            "instance-a",
-            GuardianMode::Managed,
-            "jvm_preset_recovery",
-            GuardianActionKind::Downgrade,
-            FailureMemoryActionOutcome::Failed,
-            "2026-07-11T09:00:00Z",
-            None,
-            &intent_fingerprint(GuardianLaunchRecoveryKind::DowngradePreset),
-        );
-        let strip_repair = repair_entry(
-            "instance-a",
-            GuardianMode::Managed,
-            "jvm_arg_unsupported",
-            GuardianActionKind::Strip,
-            FailureMemoryActionOutcome::Failed,
-            "2026-07-11T09:00:00Z",
-            None,
-            &intent_fingerprint(GuardianLaunchRecoveryKind::DisableCustomGc),
-        );
-
-        let same_preset =
-            launch_failure_memory_guardian_facts(GuardianLaunchFailureMemoryIntakeRequest {
-                known_effective_preset: Some("performance"),
-                ..intake_request(std::slice::from_ref(&preset_repair))
-            });
-        let inapplicable = launch_failure_memory_guardian_facts(intake_request(
-            std::slice::from_ref(&strip_repair),
-        ));
-        let unknown_runtime =
-            launch_failure_memory_guardian_facts(GuardianLaunchFailureMemoryIntakeRequest {
-                runtime_major: None,
-                ..intake_request(std::slice::from_ref(&preset_repair))
-            });
-        let unknown_effective_preset =
-            launch_failure_memory_guardian_facts(GuardianLaunchFailureMemoryIntakeRequest {
-                known_effective_preset: None,
-                ..intake_request(std::slice::from_ref(&preset_repair))
-            });
-
-        assert_eq!(field(&same_preset[0], "recovery_preset"), None);
-        assert_eq!(field(&inapplicable[0], "recovery_preset"), None);
-        assert_eq!(field(&unknown_runtime[0], "recovery_preset"), None);
-        assert_eq!(field(&unknown_effective_preset[0], "recovery_preset"), None);
+        serde_json::to_string(&facts).expect("serialize memory intake facts");
     }
 
     #[test]
@@ -938,8 +868,6 @@ mod tests {
             mode: GuardianMode::Managed,
             current_at: "2026-07-11T10:00:00Z",
             current_intent: current_intent(),
-            runtime_major: Some(21),
-            known_effective_preset: Some("graalvm"),
             current_memory_mb: 1024,
             suggested_memory_mb: Some(2048),
         }

@@ -526,7 +526,7 @@ mod tests {
                     .to_string(),
             },
             failure_class: axial_launcher::LaunchFailureClass::JvmUnsupportedOption,
-            user_intent_hash: Some(intent_fingerprint),
+            user_intent_hash: intent_fingerprint,
         })
         .expect("recovery plan");
 

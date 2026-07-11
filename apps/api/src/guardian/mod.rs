@@ -1,8 +1,8 @@
 //! Guardian system boundary.
 //!
 //! Guardian owns safety facts, diagnosis, policy decisions, action planning,
-//! outcomes, and failure memory. This module defines the Phase 1 reasoning
-//! core without changing current launch behavior.
+//! supervised recovery, user outcomes, and bounded failure memory across
+//! launch, install, runtime, and performance workflows.
 
 pub mod artifact_descriptor;
 pub mod artifact_repair;
@@ -70,12 +70,12 @@ pub use launch_failure_memory::{
 };
 pub use launch_recovery::{
     GuardianLaunchRecoveryActionTemplate, GuardianLaunchRecoveryCurrentIntent,
-    GuardianLaunchRecoveryDirective, GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryExecutor,
-    GuardianLaunchRecoveryKind, GuardianLaunchRecoveryMutation, GuardianLaunchRecoveryOutcome,
-    GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
+    GuardianLaunchRecoveryDirective, GuardianLaunchRecoveryEffect,
+    GuardianLaunchRecoveryJournalTransition, GuardianLaunchRecoveryKind,
+    GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
     GuardianLaunchRecoveryPlanRequest, GuardianLaunchRecoveryRecordRequest,
-    GuardianLaunchRecoveryReversibility, GuardianLaunchRecoveryStatus,
-    launch_recovery_diagnosis_id, launch_recovery_user_intent_fingerprint,
+    GuardianLaunchRecoveryStatus, launch_recovery_journal_transition_conflicts,
+    launch_recovery_journal_transition_matches, launch_recovery_user_intent_fingerprint,
     plan_launch_recovery_directive, record_launch_recovery_attempt, record_launch_recovery_failure,
     record_launch_recovery_success,
 };

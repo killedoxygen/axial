@@ -1,23 +1,16 @@
 use super::trace_launch_event;
 use crate::guardian::{
     GuardianLaunchRecoveryCurrentIntent, GuardianLaunchRecoveryDirective,
-    GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind, GuardianLaunchRecoveryOutcome,
-    GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
+    GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryJournalTransition,
+    GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
     GuardianLaunchRecoveryPlanRequest, GuardianLaunchRecoveryRecordRequest, GuardianUserOutcome,
-    launch_recovery_diagnosis_id, launch_recovery_public_action_label,
-    launch_recovery_suppressed_user_outcome, launch_recovery_user_intent_fingerprint,
-    plan_launch_recovery_directive, record_launch_recovery_attempt, record_launch_recovery_failure,
-    record_launch_recovery_success,
+    launch_recovery_journal_transition_conflicts, launch_recovery_journal_transition_matches,
+    launch_recovery_public_action_label, launch_recovery_suppressed_user_outcome,
+    launch_recovery_user_intent_fingerprint, plan_launch_recovery_directive,
+    record_launch_recovery_attempt, record_launch_recovery_failure, record_launch_recovery_success,
 };
 use crate::logging::timestamp_utc;
-use crate::state::contracts::{
-    CommandKind, OperationJournalEntry, OperationJournalStep, OperationOutcome, OperationPhase,
-    OperationStatus, OperationStepResult, RollbackState, StabilizationSystem,
-};
-use crate::state::{
-    AppState, OperationJournalReconciliation, OperationJournalStoreError,
-    operation_journal_completed_step_is_visible,
-};
+use crate::state::{AppState, OperationJournalReconciliation, OperationJournalStoreError};
 use axial_launcher::{
     GuardianDecision, GuardianInterventionKind, GuardianSummary, LaunchFailureClass,
 };
@@ -47,7 +40,7 @@ pub(super) fn plan_guardian_launch_recovery_directive(
         mode,
         directive,
         failure_class,
-        user_intent_hash: Some(user_intent_hash.as_str()),
+        user_intent_hash: user_intent_hash.as_str(),
     })
 }
 
@@ -55,18 +48,16 @@ pub(super) async fn record_guardian_launch_recovery_attempt(
     state: &AppState,
     session_id: &str,
     plan: &GuardianLaunchRecoveryPlan,
-    failure_class: LaunchFailureClass,
 ) -> Result<GuardianLaunchRecoveryOutcome, OperationJournalStoreError> {
     reject_mismatched_launch_recovery_transition(
         state,
         plan,
-        LaunchRecoveryJournalTransition::Attempt(failure_class),
+        GuardianLaunchRecoveryJournalTransition::Attempt,
     )?;
     let outcome = loop {
         let observed_at = timestamp_utc();
         match record_launch_recovery_attempt(GuardianLaunchRecoveryRecordRequest {
             plan,
-            failure_class,
             observed_at: observed_at.as_str(),
             journals: state.journals().as_ref(),
             failure_memory: state.failure_memory().as_ref(),
@@ -77,7 +68,7 @@ pub(super) async fn record_guardian_launch_recovery_attempt(
                 if launch_recovery_transition_matches(
                     state,
                     plan,
-                    LaunchRecoveryJournalTransition::Attempt(failure_class),
+                    GuardianLaunchRecoveryJournalTransition::Attempt,
                 ) =>
             {
                 break outcome;
@@ -88,7 +79,7 @@ pub(super) async fn record_guardian_launch_recovery_attempt(
                     state,
                     session_id,
                     plan,
-                    LaunchRecoveryJournalTransition::Attempt(failure_class),
+                    GuardianLaunchRecoveryJournalTransition::Attempt,
                     error,
                 )
                 .await?;
@@ -119,13 +110,12 @@ pub(super) async fn record_successful_self_healing_if_any(
     reject_mismatched_launch_recovery_transition(
         state,
         plan,
-        LaunchRecoveryJournalTransition::Success(plan.trigger_failure_class),
+        GuardianLaunchRecoveryJournalTransition::Success,
     )?;
     let outcome = loop {
         let observed_at = timestamp_utc();
         match record_launch_recovery_success(GuardianLaunchRecoveryRecordRequest {
             plan,
-            failure_class: plan.trigger_failure_class,
             observed_at: observed_at.as_str(),
             journals: state.journals().as_ref(),
             failure_memory: state.failure_memory().as_ref(),
@@ -136,7 +126,7 @@ pub(super) async fn record_successful_self_healing_if_any(
                 if launch_recovery_transition_matches(
                     state,
                     plan,
-                    LaunchRecoveryJournalTransition::Success(plan.trigger_failure_class),
+                    GuardianLaunchRecoveryJournalTransition::Success,
                 ) =>
             {
                 break outcome;
@@ -147,7 +137,7 @@ pub(super) async fn record_successful_self_healing_if_any(
                     state,
                     session_id,
                     plan,
-                    LaunchRecoveryJournalTransition::Success(plan.trigger_failure_class),
+                    GuardianLaunchRecoveryJournalTransition::Success,
                     error,
                 )
                 .await?;
@@ -179,13 +169,12 @@ pub(super) async fn record_failed_self_healing_if_any(
     reject_mismatched_launch_recovery_transition(
         state,
         plan,
-        LaunchRecoveryJournalTransition::Failure(trigger_failure_class),
+        GuardianLaunchRecoveryJournalTransition::Failure,
     )?;
     let outcome = loop {
         let observed_at = timestamp_utc();
         match record_launch_recovery_failure(GuardianLaunchRecoveryRecordRequest {
             plan,
-            failure_class: trigger_failure_class,
             observed_at: observed_at.as_str(),
             journals: state.journals().as_ref(),
             failure_memory: state.failure_memory().as_ref(),
@@ -196,7 +185,7 @@ pub(super) async fn record_failed_self_healing_if_any(
                 if launch_recovery_transition_matches(
                     state,
                     plan,
-                    LaunchRecoveryJournalTransition::Failure(trigger_failure_class),
+                    GuardianLaunchRecoveryJournalTransition::Failure,
                 ) =>
             {
                 break outcome;
@@ -207,7 +196,7 @@ pub(super) async fn record_failed_self_healing_if_any(
                     state,
                     session_id,
                     plan,
-                    LaunchRecoveryJournalTransition::Failure(trigger_failure_class),
+                    GuardianLaunchRecoveryJournalTransition::Failure,
                     error,
                 )
                 .await?;
@@ -241,7 +230,7 @@ async fn retry_launch_recovery_journal(
     state: &AppState,
     session_id: &str,
     plan: &GuardianLaunchRecoveryPlan,
-    transition: LaunchRecoveryJournalTransition,
+    transition: GuardianLaunchRecoveryJournalTransition,
     error: OperationJournalStoreError,
 ) -> Result<(), OperationJournalStoreError> {
     let error_class = error.class();
@@ -252,7 +241,7 @@ async fn retry_launch_recovery_journal(
             error,
             JOURNAL_RETRY_INITIAL_DELAY,
             JOURNAL_RETRY_MAX_DELAY,
-            |entry| launch_recovery_entry_matches(entry, plan, transition),
+            |entry| launch_recovery_journal_transition_matches(entry, plan, transition),
         )
         .await;
     match reconciliation {
@@ -274,136 +263,30 @@ async fn retry_launch_recovery_journal(
     }
 }
 
-#[derive(Clone, Copy)]
-enum LaunchRecoveryJournalTransition {
-    Attempt(LaunchFailureClass),
-    Success(LaunchFailureClass),
-    Failure(LaunchFailureClass),
-}
-
 fn launch_recovery_transition_matches(
     state: &AppState,
     plan: &GuardianLaunchRecoveryPlan,
-    transition: LaunchRecoveryJournalTransition,
+    transition: GuardianLaunchRecoveryJournalTransition,
 ) -> bool {
     state
         .journals()
         .get(&plan.operation_id)
         .as_ref()
-        .is_some_and(|entry| launch_recovery_entry_matches(entry, plan, transition))
+        .is_some_and(|entry| launch_recovery_journal_transition_matches(entry, plan, transition))
 }
 
 fn reject_mismatched_launch_recovery_transition(
     state: &AppState,
     plan: &GuardianLaunchRecoveryPlan,
-    transition: LaunchRecoveryJournalTransition,
+    transition: GuardianLaunchRecoveryJournalTransition,
 ) -> Result<(), OperationJournalStoreError> {
     let Some(entry) = state.journals().get(&plan.operation_id) else {
         return Ok(());
     };
-    let coarse_transition_matches = match transition {
-        LaunchRecoveryJournalTransition::Attempt(_) => {
-            (entry.status == OperationStatus::Planned && entry.outcome.is_none())
-                || (entry.status == OperationStatus::Blocked
-                    && entry.outcome == Some(OperationOutcome::Suppressed))
-        }
-        LaunchRecoveryJournalTransition::Success(_) => {
-            entry.status == OperationStatus::Succeeded
-                && entry.outcome == Some(OperationOutcome::Succeeded)
-        }
-        LaunchRecoveryJournalTransition::Failure(_) => {
-            entry.status == OperationStatus::Failed
-                && entry.outcome == Some(OperationOutcome::Failed)
-        }
-    };
-    if coarse_transition_matches && !launch_recovery_entry_matches(&entry, plan, transition) {
+    if launch_recovery_journal_transition_conflicts(&entry, plan, transition) {
         return Err(OperationJournalStoreError::AlreadyTerminal);
     }
     Ok(())
-}
-
-fn launch_recovery_entry_matches(
-    entry: &OperationJournalEntry,
-    plan: &GuardianLaunchRecoveryPlan,
-    transition: LaunchRecoveryJournalTransition,
-) -> bool {
-    let planned_step = launch_recovery_journal_step(plan, OperationStepResult::Planned);
-    let failure_class = match transition {
-        LaunchRecoveryJournalTransition::Attempt(failure_class)
-        | LaunchRecoveryJournalTransition::Success(failure_class)
-        | LaunchRecoveryJournalTransition::Failure(failure_class) => failure_class,
-    };
-    let diagnosis_id = launch_recovery_diagnosis_id(plan.directive.kind, failure_class);
-    let identity_matches = entry.operation_id == plan.operation_id
-        && entry.command == CommandKind::LaunchInstance
-        && entry.owner == StabilizationSystem::Guardian
-        && entry.ownership == plan.target.ownership
-        && entry.targets == [plan.target.clone()]
-        && entry.planned_steps == [planned_step]
-        && entry
-            .guardian_diagnosis_ids
-            .iter()
-            .any(|stored| stored == diagnosis_id.as_str());
-    if !identity_matches {
-        return false;
-    }
-    match transition {
-        LaunchRecoveryJournalTransition::Attempt(_) => {
-            (entry.status == OperationStatus::Planned
-                && entry.outcome.is_none()
-                && entry.failure_point.is_none()
-                && entry.completed_steps.is_empty())
-                || (entry.status == OperationStatus::Blocked
-                    && entry.outcome == Some(OperationOutcome::Suppressed)
-                    && entry.failure_point.is_none()
-                    && operation_journal_completed_step_is_visible(
-                        entry,
-                        &launch_recovery_journal_step(plan, OperationStepResult::Skipped),
-                    ))
-        }
-        LaunchRecoveryJournalTransition::Success(_) => {
-            entry.status == OperationStatus::Succeeded
-                && entry.outcome == Some(OperationOutcome::Succeeded)
-                && entry.failure_point.is_none()
-                && operation_journal_completed_step_is_visible(
-                    entry,
-                    &launch_recovery_journal_step(plan, OperationStepResult::Completed),
-                )
-        }
-        LaunchRecoveryJournalTransition::Failure(_) => {
-            entry.status == OperationStatus::Failed
-                && entry.outcome == Some(OperationOutcome::Failed)
-                && entry.failure_point.as_deref() == Some(launch_recovery_step_id(plan))
-                && operation_journal_completed_step_is_visible(
-                    entry,
-                    &launch_recovery_journal_step(plan, OperationStepResult::Failed),
-                )
-        }
-    }
-}
-
-fn launch_recovery_journal_step(
-    plan: &GuardianLaunchRecoveryPlan,
-    result: OperationStepResult,
-) -> OperationJournalStep {
-    let mut step =
-        OperationJournalStep::new(launch_recovery_step_id(plan), OperationPhase::Repairing);
-    step.result = result;
-    step.changed_target = Some(plan.target.clone());
-    step.generated_facts = vec![plan.action_template.public_summary_template.clone()];
-    step.rollback = RollbackState::NotApplicable;
-    step
-}
-
-fn launch_recovery_step_id(plan: &GuardianLaunchRecoveryPlan) -> &'static str {
-    match plan.directive.kind {
-        GuardianLaunchRecoveryKind::SwitchManagedRuntime => {
-            "launch_recovery_switch_managed_runtime"
-        }
-        GuardianLaunchRecoveryKind::StripRawJvmArgs => "launch_recovery_strip_raw_jvm_args",
-        GuardianLaunchRecoveryKind::DowngradePreset => "launch_recovery_downgrade_preset",
-        GuardianLaunchRecoveryKind::DisableCustomGc => "launch_recovery_disable_custom_gc",
-    }
 }
 
 pub(super) fn suppressed_launch_recovery_outcome(
@@ -437,16 +320,16 @@ fn record_guardian_intervention(
 
 pub(super) fn record_prelaunch_preset_adjustment_directive(
     guardian: &mut GuardianSummary,
-    plan: &GuardianLaunchRecoveryPlan,
+    directive: &GuardianLaunchRecoveryDirective,
 ) {
     if matches!(
-        plan.directive.effect,
+        directive.effect,
         GuardianLaunchRecoveryEffect::DowngradePreset { .. }
     ) {
         record_guardian_intervention(
             guardian,
             GuardianInterventionKind::DowngradePreset,
-            plan.directive.description.clone(),
+            directive.description.clone(),
             false,
         );
     }
@@ -595,10 +478,10 @@ mod tests {
     use super::super::status::serialize_guardian;
     use super::*;
     use crate::guardian::{
-        GuardianStartupFailureObservation, GuardianStartupFailureRequest,
-        guardian_startup_failure_outcome,
+        GuardianLaunchRecoveryKind, GuardianStartupFailureObservation,
+        GuardianStartupFailureRequest, guardian_startup_failure_outcome,
     };
-    use crate::state::contracts::{OperationStatus, TargetKind};
+    use crate::state::contracts::{OperationOutcome, OperationStatus, TargetKind};
     use crate::state::failure_memory::FailureMemoryActionOutcome;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
@@ -796,7 +679,6 @@ mod tests {
 
     #[test]
     fn prelaunch_preset_adjustment_records_backend_authored_guardian_intervention() {
-        let intent = test_launch_intent(Path::new("/tmp/axial-test"), "session");
         let directive = GuardianLaunchRecoveryDirective {
             kind: GuardianLaunchRecoveryKind::DowngradePreset,
             effect: GuardianLaunchRecoveryEffect::DowngradePreset {
@@ -806,17 +688,10 @@ mod tests {
                 "Guardian downgraded JVM preset from \"graalvm\" to \"performance\" before launch"
                     .to_string(),
         };
-        let plan = plan_guardian_launch_recovery_directive(
-            &intent,
-            directive,
-            crate::guardian::GuardianMode::Managed,
-            LaunchFailureClass::JvmUnsupportedOption,
-        )
-        .expect("prelaunch preset plan");
         let mut guardian = GuardianSummary::new(GuardianMode::Managed);
         guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
 
-        record_prelaunch_preset_adjustment_directive(&mut guardian, &plan);
+        record_prelaunch_preset_adjustment_directive(&mut guardian, &directive);
         let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
 
         assert_eq!(guardian.decision, GuardianDecision::Intervened);
@@ -855,14 +730,9 @@ mod tests {
         assert_eq!(plan.target.kind, TargetKind::Instance);
         assert_eq!(plan.target.id, intent.instance_id);
 
-        let attempt = record_guardian_launch_recovery_attempt(
-            &state,
-            session_id,
-            &plan,
-            LaunchFailureClass::JvmUnsupportedOption,
-        )
-        .await
-        .expect("persist launch recovery attempt");
+        let attempt = record_guardian_launch_recovery_attempt(&state, session_id, &plan)
+            .await
+            .expect("persist launch recovery attempt");
         assert_eq!(
             attempt.status,
             crate::guardian::GuardianLaunchRecoveryStatus::Recorded
@@ -881,14 +751,10 @@ mod tests {
             test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
         let later_session_id = "runner-launch-recovery-memory-later-session";
 
-        let suppressed = record_guardian_launch_recovery_attempt(
-            &state,
-            later_session_id,
-            &suppressed_plan,
-            LaunchFailureClass::JvmUnsupportedOption,
-        )
-        .await
-        .expect("persist suppressed launch recovery attempt");
+        let suppressed =
+            record_guardian_launch_recovery_attempt(&state, later_session_id, &suppressed_plan)
+                .await
+                .expect("persist suppressed launch recovery attempt");
         assert_eq!(
             suppressed.status,
             crate::guardian::GuardianLaunchRecoveryStatus::Suppressed
@@ -977,14 +843,9 @@ mod tests {
                 LaunchFailureClass::JvmUnsupportedOption
             );
 
-            record_guardian_launch_recovery_attempt(
-                &state,
-                session_id,
-                &plan,
-                plan.trigger_failure_class,
-            )
-            .await
-            .expect("persist trigger-keyed launch recovery attempt");
+            record_guardian_launch_recovery_attempt(&state, session_id, &plan)
+                .await
+                .expect("persist trigger-keyed launch recovery attempt");
             record_failed_self_healing_if_any(
                 &state,
                 session_id,
@@ -1000,10 +861,10 @@ mod tests {
                 .expect("terminal recovery journal");
             assert_eq!(journal.status, OperationStatus::Failed);
             assert_eq!(journal.outcome, Some(OperationOutcome::Failed));
-            assert!(launch_recovery_entry_matches(
+            assert!(launch_recovery_journal_transition_matches(
                 &journal,
                 &plan,
-                LaunchRecoveryJournalTransition::Failure(plan.trigger_failure_class),
+                GuardianLaunchRecoveryJournalTransition::Failure,
             ));
             assert_eq!(
                 journal.guardian_diagnosis_ids,
@@ -1020,14 +881,10 @@ mod tests {
             );
 
             let suppressed_plan = test_recovery_plan(&intent, kind);
-            let suppressed = record_guardian_launch_recovery_attempt(
-                &state,
-                session_id,
-                &suppressed_plan,
-                suppressed_plan.trigger_failure_class,
-            )
-            .await
-            .expect("trigger-keyed failure memory suppresses the next attempt");
+            let suppressed =
+                record_guardian_launch_recovery_attempt(&state, session_id, &suppressed_plan)
+                    .await
+                    .expect("trigger-keyed failure memory suppresses the next attempt");
             assert_eq!(
                 suppressed.status,
                 crate::guardian::GuardianLaunchRecoveryStatus::Suppressed
@@ -1049,14 +906,9 @@ mod tests {
         let intent = test_launch_intent(&root, session_id);
         let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::DowngradePreset);
 
-        let attempt = record_guardian_launch_recovery_attempt(
-            &state,
-            session_id,
-            &plan,
-            LaunchFailureClass::JvmUnsupportedOption,
-        )
-        .await
-        .expect("persist launch recovery attempt");
+        let attempt = record_guardian_launch_recovery_attempt(&state, session_id, &plan)
+            .await
+            .expect("persist launch recovery attempt");
         assert_eq!(
             attempt.status,
             crate::guardian::GuardianLaunchRecoveryStatus::Recorded
@@ -1074,14 +926,10 @@ mod tests {
         let suppressed_plan =
             test_recovery_plan(&intent, GuardianLaunchRecoveryKind::DowngradePreset);
 
-        let suppressed = record_guardian_launch_recovery_attempt(
-            &state,
-            session_id,
-            &suppressed_plan,
-            LaunchFailureClass::JvmUnsupportedOption,
-        )
-        .await
-        .expect("persist suppressed launch recovery attempt");
+        let suppressed =
+            record_guardian_launch_recovery_attempt(&state, session_id, &suppressed_plan)
+                .await
+                .expect("persist suppressed launch recovery attempt");
         assert_eq!(
             suppressed.status,
             crate::guardian::GuardianLaunchRecoveryStatus::Suppressed
@@ -1131,14 +979,9 @@ mod tests {
             .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
         let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
-        record_guardian_launch_recovery_attempt(
-            &state,
-            session_id,
-            &plan,
-            LaunchFailureClass::JvmUnsupportedOption,
-        )
-        .await
-        .expect("persist launch recovery attempt");
+        record_guardian_launch_recovery_attempt(&state, session_id, &plan)
+            .await
+            .expect("persist launch recovery attempt");
         let journal_path = root
             .join("config")
             .join("state")
@@ -1233,14 +1076,9 @@ mod tests {
             .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
         let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
-        record_guardian_launch_recovery_attempt(
-            &state,
-            session_id,
-            &plan,
-            LaunchFailureClass::JvmUnsupportedOption,
-        )
-        .await
-        .expect("persist launch recovery attempt");
+        record_guardian_launch_recovery_attempt(&state, session_id, &plan)
+            .await
+            .expect("persist launch recovery attempt");
         assert!(state.failure_memory().list().is_empty());
         let journal_path = root
             .join("config")
@@ -1385,7 +1223,16 @@ mod tests {
             intent,
             directive,
             crate::guardian::GuardianMode::Managed,
-            LaunchFailureClass::JvmUnsupportedOption,
+            match kind {
+                GuardianLaunchRecoveryKind::SwitchManagedRuntime => {
+                    LaunchFailureClass::JavaRuntimeMismatch
+                }
+                GuardianLaunchRecoveryKind::StripRawJvmArgs
+                | GuardianLaunchRecoveryKind::DowngradePreset
+                | GuardianLaunchRecoveryKind::DisableCustomGc => {
+                    LaunchFailureClass::JvmUnsupportedOption
+                }
+            },
         )
         .expect("recovery plan")
     }
