@@ -397,17 +397,6 @@ impl TestFixture {
             .expect("serialize version"),
         )
         .expect("write version json");
-        fs::write(
-            version_dir.join(".axial-loader.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 2,
-                "component_id": "net.fabricmc.fabric-loader",
-                "minecraft_version": minecraft_version,
-                "loader_version": "0.16.10"
-            }))
-            .expect("serialize loader metadata"),
-        )
-        .expect("write loader metadata");
         fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
             .expect("write version jar");
     }

@@ -5,7 +5,6 @@ mod compose;
 mod forge_installer;
 mod http;
 pub mod index;
-mod installed_metadata;
 pub mod legacy;
 mod managed_fs;
 pub mod providers;
@@ -14,7 +13,10 @@ pub mod strategies;
 pub mod types;
 pub mod workspace;
 
-pub use api::{build_id_for, installed_version_id_for, loader_components, parse_build_id};
+pub use api::{
+    MaterializedLoaderProfile, build_id_for, installed_version_id_for, loader_components,
+    parse_build_id, validate_materialized_loader_profile,
+};
 pub(crate) use bound_processors::VerifiedProcessorOutputs;
 pub(crate) use compose::compose_loader_version;
 pub(crate) use forge_installer::{VerifiedInstallerClientBytes, VerifiedInstallerReceiptSource};
@@ -22,11 +24,6 @@ pub use index::{
     fetch_builds, fetch_cached_builds, fetch_components, fetch_supported_versions,
     resolve_build_record_for_install,
 };
-pub(crate) use installed_metadata::{
-    InstalledLoaderMetadata, installed_loader_metadata_bytes,
-    materialized_profile_has_valid_provenance,
-};
-pub use installed_metadata::{InstalledLoaderProvenance, validated_installed_loader_provenance};
 pub use types::{
     LOADER_CATALOG_SCHEMA_VERSION, LoaderActiveInstallFailure, LoaderArtifactKind,
     LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState,

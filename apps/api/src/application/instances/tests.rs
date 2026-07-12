@@ -3325,17 +3325,6 @@ fn write_installed_loader_version(
         ),
     )
     .expect("write loader version json");
-    fs::write(
-        version_dir.join(".axial-loader.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": 2,
-            "component_id": component_id,
-            "minecraft_version": minecraft_version,
-            "loader_version": loader_version
-        }))
-        .expect("serialize loader metadata"),
-    )
-    .expect("write loader metadata");
 }
 
 fn write_installed_checksumless_loader_version(

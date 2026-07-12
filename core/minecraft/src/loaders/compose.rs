@@ -273,7 +273,6 @@ mod tests {
     use crate::LoaderError;
     use crate::download::ExpectedIntegrity;
     use crate::launch::{AssetIndex, Downloads, JavaVersion, VersionJson, resolve_version};
-    use crate::loaders::installed_metadata::INSTALLED_LOADER_METADATA_SCHEMA_VERSION;
     use crate::loaders::{LoaderComponentId, installed_version_id_for};
     use crate::paths::create_minecraft_dir;
     use std::fs;
@@ -631,20 +630,6 @@ mod tests {
         )
         .await
         .expect("write composed version");
-        fs::write(
-            root.join("versions")
-                .join(&version_id)
-                .join(".axial-loader.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": INSTALLED_LOADER_METADATA_SCHEMA_VERSION,
-                "component_id": LoaderComponentId::Fabric,
-                "minecraft_version": "1.21.6",
-                "loader_version": "0.16.10"
-            }))
-            .expect("serialize installed loader metadata"),
-        )
-        .expect("write installed loader metadata");
-
         let written_json = fs::read_to_string(
             root.join("versions")
                 .join(&version_id)

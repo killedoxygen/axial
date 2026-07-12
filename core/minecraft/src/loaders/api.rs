@@ -1,6 +1,8 @@
 use super::MAX_VERSION_ID_BYTES;
+use super::providers::common::infer_loader_build_metadata;
 use super::types::{
-    LoaderBuildId, LoaderBuildRecord, LoaderComponentId, LoaderComponentRecord, LoaderError,
+    LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord, LoaderComponentId,
+    LoaderComponentRecord, LoaderError,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -8,6 +10,10 @@ const INSTALLED_VERSION_ID_PREFIX: &str = "loader-v2-";
 const INSTALLED_VERSION_ID_DOMAIN: &[u8] = b"axial-installed-loader";
 const BUILD_ID_PREFIX: &str = "loader-build-v1-";
 const BUILD_ID_DOMAIN: &[u8] = b"axial-loader-build";
+
+pub(crate) fn is_reserved_installed_loader_id(version_id: &str) -> bool {
+    version_id.starts_with(INSTALLED_VERSION_ID_PREFIX)
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct InstalledLoaderIdentity {
@@ -28,6 +34,53 @@ impl InstalledLoaderIdentity {
     pub(crate) fn loader_version(&self) -> &str {
         &self.loader_version
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedLoaderProfile {
+    component_id: LoaderComponentId,
+    minecraft_version: String,
+    loader_version: String,
+}
+
+impl MaterializedLoaderProfile {
+    pub fn component_id(&self) -> LoaderComponentId {
+        self.component_id
+    }
+
+    pub fn minecraft_version(&self) -> &str {
+        &self.minecraft_version
+    }
+
+    pub fn loader_version(&self) -> &str {
+        &self.loader_version
+    }
+
+    pub(crate) fn display_metadata(&self) -> LoaderBuildMetadata {
+        infer_loader_build_metadata(&self.loader_version, &[], false, false, None)
+    }
+}
+
+pub fn validate_materialized_loader_profile(
+    installed_version_id: &str,
+    profile_id: &str,
+    declared_parent: &str,
+    materialized: bool,
+) -> Result<MaterializedLoaderProfile, LoaderError> {
+    let identity = decode_installed_version_id(installed_version_id)?;
+    if !materialized
+        || profile_id != installed_version_id
+        || declared_parent != identity.minecraft_version()
+    {
+        return Err(invalid_identity(
+            "materialized loader profile does not match its canonical identity",
+        ));
+    }
+    Ok(MaterializedLoaderProfile {
+        component_id: identity.component_id,
+        minecraft_version: identity.minecraft_version,
+        loader_version: identity.loader_version,
+    })
 }
 
 pub fn loader_components() -> Vec<LoaderComponentRecord> {
@@ -387,6 +440,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn materialized_profile_validation_is_exact_for_every_component() {
+        for component_id in [
+            LoaderComponentId::Fabric,
+            LoaderComponentId::Quilt,
+            LoaderComponentId::Forge,
+            LoaderComponentId::NeoForge,
+        ] {
+            let version_id =
+                installed_version_id_for(component_id, "1.21.5", "1.2.3").expect("canonical id");
+            let profile =
+                validate_materialized_loader_profile(&version_id, &version_id, "1.21.5", true)
+                    .expect("exact materialized profile");
+            assert_eq!(profile.component_id(), component_id);
+            assert_eq!(profile.minecraft_version(), "1.21.5");
+            assert_eq!(profile.loader_version(), "1.2.3");
+        }
+    }
+
+    #[test]
+    fn materialized_profile_validation_rejects_every_identity_mismatch() {
+        let version_id = installed_version_id_for(LoaderComponentId::Fabric, "1.21.5", "0.16.14")
+            .expect("canonical id");
+        assert!(
+            validate_materialized_loader_profile(&version_id, "other", "1.21.5", true).is_err()
+        );
+        assert!(
+            validate_materialized_loader_profile(&version_id, &version_id, "1.21.4", true).is_err()
+        );
+        assert!(
+            validate_materialized_loader_profile(&version_id, &version_id, "1.21.5", false)
+                .is_err()
+        );
+        assert!(
+            validate_materialized_loader_profile(
+                "loader-v1-obsolete",
+                "loader-v1-obsolete",
+                "1.21.5",
+                true,
+            )
+            .is_err()
+        );
     }
 
     #[test]

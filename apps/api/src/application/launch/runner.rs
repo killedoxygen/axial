@@ -3248,17 +3248,6 @@ exit 1
             .expect("encode Fabric crash fixture version"),
         )
         .expect("write Fabric crash fixture version");
-        fs::write(
-            version_dir.join(".axial-loader.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "schema_version": 2,
-                "component_id": "net.fabricmc.fabric-loader",
-                "minecraft_version": "1.21.1",
-                "loader_version": "0.16.10"
-            }))
-            .expect("encode Fabric crash fixture metadata"),
-        )
-        .expect("write Fabric crash fixture metadata");
     }
 
     #[cfg(unix)]

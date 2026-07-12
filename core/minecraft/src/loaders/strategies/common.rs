@@ -14,8 +14,7 @@ use crate::loaders::api::validate_loader_build_record_identity;
 use crate::loaders::bound_processors::spawn_bound_processor_execution;
 use crate::loaders::compose::{
     LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
-    create_managed_version_dir, finalize_version_install, managed_version_dir,
-    write_composed_version,
+    create_managed_version_dir, finalize_version_install, write_composed_version,
 };
 use crate::loaders::forge_installer::{
     AuthenticatedEmbeddedMavenArtifact, AuthenticatedForgeInstallerPlan,
@@ -33,9 +32,7 @@ use crate::loaders::types::{
     LoaderInstallSource, LoaderInstallStrategy,
 };
 use crate::loaders::workspace::cleanup::prepare_fresh_work_dir;
-use crate::loaders::{
-    installed_loader_metadata_bytes, validate_provider_version_id, validate_version_id,
-};
+use crate::loaders::{validate_provider_version_id, validate_version_id};
 use crate::paths::versions_dir;
 use crate::profiles::ensure_launcher_profiles;
 use sha1::{Digest as _, Sha1};
@@ -55,7 +52,6 @@ const MAX_LEGACY_OVERLAY_PAYLOAD_BYTES: u64 = 256 << 20;
 const MAX_LEGACY_OVERLAY_NAME_BYTES: usize = 16 << 20;
 const MAX_LEGACY_OVERLAY_OVERHEAD_BYTES: usize = 16 << 20;
 const MAX_LEGACY_OVERLAY_OUTPUT_BYTES: usize = 272 << 20;
-const LOADER_METADATA_FILE: &str = ".axial-loader.json";
 
 // Profile-source loaders ship a ready version JSON and then download its libraries.
 pub async fn install_from_profile_source<F>(
@@ -137,7 +133,6 @@ where
     )?;
     validate_required_profile_libraries(&version.libraries, source_proof)?;
     let version_bytes = serde_json::to_vec_pretty(&version)?;
-    let loader_metadata_bytes = installed_loader_metadata_bytes(&plan.record)?;
     let receipt = cleanup_on_error(
         KnownGoodInstallReceipt::from_verified_profile_source(
             base_receipt,
@@ -145,7 +140,6 @@ where
             version.clone(),
             &version_bytes,
             library_authority,
-            &loader_metadata_bytes,
         )
         .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}"))),
         library_dir,
@@ -162,16 +156,6 @@ where
             &version_bytes,
             &plan.record.minecraft_version,
             &authenticated_client,
-        )
-        .await,
-        library_dir,
-        &installed_version_id,
-    )?;
-    cleanup_on_error(
-        write_installed_loader_metadata_bytes(
-            library_dir,
-            &installed_version_id,
-            &loader_metadata_bytes,
         )
         .await,
         library_dir,
@@ -361,7 +345,6 @@ where
         .map_err(|_| LoaderError::Verify("loader client is too large".to_string()))?;
     client.url.clear();
     let version_bytes = serde_json::to_vec_pretty(&version)?;
-    let loader_metadata_bytes = installed_loader_metadata_bytes(&plan.record)?;
     let materialized_library_paths =
         library_artifact_plans_for(source.libraries(), &crate::rules::default_environment())
             .map_err(|error| LoaderError::Verify(format!("plan installer libraries: {error}")))?
@@ -381,7 +364,6 @@ where
         &version_bytes,
         &base_client_bytes,
         &child_client,
-        &loader_metadata_bytes,
         &library_authority,
     )
     .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
@@ -404,7 +386,6 @@ where
             &installed_version_id,
             &version_bytes,
             &child_client_bytes,
-            &loader_metadata_bytes,
         )
         .await,
         library_dir,
@@ -554,14 +535,12 @@ where
         .map_err(|_| LoaderError::Verify("legacy client is too large".to_string()))?;
     client.url.clear();
     let version_bytes = serde_json::to_vec_pretty(&version)?;
-    let loader_metadata_bytes = installed_loader_metadata_bytes(&plan.record)?;
     let receipt = KnownGoodInstallReceipt::from_verified_legacy_archive_source(
         base_receipt,
         &plan.record,
         version,
         &version_bytes,
         &child_client_bytes,
-        &loader_metadata_bytes,
     )
     .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
 
@@ -572,7 +551,6 @@ where
             &plan.record.version_id,
             &version_bytes,
             &child_client_bytes,
-            &loader_metadata_bytes,
         )
         .await,
         library_dir,
@@ -729,16 +707,6 @@ fn cleanup_on_error<T, E>(
     version_id: &str,
 ) -> Result<T, E> {
     result.inspect_err(|_| cleanup_incomplete_version(library_dir, version_id))
-}
-
-async fn write_installed_loader_metadata_bytes(
-    library_dir: &Path,
-    version_id: &str,
-    metadata: &[u8],
-) -> Result<(), LoaderError> {
-    managed_version_dir(library_dir, version_id)?
-        .write_exact(LOADER_METADATA_FILE, metadata)
-        .await
 }
 
 async fn download_to_memory(url: &str) -> Result<Vec<u8>, LoaderError> {
@@ -919,7 +887,6 @@ async fn write_loader_install_effects(
     version_id: &str,
     version_bytes: &[u8],
     child_client_bytes: &[u8],
-    loader_metadata_bytes: &[u8],
 ) -> Result<(), LoaderError> {
     validate_version_id(version_id, "installed loader version id")?;
     version_dir
@@ -930,9 +897,6 @@ async fn write_loader_install_effects(
         .await?;
     version_dir
         .write_exact(&format!("{version_id}.jar"), child_client_bytes)
-        .await?;
-    version_dir
-        .write_exact(LOADER_METADATA_FILE, loader_metadata_bytes)
         .await?;
     version_dir.revalidate()
 }

@@ -324,8 +324,8 @@ pub enum LaunchModelError {
     },
     #[error("inheritsFrom chain too deep (>10) for {version_id}")]
     InheritanceTooDeep { version_id: String },
-    #[error("materialized loader profile provenance is invalid for {version_id}")]
-    InvalidMaterializedProvenance { version_id: String },
+    #[error("materialized loader profile identity is invalid for {version_id}")]
+    InvalidMaterializedProfile { version_id: String },
 }
 
 pub fn load_version_json(mc_dir: &Path, version_id: &str) -> Result<VersionJson, LaunchModelError> {
@@ -349,7 +349,8 @@ pub fn load_version_json(mc_dir: &Path, version_id: &str) -> Result<VersionJson,
 
 pub fn resolve_version(mc_dir: &Path, version_id: &str) -> Result<VersionJson, LaunchModelError> {
     let version = load_version_json(mc_dir, version_id)?;
-    if version.inherits_from.is_empty() && !version.materialized {
+    let reserved_loader_id = crate::loaders::api::is_reserved_installed_loader_id(version_id);
+    if version.inherits_from.is_empty() && !version.materialized && !reserved_loader_id {
         return Ok(finalize_effective_version(version));
     }
     resolve_inheritance(mc_dir, version, version_id, 0)
@@ -578,13 +579,18 @@ fn resolve_inheritance(
         });
     }
 
-    if child.materialized {
-        if !crate::loaders::materialized_profile_has_valid_provenance(
-            mc_dir,
+    let reserved_loader_id =
+        crate::loaders::api::is_reserved_installed_loader_id(expected_version_id);
+    if child.materialized || reserved_loader_id {
+        if crate::loaders::validate_materialized_loader_profile(
             expected_version_id,
-            &child,
-        ) {
-            return Err(LaunchModelError::InvalidMaterializedProvenance {
+            &child.id,
+            &child.inherits_from,
+            child.materialized,
+        )
+        .is_err()
+        {
+            return Err(LaunchModelError::InvalidMaterializedProfile {
                 version_id: child.id,
             });
         }
@@ -1216,8 +1222,8 @@ mod tests {
     }
 
     #[test]
-    fn inherited_materialized_parent_without_provenance_is_rejected() {
-        let temp_root = temp_root("materialized-parent-without-provenance");
+    fn inherited_materialized_parent_without_canonical_identity_is_rejected() {
+        let temp_root = temp_root("materialized-parent-without-canonical-identity");
         write_version_json(
             &temp_root,
             "materialized-parent",
@@ -1242,11 +1248,91 @@ mod tests {
 
         assert!(matches!(
             resolve_version(&temp_root, "child"),
-            Err(LaunchModelError::InvalidMaterializedProvenance { version_id })
+            Err(LaunchModelError::InvalidMaterializedProfile { version_id })
                 if version_id == "materialized-parent"
         ));
 
         let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn canonical_materialized_loader_profile_resolves_without_a_sidecar() {
+        let temp_root = temp_root("canonical-materialized-loader");
+        let version_id = crate::loaders::installed_version_id_for(
+            crate::loaders::LoaderComponentId::Fabric,
+            "1.21.5",
+            "0.16.14",
+        )
+        .expect("canonical loader id");
+        write_version_json(
+            &temp_root,
+            &version_id,
+            serde_json::json!({
+                "id": version_id,
+                "inheritsFrom": "1.21.5",
+                "axialMaterialized": true,
+                "type": "release",
+                "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+                "libraries": []
+            }),
+        );
+
+        let resolved = resolve_version(&temp_root, &version_id).expect("resolve loader profile");
+        assert_eq!(resolved.id, version_id);
+        assert!(resolved.inherits_from.is_empty());
+        assert!(!resolved.materialized);
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn canonical_loader_id_without_materialized_marker_is_rejected() {
+        let temp_root = temp_root("canonical-loader-without-marker");
+        let version_id = crate::loaders::installed_version_id_for(
+            crate::loaders::LoaderComponentId::Quilt,
+            "1.21.5",
+            "0.29.2",
+        )
+        .expect("canonical loader id");
+        write_version_json(
+            &temp_root,
+            &version_id,
+            serde_json::json!({
+                "id": version_id,
+                "inheritsFrom": "1.21.5",
+                "type": "release",
+                "libraries": []
+            }),
+        );
+
+        assert!(matches!(
+            resolve_version(&temp_root, &version_id),
+            Err(LaunchModelError::InvalidMaterializedProfile { .. })
+        ));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn malformed_reserved_loader_id_without_marker_or_parent_is_rejected() {
+        let temp_root = temp_root("malformed-reserved-loader-id");
+        let version_id = "loader-v2-malformed";
+        write_version_json(
+            &temp_root,
+            version_id,
+            serde_json::json!({
+                "id": version_id,
+                "type": "release",
+                "libraries": []
+            }),
+        );
+
+        assert!(matches!(
+            resolve_version(&temp_root, version_id),
+            Err(LaunchModelError::InvalidMaterializedProfile { .. })
+        ));
+
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     #[test]

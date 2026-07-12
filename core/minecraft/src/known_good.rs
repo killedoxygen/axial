@@ -9,7 +9,6 @@ use crate::launch::{Library, VersionJson, merge_libraries_prefer_first};
 use crate::loaders::{
     LoaderBuildRecord, LoaderComponentId, LoaderInstallStrategy, VerifiedInstallerClientBytes,
     VerifiedInstallerReceiptSource, VerifiedProcessorOutputs, compose_loader_version,
-    installed_loader_metadata_bytes,
 };
 use crate::manifest::ManifestEntry;
 use crate::rules::Environment;
@@ -64,7 +63,6 @@ pub enum KnownGoodArtifactKind {
     AssetIndex,
     AssetObject,
     LogConfig,
-    LoaderMetadata,
     RuntimeManifestProof,
     RuntimeReadyMarker,
     RuntimeFile,
@@ -536,7 +534,6 @@ impl KnownGoodInstallReceipt {
         resolved_version: VersionJson,
         version_bytes: &[u8],
         child_client_bytes: &[u8],
-        loader_metadata_bytes: &[u8],
     ) -> Result<Self, KnownGoodInventoryError> {
         if base.version_id.as_str() != record.minecraft_version
             || base.effective_version.id != record.minecraft_version
@@ -603,21 +600,6 @@ impl KnownGoodInstallReceipt {
             &base.inventory,
         )?;
 
-        let expected_metadata = installed_loader_metadata_bytes(record)
-            .map_err(|_| KnownGoodInventoryError::MetadataSerialization)?;
-        if expected_metadata != loader_metadata_bytes {
-            return Err(KnownGoodInventoryError::MetadataSerialization);
-        }
-        builder.insert(KnownGoodEntry {
-            root: KnownGoodRoot::Versions,
-            path: KnownGoodRelativePath::new(&format!(
-                "{}/.axial-loader.json",
-                version_id.as_str()
-            ))?,
-            kind: KnownGoodArtifactKind::LoaderMetadata,
-            integrity: exact_bytes_integrity(loader_metadata_bytes),
-        })?;
-
         Ok(Self {
             version_id,
             inventory: builder.finish(),
@@ -632,7 +614,6 @@ impl KnownGoodInstallReceipt {
         resolved_version: VersionJson,
         version_bytes: &[u8],
         library_authority: VerifiedProfileLibraryAuthority,
-        loader_metadata_bytes: &[u8],
     ) -> Result<Self, KnownGoodInventoryError> {
         if base.version_id.as_str() != record.minecraft_version
             || base.effective_version.id != record.minecraft_version
@@ -740,21 +721,6 @@ impl KnownGoodInstallReceipt {
             return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
         }
 
-        let expected_metadata = installed_loader_metadata_bytes(record)
-            .map_err(|_| KnownGoodInventoryError::MetadataSerialization)?;
-        if expected_metadata != loader_metadata_bytes {
-            return Err(KnownGoodInventoryError::MetadataSerialization);
-        }
-        builder.insert(KnownGoodEntry {
-            root: KnownGoodRoot::Versions,
-            path: KnownGoodRelativePath::new(&format!(
-                "{}/.axial-loader.json",
-                version_id.as_str()
-            ))?,
-            kind: KnownGoodArtifactKind::LoaderMetadata,
-            integrity: exact_bytes_integrity(loader_metadata_bytes),
-        })?;
-
         Ok(Self {
             version_id,
             inventory: builder.finish(),
@@ -775,7 +741,6 @@ impl KnownGoodInstallReceipt {
         version_bytes: &[u8],
         base_client_bytes: &[u8],
         child_client: &VerifiedInstallerClientBytes,
-        loader_metadata_bytes: &[u8],
         library_authority: &VerifiedInstallerLibraryAuthority,
     ) -> Result<Self, KnownGoodInventoryError> {
         let strategy_matches = matches!(
@@ -838,12 +803,6 @@ impl KnownGoodInstallReceipt {
         {
             return Err(KnownGoodInventoryError::ClientIntegrity);
         }
-        let expected_metadata = installed_loader_metadata_bytes(record)
-            .map_err(|_| KnownGoodInventoryError::MetadataSerialization)?;
-        if expected_metadata != loader_metadata_bytes {
-            return Err(KnownGoodInventoryError::MetadataSerialization);
-        }
-
         let version_id = KnownGoodId::new(&record.version_id)?;
         let mut builder = InventoryBuilder::default();
         for entry in base.inventory.entries.iter().filter(|entry| {
@@ -946,16 +905,6 @@ impl KnownGoodInstallReceipt {
         if used_proofs.len() != proofs.len() {
             return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
         }
-        builder.insert(KnownGoodEntry {
-            root: KnownGoodRoot::Versions,
-            path: KnownGoodRelativePath::new(&format!(
-                "{}/.axial-loader.json",
-                version_id.as_str()
-            ))?,
-            kind: KnownGoodArtifactKind::LoaderMetadata,
-            integrity: exact_bytes_integrity(loader_metadata_bytes),
-        })?;
-
         Ok(Self {
             version_id,
             inventory: builder.finish(),
@@ -1647,7 +1596,6 @@ mod tests {
         resolved: VersionJson,
         version_bytes: Vec<u8>,
         base_client_bytes: Vec<u8>,
-        metadata: Vec<u8>,
         embedded_path: ArtifactRelativePath,
         terminal_path: ArtifactRelativePath,
         processor_path: ArtifactRelativePath,
@@ -1739,8 +1687,6 @@ mod tests {
         resolved_client.size = child_client.bytes().len() as i64;
         resolved_client.url.clear();
         let version_bytes = serde_json::to_vec_pretty(&resolved).expect("version bytes");
-        let metadata = installed_loader_metadata_bytes(&record).expect("loader metadata");
-
         InstallerReceiptFixture {
             base,
             record,
@@ -1750,7 +1696,6 @@ mod tests {
             resolved,
             version_bytes,
             base_client_bytes: base_client_bytes.to_vec(),
-            metadata,
             embedded_path,
             terminal_path,
             processor_path,
@@ -1905,7 +1850,6 @@ mod tests {
             resolved,
             version_bytes,
             base_client_bytes,
-            metadata,
             embedded_path,
             terminal_path,
             processor_path,
@@ -1927,7 +1871,6 @@ mod tests {
             &version_bytes,
             &base_client_bytes,
             &child_client,
-            &metadata,
             &authority,
         )
         .expect("verified installer receipt");
@@ -1993,7 +1936,6 @@ mod tests {
                 &identity.version_bytes,
                 &identity.base_client_bytes,
                 &identity.child_client,
-                &identity.metadata,
                 &identity.authority,
             ),
             Err(KnownGoodInventoryError::LoaderIdentityMismatch)
@@ -2014,7 +1956,6 @@ mod tests {
                 &cross_base.version_bytes,
                 &cross_base.base_client_bytes,
                 &foreign_client,
-                &cross_base.metadata,
                 &cross_base.authority,
             ),
             Err(KnownGoodInventoryError::ClientIntegrity)
@@ -2268,14 +2209,12 @@ mod tests {
             assert_eq!(written.libraries[0].size, 53);
             assert_eq!(written_artifact.sha1, SHA_C);
             assert_eq!(written_artifact.size, 53);
-            let metadata = installed_loader_metadata_bytes(record).expect("loader metadata");
             let receipt = KnownGoodInstallReceipt::from_verified_profile_source(
                 &base,
                 record,
                 child,
                 &version_bytes,
                 authority,
-                &metadata,
             )
             .expect("profile receipt");
             assert!(receipt.inventory.entries().iter().any(|entry| {
@@ -2330,8 +2269,6 @@ mod tests {
         child.libraries =
             merge_libraries_prefer_first(authority.libraries(), &base.effective_version.libraries);
         let version_bytes = serde_json::to_vec_pretty(&child).expect("version bytes");
-        let metadata = installed_loader_metadata_bytes(record).expect("loader metadata");
-
         assert_eq!(
             KnownGoodInstallReceipt::from_verified_profile_source(
                 &base,
@@ -2339,7 +2276,6 @@ mod tests {
                 child,
                 &version_bytes,
                 authority,
-                &metadata,
             ),
             Err(KnownGoodInventoryError::MissingChecksum)
         );
@@ -2385,15 +2321,12 @@ mod tests {
             environment: fixture.environment.clone(),
         };
         let version_bytes = serde_json::to_vec_pretty(&child).expect("version bytes");
-        let metadata = installed_loader_metadata_bytes(record).expect("loader metadata");
-
         let receipt = KnownGoodInstallReceipt::from_verified_profile_source(
             &base,
             record,
             child,
             &version_bytes,
             authority,
-            &metadata,
         )
         .expect("profile receipt");
         let inventory = receipt.into_inventory();
@@ -2456,15 +2389,12 @@ mod tests {
         child_download.size = child_client_bytes.len() as i64;
         child_download.url.clear();
         let version_bytes = serde_json::to_vec_pretty(&child).expect("version bytes");
-        let metadata = installed_loader_metadata_bytes(&record).expect("loader metadata");
-
         let receipt = KnownGoodInstallReceipt::from_verified_legacy_archive_source(
             &base,
             &record,
             child,
             &version_bytes,
             child_client_bytes,
-            &metadata,
         )
         .expect("legacy receipt");
         let inventory = receipt.into_inventory();
@@ -2597,7 +2527,6 @@ mod tests {
             },
         );
         assert_runtime_entries(&inventory);
-        assert!(!has_kind(&inventory, KnownGoodArtifactKind::LoaderMetadata));
         assert_sorted_unique(&inventory);
     }
 

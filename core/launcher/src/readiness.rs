@@ -504,16 +504,22 @@ fn child_version_jar(library_dir: &Path, version_id: &str, jar: &Path) -> bool {
 }
 
 fn legacy_forge_artifacts_must_be_unsigned(library_dir: &Path, version_id: &str) -> bool {
-    let Some(provenance) =
-        axial_minecraft::validated_installed_loader_provenance(library_dir, version_id)
-    else {
+    let Ok(profile) = axial_minecraft::load_version_json(library_dir, version_id) else {
         return false;
     };
-    if provenance.component_id() != axial_minecraft::LoaderComponentId::Forge {
+    let Ok(identity) = axial_minecraft::validate_materialized_loader_profile(
+        version_id,
+        &profile.id,
+        &profile.inherits_from,
+        profile.materialized,
+    ) else {
+        return false;
+    };
+    if identity.component_id() != axial_minecraft::LoaderComponentId::Forge {
         return false;
     }
 
-    minecraft_version_requires_unsigned_legacy_forge_artifacts(provenance.minecraft_version())
+    minecraft_version_requires_unsigned_legacy_forge_artifacts(identity.minecraft_version())
 }
 
 fn legacy_forge_library_requires_unsigned_metadata(name: &str) -> bool {
@@ -1105,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn current_loader_metadata_cannot_authorize_checksumless_library() {
+    fn canonical_loader_profile_cannot_authorize_checksumless_library() {
         let library_dir = temp_library("marked-checksumless-library-readable");
         let client = b"client";
         let version_id = axial_minecraft::installed_version_id_for(
@@ -1120,6 +1126,8 @@ mod tests {
             &format!(
                 r#"{{
                     "id": "{version_id}",
+                    "inheritsFrom": "1.21.1",
+                    "axialMaterialized": true,
                     "type": "release",
                     "mainClass": "org.quiltmc.loader.impl.launch.knot.KnotClient",
                     "assetIndex": {{}},
@@ -1135,7 +1143,6 @@ mod tests {
                 client.len()
             ),
         );
-        write_loader_metadata(&library_dir, &version_id, "1.21.1");
         fs::write(
             library_dir
                 .join("versions")
@@ -1194,8 +1201,8 @@ mod tests {
     }
 
     #[test]
-    fn forged_loader_metadata_cannot_authorize_checksumless_library() {
-        let library_dir = temp_library("marked-checksumless-library-unreadable");
+    fn non_materialized_loader_profile_cannot_authorize_checksumless_library() {
+        let library_dir = temp_library("non-materialized-checksumless-library");
         let client = b"client";
         let version_id = axial_minecraft::installed_version_id_for(
             axial_minecraft::LoaderComponentId::Quilt,
@@ -1224,7 +1231,6 @@ mod tests {
                 client.len()
             ),
         );
-        write_loader_metadata(&library_dir, &version_id, "1.20.1");
         fs::write(
             library_dir
                 .join("versions")
@@ -1287,7 +1293,6 @@ mod tests {
                 signed_client.len()
             ),
         );
-        write_forge_loader_metadata(&library_dir, &version_id);
         let version_dir = library_dir.join("versions").join(&version_id);
         fs::write(
             version_dir.join(format!("{version_id}.jar")),
@@ -1346,7 +1351,6 @@ mod tests {
                 expected_client.len()
             ),
         );
-        write_forge_loader_metadata(&library_dir, &version_id);
         let version_dir = library_dir.join("versions").join(&version_id);
         fs::write(
             version_dir.join(format!("{version_id}.jar")),
@@ -1423,7 +1427,6 @@ mod tests {
                 signed_forge.len()
             ),
         );
-        write_forge_loader_metadata(&library_dir, &version_id);
         let version_dir = library_dir.join("versions").join(&version_id);
         fs::write(version_dir.join(format!("{version_id}.jar")), client).expect("write child jar");
         let forge_path = library_dir
@@ -1502,7 +1505,6 @@ mod tests {
                 expected_library.len()
             ),
         );
-        write_forge_loader_metadata(&library_dir, &version_id);
         let version_dir = library_dir.join("versions").join(&version_id);
         fs::write(version_dir.join(format!("{version_id}.jar")), client).expect("write child jar");
         let forge_path = library_dir
@@ -1753,23 +1755,6 @@ mod tests {
         fs::write(version_dir.join(format!("{version_id}.json")), json).expect("version json");
     }
 
-    fn write_loader_metadata(library_dir: &Path, version_id: &str, minecraft_version: &str) {
-        fs::write(
-            library_dir
-                .join("versions")
-                .join(version_id)
-                .join(".axial-loader.json"),
-            r#"{
-                "schema_version": 2,
-                "component_id": "org.quiltmc.quilt-loader",
-                "minecraft_version": "PLACEHOLDER",
-                "loader_version": "0.29.2"
-            }"#
-            .replace("PLACEHOLDER", minecraft_version),
-        )
-        .expect("loader metadata");
-    }
-
     fn legacy_forge_version_id() -> String {
         axial_minecraft::installed_version_id_for(
             axial_minecraft::LoaderComponentId::Forge,
@@ -1777,22 +1762,6 @@ mod tests {
             "7.8.1.738",
         )
         .expect("valid Forge identity")
-    }
-
-    fn write_forge_loader_metadata(library_dir: &Path, version_id: &str) {
-        fs::write(
-            library_dir
-                .join("versions")
-                .join(version_id)
-                .join(".axial-loader.json"),
-            r#"{
-                "schema_version": 2,
-                "component_id": "net.minecraftforge",
-                "minecraft_version": "1.5.2",
-                "loader_version": "7.8.1.738"
-            }"#,
-        )
-        .expect("Forge loader metadata");
     }
 
     fn write_asset_version_fixture(library_dir: &Path, asset: &[u8], legacy: bool) {

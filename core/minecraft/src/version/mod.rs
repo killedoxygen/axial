@@ -1,5 +1,5 @@
 use crate::launch::{Downloads, JavaVersion, effective_java_version_for};
-use crate::loaders::InstalledLoaderMetadata;
+use crate::loaders::{MaterializedLoaderProfile, validate_materialized_loader_profile};
 use crate::paths::versions_dir;
 use crate::types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 use crate::version_meta::{analyze_minecraft_version, compare_version_entries};
@@ -9,8 +9,6 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::time::SystemTime;
-
-const LOADER_METADATA_FILE: &str = ".axial-loader.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionScanReport {
@@ -119,13 +117,6 @@ impl DependencyTracker {
     fn read_to_string(&mut self, path: &Path) -> io::Result<String> {
         let before = self.begin(path);
         let result = fs::read_to_string(path);
-        self.finish(path, before);
-        result
-    }
-
-    fn read(&mut self, path: &Path) -> io::Result<Vec<u8>> {
-        let before = self.begin(path);
-        let result = fs::read(path);
         self.finish(path, before);
         result
     }
@@ -262,8 +253,7 @@ pub enum VersionScanIssueKind {
     VersionJsonMissing,
     VersionJsonUnreadable,
     VersionJsonMalformed,
-    LoaderMetadataUnreadable,
-    LoaderMetadataMalformed,
+    LoaderIdentityMalformed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,7 +322,7 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
         }
     };
     let mut stubs = HashMap::new();
-    let mut loader_metadata = HashMap::new();
+    let mut loader_profiles = HashMap::new();
     let mut issues = Vec::new();
 
     for entry in entries {
@@ -387,37 +377,31 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
                 continue;
             }
         };
-        match read_installed_loader_metadata(
-            &entry_path,
+        let reserved_loader_id = crate::loaders::api::is_reserved_installed_loader_id(&id);
+        match validate_materialized_loader_profile(
             &id,
             &stub.id,
             &stub.inherits_from,
             stub.materialized,
-            &mut dependencies,
         ) {
-            LoaderMetadataScan::Ready(metadata) => {
-                loader_metadata.insert(id.clone(), metadata);
+            Ok(profile) => {
+                loader_profiles.insert(id.clone(), profile);
             }
-            LoaderMetadataScan::Missing if stub.materialized => issues.push(version_scan_issue(
-                VersionScanIssueKind::LoaderMetadataMalformed,
-                Some(id.clone()),
-            )),
-            LoaderMetadataScan::Missing => {}
-            LoaderMetadataScan::Unreadable => issues.push(version_scan_issue(
-                VersionScanIssueKind::LoaderMetadataUnreadable,
-                Some(id.clone()),
-            )),
-            LoaderMetadataScan::Malformed => issues.push(version_scan_issue(
-                VersionScanIssueKind::LoaderMetadataMalformed,
-                Some(id.clone()),
-            )),
+            Err(_) if stub.materialized || reserved_loader_id => {
+                issues.push(version_scan_issue(
+                    VersionScanIssueKind::LoaderIdentityMalformed,
+                    Some(id),
+                ));
+                continue;
+            }
+            Err(_) => {}
         }
         stubs.insert(id, stub);
     }
 
     let mut versions = Vec::new();
     for (id, stub) in &stubs {
-        let metadata = loader_metadata.get(id);
+        let loader_profile = loader_profiles.get(id);
         let effective_parent = stub.inherits_from.clone();
         let jar_path = versions_dir.join(id).join(format!("{id}.jar"));
         let incomplete_marker = versions_dir.join(id).join(".incomplete");
@@ -499,7 +483,7 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
             None,
             &[],
         );
-        let loader = metadata.map(loader_attachment_from_metadata);
+        let loader = loader_profile.map(loader_attachment_from_profile);
 
         versions.push(VersionEntry {
             subject_kind: VersionSubjectKind::InstalledVersion,
@@ -590,55 +574,17 @@ fn resolve_java_version(id: &str, stubs: &HashMap<String, VersionStub>) -> JavaV
     effective_java_version_for(inference_id, raw_kind, &JavaVersion::default())
 }
 
-enum LoaderMetadataScan {
-    Ready(InstalledLoaderMetadata),
-    Missing,
-    Unreadable,
-    Malformed,
-}
-
-fn read_installed_loader_metadata(
-    version_dir: &Path,
-    installed_version_id: &str,
-    profile_id: &str,
-    declared_parent: &str,
-    materialized: bool,
-    dependencies: &mut DependencyTracker,
-) -> LoaderMetadataScan {
-    let path = version_dir.join(LOADER_METADATA_FILE);
-    let result = dependencies.read(&path);
-    let data = match result {
-        Ok(data) => data,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return LoaderMetadataScan::Missing;
-        }
-        Err(_) => return LoaderMetadataScan::Unreadable,
-    };
-    let Ok(metadata) = serde_json::from_slice::<InstalledLoaderMetadata>(&data) else {
-        return LoaderMetadataScan::Malformed;
-    };
-    if !metadata.is_valid_for_profile(
-        installed_version_id,
-        profile_id,
-        declared_parent,
-        materialized,
-    ) {
-        return LoaderMetadataScan::Malformed;
-    }
-    LoaderMetadataScan::Ready(metadata)
-}
-
-fn loader_attachment_from_metadata(metadata: &InstalledLoaderMetadata) -> VersionLoaderAttachment {
+fn loader_attachment_from_profile(profile: &MaterializedLoaderProfile) -> VersionLoaderAttachment {
     VersionLoaderAttachment {
-        component_id: metadata.component_id,
-        component_name: metadata.component_id.display_name().to_string(),
+        component_id: profile.component_id(),
+        component_name: profile.component_id().display_name().to_string(),
         build_id: crate::loaders::build_id_for(
-            metadata.component_id,
-            &metadata.minecraft_version,
-            &metadata.loader_version,
+            profile.component_id(),
+            profile.minecraft_version(),
+            profile.loader_version(),
         ),
-        loader_version: metadata.loader_version.clone(),
-        build_meta: metadata.display_metadata(),
+        loader_version: profile.loader_version().to_string(),
+        build_meta: profile.display_metadata(),
     }
 }
 
@@ -649,8 +595,8 @@ fn version_scan_issue(kind: VersionScanIssueKind, version_id: Option<String>) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        InstalledLoaderMetadata, VersionScanIssueKind, VersionScanState, VersionStub,
-        resolve_java_version, scan_versions, scan_versions_report,
+        VersionScanIssueKind, VersionScanState, VersionStub, resolve_java_version, scan_versions,
+        scan_versions_report,
     };
     use crate::launch::{Downloads, JavaVersion};
     use crate::loaders::installed_version_id_for;
@@ -799,8 +745,8 @@ mod tests {
     }
 
     #[test]
-    fn scan_versions_derives_loader_lifecycle_from_immutable_provenance() {
-        let mc_dir = unique_test_dir("loader-lifecycle-metadata");
+    fn scan_versions_derives_loader_lifecycle_from_canonical_profile() {
+        let mc_dir = unique_test_dir("loader-lifecycle-profile");
         let versions_dir = mc_dir.join("versions");
         let version_id =
             installed_version_id_for(LoaderComponentId::Forge, "26.1.2", "64.0.4-beta")
@@ -819,13 +765,6 @@ mod tests {
             ),
         )
         .expect("write forge json");
-
-        let metadata = test_loader_metadata(LoaderComponentId::Forge, "26.1.2", "64.0.4-beta");
-        fs::write(
-            forge_dir.join(".axial-loader.json"),
-            serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
-        )
-        .expect("write metadata");
 
         let versions = scan_versions(&mc_dir).expect("scan versions");
         let version = versions
@@ -847,8 +786,8 @@ mod tests {
     }
 
     #[test]
-    fn scan_versions_anchors_loader_metadata_to_base_minecraft_version() {
-        let mc_dir = unique_test_dir("loader-base-version-metadata");
+    fn scan_versions_anchors_loader_profile_to_base_minecraft_version() {
+        let mc_dir = unique_test_dir("loader-base-version-profile");
         let versions_dir = mc_dir.join("versions");
         let base_dir = versions_dir.join("1.21.5");
         fs::create_dir_all(&base_dir).expect("create base version dir");
@@ -882,17 +821,6 @@ mod tests {
             ),
         )
         .expect("write fabric json");
-        fs::write(
-            fabric_dir.join(".axial-loader.json"),
-            serde_json::to_vec_pretty(&test_loader_metadata(
-                LoaderComponentId::Fabric,
-                "1.21.5",
-                "0.19.3",
-            ))
-            .expect("serialize metadata"),
-        )
-        .expect("write metadata");
-
         let versions = scan_versions(&mc_dir).expect("scan versions");
         let version = versions
             .iter()
@@ -909,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_versions_rejects_loader_metadata_for_a_different_declared_parent() {
+    fn scan_versions_rejects_loader_profile_with_a_different_declared_parent() {
         let mc_dir = unique_test_dir("loader-parent-mismatch");
         let version_id = installed_version_id_for(LoaderComponentId::NeoForge, "1.21.5", "21.5.75")
             .expect("valid loader identity");
@@ -927,44 +855,65 @@ mod tests {
             ),
         )
         .expect("write loader json");
-        fs::write(
-            version_dir.join(".axial-loader.json"),
-            serde_json::to_vec_pretty(&test_loader_metadata(
-                LoaderComponentId::NeoForge,
-                "1.21.5",
-                "21.5.75",
-            ))
-            .expect("serialize metadata"),
-        )
-        .expect("write loader metadata");
-
         let report = scan_versions_report(&mc_dir).expect("scan versions");
-        let version = report
-            .versions
-            .iter()
-            .find(|entry| entry.id == version_id)
-            .expect("loader version exists");
-
-        assert!(version.loader.is_none());
+        assert!(report.versions.iter().all(|entry| entry.id != version_id));
         assert!(report.issues.iter().any(|issue| {
-            issue.kind == VersionScanIssueKind::LoaderMetadataMalformed
+            issue.kind == VersionScanIssueKind::LoaderIdentityMalformed
                 && issue.version_id.as_deref() == Some(version_id.as_str())
         }));
 
         fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
     }
 
-    fn test_loader_metadata(
-        component_id: LoaderComponentId,
-        minecraft_version: &str,
-        loader_version: &str,
-    ) -> InstalledLoaderMetadata {
-        InstalledLoaderMetadata {
-            schema_version: 2,
-            component_id,
-            minecraft_version: minecraft_version.to_string(),
-            loader_version: loader_version.to_string(),
-        }
+    #[test]
+    fn scan_versions_rejects_canonical_loader_id_without_materialized_marker() {
+        let mc_dir = unique_test_dir("loader-marker-missing");
+        let version_id = installed_version_id_for(LoaderComponentId::Quilt, "1.21.5", "0.29.2")
+            .expect("valid loader identity");
+        let version_dir = mc_dir.join("versions").join(&version_id);
+        fs::create_dir_all(&version_dir).expect("create loader version dir");
+        fs::write(
+            version_dir.join(format!("{version_id}.json")),
+            format!(
+                r#"{{
+                    "id":"{version_id}",
+                    "inheritsFrom":"1.21.5",
+                    "type":"release"
+                }}"#
+            ),
+        )
+        .expect("write loader json");
+
+        let report = scan_versions_report(&mc_dir).expect("scan versions");
+        assert!(report.versions.iter().all(|entry| entry.id != version_id));
+        assert!(report.issues.iter().any(|issue| {
+            issue.kind == VersionScanIssueKind::LoaderIdentityMalformed
+                && issue.version_id.as_deref() == Some(version_id.as_str())
+        }));
+
+        fs::remove_dir_all(mc_dir).expect("remove temp test dir");
+    }
+
+    #[test]
+    fn scan_versions_rejects_malformed_reserved_loader_id_without_marker_or_parent() {
+        let mc_dir = unique_test_dir("malformed-reserved-loader-id");
+        let version_id = "loader-v2-malformed";
+        let version_dir = mc_dir.join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("create loader version dir");
+        fs::write(
+            version_dir.join(format!("{version_id}.json")),
+            format!(r#"{{"id":"{version_id}","type":"release"}}"#),
+        )
+        .expect("write loader json");
+
+        let report = scan_versions_report(&mc_dir).expect("scan versions");
+        assert!(report.versions.iter().all(|entry| entry.id != version_id));
+        assert!(report.issues.iter().any(|issue| {
+            issue.kind == VersionScanIssueKind::LoaderIdentityMalformed
+                && issue.version_id.as_deref() == Some(version_id)
+        }));
+
+        fs::remove_dir_all(mc_dir).expect("remove temp test dir");
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {
