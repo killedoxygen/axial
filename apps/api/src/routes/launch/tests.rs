@@ -3808,6 +3808,8 @@ fn test_launch_session_task() -> launch_app::LaunchSessionTask {
             auto_optimize: false,
             icon: String::new(),
             accent: String::new(),
+            loader_key: String::new(),
+            minecraft_version: String::new(),
         },
         config: AppConfig::default(),
         intent: LaunchIntent {

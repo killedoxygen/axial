@@ -38,7 +38,13 @@ where
     let total = files.len() as i32;
 
     for (index, planned) in files.iter().enumerate() {
-        let subdir = game_dir.join(planned.kind.install_subdir());
+        let Some(kind_dir) = planned.kind.install_subdir() else {
+            return Err(ContentError::Invalid(format!(
+                "{} is not installable as a single file",
+                planned.kind.as_str()
+            )));
+        };
+        let subdir = game_dir.join(kind_dir);
         fs::create_dir_all(&subdir)?;
         let destination = subdir.join(&planned.file.filename);
 
@@ -84,8 +90,9 @@ pub fn uninstall(game_dir: &Path, canonical_id: &CanonicalId) -> ContentResult<b
     let Some(entry) = manifest.remove(canonical_id) else {
         return Ok(false);
     };
-    let subdir = game_dir.join(entry.kind.install_subdir());
-    remove_content_file(&subdir, &entry.filename);
+    if let Some(kind_dir) = entry.kind.install_subdir() {
+        remove_content_file(&game_dir.join(kind_dir), &entry.filename);
+    }
     manifest.save(game_dir)?;
     Ok(true)
 }

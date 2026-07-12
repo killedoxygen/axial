@@ -19,13 +19,29 @@ impl ContentKind {
         }
     }
 
-    /// Instance-relative directory this kind installs into.
-    pub fn install_subdir(self) -> &'static str {
+    /// Instance-relative directory this kind installs a single file into. A
+    /// modpack has none: it is a whole instance, imported rather than dropped in
+    /// a folder.
+    pub fn install_subdir(self) -> Option<&'static str> {
         match self {
-            Self::Mod | Self::Modpack => "mods",
-            Self::ResourcePack => "resourcepacks",
-            Self::ShaderPack => "shaderpacks",
+            Self::Mod => Some("mods"),
+            Self::ResourcePack => Some("resourcepacks"),
+            Self::ShaderPack => Some("shaderpacks"),
+            Self::Modpack => None,
         }
+    }
+
+    /// Whether upstream tags this kind with the instance's mod loader. Modrinth
+    /// tags resource packs as `minecraft` and shaders as `iris`/`optifine`, so
+    /// filtering those by the instance loader would match nothing.
+    pub fn filters_by_loader(self) -> bool {
+        matches!(self, Self::Mod | Self::Modpack)
+    }
+
+    /// Whether the target instance must have a mod loader to accept this kind.
+    /// Resource packs and shaders drop into a vanilla instance fine.
+    pub fn requires_mod_loader(self) -> bool {
+        matches!(self, Self::Mod)
     }
 }
 
@@ -196,13 +212,14 @@ pub struct ContentDetail {
 }
 
 /// Resolves a file hash back to the project and version that published it. Powers
-/// dedupe and retrofit of manually added files.
+/// dedupe and retrofit of manually added files. The kind is not part of it: the
+/// hash lookup does not report one, and the directory the file was found in is a
+/// more reliable answer anyway.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionIdentity {
     pub provider: ProviderId,
     pub project_id: String,
     pub version_id: String,
-    pub kind: ContentKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
 }

@@ -1,8 +1,10 @@
 use crate::application::{
-    self, ContentPlanRequest, ContentSearchParams, InstanceContentResponse, ResolutionPlan,
+    self, ContentCompatRequest, ContentCompatResponse, ContentInstallRequest, ContentPlanRequest,
+    ContentSearchParams, InstanceContentResponse, ModpackInstallRequest, ModpackInstallResponse,
+    ModpackTarget, ResolutionPlan, SearchHit,
 };
 use crate::state::AppState;
-use axial_content::{CanonicalContent, ContentDetail, Page};
+use axial_content::{ContentDetail, Page};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -17,6 +19,12 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/content/item", get(handle_detail))
         .route("/api/v1/content/plan", post(handle_plan))
         .route("/api/v1/content/install", post(handle_install))
+        .route("/api/v1/content/compatibility", post(handle_compatibility))
+        .route("/api/v1/content/modpack/target", get(handle_modpack_target))
+        .route(
+            "/api/v1/content/modpack/install",
+            post(handle_modpack_install),
+        )
         .route(
             "/api/v1/instances/{id}/content",
             get(handle_instance_content),
@@ -32,10 +40,17 @@ struct CanonicalIdQuery {
     id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ModpackTargetQuery {
+    id: String,
+    #[serde(default)]
+    version_id: Option<String>,
+}
+
 async fn handle_search(
     State(state): State<AppState>,
     Query(params): Query<ContentSearchParams>,
-) -> Result<Json<Page<CanonicalContent>>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<Page<SearchHit>>, (StatusCode, Json<serde_json::Value>)> {
     application::content_search(&state, params).await.map(Json)
 }
 
@@ -57,9 +72,36 @@ async fn handle_plan(
 
 async fn handle_install(
     State(state): State<AppState>,
-    Json(payload): Json<ContentPlanRequest>,
+    Json(payload): Json<ContentInstallRequest>,
 ) -> Result<Json<InstanceContentResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::content_install(&state, payload)
+        .await
+        .map(Json)
+}
+
+async fn handle_compatibility(
+    State(state): State<AppState>,
+    Json(payload): Json<ContentCompatRequest>,
+) -> Result<Json<ContentCompatResponse>, (StatusCode, Json<serde_json::Value>)> {
+    application::content_compatibility(&state, payload)
+        .await
+        .map(Json)
+}
+
+async fn handle_modpack_target(
+    State(state): State<AppState>,
+    Query(query): Query<ModpackTargetQuery>,
+) -> Result<Json<ModpackTarget>, (StatusCode, Json<serde_json::Value>)> {
+    application::modpack_target(&state, &query.id, query.version_id.as_deref())
+        .await
+        .map(Json)
+}
+
+async fn handle_modpack_install(
+    State(state): State<AppState>,
+    Json(payload): Json<ModpackInstallRequest>,
+) -> Result<Json<ModpackInstallResponse>, (StatusCode, Json<serde_json::Value>)> {
+    application::modpack_install(&state, payload)
         .await
         .map(Json)
 }

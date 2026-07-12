@@ -63,9 +63,12 @@ pub use commands::{
 };
 pub use config::{ConfigPatch, current_config, update_config};
 pub use content::{
-    ContentApiError, ContentPlanRequest, ContentSearchParams, InstanceContentResponse,
-    ResolutionPlan, content_detail, content_install, content_plan, content_search,
-    content_uninstall, instance_content,
+    ContentApiError, ContentCompatRequest, ContentCompatResponse, ContentInstallRequest,
+    ContentPlanRequest, ContentSearchParams, InstanceContentResponse, ModpackInstallRequest,
+    ModpackInstallResponse, ModpackTarget, ResolutionPlan, SearchHit, content_compatibility,
+    content_detail, content_install, content_plan, content_search, content_uninstall,
+    instance_content,
+    pack::{modpack_install, modpack_target},
 };
 pub use dev::{DevCleanupResponse, DevFlushResponse, dev_cleanup_versions, dev_flush};
 pub use flags::{

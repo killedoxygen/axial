@@ -202,7 +202,10 @@ pub fn reconcile(game_dir: &Path, manifest: &ContentManifest) -> ReconcileReport
         ContentKind::ResourcePack,
         ContentKind::ShaderPack,
     ] {
-        let dir = game_dir.join(kind.install_subdir());
+        let Some(kind_dir) = kind.install_subdir() else {
+            continue;
+        };
+        let dir = game_dir.join(kind_dir);
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
@@ -227,7 +230,12 @@ pub fn reconcile(game_dir: &Path, manifest: &ContentManifest) -> ReconcileReport
 }
 
 fn entry_file_present(game_dir: &Path, entry: &ManifestEntry) -> bool {
-    let dir = game_dir.join(entry.kind.install_subdir());
+    // A modpack entry records which pack the instance came from and owns no file
+    // of its own, so it can never go missing.
+    let Some(kind_dir) = entry.kind.install_subdir() else {
+        return true;
+    };
+    let dir = game_dir.join(kind_dir);
     dir.join(&entry.filename).is_file()
         || dir.join(format!("{}.disabled", entry.filename)).is_file()
 }

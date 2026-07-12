@@ -445,13 +445,14 @@ pub(crate) async fn handle_create_instance(
     let instance =
         create_instance_with_unique_name(state, &payload, &selection, mc_dir.as_deref())?;
     let created_instance_id = instance.id.clone();
-    let instance = match apply_create_initial_settings(state, instance, &payload, &preset) {
-        Ok(instance) => instance,
-        Err(error) => {
-            rollback_created_instance(state, &created_instance_id);
-            return Err(error);
-        }
-    };
+    let instance =
+        match apply_create_initial_settings(state, instance, &payload, &selection, &preset) {
+            Ok(instance) => instance,
+            Err(error) => {
+                rollback_created_instance(state, &created_instance_id);
+                return Err(error);
+            }
+        };
     let install_queue =
         queue_create_install_or_rollback(state, &created_instance_id, install_request).await?;
     let enriched = enrich_instance_for_state(state, instance);
@@ -483,6 +484,7 @@ pub(super) enum CreateSelection {
         component_id: LoaderComponentId,
         build_id: String,
         target_version_id: String,
+        minecraft_version: String,
     },
 }
 
@@ -493,6 +495,25 @@ impl CreateSelection {
             Self::Loader {
                 target_version_id, ..
             } => target_version_id,
+        }
+    }
+
+    /// The loader short key the instance is being created with, empty for vanilla.
+    fn loader_key(&self) -> &str {
+        match self {
+            Self::Vanilla { .. } => "",
+            Self::Loader { component_id, .. } => component_id.short_key(),
+        }
+    }
+
+    /// The Minecraft version behind the selection, which for vanilla is the
+    /// version id itself.
+    fn minecraft_version(&self) -> &str {
+        match self {
+            Self::Vanilla { version_id } => version_id,
+            Self::Loader {
+                minecraft_version, ..
+            } => minecraft_version,
         }
     }
 
@@ -601,6 +622,7 @@ async fn resolve_loader_version_create_selection(
         component_id: build.component_id,
         build_id: build.build_id,
         target_version_id: build.version_id,
+        minecraft_version: build.minecraft_version,
     })
 }
 
@@ -666,6 +688,7 @@ pub(super) fn resolve_loader_create_selection_from_build_catalog(
         component_id: build.component_id,
         build_id: build.build_id,
         target_version_id: build.version_id,
+        minecraft_version: build.minecraft_version,
     })
 }
 
@@ -746,9 +769,15 @@ fn apply_create_initial_settings(
     state: &AppState,
     mut instance: Instance,
     payload: &CreateInstanceRequest,
+    selection: &CreateSelection,
     preset: &GuardianJvmPresetResolution,
 ) -> Result<Instance, (StatusCode, Json<serde_json::Value>)> {
     let mut changed = false;
+    instance.loader_key = selection.loader_key().to_string();
+    instance.minecraft_version = selection.minecraft_version().to_string();
+    if !instance.minecraft_version.is_empty() {
+        changed = true;
+    }
     if let Some(art_seed) = payload.art_seed {
         instance.art_seed = art_seed;
         changed = true;

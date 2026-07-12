@@ -3,6 +3,7 @@ pub mod install;
 pub mod manifest;
 pub mod model;
 pub mod modrinth;
+pub mod pack;
 pub mod provider;
 pub mod registry;
 
@@ -18,5 +19,6 @@ pub use model::{
     VersionIdentity,
 };
 pub use modrinth::ModrinthProvider;
+pub use pack::{PackFile, PackIndex, PackInstallReport, PackLoader, install_pack, read_pack_index};
 pub use provider::{ContentProvider, ContentQuery, LoaderGameFilter, Page, SortOrder};
 pub use registry::ContentRegistry;

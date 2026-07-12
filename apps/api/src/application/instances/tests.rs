@@ -1863,7 +1863,8 @@ fn loader_create_selection_allows_stale_exact_build_when_already_installed() {
         CreateSelection::Loader {
             component_id,
             build_id: build.build_id,
-            target_version_id: build.version_id
+            target_version_id: build.version_id,
+            minecraft_version: build.minecraft_version
         }
     );
 }

@@ -1,5 +1,5 @@
 use crate::paths::AppPaths;
-use axial_minecraft::VersionEntry;
+use axial_minecraft::{LoaderComponentId, VersionEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -43,6 +43,13 @@ pub struct Instance {
     pub icon: String,
     #[serde(default)]
     pub accent: String,
+    /// Recorded at creation so the instance can describe itself before its
+    /// version profile lands on disk. Empty on instances created before this
+    /// was tracked, which fall back to the installed version entry.
+    #[serde(default)]
+    pub loader_key: String,
+    #[serde(default)]
+    pub minecraft_version: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,12 +84,31 @@ pub struct InstanceVersionDisplay {
 }
 
 impl InstanceVersionDisplay {
-    fn from_version(version: Option<&VersionEntry>) -> Self {
-        let loader_key = version_loader_key(version);
-        let loader_label = version_loader_label(version);
+    /// The installed version entry is the source of truth; while it is still
+    /// downloading there is none, so the loader and Minecraft version the
+    /// instance was created with stand in for it.
+    fn from_version(version: Option<&VersionEntry>, declared: &Instance) -> Self {
+        // An installed entry is authoritative even when it carries no loader: it
+        // means the instance really is vanilla. The declaration only stands in
+        // while there is no entry at all.
+        let loader = match version {
+            Some(entry) => entry.loader.as_ref().map(|loader| loader.component_id),
+            None => LoaderComponentId::parse(declared.loader_key.trim()),
+        };
+        let loader_key = loader
+            .map(|id| id.short_key().to_string())
+            .unwrap_or_else(|| "vanilla".to_string());
+        let loader_label = loader
+            .map(|id| id.display_name().to_string())
+            .unwrap_or_else(|| "Vanilla".to_string());
         let minecraft_label = version
             .map(minecraft_label_for_version)
             .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                Some(declared.minecraft_version.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| "Unknown".to_string());
         let loader_version_label = version
             .and_then(|entry| entry.loader.as_ref())
@@ -95,7 +121,7 @@ impl InstanceVersionDisplay {
         } else {
             format!("{loader_label} · {loader_version_label}")
         };
-        let supports_mods = version.is_some_and(|entry| entry.loader.is_some());
+        let supports_mods = loader.is_some();
 
         Self {
             summary_label: format!("{loader_label} · {minecraft_label}"),
@@ -240,7 +266,7 @@ impl EnrichedInstance {
             .unwrap_or_default();
 
         Self {
-            version_display: InstanceVersionDisplay::from_version(version),
+            version_display: InstanceVersionDisplay::from_version(version, &instance),
             launch_action: LaunchActionState::from_readiness(
                 launchable,
                 &status_detail,
@@ -257,20 +283,6 @@ impl EnrichedInstance {
             instance,
         }
     }
-}
-
-fn version_loader_key(version: Option<&VersionEntry>) -> String {
-    version
-        .and_then(|entry| entry.loader.as_ref())
-        .map(|loader| loader.component_id.short_key().to_string())
-        .unwrap_or_else(|| "vanilla".to_string())
-}
-
-fn version_loader_label(version: Option<&VersionEntry>) -> String {
-    version
-        .and_then(|entry| entry.loader.as_ref())
-        .map(|loader| loader.component_id.display_name().to_string())
-        .unwrap_or_else(|| "Vanilla".to_string())
 }
 
 fn minecraft_label_for_version(version: &VersionEntry) -> String {
@@ -608,6 +620,8 @@ impl InstanceStore {
             auto_optimize: false,
             icon,
             accent,
+            loader_key: String::new(),
+            minecraft_version: String::new(),
         };
 
         inner.instances.push(instance.clone());
@@ -688,6 +702,8 @@ impl InstanceStore {
             auto_optimize: source.auto_optimize,
             icon: source.icon.clone(),
             accent: source.accent.clone(),
+            loader_key: source.loader_key.clone(),
+            minecraft_version: source.minecraft_version.clone(),
         };
 
         inner.instances.push(instance.clone());
@@ -951,6 +967,8 @@ mod tests {
             auto_optimize: false,
             icon: String::new(),
             accent: String::new(),
+            loader_key: String::new(),
+            minecraft_version: String::new(),
         }
     }
 
@@ -1034,6 +1052,48 @@ mod tests {
             "Quilt · 0.30.0-beta.8 (beta)"
         );
         assert!(enriched.version_display.supports_mods);
+    }
+
+    #[test]
+    fn enriched_instance_falls_back_to_declared_loader_while_the_version_downloads() {
+        let mut instance = stored_instance("fresh");
+        instance.version_id = "fabric-loader-0.17.2-1.21.6".to_string();
+        instance.loader_key = "fabric".to_string();
+        instance.minecraft_version = "1.21.6".to_string();
+
+        let enriched = EnrichedInstance::from_instance_without_resource_counts(instance, None);
+
+        assert_eq!(enriched.version_display.loader_key, "fabric");
+        assert_eq!(enriched.version_display.loader_label, "Fabric");
+        assert_eq!(enriched.version_display.minecraft_label, "1.21.6");
+        assert!(enriched.version_display.supports_mods);
+        assert!(!enriched.launchable);
+    }
+
+    #[test]
+    fn enriched_instance_without_a_version_or_declaration_stays_unknown() {
+        let enriched = EnrichedInstance::from_instance_without_resource_counts(
+            stored_instance("legacy"),
+            None,
+        );
+
+        assert_eq!(enriched.version_display.loader_key, "vanilla");
+        assert_eq!(enriched.version_display.minecraft_label, "Unknown");
+        assert!(!enriched.version_display.supports_mods);
+    }
+
+    #[test]
+    fn installed_version_entry_outranks_the_declared_loader() {
+        let mut instance = stored_instance("stale-declaration");
+        instance.loader_key = "forge".to_string();
+        instance.minecraft_version = "1.16.5".to_string();
+        let version = version_entry("1.21.1");
+
+        let enriched =
+            EnrichedInstance::from_instance_without_resource_counts(instance, Some(&version));
+
+        assert_eq!(enriched.version_display.loader_key, "vanilla");
+        assert_eq!(enriched.version_display.minecraft_label, "1.21.1");
     }
 
     #[test]

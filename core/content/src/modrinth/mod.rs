@@ -210,7 +210,9 @@ fn build_facets(query: &ContentQuery) -> String {
         "project_type:{}",
         project_type_facet(query.kind)
     )]];
-    if let Some(loader) = query.loader.as_ref().filter(|value| !value.is_empty()) {
+    if query.kind.filters_by_loader()
+        && let Some(loader) = query.loader.as_ref().filter(|value| !value.is_empty())
+    {
         groups.push(vec![format!("categories:{loader}")]);
     }
     if let Some(game_version) = query
@@ -366,7 +368,6 @@ fn map_identity(version: dto::Version) -> Option<VersionIdentity> {
         provider: ProviderId::Modrinth,
         project_id: version.project_id,
         version_id: version.id,
-        kind: ContentKind::Mod,
         title: Some(version.name),
     })
 }
