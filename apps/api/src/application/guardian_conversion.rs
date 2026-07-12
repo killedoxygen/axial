@@ -16,8 +16,9 @@ pub(super) fn launcher_guardian_decision(decision: GuardianActionKind) -> Launch
             LauncherGuardianDecision::Allowed
         }
         GuardianActionKind::Warn => LauncherGuardianDecision::Warned,
-        GuardianActionKind::Block | GuardianActionKind::AskUser => {
-            LauncherGuardianDecision::Blocked
+        GuardianActionKind::Block => LauncherGuardianDecision::Blocked,
+        GuardianActionKind::AskUser => {
+            unreachable!("preflight boundary must resolve confirmation before launch conversion")
         }
         GuardianActionKind::Repair
         | GuardianActionKind::Retry
@@ -52,10 +53,6 @@ mod tests {
         );
         assert_eq!(
             launcher_guardian_decision(GuardianActionKind::Block),
-            LauncherGuardianDecision::Blocked
-        );
-        assert_eq!(
-            launcher_guardian_decision(GuardianActionKind::AskUser),
             LauncherGuardianDecision::Blocked
         );
         assert_eq!(

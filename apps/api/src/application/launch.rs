@@ -385,7 +385,7 @@ mod tests {
 
         assert_eq!(
             outcome.guardian_decision.kind,
-            crate::guardian::GuardianActionKind::RecordOnly
+            crate::guardian::GuardianActionKind::Warn
         );
         assert_eq!(
             outcome.user_outcome.decision,

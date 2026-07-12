@@ -231,7 +231,7 @@
         "plan_present": true,
         "plan_integrity": true
       },
-      "effective_decision": "AskUser",
+      "effective_decision": "Block",
       "directives": []
     },
     {
@@ -252,7 +252,7 @@
         "jvm_args_malformed"
       ],
       "kernel_decision": {
-        "decision_kind": "AskUser",
+        "decision_kind": "Warn",
         "plan_present": true,
         "plan_integrity": true
       },
@@ -277,7 +277,7 @@
         "managed_runtime_missing"
       ],
       "kernel_decision": {
-        "decision_kind": "RecordOnly",
+        "decision_kind": "Block",
         "plan_present": true,
         "plan_integrity": true
       },
@@ -300,7 +300,7 @@
         "unknown_failure_validating"
       ],
       "kernel_decision": {
-        "decision_kind": "RecordOnly",
+        "decision_kind": "Block",
         "plan_present": true,
         "plan_integrity": true
       },
@@ -325,7 +325,7 @@
         "jvm_args_malformed"
       ],
       "kernel_decision": {
-        "decision_kind": "Strip",
+        "decision_kind": "Block",
         "plan_present": true,
         "plan_integrity": true
       },
@@ -671,7 +671,7 @@
         "java_override_unavailable"
       ],
       "kernel_decision": {
-        "decision_kind": "Fallback",
+        "decision_kind": "Warn",
         "plan_present": true,
         "plan_integrity": true
       },
@@ -846,7 +846,7 @@
         "unknown_failure_validating"
       ],
       "kernel_decision": {
-        "decision_kind": "RecordOnly",
+        "decision_kind": "Warn",
         "plan_present": true,
         "plan_integrity": true
       },
@@ -871,7 +871,7 @@
         "unknown_failure_validating"
       ],
       "kernel_decision": {
-        "decision_kind": "RecordOnly",
+        "decision_kind": "Warn",
         "plan_present": true,
         "plan_integrity": true
       },
@@ -896,7 +896,7 @@
         "unknown_failure_validating"
       ],
       "kernel_decision": {
-        "decision_kind": "RecordOnly",
+        "decision_kind": "Warn",
         "plan_present": true,
         "plan_integrity": true
       },

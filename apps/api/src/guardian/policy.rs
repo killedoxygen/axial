@@ -1,7 +1,8 @@
 use super::rules::rule_order;
 use super::{
-    ActionPlanPrerequisite, Diagnosis, GuardianAction, GuardianActionKind, GuardianActionPlan,
-    GuardianDecision, GuardianMode, GuardianSeverity, SafetyCase,
+    ActionPlanPrerequisite, Diagnosis, DiagnosisId, GuardianAction, GuardianActionKind,
+    GuardianActionPlan, GuardianDecision, GuardianFact, GuardianFactId, GuardianMode,
+    GuardianSeverity, SafetyCase,
 };
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor};
 
@@ -11,6 +12,29 @@ pub struct GuardianPolicyContext {
     pub suppression_active: bool,
     pub public_redaction_ready: bool,
     pub explicit_user_intent: bool,
+    scope: DecisionScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecisionScope {
+    General,
+    LaunchPreflight {
+        admission: PreflightAdmission,
+        signals: PreflightSignals,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreflightAdmission {
+    Ready,
+    Blocked,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PreflightSignals {
+    java_fallback: bool,
+    jvm_strip: bool,
+    warning: bool,
 }
 
 impl GuardianPolicyContext {
@@ -20,6 +44,7 @@ impl GuardianPolicyContext {
             suppression_active: false,
             public_redaction_ready: true,
             explicit_user_intent: false,
+            scope: DecisionScope::General,
         }
     }
 
@@ -41,6 +66,34 @@ impl GuardianPolicyContext {
     pub fn with_explicit_user_intent(mut self) -> Self {
         self.explicit_user_intent = true;
         self
+    }
+
+    pub(super) fn for_launch_preflight(
+        mut self,
+        admission: PreflightAdmission,
+        facts: &[GuardianFact],
+    ) -> Self {
+        self.scope = DecisionScope::LaunchPreflight {
+            admission,
+            signals: PreflightSignals::from_facts(facts),
+        };
+        self
+    }
+}
+
+impl PreflightSignals {
+    fn from_facts(facts: &[GuardianFact]) -> Self {
+        Self {
+            java_fallback: facts
+                .iter()
+                .any(|fact| PREFLIGHT_JAVA_FALLBACK_FACTS.contains(&fact.id)),
+            jvm_strip: facts
+                .iter()
+                .any(|fact| PREFLIGHT_JVM_STRIP_FACTS.contains(&fact.id)),
+            warning: facts
+                .iter()
+                .any(|fact| PREFLIGHT_WARNING_FACTS.contains(&fact.id)),
+        }
     }
 }
 
@@ -80,6 +133,133 @@ struct ModeActionRule {
     action: GuardianActionKind,
     permission: ModeActionPermission,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreflightModeMatch {
+    Any,
+    Managed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreflightActionMatch {
+    Any,
+    Exact(GuardianActionKind),
+    NonBlock,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreflightEvidenceMatch {
+    Any,
+    AdmissionBlocked,
+    Diagnosis(DiagnosisId),
+    JavaFallbackSignal,
+    JvmStripSignal,
+    WarningSignal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreflightDisposition {
+    Exact(GuardianActionKind),
+    Incoming,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreflightDispositionRule {
+    mode: PreflightModeMatch,
+    incoming: PreflightActionMatch,
+    evidence: PreflightEvidenceMatch,
+    disposition: PreflightDisposition,
+}
+
+const PREFLIGHT_JAVA_FALLBACK_FACTS: &[GuardianFactId] = &[
+    GuardianFactId::JavaOverrideMissing,
+    GuardianFactId::JavaOverrideUndefinedSentinel,
+    GuardianFactId::JavaProbeFailed,
+    GuardianFactId::JavaMajorMismatch,
+    GuardianFactId::JavaUpdateTooOld,
+];
+
+const PREFLIGHT_JVM_STRIP_FACTS: &[GuardianFactId] = &[
+    GuardianFactId::JvmArgsParseFailed,
+    GuardianFactId::JvmArgReservedLauncherFlag,
+    GuardianFactId::JvmArgMemoryConflict,
+    GuardianFactId::JvmArgUnsupportedGc,
+    GuardianFactId::JvmArgUnlockOrderInvalid,
+    GuardianFactId::JvmArgUnsafeClasspathOverride,
+    GuardianFactId::JvmArgUnsafeNativePathOverride,
+    GuardianFactId::JvmArgAgentOverride,
+];
+
+const PREFLIGHT_WARNING_FACTS: &[GuardianFactId] = &[
+    GuardianFactId::JavaOverrideEmpty,
+    GuardianFactId::JavaOverrideMissing,
+    GuardianFactId::JavaOverrideUndefinedSentinel,
+    GuardianFactId::JvmArgsParseFailed,
+    GuardianFactId::JvmArgReservedLauncherFlag,
+    GuardianFactId::JvmArgMemoryConflict,
+    GuardianFactId::JvmArgUnsupportedGc,
+    GuardianFactId::JvmArgUnlockOrderInvalid,
+    GuardianFactId::JvmArgUnsafeClasspathOverride,
+    GuardianFactId::JvmArgUnsafeNativePathOverride,
+    GuardianFactId::JvmArgAgentOverride,
+    GuardianFactId::LaunchMemoryMinClamped,
+    GuardianFactId::LaunchMemoryAllocationLow,
+    GuardianFactId::LaunchResourceMemoryPressure,
+    GuardianFactId::LaunchResourceCpuPressure,
+    GuardianFactId::LaunchResourceInstallPressure,
+    GuardianFactId::LaunchResourceDiskPressure,
+    GuardianFactId::CustomJavaOverridePresent,
+    GuardianFactId::CustomJvmPresetPresent,
+    GuardianFactId::CustomJvmArgsPresent,
+    GuardianFactId::RecentStartupFailure,
+    GuardianFactId::RecentRepairFailed,
+    GuardianFactId::RepairSuppressedUntil,
+];
+
+const PREFLIGHT_DISPOSITION_RULES: &[PreflightDispositionRule] = &[
+    PreflightDispositionRule {
+        mode: PreflightModeMatch::Any,
+        incoming: PreflightActionMatch::Any,
+        evidence: PreflightEvidenceMatch::AdmissionBlocked,
+        disposition: PreflightDisposition::Exact(GuardianActionKind::Block),
+    },
+    PreflightDispositionRule {
+        mode: PreflightModeMatch::Any,
+        incoming: PreflightActionMatch::Exact(GuardianActionKind::Block),
+        evidence: PreflightEvidenceMatch::Any,
+        disposition: PreflightDisposition::Exact(GuardianActionKind::Block),
+    },
+    PreflightDispositionRule {
+        mode: PreflightModeMatch::Managed,
+        incoming: PreflightActionMatch::Exact(GuardianActionKind::Fallback),
+        evidence: PreflightEvidenceMatch::JavaFallbackSignal,
+        disposition: PreflightDisposition::Exact(GuardianActionKind::Fallback),
+    },
+    PreflightDispositionRule {
+        mode: PreflightModeMatch::Managed,
+        incoming: PreflightActionMatch::Exact(GuardianActionKind::Strip),
+        evidence: PreflightEvidenceMatch::JvmStripSignal,
+        disposition: PreflightDisposition::Exact(GuardianActionKind::Strip),
+    },
+    PreflightDispositionRule {
+        mode: PreflightModeMatch::Any,
+        incoming: PreflightActionMatch::Exact(GuardianActionKind::AskUser),
+        evidence: PreflightEvidenceMatch::Diagnosis(DiagnosisId::JavaOverrideUnavailable),
+        disposition: PreflightDisposition::Exact(GuardianActionKind::AskUser),
+    },
+    PreflightDispositionRule {
+        mode: PreflightModeMatch::Any,
+        incoming: PreflightActionMatch::NonBlock,
+        evidence: PreflightEvidenceMatch::WarningSignal,
+        disposition: PreflightDisposition::Exact(GuardianActionKind::Warn),
+    },
+    PreflightDispositionRule {
+        mode: PreflightModeMatch::Any,
+        incoming: PreflightActionMatch::Any,
+        evidence: PreflightEvidenceMatch::Any,
+        disposition: PreflightDisposition::Incoming,
+    },
+];
 
 const MANAGED_MODE_ACTIONS: [ModeActionRule; 11] = [
     mode_action(GuardianActionKind::Allow, ModeActionPermission::Always),
@@ -173,7 +353,11 @@ pub fn decide_guardian_policy(
         };
     };
 
-    let selection = select_policy_action(safety_case.mode, diagnosis, context);
+    let mut selection = select_policy_action(safety_case.mode, diagnosis, context);
+    selection.kind = scoped_disposition(safety_case, selection.kind, context);
+    if matches!(context.scope, DecisionScope::LaunchPreflight { .. }) {
+        normalize_selected_action(&mut selection.prerequisite, selection.kind);
+    }
     GuardianDecision {
         operation_id: safety_case.operation_id.clone(),
         mode: safety_case.mode,
@@ -188,6 +372,63 @@ pub fn decide_guardian_policy(
                 reason: selection.prerequisite.diagnosis_id,
             }],
         )),
+    }
+}
+
+fn scoped_disposition(
+    safety_case: &SafetyCase,
+    incoming: GuardianActionKind,
+    context: GuardianPolicyContext,
+) -> GuardianActionKind {
+    let DecisionScope::LaunchPreflight { admission, signals } = context.scope else {
+        return incoming;
+    };
+    let rule = PREFLIGHT_DISPOSITION_RULES
+        .iter()
+        .find(|rule| preflight_rule_matches(**rule, safety_case, incoming, admission, signals))
+        .expect("preflight disposition table is total");
+    match rule.disposition {
+        PreflightDisposition::Exact(disposition) => disposition,
+        PreflightDisposition::Incoming => incoming,
+    }
+}
+
+fn preflight_rule_matches(
+    rule: PreflightDispositionRule,
+    safety_case: &SafetyCase,
+    incoming: GuardianActionKind,
+    admission: PreflightAdmission,
+    signals: PreflightSignals,
+) -> bool {
+    let mode_matches = match rule.mode {
+        PreflightModeMatch::Any => true,
+        PreflightModeMatch::Managed => safety_case.mode == GuardianMode::Managed,
+    };
+    let action_matches = match rule.incoming {
+        PreflightActionMatch::Any => true,
+        PreflightActionMatch::Exact(expected) => incoming == expected,
+        PreflightActionMatch::NonBlock => incoming != GuardianActionKind::Block,
+    };
+    let evidence_matches = match rule.evidence {
+        PreflightEvidenceMatch::Any => true,
+        PreflightEvidenceMatch::AdmissionBlocked => admission == PreflightAdmission::Blocked,
+        PreflightEvidenceMatch::Diagnosis(expected) => safety_case
+            .diagnoses
+            .iter()
+            .any(|diagnosis| diagnosis.id() == expected),
+        PreflightEvidenceMatch::JavaFallbackSignal => signals.java_fallback,
+        PreflightEvidenceMatch::JvmStripSignal => signals.jvm_strip,
+        PreflightEvidenceMatch::WarningSignal => signals.warning,
+    };
+    mode_matches && action_matches && evidence_matches
+}
+
+fn normalize_selected_action(
+    prerequisite: &mut ActionPlanPrerequisite,
+    selected: GuardianActionKind,
+) {
+    if !prerequisite.candidate_actions.contains(&selected) {
+        prerequisite.candidate_actions.push(selected);
     }
 }
 
@@ -385,8 +626,9 @@ fn action_is_retry_loop_sensitive(action: GuardianActionKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardianPolicyContext, ModeActionPermission, PolicyRejection, action_is_intervention,
-        decide_guardian_policy, mode_actions, public_boundary_rejection, reject_candidate,
+        GuardianPolicyContext, ModeActionPermission, PREFLIGHT_DISPOSITION_RULES, PolicyRejection,
+        PreflightAdmission, PreflightSignals, action_is_intervention, decide_guardian_policy,
+        mode_actions, preflight_rule_matches, public_boundary_rejection, reject_candidate,
         strongest_diagnosis,
     };
     use crate::guardian::{
@@ -634,6 +876,154 @@ mod tests {
                 Some(case.expected)
             );
         }
+    }
+
+    #[test]
+    fn preflight_disposition_overlaps_resolve_by_declared_order() {
+        let java = safety_case(
+            GuardianMode::Managed,
+            rule_diagnosis(
+                GuardianFactId::JavaOverrideMissing,
+                GuardianDomain::Runtime,
+                OperationPhase::Validating,
+                OwnershipClass::UserOwned,
+            ),
+        );
+        let jvm = safety_case(
+            GuardianMode::Managed,
+            rule_diagnosis(
+                GuardianFactId::JvmArgsParseFailed,
+                GuardianDomain::Jvm,
+                OperationPhase::Validating,
+                OwnershipClass::UserOwned,
+            ),
+        );
+        let java_signals = PreflightSignals {
+            java_fallback: true,
+            warning: true,
+            ..PreflightSignals::default()
+        };
+        let jvm_signals = PreflightSignals {
+            jvm_strip: true,
+            warning: true,
+            ..PreflightSignals::default()
+        };
+
+        assert_eq!(
+            matching_preflight_rules(
+                &jvm,
+                GuardianActionKind::Strip,
+                PreflightAdmission::Blocked,
+                jvm_signals,
+            ),
+            vec![0, 3, 5, 6]
+        );
+        assert_eq!(
+            matching_preflight_rules(
+                &java,
+                GuardianActionKind::Fallback,
+                PreflightAdmission::Ready,
+                java_signals,
+            ),
+            vec![2, 5, 6]
+        );
+
+        let mut custom_java = java.clone();
+        custom_java.mode = GuardianMode::Custom;
+        assert_eq!(
+            matching_preflight_rules(
+                &custom_java,
+                GuardianActionKind::AskUser,
+                PreflightAdmission::Ready,
+                java_signals,
+            ),
+            vec![4, 5, 6]
+        );
+        let mut custom_jvm = jvm.clone();
+        custom_jvm.mode = GuardianMode::Custom;
+        assert_eq!(
+            matching_preflight_rules(
+                &custom_jvm,
+                GuardianActionKind::AskUser,
+                PreflightAdmission::Ready,
+                jvm_signals,
+            ),
+            vec![5, 6]
+        );
+        assert_eq!(
+            matching_preflight_rules(
+                &jvm,
+                GuardianActionKind::Block,
+                PreflightAdmission::Ready,
+                jvm_signals,
+            ),
+            vec![1, 6]
+        );
+
+        let neutral = safety_case(
+            GuardianMode::Managed,
+            rule_diagnosis(
+                GuardianFactId::ExitCodeZero,
+                GuardianDomain::Session,
+                OperationPhase::Validating,
+                OwnershipClass::LauncherManaged,
+            ),
+        );
+        assert_eq!(
+            matching_preflight_rules(
+                &neutral,
+                GuardianActionKind::RecordOnly,
+                PreflightAdmission::Ready,
+                PreflightSignals::default(),
+            ),
+            vec![6]
+        );
+    }
+
+    #[test]
+    fn scoped_candidate_normalization_does_not_change_general_candidates() {
+        let fact = rule_fact(
+            GuardianFactId::JavaOverrideEmpty,
+            GuardianDomain::Runtime,
+            OperationPhase::Validating,
+            OwnershipClass::UserOwned,
+        );
+        let diagnosis = diagnose(std::slice::from_ref(&fact), OperationPhase::Validating)
+            .into_iter()
+            .next()
+            .expect("Java override diagnosis");
+        let original_candidates = diagnosis.candidate_actions().to_vec();
+        assert!(!original_candidates.contains(&GuardianActionKind::Warn));
+        let safety_case = safety_case(GuardianMode::Managed, diagnosis);
+
+        let general =
+            decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
+        assert_eq!(general.kind, GuardianActionKind::Fallback);
+        assert_eq!(
+            general
+                .action_plan
+                .expect("general action plan")
+                .prerequisite
+                .candidate_actions,
+            original_candidates
+        );
+
+        let scoped = decide_guardian_policy(
+            &safety_case,
+            GuardianPolicyContext::current_operation()
+                .for_launch_preflight(PreflightAdmission::Ready, &[fact]),
+        );
+        assert_eq!(scoped.kind, GuardianActionKind::Warn);
+        let scoped_candidates = scoped
+            .action_plan
+            .expect("scoped action plan")
+            .prerequisite
+            .candidate_actions;
+        assert_eq!(
+            scoped_candidates[..original_candidates.len()],
+            original_candidates
+        );
+        assert_eq!(scoped_candidates.last(), Some(&GuardianActionKind::Warn));
     }
 
     #[test]
@@ -965,12 +1355,10 @@ mod tests {
                     for journal_available in [false, true] {
                         for suppression_active in [false, true] {
                             for explicit_user_intent in [false, true] {
-                                let context = GuardianPolicyContext {
-                                    journal_available,
-                                    suppression_active,
-                                    public_redaction_ready: true,
-                                    explicit_user_intent,
-                                };
+                                let mut context = GuardianPolicyContext::current_operation();
+                                context.journal_available = journal_available;
+                                context.suppression_active = suppression_active;
+                                context.explicit_user_intent = explicit_user_intent;
                                 let actual = reject_candidate(*rule, &diagnosis, context).err();
                                 let expected =
                                     expected_rejection(mode, rule.action, ownership, context);
@@ -1100,12 +1488,11 @@ mod tests {
                 for suppression_active in [false, true] {
                     for public_redaction_ready in [false, true] {
                         for explicit_user_intent in [false, true] {
-                            let context = GuardianPolicyContext {
-                                journal_available,
-                                suppression_active,
-                                public_redaction_ready,
-                                explicit_user_intent,
-                            };
+                            let mut context = GuardianPolicyContext::current_operation();
+                            context.journal_available = journal_available;
+                            context.suppression_active = suppression_active;
+                            context.public_redaction_ready = public_redaction_ready;
+                            context.explicit_user_intent = explicit_user_intent;
                             let warning = rule_diagnosis(
                                 GuardianFactId::CustomJavaOverridePresent,
                                 GuardianDomain::Runtime,
@@ -1244,6 +1631,22 @@ mod tests {
             .then_some(PolicyRejection::UnknownOwnershipIntervention)
     }
 
+    fn matching_preflight_rules(
+        safety_case: &SafetyCase,
+        incoming: GuardianActionKind,
+        admission: PreflightAdmission,
+        signals: PreflightSignals,
+    ) -> Vec<usize> {
+        PREFLIGHT_DISPOSITION_RULES
+            .iter()
+            .enumerate()
+            .filter_map(|(index, rule)| {
+                preflight_rule_matches(*rule, safety_case, incoming, admission, signals)
+                    .then_some(index)
+            })
+            .collect()
+    }
+
     fn safety_case(mode: GuardianMode, diagnosis: Diagnosis) -> SafetyCase {
         SafetyCase {
             operation_id: None,
@@ -1259,7 +1662,22 @@ mod tests {
         phase: OperationPhase,
         ownership: OwnershipClass,
     ) -> Diagnosis {
-        let fact = GuardianFact {
+        let fact = rule_fact(fact_id, domain, phase, ownership);
+        let diagnoses = diagnose(&[fact], phase);
+        assert_eq!(diagnoses.len(), 1, "{}", fact_id.as_str());
+        diagnoses
+            .into_iter()
+            .next()
+            .expect("rule diagnosis should exist")
+    }
+
+    fn rule_fact(
+        fact_id: GuardianFactId,
+        domain: GuardianDomain,
+        phase: OperationPhase,
+        ownership: OwnershipClass,
+    ) -> GuardianFact {
+        GuardianFact {
             operation_id: None,
             id: fact_id,
             domain,
@@ -1275,13 +1693,7 @@ mod tests {
                 ownership,
             )),
             fields: Vec::new(),
-        };
-        let diagnoses = diagnose(&[fact], phase);
-        assert_eq!(diagnoses.len(), 1, "{}", fact_id.as_str());
-        diagnoses
-            .into_iter()
-            .next()
-            .expect("rule diagnosis should exist")
+        }
     }
 
     fn target_kind_for_domain(domain: GuardianDomain) -> TargetKind {

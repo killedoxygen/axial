@@ -252,7 +252,7 @@ async fn prepare_launch_session_with_auth_refresh(
     .await
     .map_err(launch_journal_error_response)?;
     let repair_elapsed = repair_started_at.elapsed();
-    if guardian_preflight_blocks_launch(&preflight.guardian_outcome) {
+    if preflight.guardian_outcome.user_outcome.decision == ApiGuardianActionKind::Block {
         trace_launch_session(
             LaunchSessionTiming {
                 route: "/api/v1/launch",
@@ -829,13 +829,6 @@ fn apply_guardian_preflight_interventions(
             GuardianPreflightDirective::StripExplicitJvmArgsForAttempt => extra_jvm_args.clear(),
         }
     }
-}
-
-fn guardian_preflight_blocks_launch(outcome: &GuardianPreflightOutcome) -> bool {
-    matches!(
-        outcome.user_outcome.decision,
-        ApiGuardianActionKind::Block | ApiGuardianActionKind::AskUser
-    )
 }
 
 fn guardian_summary_from_preflight_outcome(

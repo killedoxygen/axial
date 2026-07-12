@@ -1,8 +1,8 @@
 use super::{
     DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence, GuardianDecision,
     GuardianDomain, GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext,
-    GuardianSeverity, GuardianUserOutcome, SafetyCase, SafetyOutcome, build_safety_case,
-    decide_guardian_policy,
+    GuardianSeverity, GuardianUserOutcome, PreflightAdmission, SafetyCase, SafetyOutcome,
+    build_safety_case, decide_guardian_policy,
     launch_failure_memory::{
         RECENT_REPAIR_FAILED_FACT_ID, RECENT_STARTUP_FAILURE_FACT_ID,
         REPAIR_SUPPRESSED_UNTIL_FACT_ID,
@@ -111,11 +111,11 @@ pub fn guardian_preflight_outcome(
     let safety_case = build_safety_case(operation_id, request.mode, request.phase, &facts);
     let guardian_decision =
         decide_guardian_policy(&safety_case, preflight_policy_context(&request, &facts));
-    let preflight_decision = preflight_decision_kind(&request, &facts, &guardian_decision);
-    let directives = preflight_directives(preflight_decision, &safety_case);
-    let (details, guidance) = preflight_copy(preflight_decision, &safety_case, &facts);
+    let preflight_decision = preflight_boundary_verdict(guardian_decision.kind);
+    let directives = preflight_directives(guardian_decision.kind);
+    let (details, guidance) = preflight_copy(guardian_decision.kind, &safety_case, &facts);
     let summary = public_text(
-        preflight_summary(preflight_decision),
+        preflight_summary(guardian_decision.kind),
         MAX_PREFLIGHT_SUMMARY_CHARS,
     )
     .unwrap_or_else(|| "Guardian recorded launch preflight readiness.".to_string());
@@ -186,164 +186,42 @@ fn preflight_policy_context(
                 && fact.ownership == OwnershipClass::UserOwned
         });
     let context = GuardianPolicyContext::current_operation();
-    if explicit_user_intent {
+    let context = if explicit_user_intent {
         context.with_explicit_user_intent()
     } else {
         context
-    }
-}
-
-fn preflight_decision_kind(
-    request: &GuardianPreflightOutcomeRequest<'_>,
-    facts: &[GuardianFact],
-    decision: &GuardianDecision,
-) -> GuardianActionKind {
-    if readiness_blocks_launch(request.readiness) || decision.kind == GuardianActionKind::Block {
-        return GuardianActionKind::Block;
-    }
-    if request.mode == GuardianMode::Managed
-        && decision.kind == GuardianActionKind::Fallback
-        && facts.iter().any(is_java_override_unavailable_fact)
-    {
-        return GuardianActionKind::Fallback;
-    }
-    if request.mode == GuardianMode::Managed
-        && decision.kind == GuardianActionKind::Strip
-        && facts.iter().any(is_jvm_preflight_strip_fact)
-    {
-        return GuardianActionKind::Strip;
-    }
-    if decision.kind == GuardianActionKind::AskUser {
-        if decision
-            .diagnoses
-            .contains(&DiagnosisId::JavaOverrideUnavailable)
-        {
-            return GuardianActionKind::AskUser;
-        }
-        if facts.iter().any(is_preflight_warning_fact) {
-            return GuardianActionKind::Warn;
-        }
-        return GuardianActionKind::AskUser;
-    }
-    if facts.iter().any(is_preflight_warning_fact) {
-        return GuardianActionKind::Warn;
-    }
-    decision.kind
-}
-
-fn preflight_directives(
-    decision: GuardianActionKind,
-    safety_case: &SafetyCase,
-) -> Vec<GuardianPreflightDirective> {
-    let mut directives = Vec::new();
-    if decision == GuardianActionKind::Fallback
-        && safety_case
-            .diagnoses
+    };
+    let admission = if !request.readiness.launchable
+        || request
+            .readiness
+            .facts
             .iter()
-            .any(|diagnosis| java_fallback_diagnosis(diagnosis.id()))
+            .any(|fact| fact.severity == Some(GuardianSeverity::Blocking))
     {
-        directives.push(GuardianPreflightDirective::UseManagedJavaForAttempt);
+        PreflightAdmission::Blocked
+    } else {
+        PreflightAdmission::Ready
+    };
+    context.for_launch_preflight(admission, facts)
+}
+
+fn preflight_boundary_verdict(decision: GuardianActionKind) -> GuardianActionKind {
+    match decision {
+        GuardianActionKind::AskUser => GuardianActionKind::Block,
+        decision => decision,
     }
-    if decision == GuardianActionKind::Strip
-        && safety_case.diagnoses.iter().any(|diagnosis| {
-            matches!(
-                diagnosis.id(),
-                DiagnosisId::JvmArgsMalformed
-                    | DiagnosisId::JvmArgUnsupported
-                    | DiagnosisId::JvmArgUnsafeOverride
-            )
-        })
-    {
-        directives.push(GuardianPreflightDirective::StripExplicitJvmArgsForAttempt);
+}
+
+fn preflight_directives(decision: GuardianActionKind) -> Vec<GuardianPreflightDirective> {
+    match decision {
+        GuardianActionKind::Fallback => {
+            vec![GuardianPreflightDirective::UseManagedJavaForAttempt]
+        }
+        GuardianActionKind::Strip => {
+            vec![GuardianPreflightDirective::StripExplicitJvmArgsForAttempt]
+        }
+        _ => Vec::new(),
     }
-    directives
-}
-
-fn java_fallback_diagnosis(diagnosis_id: DiagnosisId) -> bool {
-    matches!(
-        diagnosis_id,
-        DiagnosisId::JavaOverrideUnavailable
-            | DiagnosisId::JavaProbeFailed
-            | DiagnosisId::JavaRuntimeMajorMismatch
-            | DiagnosisId::JavaRuntimeUpdateTooOld
-    )
-}
-
-fn is_java_override_unavailable_fact(fact: &GuardianFact) -> bool {
-    matches!(
-        fact.id,
-        GuardianFactId::JavaOverrideMissing
-            | GuardianFactId::JavaOverrideUndefinedSentinel
-            | GuardianFactId::JavaProbeFailed
-            | GuardianFactId::JavaMajorMismatch
-            | GuardianFactId::JavaUpdateTooOld
-    )
-}
-
-fn is_jvm_preflight_strip_fact(fact: &GuardianFact) -> bool {
-    matches!(
-        fact.id,
-        GuardianFactId::JvmArgsParseFailed
-            | GuardianFactId::JvmArgReservedLauncherFlag
-            | GuardianFactId::JvmArgMemoryConflict
-            | GuardianFactId::JvmArgUnsupportedGc
-            | GuardianFactId::JvmArgUnlockOrderInvalid
-            | GuardianFactId::JvmArgUnsafeClasspathOverride
-            | GuardianFactId::JvmArgUnsafeNativePathOverride
-            | GuardianFactId::JvmArgAgentOverride
-    )
-}
-
-fn readiness_blocks_launch(readiness: GuardianPreflightReadiness<'_>) -> bool {
-    !readiness.launchable
-        || readiness.facts.iter().any(|fact| {
-            fact.severity == Some(GuardianSeverity::Blocking) && is_readiness_fact(fact.id)
-        })
-}
-
-const READINESS_FACT_IDS: &[GuardianFactId] = &[
-    GuardianFactId::VersionJsonMissing,
-    GuardianFactId::ParentVersionMissing,
-    GuardianFactId::IncompleteInstall,
-    GuardianFactId::ClientJarMissing,
-    GuardianFactId::LibrariesMissing,
-    GuardianFactId::AssetIndexMissing,
-    GuardianFactId::LauncherManagedArtifactSignatureCorruption,
-    GuardianFactId::ManagedRuntimeMissing,
-    GuardianFactId::JavaOverrideMissing,
-];
-
-fn is_readiness_fact(id: GuardianFactId) -> bool {
-    READINESS_FACT_IDS.contains(&id)
-}
-
-fn is_preflight_warning_fact(fact: &GuardianFact) -> bool {
-    matches!(
-        fact.id,
-        GuardianFactId::JavaOverrideEmpty
-            | GuardianFactId::JavaOverrideUndefinedSentinel
-            | GuardianFactId::JavaOverrideMissing
-            | GuardianFactId::JvmArgsParseFailed
-            | GuardianFactId::JvmArgReservedLauncherFlag
-            | GuardianFactId::JvmArgMemoryConflict
-            | GuardianFactId::JvmArgUnsupportedGc
-            | GuardianFactId::JvmArgUnlockOrderInvalid
-            | GuardianFactId::JvmArgUnsafeClasspathOverride
-            | GuardianFactId::JvmArgUnsafeNativePathOverride
-            | GuardianFactId::JvmArgAgentOverride
-            | GuardianFactId::LaunchMemoryMinClamped
-            | GuardianFactId::LaunchMemoryAllocationLow
-            | GuardianFactId::LaunchResourceMemoryPressure
-            | GuardianFactId::LaunchResourceCpuPressure
-            | GuardianFactId::LaunchResourceInstallPressure
-            | GuardianFactId::LaunchResourceDiskPressure
-            | GuardianFactId::CustomJavaOverridePresent
-            | GuardianFactId::CustomJvmPresetPresent
-            | GuardianFactId::CustomJvmArgsPresent
-            | RECENT_STARTUP_FAILURE_FACT_ID
-            | RECENT_REPAIR_FAILED_FACT_ID
-            | REPAIR_SUPPRESSED_UNTIL_FACT_ID
-    )
 }
 
 fn preflight_copy(
@@ -1103,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn java_override_unavailable_asks_in_custom_when_intent_can_be_confirmed() {
+    fn java_override_confirmation_copy_survives_temporary_boundary_block() {
         let fact = fact(
             GuardianFactId::JavaOverrideMissing,
             GuardianDomain::Runtime,
@@ -1119,11 +997,44 @@ mod tests {
         });
 
         assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::AskUser);
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::AskUser);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
+        assert_eq!(
+            outcome.user_outcome.summary,
+            "Guardian needs confirmation before launch."
+        );
         assert!(outcome.user_outcome.guidance.contains(
             &"Confirm managed Java for this launch or choose a valid Java runtime.".to_string()
         ));
         assert!(outcome.directives.is_empty());
+    }
+
+    #[test]
+    fn readiness_admission_uses_typed_severity_without_fact_id_membership() {
+        let mut readiness_fact = fact(
+            GuardianFactId::ExitCodeZero,
+            GuardianDomain::Session,
+            GuardianSeverity::Blocking,
+            OwnershipClass::LauncherManaged,
+            TargetKind::Session,
+            "session",
+        );
+        let blocked = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
+            readiness: GuardianPreflightReadiness::from_facts(
+                true,
+                std::slice::from_ref(&readiness_fact),
+            ),
+            ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[])
+        });
+        assert_eq!(blocked.guardian_decision.kind, GuardianActionKind::Block);
+        assert_eq!(blocked.user_outcome.decision, GuardianActionKind::Block);
+
+        readiness_fact.severity = Some(GuardianSeverity::Warning);
+        let ready = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
+            readiness: GuardianPreflightReadiness::from_facts(true, &[readiness_fact]),
+            ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[])
+        });
+        assert_eq!(ready.guardian_decision.kind, GuardianActionKind::RecordOnly);
+        assert_eq!(ready.user_outcome.decision, GuardianActionKind::RecordOnly);
     }
 
     #[test]
@@ -1302,6 +1213,72 @@ mod tests {
                 assert!(outcome.directives.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn historical_warning_survives_the_producer_jvm_args_empty_diagnosis() {
+        let empty_args = fact(
+            GuardianFactId::JvmArgsEmpty,
+            GuardianDomain::Jvm,
+            GuardianSeverity::Info,
+            OwnershipClass::UserOwned,
+            TargetKind::Config,
+            "explicit_jvm_args",
+        );
+        let historical = fact_with_fields(
+            RECENT_STARTUP_FAILURE_FACT_ID,
+            "instance-a",
+            [
+                ("failure_class", "out_of_memory"),
+                ("occurrences", "1"),
+                ("latest_observed_today", "true"),
+            ],
+        );
+
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest::new(
+            GuardianMode::Managed,
+            &[empty_args, historical],
+        ));
+
+        assert_eq!(outcome.safety_case.diagnoses.len(), 1);
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Warn);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Warn);
+        assert!(outcome.user_outcome.details.iter().any(|detail| {
+            detail == "This instance has recorded one out-of-memory crash; the latest was today."
+        }));
+    }
+
+    #[test]
+    fn preflight_has_one_verdict_authority_and_one_confirmation_adapter() {
+        let source = include_str!("preflight.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("preflight production source");
+        for removed in [
+            "preflight_decision_kind",
+            "readiness_blocks_launch",
+            "READINESS_FACT_IDS",
+            "is_preflight_warning_fact",
+            "is_java_override_unavailable_fact",
+            "is_jvm_preflight_strip_fact",
+            "java_fallback_diagnosis",
+        ] {
+            assert!(
+                !source.contains(removed),
+                "stale preflight authority: {removed}"
+            );
+        }
+        assert_eq!(
+            source
+                .matches("GuardianActionKind::AskUser => GuardianActionKind::Block")
+                .count(),
+            1
+        );
+
+        let session = include_str!("../application/launch/session.rs");
+        assert!(!session.contains("ApiGuardianActionKind::AskUser"));
+        let conversion = include_str!("../application/guardian_conversion.rs");
+        assert!(!conversion.contains("GuardianActionKind::Block | GuardianActionKind::AskUser"));
     }
 
     #[test]

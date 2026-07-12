@@ -102,12 +102,12 @@ struct PolicyContextCoordinate {
 
 impl PolicyContextCoordinate {
     fn policy_context(&self) -> GuardianPolicyContext {
-        GuardianPolicyContext {
-            journal_available: self.journal_available,
-            suppression_active: self.suppression_active,
-            public_redaction_ready: self.public_redaction_ready,
-            explicit_user_intent: self.explicit_user_intent,
-        }
+        let mut context = GuardianPolicyContext::current_operation();
+        context.journal_available = self.journal_available;
+        context.suppression_active = self.suppression_active;
+        context.public_redaction_ready = self.public_redaction_ready;
+        context.explicit_user_intent = self.explicit_user_intent;
+        context
     }
 }
 
@@ -365,11 +365,26 @@ pub(super) fn decision_projection(
     PolicyDecisionCell {
         decision_kind: decision.kind,
         plan_present: decision.action_plan.is_some(),
-        plan_integrity: decision_plan_integrity(decision, safety_case),
+        plan_integrity: decision_plan_integrity(decision, safety_case, false),
     }
 }
 
-fn decision_plan_integrity(decision: &super::GuardianDecision, safety_case: &SafetyCase) -> bool {
+pub(super) fn scoped_decision_projection(
+    decision: &super::GuardianDecision,
+    safety_case: &SafetyCase,
+) -> PolicyDecisionCell {
+    PolicyDecisionCell {
+        decision_kind: decision.kind,
+        plan_present: decision.action_plan.is_some(),
+        plan_integrity: decision_plan_integrity(decision, safety_case, true),
+    }
+}
+
+fn decision_plan_integrity(
+    decision: &super::GuardianDecision,
+    safety_case: &SafetyCase,
+    allow_selected_append: bool,
+) -> bool {
     if decision.operation_id != safety_case.operation_id
         || decision.mode != safety_case.mode
         || decision.diagnoses
@@ -388,11 +403,19 @@ fn decision_plan_integrity(decision: &super::GuardianDecision, safety_case: &Saf
         return false;
     };
     let prerequisite_matches = safety_case.diagnoses.iter().any(|diagnosis| {
+        let candidates = &plan.prerequisite.candidate_actions;
+        let base_candidates = diagnosis.candidate_actions();
+        let candidates_match = candidates == base_candidates
+            || (allow_selected_append
+                && !base_candidates.contains(&decision.kind)
+                && candidates.len() == base_candidates.len() + 1
+                && candidates.starts_with(base_candidates)
+                && candidates.last() == Some(&decision.kind));
         plan.prerequisite.diagnosis_id == diagnosis.id()
             && plan.prerequisite.ownership == diagnosis.ownership()
             && plan.prerequisite.confidence == diagnosis.confidence()
             && plan.prerequisite.affected_targets == diagnosis.affected_targets()
-            && plan.prerequisite.candidate_actions == diagnosis.candidate_actions()
+            && candidates_match
     });
 
     plan.owner == StabilizationSystem::Guardian

@@ -97,6 +97,7 @@ pub use performance::{
     performance_plan_guardian_facts, performance_rules_guardian_facts,
     performance_state_error_guardian_fact, plan_performance_supervision,
 };
+pub(super) use policy::PreflightAdmission;
 pub use policy::{GuardianPolicyContext, decide_guardian_policy};
 pub use preflight::{
     GuardianPreflightDirective, GuardianPreflightOutcome, GuardianPreflightOutcomeRequest,

@@ -1,4 +1,4 @@
-use super::decision_snapshot::{PolicyDecisionCell, decision_projection};
+use super::decision_snapshot::{PolicyDecisionCell, scoped_decision_projection};
 use super::{
     DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence, GuardianDomain,
     GuardianFact, GuardianFactId, GuardianMode, GuardianPreflightDirective,
@@ -471,6 +471,17 @@ fn boundary_case(id: impl Into<String>, family: BoundaryFamily, spec: CaseSpec) 
         explicit_user_intent: spec.explicit_user_intent,
     });
     assert_eq!(outcome.safety.decision, outcome.user_outcome.decision);
+    let plan = outcome
+        .guardian_decision
+        .action_plan
+        .as_ref()
+        .expect("preflight decision has an action plan");
+    assert!(
+        plan.prerequisite
+            .candidate_actions
+            .contains(&outcome.guardian_decision.kind),
+        "scoped verdict is absent from prerequisite candidates"
+    );
     BoundaryCase {
         id: id.into(),
         family,
@@ -481,7 +492,10 @@ fn boundary_case(id: impl Into<String>, family: BoundaryFamily, spec: CaseSpec) 
             .iter()
             .map(|diagnosis| diagnosis.id())
             .collect(),
-        kernel_decision: decision_projection(&outcome.guardian_decision, &outcome.safety_case),
+        kernel_decision: scoped_decision_projection(
+            &outcome.guardian_decision,
+            &outcome.safety_case,
+        ),
         effective_decision: outcome.user_outcome.decision,
         directives: outcome.directives,
     }
@@ -666,6 +680,21 @@ fn assert_snapshot_coverage(snapshot: &GuardianPreflightBoundarySnapshot) {
             .iter()
             .all(|case| case.kernel_decision.plan_integrity)
     );
+    for case in &snapshot.cases {
+        if case.id == "precedence--java-override-custom-ask-user" {
+            assert_eq!(
+                case.kernel_decision.decision_kind,
+                GuardianActionKind::AskUser
+            );
+            assert_eq!(case.effective_decision, GuardianActionKind::Block);
+        } else {
+            assert_eq!(
+                case.kernel_decision.decision_kind, case.effective_decision,
+                "unexpected preflight boundary adaptation in {}",
+                case.id
+            );
+        }
+    }
     assert!(
         snapshot
             .cases
@@ -695,7 +724,7 @@ fn assert_snapshot_coverage(snapshot: &GuardianPreflightBoundarySnapshot) {
     assert_effective_decision(
         snapshot,
         "precedence--java-override-custom-ask-user",
-        GuardianActionKind::AskUser,
+        GuardianActionKind::Block,
     );
     assert_effective_decision(
         snapshot,
