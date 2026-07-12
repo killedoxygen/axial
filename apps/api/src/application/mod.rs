@@ -10,6 +10,7 @@ pub mod auth;
 pub mod authority;
 pub mod commands;
 pub mod config;
+pub mod content;
 pub mod dev;
 pub mod flags;
 pub mod install;
@@ -61,6 +62,11 @@ pub use commands::{
     phase_one_command_kinds,
 };
 pub use config::{ConfigPatch, current_config, update_config};
+pub use content::{
+    ContentApiError, ContentPlanRequest, ContentSearchParams, InstanceContentResponse,
+    ResolutionPlan, content_detail, content_install, content_plan, content_search,
+    content_uninstall, instance_content,
+};
 pub use dev::{DevCleanupResponse, DevFlushResponse, dev_cleanup_versions, dev_flush};
 pub use flags::{
     FlagOverridePatch, FlagSource, FlagViewModel, FlagsResponse, list_flags, update_flag,

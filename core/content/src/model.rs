@@ -57,6 +57,11 @@ impl CanonicalId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The provider-local project id (the part after the provider prefix).
+    pub fn project_id(&self) -> &str {
+        self.0.split_once(':').map(|(_, id)| id).unwrap_or(&self.0)
+    }
 }
 
 /// One provider's view of a project. Multiple refs on the same canonical record

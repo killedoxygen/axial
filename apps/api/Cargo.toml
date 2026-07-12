@@ -37,6 +37,7 @@ url.workspace = true
 uuid.workspace = true
 zip.workspace = true
 axial-config = { path = "../../core/config" }
+axial-content = { path = "../../core/content" }
 axial-launcher = { path = "../../core/launcher" }
 axial-minecraft = { path = "../../core/minecraft" }
 axial-performance = { path = "../../core/performance" }

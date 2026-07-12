@@ -17,6 +17,7 @@ pub mod skins;
 pub mod updater;
 
 use axial_config::{AppConfig, ConfigStore, ConfigStoreError, InstanceStore, find_flag};
+use axial_content::ContentRegistry;
 pub use axial_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
 pub use axial_minecraft::download::DownloadProgress;
 use axial_performance::PerformanceManager;
@@ -70,6 +71,7 @@ pub struct AppState {
     telemetry: Arc<TelemetryHub>,
     remote_flags: Arc<RemoteFlagStore>,
     updater: Arc<UpdaterStore>,
+    content: Arc<ContentRegistry>,
     startup_warnings: Arc<Vec<String>>,
     config_changes: Arc<broadcast::Sender<()>>,
     library_dir: Arc<RwLock<Option<String>>>,
@@ -121,6 +123,7 @@ impl AppState {
             &init.config.paths().config_dir,
         ));
         let updater = Arc::new(UpdaterStore::new(&init.config.paths().config_dir));
+        let content = Arc::new(ContentRegistry::new(content_http_client()));
         let (config_changes, _) = broadcast::channel(32);
 
         Self {
@@ -141,6 +144,7 @@ impl AppState {
             telemetry,
             remote_flags,
             updater,
+            content,
             startup_warnings: Arc::new(bound_startup_warnings(init.startup_warnings)),
             config_changes: Arc::new(config_changes),
             library_dir: Arc::new(RwLock::new(if library_dir.is_empty() {
@@ -200,6 +204,10 @@ impl AppState {
 
     pub fn installs(&self) -> &Arc<InstallStore> {
         &self.installs
+    }
+
+    pub fn content(&self) -> &Arc<ContentRegistry> {
+        &self.content
     }
 
     pub fn failure_memory(&self) -> &Arc<GuardianFailureMemoryStore> {
@@ -317,4 +325,12 @@ fn bound_startup_warnings(warnings: Vec<String>) -> Vec<String> {
         .take(STARTUP_WARNING_LIMIT)
         .map(|warning| warning.chars().take(STARTUP_WARNING_MAX_CHARS).collect())
         .collect()
+}
+
+fn content_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_default()
 }

@@ -11,18 +11,26 @@ use std::collections::HashMap;
 /// provider's records would be deduped in.
 #[derive(Debug, Clone)]
 pub struct ContentRegistry {
+    client: reqwest::Client,
     modrinth: ModrinthProvider,
 }
 
 impl ContentRegistry {
     pub fn new(client: reqwest::Client) -> Self {
         Self {
-            modrinth: ModrinthProvider::new(client),
+            modrinth: ModrinthProvider::new(client.clone()),
+            client,
         }
     }
 
-    pub fn with_modrinth(modrinth: ModrinthProvider) -> Self {
-        Self { modrinth }
+    pub fn with_modrinth(client: reqwest::Client, modrinth: ModrinthProvider) -> Self {
+        Self { client, modrinth }
+    }
+
+    /// The shared HTTP client, for driving verified downloads through the same
+    /// connection pool the providers use.
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
     }
 
     pub async fn search(&self, query: &ContentQuery) -> ContentResult<Page<CanonicalContent>> {
