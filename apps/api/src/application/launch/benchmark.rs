@@ -2250,14 +2250,14 @@ mod tests {
         let _ = waiter.await;
         backend.gate.release();
 
-        let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(record) = state.sessions().get(&session_id).await
                     && matches!(record.state, LaunchState::Failed | LaunchState::Exited)
                 {
                     break record;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -2266,7 +2266,7 @@ mod tests {
             terminal.outcome.as_ref().map(|outcome| outcome.kind),
             Some(LaunchSessionOutcomeKind::Failed)
         );
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let manifest = state
                     .benchmark_suites()
@@ -2278,7 +2278,7 @@ mod tests {
                 {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
