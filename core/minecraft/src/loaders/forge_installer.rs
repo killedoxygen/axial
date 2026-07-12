@@ -1,5 +1,10 @@
+use super::api::validate_loader_build_record_identity;
 use super::compose::LoaderProfileFragment;
 use super::source::VerifiedLoaderSource;
+use super::types::{
+    LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId, LoaderInstallSource,
+    LoaderInstallStrategy,
+};
 use crate::artifact_path::ArtifactRelativePath;
 use crate::download::DownloadError;
 use crate::launch::{Library, maven_to_path};
@@ -57,6 +62,8 @@ pub enum ForgeInstallerError {
     UndeclaredEmbeddedArtifact { name: String },
     #[error("installer contains portable case-fold path aliases")]
     PortablePathAlias,
+    #[error("installer identity does not match the live loader build")]
+    IdentityMismatch,
     #[error("download failed: {0}")]
     Download(#[from] DownloadError),
 }
@@ -64,11 +71,16 @@ pub enum ForgeInstallerError {
 #[derive(Debug)]
 pub(crate) struct AuthenticatedForgeInstallerPlan {
     source: VerifiedLoaderSource,
-    version_json: Vec<u8>,
+    version: LoaderProfileFragment,
     install_profile_json: Option<Vec<u8>>,
     libraries: Vec<Library>,
     embedded_maven_artifacts: Vec<AuthenticatedEmbeddedMavenArtifact>,
     strip_client_meta: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct BoundForgeInstallerPlan {
+    authenticated: AuthenticatedForgeInstallerPlan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,13 +89,10 @@ pub(crate) struct AuthenticatedEmbeddedMavenArtifact {
     bytes: Vec<u8>,
 }
 
+#[cfg(test)]
 impl AuthenticatedForgeInstallerPlan {
     pub(crate) fn source_bytes(&self) -> &[u8] {
         self.source.bytes()
-    }
-
-    pub(crate) fn version_json(&self) -> &[u8] {
-        &self.version_json
     }
 
     pub(crate) fn install_profile_json(&self) -> Option<&[u8]> {
@@ -100,6 +109,32 @@ impl AuthenticatedForgeInstallerPlan {
 
     pub(crate) fn strip_client_meta(&self) -> bool {
         self.strip_client_meta
+    }
+}
+
+impl BoundForgeInstallerPlan {
+    pub(crate) fn source_bytes(&self) -> &[u8] {
+        self.authenticated.source.bytes()
+    }
+
+    pub(crate) fn version(&self) -> &LoaderProfileFragment {
+        &self.authenticated.version
+    }
+
+    pub(crate) fn install_profile_json(&self) -> Option<&[u8]> {
+        self.authenticated.install_profile_json.as_deref()
+    }
+
+    pub(crate) fn libraries(&self) -> &[Library] {
+        &self.authenticated.libraries
+    }
+
+    pub(crate) fn embedded_maven_artifacts(&self) -> &[AuthenticatedEmbeddedMavenArtifact] {
+        &self.authenticated.embedded_maven_artifacts
+    }
+
+    pub(crate) fn strip_client_meta(&self) -> bool {
+        self.authenticated.strip_client_meta
     }
 }
 
@@ -136,6 +171,16 @@ struct LegacyInstallData {
 
 #[derive(Debug, Deserialize)]
 struct InstallProfileDeclarations {
+    #[serde(default)]
+    spec: Option<i32>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    minecraft: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
     #[serde(default)]
     libraries: Vec<Library>,
     #[serde(default)]
@@ -272,7 +317,7 @@ pub(crate) fn plan_authenticated_installer(
 
     Ok(AuthenticatedForgeInstallerPlan {
         source,
-        version_json: effective_version_json,
+        version: version_fragment,
         install_profile_json,
         libraries,
         embedded_maven_artifacts: embedded
@@ -286,6 +331,326 @@ pub(crate) fn plan_authenticated_installer(
             .collect(),
         strip_client_meta: legacy_profile.is_some_and(|profile| profile.install.strip_meta),
     })
+}
+
+pub(crate) fn bind_authenticated_installer_plan(
+    mut authenticated: AuthenticatedForgeInstallerPlan,
+    record: &LoaderBuildRecord,
+) -> Result<BoundForgeInstallerPlan, ForgeInstallerError> {
+    if validate_loader_build_record_identity(record).is_err()
+        || record.component_name != record.component_id.display_name()
+        || record.artifact_kind != LoaderArtifactKind::InstallerJar
+        || !matches!(
+            &record.install_source,
+            LoaderInstallSource::InstallerJar { url } if !url.is_empty()
+        )
+    {
+        return Err(ForgeInstallerError::IdentityMismatch);
+    }
+    let install_profile = authenticated
+        .install_profile_json
+        .as_deref()
+        .map(serde_json::from_slice::<InstallProfileDeclarations>)
+        .transpose()?;
+    let legacy_profile = authenticated
+        .install_profile_json
+        .as_deref()
+        .and_then(|profile| serde_json::from_slice::<LegacyInstallProfile>(profile).ok());
+
+    let root_artifact = match (record.component_id, record.strategy) {
+        (LoaderComponentId::Forge, LoaderInstallStrategy::ForgeModern) => {
+            if legacy_profile.is_some() {
+                return Err(ForgeInstallerError::IdentityMismatch);
+            }
+            validate_effective_version_identity(
+                &mut authenticated.version,
+                record,
+                EffectiveProfileShape::Modern,
+            )?;
+            let expected_version = format!(
+                "{}-forge-{}",
+                record.minecraft_version, record.loader_version
+            );
+            let expected_path = format!(
+                "net.minecraftforge:forge:{}-{}:shim",
+                record.minecraft_version, record.loader_version
+            );
+            validate_modern_install_profile(
+                install_profile.as_ref(),
+                record,
+                1,
+                "forge",
+                &expected_version,
+                Some(&expected_path),
+            )?;
+            RootArtifact::Universal
+        }
+        (LoaderComponentId::NeoForge, LoaderInstallStrategy::NeoForgeModern) => {
+            if legacy_profile.is_some() {
+                return Err(ForgeInstallerError::IdentityMismatch);
+            }
+            validate_effective_version_identity(
+                &mut authenticated.version,
+                record,
+                EffectiveProfileShape::Modern,
+            )?;
+            validate_modern_install_profile(
+                install_profile.as_ref(),
+                record,
+                1,
+                "NeoForge",
+                &format!("neoforge-{}", record.loader_version),
+                None,
+            )?;
+            RootArtifact::Universal
+        }
+        (LoaderComponentId::Forge, LoaderInstallStrategy::ForgeLegacyInstaller) => {
+            if let Some(legacy_profile) = legacy_profile.as_ref() {
+                validate_effective_version_identity(
+                    &mut authenticated.version,
+                    record,
+                    EffectiveProfileShape::LegacyVersionInfo,
+                )?;
+                validate_legacy_install_profile(legacy_profile, record, &authenticated.version)?;
+                RootArtifact::Universal
+            } else {
+                validate_effective_version_identity(
+                    &mut authenticated.version,
+                    record,
+                    EffectiveProfileShape::Modern,
+                )?;
+                let expected_version = format!(
+                    "{}-forge-{}",
+                    record.minecraft_version, record.loader_version
+                );
+                let expected_path = format!(
+                    "net.minecraftforge:forge:{}-{}",
+                    record.minecraft_version, record.loader_version
+                );
+                validate_modern_install_profile(
+                    install_profile.as_ref(),
+                    record,
+                    0,
+                    "forge",
+                    &expected_version,
+                    Some(&expected_path),
+                )?;
+                RootArtifact::Plain
+            }
+        }
+        _ => return Err(ForgeInstallerError::IdentityMismatch),
+    };
+    validate_component_root_libraries(&authenticated.libraries, record, root_artifact)?;
+
+    Ok(BoundForgeInstallerPlan { authenticated })
+}
+
+#[derive(Clone, Copy)]
+enum EffectiveProfileShape {
+    Modern,
+    LegacyVersionInfo,
+}
+
+#[derive(Clone, Copy)]
+enum RootArtifact {
+    Plain,
+    Universal,
+}
+
+fn validate_effective_version_identity(
+    version: &mut LoaderProfileFragment,
+    record: &LoaderBuildRecord,
+    shape: EffectiveProfileShape,
+) -> Result<(), ForgeInstallerError> {
+    let expected_id = match record.component_id {
+        LoaderComponentId::Forge => {
+            format!(
+                "{}-forge-{}",
+                record.minecraft_version, record.loader_version
+            )
+        }
+        LoaderComponentId::NeoForge => format!("neoforge-{}", record.loader_version),
+        LoaderComponentId::Fabric | LoaderComponentId::Quilt => {
+            return Err(ForgeInstallerError::IdentityMismatch);
+        }
+    };
+    let valid_parent = version.inherits_from == record.minecraft_version
+        || (matches!(shape, EffectiveProfileShape::LegacyVersionInfo)
+            && version.inherits_from.is_empty());
+    let valid_assets = version.assets.is_empty()
+        || (matches!(shape, EffectiveProfileShape::LegacyVersionInfo)
+            && legacy_assets_alias_matches(&version.assets, &record.minecraft_version));
+    if version.id != expected_id
+        || !valid_parent
+        || (!version.kind.is_empty() && version.kind != "release")
+        || version.asset_index.is_some()
+        || !valid_assets
+        || version.downloads.is_some()
+        || version.java_version.is_some()
+        || version
+            .logging
+            .as_ref()
+            .is_some_and(|logging| *logging != crate::launch::LoggingConf::default())
+    {
+        return Err(ForgeInstallerError::IdentityMismatch);
+    }
+    version.inherits_from = record.minecraft_version.clone();
+    version.assets.clear();
+    version.logging = None;
+    Ok(())
+}
+
+fn legacy_assets_alias_matches(assets: &str, minecraft_version: &str) -> bool {
+    if assets == minecraft_version {
+        return true;
+    }
+    let mut parts = assets.split('.');
+    let (Some(major), Some(minor), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !major.is_empty()
+        && !minor.is_empty()
+        && major.chars().all(|value| value.is_ascii_digit())
+        && minor.chars().all(|value| value.is_ascii_digit())
+        && minecraft_version
+            .strip_prefix(assets)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+fn validate_modern_install_profile(
+    profile: Option<&InstallProfileDeclarations>,
+    record: &LoaderBuildRecord,
+    expected_spec: i32,
+    expected_profile: &str,
+    expected_version: &str,
+    expected_path: Option<&str>,
+) -> Result<(), ForgeInstallerError> {
+    let profile = profile.ok_or(ForgeInstallerError::IdentityMismatch)?;
+    if profile.spec != Some(expected_spec)
+        || profile.profile.as_deref() != Some(expected_profile)
+        || profile.version.as_deref() != Some(expected_version)
+        || profile.minecraft.as_deref() != Some(record.minecraft_version.as_str())
+        || profile.path.as_deref() != expected_path
+    {
+        return Err(ForgeInstallerError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn validate_legacy_install_profile(
+    profile: &LegacyInstallProfile,
+    record: &LoaderBuildRecord,
+    version: &LoaderProfileFragment,
+) -> Result<(), ForgeInstallerError> {
+    let minecraft = legacy_profile_minecraft(profile);
+    let expected_version_id = format!(
+        "{}-forge-{}",
+        record.minecraft_version, record.loader_version
+    );
+    let historical_target = format!(
+        "{}-Forge{}",
+        record.minecraft_version, record.loader_version
+    );
+    let normalized_library = normalize_legacy_forge_library(
+        &profile.install.path,
+        &profile.install.file_path,
+        minecraft,
+    )
+    .ok_or(ForgeInstallerError::IdentityMismatch)?;
+    let normalized_version_id = normalize_legacy_forge_version_id(&profile.install.path, minecraft)
+        .ok_or(ForgeInstallerError::IdentityMismatch)?;
+    let expected_root = format!(
+        "net.minecraftforge:forge:{}-{}",
+        record.minecraft_version, record.loader_version
+    );
+
+    if minecraft != record.minecraft_version
+        || (!profile.minecraft.is_empty() && profile.minecraft != record.minecraft_version)
+        || (!profile.install.minecraft.is_empty()
+            && profile.install.minecraft != record.minecraft_version)
+        || normalized_version_id != expected_version_id
+        || version.id != normalized_version_id
+        || !normalized_library.starts_with(&format!("{expected_root}:"))
+        || (profile.install.target != expected_version_id
+            && profile.install.target != historical_target)
+    {
+        return Err(ForgeInstallerError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn validate_component_root_libraries(
+    libraries: &[Library],
+    record: &LoaderBuildRecord,
+    required_artifact: RootArtifact,
+) -> Result<(), ForgeInstallerError> {
+    let expected = match record.component_id {
+        LoaderComponentId::Forge => format!(
+            "net.minecraftforge:forge:{}-{}",
+            record.minecraft_version, record.loader_version
+        ),
+        LoaderComponentId::NeoForge => {
+            format!("net.neoforged:neoforge:{}", record.loader_version)
+        }
+        LoaderComponentId::Fabric | LoaderComponentId::Quilt => {
+            return Err(ForgeInstallerError::IdentityMismatch);
+        }
+    };
+    let mut roots = HashSet::new();
+    let mut required = 0_usize;
+    for library in libraries {
+        let Some((root, classifier)) = component_root_coordinate(&library.name)? else {
+            continue;
+        };
+        roots.insert(root.to_string());
+        if root != expected {
+            return Err(ForgeInstallerError::IdentityMismatch);
+        }
+        if matches!(
+            (required_artifact, classifier),
+            (RootArtifact::Plain, None) | (RootArtifact::Universal, Some("universal"))
+        ) {
+            required += 1;
+        }
+    }
+    if roots.len() != 1 || required != 1 {
+        return Err(ForgeInstallerError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn component_root_coordinate(
+    coordinate: &str,
+) -> Result<Option<(&str, Option<&str>)>, ForgeInstallerError> {
+    let coordinate = coordinate
+        .split_once('@')
+        .map_or(coordinate, |(value, _)| value);
+    let mut parts = coordinate.split(':');
+    let Some(group) = parts.next() else {
+        return Ok(None);
+    };
+    let Some(artifact) = parts.next() else {
+        return Ok(None);
+    };
+    let recognized = matches!(
+        (group, artifact),
+        ("net.minecraftforge", "forge")
+            | ("net.minecraftforge", "minecraftforge")
+            | ("net.neoforged", "neoforge")
+    );
+    if !recognized {
+        return Ok(None);
+    }
+    let version = parts.next().ok_or(ForgeInstallerError::IdentityMismatch)?;
+    let classifier = parts.next();
+    if version.is_empty() || classifier.is_some_and(str::is_empty) || parts.next().is_some() {
+        return Err(ForgeInstallerError::IdentityMismatch);
+    }
+    let root_len = coordinate
+        .rfind(':')
+        .filter(|_| classifier.is_some())
+        .unwrap_or(coordinate.len());
+    Ok(Some((&coordinate[..root_len], classifier)))
 }
 
 fn merge_libraries_by_name(
@@ -638,11 +1003,17 @@ fn normalize_legacy_forge_version_id(path: &str, minecraft: &str) -> Option<Stri
 mod tests {
     use super::{
         AuthenticatedForgeInstallerPlan, ForgeInstallerError, MAX_INSTALLER_EMBEDDED_ENTRY_BYTES,
-        MAX_INSTALLER_PROFILE_ENTRY_BYTES, merge_libraries_by_name, normalize_legacy_forge_library,
-        normalize_legacy_forge_version_id, plan_authenticated_installer,
+        MAX_INSTALLER_PROFILE_ENTRY_BYTES, bind_authenticated_installer_plan,
+        merge_libraries_by_name, normalize_legacy_forge_library, normalize_legacy_forge_version_id,
+        plan_authenticated_installer,
     };
     use crate::launch::Library;
     use crate::loaders::source::VerifiedLoaderSource;
+    use crate::loaders::types::{
+        LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
+        LoaderComponentId, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
+    };
+    use crate::loaders::{build_id_for, installed_version_id_for};
     use std::io::{Cursor, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
     use zip::write::SimpleFileOptions;
@@ -684,6 +1055,206 @@ mod tests {
             ),
             Some("net.minecraftforge:forge:1.6.4-9.11.1.1345:universal".to_string())
         );
+    }
+
+    #[test]
+    fn binds_representative_real_format_forge_neoforge_and_legacy_profiles() {
+        let forge = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeModern,
+            "1.21.5",
+            "55.0.0",
+        );
+        let (version, install) = modern_binding_profiles(&forge);
+        bind_modern_fixture(&forge, &version, &install).expect("modern Forge binding");
+
+        let neoforge = binding_record(
+            LoaderComponentId::NeoForge,
+            LoaderInstallStrategy::NeoForgeModern,
+            "1.21.5",
+            "21.5.74",
+        );
+        let (version, install) = modern_binding_profiles(&neoforge);
+        bind_modern_fixture(&neoforge, &version, &install).expect("modern NeoForge binding");
+
+        let legacy = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeLegacyInstaller,
+            "1.7.10",
+            "10.13.4.1614-1.7.10",
+        );
+        let install = legacy_binding_profile(&legacy);
+        bind_legacy_fixture(&legacy, &install).expect("legacy Forge binding");
+
+        let legacy_assets_alias = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeLegacyInstaller,
+            "1.8.9",
+            "11.15.1.2318-1.8.9",
+        );
+        let install = legacy_binding_profile(&legacy_assets_alias);
+        bind_legacy_fixture(&legacy_assets_alias, &install)
+            .expect("legacy Forge base-assets alias binding");
+
+        let later_legacy = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeLegacyInstaller,
+            "1.12.2",
+            "14.23.5.2859",
+        );
+        let (version, install) = later_legacy_binding_profiles(&later_legacy);
+        bind_modern_fixture(&later_legacy, &version, &install).expect("later legacy Forge binding");
+    }
+
+    #[test]
+    fn modern_binding_rejects_effective_identity_root_and_base_override_drift() {
+        let record = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeModern,
+            "1.21.5",
+            "55.0.0",
+        );
+        let (version, install) = modern_binding_profiles(&record);
+        let mut variants = Vec::new();
+
+        let mut drift = version.clone();
+        drift["id"] = "1.21.5-forge-55.0.1".into();
+        variants.push((drift, install.clone()));
+        let mut drift = version.clone();
+        drift["inheritsFrom"] = "1.21.4".into();
+        variants.push((drift, install.clone()));
+        let mut drift = version.clone();
+        drift["type"] = "snapshot".into();
+        variants.push((drift, install.clone()));
+        let mut drift = version.clone();
+        drift["libraries"] = serde_json::json!([]);
+        let mut install_without_roots = install.clone();
+        install_without_roots["libraries"] = serde_json::json!([]);
+        variants.push((drift, install_without_roots));
+        let mut drift = version.clone();
+        drift["libraries"][0]["name"] = "net.minecraftforge:forge:1.21.5-55.0.1:universal".into();
+        variants.push((drift, install.clone()));
+        let mut drift = version.clone();
+        drift["libraries"] = serde_json::json!([
+            {"name":"net.minecraftforge:forge:1.21.5-55.0.0:universal"},
+            {"name":"net.neoforged:neoforge:21.5.74:universal"}
+        ]);
+        variants.push((drift, install.clone()));
+        let mut drift = version.clone();
+        drift["libraries"] = serde_json::json!([
+            {"name":"net.minecraftforge:forge:1.21.5-55.0.0:universal"},
+            {"name":"net.minecraftforge:forge:1.21.5-55.0.0:universal@zip"}
+        ]);
+        variants.push((drift, install.clone()));
+
+        for (field, value) in [
+            ("assetIndex", serde_json::json!({})),
+            ("assets", serde_json::json!("legacy")),
+            ("downloads", serde_json::json!({})),
+            ("javaVersion", serde_json::json!({})),
+            (
+                "logging",
+                serde_json::json!({
+                    "client": {
+                        "argument": "-Dlog.config=hostile",
+                        "file": {"id":"hostile.xml"}
+                    }
+                }),
+            ),
+        ] {
+            let mut drift = version.clone();
+            drift[field] = value;
+            variants.push((drift, install.clone()));
+        }
+
+        for (version, install) in variants {
+            assert!(bind_modern_fixture(&record, &version, &install).is_err());
+        }
+    }
+
+    #[test]
+    fn modern_binding_rejects_every_authored_install_identity_field_drift() {
+        for record in [
+            binding_record(
+                LoaderComponentId::Forge,
+                LoaderInstallStrategy::ForgeModern,
+                "1.21.5",
+                "55.0.0",
+            ),
+            binding_record(
+                LoaderComponentId::NeoForge,
+                LoaderInstallStrategy::NeoForgeModern,
+                "1.21.5",
+                "21.5.74",
+            ),
+        ] {
+            let (version, install) = modern_binding_profiles(&record);
+            for (field, value) in [
+                ("spec", serde_json::json!(99)),
+                ("profile", serde_json::json!("wrong")),
+                ("version", serde_json::json!("wrong")),
+                ("minecraft", serde_json::json!("1.21.4")),
+                ("path", serde_json::json!("wrong:root:1.0:shim")),
+            ] {
+                let mut drift = install.clone();
+                drift[field] = value;
+                assert!(bind_modern_fixture(&record, &version, &drift).is_err());
+            }
+            for field in ["spec", "profile", "version", "minecraft"] {
+                let mut drift = install.clone();
+                drift.as_object_mut().expect("install object").remove(field);
+                assert!(bind_modern_fixture(&record, &version, &drift).is_err());
+            }
+            let mut path_presence_drift = install.clone();
+            if record.component_id == LoaderComponentId::Forge {
+                path_presence_drift
+                    .as_object_mut()
+                    .expect("install object")
+                    .remove("path");
+            } else {
+                path_presence_drift["path"] =
+                    format!("net.neoforged:neoforge:{}:shim", record.loader_version).into();
+            }
+            assert!(bind_modern_fixture(&record, &version, &path_presence_drift).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_binding_rejects_path_minecraft_target_and_parent_drift() {
+        let record = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeLegacyInstaller,
+            "1.7.10",
+            "10.13.4.1614-1.7.10",
+        );
+        let profile = legacy_binding_profile(&record);
+        let mut variants = Vec::new();
+
+        let mut drift = profile.clone();
+        drift["install"]["path"] = "net.minecraftforge:forge:1.7.10-10.13.4.1614-wrong".into();
+        variants.push(drift);
+        let mut drift = profile.clone();
+        drift["install"]["filePath"] = "forge-wrong-universal.jar".into();
+        variants.push(drift);
+        let mut drift = profile.clone();
+        drift["install"]["minecraft"] = "1.7.9".into();
+        variants.push(drift);
+        let mut drift = profile.clone();
+        drift["minecraft"] = "1.7.9".into();
+        variants.push(drift);
+        let mut drift = profile.clone();
+        drift["install"]["target"] = "1.7.10-ForgeWrong".into();
+        variants.push(drift);
+        let mut drift = profile.clone();
+        drift["versionInfo"]["inheritsFrom"] = "1.7.9".into();
+        variants.push(drift);
+        let mut drift = profile.clone();
+        drift["versionInfo"]["assets"] = "unrelated-assets".into();
+        variants.push(drift);
+
+        for profile in variants {
+            assert!(bind_legacy_fixture(&record, &profile).is_err());
+        }
     }
 
     #[test]
@@ -819,7 +1390,6 @@ mod tests {
 
         let plan = plan(&jar);
         assert_eq!(plan.source_bytes(), jar);
-        assert_eq!(plan.version_json(), version_json);
         assert_eq!(
             plan.install_profile_json(),
             Some(install_profile.as_slice())
@@ -1049,6 +1619,203 @@ mod tests {
         assert!(
             matches!(error, ForgeInstallerError::EntryTooLarge { name } if name == "example/mod/1.0/mod-1.0.jar")
         );
+    }
+
+    fn binding_record(
+        component_id: LoaderComponentId,
+        strategy: LoaderInstallStrategy,
+        minecraft_version: &str,
+        loader_version: &str,
+    ) -> LoaderBuildRecord {
+        LoaderBuildRecord {
+            subject_kind: LoaderBuildSubjectKind::LoaderBuild,
+            component_id,
+            component_name: component_id.display_name().to_string(),
+            build_id: build_id_for(component_id, minecraft_version, loader_version),
+            minecraft_version: minecraft_version.to_string(),
+            loader_version: loader_version.to_string(),
+            version_id: installed_version_id_for(component_id, minecraft_version, loader_version)
+                .expect("canonical installed version id"),
+            build_meta: LoaderBuildMetadata::default(),
+            strategy,
+            artifact_kind: LoaderArtifactKind::InstallerJar,
+            installability: LoaderInstallability::Installable,
+            install_source: LoaderInstallSource::InstallerJar {
+                url: "https://example.test/installer.jar".to_string(),
+            },
+        }
+    }
+
+    fn modern_binding_profiles(
+        record: &LoaderBuildRecord,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let (id, version_libraries, profile, path, install_libraries) = match record.component_id {
+            LoaderComponentId::Forge => (
+                format!(
+                    "{}-forge-{}",
+                    record.minecraft_version, record.loader_version
+                ),
+                serde_json::json!([
+                    {"name": format!(
+                        "net.minecraftforge:forge:{}-{}:universal",
+                        record.minecraft_version, record.loader_version
+                    )},
+                    {"name": format!(
+                        "net.minecraftforge:forge:{}-{}:client",
+                        record.minecraft_version, record.loader_version
+                    )}
+                ]),
+                "forge",
+                Some(format!(
+                    "net.minecraftforge:forge:{}-{}:shim",
+                    record.minecraft_version, record.loader_version
+                )),
+                serde_json::json!([
+                    {"name": format!(
+                        "net.minecraftforge:forge:{}-{}:universal",
+                        record.minecraft_version, record.loader_version
+                    )},
+                    {"name": format!(
+                        "net.minecraftforge:forge:{}-{}:shim",
+                        record.minecraft_version, record.loader_version
+                    )}
+                ]),
+            ),
+            LoaderComponentId::NeoForge => (
+                format!("neoforge-{}", record.loader_version),
+                serde_json::json!([
+                    {"name": format!(
+                        "net.neoforged:neoforge:{}:universal",
+                        record.loader_version
+                    )}
+                ]),
+                "NeoForge",
+                None,
+                serde_json::json!([
+                    {"name": format!(
+                        "net.neoforged:neoforge:{}:universal",
+                        record.loader_version
+                    )}
+                ]),
+            ),
+            LoaderComponentId::Fabric | LoaderComponentId::Quilt => {
+                unreachable!("installer binding fixture component")
+            }
+        };
+        let version = serde_json::json!({
+            "id": id.clone(),
+            "inheritsFrom": record.minecraft_version,
+            "type": "release",
+            "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+            "logging": {},
+            "libraries": version_libraries
+        });
+        let mut install = serde_json::json!({
+            "spec": 1,
+            "profile": profile,
+            "version": id,
+            "minecraft": record.minecraft_version,
+            "libraries": install_libraries,
+            "processors": []
+        });
+        if let Some(path) = path {
+            install["path"] = path.into();
+        }
+        (version, install)
+    }
+
+    fn legacy_binding_profile(record: &LoaderBuildRecord) -> serde_json::Value {
+        let version = format!("{}-{}", record.minecraft_version, record.loader_version);
+        let assets = if record.minecraft_version == "1.8.9" {
+            "1.8"
+        } else {
+            record.minecraft_version.as_str()
+        };
+        serde_json::json!({
+            "versionInfo": {
+                "id": format!("{}-Forge{}", record.minecraft_version, record.loader_version),
+                "inheritsFrom": record.minecraft_version,
+                "type": "release",
+                "assets": assets,
+                "mainClass": "net.minecraft.launchwrapper.Launch",
+                "libraries": [
+                    {"name": format!("net.minecraftforge:forge:{version}")}
+                ]
+            },
+            "install": {
+                "path": format!("net.minecraftforge:forge:{version}"),
+                "filePath": format!("forge-{version}-universal.jar"),
+                "target": format!("{}-Forge{}", record.minecraft_version, record.loader_version),
+                "minecraft": record.minecraft_version
+            }
+        })
+    }
+
+    fn later_legacy_binding_profiles(
+        record: &LoaderBuildRecord,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let id = format!(
+            "{}-forge-{}",
+            record.minecraft_version, record.loader_version
+        );
+        let root = format!(
+            "net.minecraftforge:forge:{}-{}",
+            record.minecraft_version, record.loader_version
+        );
+        (
+            serde_json::json!({
+                "id": id.clone(),
+                "inheritsFrom": record.minecraft_version,
+                "type": "release",
+                "mainClass": "net.minecraft.launchwrapper.Launch",
+                "logging": {},
+                "libraries": [{"name": root.clone()}]
+            }),
+            serde_json::json!({
+                "spec": 0,
+                "profile": "forge",
+                "version": id,
+                "path": root.clone(),
+                "minecraft": record.minecraft_version,
+                "libraries": [{"name": root}],
+                "processors": []
+            }),
+        )
+    }
+
+    fn bind_modern_fixture(
+        record: &LoaderBuildRecord,
+        version: &serde_json::Value,
+        install: &serde_json::Value,
+    ) -> Result<(), ForgeInstallerError> {
+        let version = serde_json::to_vec(version).expect("serialize version profile");
+        let install = serde_json::to_vec(install).expect("serialize install profile");
+        let jar = zip_with_entries(&[
+            ("version.json", version.as_slice()),
+            ("install_profile.json", install.as_slice()),
+        ]);
+        bind_bytes(record, jar)
+    }
+
+    fn bind_legacy_fixture(
+        record: &LoaderBuildRecord,
+        install: &serde_json::Value,
+    ) -> Result<(), ForgeInstallerError> {
+        let install_bytes = serde_json::to_vec(install).expect("serialize legacy install profile");
+        let file_path = install["install"]["filePath"]
+            .as_str()
+            .unwrap_or("forge-invalid-universal.jar");
+        let jar = zip_with_entries(&[
+            ("install_profile.json", install_bytes.as_slice()),
+            (file_path, b"legacy root"),
+        ]);
+        bind_bytes(record, jar)
+    }
+
+    fn bind_bytes(record: &LoaderBuildRecord, bytes: Vec<u8>) -> Result<(), ForgeInstallerError> {
+        let authenticated =
+            plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(bytes))?;
+        bind_authenticated_installer_plan(authenticated, record).map(|_| ())
     }
 
     fn zip_with_entry(name: &str, bytes: Vec<u8>) -> Vec<u8> {

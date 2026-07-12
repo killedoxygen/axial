@@ -6,14 +6,15 @@ use crate::download::{
 };
 use crate::known_good::KnownGoodInstallReceipt;
 use crate::launch::{DownloadEntry, VersionJson, library_merge_key, resolve_version};
+use crate::loaders::api::validate_loader_build_record_identity;
 use crate::loaders::compose::{
     LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
     compose_loader_version_from_installed_base, create_managed_version_dir,
     finalize_version_install, managed_version_dir, write_composed_version,
 };
 use crate::loaders::forge_installer::{
-    AuthenticatedEmbeddedMavenArtifact, AuthenticatedForgeInstallerPlan,
-    plan_authenticated_installer,
+    AuthenticatedEmbeddedMavenArtifact, AuthenticatedForgeInstallerPlan, BoundForgeInstallerPlan,
+    bind_authenticated_installer_plan, plan_authenticated_installer,
 };
 #[cfg(not(test))]
 use crate::loaders::http::fetch_bytes;
@@ -23,7 +24,10 @@ use crate::loaders::managed_fs::ManagedDir;
 use crate::loaders::processors::run_processors;
 use crate::loaders::providers::{self, ProfileInstallProof};
 use crate::loaders::source::{VerifiedLoaderSource, fetch_sha1_verified_source};
-use crate::loaders::types::{LoaderBuildRecord, LoaderError, LoaderInstallPlan};
+use crate::loaders::types::{
+    LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId, LoaderError, LoaderInstallPlan,
+    LoaderInstallSource, LoaderInstallStrategy,
+};
 use crate::loaders::workspace::cleanup::prepare_fresh_work_dir;
 use crate::loaders::{
     installed_loader_metadata_bytes, validate_provider_version_id, validate_version_id,
@@ -184,6 +188,7 @@ pub async fn install_from_installer_source<F>(
 where
     F: FnMut(DownloadProgress),
 {
+    validate_installer_record_authority(&plan.record, installer_url)?;
     send(progress(
         "artifacts",
         0,
@@ -199,6 +204,10 @@ where
         "loader installer",
     )
     .await?;
+    let authenticated =
+        extract_installer_blocking(installer_source, plan.record.component_name.clone()).await?;
+    let installer_plan = bind_authenticated_installer_plan(authenticated, &plan.record)
+        .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
     let base_receipt = Box::pin(ensure_base_version(
         library_dir,
         &plan.record.minecraft_version,
@@ -209,29 +218,26 @@ where
         .authenticated_client_integrity()
         .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
     drop(base_receipt);
-    Box::pin(install_installer_source_after_authenticated_base(
+    Box::pin(install_bound_installer_after_authenticated_base(
         library_dir,
         plan,
-        installer_source,
+        installer_plan,
         &authenticated_client,
         send,
     ))
     .await
 }
 
-async fn install_installer_source_after_authenticated_base<F>(
+async fn install_bound_installer_after_authenticated_base<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
-    installer_source: VerifiedLoaderSource,
+    installer_plan: BoundForgeInstallerPlan,
     authenticated_client: &ExpectedIntegrity,
     send: &mut F,
 ) -> Result<String, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
-    let installer_plan =
-        extract_installer_blocking(installer_source, plan.record.component_name.clone()).await?;
-
     send(progress(
         "profile",
         0,
@@ -241,18 +247,14 @@ where
             plan.record.component_name
         )),
     ));
-    let installer_version =
-        serde_json::from_slice::<LoaderProfileFragment>(installer_plan.version_json())?;
-    if !installer_version.id.trim().is_empty() {
-        validate_provider_version_id(&installer_version.id, "upstream installer version id")?;
-    }
+    let installer_version = installer_plan.version();
     let installed_version_id = plan.record.version_id.clone();
     validate_version_id(&installed_version_id, "installed loader version id")?;
     let version = compose_loader_version_from_installed_base(
         library_dir,
         &plan.record.minecraft_version,
         &installed_version_id,
-        &installer_version,
+        installer_version,
     )?;
     let version_bytes = serde_json::to_vec_pretty(&version)?;
     cleanup_on_error(
@@ -372,6 +374,35 @@ where
     )?;
     send(done());
     Ok(installed_version_id)
+}
+
+fn validate_installer_record_authority(
+    record: &LoaderBuildRecord,
+    installer_url: &str,
+) -> Result<(), LoaderError> {
+    validate_loader_build_record_identity(record)?;
+    let expected_strategy = match record.component_id {
+        LoaderComponentId::Forge => matches!(
+            record.strategy,
+            LoaderInstallStrategy::ForgeModern | LoaderInstallStrategy::ForgeLegacyInstaller
+        ),
+        LoaderComponentId::NeoForge => record.strategy == LoaderInstallStrategy::NeoForgeModern,
+        LoaderComponentId::Fabric | LoaderComponentId::Quilt => false,
+    };
+    let exact_source = matches!(
+        &record.install_source,
+        LoaderInstallSource::InstallerJar { url } if url == installer_url && !url.is_empty()
+    );
+    if !expected_strategy
+        || record.component_name != record.component_id.display_name()
+        || record.artifact_kind != LoaderArtifactKind::InstallerJar
+        || !exact_source
+    {
+        return Err(LoaderError::InvalidProfile(
+            "loader installer authority does not match the live build record".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 // Legacy archive loaders carry Maven entries in provider-specific zip layouts.
@@ -1112,12 +1143,12 @@ mod tests {
     use super::{
         base_version_install_lock_from_map, cleanup_on_error,
         download_loader_libraries_with_evidence, download_profile_loader_libraries_with_evidence,
-        ensure_base_version, fetch_sha1_verified_source, install_from_installer_source,
+        ensure_base_version, fetch_sha1_verified_source,
+        install_bound_installer_after_authenticated_base, install_from_installer_source,
         install_from_legacy_archive, install_from_profile_source,
-        install_installer_source_after_authenticated_base,
         install_legacy_archive_after_authenticated_base, overlay_legacy_archive_bytes,
         strip_child_client_jar_meta, validate_and_enrich_profile_source,
-        write_patched_client_jar_integrity,
+        validate_installer_record_authority, write_patched_client_jar_integrity,
     };
     use crate::download::{
         DownloadProgress, ExecutionDownloadFactKind, ExpectedIntegrity,
@@ -1129,6 +1160,9 @@ mod tests {
         resolve_version,
     };
     use crate::loaders::compose::LoaderProfileFragment;
+    use crate::loaders::forge_installer::{
+        BoundForgeInstallerPlan, bind_authenticated_installer_plan, plan_authenticated_installer,
+    };
     use crate::loaders::providers::{ProfileInstallProof, ProfileLibraryProof};
     use crate::loaders::source::VerifiedLoaderSource;
     use crate::loaders::types::LoaderError;
@@ -1154,7 +1188,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn cleanup_on_error_removes_incomplete_version_dir() {
+    fn cleanup_on_error_clears_incomplete_version_dir() {
         let root = temp_dir("cleanup-on-error");
         let version_dir = versions_dir(&root).join("broken-loader");
         fs::create_dir_all(&version_dir).expect("version dir");
@@ -1167,7 +1201,13 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(!version_dir.exists());
+        assert!(version_dir.is_dir());
+        assert_eq!(
+            fs::read_dir(&version_dir)
+                .expect("retained version shell")
+                .count(),
+            0
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1528,6 +1568,9 @@ mod tests {
             record.component_id = component;
             record.component_name = component.display_name().to_string();
             record.strategy = strategy;
+            record.install_source = LoaderInstallSource::InstallerJar {
+                url: server.url.clone(),
+            };
             canonicalize_record_identity(&mut record);
             let plan = LoaderInstallPlan { record };
 
@@ -1551,7 +1594,10 @@ mod tests {
             installer_jar("upstream-installer-id"),
             b"not-a-digest installer.jar".to_vec(),
         );
-        let record = installer_record();
+        let mut record = installer_record();
+        record.install_source = LoaderInstallSource::InstallerJar {
+            url: server.url.clone(),
+        };
         let plan = LoaderInstallPlan { record };
 
         let error = install_from_installer_source(&root, &plan, &server.url, &mut |_| {})
@@ -1566,24 +1612,82 @@ mod tests {
         server.stop();
     }
 
+    #[test]
+    fn installer_record_authority_rejects_every_envelope_drift() {
+        let record = installer_record();
+        let url = match &record.install_source {
+            LoaderInstallSource::InstallerJar { url } => url.clone(),
+            _ => unreachable!("installer fixture source"),
+        };
+        validate_installer_record_authority(&record, &url).expect("canonical installer authority");
+
+        let mut variants = Vec::new();
+        let mut drift = record.clone();
+        drift.build_id.push('x');
+        variants.push((drift, url.clone()));
+        let mut drift = record.clone();
+        drift.component_name = "NeoForge".to_string();
+        variants.push((drift, url.clone()));
+        let mut drift = record.clone();
+        drift.strategy = LoaderInstallStrategy::NeoForgeModern;
+        variants.push((drift, url.clone()));
+        let mut drift = record.clone();
+        drift.artifact_kind = LoaderArtifactKind::ProfileJson;
+        variants.push((drift, url.clone()));
+        let mut drift = record.clone();
+        drift.install_source = LoaderInstallSource::ProfileJson { url: url.clone() };
+        variants.push((drift, url.clone()));
+        variants.push((
+            record,
+            "https://example.test/other-installer.jar".to_string(),
+        ));
+
+        for (record, requested_url) in variants {
+            assert!(validate_installer_record_authority(&record, &requested_url).is_err());
+        }
+    }
+
     #[tokio::test]
-    async fn installer_source_installs_to_backend_version_id_when_upstream_id_differs() {
-        let root = temp_dir("installer-upstream-id-mismatch");
+    async fn semantic_installer_drift_is_rejected_before_base_effects() {
+        let root = temp_dir("installer-semantic-drift");
+        let mut record = installer_record();
+        let server = TestByteServer::start_with_sha1(modern_forge_installer_jar_with_parent(
+            &record, "1.21.4", None,
+        ));
+        record.install_source = LoaderInstallSource::InstallerJar {
+            url: server.url.clone(),
+        };
+        let plan = LoaderInstallPlan { record };
+
+        let error = install_from_installer_source(&root, &plan, &server.url, &mut |_| {})
+            .await
+            .expect_err("semantic drift must fail before base acquisition");
+
+        assert!(matches!(error, LoaderError::InvalidProfile(_)));
+        assert!(!root.exists());
+        assert_eq!(server.request_count(), 2);
+        server.stop();
+    }
+
+    #[tokio::test]
+    async fn authenticated_installer_identity_installs_to_backend_version_id() {
+        let root = temp_dir("installer-bound-identity");
         write_base_version(&root, "1.21.5");
         let record = installer_record();
         let installer_server =
-            TestByteServer::start_with_sha1(installer_jar("upstream-installer-id"));
+            TestByteServer::start_with_sha1(modern_forge_installer_jar(&record, None));
         let plan = LoaderInstallPlan {
             record: record.clone(),
         };
         let mut progress = |_progress: DownloadProgress| {};
         let installer_source =
             verified_test_source(&installer_server.url, "loader installer").await;
+        let installer_plan = bind_test_installer(installer_source, &record);
 
-        let installed_version_id = install_installer_source_after_authenticated_base(
+        let installed_version_id = install_bound_installer_after_authenticated_base(
             &root,
             &plan,
-            installer_source,
+            installer_plan,
             &test_client_integrity(&root, &record.minecraft_version),
             &mut progress,
         )
@@ -1591,49 +1695,39 @@ mod tests {
         .expect("install installer-backed loader");
 
         assert_eq!(installed_version_id, record.version_id);
-        assert_backend_version_was_written(&root, &record.version_id, "upstream-installer-id");
+        assert_backend_version_was_written(
+            &root,
+            &record.version_id,
+            &format!("1.21.5-forge-{}", record.loader_version),
+        );
         assert_eq!(installer_server.request_count(), 2);
         installer_server.stop();
         let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn installer_source_allows_checksumless_legacy_profile_libraries() {
-        let root = temp_dir("installer-checksumless-legacy-libraries");
-        let minecraft_version = "1.7.10";
+    async fn installer_source_allows_checksumless_authenticated_root_library() {
+        let root = temp_dir("installer-checksumless-root-library");
+        let minecraft_version = "1.21.5";
         write_base_version(&root, minecraft_version);
         let library_body = zip_entries(&[("net/minecraftforge/Forge.class", b"forge")]);
         let library_server = TestByteServer::start(library_body);
-        let mut record = installer_record();
-        record.minecraft_version = minecraft_version.to_string();
-        record.loader_version = "10.13.4.1614-1.7.10".to_string();
-        canonicalize_record_identity(&mut record);
-        let installer_server = TestByteServer::start_with_sha1(installer_jar_with_profile_json(
-                format!(
-                    r#"{{
-                        "id":"upstream-forge-1.7.10",
-                        "inheritsFrom":"{minecraft_version}",
-                        "mainClass":"net.minecraft.launchwrapper.Launch",
-                        "minecraftArguments":"--username ${{auth_player_name}} --accessToken ${{auth_access_token}}",
-                        "libraries":[{{
-                            "name":"net.minecraftforge:forge:1.7.10-10.13.4.1614-1.7.10",
-                            "url":"{}"
-                        }}]
-                    }}"#,
-                    library_server.url
-                )
-                .as_bytes(),
-            ));
+        let record = installer_record();
+        let installer_server = TestByteServer::start_with_sha1(modern_forge_installer_jar(
+            &record,
+            Some(&library_server.url),
+        ));
         let plan = LoaderInstallPlan {
             record: record.clone(),
         };
         let installer_source =
             verified_test_source(&installer_server.url, "loader installer").await;
+        let installer_plan = bind_test_installer(installer_source, &record);
 
-        let installed_version_id = install_installer_source_after_authenticated_base(
+        let installed_version_id = install_bound_installer_after_authenticated_base(
             &root,
             &plan,
-            installer_source,
+            installer_plan,
             &test_client_integrity(&root, &record.minecraft_version),
             &mut |_| {},
         )
@@ -1643,9 +1737,9 @@ mod tests {
         assert_eq!(installed_version_id, record.version_id);
         assert_eq!(installer_server.request_count(), 2);
         assert_eq!(library_server.request_count(), 1);
-        let library_path = root.join("libraries").join(
-            "net/minecraftforge/forge/1.7.10-10.13.4.1614-1.7.10/forge-1.7.10-10.13.4.1614-1.7.10.jar",
-        );
+        let library_path = root
+            .join("libraries")
+            .join("net/minecraftforge/forge/1.21.5-55.0.0/forge-1.21.5-55.0.0-universal.jar");
         assert!(zip_contains(
             &library_path,
             "net/minecraftforge/Forge.class"
@@ -1660,7 +1754,7 @@ mod tests {
             serde_json::from_slice(&version_json).expect("parse installer profile");
         let libraries = version["libraries"].as_array().expect("libraries");
         assert!(libraries.iter().any(|library| {
-            library["name"] == "net.minecraftforge:forge:1.7.10-10.13.4.1614-1.7.10"
+            library["name"] == "net.minecraftforge:forge:1.21.5-55.0.0:universal"
                 && library.get("axialChecksumlessAllowed").is_none()
         }));
 
@@ -1767,7 +1861,15 @@ mod tests {
                     "id":"{minecraft_version}",
                     "type":"release",
                     "mainClass":"net.minecraft.client.Minecraft",
+                    "assets":"base-assets",
                     "assetIndex":{{"id":"legacy","url":"","sha1":"","size":0,"totalSize":0}},
+                    "javaVersion":{{"component":"jre-legacy","majorVersion":8}},
+                    "logging":{{
+                        "client":{{
+                            "argument":"base-logging",
+                            "file":{{"id":"base-log.xml","url":"","sha1":"","size":0}}
+                        }}
+                    }},
                     "downloads":{{
                         "client":{{
                             "url":"https://example.invalid/{minecraft_version}.jar",
@@ -1787,7 +1889,6 @@ mod tests {
                 "id": "1.5.2-Forge7.8.1.738",
                 "mainClass": "net.minecraft.launchwrapper.Launch",
                 "minecraftArguments": "${auth_player_name} ${auth_session}",
-                "assetIndex": { "id": "legacy" },
                 "libraries": [
                     { "name": "net.minecraftforge:minecraftforge:7.8.1.738" }
                 ]
@@ -1824,11 +1925,12 @@ mod tests {
         };
         let installer_source =
             verified_test_source(&installer_server.url, "loader installer").await;
+        let installer_plan = bind_test_installer(installer_source, &record);
 
-        install_installer_source_after_authenticated_base(
+        install_bound_installer_after_authenticated_base(
             &root,
             &plan,
-            installer_source,
+            installer_plan,
             &test_client_integrity(&root, &record.minecraft_version),
             &mut |_| {},
         )
@@ -1881,6 +1983,12 @@ mod tests {
             child_jar_bytes.len() as i64
         );
         assert_eq!(version["downloads"]["client"]["url"], "");
+        assert_eq!(version["assets"], "base-assets");
+        assert_eq!(version["assetIndex"]["id"], "legacy");
+        assert_eq!(version["javaVersion"]["component"], "jre-legacy");
+        assert_eq!(version["javaVersion"]["majorVersion"], 8);
+        assert_eq!(version["logging"]["client"]["argument"], "base-logging");
+        assert_eq!(version["logging"]["client"]["file"]["id"], "base-log.xml");
 
         assert_eq!(installer_server.request_count(), 2);
         installer_server.stop();
@@ -2174,6 +2282,93 @@ mod tests {
 
     fn installer_jar(version_id: &str) -> Vec<u8> {
         installer_jar_with_profile_json(&profile_json(version_id))
+    }
+
+    fn modern_forge_installer_jar(
+        record: &LoaderBuildRecord,
+        library_url: Option<&str>,
+    ) -> Vec<u8> {
+        modern_forge_installer_jar_with_parent(record, &record.minecraft_version, library_url)
+    }
+
+    fn modern_forge_installer_jar_with_parent(
+        record: &LoaderBuildRecord,
+        parent: &str,
+        library_url: Option<&str>,
+    ) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+
+        let root_coordinate = format!(
+            "net.minecraftforge:forge:{}-{}:universal",
+            record.minecraft_version, record.loader_version
+        );
+        let mut library = serde_json::json!({"name": root_coordinate});
+        if let Some(url) = library_url {
+            library["url"] = serde_json::Value::String(url.to_string());
+        }
+        let version_json = serde_json::to_vec(&serde_json::json!({
+            "id": format!("{}-forge-{}", record.minecraft_version, record.loader_version),
+            "inheritsFrom": parent,
+            "type": "release",
+            "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+            "logging": {},
+            "libraries": [library]
+        }))
+        .expect("serialize Forge version profile");
+        let install_profile = serde_json::to_vec(&serde_json::json!({
+            "spec": 1,
+            "profile": "forge",
+            "version": format!("{}-forge-{}", record.minecraft_version, record.loader_version),
+            "path": format!(
+                "net.minecraftforge:forge:{}-{}:shim",
+                record.minecraft_version, record.loader_version
+            ),
+            "minecraft": record.minecraft_version,
+            "processors": [],
+            "libraries": []
+        }))
+        .expect("serialize Forge install profile");
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut archive = zip::ZipWriter::new(&mut cursor);
+        archive
+            .start_file("version.json", SimpleFileOptions::default())
+            .expect("start version profile");
+        archive
+            .write_all(&version_json)
+            .expect("write version profile");
+        archive
+            .start_file("install_profile.json", SimpleFileOptions::default())
+            .expect("start install profile");
+        archive
+            .write_all(&install_profile)
+            .expect("write install profile");
+        if library_url.is_none() {
+            let embedded = zip_entries(&[("net/minecraftforge/Forge.class", b"forge")]);
+            archive
+                .start_file(
+                    format!(
+                        "maven/net/minecraftforge/forge/{0}-{1}/forge-{0}-{1}-universal.jar",
+                        record.minecraft_version, record.loader_version
+                    ),
+                    SimpleFileOptions::default(),
+                )
+                .expect("start embedded Forge root");
+            archive
+                .write_all(&embedded)
+                .expect("write embedded Forge root");
+        }
+        archive.finish().expect("finish installer jar");
+        cursor.into_inner()
+    }
+
+    fn bind_test_installer(
+        source: VerifiedLoaderSource,
+        record: &LoaderBuildRecord,
+    ) -> BoundForgeInstallerPlan {
+        let authenticated =
+            plan_authenticated_installer(source).expect("authenticated installer plan");
+        bind_authenticated_installer_plan(authenticated, record).expect("bound installer plan")
     }
 
     fn installer_jar_with_profile_json(profile_json: &[u8]) -> Vec<u8> {
