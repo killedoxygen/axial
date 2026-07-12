@@ -21,7 +21,8 @@ use axial_minecraft::download::{
     download_file_with_client_report,
 };
 use axial_minecraft::{
-    DownloadError, DownloadProgress, LoaderComponentId, LoaderError, LoaderProviderFailureKind,
+    DownloadError, DownloadProgress, LoaderComponentId, LoaderError, LoaderInstallError,
+    LoaderProviderFailureKind,
 };
 use axial_performance::PerformanceManager;
 use axum::{body::to_bytes, response::IntoResponse};
@@ -2138,15 +2139,34 @@ async fn loader_pre_operation_failure_does_not_allocate_an_operation() {
 }
 
 #[test]
-fn loader_error_progress_hides_raw_details_and_keeps_terminal_shape() {
-    let progress = loader_error_progress(&LoaderError::ArtifactMissing(
-        "missing https://cdn.example.invalid/path/mod-loader.jar in /tmp/axial".to_string(),
+fn pre_operation_response_defensively_normalizes_unexpected_active_failure() {
+    let error = loader_pre_operation_error_response(LoaderError::Verify(
+        "private active-worker detail".to_string(),
     ));
 
+    assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(error.1.0["failure_kind"], json!("catalog_unavailable"));
+    assert_eq!(
+        error.1.0["error"],
+        json!("Loader catalog is unavailable. Check your connection and try again.")
+    );
+    assert!(
+        !error
+            .1
+            .0
+            .to_string()
+            .contains("private active-worker detail")
+    );
+}
+
+#[test]
+fn typed_active_loader_progress_is_terminal_and_redacted() {
+    let error = LoaderInstallError::from(LoaderError::ArtifactMissing(
+        "missing https://cdn.example.invalid/path/mod-loader.jar in /tmp/axial".to_string(),
+    ));
+    let progress = loader_install_error_progress(&error);
+
     assert_eq!(progress.phase, "error");
-    assert_eq!(progress.current, 0);
-    assert_eq!(progress.total, 0);
-    assert_eq!(progress.file, None);
     assert_eq!(
         progress.error.as_deref(),
         Some("Loader artifact is unavailable. Try another build or component.")
@@ -2157,13 +2177,14 @@ fn loader_error_progress_hides_raw_details_and_keeps_terminal_shape() {
 
 #[test]
 fn loader_base_install_rosetta_failure_keeps_specific_terminal_message() {
-    let progress = loader_error_progress(&LoaderError::BaseInstallFailed {
+    let error = LoaderInstallError::from(LoaderError::BaseInstallFailed {
         error: Box::new(DownloadError::RuntimeRosettaRequired {
             component: "jre-legacy".to_string(),
         }),
         facts: Vec::new(),
         descriptors: Vec::new(),
     });
+    let progress = loader_install_error_progress(&error);
 
     let message = progress.error.clone().expect("error is present");
     assert!(message.contains("Rosetta 2"));
@@ -2171,22 +2192,6 @@ fn loader_base_install_rosetta_failure_keeps_specific_terminal_message() {
 
     let sanitized = sanitize_install_progress(progress);
     assert_eq!(sanitized.error.as_deref(), Some(message.as_str()));
-}
-
-#[test]
-fn loader_base_install_generic_failure_keeps_loader_message() {
-    let progress = loader_error_progress(&LoaderError::BaseInstallFailed {
-        error: Box::new(DownloadError::ResolveManifest(
-            "https://example.invalid/manifest.json".to_string(),
-        )),
-        facts: Vec::new(),
-        descriptors: Vec::new(),
-    });
-
-    assert_eq!(
-        progress.error.as_deref(),
-        Some("Base game install failed. Retry the install from Downloads.")
-    );
 }
 
 #[test]
@@ -3392,10 +3397,18 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
     )
     .await
     .expect("record install journal");
-    let error = LoaderError::ProviderUnavailable {
-        kind: LoaderProviderFailureKind::HttpServer,
-        status: Some(503),
+    let active_failure = || {
+        let LoaderInstallError::Active(failure) =
+            LoaderInstallError::from(LoaderError::ProviderUnavailable {
+                kind: LoaderProviderFailureKind::HttpServer,
+                status: Some(503),
+            })
+        else {
+            panic!("provider failure must cross the active worker boundary")
+        };
+        failure
     };
+    let error = active_failure();
 
     record_loader_install_operation_guardian_failure_outcome(
         &journals,
@@ -3438,7 +3451,7 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
         &failure_memory,
         &suppressed_operation_id,
         "loader_fabric_build_1_21_5",
-        &error,
+        &active_failure(),
         "2026-06-16T10:01:00+00:00",
     )
     .await
@@ -3466,34 +3479,75 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
 }
 
 #[tokio::test]
-async fn loader_base_install_dependency_failure_records_guardian_block_without_raw_details() {
+async fn delegated_base_provider_fact_uses_download_pipeline_without_dependency_fallback() {
     let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let operation_id = install_operation_id("loader-base-provider-failure");
+    begin_install_operation_journal(&journals, &operation_id, "fabric-loader")
+        .await
+        .expect("record install journal");
+    let error = LoaderInstallError::from(LoaderError::BaseInstallFailed {
+        error: Box::new(DownloadError::ResolveManifest(
+            "provider unavailable".to_string(),
+        )),
+        facts: vec![download_fact(
+            ExecutionDownloadFactKind::ProviderFailure,
+            "minecraft_version_manifest",
+        )],
+        descriptors: Vec::new(),
+    });
+
+    let outcome = dispatch_loader_install_failure(
+        &journals,
+        &failure_memory,
+        &operation_id,
+        "loader_fabric_build_1_21_5",
+        "1.21.5",
+        error,
+        "2026-06-16T10:00:00+00:00",
+    )
+    .await;
+
+    assert!(outcome.is_none());
+    let entry = journals.get(&operation_id).expect("journal");
+    let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
+    assert_eq!(summary.diagnosis_id(), DiagnosisId::DownloadUnavailable);
+    assert!(
+        !entry
+            .guardian_diagnosis_ids
+            .contains(&DiagnosisId::InstallDependencyFailed)
+    );
+}
+
+#[tokio::test]
+async fn empty_base_install_payload_uses_only_dependency_fallback() {
+    let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
     let operation_id = install_operation_id("loader-base-dependency-failure");
     begin_install_operation_journal(&journals, &operation_id, "fabric-loader")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
-    record_install_operation_progress(
+    let error = LoaderInstallError::from(LoaderError::BaseInstallFailed {
+        error: Box::new(DownloadError::ResolveManifest(
+            "private manifest".to_string(),
+        )),
+        facts: Vec::new(),
+        descriptors: Vec::new(),
+    });
+    let outcome = dispatch_loader_install_failure(
         &journals,
-        &operation_id,
-        &base_install_failed_progress(),
-        &mut last_phase,
-    )
-    .await
-    .expect("record install journal");
-
-    record_loader_base_install_dependency_guardian_failure_outcome(
-        &journals,
+        &failure_memory,
         &operation_id,
         "loader_fabric_build_1_21_5",
         "1.21.5",
+        error,
+        "2026-06-16T10:00:00+00:00",
     )
-    .await
-    .expect("record loader dependency failure outcome");
+    .await;
 
+    assert!(outcome.is_none());
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
-    assert_eq!(entry.status, OperationStatus::Failed);
     assert_eq!(summary.diagnosis_id(), DiagnosisId::InstallDependencyFailed);
     assert_eq!(summary.decision(), "block");
     assert!(
@@ -3515,6 +3569,67 @@ async fn loader_base_install_dependency_failure_records_guardian_block_without_r
     );
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
     assert_no_sensitive_fragments(&serde_json::to_string(&summary).expect("summary json"));
+}
+
+#[tokio::test]
+async fn delegated_artifact_checksum_dispatch_repairs_and_journals_real_effect() {
+    let root = temp_root("loader-delegated-artifact-repair");
+    let destination = root.join("loader.jar");
+    fs::write(&destination, b"corrupt loader").expect("corrupt artifact");
+    let replacement = b"fresh loader".to_vec();
+    let server = TestByteServer::start(replacement.clone());
+    let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let operation_id = install_operation_id("loader-delegated-artifact-repair");
+    begin_install_operation_journal(&journals, &operation_id, "fabric-loader")
+        .await
+        .expect("record install journal");
+    let target_id = "loader_fabric_library";
+    let error = LoaderInstallError::from(LoaderError::ArtifactDownloadFailed {
+        facts: vec![download_fact(
+            ExecutionDownloadFactKind::ChecksumMismatch,
+            target_id,
+        )],
+        descriptors: vec![selected_descriptor(
+            SelectedDownloadArtifactKind::Library,
+            target_id,
+            &destination,
+            &server.url,
+            &replacement,
+        )],
+    });
+
+    let outcome = dispatch_loader_install_failure(
+        &journals,
+        &failure_memory,
+        &operation_id,
+        "loader_fabric_build_1_21_5",
+        "1.21.5",
+        error,
+        "2026-06-16T10:00:00+00:00",
+    )
+    .await
+    .expect("matching delegated artifact is repaired");
+
+    assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
+    assert_eq!(
+        fs::read(&destination).expect("repaired artifact"),
+        replacement
+    );
+    assert!(server.request_count() >= 1);
+    let repair_journal = journals.get(&outcome.operation_id).expect("repair journal");
+    assert_eq!(repair_journal.status, OperationStatus::Succeeded);
+    assert_eq!(repair_journal.outcome, Some(OperationOutcome::Succeeded));
+    assert!(
+        repair_journal
+            .completed_steps
+            .iter()
+            .any(|step| step.step_id == "promote_verified_artifact")
+    );
+    assert!(outcome.facts.iter().any(|fact| fact == "download_promoted"));
+
+    server.stop();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]

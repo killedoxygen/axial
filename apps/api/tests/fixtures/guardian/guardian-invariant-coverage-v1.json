@@ -27,7 +27,7 @@
     },
     {
       "id": "I7",
-      "status": "execution_sources_classified_loader_worker_pending"
+      "status": "typed_loader_worker_and_delegated_dispatch_complete"
     },
     {
       "id": "I8",
@@ -6631,16 +6631,6 @@
       {
         "source": "ProviderSchemaInvalid",
         "boundary": "response_before_operation_allocation"
-      }
-    ],
-    "loader_delegated": [
-      {
-        "source": "BaseInstallFailed",
-        "boundary": "vanilla_install_fact_and_repair_pipeline"
-      },
-      {
-        "source": "ArtifactDownloadFailed",
-        "boundary": "selected_artifact_fact_and_repair_pipeline"
       }
     ],
     "readiness": [

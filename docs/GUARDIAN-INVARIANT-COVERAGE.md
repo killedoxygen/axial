@@ -16,7 +16,7 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | I4 | current_hand_attempt_bounds_registered |
 | I5 | launch_failure_surfaces_bounded_and_redacted |
 | I6 | implemented_memory_trigger_rules_registered |
-| I7 | execution_sources_classified_loader_worker_pending |
+| I7 | typed_loader_worker_and_delegated_dispatch_complete |
 | I8 | preflight_costs_declared_measurement_pending_phase_4 |
 | I9 | reserved_facts_unused_agent_demo_pending_phase_5 |
 
@@ -31,7 +31,7 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Diagnosis rules | 60 |
 | Registered facts | 119 |
 | Preflight senses | 6 |
-| Adapter sources | 104 |
+| Adapter sources | 102 |
 | Repair hands | 3 |
 
 ### Decision Distribution

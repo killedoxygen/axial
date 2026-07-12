@@ -233,7 +233,7 @@ pub type InstallApplicationError = (StatusCode, Json<serde_json::Value>);
 use loader::start_loader_install_owned;
 #[cfg(test)]
 use loader::{
-    base_install_failed_progress, loader_error_progress, loader_install_done_progress,
+    dispatch_loader_install_failure, loader_install_done_progress, loader_install_error_progress,
     loader_install_key_fields, wait_for_active_vanilla_base_install,
 };
 pub use loader::{

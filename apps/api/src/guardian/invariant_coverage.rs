@@ -20,9 +20,7 @@ use axial_launcher::{
     LaunchFailureClass, LaunchReadiness, LaunchReadinessReason, LaunchReadinessReasonId,
     LaunchReadinessSeverity,
 };
-use axial_minecraft::{
-    LoaderDelegatedInstallFailureKind, LoaderInstallFailureKind, LoaderPreOperationFailureKind,
-};
+use axial_minecraft::{LoaderInstallFailureKind, LoaderPreOperationFailureKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
@@ -124,7 +122,6 @@ struct AdapterCoverage {
     install: Vec<AdapterCell>,
     loader_active_install: Vec<LoaderActiveInstallAdapterCell>,
     loader_pre_operation: Vec<LoaderBoundaryAdapterCell>,
-    loader_delegated: Vec<LoaderBoundaryAdapterCell>,
     readiness: Vec<AdapterCell>,
 }
 
@@ -221,7 +218,7 @@ fn generate_coverage() -> InvariantCoverage {
             invariant("I4", "current_hand_attempt_bounds_registered"),
             invariant("I5", "launch_failure_surfaces_bounded_and_redacted"),
             invariant("I6", "implemented_memory_trigger_rules_registered"),
-            invariant("I7", "execution_sources_classified_loader_worker_pending"),
+            invariant("I7", "typed_loader_worker_and_delegated_dispatch_complete"),
             invariant("I8", "preflight_costs_declared_measurement_pending_phase_4"),
             invariant("I9", "reserved_facts_unused_agent_demo_pending_phase_5"),
         ],
@@ -242,7 +239,6 @@ fn generate_coverage() -> InvariantCoverage {
             install: install_adapter_coverage(),
             loader_active_install: loader_active_install_adapter_coverage(),
             loader_pre_operation: loader_pre_operation_adapter_coverage(),
-            loader_delegated: loader_delegated_adapter_coverage(),
             readiness: readiness_adapter_coverage(),
         },
         repair_hands: repair_hand_coverage()
@@ -677,24 +673,6 @@ fn loader_pre_operation_adapter_coverage() -> Vec<LoaderBoundaryAdapterCell> {
         .collect()
 }
 
-fn loader_delegated_adapter_coverage() -> Vec<LoaderBoundaryAdapterCell> {
-    LoaderDelegatedInstallFailureKind::ALL
-        .iter()
-        .map(|kind| LoaderBoundaryAdapterCell {
-            source: debug_name(kind),
-            boundary: match kind {
-                LoaderDelegatedInstallFailureKind::BaseInstallFailed => {
-                    "vanilla_install_fact_and_repair_pipeline"
-                }
-                LoaderDelegatedInstallFailureKind::ArtifactDownloadFailed => {
-                    "selected_artifact_fact_and_repair_pipeline"
-                }
-            }
-            .to_string(),
-        })
-        .collect()
-}
-
 fn readiness_adapter_coverage() -> Vec<AdapterCell> {
     LaunchReadinessReasonId::ALL
         .iter()
@@ -763,7 +741,6 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
         + snapshot.adapters.install.len()
         + snapshot.adapters.loader_active_install.len()
         + snapshot.adapters.loader_pre_operation.len()
-        + snapshot.adapters.loader_delegated.len()
         + snapshot.adapters.readiness.len();
     document.push_str("\n## Coverage Summary\n");
     markdown_table(

@@ -30,9 +30,10 @@ use crate::state::{
     OperationJournalStoreError, operation_journal_completed_step_is_visible,
     operation_journal_plan_is_visible,
 };
+use axial_minecraft::LoaderInstallFailureKind;
 use axial_minecraft::download::{ExecutionDownloadFact, ExecutionDownloadFactKind};
+use axial_minecraft::loaders::LoaderActiveInstallFailure;
 use axial_minecraft::{DownloadError, DownloadProgress};
-use axial_minecraft::{LoaderError, LoaderFailureDisposition, LoaderInstallFailureKind};
 use serde_json::{Value, json};
 use tracing::warn;
 
@@ -413,17 +414,15 @@ pub(super) async fn record_loader_install_operation_guardian_failure_outcome(
     failure_memory: &GuardianFailureMemoryStore,
     operation_id: &OperationId,
     target_id: &str,
-    error: &LoaderError,
+    failure: &LoaderActiveInstallFailure,
     observed_at: &str,
 ) -> Result<(), OperationJournalStoreError> {
-    let LoaderFailureDisposition::ActiveInstall(failure_kind) = error.failure_disposition() else {
-        unreachable!("non-active loader failure reached active Guardian recorder")
-    };
+    let failure_kind = failure.kind();
     let (kind, ownership, phase) = loader_install_guardian_evidence_kind(failure_kind);
     let evidence = loader_error_guardian_failure_evidence(
         operation_id,
         target_id,
-        error,
+        failure,
         failure_kind,
         kind,
         ownership,
@@ -1310,7 +1309,7 @@ pub(crate) const fn loader_install_guardian_evidence_kind(
 fn loader_error_guardian_failure_evidence(
     operation_id: &OperationId,
     target_id: &str,
-    error: &LoaderError,
+    failure: &LoaderActiveInstallFailure,
     failure_kind: LoaderInstallFailureKind,
     kind: GuardianInstallArtifactFailureKind,
     ownership: OwnershipClass,
@@ -1322,10 +1321,10 @@ fn loader_error_guardian_failure_evidence(
     )
     .with_ownership(ownership)
     .with_field("failure_kind", failure_kind.as_str());
-    if let Some(provider_kind) = error.provider_failure_kind() {
+    if let Some(provider_kind) = failure.source().provider_failure_kind() {
         evidence = evidence.with_field("provider_failure", provider_kind.as_str());
     }
-    if let Some(status) = error.provider_status() {
+    if let Some(status) = failure.source().provider_status() {
         evidence = evidence.with_field("status", status.to_string());
     }
     evidence

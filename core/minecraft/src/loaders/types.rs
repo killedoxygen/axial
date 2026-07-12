@@ -325,28 +325,6 @@ loader_failure_kinds!(LoaderInstallFailureKind {
     ParseFailed => "parse_failed",
 });
 
-loader_failure_kinds!(LoaderDelegatedInstallFailureKind {
-    BaseInstallFailed => "base_install_failed",
-    ArtifactDownloadFailed => "artifact_download_failed",
-});
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoaderFailureDisposition {
-    PreOperation(LoaderPreOperationFailureKind),
-    ActiveInstall(LoaderInstallFailureKind),
-    Delegated(LoaderDelegatedInstallFailureKind),
-}
-
-impl LoaderFailureDisposition {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::PreOperation(kind) => kind.as_str(),
-            Self::ActiveInstall(kind) => kind.as_str(),
-            Self::Delegated(kind) => kind.as_str(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoaderProviderFailureKind {
     Network,
@@ -428,108 +406,33 @@ pub enum LoaderError {
 }
 
 impl LoaderError {
-    pub fn failure_disposition(&self) -> LoaderFailureDisposition {
-        use LoaderFailureDisposition::{ActiveInstall, Delegated, PreOperation};
-
+    pub fn pre_operation_failure_kind(&self) -> Option<LoaderPreOperationFailureKind> {
         match self {
             Self::CatalogUnavailable {
                 provider_failure_kind: Some(kind),
                 ..
-            } => PreOperation(provider_pre_operation_failure_kind(*kind)),
+            } => Some(provider_pre_operation_failure_kind(*kind)),
             Self::CatalogUnavailable { .. } => {
-                PreOperation(LoaderPreOperationFailureKind::CatalogUnavailable)
+                Some(LoaderPreOperationFailureKind::CatalogUnavailable)
             }
-            Self::CatalogStale => PreOperation(LoaderPreOperationFailureKind::CatalogStale),
-            Self::BuildNotFound(_) => PreOperation(LoaderPreOperationFailureKind::BuildNotFound),
-            Self::ArtifactMissing(_) => ActiveInstall(LoaderInstallFailureKind::ArtifactMissing),
-            Self::InvalidProfile(_) => ActiveInstall(LoaderInstallFailureKind::InvalidProfile),
-            Self::ProviderUnavailable { kind, .. } => match kind {
-                LoaderProviderFailureKind::Timeout | LoaderProviderFailureKind::Network => {
-                    ActiveInstall(LoaderInstallFailureKind::ProviderNetworkFailure)
-                }
-                LoaderProviderFailureKind::HttpRateLimited => {
-                    ActiveInstall(LoaderInstallFailureKind::ProviderRateLimited)
-                }
-                LoaderProviderFailureKind::HttpServer
-                | LoaderProviderFailureKind::HttpStatus
-                | LoaderProviderFailureKind::HttpNotFound => {
-                    ActiveInstall(LoaderInstallFailureKind::ProviderHttpFailure)
-                }
-                LoaderProviderFailureKind::ResponseTooLarge => {
-                    ActiveInstall(LoaderInstallFailureKind::ProviderResponseTooLarge)
-                }
-                LoaderProviderFailureKind::SchemaInvalid => {
-                    ActiveInstall(LoaderInstallFailureKind::ProviderSchemaInvalid)
-                }
-            },
-            Self::ProviderDataInvalid { kind, .. } => match kind {
-                LoaderProviderFailureKind::ResponseTooLarge => {
-                    ActiveInstall(LoaderInstallFailureKind::ProviderResponseTooLarge)
-                }
-                LoaderProviderFailureKind::SchemaInvalid => {
-                    ActiveInstall(LoaderInstallFailureKind::ProviderSchemaInvalid)
-                }
-                LoaderProviderFailureKind::HttpRateLimited => {
-                    ActiveInstall(LoaderInstallFailureKind::ProviderRateLimited)
-                }
-                LoaderProviderFailureKind::Timeout | LoaderProviderFailureKind::Network => {
-                    ActiveInstall(LoaderInstallFailureKind::ProviderNetworkFailure)
-                }
-                LoaderProviderFailureKind::HttpServer
-                | LoaderProviderFailureKind::HttpStatus
-                | LoaderProviderFailureKind::HttpNotFound => {
-                    ActiveInstall(LoaderInstallFailureKind::ProviderHttpFailure)
-                }
-            },
-            Self::Verify(_) => ActiveInstall(LoaderInstallFailureKind::VerifyFailed),
-            Self::ProcessorFailed(_) => ActiveInstall(LoaderInstallFailureKind::ProcessorFailed),
-            Self::InstallExecutionFailed(_) | Self::Io(_) => {
-                ActiveInstall(LoaderInstallFailureKind::InstallExecutionFailed)
-            }
-            Self::BaseInstallFailed { .. } => {
-                Delegated(LoaderDelegatedInstallFailureKind::BaseInstallFailed)
-            }
-            Self::ArtifactDownloadFailed { .. } => {
-                Delegated(LoaderDelegatedInstallFailureKind::ArtifactDownloadFailed)
-            }
-            Self::Parse(_) => ActiveInstall(LoaderInstallFailureKind::ParseFailed),
+            Self::CatalogStale => Some(LoaderPreOperationFailureKind::CatalogStale),
+            Self::BuildNotFound(_) => Some(LoaderPreOperationFailureKind::BuildNotFound),
             Self::InvalidMinecraftVersion => {
-                PreOperation(LoaderPreOperationFailureKind::InvalidMinecraftVersion)
+                Some(LoaderPreOperationFailureKind::InvalidMinecraftVersion)
             }
-            Self::InvalidBuildId => PreOperation(LoaderPreOperationFailureKind::InvalidBuildId),
+            Self::InvalidBuildId => Some(LoaderPreOperationFailureKind::InvalidBuildId),
+            _ => None,
         }
     }
 
     pub fn availability_failure_kind(&self) -> Option<LoaderPreOperationFailureKind> {
-        match self.failure_disposition() {
-            LoaderFailureDisposition::PreOperation(kind) => Some(kind),
-            LoaderFailureDisposition::ActiveInstall(kind) => match kind {
-                LoaderInstallFailureKind::ArtifactMissing => {
-                    Some(LoaderPreOperationFailureKind::ProviderHttpFailure)
-                }
-                LoaderInstallFailureKind::ProviderHttpFailure => {
-                    Some(LoaderPreOperationFailureKind::ProviderHttpFailure)
-                }
-                LoaderInstallFailureKind::ProviderNetworkFailure => {
-                    Some(LoaderPreOperationFailureKind::ProviderNetworkFailure)
-                }
-                LoaderInstallFailureKind::ProviderRateLimited => {
-                    Some(LoaderPreOperationFailureKind::ProviderRateLimited)
-                }
-                LoaderInstallFailureKind::ProviderResponseTooLarge => {
-                    Some(LoaderPreOperationFailureKind::ProviderResponseTooLarge)
-                }
-                LoaderInstallFailureKind::ProviderSchemaInvalid => {
-                    Some(LoaderPreOperationFailureKind::ProviderSchemaInvalid)
-                }
-                LoaderInstallFailureKind::InvalidProfile
-                | LoaderInstallFailureKind::ProcessorFailed
-                | LoaderInstallFailureKind::InstallExecutionFailed
-                | LoaderInstallFailureKind::VerifyFailed
-                | LoaderInstallFailureKind::ParseFailed => None,
-            },
-            LoaderFailureDisposition::Delegated(_) => None,
-        }
+        self.pre_operation_failure_kind().or_else(|| match self {
+            Self::ArtifactMissing(_) => Some(LoaderPreOperationFailureKind::ProviderHttpFailure),
+            Self::ProviderUnavailable { kind, .. } | Self::ProviderDataInvalid { kind, .. } => {
+                Some(provider_pre_operation_failure_kind(*kind))
+            }
+            _ => None,
+        })
     }
 
     pub fn provider_failure_kind(&self) -> Option<LoaderProviderFailureKind> {
@@ -556,9 +459,138 @@ impl LoaderError {
             _ => None,
         }
     }
+}
 
-    pub fn safe_status_label(&self) -> &'static str {
-        self.failure_disposition().as_str()
+#[derive(Debug, Error)]
+#[error("{source}")]
+pub struct LoaderActiveInstallFailure {
+    kind: LoaderInstallFailureKind,
+    #[source]
+    source: LoaderError,
+}
+
+impl LoaderActiveInstallFailure {
+    pub fn kind(&self) -> LoaderInstallFailureKind {
+        self.kind
+    }
+
+    pub fn source(&self) -> &LoaderError {
+        &self.source
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("base Minecraft install failed: {error}")]
+pub struct LoaderBaseInstallFailure {
+    error: Box<DownloadError>,
+    facts: Vec<ExecutionDownloadFact>,
+    descriptors: Vec<SelectedDownloadArtifactDescriptor>,
+}
+
+impl LoaderBaseInstallFailure {
+    pub fn error(&self) -> &DownloadError {
+        &self.error
+    }
+
+    pub fn facts(&self) -> &[ExecutionDownloadFact] {
+        &self.facts
+    }
+
+    pub fn descriptors(&self) -> &[SelectedDownloadArtifactDescriptor] {
+        &self.descriptors
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("loader artifact download failed")]
+pub struct LoaderArtifactDownloadFailure {
+    facts: Vec<ExecutionDownloadFact>,
+    descriptors: Vec<SelectedDownloadArtifactDescriptor>,
+}
+
+impl LoaderArtifactDownloadFailure {
+    pub fn facts(&self) -> &[ExecutionDownloadFact] {
+        &self.facts
+    }
+
+    pub fn descriptors(&self) -> &[SelectedDownloadArtifactDescriptor] {
+        &self.descriptors
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum LoaderInstallError {
+    #[error("{0}")]
+    Active(#[source] LoaderActiveInstallFailure),
+    #[error("{0}")]
+    BaseInstallFailed(#[source] LoaderBaseInstallFailure),
+    #[error("{0}")]
+    ArtifactDownloadFailed(#[source] LoaderArtifactDownloadFailure),
+}
+
+impl From<LoaderError> for LoaderInstallError {
+    fn from(source: LoaderError) -> Self {
+        match source {
+            LoaderError::BaseInstallFailed {
+                error,
+                facts,
+                descriptors,
+            } => Self::BaseInstallFailed(LoaderBaseInstallFailure {
+                error,
+                facts,
+                descriptors,
+            }),
+            LoaderError::ArtifactDownloadFailed { facts, descriptors } => {
+                Self::ArtifactDownloadFailed(LoaderArtifactDownloadFailure { facts, descriptors })
+            }
+            source => Self::Active(LoaderActiveInstallFailure {
+                kind: active_install_failure_kind(&source),
+                source,
+            }),
+        }
+    }
+}
+
+fn active_install_failure_kind(source: &LoaderError) -> LoaderInstallFailureKind {
+    match source {
+        LoaderError::ArtifactMissing(_) => LoaderInstallFailureKind::ArtifactMissing,
+        LoaderError::InvalidProfile(_) => LoaderInstallFailureKind::InvalidProfile,
+        LoaderError::ProviderUnavailable { kind, .. }
+        | LoaderError::ProviderDataInvalid { kind, .. } => {
+            provider_active_install_failure_kind(*kind)
+        }
+        LoaderError::CatalogUnavailable { .. }
+        | LoaderError::CatalogStale
+        | LoaderError::BuildNotFound(_)
+        | LoaderError::InvalidMinecraftVersion
+        | LoaderError::InvalidBuildId => LoaderInstallFailureKind::InstallExecutionFailed,
+        LoaderError::Verify(_) => LoaderInstallFailureKind::VerifyFailed,
+        LoaderError::ProcessorFailed(_) => LoaderInstallFailureKind::ProcessorFailed,
+        LoaderError::InstallExecutionFailed(_) | LoaderError::Io(_) => {
+            LoaderInstallFailureKind::InstallExecutionFailed
+        }
+        LoaderError::Parse(_) => LoaderInstallFailureKind::ParseFailed,
+        LoaderError::BaseInstallFailed { .. } | LoaderError::ArtifactDownloadFailed { .. } => {
+            LoaderInstallFailureKind::InstallExecutionFailed
+        }
+    }
+}
+
+fn provider_active_install_failure_kind(
+    kind: LoaderProviderFailureKind,
+) -> LoaderInstallFailureKind {
+    match kind {
+        LoaderProviderFailureKind::Timeout | LoaderProviderFailureKind::Network => {
+            LoaderInstallFailureKind::ProviderNetworkFailure
+        }
+        LoaderProviderFailureKind::HttpRateLimited => LoaderInstallFailureKind::ProviderRateLimited,
+        LoaderProviderFailureKind::HttpServer
+        | LoaderProviderFailureKind::HttpStatus
+        | LoaderProviderFailureKind::HttpNotFound => LoaderInstallFailureKind::ProviderHttpFailure,
+        LoaderProviderFailureKind::ResponseTooLarge => {
+            LoaderInstallFailureKind::ProviderResponseTooLarge
+        }
+        LoaderProviderFailureKind::SchemaInvalid => LoaderInstallFailureKind::ProviderSchemaInvalid,
     }
 }
 
@@ -589,8 +621,8 @@ fn provider_pre_operation_failure_kind(
 #[cfg(test)]
 mod tests {
     use super::{
-        LoaderDelegatedInstallFailureKind, LoaderError, LoaderFailureDisposition,
-        LoaderGameVersion, LoaderInstallFailureKind, LoaderPreOperationFailureKind,
+        LoaderError, LoaderGameVersion, LoaderInstallError, LoaderInstallFailureKind,
+        LoaderPreOperationFailureKind,
     };
     use std::collections::HashSet;
     use std::io;
@@ -602,23 +634,25 @@ mod tests {
             .map(|kind| kind.as_str())
             .collect::<HashSet<_>>();
         assert_eq!(names.len(), LoaderInstallFailureKind::ALL.len());
-        assert_eq!(
-            LoaderError::ProcessorFailed("processor exit".to_string()).failure_disposition(),
-            LoaderFailureDisposition::ActiveInstall(LoaderInstallFailureKind::ProcessorFailed)
-        );
-        assert_eq!(
-            LoaderError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
-                .failure_disposition(),
-            LoaderFailureDisposition::ActiveInstall(
-                LoaderInstallFailureKind::InstallExecutionFailed
-            )
-        );
-        assert_eq!(
-            LoaderError::Io(io::Error::other("disk failure")).failure_disposition(),
-            LoaderFailureDisposition::ActiveInstall(
-                LoaderInstallFailureKind::InstallExecutionFailed
-            )
-        );
+        for (source, expected) in [
+            (
+                LoaderError::ProcessorFailed("processor exit".to_string()),
+                LoaderInstallFailureKind::ProcessorFailed,
+            ),
+            (
+                LoaderError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+                LoaderInstallFailureKind::InstallExecutionFailed,
+            ),
+            (
+                LoaderError::Io(io::Error::other("disk failure")),
+                LoaderInstallFailureKind::InstallExecutionFailed,
+            ),
+        ] {
+            let LoaderInstallError::Active(failure) = LoaderInstallError::from(source) else {
+                panic!("active loader source crossed delegated boundary")
+            };
+            assert_eq!(failure.kind(), expected);
+        }
     }
 
     #[test]
@@ -632,30 +666,31 @@ mod tests {
                 .iter()
                 .map(|kind| kind.as_str())
                 .collect::<HashSet<_>>(),
-            LoaderDelegatedInstallFailureKind::ALL
-                .iter()
-                .map(|kind| kind.as_str())
-                .collect::<HashSet<_>>(),
         ] {
             assert!(!names.is_empty());
         }
         assert_eq!(LoaderPreOperationFailureKind::ALL.len(), 10);
         assert_eq!(LoaderInstallFailureKind::ALL.len(), 11);
-        assert_eq!(LoaderDelegatedInstallFailureKind::ALL.len(), 2);
-
         assert_eq!(
-            LoaderError::InvalidBuildId.failure_disposition(),
-            LoaderFailureDisposition::PreOperation(LoaderPreOperationFailureKind::InvalidBuildId)
+            LoaderError::InvalidBuildId.pre_operation_failure_kind(),
+            Some(LoaderPreOperationFailureKind::InvalidBuildId)
         );
-        assert_eq!(
-            LoaderError::ArtifactDownloadFailed {
+        assert!(matches!(
+            LoaderInstallError::from(LoaderError::ArtifactDownloadFailed {
                 facts: Vec::new(),
                 descriptors: Vec::new(),
-            }
-            .failure_disposition(),
-            LoaderFailureDisposition::Delegated(
-                LoaderDelegatedInstallFailureKind::ArtifactDownloadFailed
-            )
+            }),
+            LoaderInstallError::ArtifactDownloadFailed(_)
+        ));
+
+        let LoaderInstallError::Active(failure) =
+            LoaderInstallError::from(LoaderError::InvalidBuildId)
+        else {
+            panic!("defensive pre-operation source must normalize to active failure")
+        };
+        assert_eq!(
+            failure.kind(),
+            LoaderInstallFailureKind::InstallExecutionFailed
         );
     }
 

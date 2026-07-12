@@ -17,14 +17,13 @@ pub use index::{
     resolve_build_record,
 };
 pub use types::{
-    LOADER_CATALOG_SCHEMA_VERSION, LoaderArtifactKind, LoaderAvailability, LoaderBuildId,
-    LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState, LoaderComponentId,
-    LoaderComponentRecord, LoaderDelegatedInstallFailureKind, LoaderError,
-    LoaderFailureDisposition, LoaderGameVersion, LoaderInstallFailureKind, LoaderInstallPlan,
-    LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
-    LoaderPreOperationFailureKind, LoaderProviderFailureKind, LoaderSelectionMeta,
-    LoaderSelectionReason, LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
-    LoaderVersionIndex,
+    LOADER_CATALOG_SCHEMA_VERSION, LoaderActiveInstallFailure, LoaderArtifactKind,
+    LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState,
+    LoaderComponentId, LoaderComponentRecord, LoaderError, LoaderGameVersion, LoaderInstallError,
+    LoaderInstallFailureKind, LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy,
+    LoaderInstallability, LoaderPreOperationFailureKind, LoaderProviderFailureKind,
+    LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource, LoaderTerm,
+    LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
 };
 
 use crate::download::DownloadProgress;
@@ -36,21 +35,24 @@ pub async fn install_build<F>(
     library_dir: &Path,
     record: LoaderBuildRecord,
     send: F,
-) -> Result<String, LoaderError>
+) -> Result<String, LoaderInstallError>
 where
     F: FnMut(DownloadProgress),
 {
-    validate_version_id(&record.version_id, "loader build version id")?;
+    validate_version_id(&record.version_id, "loader build version id")
+        .map_err(LoaderInstallError::from)?;
     let stage_dir = loader_work_dir(library_dir).join(&record.version_id);
     if stage_dir.exists() {
         let _ = fs::remove_dir_all(&stage_dir);
     }
-    fs::create_dir_all(&stage_dir)?;
+    fs::create_dir_all(&stage_dir)
+        .map_err(LoaderError::from)
+        .map_err(LoaderInstallError::from)?;
 
     let plan = LoaderInstallPlan { record, stage_dir };
     let result = Box::pin(strategies::install_build(library_dir, &plan, send)).await;
     let _ = fs::remove_dir_all(&plan.stage_dir);
-    result
+    result.map_err(LoaderInstallError::from)
 }
 
 pub(crate) fn validate_version_id(version_id: &str, context: &str) -> Result<(), LoaderError> {
