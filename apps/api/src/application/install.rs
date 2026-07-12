@@ -13,7 +13,7 @@ mod repair;
 mod stream;
 
 #[cfg(test)]
-pub(crate) use operation::{LoaderGuardianFailureDisposition, loader_install_failure_disposition};
+pub(crate) use operation::loader_install_guardian_evidence_kind;
 
 use super::InstallVersionCommand;
 use crate::guardian::{DiagnosisId, GuardianArtifactRepairOutcome, GuardianInstallOutcomeSummary};
@@ -236,7 +236,9 @@ use loader::{
     base_install_failed_progress, loader_error_progress, loader_install_done_progress,
     loader_install_key_fields, wait_for_active_vanilla_base_install,
 };
-pub use loader::{loader_builds, loader_components, loader_error_response, loader_game_versions};
+pub use loader::{
+    loader_builds, loader_components, loader_game_versions, loader_pre_operation_error_response,
+};
 pub use model::{
     InstallActionViewModel, InstallFailureViewModel, InstallGuardianRepairSummary,
     InstallProgressStepViewModel, InstallProgressViewModel, InstallQueueActiveViewModel,
@@ -250,6 +252,8 @@ use operation::{
     install_progress_history_from_journal, install_progress_record,
     install_progress_with_terminal_error, install_repair_facts_from_download_error_or_facts,
     interrupted_install_progress, observed_install_failure_progress, public_install_id,
+    record_loader_base_install_dependency_guardian_failure_outcome,
+    record_loader_install_operation_guardian_failure_outcome,
 };
 pub use operation::{
     begin_install_operation_journal, install_guardian_outcome_summary_from_journal,
@@ -259,9 +263,7 @@ pub use operation::{
     record_install_operation_guardian_failure_outcome_for_error_with_memory,
     record_install_operation_guardian_failure_outcome_with_memory,
     record_install_operation_interrupted, record_install_operation_progress,
-    record_loader_base_install_dependency_guardian_failure_outcome,
-    record_loader_install_operation_guardian_failure_outcome, sanitize_install_progress,
-    stage_install_version_command, vanilla_install_progress_view_model,
+    sanitize_install_progress, stage_install_version_command, vanilla_install_progress_view_model,
 };
 use repair::InstallRepairResume;
 pub use repair::{
@@ -938,7 +940,7 @@ async fn install_queue_spec_from_request(
                 &build_id,
             )
             .await
-            .map_err(loader_error_response)?;
+            .map_err(loader_pre_operation_error_response)?;
             Ok(InstallQueueSpec::loader(
                 build.component_id,
                 build.build_id,

@@ -19,10 +19,12 @@ pub use index::{
 pub use types::{
     LOADER_CATALOG_SCHEMA_VERSION, LoaderArtifactKind, LoaderAvailability, LoaderBuildId,
     LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState, LoaderComponentId,
-    LoaderComponentRecord, LoaderError, LoaderGameVersion, LoaderInstallFailureKind,
-    LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
-    LoaderProviderFailureKind, LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource,
-    LoaderTerm, LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
+    LoaderComponentRecord, LoaderDelegatedInstallFailureKind, LoaderError,
+    LoaderFailureDisposition, LoaderGameVersion, LoaderInstallFailureKind, LoaderInstallPlan,
+    LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
+    LoaderPreOperationFailureKind, LoaderProviderFailureKind, LoaderSelectionMeta,
+    LoaderSelectionReason, LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
+    LoaderVersionIndex,
 };
 
 use crate::download::DownloadProgress;

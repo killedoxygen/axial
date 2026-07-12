@@ -25,12 +25,13 @@ pub use lifecycle::{LifecycleChannel, LifecycleLabel, LifecycleMeta};
 pub use loaders::{
     LOADER_CATALOG_SCHEMA_VERSION, LoaderArtifactKind, LoaderAvailability, LoaderBuildId,
     LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState, LoaderComponentId,
-    LoaderComponentRecord, LoaderError, LoaderGameVersion, LoaderInstallFailureKind,
-    LoaderInstallStrategy, LoaderInstallability, LoaderProviderFailureKind, LoaderSelectionMeta,
-    LoaderSelectionReason, LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
-    LoaderVersionIndex, build_id_for, fetch_builds, fetch_cached_builds, fetch_components,
-    fetch_supported_versions, install_build, installed_version_id_for, loader_components,
-    parse_build_id, resolve_build_record,
+    LoaderComponentRecord, LoaderDelegatedInstallFailureKind, LoaderError,
+    LoaderFailureDisposition, LoaderGameVersion, LoaderInstallFailureKind, LoaderInstallStrategy,
+    LoaderInstallability, LoaderPreOperationFailureKind, LoaderProviderFailureKind,
+    LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource, LoaderTerm,
+    LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex, build_id_for, fetch_builds,
+    fetch_cached_builds, fetch_components, fetch_supported_versions, install_build,
+    installed_version_id_for, loader_components, parse_build_id, resolve_build_record,
 };
 pub use manifest::{
     ManifestEntry, VersionManifest, fetch_version_manifest, fetch_version_manifest_cached,

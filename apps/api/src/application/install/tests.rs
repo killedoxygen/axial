@@ -21,8 +21,7 @@ use axial_minecraft::download::{
     download_file_with_client_report,
 };
 use axial_minecraft::{
-    DownloadError, DownloadProgress, LoaderComponentId, LoaderError, LoaderInstallFailureKind,
-    LoaderProviderFailureKind,
+    DownloadError, DownloadProgress, LoaderComponentId, LoaderError, LoaderProviderFailureKind,
 };
 use axial_performance::PerformanceManager;
 use axum::{body::to_bytes, response::IntoResponse};
@@ -2068,12 +2067,13 @@ async fn install_status_returns_not_found_for_unknown_install() {
 }
 
 #[test]
-fn loader_error_response_keeps_status_and_failure_kind_without_raw_details() {
-    let (status, Json(body)) = loader_error_response(LoaderError::CatalogUnavailable {
-        message: "GET https://loader.example.invalid/catalog.json timed out".to_string(),
-        provider_failure_kind: None,
-        provider_status: None,
-    });
+fn loader_pre_operation_error_response_is_bounded_and_typed() {
+    let (status, Json(body)) =
+        loader_pre_operation_error_response(LoaderError::CatalogUnavailable {
+            message: "GET https://loader.example.invalid/catalog.json timed out".to_string(),
+            provider_failure_kind: None,
+            provider_status: None,
+        });
 
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(body["failure_kind"], json!("catalog_unavailable"));
@@ -2083,36 +2083,12 @@ fn loader_error_response_keeps_status_and_failure_kind_without_raw_details() {
     );
     assert_no_public_raw_fragments(body["error"].as_str().expect("error is a string"));
 
-    let (status, Json(body)) = loader_error_response(LoaderError::ProviderUnavailable {
-        kind: LoaderProviderFailureKind::HttpRateLimited,
-        status: Some(429),
-    });
-
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(body["failure_kind"], json!("provider_rate_limited"));
-    assert_eq!(
-        body["error"],
-        json!("Loader provider is unavailable. Check your connection and try again.")
-    );
-    assert_no_public_raw_fragments(body["error"].as_str().expect("error is a string"));
-
-    let (status, Json(body)) = loader_error_response(LoaderError::ProviderUnavailable {
-        kind: LoaderProviderFailureKind::HttpNotFound,
-        status: Some(404),
-    });
-
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["failure_kind"], json!("provider_http_failure"));
-    assert_eq!(
-        body["error"],
-        json!("Loader provider is unavailable. Check your connection and try again.")
-    );
-
-    let (status, Json(body)) = loader_error_response(LoaderError::CatalogUnavailable {
-        message: "provider_http_failure".to_string(),
-        provider_failure_kind: Some(LoaderProviderFailureKind::HttpNotFound),
-        provider_status: Some(404),
-    });
+    let (status, Json(body)) =
+        loader_pre_operation_error_response(LoaderError::CatalogUnavailable {
+            message: "provider_http_failure".to_string(),
+            provider_failure_kind: Some(LoaderProviderFailureKind::HttpNotFound),
+            provider_status: Some(404),
+        });
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["failure_kind"], json!("provider_http_failure"));
@@ -2120,120 +2096,45 @@ fn loader_error_response_keeps_status_and_failure_kind_without_raw_details() {
         body["error"],
         json!("Loader catalog is unavailable. Check your connection and try again.")
     );
-
-    let (status, Json(body)) = loader_error_response(LoaderError::ProviderDataInvalid {
-        kind: LoaderProviderFailureKind::ResponseTooLarge,
-        status: None,
-    });
-
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(body["failure_kind"], json!("provider_response_too_large"));
-    assert_eq!(
-        body["error"],
-        json!("Loader provider returned data Axial could not trust. Try again later.")
-    );
-    assert_no_public_raw_fragments(body["error"].as_str().expect("error is a string"));
-
-    let (status, Json(body)) = loader_error_response(LoaderError::Io(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        "permission denied: /home/zero/.axial/libraries/example.jar",
-    )));
-
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body["failure_kind"], json!("install_execution_failed"));
-    assert_eq!(
-        body["error"],
-        json!("Could not write loader files. Check app data permissions and try again.")
-    );
-    assert_no_public_raw_fragments(body["error"].as_str().expect("error is a string"));
-
-    let parse_error = serde_json::from_str::<serde_json::Value>("{\"loader\":")
-        .expect_err("invalid json should fail");
-    let (status, Json(body)) = loader_error_response(LoaderError::Parse(parse_error));
-
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body["failure_kind"], json!("parse_failed"));
-    assert_eq!(
-        body["error"],
-        json!("Loader install data could not be read. Try again.")
-    );
-    assert_no_public_raw_fragments(body["error"].as_str().expect("error is a string"));
-
-    let (status, Json(body)) = loader_error_response(LoaderError::ArtifactMissing(
-        "missing https://cdn.example.invalid/path/mod-loader.jar in /tmp/axial".to_string(),
-    ));
-
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(body["failure_kind"], json!("artifact_missing"));
-    assert_eq!(
-        body["error"],
-        json!("Loader artifact is unavailable. Try another build or component.")
-    );
-    assert_no_public_raw_fragments(body["error"].as_str().expect("error is a string"));
-
-    let (status, Json(body)) = loader_error_response(LoaderError::BaseInstallFailed {
-        error: Box::new(DownloadError::ResolveManifest(
-            "https://example.invalid/manifest.json?token=secret".to_string(),
-        )),
-        facts: vec![ExecutionDownloadFact {
-            kind: ExecutionDownloadFactKind::ProviderFailure,
-            target: "minecraft_client_1.21.5".to_string(),
-            fields: vec![(
-                "url".to_string(),
-                "https://example.invalid/client.jar?token=secret".to_string(),
-            )],
-        }],
-        descriptors: Vec::new(),
-    });
-
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert_eq!(body["failure_kind"], json!("base_install_failed"));
-    assert_eq!(
-        body["error"],
-        json!("Base game install failed. Retry the install from Downloads.")
-    );
-    assert_no_public_raw_fragments(body["error"].as_str().expect("error is a string"));
 }
 
 #[test]
-fn loader_error_response_preserves_safe_explicit_messages() {
-    let (status, Json(body)) = loader_error_response(LoaderError::InvalidMinecraftVersion);
+fn loader_pre_operation_error_response_preserves_safe_explicit_messages() {
+    let (status, Json(body)) =
+        loader_pre_operation_error_response(LoaderError::InvalidMinecraftVersion);
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["failure_kind"], json!("invalid_minecraft_version"));
     assert_eq!(body["error"], json!("Invalid Minecraft version."));
 }
 
-#[test]
-fn loader_failure_disposition_preserves_operation_boundaries() {
-    assert!(matches!(
-        loader_install_failure_disposition(LoaderInstallFailureKind::CatalogUnavailable),
-        LoaderGuardianFailureDisposition::PreOperation
-    ));
-    assert!(matches!(
-        loader_install_failure_disposition(LoaderInstallFailureKind::BaseInstallFailed),
-        LoaderGuardianFailureDisposition::DelegatedBaseInstall
-    ));
-    assert!(matches!(
-        loader_install_failure_disposition(LoaderInstallFailureKind::ArtifactDownloadFailed),
-        LoaderGuardianFailureDisposition::DelegatedArtifactDownload
-    ));
-    assert!(matches!(
-        loader_install_failure_disposition(LoaderInstallFailureKind::ProcessorFailed),
-        LoaderGuardianFailureDisposition::Evidence {
-            kind: crate::guardian::GuardianInstallArtifactFailureKind::ProcessorFailed,
-            ownership: OwnershipClass::LauncherManaged,
-            phase: OperationPhase::Installing,
-        }
-    ));
-    assert!(matches!(
-        loader_install_failure_disposition(LoaderInstallFailureKind::InstallExecutionFailed),
-        LoaderGuardianFailureDisposition::Evidence {
-            kind: crate::guardian::GuardianInstallArtifactFailureKind::ExecutionFailed,
-            phase: OperationPhase::Installing,
-            ..
-        }
-    ));
+#[tokio::test]
+async fn loader_pre_operation_failure_does_not_allocate_an_operation() {
+    let root = temp_root("loader-pre-operation-boundary");
+    let state = build_test_state(&root);
+    configure_library_dir(&state, &root.join("library"));
+    let request = state.try_admit_request().expect("admit loader request");
+    let producer = request
+        .producer_handoff()
+        .try_claim()
+        .expect("claim loader producer");
+
+    let error = start_loader_install_owned(
+        &state,
+        LoaderInstallStartRequest {
+            component_id: LoaderComponentId::Fabric,
+            build_id: "invalid-build-id".to_string(),
+        },
+        &producer,
+    )
+    .await
+    .expect_err("invalid build is rejected before operation allocation");
+
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert_eq!(error.1.0["failure_kind"], json!("invalid_build_id"));
+    assert!(state.journals().list().is_empty());
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

@@ -4,7 +4,7 @@ use crate::download::{
 };
 use crate::loaders::types::{
     CachedCatalog, LOADER_CATALOG_SCHEMA_VERSION, LoaderAvailability, LoaderCatalogState,
-    LoaderError,
+    LoaderError, LoaderProviderFailureKind,
 };
 use chrono::Utc;
 use std::collections::HashMap;
@@ -59,8 +59,17 @@ where
             ))
         }
         Err(error) => {
-            let failure_kind = error.failure_kind();
-            let last_error = error.safe_status_label().to_string();
+            let Some(failure_kind) = error.availability_failure_kind() else {
+                return Err(error);
+            };
+            let last_error = failure_kind.as_str().to_string();
+            let provider_failure_kind = error.provider_failure_kind().or_else(|| {
+                matches!(error, LoaderError::ArtifactMissing(_))
+                    .then_some(LoaderProviderFailureKind::HttpNotFound)
+            });
+            let provider_status = error
+                .provider_status()
+                .or_else(|| matches!(error, LoaderError::ArtifactMissing(_)).then_some(404));
             if let Ok(cached) = cached {
                 update_memory_cache(&cache_path, &cached);
                 return Ok((
@@ -79,9 +88,9 @@ where
                 ));
             }
             Err(LoaderError::CatalogUnavailable {
-                message: error.safe_status_label().to_string(),
-                provider_failure_kind: error.provider_failure_kind(),
-                provider_status: error.provider_status(),
+                message: last_error,
+                provider_failure_kind,
+                provider_status,
             })
         }
     }
@@ -305,8 +314,34 @@ mod tests {
         );
         assert_eq!(
             state.availability.last_failure_kind,
-            Some(crate::loaders::types::LoaderInstallFailureKind::ProviderResponseTooLarge)
+            Some(crate::loaders::types::LoaderPreOperationFailureKind::ProviderResponseTooLarge)
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn missing_catalog_is_normalized_to_pre_operation_http_failure() {
+        let root = temp_dir("missing-live-catalog");
+        fs::create_dir_all(&root).expect("create root");
+        let cache_path = root.join("catalog.json");
+
+        let error = resolve_cached(cache_path, Duration::ZERO, || async {
+            Err::<Vec<String>, _>(LoaderError::ArtifactMissing(
+                "https://provider.invalid/catalog?token=secret".to_string(),
+            ))
+        })
+        .await
+        .expect_err("missing live catalog without cache must fail");
+
+        assert!(matches!(
+            error,
+            LoaderError::CatalogUnavailable {
+                provider_failure_kind: Some(LoaderProviderFailureKind::HttpNotFound),
+                provider_status: Some(404),
+                ..
+            }
+        ));
 
         let _ = fs::remove_dir_all(root);
     }

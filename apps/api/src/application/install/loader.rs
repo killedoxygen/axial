@@ -20,8 +20,9 @@ use crate::install_runtime::prewarm_version_runtime;
 use crate::state::InstallInitializationStatus;
 use crate::state::{AppState, InstallStore, ProducerLease};
 use axial_minecraft::{
-    DownloadProgress, LoaderComponentId, LoaderError, LoaderProviderFailureKind, fetch_builds,
-    fetch_components, fetch_supported_versions, install_build, resolve_build_record,
+    DownloadProgress, LoaderComponentId, LoaderDelegatedInstallFailureKind, LoaderError,
+    LoaderFailureDisposition, LoaderPreOperationFailureKind, LoaderProviderFailureKind,
+    fetch_builds, fetch_components, fetch_supported_versions, install_build, resolve_build_record,
 };
 use axum::{Json, http::StatusCode};
 use std::path::PathBuf;
@@ -54,7 +55,7 @@ pub(super) async fn start_loader_install_owned(
 
     let build = resolve_build_record(library_dir_path.as_path(), request.component_id, &build_id)
         .await
-        .map_err(loader_error_response)?;
+        .map_err(loader_pre_operation_error_response)?;
 
     let (install_version_key, install_manifest_key) =
         loader_install_key_fields(build.component_id, &build.build_id, &build.version_id);
@@ -250,12 +251,18 @@ pub(super) async fn start_loader_install_owned(
 
                 if let Err(error) = result {
                     let observed_at = chrono::Utc::now().to_rfc3339();
-                    let repair_outcome = match &error {
-                        LoaderError::BaseInstallFailed {
-                            error: base_error,
-                            facts,
-                            descriptors,
-                        } => {
+                    let repair_outcome = match error.failure_disposition() {
+                        LoaderFailureDisposition::Delegated(
+                            LoaderDelegatedInstallFailureKind::BaseInstallFailed,
+                        ) => {
+                            let LoaderError::BaseInstallFailed {
+                                error: base_error,
+                                facts,
+                                descriptors,
+                            } = &error
+                            else {
+                                unreachable!("base-install disposition must own base-install facts")
+                            };
                             // fallback outcome, recorded first so the
                             // error-aware one below wins on journal read
                             if facts.is_empty() {
@@ -279,7 +286,15 @@ pub(super) async fn start_loader_install_owned(
                             )
                             .await
                         }
-                        LoaderError::ArtifactDownloadFailed { facts, descriptors } => {
+                        LoaderFailureDisposition::Delegated(
+                            LoaderDelegatedInstallFailureKind::ArtifactDownloadFailed,
+                        ) => {
+                            let LoaderError::ArtifactDownloadFailed { facts, descriptors } = &error
+                            else {
+                                unreachable!(
+                                    "artifact-download disposition must own download facts"
+                                )
+                            };
                             record_install_failure_outcome_and_repair(
                                 worker_journals.as_ref(),
                                 worker_failure_memory.as_ref(),
@@ -290,7 +305,7 @@ pub(super) async fn start_loader_install_owned(
                             )
                             .await
                         }
-                        _ => {
+                        LoaderFailureDisposition::ActiveInstall(_) => {
                             record_loader_install_operation_guardian_failure_outcome(
                                 worker_journals.as_ref(),
                                 worker_failure_memory.as_ref(),
@@ -303,6 +318,10 @@ pub(super) async fn start_loader_install_owned(
                             .ok();
                             None
                         }
+                        LoaderFailureDisposition::PreOperation(failure_kind) => unreachable!(
+                            "pre-operation loader failure reached active worker: {}",
+                            failure_kind.as_str()
+                        ),
                     };
                     if repair_resume.resume_after(repair_outcome.as_ref()) {
                         continue;
@@ -400,7 +419,7 @@ pub async fn loader_builds(
         &request.mc_version,
     )
     .await
-    .map_err(loader_error_response)?;
+    .map_err(loader_pre_operation_error_response)?;
     invalidate_create_view_source(library_dir.as_path(), request.component_id.as_str());
     Ok(LoaderBuildsResponse { builds, catalog })
 }
@@ -419,7 +438,7 @@ pub async fn loader_game_versions(
     fetch_supported_versions(PathBuf::from(library_dir).as_path(), component_id)
         .await
         .map(|(versions, catalog)| LoaderGameVersionsResponse { versions, catalog })
-        .map_err(loader_error_response)
+        .map_err(loader_pre_operation_error_response)
 }
 
 pub(crate) fn loader_install_key_fields(
@@ -481,38 +500,32 @@ pub(crate) async fn wait_for_active_vanilla_base_install(
     }
 }
 
-pub fn loader_error_response(error: LoaderError) -> InstallApplicationError {
-    let status = match error {
-        LoaderError::InvalidMinecraftVersion | LoaderError::InvalidBuildId => {
-            StatusCode::BAD_REQUEST
+pub fn loader_pre_operation_error_response(error: LoaderError) -> InstallApplicationError {
+    let LoaderFailureDisposition::PreOperation(failure_kind) = error.failure_disposition() else {
+        unreachable!("active or delegated loader failure reached pre-operation response")
+    };
+    let status = match failure_kind {
+        LoaderPreOperationFailureKind::InvalidMinecraftVersion
+        | LoaderPreOperationFailureKind::InvalidBuildId => StatusCode::BAD_REQUEST,
+        LoaderPreOperationFailureKind::BuildNotFound => StatusCode::NOT_FOUND,
+        LoaderPreOperationFailureKind::CatalogStale => StatusCode::PRECONDITION_FAILED,
+        LoaderPreOperationFailureKind::ProviderHttpFailure
+            if error.provider_failure_kind() == Some(LoaderProviderFailureKind::HttpNotFound) =>
+        {
+            StatusCode::NOT_FOUND
         }
-        LoaderError::BuildNotFound(_) => StatusCode::NOT_FOUND,
-        LoaderError::CatalogStale => StatusCode::PRECONDITION_FAILED,
-        LoaderError::CatalogUnavailable {
-            provider_failure_kind: Some(LoaderProviderFailureKind::HttpNotFound),
-            ..
-        }
-        | LoaderError::ProviderUnavailable {
-            kind: LoaderProviderFailureKind::HttpNotFound,
-            ..
-        }
-        | LoaderError::ProviderDataInvalid {
-            kind: LoaderProviderFailureKind::HttpNotFound,
-            ..
-        } => StatusCode::NOT_FOUND,
-        LoaderError::CatalogUnavailable { .. }
-        | LoaderError::ArtifactMissing(_)
-        | LoaderError::BaseInstallFailed { .. }
-        | LoaderError::ArtifactDownloadFailed { .. }
-        | LoaderError::ProviderUnavailable { .. }
-        | LoaderError::ProviderDataInvalid { .. } => StatusCode::BAD_GATEWAY,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
+        LoaderPreOperationFailureKind::CatalogUnavailable
+        | LoaderPreOperationFailureKind::ProviderHttpFailure
+        | LoaderPreOperationFailureKind::ProviderNetworkFailure
+        | LoaderPreOperationFailureKind::ProviderRateLimited
+        | LoaderPreOperationFailureKind::ProviderResponseTooLarge
+        | LoaderPreOperationFailureKind::ProviderSchemaInvalid => StatusCode::BAD_GATEWAY,
     };
     (
         status,
         Json(serde_json::json!({
             "error": public_loader_error_message(&error),
-            "failure_kind": error.failure_kind(),
+            "failure_kind": failure_kind,
         })),
     )
 }
