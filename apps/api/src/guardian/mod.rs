@@ -82,15 +82,15 @@ pub(crate) use directive::{GuardianRecoveryIntentAxis, GuardianRecoveryMetadata}
 pub use facts::guardian_fact_from_execution;
 pub(crate) use healing::execute_managed_runtime_ready_marker_repair;
 pub use healing::{GuardianRepairOutcome, GuardianRepairStatus};
+#[cfg(test)]
+pub(crate) use install_evidence::assess_install_artifact_failure;
 pub use install_evidence::{
     GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-    GuardianInstallFailureOutcome, install_artifact_failure_from_minecraft_download_fact,
-    install_artifact_failure_guardian_fact, install_artifact_failure_guardian_outcome,
-    install_artifact_failure_guardian_outcome_with_context, install_artifact_failure_safety_case,
+    install_artifact_failure_from_minecraft_download_fact, install_artifact_failure_guardian_fact,
 };
 pub(crate) use install_evidence::{
-    authorize_install_existing_artifact_failure_repair,
-    authorize_install_missing_artifact_failure_repair,
+    GuardianInstallAssessment, GuardianInstallFailureOutcome,
+    assess_install_artifact_failure_with_context, install_artifact_failure_safety_case,
 };
 pub use jvm_preset::{
     GuardianJvmPresetId, GuardianJvmPresetResolution, normalize_create_jvm_preset,
@@ -129,6 +129,8 @@ pub use performance::{
     plan_performance_supervision,
 };
 pub(super) use policy::PreflightAdmission;
+#[cfg(test)]
+pub(crate) use policy::with_guardian_policy_evaluation_count;
 pub use policy::{GuardianDecision, GuardianPolicyContext, decide_guardian_policy};
 pub use preflight::{
     GuardianPreflightOutcome, GuardianPreflightOutcomeRequest, GuardianPreflightOverrideSignals,

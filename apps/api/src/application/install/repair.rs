@@ -4,21 +4,18 @@ use super::{
     reconcile_install_journal_transition,
 };
 use crate::guardian::{
-    DiagnosisId, GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus, GuardianCopyRequest,
-    GuardianInstallArtifactFailureEvidence, GuardianMinecraftArtifactRepairDescriptor,
-    GuardianMode, author_guardian_copy, authorize_install_existing_artifact_failure_repair,
-    authorize_install_missing_artifact_failure_repair, execute_guardian_missing_download,
-    execute_guardian_quarantine_redownload, install_artifact_failure_from_minecraft_download_fact,
+    DiagnosisId, GuardianActionKind, GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus,
+    GuardianCopyRequest, GuardianInstallArtifactFailureEvidence,
+    GuardianInstallArtifactFailureKind, GuardianInstallAssessment,
+    GuardianMinecraftArtifactRepairDescriptor, author_guardian_copy,
+    execute_guardian_missing_download, execute_guardian_quarantine_redownload,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
-    CommandKind, OperationId, OperationJournalEntry, OperationPhase, OwnershipClass,
-    StabilizationSystem,
+    CommandKind, OperationId, OperationJournalEntry, OwnershipClass, StabilizationSystem,
 };
 use crate::state::{GuardianFailureMemoryStore, OperationJournalStore, OperationJournalStoreError};
-use axial_minecraft::download::{
-    ExecutionDownloadFact, ExecutionDownloadFactKind, SelectedDownloadArtifactDescriptor,
-};
+use axial_minecraft::download::SelectedDownloadArtifactDescriptor;
 use reqwest::Client;
 
 const REPAIR_OPERATION_FACT_PREFIX: &str = "guardian_repair_operation:";
@@ -121,16 +118,19 @@ pub fn install_guardian_repair_summary_from_journal(
     })
 }
 
-pub async fn repair_install_artifact_corruption_with_guardian(
+pub(super) async fn repair_install_artifact_corruption_with_guardian(
     journals: &OperationJournalStore,
     failure_memory: &GuardianFailureMemoryStore,
     client: &Client,
-    operation_id: &OperationId,
-    facts: &[ExecutionDownloadFact],
+    assessment: GuardianInstallAssessment,
+    evidence: &[GuardianInstallArtifactFailureEvidence],
     descriptors: &[SelectedDownloadArtifactDescriptor],
     observed_at: &str,
 ) -> Result<Option<GuardianArtifactRepairOutcome>, OperationJournalStoreError> {
-    let Some(repair) = first_repairable_install_artifact(facts, descriptors, operation_id) else {
+    if assessment.decision_kind() != GuardianActionKind::Repair {
+        return Ok(None);
+    }
+    let Some(repair) = first_repairable_install_artifact(&assessment, evidence, descriptors) else {
         return Ok(None);
     };
     let destination_missing = repair
@@ -138,17 +138,11 @@ pub async fn repair_install_artifact_corruption_with_guardian(
         .destination()
         .try_exists()
         .is_ok_and(|exists| !exists);
-    let missing_download = repair.evidence.kind
-        == crate::guardian::GuardianInstallArtifactFailureKind::ArtifactMissing
-        || destination_missing;
+    let missing_download =
+        repair.kind == GuardianInstallArtifactFailureKind::ArtifactMissing || destination_missing;
     let outcome = if missing_download {
-        let Ok(authorization) = authorize_install_missing_artifact_failure_repair(
-            Some(operation_id.clone()),
-            GuardianMode::Managed,
-            OperationPhase::Downloading,
-            std::slice::from_ref(&repair.evidence),
-            repair.descriptor,
-        ) else {
+        let Ok(authorization) = assessment.into_missing_repair_authorization(repair.descriptor)
+        else {
             return Ok(None);
         };
         execute_guardian_missing_download(
@@ -161,13 +155,8 @@ pub async fn repair_install_artifact_corruption_with_guardian(
         )
         .await
     } else {
-        let Ok(authorization) = authorize_install_existing_artifact_failure_repair(
-            Some(operation_id.clone()),
-            GuardianMode::Managed,
-            OperationPhase::Downloading,
-            std::slice::from_ref(&repair.evidence),
-            repair.descriptor,
-        ) else {
+        let Ok(authorization) = assessment.into_existing_repair_authorization(repair.descriptor)
+        else {
             return Ok(None);
         };
         execute_guardian_quarantine_redownload(
@@ -185,74 +174,50 @@ pub async fn repair_install_artifact_corruption_with_guardian(
 
 struct RepairableInstallArtifact {
     descriptor: GuardianMinecraftArtifactRepairDescriptor,
-    evidence: GuardianInstallArtifactFailureEvidence,
+    kind: GuardianInstallArtifactFailureKind,
 }
 
 fn first_repairable_install_artifact(
-    facts: &[ExecutionDownloadFact],
+    assessment: &GuardianInstallAssessment,
+    evidence: &[GuardianInstallArtifactFailureEvidence],
     descriptors: &[SelectedDownloadArtifactDescriptor],
-    operation_id: &OperationId,
 ) -> Option<RepairableInstallArtifact> {
-    facts
+    let repair_target = assessment.repair_target()?;
+    evidence
         .iter()
-        .filter(|fact| repairable_install_artifact_fact_kind(fact.kind))
-        .filter(|fact| !artifact_missing_shadowed_by_terminal_failure(fact, facts))
-        .filter_map(|fact| {
+        .filter(|evidence| repairable_install_artifact_kind(evidence.kind))
+        .filter(|candidate| {
+            candidate.kind != GuardianInstallArtifactFailureKind::ArtifactMissing
+                || !evidence
+                    .iter()
+                    .any(|other| other.kind != GuardianInstallArtifactFailureKind::ArtifactMissing)
+        })
+        .filter_map(|evidence| {
             let descriptor = descriptors
                 .iter()
-                .find(|descriptor| descriptor.target == fact.target)?;
+                .find(|descriptor| descriptor.target == evidence.target_id)?;
             let descriptor =
                 GuardianMinecraftArtifactRepairDescriptor::from_core_selected_descriptor(
                     descriptor,
                 )
                 .ok()?;
-            let evidence = install_artifact_failure_from_minecraft_download_fact(
-                Some(operation_id.clone()),
-                OwnershipClass::LauncherManaged,
-                fact,
-            )?;
+            if descriptor.target() != repair_target {
+                return None;
+            }
             Some(RepairableInstallArtifact {
                 descriptor,
-                evidence,
+                kind: evidence.kind,
             })
         })
         .next()
 }
 
-fn repairable_install_artifact_fact_kind(kind: ExecutionDownloadFactKind) -> bool {
+fn repairable_install_artifact_kind(kind: GuardianInstallArtifactFailureKind) -> bool {
     matches!(
         kind,
-        ExecutionDownloadFactKind::ArtifactMissing
-            | ExecutionDownloadFactKind::ChecksumMismatch
-            | ExecutionDownloadFactKind::SizeMismatch
-    )
-}
-
-fn artifact_missing_shadowed_by_terminal_failure(
-    fact: &ExecutionDownloadFact,
-    facts: &[ExecutionDownloadFact],
-) -> bool {
-    fact.kind == ExecutionDownloadFactKind::ArtifactMissing
-        && facts.iter().any(|candidate| {
-            candidate.kind != ExecutionDownloadFactKind::ArtifactMissing
-                && terminal_download_failure_fact_kind(candidate.kind)
-        })
-}
-
-fn terminal_download_failure_fact_kind(kind: ExecutionDownloadFactKind) -> bool {
-    matches!(
-        kind,
-        ExecutionDownloadFactKind::ChecksumMismatch
-            | ExecutionDownloadFactKind::MetadataInvalid
-            | ExecutionDownloadFactKind::MetadataMissing
-            | ExecutionDownloadFactKind::Interrupted
-            | ExecutionDownloadFactKind::NetworkFailure
-            | ExecutionDownloadFactKind::OwnershipRefused
-            | ExecutionDownloadFactKind::PermissionFailure
-            | ExecutionDownloadFactKind::PromoteFailed
-            | ExecutionDownloadFactKind::ProviderFailure
-            | ExecutionDownloadFactKind::SizeMismatch
-            | ExecutionDownloadFactKind::TempWriteFailed
+        GuardianInstallArtifactFailureKind::ArtifactMissing
+            | GuardianInstallArtifactFailureKind::ChecksumMismatch
+            | GuardianInstallArtifactFailureKind::SizeMismatch
     )
 }
 

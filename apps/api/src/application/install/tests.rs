@@ -562,12 +562,14 @@ async fn install_existing_active_response_includes_backend_operation_id() {
         .expect("create existing install journal");
     assert!(state.installs().mark_initialized("existing-install").await);
 
-    let response = start_install_version(
+    let producer = state.try_claim_producer().expect("claim install producer");
+    let response = start_install_version_owned(
         &state,
         InstallVersionStartRequest {
             version_id: "1.21.5".to_string(),
             manifest_url: String::new(),
         },
+        &producer,
     )
     .await
     .expect("existing active install should be returned");
@@ -651,7 +653,8 @@ async fn enqueue_prestart_failure_does_not_insert_pending_queue_item() {
     let root = temp_root("install-queue-start-failure-retention");
     let state = build_test_state(&root);
 
-    let error = enqueue_install(
+    let admitted = state.try_admit_request().expect("admit install request");
+    let error = enqueue_install_owned(
         &state,
         InstallQueueRequest {
             kind: "vanilla".to_string(),
@@ -660,6 +663,7 @@ async fn enqueue_prestart_failure_does_not_insert_pending_queue_item() {
             component_id: String::new(),
             build_id: String::new(),
         },
+        admitted.producer_handoff(),
     )
     .await
     .expect_err("missing library should fail before queue insertion");
@@ -1366,46 +1370,29 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
     )
     .await
     .expect("record install journal");
-    record_install_operation_guardian_evidence(
+    let facts = [ExecutionDownloadFact {
+        kind: ExecutionDownloadFactKind::ProviderFailure,
+        target: "minecraft_client_1.21.5".to_string(),
+        fields: vec![
+            (
+                "url".to_string(),
+                "https://example.invalid/client.jar?token=secret".to_string(),
+            ),
+            (
+                "provider_payload".to_string(),
+                "{\"token\":\"secret\"}".to_string(),
+            ),
+        ],
+    }];
+    record_install_failure_outcome_and_repair(
         state.journals(),
+        &GuardianFailureMemoryStore::new(),
         &operation_id,
-        &[ExecutionDownloadFact {
-            kind: ExecutionDownloadFactKind::ProviderFailure,
-            target: "minecraft_client_1.21.5".to_string(),
-            fields: vec![
-                (
-                    "url".to_string(),
-                    "https://example.invalid/client.jar?token=secret".to_string(),
-                ),
-                (
-                    "provider_payload".to_string(),
-                    "{\"token\":\"secret\"}".to_string(),
-                ),
-            ],
-        }],
+        &facts,
+        &[],
+        "2026-07-09T10:00:00+00:00",
     )
-    .await
-    .expect("record install journal");
-    record_install_operation_guardian_failure_outcome(
-        state.journals(),
-        &operation_id,
-        &[ExecutionDownloadFact {
-            kind: ExecutionDownloadFactKind::ProviderFailure,
-            target: "minecraft_client_1.21.5".to_string(),
-            fields: vec![
-                (
-                    "url".to_string(),
-                    "https://example.invalid/client.jar?token=secret".to_string(),
-                ),
-                (
-                    "provider_payload".to_string(),
-                    "{\"token\":\"secret\"}".to_string(),
-                ),
-            ],
-        }],
-    )
-    .await
-    .expect("record install journal");
+    .await;
 
     let response = install_status(&state, install_id)
         .await
@@ -1495,19 +1482,16 @@ async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
             fields: Vec::new(),
         },
     ];
-    record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts)
-        .await
-        .expect("record install journal");
-    record_install_operation_guardian_failure_outcome_for_error_with_memory(
+    record_install_failure_outcome_and_repair_for_error(
         state.journals(),
         &failure_memory,
         &operation_id,
         &error,
         &facts,
+        &[],
         "2026-07-09T10:00:00+00:00",
     )
-    .await
-    .expect("record install journal");
+    .await;
 
     let response = install_status(&state, install_id)
         .await
@@ -1598,19 +1582,16 @@ async fn install_status_exposes_rosetta_required_failure_with_retry() {
             fields: Vec::new(),
         },
     ];
-    record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts)
-        .await
-        .expect("record install journal");
-    record_install_operation_guardian_failure_outcome_for_error_with_memory(
+    record_install_failure_outcome_and_repair_for_error(
         state.journals(),
         &failure_memory,
         &operation_id,
         &error,
         &facts,
+        &[],
         "2026-07-09T10:00:00+00:00",
     )
-    .await
-    .expect("record install journal");
+    .await;
 
     let response = install_status(&state, install_id)
         .await
@@ -1703,19 +1684,16 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
             fields: Vec::new(),
         },
     ];
-    record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts)
-        .await
-        .expect("record install journal");
-    record_install_operation_guardian_failure_outcome_for_error_with_memory(
+    record_install_failure_outcome_and_repair_for_error(
         state.journals(),
         &failure_memory,
         &operation_id,
         &error,
         &facts,
+        &[],
         "2026-07-09T10:05:00+00:00",
     )
-    .await
-    .expect("record install journal");
+    .await;
 
     let response = install_status(&state, install_id)
         .await
@@ -1770,16 +1748,16 @@ async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory
         .await
         .expect("create install journal");
 
-    record_install_operation_guardian_failure_outcome_for_error_with_memory(
+    record_install_failure_outcome_and_repair_for_error(
         &journals,
         &failure_memory,
         &operation_id,
         &error,
         &facts,
+        &[],
         "2026-07-09T10:05:00+00:00",
     )
-    .await
-    .expect("record install journal");
+    .await;
 
     let entries = failure_memory.list();
     let entry = entries
@@ -1945,12 +1923,15 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
                 ("jvm_arg".to_string(), "-Xmx8192M".to_string()),
             ],
         }];
-        record_install_operation_guardian_evidence(state.journals(), &operation_id, &facts)
-            .await
-            .expect("record install journal");
-        record_install_operation_guardian_failure_outcome(state.journals(), &operation_id, &facts)
-            .await
-            .expect("record install journal");
+        record_install_failure_outcome_and_repair(
+            state.journals(),
+            &GuardianFailureMemoryStore::new(),
+            &operation_id,
+            &facts,
+            &[],
+            "2026-07-09T10:00:00+00:00",
+        )
+        .await;
 
         let response = install_status(&state, install_id)
             .await
@@ -3080,8 +3061,9 @@ async fn install_journal_records_guardian_evidence_from_core_download_facts() {
     .await
     .expect("record install journal");
 
-    record_install_operation_guardian_evidence(
+    record_install_failure_outcome_and_repair(
         &journals,
+        &GuardianFailureMemoryStore::new(),
         &operation_id,
         &[
             ExecutionDownloadFact {
@@ -3101,9 +3083,10 @@ async fn install_journal_records_guardian_evidence_from_core_download_facts() {
                 fields: Vec::new(),
             },
         ],
+        &[],
+        "2026-07-09T10:00:00+00:00",
     )
-    .await
-    .expect("record install journal");
+    .await;
 
     let entry = journals.get(&operation_id).expect("journal");
     assert_eq!(entry.status, OperationStatus::Failed);
@@ -3151,12 +3134,15 @@ async fn install_journal_treats_temp_discard_as_non_terminal_evidence_only() {
             "/Users/alice/.axial/libraries/secret.jar".to_string(),
         )],
     }];
-    record_install_operation_guardian_evidence(&journals, &operation_id, &facts)
-        .await
-        .expect("record install journal");
-    record_install_operation_guardian_failure_outcome(&journals, &operation_id, &facts)
-        .await
-        .expect("record install journal");
+    record_install_failure_outcome_and_repair(
+        &journals,
+        &GuardianFailureMemoryStore::new(),
+        &operation_id,
+        &facts,
+        &[],
+        "2026-07-09T10:00:00+00:00",
+    )
+    .await;
 
     let entry = journals.get(&operation_id).expect("journal");
     assert!(install_guardian_outcome_summary_from_journal(&entry).is_none());
@@ -3202,12 +3188,15 @@ async fn install_journal_records_guardian_download_failure_outcome_without_raw_d
             ),
         ],
     }];
-    record_install_operation_guardian_evidence(&journals, &operation_id, &facts)
-        .await
-        .expect("record install journal");
-    record_install_operation_guardian_failure_outcome(&journals, &operation_id, &facts)
-        .await
-        .expect("record install journal");
+    record_install_failure_outcome_and_repair(
+        &journals,
+        &GuardianFailureMemoryStore::new(),
+        &operation_id,
+        &facts,
+        &[],
+        "2026-07-09T10:00:00+00:00",
+    )
+    .await;
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
@@ -3314,15 +3303,18 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
         fields: vec![("status".to_string(), "503".to_string())],
     }];
 
-    record_install_operation_guardian_failure_outcome_with_memory(
-        &journals,
-        &failure_memory,
-        &operation_id,
-        &facts,
-        "2026-06-16T10:00:00+00:00",
+    let (_, policy_evaluations) = crate::guardian::with_guardian_policy_evaluation_count(
+        record_install_failure_outcome_and_repair(
+            &journals,
+            &failure_memory,
+            &operation_id,
+            &facts,
+            &[],
+            "2026-06-16T10:00:00+00:00",
+        ),
     )
-    .await
-    .expect("record install journal");
+    .await;
+    assert_eq!(policy_evaluations, 1);
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
@@ -3349,15 +3341,15 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     )
     .await
     .expect("record install journal");
-    record_install_operation_guardian_failure_outcome_with_memory(
+    record_install_failure_outcome_and_repair(
         &journals,
         &failure_memory,
         &suppressed_operation_id,
         &facts,
+        &[],
         "2026-06-16T10:01:00+00:00",
     )
-    .await
-    .expect("record install journal");
+    .await;
 
     let suppressed_entry = journals.get(&suppressed_operation_id).expect("journal");
     let suppressed =
@@ -3705,18 +3697,18 @@ async fn install_guardian_repair_repairs_matching_checksum_failure() {
         &replacement,
     )];
 
-    let outcome = repair_install_artifact_corruption_with_guardian(
-        &journals,
-        &failure_memory,
-        &reqwest::Client::new(),
-        &operation_id,
-        &facts,
-        &descriptors,
-        "2026-06-15T10:00:00+00:00",
-    )
-    .await
-    .expect("repair journal")
-    .expect("repair outcome");
+    let (outcome, policy_evaluations) =
+        crate::guardian::with_guardian_policy_evaluation_count(record_repairable_install_failure(
+            &journals,
+            &failure_memory,
+            &operation_id,
+            &facts,
+            &descriptors,
+            "2026-06-15T10:00:00+00:00",
+        ))
+        .await;
+    let outcome = outcome.expect("repair outcome");
+    assert_eq!(policy_evaluations, 1);
 
     assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
     assert_eq!(
@@ -3770,12 +3762,14 @@ async fn install_worker_self_heals_corrupt_launcher_artifact_without_guardian_re
     fs::create_dir_all(client_jar.parent().expect("client jar parent")).expect("client jar parent");
     fs::write(&client_jar, vec![b'X'; replacement.len()]).expect("corrupt client jar");
 
-    let response = start_install_version(
+    let producer = state.try_claim_producer().expect("claim install producer");
+    let response = start_install_version_owned(
         &state,
         InstallVersionStartRequest {
             version_id: version_id.to_string(),
             manifest_url: version_server.url.clone(),
         },
+        &producer,
     )
     .await
     .expect("start install");
@@ -3831,17 +3825,15 @@ async fn install_guardian_repair_restores_missing_matching_artifact() {
         &replacement,
     )];
 
-    let outcome = repair_install_artifact_corruption_with_guardian(
+    let outcome = record_repairable_install_failure(
         &journals,
         &failure_memory,
-        &reqwest::Client::new(),
         &operation_id,
         &facts,
         &descriptors,
         "2026-06-15T10:00:00+00:00",
     )
     .await
-    .expect("repair journal")
     .expect("repair outcome");
 
     assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
@@ -3884,17 +3876,15 @@ async fn install_guardian_missing_artifact_repair_blocks_if_target_now_exists() 
         &replacement,
     )];
 
-    let outcome = repair_install_artifact_corruption_with_guardian(
+    let outcome = record_repairable_install_failure(
         &journals,
         &failure_memory,
-        &reqwest::Client::new(),
         &operation_id,
         &facts,
         &descriptors,
         "2026-06-15T10:00:00+00:00",
     )
     .await
-    .expect("repair journal")
     .expect("blocked repair outcome");
 
     assert_eq!(outcome.status, GuardianArtifactRepairStatus::Blocked);
@@ -3942,17 +3932,15 @@ async fn install_guardian_repair_skips_artifact_missing_when_provider_failure_ma
         &replacement,
     )];
 
-    let outcome = repair_install_artifact_corruption_with_guardian(
+    let outcome = record_repairable_install_failure(
         &journals,
         &failure_memory,
-        &reqwest::Client::new(),
         &operation_id,
         &facts,
         &descriptors,
         "2026-06-15T10:00:00+00:00",
     )
-    .await
-    .expect("repair journal");
+    .await;
 
     assert!(outcome.is_none());
     assert!(!destination.exists());
@@ -3990,17 +3978,15 @@ async fn install_guardian_repair_skips_artifact_missing_when_later_terminal_fail
         &replacement,
     )];
 
-    let outcome = repair_install_artifact_corruption_with_guardian(
+    let outcome = record_repairable_install_failure(
         &journals,
         &failure_memory,
-        &reqwest::Client::new(),
         &operation_id,
         &facts,
         &descriptors,
         "2026-06-15T10:00:00+00:00",
     )
-    .await
-    .expect("repair journal");
+    .await;
 
     assert!(outcome.is_none());
     assert!(!destination.exists());
@@ -4026,10 +4012,9 @@ async fn install_guardian_repair_ignores_unrepairable_or_unmatched_facts() {
         b"fresh client",
     )];
 
-    let network_outcome = repair_install_artifact_corruption_with_guardian(
+    let network_outcome = record_repairable_install_failure(
         &journals,
         &failure_memory,
-        &reqwest::Client::new(),
         &operation_id,
         &[download_fact(
             ExecutionDownloadFactKind::NetworkFailure,
@@ -4038,13 +4023,12 @@ async fn install_guardian_repair_ignores_unrepairable_or_unmatched_facts() {
         &descriptors,
         "2026-06-15T10:00:00+00:00",
     )
-    .await
-    .expect("repair journal");
-    let unmatched_outcome = repair_install_artifact_corruption_with_guardian(
+    .await;
+    let unmatched_operation_id = install_operation_id("install-no-repair-unmatched");
+    let unmatched_outcome = record_repairable_install_failure(
         &journals,
         &failure_memory,
-        &reqwest::Client::new(),
-        &operation_id,
+        &unmatched_operation_id,
         &[download_fact(
             ExecutionDownloadFactKind::ChecksumMismatch,
             "other.jar",
@@ -4052,13 +4036,14 @@ async fn install_guardian_repair_ignores_unrepairable_or_unmatched_facts() {
         &descriptors,
         "2026-06-15T10:00:00+00:00",
     )
-    .await
-    .expect("repair journal");
+    .await;
 
     assert!(network_outcome.is_none());
     assert!(unmatched_outcome.is_none());
     assert_eq!(fs::read(&destination).expect("artifact"), b"corrupt client");
-    assert!(failure_memory.list().is_empty());
+    let memory = failure_memory.list();
+    assert_eq!(memory.len(), 1);
+    assert_eq!(memory[0].diagnosis_id, DiagnosisId::DownloadUnavailable);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -4365,6 +4350,28 @@ fn download_fact(kind: ExecutionDownloadFactKind, target: &str) -> ExecutionDown
         target: target.to_string(),
         fields: vec![("algorithm".to_string(), "sha1".to_string())],
     }
+}
+
+async fn record_repairable_install_failure(
+    journals: &OperationJournalStore,
+    failure_memory: &GuardianFailureMemoryStore,
+    operation_id: &OperationId,
+    facts: &[ExecutionDownloadFact],
+    descriptors: &[SelectedDownloadArtifactDescriptor],
+    observed_at: &str,
+) -> Option<GuardianArtifactRepairOutcome> {
+    begin_install_operation_journal(journals, operation_id, "guardian-repair-test")
+        .await
+        .expect("record install journal");
+    record_install_failure_outcome_and_repair(
+        journals,
+        failure_memory,
+        operation_id,
+        facts,
+        descriptors,
+        observed_at,
+    )
+    .await
 }
 
 fn selected_descriptor(

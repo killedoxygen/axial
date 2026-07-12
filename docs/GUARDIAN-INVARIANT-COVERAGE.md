@@ -16,7 +16,7 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | I4 | current_hand_attempt_bounds_registered |
 | I5 | launch_failure_surfaces_bounded_and_redacted |
 | I6 | implemented_memory_trigger_rules_registered |
-| I7 | typed_loader_worker_and_delegated_dispatch_complete |
+| I7 | typed_loader_worker_delegated_dispatch_and_single_install_assessment_complete |
 | I8 | preflight_costs_declared_measurement_pending_phase_4 |
 | I9 | reserved_facts_unused_agent_demo_pending_phase_5 |
 

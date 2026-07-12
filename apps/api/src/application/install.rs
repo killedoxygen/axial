@@ -16,7 +16,10 @@ mod stream;
 pub(crate) use operation::loader_install_guardian_evidence_kind;
 
 use super::InstallVersionCommand;
-use crate::guardian::{DiagnosisId, GuardianArtifactRepairOutcome, GuardianInstallOutcomeSummary};
+use crate::guardian::{
+    DiagnosisId, GuardianArtifactRepairOutcome, GuardianInstallArtifactFailureEvidence,
+    GuardianInstallOutcomeSummary,
+};
 use crate::observability::{
     operation_journal_proof_record,
     telemetry::{
@@ -248,27 +251,26 @@ pub use model::{
     InstallVersionStartRequest, LoaderBuildsRequest, LoaderInstallStartRequest,
 };
 use operation::{
-    InstallProgressCoalescer, install_failure_point_from_journal, install_journal_is_terminal,
-    install_progress_history_from_journal, install_progress_record,
-    install_progress_with_terminal_error, install_repair_facts_from_download_error_or_facts,
-    interrupted_install_progress, observed_install_failure_progress, public_install_id,
+    InstallProgressCoalescer, assess_install_guardian_failure,
+    install_failure_evidence_from_download_error_or_facts,
+    install_failure_evidence_from_download_facts, install_failure_point_from_journal,
+    install_journal_is_terminal, install_progress_history_from_journal, install_progress_record,
+    install_progress_with_terminal_error, interrupted_install_progress,
+    observed_install_failure_progress, public_install_id, record_install_guardian_terminal_outcome,
+    record_install_operation_guardian_evidence,
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome,
 };
 pub use operation::{
     begin_install_operation_journal, install_guardian_outcome_summary_from_journal,
     install_operation_id, loader_install_progress_view_model, public_loader_install_progress_json,
-    public_vanilla_install_progress_json, record_install_operation_guardian_evidence,
-    record_install_operation_guardian_failure_outcome,
-    record_install_operation_guardian_failure_outcome_for_error_with_memory,
-    record_install_operation_guardian_failure_outcome_with_memory,
-    record_install_operation_interrupted, record_install_operation_progress,
-    sanitize_install_progress, stage_install_version_command, vanilla_install_progress_view_model,
+    public_vanilla_install_progress_json, record_install_operation_interrupted,
+    record_install_operation_progress, sanitize_install_progress, stage_install_version_command,
+    vanilla_install_progress_view_model,
 };
-use repair::InstallRepairResume;
+use repair::{InstallRepairResume, repair_install_artifact_corruption_with_guardian};
 pub use repair::{
     install_guardian_repair_summary_from_journal, record_install_operation_guardian_repair_outcome,
-    repair_install_artifact_corruption_with_guardian,
 };
 pub use stream::{install_events_stream, loader_install_events_stream};
 
@@ -535,17 +537,6 @@ pub(crate) async fn start_install_version_owned(
     })
 }
 
-#[cfg(test)]
-pub(crate) async fn start_install_version(
-    state: &AppState,
-    request: InstallVersionStartRequest,
-) -> Result<InstallStartResponse, InstallApplicationError> {
-    let producer = state
-        .try_claim_producer()
-        .expect("claim test install producer");
-    start_install_version_owned(state, request, &producer).await
-}
-
 pub(super) async fn record_install_failure_outcome_and_repair(
     journals: &crate::state::OperationJournalStore,
     failure_memory: &crate::state::GuardianFailureMemoryStore,
@@ -554,27 +545,12 @@ pub(super) async fn record_install_failure_outcome_and_repair(
     install_descriptors: &[SelectedDownloadArtifactDescriptor],
     observed_at: &str,
 ) -> Option<GuardianArtifactRepairOutcome> {
-    if record_install_operation_guardian_evidence(journals, operation_id, install_facts)
-        .await
-        .is_err()
-    {
-        tracing::warn!("failed to commit install Guardian evidence");
-        return None;
-    }
-    record_install_operation_guardian_failure_outcome_with_memory(
+    let evidence = install_failure_evidence_from_download_facts(operation_id, install_facts);
+    record_install_failure_evidence_and_repair(
         journals,
         failure_memory,
         operation_id,
-        install_facts,
-        observed_at,
-    )
-    .await
-    .ok()?;
-    repair_install_failure_with_guardian(
-        journals,
-        failure_memory,
-        operation_id,
-        install_facts,
+        &evidence,
         install_descriptors,
         observed_at,
     )
@@ -590,29 +566,13 @@ pub(super) async fn record_install_failure_outcome_and_repair_for_error(
     install_descriptors: &[SelectedDownloadArtifactDescriptor],
     observed_at: &str,
 ) -> Option<GuardianArtifactRepairOutcome> {
-    if record_install_operation_guardian_evidence(journals, operation_id, install_facts)
-        .await
-        .is_err()
-    {
-        tracing::warn!("failed to commit install Guardian evidence");
-        return None;
-    }
-    record_install_operation_guardian_failure_outcome_for_error_with_memory(
+    let evidence =
+        install_failure_evidence_from_download_error_or_facts(operation_id, error, install_facts);
+    record_install_failure_evidence_and_repair(
         journals,
         failure_memory,
         operation_id,
-        error,
-        install_facts,
-        observed_at,
-    )
-    .await
-    .ok()?;
-    let repair_facts = install_repair_facts_from_download_error_or_facts(error, install_facts);
-    repair_install_failure_with_guardian(
-        journals,
-        failure_memory,
-        operation_id,
-        &repair_facts,
+        &evidence,
         install_descriptors,
         observed_at,
     )
@@ -632,21 +592,55 @@ fn install_error_log_kind(error: &DownloadError) -> &'static str {
     }
 }
 
-async fn repair_install_failure_with_guardian(
+async fn record_install_failure_evidence_and_repair(
     journals: &crate::state::OperationJournalStore,
     failure_memory: &crate::state::GuardianFailureMemoryStore,
     operation_id: &crate::state::contracts::OperationId,
-    install_facts: &[ExecutionDownloadFact],
+    evidence: &[GuardianInstallArtifactFailureEvidence],
     install_descriptors: &[SelectedDownloadArtifactDescriptor],
     observed_at: &str,
 ) -> Option<GuardianArtifactRepairOutcome> {
+    if record_install_operation_guardian_evidence(
+        journals,
+        operation_id,
+        evidence,
+        crate::state::contracts::OperationPhase::Downloading,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("failed to commit install Guardian evidence");
+        return None;
+    }
+    let assessment = assess_install_guardian_failure(
+        Some(failure_memory),
+        operation_id,
+        evidence,
+        crate::state::contracts::OperationPhase::Downloading,
+        observed_at,
+    )?;
+    if record_install_guardian_terminal_outcome(
+        journals,
+        Some(failure_memory),
+        operation_id,
+        evidence,
+        crate::state::contracts::OperationPhase::Downloading,
+        &assessment,
+        observed_at,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("failed to commit install Guardian outcome");
+        return None;
+    }
     let repair_client = reqwest::Client::new();
     let repair_outcome = match repair_install_artifact_corruption_with_guardian(
         journals,
         failure_memory,
         &repair_client,
-        operation_id,
-        install_facts,
+        assessment,
+        evidence,
         install_descriptors,
         observed_at,
     )
@@ -821,17 +815,6 @@ pub(crate) async fn enqueue_install_owned(
     handoff: RequestProducerHandoff,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
     enqueue_install_with_placement(state, request, InstallQueuePlacement::Back, handoff).await
-}
-
-#[cfg(test)]
-pub(crate) async fn enqueue_install(
-    state: &AppState,
-    request: InstallQueueRequest,
-) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    let admitted = state
-        .try_admit_request()
-        .expect("admit test install request");
-    enqueue_install_owned(state, request, admitted.producer_handoff()).await
 }
 
 pub(crate) async fn retry_install_owned(

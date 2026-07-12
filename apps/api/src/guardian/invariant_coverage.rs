@@ -1,3 +1,4 @@
+use super::assess_install_artifact_failure;
 use super::launch_decision::failure_class_matrix_decision;
 use super::repair_authorization::repair_hand_coverage;
 use super::rules::DIAGNOSIS_RULES;
@@ -6,7 +7,7 @@ use super::{
     GuardianInstallArtifactFailureKind, GuardianMode, GuardianPrepareFailureRequest,
     GuardianStartupFailureObservation, GuardianStartupFailureRequest, guardian_fact_from_execution,
     guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
-    install_artifact_failure_guardian_fact, install_artifact_failure_guardian_outcome,
+    install_artifact_failure_guardian_fact,
 };
 use crate::application::install::loader_install_guardian_evidence_kind;
 use crate::application::launch::readiness_guardian_facts_for_coverage;
@@ -218,7 +219,10 @@ fn generate_coverage() -> InvariantCoverage {
             invariant("I4", "current_hand_attempt_bounds_registered"),
             invariant("I5", "launch_failure_surfaces_bounded_and_redacted"),
             invariant("I6", "implemented_memory_trigger_rules_registered"),
-            invariant("I7", "typed_loader_worker_and_delegated_dispatch_complete"),
+            invariant(
+                "I7",
+                "typed_loader_worker_delegated_dispatch_and_single_install_assessment_complete",
+            ),
             invariant("I8", "preflight_costs_declared_measurement_pending_phase_4"),
             invariant("I9", "reserved_facts_unused_agent_demo_pending_phase_5"),
         ],
@@ -630,13 +634,12 @@ fn loader_active_install_adapter_coverage() -> Vec<LoaderActiveInstallAdapterCel
             .with_ownership(ownership)
             .with_field("failure_kind", failure_kind.as_str());
             let fact = install_artifact_failure_guardian_fact(&evidence, phase);
-            let outcome = install_artifact_failure_guardian_outcome(
-                None,
-                GuardianMode::Managed,
-                phase,
-                &[evidence],
-            )
-            .expect("active loader evidence reaches a Guardian outcome");
+            let assessment =
+                assess_install_artifact_failure(None, GuardianMode::Managed, phase, &[evidence])
+                    .expect("active loader evidence reaches a Guardian assessment");
+            let outcome = assessment
+                .terminal_outcome()
+                .expect("active loader assessment has a terminal outcome");
             assert_public_outcome(
                 outcome.user_outcome.decision(),
                 outcome.user_outcome.summary(),

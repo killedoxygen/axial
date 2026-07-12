@@ -8,11 +8,12 @@ use crate::application::{
 };
 use crate::guardian::{
     DiagnosisId, GuardianActionKind, GuardianInstallArtifactFailureEvidence,
-    GuardianInstallArtifactFailureKind, GuardianMode, GuardianPolicyContext, diagnose,
+    GuardianInstallArtifactFailureKind, GuardianInstallAssessment, GuardianMode,
+    GuardianPolicyContext, assess_install_artifact_failure_with_context, diagnose,
     guardian_install_outcome_fact_group, guardian_install_outcome_from_persisted_group,
     guardian_install_outcome_persistence_facts,
     install_artifact_failure_from_minecraft_download_fact, install_artifact_failure_guardian_fact,
-    install_artifact_failure_guardian_outcome_with_context, install_artifact_failure_safety_case,
+    install_artifact_failure_safety_case,
 };
 use crate::observability::{
     RedactionAudience, sanitize_evidence_token, sanitize_public_diagnostic_text,
@@ -220,13 +221,15 @@ pub async fn record_install_operation_interrupted(
         GuardianInstallArtifactFailureKind::NetworkFailure,
     )
     .with_field("phase", phase);
-    let (fact_ids, diagnosis_ids) = install_guardian_evidence_update(
+    let (fact_ids, diagnosis_ids) = assess_install_guardian_failure(
         None,
         operation_id,
         &[evidence],
         OperationPhase::Downloading,
         &chrono::Utc::now().to_rfc3339(),
     )
+    .as_ref()
+    .and_then(install_guardian_terminal_update)
     .unwrap_or_default();
     let step = install_progress_step(
         &safe_progress_phase(&progress.phase),
@@ -278,13 +281,15 @@ pub(super) async fn record_install_operation_initialization_cancelled(
         GuardianInstallArtifactFailureKind::NetworkFailure,
     )
     .with_field("phase", "initializing");
-    let (fact_ids, diagnosis_ids) = install_guardian_evidence_update(
+    let (fact_ids, diagnosis_ids) = assess_install_guardian_failure(
         None,
         operation_id,
         &[evidence],
         OperationPhase::Downloading,
         &chrono::Utc::now().to_rfc3339(),
     )
+    .as_ref()
+    .and_then(install_guardian_terminal_update)
     .unwrap_or_default();
     let step = install_progress_step("initializing", OperationStepResult::Failed, &progress);
     loop {
@@ -321,23 +326,15 @@ pub(super) async fn record_install_operation_initialization_cancelled(
     }
 }
 
-pub async fn record_install_operation_guardian_evidence(
+pub(super) async fn record_install_operation_guardian_evidence(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
-    facts: &[ExecutionDownloadFact],
+    evidence: &[GuardianInstallArtifactFailureEvidence],
+    phase: OperationPhase,
 ) -> Result<(), OperationJournalStoreError> {
-    let guardian_facts = facts
+    let guardian_facts = evidence
         .iter()
-        .filter_map(|fact| {
-            install_artifact_failure_from_minecraft_download_fact(
-                Some(operation_id.clone()),
-                OwnershipClass::LauncherManaged,
-                fact,
-            )
-        })
-        .map(|evidence| {
-            install_artifact_failure_guardian_fact(&evidence, OperationPhase::Downloading)
-        })
+        .map(|evidence| install_artifact_failure_guardian_fact(evidence, phase))
         .collect::<Vec<_>>();
     if guardian_facts.is_empty() {
         return Ok(());
@@ -347,66 +344,12 @@ pub async fn record_install_operation_guardian_evidence(
         .iter()
         .map(|fact| format!("guardian_fact:{}", fact.id.as_str()))
         .collect::<Vec<_>>();
-    let diagnosis_ids = diagnose(&guardian_facts, OperationPhase::Downloading)
+    let diagnosis_ids = diagnose(&guardian_facts, phase)
         .into_iter()
         .map(|diagnosis| diagnosis.id())
         .collect::<Vec<_>>();
     record_guardian_evidence_with_reconciliation(journals, operation_id, fact_ids, diagnosis_ids)
         .await
-}
-
-pub async fn record_install_operation_guardian_failure_outcome(
-    journals: &OperationJournalStore,
-    operation_id: &OperationId,
-    facts: &[ExecutionDownloadFact],
-) -> Result<(), OperationJournalStoreError> {
-    let evidence = install_failure_evidence_from_download_facts(operation_id, facts);
-    record_install_operation_guardian_failure_outcome_from_evidence(
-        journals,
-        operation_id,
-        &evidence,
-    )
-    .await
-}
-
-pub async fn record_install_operation_guardian_failure_outcome_with_memory(
-    journals: &OperationJournalStore,
-    failure_memory: &GuardianFailureMemoryStore,
-    operation_id: &OperationId,
-    facts: &[ExecutionDownloadFact],
-    observed_at: &str,
-) -> Result<(), OperationJournalStoreError> {
-    let evidence = install_failure_evidence_from_download_facts(operation_id, facts);
-    record_install_operation_guardian_failure_outcome_from_evidence_with_memory(
-        journals,
-        Some(failure_memory),
-        operation_id,
-        &evidence,
-        OperationPhase::Downloading,
-        observed_at,
-    )
-    .await
-}
-
-pub async fn record_install_operation_guardian_failure_outcome_for_error_with_memory(
-    journals: &OperationJournalStore,
-    failure_memory: &GuardianFailureMemoryStore,
-    operation_id: &OperationId,
-    error: &DownloadError,
-    facts: &[ExecutionDownloadFact],
-    observed_at: &str,
-) -> Result<(), OperationJournalStoreError> {
-    let evidence =
-        install_failure_evidence_from_download_error_or_facts(operation_id, error, facts);
-    record_install_operation_guardian_failure_outcome_from_evidence_with_memory(
-        journals,
-        Some(failure_memory),
-        operation_id,
-        &evidence,
-        OperationPhase::Downloading,
-        observed_at,
-    )
-    .await
 }
 
 pub(super) async fn record_loader_install_operation_guardian_failure_outcome(
@@ -427,9 +370,9 @@ pub(super) async fn record_loader_install_operation_guardian_failure_outcome(
         kind,
         ownership,
     );
-    record_install_operation_guardian_failure_outcome_from_evidence_with_memory(
+    record_install_terminal_guardian_failure(
         journals,
-        Some(failure_memory),
+        failure_memory,
         operation_id,
         &[evidence],
         phase,
@@ -451,10 +394,11 @@ pub(super) async fn record_loader_base_install_dependency_guardian_failure_outco
     )
     .with_field("dependency", "base_version")
     .with_field("base_version", base_version_id);
-    record_install_operation_guardian_failure_outcome_from_evidence(
+    record_install_terminal_guardian_failure_without_memory(
         journals,
         operation_id,
         &[evidence],
+        OperationPhase::Downloading,
     )
     .await
 }
@@ -885,7 +829,7 @@ fn progress_fraction(progress: &DownloadProgress) -> f32 {
     (progress.current.max(0) as f32 / progress.total as f32).clamp(0.0, 1.0)
 }
 
-fn install_failure_evidence_from_download_facts(
+pub(super) fn install_failure_evidence_from_download_facts(
     operation_id: &OperationId,
     facts: &[ExecutionDownloadFact],
 ) -> Vec<GuardianInstallArtifactFailureEvidence> {
@@ -901,7 +845,7 @@ fn install_failure_evidence_from_download_facts(
         .collect()
 }
 
-fn install_failure_evidence_from_download_error_or_facts(
+pub(super) fn install_failure_evidence_from_download_error_or_facts(
     operation_id: &OperationId,
     error: &DownloadError,
     facts: &[ExecutionDownloadFact],
@@ -1002,34 +946,6 @@ fn install_failure_target_and_kind_from_download_error(
     Some(evidence)
 }
 
-pub(super) fn install_repair_facts_from_download_error_or_facts(
-    error: &DownloadError,
-    facts: &[ExecutionDownloadFact],
-) -> Vec<ExecutionDownloadFact> {
-    if matches!(
-        error,
-        DownloadError::RuntimeRosettaRequired { .. }
-            | DownloadError::RuntimeUnavailableForPlatform { .. }
-    ) {
-        return Vec::new();
-    }
-
-    let terminal_facts = terminal_download_failure_facts_for_error(error, facts);
-    if should_prefer_terminal_download_facts(error) && !terminal_facts.is_empty() {
-        return terminal_facts;
-    }
-
-    if install_failure_target_and_kind_from_download_error(error).is_some() {
-        return Vec::new();
-    }
-
-    if !terminal_facts.is_empty() {
-        return terminal_facts;
-    }
-
-    Vec::new()
-}
-
 fn terminal_download_failure_facts_for_error(
     error: &DownloadError,
     facts: &[ExecutionDownloadFact],
@@ -1088,32 +1004,45 @@ fn terminal_download_failure_fact_kind(kind: ExecutionDownloadFactKind) -> bool 
     )
 }
 
-async fn record_install_operation_guardian_failure_outcome_from_evidence(
+async fn record_install_terminal_guardian_failure_without_memory(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
     evidence: &[GuardianInstallArtifactFailureEvidence],
+    phase: OperationPhase,
 ) -> Result<(), OperationJournalStoreError> {
-    record_install_operation_guardian_failure_outcome_from_evidence_with_memory(
+    record_install_operation_guardian_evidence(journals, operation_id, evidence, phase).await?;
+    let Some(assessment) = assess_install_guardian_failure(
+        None,
+        operation_id,
+        evidence,
+        phase,
+        &chrono::Utc::now().to_rfc3339(),
+    ) else {
+        return Ok(());
+    };
+    record_install_guardian_terminal_outcome(
         journals,
         None,
         operation_id,
         evidence,
-        OperationPhase::Downloading,
-        &chrono::Utc::now().to_rfc3339(),
+        phase,
+        &assessment,
+        "",
     )
     .await
 }
 
-async fn record_install_operation_guardian_failure_outcome_from_evidence_with_memory(
+async fn record_install_terminal_guardian_failure(
     journals: &OperationJournalStore,
-    failure_memory: Option<&GuardianFailureMemoryStore>,
+    failure_memory: &GuardianFailureMemoryStore,
     operation_id: &OperationId,
     evidence: &[GuardianInstallArtifactFailureEvidence],
     phase: OperationPhase,
     observed_at: &str,
 ) -> Result<(), OperationJournalStoreError> {
-    let Some((facts, diagnosis_ids)) = install_guardian_evidence_update(
-        failure_memory,
+    record_install_operation_guardian_evidence(journals, operation_id, evidence, phase).await?;
+    let Some(assessment) = assess_install_guardian_failure(
+        Some(failure_memory),
         operation_id,
         evidence,
         phase,
@@ -1121,7 +1050,82 @@ async fn record_install_operation_guardian_failure_outcome_from_evidence_with_me
     ) else {
         return Ok(());
     };
-    record_guardian_evidence_with_reconciliation(journals, operation_id, facts, diagnosis_ids).await
+    record_install_guardian_terminal_outcome(
+        journals,
+        Some(failure_memory),
+        operation_id,
+        evidence,
+        phase,
+        &assessment,
+        observed_at,
+    )
+    .await
+}
+
+pub(super) fn assess_install_guardian_failure(
+    failure_memory: Option<&GuardianFailureMemoryStore>,
+    operation_id: &OperationId,
+    evidence: &[GuardianInstallArtifactFailureEvidence],
+    phase: OperationPhase,
+    observed_at: &str,
+) -> Option<GuardianInstallAssessment> {
+    let mode = GuardianMode::Managed;
+    let context = failure_memory_suppression_context(
+        failure_memory,
+        Some(operation_id.clone()),
+        mode,
+        phase,
+        evidence,
+        observed_at,
+    );
+    assess_install_artifact_failure_with_context(
+        Some(operation_id.clone()),
+        mode,
+        phase,
+        evidence,
+        context,
+    )
+}
+
+pub(super) async fn record_install_guardian_terminal_outcome(
+    journals: &OperationJournalStore,
+    failure_memory: Option<&GuardianFailureMemoryStore>,
+    operation_id: &OperationId,
+    evidence: &[GuardianInstallArtifactFailureEvidence],
+    phase: OperationPhase,
+    assessment: &GuardianInstallAssessment,
+    observed_at: &str,
+) -> Result<(), OperationJournalStoreError> {
+    let Some(outcome) = assessment.terminal_outcome() else {
+        return Ok(());
+    };
+    record_provider_failure_memory_if_needed(
+        failure_memory,
+        Some(operation_id.clone()),
+        GuardianMode::Managed,
+        phase,
+        evidence,
+        outcome,
+        observed_at,
+    );
+    let facts = guardian_install_outcome_persistence_facts(&outcome.user_outcome);
+    record_guardian_evidence_with_reconciliation(
+        journals,
+        operation_id,
+        facts,
+        vec![outcome.diagnosis_id],
+    )
+    .await
+}
+
+fn install_guardian_terminal_update(
+    assessment: &GuardianInstallAssessment,
+) -> Option<(Vec<String>, Vec<DiagnosisId>)> {
+    let outcome = assessment.terminal_outcome()?;
+    Some((
+        guardian_install_outcome_persistence_facts(&outcome.user_outcome),
+        vec![outcome.diagnosis_id],
+    ))
 }
 
 async fn record_guardian_evidence_with_reconciliation(
@@ -1223,45 +1227,6 @@ fn install_entry_contains_fact(entry: &OperationJournalEntry, fact: &str) -> boo
         .completed_steps
         .last()
         .is_some_and(|step| step.generated_facts.iter().any(|existing| existing == fact))
-}
-
-fn install_guardian_evidence_update(
-    failure_memory: Option<&GuardianFailureMemoryStore>,
-    operation_id: &OperationId,
-    evidence: &[GuardianInstallArtifactFailureEvidence],
-    phase: OperationPhase,
-    observed_at: &str,
-) -> Option<(Vec<String>, Vec<DiagnosisId>)> {
-    let mode = GuardianMode::Managed;
-    let context = failure_memory_suppression_context(
-        failure_memory,
-        Some(operation_id.clone()),
-        mode,
-        phase,
-        evidence,
-        observed_at,
-    );
-    let outcome = install_artifact_failure_guardian_outcome_with_context(
-        Some(operation_id.clone()),
-        mode,
-        phase,
-        evidence,
-        context,
-    )?;
-
-    record_provider_failure_memory_if_needed(
-        failure_memory,
-        Some(operation_id.clone()),
-        mode,
-        phase,
-        evidence,
-        &outcome,
-        observed_at,
-    );
-
-    let facts = guardian_install_outcome_persistence_facts(&outcome.user_outcome);
-
-    Some((facts, vec![outcome.diagnosis_id]))
 }
 
 pub(crate) const fn loader_install_guardian_evidence_kind(

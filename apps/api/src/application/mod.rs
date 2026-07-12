@@ -66,9 +66,8 @@ pub use install::{
     loader_builds, loader_components, loader_game_versions, loader_install_events_stream,
     loader_install_progress_view_model, loader_pre_operation_error_response,
     public_loader_install_progress_json, public_vanilla_install_progress_json,
-    record_install_operation_guardian_evidence, record_install_operation_guardian_repair_outcome,
-    record_install_operation_interrupted, record_install_operation_progress, remove_queued_install,
-    repair_install_artifact_corruption_with_guardian, sanitize_install_progress,
+    record_install_operation_guardian_repair_outcome, record_install_operation_interrupted,
+    record_install_operation_progress, remove_queued_install, sanitize_install_progress,
     stage_install_version_command, vanilla_install_progress_view_model,
 };
 pub(crate) use install::{enqueue_install_owned, install_queue_status_owned, retry_install_owned};

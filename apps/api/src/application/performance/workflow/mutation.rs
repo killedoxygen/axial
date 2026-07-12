@@ -14,7 +14,7 @@ use super::{
 };
 use crate::application::guardian_conversion::api_guardian_mode_from_config;
 use crate::guardian::{
-    GuardianCopyRequest, GuardianFact, GuardianPerformanceOperationKind,
+    GuardianCopyRequest, GuardianFact, GuardianMode, GuardianPerformanceOperationKind,
     GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection,
     GuardianPerformanceSupervisionRequest, GuardianPolicyContext, author_guardian_copy,
     performance_plan_guardian_facts, plan_performance_supervision,
@@ -267,6 +267,7 @@ async fn execute_performance_rollback(
     }
     let supervision = match supervise_performance_operation(
         state,
+        &operation_id,
         GuardianPerformanceOperationKind::RollbackManagedComposition,
         &target_id,
         OperationPhase::RollingBack,
@@ -413,6 +414,7 @@ async fn execute_performance_remove(
     })?;
     let supervision = match supervise_performance_operation(
         state,
+        &operation_id,
         GuardianPerformanceOperationKind::RemoveManagedComposition,
         &target_id,
         OperationPhase::Installing,
@@ -558,6 +560,7 @@ async fn execute_performance_install(
     let guardian_facts = performance_plan_guardian_facts(&plan, OperationPhase::Installing);
     let supervision = match supervise_performance_operation(
         state,
+        &operation_id,
         GuardianPerformanceOperationKind::ApplyManagedComposition,
         &plan.composition_id,
         OperationPhase::Installing,
@@ -677,8 +680,33 @@ async fn execute_performance_install(
     result.map_err(Into::into)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn supervise_performance_operation(
     state: &AppState,
+    operation_id: &OperationId,
+    operation: GuardianPerformanceOperationKind,
+    target_id: &str,
+    phase: OperationPhase,
+    rollback_state: RollbackState,
+    facts: &[GuardianFact],
+    fallback_chain_len: usize,
+) -> Result<GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection> {
+    plan_performance_operation_supervision(
+        api_guardian_mode_from_config(&state.config().current().guardian_mode),
+        operation_id,
+        operation,
+        target_id,
+        phase,
+        rollback_state,
+        facts,
+        fallback_chain_len,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_performance_operation_supervision(
+    mode: GuardianMode,
+    operation_id: &OperationId,
     operation: GuardianPerformanceOperationKind,
     target_id: &str,
     phase: OperationPhase,
@@ -687,8 +715,8 @@ fn supervise_performance_operation(
     fallback_chain_len: usize,
 ) -> Result<GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection> {
     plan_performance_supervision(GuardianPerformanceSupervisionRequest {
-        operation_id: None,
-        mode: api_guardian_mode_from_config(&state.config().current().guardian_mode),
+        operation_id: Some(operation_id.clone()),
+        mode,
         phase,
         operation,
         target: performance_composition_target(target_id),
@@ -875,9 +903,14 @@ fn managed_mutation_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{PERFORMANCE_INSTALL_INTERNAL_ERROR, performance_supervision_error};
-    use crate::guardian::GuardianPerformanceSupervisionRejection;
-    use crate::state::contracts::OperationPhase;
+    use super::{
+        PERFORMANCE_INSTALL_INTERNAL_ERROR, performance_supervision_error,
+        plan_performance_operation_supervision,
+    };
+    use crate::guardian::{
+        GuardianMode, GuardianPerformanceOperationKind, GuardianPerformanceSupervisionRejection,
+    };
+    use crate::state::contracts::{OperationId, OperationPhase, RollbackState};
     use axum::http::StatusCode;
 
     #[test]
@@ -921,5 +954,27 @@ mod tests {
             );
             assert_ne!(message, PERFORMANCE_INSTALL_INTERNAL_ERROR);
         }
+    }
+
+    #[test]
+    fn performance_supervision_carries_the_allocated_operation_id() {
+        let operation_id = OperationId::new("performance-operation-identity");
+        let supervision = plan_performance_operation_supervision(
+            GuardianMode::Managed,
+            &operation_id,
+            GuardianPerformanceOperationKind::RemoveManagedComposition,
+            "managed-composition",
+            OperationPhase::Installing,
+            RollbackState::NotApplicable,
+            &[],
+            0,
+        )
+        .expect("managed removal supervision");
+
+        assert_eq!(
+            supervision.decision.operation_id(),
+            Some(&operation_id),
+            "Performance policy must use the already allocated journal identity"
+        );
     }
 }

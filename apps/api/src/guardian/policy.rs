@@ -6,6 +6,28 @@ use super::{
 use crate::state::contracts::{OperationId, OwnershipClass, StabilizationSystem, TargetDescriptor};
 use serde::Serialize;
 
+#[cfg(test)]
+use std::{cell::Cell, future::Future};
+
+#[cfg(test)]
+tokio::task_local! {
+    static POLICY_EVALUATION_COUNT: Cell<usize>;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_guardian_policy_evaluation_count<F>(future: F) -> (F::Output, usize)
+where
+    F: Future,
+{
+    POLICY_EVALUATION_COUNT
+        .scope(Cell::new(0), async move {
+            let output = future.await;
+            let count = POLICY_EVALUATION_COUNT.with(Cell::get);
+            (output, count)
+        })
+        .await
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct GuardianDecision {
     operation_id: Option<OperationId>,
@@ -375,6 +397,9 @@ pub fn decide_guardian_policy(
     safety_case: &SafetyCase,
     context: GuardianPolicyContext,
 ) -> GuardianDecision {
+    #[cfg(test)]
+    let _ = POLICY_EVALUATION_COUNT.try_with(|count| count.set(count.get().saturating_add(1)));
+
     let diagnoses = safety_case
         .diagnoses
         .iter()
