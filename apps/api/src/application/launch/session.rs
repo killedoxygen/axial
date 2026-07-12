@@ -11,8 +11,9 @@ use super::policy;
 use super::runner::trace_launch_event;
 use crate::application::guardian_conversion::api_guardian_mode;
 use crate::application::timing::{
-    LaunchPreflightFactTiming, LaunchPreflightResponseTiming, LaunchSessionTiming,
-    trace_launch_preflight_facts, trace_launch_preflight_response, trace_launch_session,
+    LaunchPreflightFactTiming, LaunchPreflightResponseTiming, LaunchPreflightSenseTimings,
+    LaunchSessionTiming, trace_launch_preflight_facts, trace_launch_preflight_response,
+    trace_launch_session,
 };
 use crate::application::version::VERSION_SCAN_DEGRADED_MESSAGE;
 use crate::application::{
@@ -582,9 +583,9 @@ async fn build_launch_preflight_facts_with_memory_capture(
     let memory_started_at = Instant::now();
     let memory_evidence = capture_memory();
     let memory_elapsed = memory_started_at.elapsed();
-    let scan_started_at = Instant::now();
+    let installed_versions_started_at = Instant::now();
     let installed_versions = state.installed_versions_snapshot(producer).await;
-    let scan_elapsed = scan_started_at.elapsed();
+    let installed_versions_elapsed = installed_versions_started_at.elapsed();
     let report_matches_launch_root = installed_versions
         .as_ref()
         .is_some_and(|lookup| lookup.library_dir() == library_dir);
@@ -752,7 +753,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
     let readiness_elapsed = readiness_started_at.elapsed();
     let readiness_facts = readiness_guardian_facts(&readiness);
     guardian_facts.extend(readiness_facts.iter().cloned());
-    let guardian_started_at = Instant::now();
+    let guardian_policy_started_at = Instant::now();
     let guardian_outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
         operation_id: None,
         mode: api_guardian_mode(guardian.mode),
@@ -773,18 +774,20 @@ async fn build_launch_preflight_facts_with_memory_capture(
     );
     let guardian_admission = GuardianLaunchAdmission::preflight(&guardian_outcome);
     let guardian_summary = guardian_summary_from_admission(guardian.mode, &guardian_admission);
-    let guardian_elapsed = guardian_started_at.elapsed();
+    let guardian_policy_elapsed = guardian_policy_started_at.elapsed();
 
     trace_launch_preflight_facts(LaunchPreflightFactTiming {
         instance_id: &instance.id,
         version_id: &instance.version_id,
         total: started_at.elapsed(),
-        memory: memory_elapsed,
-        scan: scan_elapsed,
-        overrides: overrides_elapsed,
-        resources: resources_elapsed,
-        readiness: readiness_elapsed,
-        guardian: guardian_elapsed,
+        senses: LaunchPreflightSenseTimings {
+            memory: memory_elapsed,
+            installed_versions: installed_versions_elapsed,
+            overrides: overrides_elapsed,
+            resources: resources_elapsed,
+            readiness: readiness_elapsed,
+            guardian_policy: guardian_policy_elapsed,
+        },
         version_count: version_records.len(),
         readiness_launchable: readiness.launchable,
         reason_count: readiness.reasons.len(),

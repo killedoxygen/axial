@@ -31,7 +31,7 @@
     },
     {
       "id": "I8",
-      "status": "pending_phase_4_timing"
+      "status": "preflight_costs_declared_measurement_pending_phase_4"
     },
     {
       "id": "I9",
@@ -5379,7 +5379,7 @@
       "memory_feedback": false
     }
   ],
-  "senses": [
+  "facts": [
     {
       "fact": "agent_hook_failed",
       "availability": "reserved_phase_5",
@@ -5984,6 +5984,56 @@
       "fact": "watchdog_killed_process",
       "availability": "registered_current",
       "referenced_by_rule": true
+    }
+  ],
+  "preflight_senses": [
+    {
+      "id": "memory",
+      "declared_cost_class": "metadata_io",
+      "timing_signal": "launch_preflight_sense_timing",
+      "measurement_status": "pending_phase_4",
+      "ceiling_ms": null,
+      "evidence": null
+    },
+    {
+      "id": "installed_versions",
+      "declared_cost_class": "content_io",
+      "timing_signal": "launch_preflight_sense_timing",
+      "measurement_status": "pending_phase_4",
+      "ceiling_ms": null,
+      "evidence": null
+    },
+    {
+      "id": "overrides",
+      "declared_cost_class": "external_probe",
+      "timing_signal": "launch_preflight_sense_timing",
+      "measurement_status": "pending_phase_4",
+      "ceiling_ms": null,
+      "evidence": null
+    },
+    {
+      "id": "resources",
+      "declared_cost_class": "metadata_io",
+      "timing_signal": "launch_preflight_sense_timing",
+      "measurement_status": "pending_phase_4",
+      "ceiling_ms": null,
+      "evidence": null
+    },
+    {
+      "id": "readiness",
+      "declared_cost_class": "content_io",
+      "timing_signal": "launch_preflight_sense_timing",
+      "measurement_status": "pending_phase_4",
+      "ceiling_ms": null,
+      "evidence": null
+    },
+    {
+      "id": "guardian_policy",
+      "declared_cost_class": "in_process",
+      "timing_signal": "launch_preflight_sense_timing",
+      "measurement_status": "pending_phase_4",
+      "ceiling_ms": null,
+      "evidence": null
     }
   ],
   "adapters": {

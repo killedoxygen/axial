@@ -15,6 +15,7 @@ use crate::application::install::{
     LoaderGuardianFailureDisposition, loader_install_failure_disposition,
 };
 use crate::application::launch::readiness_guardian_facts_for_coverage;
+use crate::application::timing::{LAUNCH_PREFLIGHT_SENSE_TIMING_SIGNAL, LaunchPreflightSenseId};
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::evidence_text_looks_sensitive;
 use crate::state::contracts::{
@@ -55,7 +56,8 @@ struct InvariantCoverage {
     axes: CoverageAxes,
     kernel_cells: Vec<KernelCell>,
     rules: Vec<RuleCoverage>,
-    senses: Vec<SenseCoverage>,
+    facts: Vec<FactCoverage>,
+    preflight_senses: Vec<PreflightSenseCoverage>,
     adapters: AdapterCoverage,
     memory_feedback: Vec<MemoryFeedbackCoverage>,
     repair_hands: Vec<RepairHandCoverage>,
@@ -102,10 +104,21 @@ struct RuleCoverage {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SenseCoverage {
+struct FactCoverage {
     fact: String,
     availability: String,
     referenced_by_rule: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreflightSenseCoverage {
+    id: String,
+    declared_cost_class: String,
+    timing_signal: String,
+    measurement_status: String,
+    ceiling_ms: Option<u64>,
+    evidence: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -202,7 +215,7 @@ fn generate_coverage() -> InvariantCoverage {
             invariant("I5", "launch_failure_surfaces_bounded_and_redacted"),
             invariant("I6", "launch_failure_mapping_round_trip_only"),
             invariant("I7", "pending_loader_delegation_proof"),
-            invariant("I8", "pending_phase_4_timing"),
+            invariant("I8", "preflight_costs_declared_measurement_pending_phase_4"),
             invariant("I9", "reserved_facts_unused_agent_demo_pending_phase_5"),
         ],
         axes: CoverageAxes {
@@ -215,7 +228,8 @@ fn generate_coverage() -> InvariantCoverage {
         },
         kernel_cells,
         rules: rule_coverage(),
-        senses: sense_coverage(),
+        facts: fact_coverage(),
+        preflight_senses: preflight_sense_coverage(),
         adapters: AdapterCoverage {
             execution: execution_adapter_coverage(),
             install: install_adapter_coverage(),
@@ -488,10 +502,10 @@ fn rule_coverage() -> Vec<RuleCoverage> {
         .collect()
 }
 
-fn sense_coverage() -> Vec<SenseCoverage> {
+fn fact_coverage() -> Vec<FactCoverage> {
     GuardianFactId::ALL
         .iter()
-        .map(|fact| SenseCoverage {
+        .map(|fact| FactCoverage {
             fact: fact_name(fact),
             availability: if RESERVED_AGENT_FACTS.contains(fact) {
                 "reserved_phase_5".to_string()
@@ -501,6 +515,20 @@ fn sense_coverage() -> Vec<SenseCoverage> {
             referenced_by_rule: DIAGNOSIS_RULES
                 .iter()
                 .any(|rule| rule_references_fact(rule, fact)),
+        })
+        .collect()
+}
+
+fn preflight_sense_coverage() -> Vec<PreflightSenseCoverage> {
+    LaunchPreflightSenseId::ALL
+        .iter()
+        .map(|sense| PreflightSenseCoverage {
+            id: sense.as_str().to_string(),
+            declared_cost_class: sense.declared_cost_class().as_str().to_string(),
+            timing_signal: LAUNCH_PREFLIGHT_SENSE_TIMING_SIGNAL.to_string(),
+            measurement_status: "pending_phase_4".to_string(),
+            ceiling_ms: None,
+            evidence: None,
         })
         .collect()
 }
