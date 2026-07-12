@@ -26,6 +26,24 @@ const REPAIR_OPERATION_FACT_PREFIX: &str = "guardian_repair_operation:";
 const REPAIR_STATUS_FACT_PREFIX: &str = "guardian_repair_status:";
 const REPAIR_SUMMARY_FACT_PREFIX: &str = "guardian_repair_summary:";
 
+#[derive(Default)]
+pub(super) struct InstallRepairResume {
+    resumed: bool,
+}
+
+impl InstallRepairResume {
+    pub(super) fn resume_after(&mut self, outcome: Option<&GuardianArtifactRepairOutcome>) -> bool {
+        if self.resumed
+            || !outcome
+                .is_some_and(|outcome| outcome.status == GuardianArtifactRepairStatus::Repaired)
+        {
+            return false;
+        }
+        self.resumed = true;
+        true
+    }
+}
+
 pub async fn record_install_operation_guardian_repair_outcome(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
@@ -234,8 +252,11 @@ fn terminal_download_failure_fact_kind(kind: ExecutionDownloadFactKind) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::install_guardian_repair_summary_from_journal;
-    use crate::guardian::DiagnosisId;
+    use super::{InstallRepairResume, install_guardian_repair_summary_from_journal};
+    use crate::guardian::{
+        DiagnosisId, GuardianActionKind, GuardianArtifactRepairOutcome,
+        GuardianArtifactRepairStatus,
+    };
     use crate::state::contracts::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
         OperationPhase, OperationStepResult, OwnershipClass, RollbackState, StabilizationSystem,
@@ -265,5 +286,45 @@ mod tests {
             .push(DiagnosisId::LauncherManagedArtifactCorrupt);
 
         assert!(install_guardian_repair_summary_from_journal(&entry).is_none());
+    }
+
+    #[test]
+    fn install_repair_resume_is_spent_only_by_the_first_successful_repair() {
+        for status in [
+            GuardianArtifactRepairStatus::Blocked,
+            GuardianArtifactRepairStatus::Failed,
+            GuardianArtifactRepairStatus::Suppressed,
+        ] {
+            let mut resume = InstallRepairResume::default();
+            assert!(!resume.resume_after(None));
+            assert!(!resume.resume_after(Some(&repair_outcome(status))));
+            assert!(resume.resume_after(Some(&repair_outcome(
+                GuardianArtifactRepairStatus::Repaired
+            ))));
+            assert!(!resume.resume_after(Some(&repair_outcome(
+                GuardianArtifactRepairStatus::Repaired
+            ))));
+        }
+    }
+
+    #[test]
+    fn install_repair_resume_allows_exactly_one_rerun_after_repeated_repaired_outcomes() {
+        let mut resume = InstallRepairResume::default();
+        let repaired = repair_outcome(GuardianArtifactRepairStatus::Repaired);
+
+        assert!(resume.resume_after(Some(&repaired)));
+        assert!(!resume.resume_after(Some(&repaired)));
+        assert!(!resume.resume_after(None));
+    }
+
+    fn repair_outcome(status: GuardianArtifactRepairStatus) -> GuardianArtifactRepairOutcome {
+        GuardianArtifactRepairOutcome {
+            operation_id: OperationId::new("guardian-repair"),
+            diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
+            action: GuardianActionKind::Repair,
+            status,
+            facts: Vec::new(),
+            summary: "guardian_artifact_repair".to_string(),
+        }
     }
 }

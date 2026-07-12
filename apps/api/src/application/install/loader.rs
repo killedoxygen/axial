@@ -1,7 +1,8 @@
+use super::repair::InstallRepairResume;
 use super::{
-    BASE_INSTALL_FAILED_MESSAGE, INSTALL_REPAIR_RESUME_MAX_DEPTH, InstallApplicationError,
-    InstallProgressCoalescer, InstallProgressViewModel, InstallStartResponse,
-    LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
+    BASE_INSTALL_FAILED_MESSAGE, InstallApplicationError, InstallProgressCoalescer,
+    InstallProgressViewModel, InstallStartResponse, LOADER_INSTALL_INTERRUPTED_MESSAGE,
+    LoaderBuildsRequest, LoaderInstallStartRequest,
     begin_install_journal_with_owned_reconciliation, emit_install_failed,
     finish_install_progress_task, generate_install_id, install_journal_error_response,
     install_operation_id, operation::install_progress_with_terminal_error,
@@ -15,7 +16,6 @@ use crate::application::{InstallVersionCommand, instances::invalidate_create_vie
 use crate::dto::loaders::{
     LoaderBuildsResponse, LoaderComponentsResponse, LoaderGameVersionsResponse,
 };
-use crate::guardian::GuardianArtifactRepairStatus;
 use crate::install_runtime::prewarm_version_runtime;
 use crate::state::InstallInitializationStatus;
 use crate::state::{AppState, InstallStore, ProducerLease};
@@ -215,7 +215,7 @@ pub(super) async fn start_loader_install_owned(
             }
 
             let final_progress = Arc::new(Mutex::new(None::<DownloadProgress>));
-            let mut repair_resume_depth = 0_u8;
+            let mut repair_resume = InstallRepairResume::default();
             loop {
                 if let Ok(mut final_progress) = final_progress.lock() {
                     *final_progress = None;
@@ -304,12 +304,7 @@ pub(super) async fn start_loader_install_owned(
                             None
                         }
                     };
-                    if repair_resume_depth < INSTALL_REPAIR_RESUME_MAX_DEPTH
-                        && repair_outcome.as_ref().is_some_and(|outcome| {
-                            outcome.status == GuardianArtifactRepairStatus::Repaired
-                        })
-                    {
-                        repair_resume_depth += 1;
+                    if repair_resume.resume_after(repair_outcome.as_ref()) {
                         continue;
                     }
                     let progress = loader_error_progress(&error);

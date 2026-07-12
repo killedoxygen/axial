@@ -13,10 +13,7 @@ mod repair;
 mod stream;
 
 use super::InstallVersionCommand;
-use crate::guardian::{
-    DiagnosisId, GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus,
-    GuardianInstallOutcomeSummary,
-};
+use crate::guardian::{DiagnosisId, GuardianArtifactRepairOutcome, GuardianInstallOutcomeSummary};
 use crate::observability::{
     operation_journal_proof_record,
     telemetry::{
@@ -49,7 +46,6 @@ pub(crate) const LOADER_INSTALL_INTERRUPTED_MESSAGE: &str =
     "Loader install stopped before completing. Try again.";
 pub(crate) const BASE_INSTALL_FAILED_MESSAGE: &str =
     "Base game install failed. Retry the install from Downloads.";
-const INSTALL_REPAIR_RESUME_MAX_DEPTH: u8 = 1;
 const INSTALL_JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const INSTALL_JOURNAL_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
@@ -264,6 +260,7 @@ pub use operation::{
     record_loader_install_operation_guardian_failure_outcome, sanitize_install_progress,
     stage_install_version_command, vanilla_install_progress_view_model,
 };
+use repair::InstallRepairResume;
 pub use repair::{
     install_guardian_repair_summary_from_journal, record_install_operation_guardian_repair_outcome,
     repair_install_artifact_corruption_with_guardian,
@@ -406,7 +403,7 @@ pub(crate) async fn start_install_version_owned(
             };
 
             let downloader = Downloader::new(mc_dir);
-            let mut repair_resume_depth = 0_u8;
+            let mut repair_resume = InstallRepairResume::default();
             let (final_install_succeeded, final_terminal_progress) = loop {
                 if let Ok(mut terminal_progress) = terminal_progress.lock() {
                     *terminal_progress = None;
@@ -474,12 +471,7 @@ pub(crate) async fn start_install_version_owned(
                     &observed_at,
                 )
                 .await;
-                if repair_resume_depth < INSTALL_REPAIR_RESUME_MAX_DEPTH
-                    && repair_outcome.as_ref().is_some_and(|outcome| {
-                        outcome.status == GuardianArtifactRepairStatus::Repaired
-                    })
-                {
-                    repair_resume_depth += 1;
+                if repair_resume.resume_after(repair_outcome.as_ref()) {
                     continue;
                 }
                 break (
