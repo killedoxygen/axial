@@ -328,7 +328,7 @@ pub fn record_launch_failure_observation(
     ))
 }
 
-fn launch_failure_diagnosis_id(failure_class: LaunchFailureClass) -> DiagnosisId {
+pub(super) fn launch_failure_diagnosis_id(failure_class: LaunchFailureClass) -> DiagnosisId {
     match failure_class {
         LaunchFailureClass::Unknown => DiagnosisId::LaunchFailureUnknown,
         LaunchFailureClass::JvmUnsupportedOption => DiagnosisId::JvmUnsupportedOption,
@@ -350,7 +350,9 @@ fn launch_failure_diagnosis_id(failure_class: LaunchFailureClass) -> DiagnosisId
     }
 }
 
-fn launch_failure_class_for_diagnosis(diagnosis_id: DiagnosisId) -> Option<LaunchFailureClass> {
+pub(super) fn launch_failure_class_for_diagnosis(
+    diagnosis_id: DiagnosisId,
+) -> Option<LaunchFailureClass> {
     Some(match diagnosis_id {
         DiagnosisId::LaunchFailureUnknown => LaunchFailureClass::Unknown,
         DiagnosisId::JvmUnsupportedOption => LaunchFailureClass::JvmUnsupportedOption,

@@ -41,6 +41,13 @@ pub(super) fn readiness_guardian_facts(readiness: &LaunchReadiness) -> Vec<Guard
         .collect()
 }
 
+#[cfg(test)]
+pub(crate) fn readiness_guardian_facts_for_coverage(
+    readiness: &LaunchReadiness,
+) -> Vec<GuardianFact> {
+    readiness_guardian_facts(readiness)
+}
+
 fn readiness_guardian_fact_id(reason: LaunchReadinessReasonId) -> GuardianFactId {
     match reason {
         LaunchReadinessReasonId::InstalledVersionsDegraded => {

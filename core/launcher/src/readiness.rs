@@ -39,9 +39,21 @@ pub struct LaunchReadinessReason {
     pub message: &'static str,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LaunchReadinessReasonId {
+macro_rules! launch_readiness_reasons {
+    ($($variant:ident),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum LaunchReadinessReasonId {
+            $($variant),+
+        }
+
+        impl LaunchReadinessReasonId {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
+launch_readiness_reasons! {
     InstalledVersionsDegraded,
     VersionJsonMissing,
     ParentVersionMissing,

@@ -13,6 +13,27 @@ use crate::state::failure_memory::FailureMemoryKey;
 const ARTIFACT_REPAIR_MAX_ATTEMPTS: u32 = 1;
 const RUNTIME_REPAIR_MAX_ATTEMPTS: u32 = 1;
 
+#[cfg(test)]
+pub(super) fn repair_hand_coverage() -> [(&'static str, DiagnosisId, u32); 3] {
+    [
+        (
+            QuarantineRedownload::ID,
+            DiagnosisId::LauncherManagedArtifactCorrupt,
+            ARTIFACT_REPAIR_MAX_ATTEMPTS,
+        ),
+        (
+            MissingDownload::ID,
+            DiagnosisId::LauncherManagedArtifactCorrupt,
+            ARTIFACT_REPAIR_MAX_ATTEMPTS,
+        ),
+        (
+            ReadyMarker::ID,
+            DiagnosisId::ManagedRuntimeCorrupt,
+            RUNTIME_REPAIR_MAX_ATTEMPTS,
+        ),
+    ]
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RepairAuthorizationContext {
     journal_available: bool,
@@ -72,6 +93,21 @@ pub(crate) struct MissingDownload {
 
 pub(crate) struct ReadyMarker {
     _private: (),
+}
+
+impl QuarantineRedownload {
+    #[cfg(test)]
+    const ID: &'static str = "quarantine_redownload";
+}
+
+impl MissingDownload {
+    #[cfg(test)]
+    const ID: &'static str = "missing_download";
+}
+
+impl ReadyMarker {
+    #[cfg(test)]
+    const ID: &'static str = "ready_marker";
 }
 
 mod sealed {

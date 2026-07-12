@@ -25,8 +25,20 @@ use axial_minecraft::download::{
     ExecutionDownloadFactKind as MinecraftDownloadFactKind,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GuardianInstallArtifactFailureKind {
+macro_rules! install_artifact_failure_kinds {
+    ($($variant:ident),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum GuardianInstallArtifactFailureKind {
+            $($variant),+
+        }
+
+        impl GuardianInstallArtifactFailureKind {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
+install_artifact_failure_kinds! {
     ChecksumMismatch,
     SizeMismatch,
     ArtifactMissing,

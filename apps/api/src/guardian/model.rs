@@ -5,12 +5,20 @@ use crate::state::contracts::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum GuardianMode {
-    Managed,
-    Custom,
-    Disabled,
+macro_rules! guardian_modes {
+    ($($variant:ident),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        pub enum GuardianMode {
+            $($variant),+
+        }
+
+        impl GuardianMode {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
 }
+
+guardian_modes!(Managed, Custom, Disabled);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum GuardianFactId {

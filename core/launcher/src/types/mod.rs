@@ -43,67 +43,49 @@ pub enum LaunchState {
     Exited,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LaunchFailureClass {
-    Unknown,
-    JvmUnsupportedOption,
-    JvmExperimentalUnlock,
-    JvmOptionOrdering,
-    JavaRuntimeMismatch,
-    OutOfMemory,
-    GraphicsDriverCrash,
-    MissingDependency,
-    ModTransformationFailure,
-    ModAttributedCrash,
-    ClasspathModuleConflict,
-    LauncherManagedArtifactSignature,
-    AuthModeIncompatible,
-    LoaderBootstrapFailure,
-    StartupStalled,
+macro_rules! launch_failure_classes {
+    ($($variant:ident => $wire:literal),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum LaunchFailureClass {
+            $($variant),+
+        }
+
+        impl LaunchFailureClass {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire),+
+                }
+            }
+
+            pub fn from_name(raw: &str) -> Option<Self> {
+                match raw {
+                    $($wire => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
 }
 
-impl LaunchFailureClass {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::JvmUnsupportedOption => "jvm_unsupported_option",
-            Self::JvmExperimentalUnlock => "jvm_experimental_unlock",
-            Self::JvmOptionOrdering => "jvm_option_ordering",
-            Self::JavaRuntimeMismatch => "java_runtime_mismatch",
-            Self::OutOfMemory => "out_of_memory",
-            Self::GraphicsDriverCrash => "graphics_driver_crash",
-            Self::MissingDependency => "missing_dependency",
-            Self::ModTransformationFailure => "mod_transformation_failure",
-            Self::ModAttributedCrash => "mod_attributed_crash",
-            Self::ClasspathModuleConflict => "classpath_module_conflict",
-            Self::LauncherManagedArtifactSignature => "launcher_managed_artifact_signature",
-            Self::AuthModeIncompatible => "auth_mode_incompatible",
-            Self::LoaderBootstrapFailure => "loader_bootstrap_failure",
-            Self::StartupStalled => "startup_stalled",
-        }
-    }
-
-    pub fn from_name(raw: &str) -> Option<Self> {
-        Some(match raw {
-            "unknown" => Self::Unknown,
-            "jvm_unsupported_option" => Self::JvmUnsupportedOption,
-            "jvm_experimental_unlock" => Self::JvmExperimentalUnlock,
-            "jvm_option_ordering" => Self::JvmOptionOrdering,
-            "java_runtime_mismatch" => Self::JavaRuntimeMismatch,
-            "out_of_memory" => Self::OutOfMemory,
-            "graphics_driver_crash" => Self::GraphicsDriverCrash,
-            "missing_dependency" => Self::MissingDependency,
-            "mod_transformation_failure" => Self::ModTransformationFailure,
-            "mod_attributed_crash" => Self::ModAttributedCrash,
-            "classpath_module_conflict" => Self::ClasspathModuleConflict,
-            "launcher_managed_artifact_signature" => Self::LauncherManagedArtifactSignature,
-            "auth_mode_incompatible" => Self::AuthModeIncompatible,
-            "loader_bootstrap_failure" => Self::LoaderBootstrapFailure,
-            "startup_stalled" => Self::StartupStalled,
-            _ => return None,
-        })
-    }
+launch_failure_classes! {
+    Unknown => "unknown",
+    JvmUnsupportedOption => "jvm_unsupported_option",
+    JvmExperimentalUnlock => "jvm_experimental_unlock",
+    JvmOptionOrdering => "jvm_option_ordering",
+    JavaRuntimeMismatch => "java_runtime_mismatch",
+    OutOfMemory => "out_of_memory",
+    GraphicsDriverCrash => "graphics_driver_crash",
+    MissingDependency => "missing_dependency",
+    ModTransformationFailure => "mod_transformation_failure",
+    ModAttributedCrash => "mod_attributed_crash",
+    ClasspathModuleConflict => "classpath_module_conflict",
+    LauncherManagedArtifactSignature => "launcher_managed_artifact_signature",
+    AuthModeIncompatible => "auth_mode_incompatible",
+    LoaderBootstrapFailure => "loader_bootstrap_failure",
+    StartupStalled => "startup_stalled",
 }
 
 impl FromStr for LaunchFailureClass {
@@ -127,23 +109,7 @@ mod tests {
 
     #[test]
     fn launch_failure_class_strings_match_serde_names() {
-        for class in [
-            LaunchFailureClass::Unknown,
-            LaunchFailureClass::JvmUnsupportedOption,
-            LaunchFailureClass::JvmExperimentalUnlock,
-            LaunchFailureClass::JvmOptionOrdering,
-            LaunchFailureClass::JavaRuntimeMismatch,
-            LaunchFailureClass::OutOfMemory,
-            LaunchFailureClass::GraphicsDriverCrash,
-            LaunchFailureClass::MissingDependency,
-            LaunchFailureClass::ModTransformationFailure,
-            LaunchFailureClass::ModAttributedCrash,
-            LaunchFailureClass::ClasspathModuleConflict,
-            LaunchFailureClass::LauncherManagedArtifactSignature,
-            LaunchFailureClass::AuthModeIncompatible,
-            LaunchFailureClass::LoaderBootstrapFailure,
-            LaunchFailureClass::StartupStalled,
-        ] {
+        for &class in LaunchFailureClass::ALL {
             let serialized = serde_json::to_string(&class).expect("serialize");
             assert_eq!(serialized.trim_matches('"'), class.as_str());
             assert_eq!(

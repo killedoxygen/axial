@@ -554,7 +554,7 @@ fn startup_failure_class(observation: GuardianStartupFailureObservation) -> Laun
     }
 }
 
-fn failure_class_fact_id(failure_class: LaunchFailureClass) -> GuardianFactId {
+pub(super) fn failure_class_fact_id(failure_class: LaunchFailureClass) -> GuardianFactId {
     match failure_class {
         LaunchFailureClass::JavaRuntimeMismatch => GuardianFactId::JavaMajorMismatch,
         LaunchFailureClass::JvmUnsupportedOption => GuardianFactId::JvmArgUnsupported,
@@ -576,6 +576,57 @@ fn failure_class_fact_id(failure_class: LaunchFailureClass) -> GuardianFactId {
         LaunchFailureClass::StartupStalled => GuardianFactId::StartupWindowExpired,
         LaunchFailureClass::Unknown => GuardianFactId::UnknownLaunchFailure,
     }
+}
+
+#[cfg(test)]
+pub(super) fn failure_class_matrix_decision(
+    failure_class: LaunchFailureClass,
+    phase: OperationPhase,
+    mode: GuardianMode,
+) -> GuardianDecision {
+    let domain = match failure_class {
+        LaunchFailureClass::JavaRuntimeMismatch => GuardianDomain::Runtime,
+        LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering => GuardianDomain::Jvm,
+        LaunchFailureClass::LauncherManagedArtifactSignature => GuardianDomain::Download,
+        LaunchFailureClass::Unknown
+        | LaunchFailureClass::OutOfMemory
+        | LaunchFailureClass::GraphicsDriverCrash
+        | LaunchFailureClass::MissingDependency
+        | LaunchFailureClass::ModTransformationFailure
+        | LaunchFailureClass::ModAttributedCrash
+        | LaunchFailureClass::ClasspathModuleConflict
+        | LaunchFailureClass::AuthModeIncompatible
+        | LaunchFailureClass::LoaderBootstrapFailure
+        | LaunchFailureClass::StartupStalled => GuardianDomain::Startup,
+    };
+    let mut facts = vec![
+        launch_fact(
+            failure_class_fact_id(failure_class),
+            domain,
+            phase,
+            OwnershipClass::LauncherManaged,
+            "launch_failure",
+        ),
+        condition_fact(GuardianFactId::LaunchFailureClassified, phase),
+    ];
+    if phase == OperationPhase::Launching {
+        facts.push(GuardianFact {
+            operation_id: None,
+            id: GuardianFactId::ProcessExitedBeforeBoot,
+            domain: GuardianDomain::Session,
+            phase,
+            reliability: FactReliability::ProcessLifecycle,
+            severity: None,
+            confidence: None,
+            ownership: OwnershipClass::LauncherManaged,
+            target: None,
+            fields: Vec::new(),
+        });
+    }
+    let safety_case = build_safety_case(None, mode, phase, &facts);
+    decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation())
 }
 
 fn is_legacy_version_family(version_id: &str) -> bool {

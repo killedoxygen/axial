@@ -51,6 +51,8 @@ pub fn snapshot_status(
 }
 #[cfg(test)]
 use session::prepare_launch_session;
+#[cfg(test)]
+pub(crate) use session::readiness_guardian_facts_for_coverage;
 pub use session::{
     LaunchPreflightMemory, LaunchPreflightOverride, LaunchPreflightOverrides,
     LaunchPreflightResourceBudget, LaunchPreflightResponse, LaunchRequest,

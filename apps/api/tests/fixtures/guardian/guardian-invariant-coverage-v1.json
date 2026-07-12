@@ -1,0 +1,6424 @@
+{
+  "schema": "axial.guardian.invariant_coverage.v1",
+  "invariants": [
+    {
+      "id": "I1",
+      "status": "launch_failure_matrix_and_rules_registered"
+    },
+    {
+      "id": "I2",
+      "status": "current_typed_hands_registered"
+    },
+    {
+      "id": "I3",
+      "status": "pending_prepare_failure_guidance"
+    },
+    {
+      "id": "I4",
+      "status": "current_hand_attempt_bounds_registered"
+    },
+    {
+      "id": "I5",
+      "status": "launch_failure_surfaces_bounded_and_redacted"
+    },
+    {
+      "id": "I6",
+      "status": "launch_failure_mapping_round_trip_only"
+    },
+    {
+      "id": "I7",
+      "status": "pending_loader_error_classification"
+    },
+    {
+      "id": "I8",
+      "status": "pending_phase_4_timing"
+    },
+    {
+      "id": "I9",
+      "status": "reserved_facts_unused_agent_demo_pending_phase_5"
+    }
+  ],
+  "axes": {
+    "failure_classes": [
+      "unknown",
+      "jvm_unsupported_option",
+      "jvm_experimental_unlock",
+      "jvm_option_ordering",
+      "java_runtime_mismatch",
+      "out_of_memory",
+      "graphics_driver_crash",
+      "missing_dependency",
+      "mod_transformation_failure",
+      "mod_attributed_crash",
+      "classpath_module_conflict",
+      "launcher_managed_artifact_signature",
+      "auth_mode_incompatible",
+      "loader_bootstrap_failure",
+      "startup_stalled"
+    ],
+    "phases": [
+      "Startup",
+      "Planning",
+      "Validating",
+      "Downloading",
+      "Installing",
+      "Preparing",
+      "Launching",
+      "Running",
+      "Repairing",
+      "RollingBack",
+      "Completed",
+      "Failed"
+    ],
+    "modes": [
+      "Managed",
+      "Custom",
+      "Disabled"
+    ]
+  },
+  "kernel_cells": [
+    {
+      "failure_class": "unknown",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "startup_failed_unknown",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "startup_failed_unknown",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "startup_failed_unknown",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "unknown",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Strip",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "AskUser",
+      "public_surface": false
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "jvm_arg_unsupported",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Fallback",
+      "public_surface": false
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "java_runtime_major_mismatch",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "out_of_memory",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "out_of_memory",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "out_of_memory",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "out_of_memory",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "graphics_driver_crash",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "graphics_driver_crash",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "graphics_driver_crash",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "missing_dependency",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "missing_dependency",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "missing_dependency",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "missing_dependency",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "mod_transformation_failure",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "mod_transformation_failure",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "mod_transformation_failure",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "mod_attributed_crash",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "mod_attributed_crash",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "mod_attributed_crash",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "classpath_module_conflict",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "classpath_module_conflict",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "classpath_module_conflict",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "decision": "Block",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "auth_mode_incompatible",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "auth_mode_incompatible",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "auth_mode_incompatible",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "loader_bootstrap_failure",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "loader_bootstrap_failure",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "loader_bootstrap_failure",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_startup",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Planning",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Planning",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Planning",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_planning",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Validating",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Validating",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Validating",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_validating",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Downloading",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Downloading",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Downloading",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_downloading",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Installing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Installing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Installing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_installing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Preparing",
+      "mode": "Managed",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Preparing",
+      "mode": "Custom",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Preparing",
+      "mode": "Disabled",
+      "diagnosis": "launch_prepare_failed",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Launching",
+      "mode": "Managed",
+      "diagnosis": "startup_stalled",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Launching",
+      "mode": "Custom",
+      "diagnosis": "startup_stalled",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Launching",
+      "mode": "Disabled",
+      "diagnosis": "startup_stalled",
+      "decision": "Block",
+      "public_surface": true
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Running",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Running",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Running",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_running",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Repairing",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Repairing",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Repairing",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_repairing",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "RollingBack",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "RollingBack",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "RollingBack",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_rolling_back",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Completed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Completed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Completed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_completed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Failed",
+      "mode": "Managed",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Failed",
+      "mode": "Custom",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    },
+    {
+      "failure_class": "startup_stalled",
+      "phase": "Failed",
+      "mode": "Disabled",
+      "diagnosis": "unknown_failure_failed",
+      "decision": "RecordOnly",
+      "public_surface": false
+    }
+  ],
+  "rules": [
+    {
+      "diagnosis": "java_override_unavailable",
+      "triggers": [
+        "java_override_empty",
+        "java_override_missing",
+        "java_override_undefined_sentinel"
+      ],
+      "evidence": [
+        "java_override_empty",
+        "java_override_missing",
+        "java_override_undefined_sentinel"
+      ],
+      "phases": [],
+      "actions": [
+        "Fallback",
+        "AskUser",
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "java_probe_failed",
+      "triggers": [
+        "java_probe_failed"
+      ],
+      "evidence": [
+        "java_probe_failed"
+      ],
+      "phases": [],
+      "actions": [
+        "Fallback",
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "java_runtime_major_mismatch",
+      "triggers": [
+        "java_major_mismatch"
+      ],
+      "evidence": [
+        "java_major_mismatch"
+      ],
+      "phases": [],
+      "actions": [
+        "Fallback",
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "java_runtime_update_too_old",
+      "triggers": [
+        "java_update_too_old"
+      ],
+      "evidence": [
+        "java_update_too_old"
+      ],
+      "phases": [],
+      "actions": [
+        "Fallback",
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "managed_runtime_missing",
+      "triggers": [
+        "managed_runtime_missing"
+      ],
+      "evidence": [
+        "managed_runtime_missing"
+      ],
+      "phases": [],
+      "actions": [
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "managed_runtime_unavailable_for_platform",
+      "triggers": [
+        "managed_runtime_unavailable_for_platform"
+      ],
+      "evidence": [
+        "managed_runtime_unavailable_for_platform"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "managed_runtime_rosetta_required",
+      "triggers": [
+        "managed_runtime_rosetta_required"
+      ],
+      "evidence": [
+        "managed_runtime_rosetta_required"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "managed_runtime_corrupt",
+      "triggers": [
+        "managed_runtime_ready_marker_missing",
+        "managed_runtime_corrupt"
+      ],
+      "evidence": [
+        "managed_runtime_ready_marker_missing",
+        "managed_runtime_corrupt"
+      ],
+      "phases": [],
+      "actions": [
+        "Repair",
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "installed_version_metadata_missing",
+      "triggers": [
+        "version_json_missing"
+      ],
+      "evidence": [
+        "version_json_missing"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "parent_version_metadata_missing",
+      "triggers": [
+        "parent_version_missing"
+      ],
+      "evidence": [
+        "parent_version_missing"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "install_incomplete",
+      "triggers": [
+        "incomplete_install"
+      ],
+      "evidence": [
+        "incomplete_install"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "client_jar_missing",
+      "triggers": [
+        "client_jar_missing"
+      ],
+      "evidence": [
+        "client_jar_missing"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "libraries_missing",
+      "triggers": [
+        "libraries_missing"
+      ],
+      "evidence": [
+        "libraries_missing"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "asset_index_missing",
+      "triggers": [
+        "asset_index_missing"
+      ],
+      "evidence": [
+        "asset_index_missing"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "launch_command_invalid",
+      "triggers": [
+        "launch_command_invalid"
+      ],
+      "evidence": [
+        "launch_command_invalid"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "launch_command_prepared",
+      "triggers": [
+        "launch_command_prepared"
+      ],
+      "evidence": [
+        "launch_command_prepared"
+      ],
+      "phases": [],
+      "actions": [
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "launch_memory_min_clamped",
+      "triggers": [
+        "launch_memory_min_clamped"
+      ],
+      "evidence": [
+        "launch_memory_min_clamped"
+      ],
+      "phases": [],
+      "actions": [
+        "Warn",
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "launch_memory_allocation_low",
+      "triggers": [
+        "launch_memory_allocation_low"
+      ],
+      "evidence": [
+        "launch_memory_allocation_low"
+      ],
+      "phases": [],
+      "actions": [
+        "Warn",
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "launch_resource_memory_pressure",
+      "triggers": [
+        "launch_resource_memory_pressure"
+      ],
+      "evidence": [
+        "launch_resource_memory_pressure"
+      ],
+      "phases": [],
+      "actions": [
+        "Warn",
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "launch_resource_cpu_pressure",
+      "triggers": [
+        "launch_resource_cpu_pressure"
+      ],
+      "evidence": [
+        "launch_resource_cpu_pressure"
+      ],
+      "phases": [],
+      "actions": [
+        "Warn",
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "launch_resource_install_pressure",
+      "triggers": [
+        "launch_resource_install_pressure"
+      ],
+      "evidence": [
+        "launch_resource_install_pressure"
+      ],
+      "phases": [],
+      "actions": [
+        "Warn",
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "launch_resource_disk_pressure",
+      "triggers": [
+        "launch_resource_disk_pressure"
+      ],
+      "evidence": [
+        "launch_resource_disk_pressure"
+      ],
+      "phases": [],
+      "actions": [
+        "Warn",
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "custom_java_override_present",
+      "triggers": [
+        "custom_java_override_present"
+      ],
+      "evidence": [
+        "custom_java_override_present"
+      ],
+      "phases": [],
+      "actions": [
+        "Warn",
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "custom_jvm_preset_present",
+      "triggers": [
+        "custom_jvm_preset_present"
+      ],
+      "evidence": [
+        "custom_jvm_preset_present"
+      ],
+      "phases": [],
+      "actions": [
+        "Warn",
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "custom_jvm_args_present",
+      "triggers": [
+        "custom_jvm_args_present"
+      ],
+      "evidence": [
+        "custom_jvm_args_present"
+      ],
+      "phases": [],
+      "actions": [
+        "Warn",
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "jvm_args_empty",
+      "triggers": [
+        "jvm_args_empty"
+      ],
+      "evidence": [
+        "jvm_args_empty"
+      ],
+      "phases": [],
+      "actions": [
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "jvm_args_malformed",
+      "triggers": [
+        "jvm_args_parse_failed"
+      ],
+      "evidence": [
+        "jvm_args_parse_failed"
+      ],
+      "phases": [],
+      "actions": [
+        "Strip",
+        "AskUser",
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "jvm_arg_unsupported",
+      "triggers": [
+        "jvm_arg_unsupported_gc",
+        "jvm_arg_unlock_order_invalid",
+        "jvm_arg_unsupported",
+        "jvm_arg_experimental_unlock_missing"
+      ],
+      "evidence": [
+        "jvm_arg_unsupported_gc",
+        "jvm_arg_unlock_order_invalid",
+        "jvm_arg_unsupported",
+        "jvm_arg_experimental_unlock_missing"
+      ],
+      "phases": [],
+      "actions": [
+        "Strip",
+        "AskUser",
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "jvm_arg_unsafe_override",
+      "triggers": [
+        "jvm_arg_reserved_launcher_flag",
+        "jvm_arg_memory_conflict",
+        "jvm_arg_unsafe_classpath_override",
+        "jvm_arg_unsafe_native_path_override",
+        "jvm_arg_agent_override"
+      ],
+      "evidence": [
+        "jvm_arg_reserved_launcher_flag",
+        "jvm_arg_memory_conflict",
+        "jvm_arg_unsafe_classpath_override",
+        "jvm_arg_unsafe_native_path_override",
+        "jvm_arg_agent_override"
+      ],
+      "phases": [],
+      "actions": [
+        "Strip",
+        "AskUser",
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "launcher_managed_artifact_signature_corrupt",
+      "triggers": [
+        "launcher_managed_artifact_signature_corruption"
+      ],
+      "evidence": [
+        "launcher_managed_artifact_signature_corruption"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "launcher_managed_artifact_corrupt",
+      "triggers": [
+        "artifact_checksum_mismatch",
+        "artifact_size_mismatch",
+        "managed_file_corrupt",
+        "artifact_missing"
+      ],
+      "evidence": [
+        "artifact_checksum_mismatch",
+        "artifact_size_mismatch",
+        "managed_file_corrupt",
+        "artifact_missing"
+      ],
+      "phases": [],
+      "actions": [
+        "Quarantine",
+        "Repair",
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "install_artifact_metadata_invalid",
+      "triggers": [
+        "provider_data_invalid"
+      ],
+      "evidence": [
+        "provider_data_invalid"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "install_dependency_failed",
+      "triggers": [
+        "install_dependency_failed"
+      ],
+      "evidence": [
+        "install_dependency_failed"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "download_unavailable",
+      "triggers": [
+        "download_provider_unavailable",
+        "download_interrupted"
+      ],
+      "evidence": [
+        "download_provider_unavailable",
+        "download_interrupted"
+      ],
+      "phases": [],
+      "actions": [
+        "Retry",
+        "AskUser",
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "filesystem_permission_denied",
+      "triggers": [
+        "filesystem_permission_denied"
+      ],
+      "evidence": [
+        "filesystem_permission_denied"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "temp_file_leftover",
+      "triggers": [
+        "temp_file_leftover"
+      ],
+      "evidence": [
+        "temp_file_leftover"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "atomic_promotion_failed",
+      "triggers": [
+        "atomic_promotion_failed"
+      ],
+      "evidence": [
+        "atomic_promotion_failed"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "artifact_ownership_unsafe",
+      "triggers": [
+        "ownership_unknown",
+        "primitive_refused"
+      ],
+      "evidence": [
+        "ownership_unknown",
+        "primitive_refused"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "performance_rules_invalid",
+      "triggers": [
+        "performance_rules_invalid"
+      ],
+      "evidence": [
+        "performance_rules_invalid"
+      ],
+      "phases": [],
+      "actions": [
+        "RecordOnly",
+        "Warn"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "performance_health_degraded",
+      "triggers": [
+        "performance_health_degraded"
+      ],
+      "evidence": [
+        "performance_health_degraded"
+      ],
+      "phases": [],
+      "actions": [
+        "RecordOnly",
+        "Warn"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "performance_health_invalid",
+      "triggers": [
+        "performance_health_invalid"
+      ],
+      "evidence": [
+        "performance_health_invalid"
+      ],
+      "phases": [],
+      "actions": [
+        "RecordOnly",
+        "Warn"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "performance_fallback_selected",
+      "triggers": [
+        "performance_fallback_selected",
+        "performance_health_fallback"
+      ],
+      "evidence": [
+        "performance_fallback_selected",
+        "performance_health_fallback"
+      ],
+      "phases": [],
+      "actions": [
+        "RecordOnly",
+        "Warn"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "performance_repeated_failure_memory",
+      "triggers": [
+        "performance_repeated_failure_memory"
+      ],
+      "evidence": [
+        "performance_repeated_failure_memory"
+      ],
+      "phases": [],
+      "actions": [
+        "RecordOnly",
+        "Warn"
+      ],
+      "memory_feedback": true
+    },
+    {
+      "diagnosis": "performance_user_owned_conflict",
+      "triggers": [
+        "performance_user_owned_conflict"
+      ],
+      "evidence": [
+        "performance_user_owned_conflict"
+      ],
+      "phases": [],
+      "actions": [
+        "RecordOnly",
+        "Warn",
+        "AskUser",
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "process_lifecycle_observed",
+      "triggers": [
+        "process_spawned",
+        "launcher_stop_requested",
+        "watchdog_killed_process",
+        "exit_code_zero",
+        "exit_code_nonzero",
+        "exit_code_unknown",
+        "boot_marker_observed",
+        "process_exited",
+        "process_exited_before_boot",
+        "process_exited_after_boot"
+      ],
+      "evidence": [
+        "process_spawned",
+        "launcher_stop_requested",
+        "watchdog_killed_process",
+        "exit_code_zero",
+        "exit_code_nonzero",
+        "exit_code_unknown",
+        "boot_marker_observed",
+        "process_exited",
+        "process_exited_before_boot",
+        "process_exited_after_boot"
+      ],
+      "phases": [],
+      "actions": [
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "persisted_state_schema_invalid",
+      "triggers": [
+        "persisted_state_schema_invalid"
+      ],
+      "evidence": [
+        "persisted_state_schema_invalid"
+      ],
+      "phases": [],
+      "actions": [
+        "Warn",
+        "RecordOnly"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "jvm_preset_adjusted",
+      "triggers": [
+        "jvm_preset_compatibility_adjusted"
+      ],
+      "evidence": [
+        "jvm_preset_compatibility_adjusted"
+      ],
+      "phases": [
+        "Preparing"
+      ],
+      "actions": [
+        "Downgrade",
+        "AskUser",
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "launch_prepare_failed",
+      "triggers": [
+        "out_of_memory",
+        "graphics_driver_crash",
+        "missing_dependency",
+        "mod_transformation_failure",
+        "mod_attributed_crash",
+        "classpath_module_conflict",
+        "launcher_managed_artifact_signature_corruption",
+        "auth_mode_incompatible",
+        "loader_bootstrap_failure",
+        "startup_window_expired",
+        "unknown_launch_failure"
+      ],
+      "evidence": [
+        "out_of_memory",
+        "graphics_driver_crash",
+        "missing_dependency",
+        "mod_transformation_failure",
+        "mod_attributed_crash",
+        "classpath_module_conflict",
+        "launcher_managed_artifact_signature_corruption",
+        "auth_mode_incompatible",
+        "loader_bootstrap_failure",
+        "startup_window_expired",
+        "unknown_launch_failure"
+      ],
+      "phases": [
+        "Preparing"
+      ],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "startup_stalled",
+      "triggers": [
+        "startup_window_expired"
+      ],
+      "evidence": [
+        "startup_window_expired"
+      ],
+      "phases": [
+        "Launching"
+      ],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "out_of_memory",
+      "triggers": [
+        "out_of_memory"
+      ],
+      "evidence": [
+        "process_exited_before_boot",
+        "out_of_memory"
+      ],
+      "phases": [
+        "Launching"
+      ],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "graphics_driver_crash",
+      "triggers": [
+        "graphics_driver_crash"
+      ],
+      "evidence": [
+        "process_exited_before_boot",
+        "graphics_driver_crash"
+      ],
+      "phases": [
+        "Launching"
+      ],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "missing_dependency",
+      "triggers": [
+        "missing_dependency"
+      ],
+      "evidence": [
+        "process_exited_before_boot",
+        "missing_dependency"
+      ],
+      "phases": [
+        "Launching"
+      ],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "mod_transformation_failure",
+      "triggers": [
+        "mod_transformation_failure"
+      ],
+      "evidence": [
+        "process_exited_before_boot",
+        "mod_transformation_failure"
+      ],
+      "phases": [
+        "Launching"
+      ],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "mod_attributed_crash",
+      "triggers": [
+        "mod_attributed_crash"
+      ],
+      "evidence": [
+        "process_exited_before_boot",
+        "mod_attributed_crash"
+      ],
+      "phases": [
+        "Launching"
+      ],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "classpath_module_conflict",
+      "triggers": [
+        "classpath_module_conflict"
+      ],
+      "evidence": [
+        "process_exited_before_boot",
+        "classpath_module_conflict"
+      ],
+      "phases": [
+        "Launching"
+      ],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "auth_mode_incompatible",
+      "triggers": [
+        "auth_mode_incompatible"
+      ],
+      "evidence": [
+        "process_exited_before_boot",
+        "auth_mode_incompatible"
+      ],
+      "phases": [
+        "Launching"
+      ],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "loader_bootstrap_failure",
+      "triggers": [
+        "loader_bootstrap_failure"
+      ],
+      "evidence": [
+        "process_exited_before_boot",
+        "loader_bootstrap_failure"
+      ],
+      "phases": [
+        "Launching"
+      ],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "startup_failed_unknown",
+      "triggers": [
+        "unknown_launch_failure"
+      ],
+      "evidence": [
+        "process_exited_before_boot",
+        "unknown_launch_failure"
+      ],
+      "phases": [
+        "Launching"
+      ],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    }
+  ],
+  "senses": [
+    {
+      "fact": "agent_hook_failed",
+      "availability": "reserved_phase_5",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "agent_unavailable",
+      "availability": "reserved_phase_5",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "artifact_checksum_mismatch",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "artifact_missing",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "artifact_quarantined",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "artifact_size_mismatch",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "artifact_verified",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "asset_index_missing",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "atomic_promotion_completed",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "atomic_promotion_failed",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "auth_mode_incompatible",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "boot_marker_observed",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "boot_milestone_overdue",
+      "availability": "reserved_phase_5",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "boot_milestone_reached",
+      "availability": "reserved_phase_5",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "classpath_module_conflict",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "client_jar_missing",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "custom_java_override_present",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "custom_jvm_args_present",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "custom_jvm_preset_present",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "download_interrupted",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "download_provider_unavailable",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "download_temp_discarded",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "download_written_to_temp",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "exit_code_nonzero",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "exit_code_unknown",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "exit_code_zero",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "file_written_to_temp",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "filesystem_locked",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "filesystem_permission_denied",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "frame_budget_exceeded",
+      "availability": "reserved_phase_5",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "gc_pause_storm",
+      "availability": "reserved_phase_5",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "graphics_driver_crash",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "heap_pressure_critical",
+      "availability": "reserved_phase_5",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "incomplete_install",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "install_dependency_failed",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "installed_versions_degraded",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "java_major_mismatch",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "java_override_empty",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "java_override_missing",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "java_override_undefined_sentinel",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "java_probe_failed",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "java_update_too_old",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "jvm_arg_agent_override",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "jvm_arg_experimental_unlock_missing",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "jvm_arg_memory_conflict",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "jvm_arg_reserved_launcher_flag",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "jvm_arg_unlock_order_invalid",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "jvm_arg_unsafe_classpath_override",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "jvm_arg_unsafe_native_path_override",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "jvm_arg_unsupported",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "jvm_arg_unsupported_gc",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "jvm_args_empty",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "jvm_args_parse_failed",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "jvm_preset_compatibility_adjusted",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launch_command_invalid",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launch_command_prepared",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launch_failure_classified",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launch_jvm_preset_downgrade_available",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launch_jvm_strip_available",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launch_memory_allocation_low",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launch_memory_min_clamped",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launch_resource_cpu_pressure",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launch_resource_disk_pressure",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launch_resource_install_pressure",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launch_resource_memory_pressure",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launch_runtime_fallback_available",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launcher_managed_artifact_signature_corruption",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "launcher_stop_requested",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "libraries_missing",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "loader_bootstrap_failure",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "managed_file_corrupt",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "managed_runtime_corrupt",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "managed_runtime_missing",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "managed_runtime_ready_marker_missing",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "managed_runtime_repair_applied",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "managed_runtime_rosetta_required",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "managed_runtime_unavailable_for_platform",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "missing_dependency",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "mod_attributed_crash",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "mod_transformation_failure",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "no_structured_fact_completed",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_downloading",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_failed",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_installing",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_launching",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_planning",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_preparing",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_repairing",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_rolling_back",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_running",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_startup",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "no_structured_fact_validating",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "out_of_memory",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "ownership_unknown",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "parent_version_missing",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "performance_fallback_selected",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "performance_health_degraded",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "performance_health_fallback",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "performance_health_invalid",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "performance_repeated_failure_memory",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "performance_rules_invalid",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "performance_user_owned_conflict",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "persisted_state_schema_invalid",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "primitive_refused",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "process_exited",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "process_exited_after_boot",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "process_exited_before_boot",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "process_spawned",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "provider_data_invalid",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "recent_repair_failed",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "recent_startup_failure",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "repair_suppressed_until",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "rollback_available",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "rollback_unavailable",
+      "availability": "registered_current",
+      "referenced_by_rule": false
+    },
+    {
+      "fact": "startup_window_expired",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "temp_file_leftover",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "unknown_launch_failure",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "version_json_missing",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "watchdog_killed_process",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    }
+  ],
+  "adapters": {
+    "execution": [
+      {
+        "source": "ArtifactMissing",
+        "fact": "artifact_missing"
+      },
+      {
+        "source": "ArtifactVerified",
+        "fact": "artifact_verified"
+      },
+      {
+        "source": "ChecksumMismatch",
+        "fact": "artifact_checksum_mismatch"
+      },
+      {
+        "source": "DownloadChecksumMismatch",
+        "fact": "artifact_checksum_mismatch"
+      },
+      {
+        "source": "DownloadInterrupted",
+        "fact": "download_interrupted"
+      },
+      {
+        "source": "DownloadNetworkFailure",
+        "fact": "download_interrupted"
+      },
+      {
+        "source": "DownloadPromoted",
+        "fact": "atomic_promotion_completed"
+      },
+      {
+        "source": "DownloadPromotionFailed",
+        "fact": "atomic_promotion_failed"
+      },
+      {
+        "source": "DownloadProviderFailure",
+        "fact": "download_provider_unavailable"
+      },
+      {
+        "source": "DownloadSizeMismatch",
+        "fact": "artifact_size_mismatch"
+      },
+      {
+        "source": "DownloadTempDiscarded",
+        "fact": "download_temp_discarded"
+      },
+      {
+        "source": "DownloadTempWriteFailed",
+        "fact": "temp_file_leftover"
+      },
+      {
+        "source": "DownloadWrittenToTemp",
+        "fact": "download_written_to_temp"
+      },
+      {
+        "source": "SizeMismatch",
+        "fact": "artifact_size_mismatch"
+      },
+      {
+        "source": "FileCorrupt",
+        "fact": "managed_file_corrupt"
+      },
+      {
+        "source": "FileLocked",
+        "fact": "filesystem_locked"
+      },
+      {
+        "source": "FileMissing",
+        "fact": "artifact_missing"
+      },
+      {
+        "source": "FileOwnershipUnknown",
+        "fact": "ownership_unknown"
+      },
+      {
+        "source": "FilePermissionDenied",
+        "fact": "filesystem_permission_denied"
+      },
+      {
+        "source": "FileQuarantined",
+        "fact": "artifact_quarantined"
+      },
+      {
+        "source": "FilePromoted",
+        "fact": "atomic_promotion_completed"
+      },
+      {
+        "source": "FileTempLeftover",
+        "fact": "temp_file_leftover"
+      },
+      {
+        "source": "FileWrittenToTemp",
+        "fact": "file_written_to_temp"
+      },
+      {
+        "source": "InstallDependencyFailed",
+        "fact": "install_dependency_failed"
+      },
+      {
+        "source": "RuntimeCorrupt",
+        "fact": "managed_runtime_corrupt"
+      },
+      {
+        "source": "RuntimeJavaOverrideEmpty",
+        "fact": "java_override_empty"
+      },
+      {
+        "source": "RuntimeJavaOverrideUndefinedSentinel",
+        "fact": "java_override_undefined_sentinel"
+      },
+      {
+        "source": "RuntimeMissingExecutable",
+        "fact": "managed_runtime_missing"
+      },
+      {
+        "source": "RuntimeProbeFailed",
+        "fact": "java_probe_failed"
+      },
+      {
+        "source": "RuntimeReadyMarkerMissing",
+        "fact": "managed_runtime_ready_marker_missing"
+      },
+      {
+        "source": "RuntimeRepairApplied",
+        "fact": "managed_runtime_repair_applied"
+      },
+      {
+        "source": "RuntimeRosettaRequired",
+        "fact": "managed_runtime_rosetta_required"
+      },
+      {
+        "source": "RuntimeUnavailableForPlatform",
+        "fact": "managed_runtime_unavailable_for_platform"
+      },
+      {
+        "source": "RuntimeWrongMajor",
+        "fact": "java_major_mismatch"
+      },
+      {
+        "source": "RuntimeWrongUpdate",
+        "fact": "java_update_too_old"
+      },
+      {
+        "source": "JvmArgsEmpty",
+        "fact": "jvm_args_empty"
+      },
+      {
+        "source": "JvmArgsParseFailed",
+        "fact": "jvm_args_parse_failed"
+      },
+      {
+        "source": "JvmArgReservedLauncherFlag",
+        "fact": "jvm_arg_reserved_launcher_flag"
+      },
+      {
+        "source": "JvmArgMemoryConflict",
+        "fact": "jvm_arg_memory_conflict"
+      },
+      {
+        "source": "JvmArgUnsupportedGc",
+        "fact": "jvm_arg_unsupported_gc"
+      },
+      {
+        "source": "JvmArgUnlockOrderInvalid",
+        "fact": "jvm_arg_unlock_order_invalid"
+      },
+      {
+        "source": "JvmArgUnsafeClasspathOverride",
+        "fact": "jvm_arg_unsafe_classpath_override"
+      },
+      {
+        "source": "JvmArgUnsafeNativePathOverride",
+        "fact": "jvm_arg_unsafe_native_path_override"
+      },
+      {
+        "source": "JvmArgAgentOverride",
+        "fact": "jvm_arg_agent_override"
+      },
+      {
+        "source": "LaunchCommandInvalid",
+        "fact": "launch_command_invalid"
+      },
+      {
+        "source": "LaunchCommandPrepared",
+        "fact": "launch_command_prepared"
+      },
+      {
+        "source": "ProcessSpawned",
+        "fact": "process_spawned"
+      },
+      {
+        "source": "ProcessStopIntent",
+        "fact": "launcher_stop_requested"
+      },
+      {
+        "source": "ProcessKilled",
+        "fact": "watchdog_killed_process"
+      },
+      {
+        "source": "ProcessExitCode",
+        "fact": "exit_code_unknown"
+      },
+      {
+        "source": "ProcessBootEvidence",
+        "fact": "boot_marker_observed"
+      },
+      {
+        "source": "ProcessWatchdogAction",
+        "fact": "watchdog_killed_process"
+      },
+      {
+        "source": "ProcessExited",
+        "fact": "process_exited"
+      },
+      {
+        "source": "PrimitiveRefused",
+        "fact": "primitive_refused"
+      },
+      {
+        "source": "ProviderDataInvalid",
+        "fact": "provider_data_invalid"
+      },
+      {
+        "source": "RollbackAvailable",
+        "fact": "rollback_available"
+      },
+      {
+        "source": "RollbackUnavailable",
+        "fact": "rollback_unavailable"
+      }
+    ],
+    "install": [
+      {
+        "source": "ChecksumMismatch",
+        "fact": "artifact_checksum_mismatch"
+      },
+      {
+        "source": "SizeMismatch",
+        "fact": "artifact_size_mismatch"
+      },
+      {
+        "source": "ArtifactMissing",
+        "fact": "artifact_missing"
+      },
+      {
+        "source": "MetadataInvalid",
+        "fact": "provider_data_invalid"
+      },
+      {
+        "source": "ProviderFailure",
+        "fact": "download_provider_unavailable"
+      },
+      {
+        "source": "NetworkFailure",
+        "fact": "download_interrupted"
+      },
+      {
+        "source": "PermissionDenied",
+        "fact": "filesystem_permission_denied"
+      },
+      {
+        "source": "TempWriteFailed",
+        "fact": "temp_file_leftover"
+      },
+      {
+        "source": "PromotionFailed",
+        "fact": "atomic_promotion_failed"
+      },
+      {
+        "source": "DependencyFailed",
+        "fact": "install_dependency_failed"
+      },
+      {
+        "source": "OwnershipRefused",
+        "fact": "primitive_refused"
+      },
+      {
+        "source": "RuntimeRosettaRequired",
+        "fact": "managed_runtime_rosetta_required"
+      },
+      {
+        "source": "RuntimeUnavailableForPlatform",
+        "fact": "managed_runtime_unavailable_for_platform"
+      }
+    ],
+    "readiness": [
+      {
+        "source": "InstalledVersionsDegraded",
+        "fact": "installed_versions_degraded"
+      },
+      {
+        "source": "VersionJsonMissing",
+        "fact": "version_json_missing"
+      },
+      {
+        "source": "ParentVersionMissing",
+        "fact": "parent_version_missing"
+      },
+      {
+        "source": "IncompleteInstall",
+        "fact": "incomplete_install"
+      },
+      {
+        "source": "ClientJarMissing",
+        "fact": "client_jar_missing"
+      },
+      {
+        "source": "ClientJarCorrupt",
+        "fact": "artifact_checksum_mismatch"
+      },
+      {
+        "source": "LibrariesMissing",
+        "fact": "libraries_missing"
+      },
+      {
+        "source": "LibrariesCorrupt",
+        "fact": "artifact_checksum_mismatch"
+      },
+      {
+        "source": "LauncherManagedArtifactSignatureCorrupt",
+        "fact": "launcher_managed_artifact_signature_corruption"
+      },
+      {
+        "source": "AssetIndexMissing",
+        "fact": "asset_index_missing"
+      },
+      {
+        "source": "AssetIndexCorrupt",
+        "fact": "artifact_checksum_mismatch"
+      },
+      {
+        "source": "ManagedRuntimeMissing",
+        "fact": "managed_runtime_missing"
+      },
+      {
+        "source": "JavaOverrideMissing",
+        "fact": "java_override_missing"
+      }
+    ]
+  },
+  "memory_feedback": [
+    {
+      "failure_class": "unknown",
+      "diagnosis": "unknown",
+      "round_trip": true
+    },
+    {
+      "failure_class": "jvm_unsupported_option",
+      "diagnosis": "jvm_unsupported_option",
+      "round_trip": true
+    },
+    {
+      "failure_class": "jvm_experimental_unlock",
+      "diagnosis": "jvm_experimental_unlock",
+      "round_trip": true
+    },
+    {
+      "failure_class": "jvm_option_ordering",
+      "diagnosis": "jvm_option_ordering",
+      "round_trip": true
+    },
+    {
+      "failure_class": "java_runtime_mismatch",
+      "diagnosis": "java_runtime_mismatch",
+      "round_trip": true
+    },
+    {
+      "failure_class": "out_of_memory",
+      "diagnosis": "out_of_memory",
+      "round_trip": true
+    },
+    {
+      "failure_class": "graphics_driver_crash",
+      "diagnosis": "graphics_driver_crash",
+      "round_trip": true
+    },
+    {
+      "failure_class": "missing_dependency",
+      "diagnosis": "missing_dependency",
+      "round_trip": true
+    },
+    {
+      "failure_class": "mod_transformation_failure",
+      "diagnosis": "mod_transformation_failure",
+      "round_trip": true
+    },
+    {
+      "failure_class": "mod_attributed_crash",
+      "diagnosis": "mod_attributed_crash",
+      "round_trip": true
+    },
+    {
+      "failure_class": "classpath_module_conflict",
+      "diagnosis": "classpath_module_conflict",
+      "round_trip": true
+    },
+    {
+      "failure_class": "launcher_managed_artifact_signature",
+      "diagnosis": "launcher_managed_artifact_signature",
+      "round_trip": true
+    },
+    {
+      "failure_class": "auth_mode_incompatible",
+      "diagnosis": "auth_mode_incompatible",
+      "round_trip": true
+    },
+    {
+      "failure_class": "loader_bootstrap_failure",
+      "diagnosis": "loader_bootstrap_failure",
+      "round_trip": true
+    },
+    {
+      "failure_class": "startup_stalled",
+      "diagnosis": "startup_stalled",
+      "round_trip": true
+    }
+  ],
+  "repair_hands": [
+    {
+      "kind": "quarantine_redownload",
+      "diagnosis": "launcher_managed_artifact_corrupt",
+      "max_attempts": 1
+    },
+    {
+      "kind": "missing_download",
+      "diagnosis": "launcher_managed_artifact_corrupt",
+      "max_attempts": 1
+    },
+    {
+      "kind": "ready_marker",
+      "diagnosis": "managed_runtime_corrupt",
+      "max_attempts": 1
+    }
+  ],
+  "deferred_demonstrations": [
+    {
+      "invariant": "I8",
+      "phase": "phase_4",
+      "status": "integrity_hot_path_timing_pending"
+    },
+    {
+      "invariant": "I9",
+      "phase": "phase_5",
+      "status": "agent_fallback_execution_pending"
+    }
+  ],
+  "known_gaps": [
+    {
+      "invariant": "I3",
+      "boundary": "prepare_failure_guidance",
+      "missing_variants": [
+        "Unknown",
+        "OutOfMemory",
+        "GraphicsDriverCrash",
+        "MissingDependency",
+        "ModTransformationFailure",
+        "ModAttributedCrash",
+        "ClasspathModuleConflict",
+        "AuthModeIncompatible",
+        "LoaderBootstrapFailure"
+      ]
+    },
+    {
+      "invariant": "I7",
+      "boundary": "loader_install_failure_adapter",
+      "missing_variants": [
+        "BaseInstallFailed",
+        "BuildNotFound",
+        "ProcessorFailed",
+        "Other"
+      ]
+    }
+  ]
+}

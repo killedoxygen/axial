@@ -139,8 +139,20 @@ pub enum TargetKind {
     NetworkResource,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub enum OperationPhase {
+macro_rules! operation_phases {
+    ($($variant:ident),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+        pub enum OperationPhase {
+            $($variant),+
+        }
+
+        impl OperationPhase {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
+operation_phases! {
     Startup,
     Planning,
     Validating,

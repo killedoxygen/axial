@@ -64,8 +64,20 @@ pub struct ExecutionFact {
     pub fields: Vec<EvidenceField>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ExecutionFactKind {
+macro_rules! execution_fact_kinds {
+    ($($variant:ident),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        pub enum ExecutionFactKind {
+            $($variant),+
+        }
+
+        impl ExecutionFactKind {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
+execution_fact_kinds! {
     ArtifactMissing,
     ArtifactVerified,
     ChecksumMismatch,

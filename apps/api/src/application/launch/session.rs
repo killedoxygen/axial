@@ -4,6 +4,9 @@ mod readiness;
 mod resources;
 mod runtime_repair;
 
+#[cfg(test)]
+pub(crate) use readiness::readiness_guardian_facts_for_coverage;
+
 use super::policy;
 use super::runner::trace_launch_event;
 use crate::application::guardian_conversion::api_guardian_mode;
