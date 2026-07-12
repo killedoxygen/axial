@@ -281,8 +281,18 @@ pub(super) async fn start_loader_install_owned(
                         let publication = match outcome {
                             LoaderInstallOutcome::KnownGood(receipt) => {
                                 publish_known_good_loader_terminal(
-                                    worker_state
-                                        .accept_known_good_install_receipt(&library_dir, *receipt),
+                                    async {
+                                        require_exact_loader_receipt_version(
+                                            &version_id,
+                                            receipt.version_id(),
+                                        )?;
+                                        worker_state
+                                            .accept_known_good_install_receipt(
+                                                &library_dir,
+                                                *receipt,
+                                            )
+                                            .await
+                                    },
                                     captured_terminal,
                                     |progress| {
                                         let _ = progress_tx.send(progress);
@@ -366,6 +376,18 @@ pub(super) async fn start_loader_install_owned(
         operation_id: staging.result.operation_id.unwrap_or(operation_id),
         view_model: InstallProgressViewModel::starting(),
     })
+}
+
+pub(super) fn require_exact_loader_receipt_version(
+    expected_version_id: &str,
+    receipt_version_id: &str,
+) -> std::io::Result<()> {
+    if expected_version_id != receipt_version_id {
+        return Err(std::io::Error::other(
+            "verified loader receipt identity did not match the resolved install target",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) struct LoaderTerminalPublication {

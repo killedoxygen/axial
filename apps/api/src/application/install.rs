@@ -237,7 +237,8 @@ use loader::start_loader_install_owned;
 #[cfg(test)]
 use loader::{
     dispatch_loader_install_failure, loader_install_done_progress, loader_install_error_progress,
-    publish_known_good_loader_terminal, wait_for_active_vanilla_base_install,
+    publish_known_good_loader_terminal, require_exact_loader_receipt_version,
+    wait_for_active_vanilla_base_install,
 };
 pub use loader::{
     loader_builds, loader_components, loader_game_versions, loader_pre_operation_error_response,

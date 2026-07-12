@@ -2239,6 +2239,47 @@ async fn loader_receipt_acceptance_failure_cannot_publish_success() {
 }
 
 #[tokio::test]
+async fn loader_receipt_identity_mismatch_cannot_publish_success() {
+    let published = Arc::new(Mutex::new(None));
+    let published_progress = Arc::clone(&published);
+
+    let publication = publish_known_good_loader_terminal(
+        async {
+            require_exact_loader_receipt_version(
+                "loader-v2-expected",
+                "loader-v2-authenticated-base",
+            )?;
+            Ok(1)
+        },
+        Some(done_progress()),
+        move |progress| {
+            *published_progress.lock().expect("published lock") = Some(progress);
+        },
+    )
+    .await;
+    let progress = published
+        .lock()
+        .expect("published lock")
+        .take()
+        .expect("terminal progress");
+    let progress = sanitize_install_progress(progress);
+
+    assert!(publication.acceptance_failed);
+    assert_eq!(
+        publication.failure_summary.as_deref(),
+        Some(INSTALL_FAILURE_MESSAGE)
+    );
+    assert!(progress.done);
+    assert_eq!(progress.error.as_deref(), Some(INSTALL_FAILURE_MESSAGE));
+    assert_ne!(progress.phase, "done");
+    assert!(
+        !serde_json::to_string(&progress)
+            .expect("progress json")
+            .contains("authenticated-base")
+    );
+}
+
+#[tokio::test]
 async fn loader_install_events_keep_terminal_installs_subscribable_after_stream_ends() {
     let root = temp_root("loader-install-events-terminal-retention");
     let state = build_test_state(&root);
