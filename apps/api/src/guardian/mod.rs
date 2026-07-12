@@ -30,6 +30,8 @@ mod model;
 #[cfg(test)]
 mod outcome_snapshot;
 #[cfg(test)]
+mod preflight_copy_snapshot;
+#[cfg(test)]
 mod preflight_decision_snapshot;
 mod repair_terminal;
 mod rules;

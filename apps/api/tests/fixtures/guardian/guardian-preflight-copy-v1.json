@@ -1,0 +1,1399 @@
+{
+  "schema": "axial.guardian.preflight_copy.v1",
+  "cases": [
+    {
+      "id": "boundary--fallback--java_major_mismatch",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "fallback--java_major_mismatch",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Fallback",
+        "effective_decision": "Fallback",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian will ignore the incompatible Java override and use managed Java for this launch."
+        ],
+        "guidance": [
+          "Choose a Java runtime matching this Minecraft version before re-enabling the override."
+        ]
+      }
+    },
+    {
+      "id": "boundary--fallback--java_override_missing",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "fallback--java_override_missing",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Fallback",
+        "effective_decision": "Fallback",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian will ignore the unavailable Java override and use managed Java for this launch."
+        ],
+        "guidance": [
+          "Update or remove the bad Java override after launch if you want to use Custom Java again."
+        ]
+      }
+    },
+    {
+      "id": "boundary--fallback--java_override_undefined_sentinel",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "fallback--java_override_undefined_sentinel",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Fallback",
+        "effective_decision": "Fallback",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian will ignore the unavailable Java override and use managed Java for this launch."
+        ],
+        "guidance": [
+          "Update or remove the bad Java override after launch if you want to use Custom Java again."
+        ]
+      }
+    },
+    {
+      "id": "boundary--fallback--java_probe_failed",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "fallback--java_probe_failed",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Fallback",
+        "effective_decision": "Fallback",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian will ignore the Java override that failed probing and use managed Java for this launch."
+        ],
+        "guidance": [
+          "Update or remove the Java override after launch if you want to use Custom Java again."
+        ]
+      }
+    },
+    {
+      "id": "boundary--fallback--java_update_too_old",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "fallback--java_update_too_old",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Fallback",
+        "effective_decision": "Fallback",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian will ignore the outdated Java override and use managed Java for this launch."
+        ],
+        "guidance": [
+          "Use Java 8u312 or newer before re-enabling this override."
+        ]
+      }
+    },
+    {
+      "id": "boundary--precedence--client-jar-missing-block",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "precedence--client-jar-missing-block",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked launch because client game files are missing."
+        ],
+        "guidance": [
+          "Install or repair the affected version before launching again."
+        ]
+      }
+    },
+    {
+      "id": "boundary--precedence--disabled-jvm-args-block",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "precedence--disabled-jvm-args-block",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch."
+        ],
+        "guidance": [
+          "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch."
+        ]
+      }
+    },
+    {
+      "id": "boundary--precedence--empty-record-only-permitted",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "precedence--empty-record-only-permitted",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "RecordOnly",
+        "effective_decision": "RecordOnly",
+        "phase": "Validating",
+        "summary": "Guardian recorded launch preflight readiness.",
+        "details": [],
+        "guidance": []
+      }
+    },
+    {
+      "id": "boundary--precedence--java-override-custom-ask-user",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "precedence--java-override-custom-ask-user",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "AskUser",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian needs confirmation before launch.",
+        "details": [
+          "Guardian needs confirmation before changing the selected Java override."
+        ],
+        "guidance": [
+          "Confirm managed Java for this launch or choose a valid Java runtime."
+        ]
+      }
+    },
+    {
+      "id": "boundary--precedence--jvm-args-custom-warning-over-ask-user",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "precedence--jvm-args-custom-warning-over-ask-user",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch."
+        ],
+        "guidance": [
+          "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch."
+        ]
+      }
+    },
+    {
+      "id": "boundary--precedence--managed-runtime-missing-readiness-block-over-record-only",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "precedence--managed-runtime-missing-readiness-block-over-record-only",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Managed Java runtime is missing and can be prepared before launch."
+        ],
+        "guidance": [
+          "Let Axial prepare the managed Java runtime before launching."
+        ]
+      }
+    },
+    {
+      "id": "boundary--precedence--readiness-flag-block",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "precedence--readiness-flag-block",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked launch because preflight readiness failed."
+        ],
+        "guidance": []
+      }
+    },
+    {
+      "id": "boundary--precedence--readiness-over-strip",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "precedence--readiness-over-strip",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch."
+        ],
+        "guidance": [
+          "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch."
+        ]
+      }
+    },
+    {
+      "id": "boundary--precedence--strip-over-resource-warning",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "precedence--strip-over-resource-warning",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Strip",
+        "effective_decision": "Strip",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian removed malformed explicit JVM args for this launch.",
+          "Launch memory budget is tight for the current active sessions."
+        ],
+        "guidance": [
+          "Fix the saved JVM args before re-enabling them.",
+          "Close another running session or lower memory allocation if startup is unstable."
+        ]
+      }
+    },
+    {
+      "id": "boundary--strip--jvm_arg_agent_override",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "strip--jvm_arg_agent_override",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Strip",
+        "effective_decision": "Strip",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian removed explicit JVM args that override launcher-owned settings for this launch."
+        ],
+        "guidance": [
+          "Remove memory, classpath, native-path, or agent overrides from saved JVM args before re-enabling them."
+        ]
+      }
+    },
+    {
+      "id": "boundary--strip--jvm_arg_memory_conflict",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "strip--jvm_arg_memory_conflict",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Strip",
+        "effective_decision": "Strip",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian removed explicit JVM args that override launcher-owned settings for this launch."
+        ],
+        "guidance": [
+          "Remove memory, classpath, native-path, or agent overrides from saved JVM args before re-enabling them."
+        ]
+      }
+    },
+    {
+      "id": "boundary--strip--jvm_arg_reserved_launcher_flag",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "strip--jvm_arg_reserved_launcher_flag",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Strip",
+        "effective_decision": "Strip",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian removed explicit JVM args that override launcher-owned settings for this launch."
+        ],
+        "guidance": [
+          "Remove memory, classpath, native-path, or agent overrides from saved JVM args before re-enabling them."
+        ]
+      }
+    },
+    {
+      "id": "boundary--strip--jvm_arg_unlock_order_invalid",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "strip--jvm_arg_unlock_order_invalid",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Strip",
+        "effective_decision": "Strip",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian removed unsupported explicit JVM args for this launch."
+        ],
+        "guidance": [
+          "Use JVM flags supported by the selected Java runtime before re-enabling them."
+        ]
+      }
+    },
+    {
+      "id": "boundary--strip--jvm_arg_unsafe_classpath_override",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "strip--jvm_arg_unsafe_classpath_override",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Strip",
+        "effective_decision": "Strip",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian removed explicit JVM args that override launcher-owned settings for this launch."
+        ],
+        "guidance": [
+          "Remove memory, classpath, native-path, or agent overrides from saved JVM args before re-enabling them."
+        ]
+      }
+    },
+    {
+      "id": "boundary--strip--jvm_arg_unsafe_native_path_override",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "strip--jvm_arg_unsafe_native_path_override",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Strip",
+        "effective_decision": "Strip",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian removed explicit JVM args that override launcher-owned settings for this launch."
+        ],
+        "guidance": [
+          "Remove memory, classpath, native-path, or agent overrides from saved JVM args before re-enabling them."
+        ]
+      }
+    },
+    {
+      "id": "boundary--strip--jvm_arg_unsupported_gc",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "strip--jvm_arg_unsupported_gc",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Strip",
+        "effective_decision": "Strip",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian removed unsupported explicit JVM args for this launch."
+        ],
+        "guidance": [
+          "Use JVM flags supported by the selected Java runtime before re-enabling them."
+        ]
+      }
+    },
+    {
+      "id": "boundary--strip--jvm_args_parse_failed",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "strip--jvm_args_parse_failed",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Strip",
+        "effective_decision": "Strip",
+        "phase": "Validating",
+        "summary": "Guardian adjusted launch preflight.",
+        "details": [
+          "Guardian removed malformed explicit JVM args for this launch."
+        ],
+        "guidance": [
+          "Fix the saved JVM args before re-enabling them."
+        ]
+      }
+    },
+    {
+      "id": "boundary--warning--custom_java_override_present",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "warning--custom_java_override_present",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Guardian Custom mode will keep the selected Java override for this launch."
+        ],
+        "guidance": [
+          "Switch Guardian back to Managed if you want Axial to adjust unsafe choices."
+        ]
+      }
+    },
+    {
+      "id": "boundary--warning--custom_jvm_args_present",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "warning--custom_jvm_args_present",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Guardian Custom mode will keep explicit JVM args; remove them first if startup becomes unstable."
+        ],
+        "guidance": [
+          "Switch Guardian back to Managed if you want Axial to adjust unsafe choices."
+        ]
+      }
+    },
+    {
+      "id": "boundary--warning--custom_jvm_preset_present",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "warning--custom_jvm_preset_present",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Guardian Custom mode will keep the selected JVM preset for this launch."
+        ],
+        "guidance": [
+          "Switch Guardian back to Managed if you want Axial to adjust unsafe choices."
+        ]
+      }
+    },
+    {
+      "id": "boundary--warning--java_override_empty",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "warning--java_override_empty",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Guardian detected an unavailable Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch."
+        ],
+        "guidance": [
+          "Guardian detected an unavailable Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch."
+        ]
+      }
+    },
+    {
+      "id": "boundary--warning--launch_memory_allocation_low",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "warning--launch_memory_allocation_low",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Launch memory allocation is very low for Minecraft."
+        ],
+        "guidance": [
+          "Raise the maximum memory allocation if Minecraft crashes during startup, stalls while loading, or exits with out-of-memory errors."
+        ]
+      }
+    },
+    {
+      "id": "boundary--warning--launch_memory_min_clamped",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "warning--launch_memory_min_clamped",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Minimum memory was higher than maximum memory, so Axial clamped the launch minimum to match the maximum allocation."
+        ],
+        "guidance": [
+          "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional."
+        ]
+      }
+    },
+    {
+      "id": "boundary--warning--launch_resource_cpu_pressure",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "warning--launch_resource_cpu_pressure",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Launch concurrency may be tight: other active launch sessions can saturate low-end CPUs."
+        ],
+        "guidance": [
+          "Multiple launches can saturate low-end CPUs; wait for another launch to finish if startup feels sluggish."
+        ]
+      }
+    },
+    {
+      "id": "boundary--warning--launch_resource_disk_pressure",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "warning--launch_resource_disk_pressure",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Launch-relevant storage has low free space."
+        ],
+        "guidance": [
+          "Free disk space before launching if caches or natives become unreliable."
+        ]
+      }
+    },
+    {
+      "id": "boundary--warning--launch_resource_install_pressure",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "warning--launch_resource_install_pressure",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Active install or download work may add pressure during startup."
+        ],
+        "guidance": [
+          "Wait for active install or download work to finish if startup feels slow."
+        ]
+      }
+    },
+    {
+      "id": "boundary--warning--launch_resource_memory_pressure",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "warning--launch_resource_memory_pressure",
+        "historical_overrides": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Launch memory budget is tight for the current active sessions."
+        ],
+        "guidance": [
+          "Close another running session or lower memory allocation if startup is unstable."
+        ]
+      }
+    },
+    {
+      "id": "boundary--warning--recent_repair_failed",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "warning--recent_repair_failed",
+        "historical_overrides": [
+          {
+            "kind": "recent_repair_failed",
+            "recovery": "java_runtime"
+          }
+        ]
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "The previous managed Java recovery attempt failed."
+        ],
+        "guidance": [
+          "Review the selected Java runtime before relaunching."
+        ]
+      }
+    },
+    {
+      "id": "boundary--warning--recent_startup_failure",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "warning--recent_startup_failure",
+        "historical_overrides": [
+          {
+            "kind": "recent_startup_failure",
+            "failure_class": "out_of_memory",
+            "occurrences": 1,
+            "latest_observed_today": true,
+            "occurrences_today": null,
+            "current_memory_mb": null,
+            "suggested_memory_mb": null
+          }
+        ]
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "This instance has recorded one out-of-memory crash; the latest was today."
+        ],
+        "guidance": [
+          "Guardian could not verify safe headroom for a larger memory allocation. Close another session or free memory before relaunching."
+        ]
+      }
+    },
+    {
+      "id": "boundary--warning--repair_suppressed_until",
+      "axis": "boundary_ref",
+      "input": {
+        "kind": "boundary_ref",
+        "boundary_ref": "warning--repair_suppressed_until",
+        "historical_overrides": [
+          {
+            "kind": "repair_suppressed_until",
+            "suppression_until": "2026-07-11T11:05:00Z"
+          }
+        ]
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Guardian will not auto-repair this launch again until 11:05 UTC."
+        ],
+        "guidance": [
+          "Review the launch settings before retrying; unchanged settings will not trigger another automatic repair before 11:05 UTC."
+        ]
+      }
+    },
+    {
+      "id": "history--occurrence-windows",
+      "axis": "historical_composition",
+      "input": {
+        "kind": "historical_composition",
+        "mode": "Managed",
+        "facts": [
+          {
+            "kind": "startup_failure",
+            "target": "occurrence-today",
+            "failure_class": "mod_attributed_crash",
+            "occurrences": 4,
+            "latest_observed_today": true,
+            "occurrences_today": 3,
+            "current_memory_mb": null,
+            "suggested_memory_mb": null
+          },
+          {
+            "kind": "startup_failure",
+            "target": "occurrence-recorded",
+            "failure_class": "missing_dependency",
+            "occurrences": 4,
+            "latest_observed_today": true,
+            "occurrences_today": null,
+            "current_memory_mb": null,
+            "suggested_memory_mb": null
+          },
+          {
+            "kind": "startup_failure",
+            "target": "occurrence-recent",
+            "failure_class": "graphics_driver_crash",
+            "occurrences": 1,
+            "latest_observed_today": false,
+            "occurrences_today": null,
+            "current_memory_mb": null,
+            "suggested_memory_mb": null
+          },
+          {
+            "kind": "startup_failure",
+            "target": "occurrence-uncounted",
+            "failure_class": "mod_transformation_failure",
+            "occurrences": null,
+            "latest_observed_today": null,
+            "occurrences_today": null,
+            "current_memory_mb": null,
+            "suggested_memory_mb": null
+          }
+        ],
+        "resources": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "This instance had 3 mod-attributed crashes today.",
+          "This instance has recorded 4 missing-dependency crashes; the latest was today.",
+          "This instance has recorded one graphics driver crash; the latest was within the past 24 hours.",
+          "A recent launch ended with a mod transformation crash."
+        ],
+        "guidance": [
+          "Review recently changed mods and disable the suspected mod before relaunching.",
+          "Repair the instance dependencies before relaunching.",
+          "Update the graphics driver and remove graphics overrides before relaunching.",
+          "Review recently changed mods and their loader compatibility before relaunching."
+        ]
+      }
+    },
+    {
+      "id": "history--oom-headroom",
+      "axis": "historical_composition",
+      "input": {
+        "kind": "historical_composition",
+        "mode": "Managed",
+        "facts": [
+          {
+            "kind": "startup_failure",
+            "target": "oom-budgeted",
+            "failure_class": "out_of_memory",
+            "occurrences": 1,
+            "latest_observed_today": true,
+            "occurrences_today": null,
+            "current_memory_mb": 4096,
+            "suggested_memory_mb": 6144
+          },
+          {
+            "kind": "startup_failure",
+            "target": "oom-unverified",
+            "failure_class": "out_of_memory",
+            "occurrences": 2,
+            "latest_observed_today": true,
+            "occurrences_today": 2,
+            "current_memory_mb": 4096,
+            "suggested_memory_mb": null
+          }
+        ],
+        "resources": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "This instance has recorded one out-of-memory crash; the latest was today.",
+          "This instance had 2 out-of-memory crashes today."
+        ],
+        "guidance": [
+          "Increase this instance's maximum memory from 4096 MB to 6144 MB before relaunching.",
+          "Guardian could not verify safe headroom for a larger memory allocation. Close another session or free memory before relaunching."
+        ]
+      }
+    },
+    {
+      "id": "history--repair-variants",
+      "axis": "historical_composition",
+      "input": {
+        "kind": "historical_composition",
+        "mode": "Managed",
+        "facts": [
+          {
+            "kind": "repair_failed",
+            "target": "repair-java",
+            "recovery": "java_runtime"
+          },
+          {
+            "kind": "repair_failed",
+            "target": "repair-jvm-args",
+            "recovery": "jvm_args"
+          },
+          {
+            "kind": "repair_failed",
+            "target": "repair-jvm-preset",
+            "recovery": "jvm_preset"
+          }
+        ],
+        "resources": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "The previous managed Java recovery attempt failed.",
+          "The previous JVM argument recovery attempt failed.",
+          "The previous JVM preset recovery attempt failed."
+        ],
+        "guidance": [
+          "Review the selected Java runtime before relaunching.",
+          "Review or remove explicit JVM arguments before relaunching.",
+          "Review the JVM preset before relaunching."
+        ]
+      }
+    },
+    {
+      "id": "history--saturated-warning-composition",
+      "axis": "historical_composition",
+      "input": {
+        "kind": "historical_composition",
+        "mode": "Managed",
+        "facts": [
+          {
+            "kind": "startup_failure",
+            "target": "saturated-oom",
+            "failure_class": "out_of_memory",
+            "occurrences": 2,
+            "latest_observed_today": true,
+            "occurrences_today": 2,
+            "current_memory_mb": 4096,
+            "suggested_memory_mb": 6144
+          },
+          {
+            "kind": "suppressed",
+            "target": "saturated-suppression",
+            "suppression_until": "2026-07-11T13:45:00+02:00"
+          }
+        ],
+        "resources": [
+          "memory_clamped",
+          "low_memory_allocation",
+          "memory_pressure",
+          "cpu_pressure",
+          "install_pressure",
+          "disk_pressure"
+        ]
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "This instance had 2 out-of-memory crashes today.",
+          "Guardian will not auto-repair this launch again until 11:45 UTC.",
+          "Minimum memory was higher than maximum memory, so Axial clamped the launch minimum to match the maximum allocation.",
+          "Launch memory allocation is very low for Minecraft.",
+          "Launch memory budget is tight for the current active sessions.",
+          "Launch concurrency may be tight: other active launch sessions can saturate low-end CPUs."
+        ],
+        "guidance": [
+          "Increase this instance's maximum memory from 4096 MB to 6144 MB before relaunching.",
+          "Review the launch settings before retrying; unchanged settings will not trigger another automatic repair before 11:45 UTC.",
+          "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.",
+          "Raise the maximum memory allocation if Minecraft crashes during startup, stalls while loading, or exits with out-of-memory errors.",
+          "Close another running session or lower memory allocation if startup is unstable.",
+          "Multiple launches can saturate low-end CPUs; wait for another launch to finish if startup feels sluggish."
+        ]
+      }
+    },
+    {
+      "id": "history--suppression-offset",
+      "axis": "historical_composition",
+      "input": {
+        "kind": "historical_composition",
+        "mode": "Managed",
+        "facts": [
+          {
+            "kind": "suppressed",
+            "target": "suppression-offset",
+            "suppression_until": "2026-07-11T13:45:00+02:00"
+          }
+        ],
+        "resources": []
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Guardian will not auto-repair this launch again until 11:45 UTC."
+        ],
+        "guidance": [
+          "Review the launch settings before retrying; unchanged settings will not trigger another automatic repair before 11:45 UTC."
+        ]
+      }
+    },
+    {
+      "id": "static--artifact-corrupt-block",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Managed",
+        "launchable": false,
+        "fact_id": "artifact_checksum_mismatch",
+        "source": "readiness",
+        "explicit_user_intent": false
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked launch because launcher-managed game files are corrupt."
+        ],
+        "guidance": [
+          "Install or repair the affected version before launching again."
+        ]
+      }
+    },
+    {
+      "id": "static--asset-index-missing-block",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Managed",
+        "launchable": false,
+        "fact_id": "asset_index_missing",
+        "source": "readiness",
+        "explicit_user_intent": false
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked launch because the asset index is missing."
+        ],
+        "guidance": [
+          "Install or repair the affected version before launching again."
+        ]
+      }
+    },
+    {
+      "id": "static--install-incomplete-block",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Managed",
+        "launchable": false,
+        "fact_id": "incomplete_install",
+        "source": "readiness",
+        "explicit_user_intent": false
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked launch because the install is incomplete."
+        ],
+        "guidance": [
+          "Install or repair the affected version before launching again."
+        ]
+      }
+    },
+    {
+      "id": "static--installed-version-metadata-missing-block",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Managed",
+        "launchable": false,
+        "fact_id": "version_json_missing",
+        "source": "readiness",
+        "explicit_user_intent": false
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked launch because installed version metadata is missing."
+        ],
+        "guidance": [
+          "Install or repair the affected version before launching again."
+        ]
+      }
+    },
+    {
+      "id": "static--java-major-mismatch-block",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Custom",
+        "launchable": true,
+        "fact_id": "java_major_mismatch",
+        "source": "direct",
+        "explicit_user_intent": true
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked launch because the selected Java override has the wrong Java version."
+        ],
+        "guidance": [
+          "Choose a Java runtime matching this Minecraft version requirement."
+        ]
+      }
+    },
+    {
+      "id": "static--java-override-unavailable-block",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Custom",
+        "launchable": false,
+        "fact_id": "java_override_missing",
+        "source": "readiness",
+        "explicit_user_intent": true
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked launch because the selected Java override is unavailable."
+        ],
+        "guidance": [
+          "Guardian detected an unavailable Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch."
+        ]
+      }
+    },
+    {
+      "id": "static--java-probe-failed-block",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Custom",
+        "launchable": true,
+        "fact_id": "java_probe_failed",
+        "source": "direct",
+        "explicit_user_intent": true
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked launch because the selected Java override could not be probed."
+        ],
+        "guidance": [
+          "Use a Java runtime that can run `java -version`, or switch back to Managed Java."
+        ]
+      }
+    },
+    {
+      "id": "static--java-update-too-old-block",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Custom",
+        "launchable": true,
+        "fact_id": "java_update_too_old",
+        "source": "direct",
+        "explicit_user_intent": true
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked launch because the selected Java 8 override is too old."
+        ],
+        "guidance": [
+          "Use Java 8u312 or newer for this legacy launch."
+        ]
+      }
+    },
+    {
+      "id": "static--jvm-unsafe-override-block",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Disabled",
+        "launchable": true,
+        "fact_id": "jvm_arg_reserved_launcher_flag",
+        "source": "direct",
+        "explicit_user_intent": true
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly."
+        ],
+        "guidance": [
+          "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly."
+        ]
+      }
+    },
+    {
+      "id": "static--jvm-unsafe-override-warn",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Custom",
+        "launchable": true,
+        "fact_id": "jvm_arg_reserved_launcher_flag",
+        "source": "direct",
+        "explicit_user_intent": true
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly."
+        ],
+        "guidance": [
+          "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly."
+        ]
+      }
+    },
+    {
+      "id": "static--jvm-unsupported-block",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Disabled",
+        "launchable": true,
+        "fact_id": "jvm_arg_unsupported_gc",
+        "source": "direct",
+        "explicit_user_intent": true
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails."
+        ],
+        "guidance": [
+          "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails."
+        ]
+      }
+    },
+    {
+      "id": "static--jvm-unsupported-warn",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Custom",
+        "launchable": true,
+        "fact_id": "jvm_arg_unsupported_gc",
+        "source": "direct",
+        "explicit_user_intent": true
+      },
+      "output": {
+        "kernel_decision": "Warn",
+        "effective_decision": "Warn",
+        "phase": "Validating",
+        "summary": "Guardian found launch preflight warnings.",
+        "details": [
+          "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails."
+        ],
+        "guidance": [
+          "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails."
+        ]
+      }
+    },
+    {
+      "id": "static--launcher-signature-corrupt-block",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Managed",
+        "launchable": false,
+        "fact_id": "launcher_managed_artifact_signature_corruption",
+        "source": "readiness",
+        "explicit_user_intent": false
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked launch because launcher-managed jar signatures are inconsistent."
+        ],
+        "guidance": [
+          "Install or repair the affected version before launching again."
+        ]
+      }
+    },
+    {
+      "id": "static--libraries-missing-block",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Managed",
+        "launchable": false,
+        "fact_id": "libraries_missing",
+        "source": "readiness",
+        "explicit_user_intent": false
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked launch because required libraries are missing."
+        ],
+        "guidance": [
+          "Install or repair the affected version before launching again."
+        ]
+      }
+    },
+    {
+      "id": "static--managed-runtime-corrupt-repair",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Managed",
+        "launchable": true,
+        "fact_id": "managed_runtime_corrupt",
+        "source": "direct",
+        "explicit_user_intent": false
+      },
+      "output": {
+        "kernel_decision": "Repair",
+        "effective_decision": "Repair",
+        "phase": "Validating",
+        "summary": "Guardian selected a guarded launch preflight action.",
+        "details": [],
+        "guidance": []
+      }
+    },
+    {
+      "id": "static--managed-runtime-missing-record-only",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Managed",
+        "launchable": true,
+        "fact_id": "managed_runtime_missing",
+        "source": "readiness",
+        "explicit_user_intent": false
+      },
+      "output": {
+        "kernel_decision": "RecordOnly",
+        "effective_decision": "RecordOnly",
+        "phase": "Validating",
+        "summary": "Guardian recorded launch preflight readiness.",
+        "details": [
+          "Managed Java runtime is missing and can be prepared before launch."
+        ],
+        "guidance": [
+          "Let Axial prepare the managed Java runtime before launching."
+        ]
+      }
+    },
+    {
+      "id": "static--parent-version-metadata-missing-block",
+      "axis": "static",
+      "input": {
+        "kind": "static",
+        "mode": "Managed",
+        "launchable": false,
+        "fact_id": "parent_version_missing",
+        "source": "readiness",
+        "explicit_user_intent": false
+      },
+      "output": {
+        "kernel_decision": "Block",
+        "effective_decision": "Block",
+        "phase": "Validating",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked launch because parent version metadata is missing."
+        ],
+        "guidance": [
+          "Install or repair the affected version before launching again."
+        ]
+      }
+    }
+  ]
+}

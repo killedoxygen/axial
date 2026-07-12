@@ -244,6 +244,75 @@ fn build_snapshot() -> GuardianPreflightBoundarySnapshot {
     }
 }
 
+pub(super) fn committed_preflight_boundary_case_ids() -> Vec<String> {
+    committed_preflight_boundary_snapshot()
+        .cases
+        .into_iter()
+        .map(|case| case.id)
+        .collect()
+}
+
+pub(super) fn replay_committed_preflight_boundary_case(
+    case_id: &str,
+    field_overrides: &[(GuardianFactId, Vec<EvidenceField>)],
+) -> Option<super::GuardianPreflightOutcome> {
+    let snapshot = committed_preflight_boundary_snapshot();
+    let case = snapshot.cases.into_iter().find(|case| case.id == case_id)?;
+    let mut spec = CaseSpec {
+        mode: case.input.mode,
+        launchable: case.input.launchable,
+        facts: case
+            .input
+            .direct_fact_ids
+            .into_iter()
+            .map(producer_fact)
+            .collect(),
+        readiness_facts: case
+            .input
+            .readiness_fact_ids
+            .into_iter()
+            .map(producer_fact)
+            .collect(),
+        resource_signals: case.input.resource_signals,
+        override_signals: case.input.override_signals,
+        explicit_user_intent: case.input.explicit_user_intent,
+    };
+    for fact in spec.facts.iter_mut().chain(&mut spec.readiness_facts) {
+        fact.fields.clear();
+        if let Some((_, fields)) = field_overrides.iter().find(|(id, _)| *id == fact.id) {
+            fact.fields = fields.clone();
+        }
+    }
+    assert!(field_overrides.iter().all(|(id, _)| {
+        spec.facts
+            .iter()
+            .chain(&spec.readiness_facts)
+            .any(|fact| fact.id == *id)
+    }));
+    let resources = resource_signals(&spec.resource_signals);
+    let overrides = override_signals(&spec.override_signals);
+    Some(guardian_preflight_outcome(
+        GuardianPreflightOutcomeRequest {
+            operation_id: None,
+            mode: spec.mode,
+            phase: OperationPhase::Validating,
+            facts: &spec.facts,
+            readiness: GuardianPreflightReadiness::from_facts(
+                spec.launchable,
+                &spec.readiness_facts,
+            ),
+            resources,
+            overrides,
+            explicit_user_intent: spec.explicit_user_intent,
+        },
+    ))
+}
+
+fn committed_preflight_boundary_snapshot() -> GuardianPreflightBoundarySnapshot {
+    serde_json::from_str(SNAPSHOT_FIXTURE)
+        .expect("strict committed Guardian preflight boundary snapshot fixture")
+}
+
 fn source_family_cases() -> Vec<BoundaryCase> {
     let mut cases = FALLBACK_FACT_IDS
         .into_iter()
