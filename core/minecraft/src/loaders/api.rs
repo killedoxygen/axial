@@ -6,6 +6,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
 const INSTALLED_VERSION_ID_PREFIX: &str = "loader-v2-";
 const INSTALLED_VERSION_ID_DOMAIN: &[u8] = b"axial-installed-loader";
+const BUILD_ID_PREFIX: &str = "loader-build-v1-";
+const BUILD_ID_DOMAIN: &[u8] = b"axial-loader-build";
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct InstalledLoaderIdentity {
@@ -48,33 +50,49 @@ pub fn build_id_for(
     minecraft_version: &str,
     loader_version: &str,
 ) -> LoaderBuildId {
-    format!(
-        "{}:{}:{}",
-        component_id.short_key(),
-        minecraft_version.trim(),
-        loader_version.trim()
-    )
+    let mut payload = Vec::new();
+    payload.extend_from_slice(BUILD_ID_DOMAIN);
+    payload.push(0);
+    payload.push(component_tag(component_id));
+    append_build_coordinate(&mut payload, minecraft_version);
+    append_build_coordinate(&mut payload, loader_version);
+    format!("{BUILD_ID_PREFIX}{}", URL_SAFE_NO_PAD.encode(payload))
 }
 
 pub fn parse_build_id(build_id: &str) -> Option<(LoaderComponentId, String, String)> {
-    let mut parts = build_id.splitn(3, ':');
-    let component_id = match parts.next()? {
-        "fabric" => LoaderComponentId::Fabric,
-        "quilt" => LoaderComponentId::Quilt,
-        "forge" => LoaderComponentId::Forge,
-        "neoforge" => LoaderComponentId::NeoForge,
-        _ => return None,
-    };
-    let minecraft_version = parts.next()?.trim();
-    let loader_version = parts.next()?.trim();
-    if minecraft_version.is_empty() || loader_version.is_empty() {
+    let payload = URL_SAFE_NO_PAD
+        .decode(build_id.strip_prefix(BUILD_ID_PREFIX)?)
+        .ok()?;
+    let mut remaining = payload.as_slice();
+    if take_payload_bytes(&mut remaining, BUILD_ID_DOMAIN.len()) != Some(BUILD_ID_DOMAIN)
+        || take_payload_bytes(&mut remaining, 1) != Some(&[0])
+    {
         return None;
     }
-    Some((
-        component_id,
-        minecraft_version.to_string(),
-        loader_version.to_string(),
-    ))
+    let component_id = component_from_tag(*take_payload_bytes(&mut remaining, 1)?.first()?)?;
+    let minecraft_version = take_build_coordinate(&mut remaining)?;
+    let loader_version = take_build_coordinate(&mut remaining)?;
+    if !remaining.is_empty()
+        || build_id_for(component_id, &minecraft_version, &loader_version) != build_id
+    {
+        return None;
+    }
+    Some((component_id, minecraft_version, loader_version))
+}
+
+fn append_build_coordinate(payload: &mut Vec<u8>, coordinate: &str) {
+    payload.extend_from_slice(&(coordinate.len() as u64).to_be_bytes());
+    payload.extend_from_slice(coordinate.as_bytes());
+}
+
+fn take_build_coordinate(remaining: &mut &[u8]) -> Option<String> {
+    let length = take_payload_bytes(remaining, size_of::<u64>())?;
+    let length = usize::try_from(u64::from_be_bytes(length.try_into().ok()?)).ok()?;
+    let coordinate = std::str::from_utf8(take_payload_bytes(remaining, length)?)
+        .ok()?
+        .to_string();
+    validate_identity_coordinate(&coordinate, "loader build coordinate").ok()?;
+    Some(coordinate)
 }
 
 pub fn installed_version_id_for(
@@ -102,12 +120,7 @@ pub fn installed_version_id_for(
     );
     payload.extend_from_slice(INSTALLED_VERSION_ID_DOMAIN);
     payload.push(0);
-    payload.push(match component_id {
-        LoaderComponentId::Fabric => 1,
-        LoaderComponentId::Quilt => 2,
-        LoaderComponentId::Forge => 3,
-        LoaderComponentId::NeoForge => 4,
-    });
+    payload.push(component_tag(component_id));
     payload.extend_from_slice(&minecraft_len.to_be_bytes());
     payload.extend_from_slice(minecraft_version);
     payload.extend_from_slice(&loader_len.to_be_bytes());
@@ -146,17 +159,9 @@ pub(crate) fn decode_installed_version_id(
         ));
     }
 
-    let component_id = match take_payload_bytes(&mut remaining, 1) {
-        Some([1]) => LoaderComponentId::Fabric,
-        Some([2]) => LoaderComponentId::Quilt,
-        Some([3]) => LoaderComponentId::Forge,
-        Some([4]) => LoaderComponentId::NeoForge,
-        _ => {
-            return Err(invalid_identity(
-                "installed loader version id component is invalid",
-            ));
-        }
-    };
+    let component_id = take_payload_bytes(&mut remaining, 1)
+        .and_then(|tag| component_from_tag(tag[0]))
+        .ok_or_else(|| invalid_identity("installed loader version id component is invalid"))?;
     let minecraft_version = take_identity_coordinate(&mut remaining, "Minecraft version")?;
     let loader_version = take_identity_coordinate(&mut remaining, "loader version")?;
     if !remaining.is_empty() {
@@ -203,6 +208,25 @@ fn take_payload_bytes<'a>(remaining: &mut &'a [u8], length: usize) -> Option<&'a
     let (taken, rest) = remaining.split_at(length);
     *remaining = rest;
     Some(taken)
+}
+
+fn component_tag(component_id: LoaderComponentId) -> u8 {
+    match component_id {
+        LoaderComponentId::Fabric => 1,
+        LoaderComponentId::Quilt => 2,
+        LoaderComponentId::Forge => 3,
+        LoaderComponentId::NeoForge => 4,
+    }
+}
+
+fn component_from_tag(tag: u8) -> Option<LoaderComponentId> {
+    match tag {
+        1 => Some(LoaderComponentId::Fabric),
+        2 => Some(LoaderComponentId::Quilt),
+        3 => Some(LoaderComponentId::Forge),
+        4 => Some(LoaderComponentId::NeoForge),
+        _ => None,
+    }
 }
 
 pub(crate) fn validate_loader_build_record_identity(
@@ -253,6 +277,57 @@ fn invalid_identity(message: &str) -> LoaderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_id_round_trips_every_component_without_delimiter_aliases() {
+        let coordinates = [
+            ("1.21.5", "0.16.14"),
+            ("c", "a:b"),
+            ("c:a", "b"),
+            ("version:with:colons", "release+build.7"),
+            ("1.20.1-pre1", "loader_\u{03b2}"),
+        ];
+
+        for component_id in [
+            LoaderComponentId::Fabric,
+            LoaderComponentId::Quilt,
+            LoaderComponentId::Forge,
+            LoaderComponentId::NeoForge,
+        ] {
+            for (minecraft_version, loader_version) in coordinates {
+                let build_id = build_id_for(component_id, minecraft_version, loader_version);
+                assert_eq!(
+                    parse_build_id(&build_id),
+                    Some((
+                        component_id,
+                        minecraft_version.to_string(),
+                        loader_version.to_string()
+                    ))
+                );
+            }
+        }
+
+        assert_ne!(
+            build_id_for(LoaderComponentId::Fabric, "c", "a:b"),
+            build_id_for(LoaderComponentId::Fabric, "c:a", "b")
+        );
+    }
+
+    #[test]
+    fn build_id_parser_rejects_legacy_and_noncanonical_payloads() {
+        assert!(parse_build_id("fabric:1.21.5:0.16.14").is_none());
+        assert!(
+            parse_build_id(&build_id_for(
+                LoaderComponentId::Fabric,
+                " 1.21.5",
+                "0.16.14"
+            ))
+            .is_none()
+        );
+
+        let canonical = build_id_for(LoaderComponentId::Fabric, "1.21.5", "0.16.14");
+        assert!(parse_build_id(&format!("{canonical}A")).is_none());
+    }
 
     #[test]
     fn invalid_coordinates_do_not_produce_filesystem_ids() {

@@ -32,8 +32,8 @@ pub(crate) async fn fetch_sha1_verified_source(
     max_source_bytes: u64,
     source_label: &'static str,
 ) -> Result<VerifiedLoaderSource, LoaderError> {
+    let proof_url = sha1_sidecar_url(source_url)?;
     let bytes = fetch_bytes(source_url, max_source_bytes).await?;
-    let proof_url = format!("{source_url}.sha1");
     let proof_bytes = fetch_bytes(&proof_url, MAX_SOURCE_SHA1_PROOF_BYTES).await?;
     let proof = strict_sha1_proof(&proof_bytes, source_label)?;
     let actual = format!("{:x}", sha1::Sha1::digest(&bytes));
@@ -43,6 +43,24 @@ pub(crate) async fn fetch_sha1_verified_source(
         )));
     }
     Ok(VerifiedLoaderSource { bytes })
+}
+
+fn sha1_sidecar_url(source_url: &str) -> Result<String, LoaderError> {
+    let mut url = reqwest::Url::parse(source_url)
+        .map_err(|_| LoaderError::InvalidProfile("loader source URL is invalid".to_string()))?;
+    if url.query().is_some() {
+        return Err(LoaderError::InvalidProfile(
+            "loader source URL must not contain a query".to_string(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(LoaderError::InvalidProfile(
+            "loader source URL must not contain a fragment".to_string(),
+        ));
+    }
+    let proof_path = format!("{}.sha1", url.path());
+    url.set_path(&proof_path);
+    Ok(url.into())
 }
 
 fn strict_sha1_proof<'a>(bytes: &'a [u8], source_label: &str) -> Result<&'a str, LoaderError> {
@@ -66,7 +84,30 @@ fn source_proof_error(source_label: &str) -> LoaderError {
 
 #[cfg(test)]
 mod tests {
-    use super::strict_sha1_proof;
+    use super::{sha1_sidecar_url, strict_sha1_proof};
+
+    #[test]
+    fn sha1_sidecar_url_appends_to_the_parsed_path() {
+        assert_eq!(
+            sha1_sidecar_url("https://maven.example.test/path/artifact.jar").expect("sidecar URL"),
+            "https://maven.example.test/path/artifact.jar.sha1"
+        );
+        assert_eq!(
+            sha1_sidecar_url("https://maven.example.test/path/artifact%20name.jar")
+                .expect("encoded sidecar URL"),
+            "https://maven.example.test/path/artifact%20name.jar.sha1"
+        );
+    }
+
+    #[test]
+    fn sha1_sidecar_url_rejects_query_and_fragment_components() {
+        for source_url in [
+            "https://maven.example.test/artifact.jar?token=value",
+            "https://maven.example.test/artifact.jar#digest",
+        ] {
+            assert!(sha1_sidecar_url(source_url).is_err());
+        }
+    }
 
     #[test]
     fn strict_sha1_proof_accepts_only_digest_with_optional_line_ending() {

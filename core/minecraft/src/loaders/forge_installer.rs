@@ -53,6 +53,10 @@ pub enum ForgeInstallerError {
     ConflictingEmbeddedArtifact,
     #[error("installer contains conflicting declarations for library {name}")]
     ConflictingLibraryDeclaration { name: String },
+    #[error("installer contains an undeclared embedded Maven artifact: {name}")]
+    UndeclaredEmbeddedArtifact { name: String },
+    #[error("installer contains portable case-fold path aliases")]
+    PortablePathAlias,
     #[error("download failed: {0}")]
     Download(#[from] DownloadError),
 }
@@ -131,9 +135,27 @@ struct LegacyInstallData {
 }
 
 #[derive(Debug, Deserialize)]
-struct InstallProfileLibraries {
+struct InstallProfileDeclarations {
     #[serde(default)]
     libraries: Vec<Library>,
+    #[serde(default)]
+    processors: Vec<ProcessorDeclaration>,
+    #[serde(default)]
+    data: HashMap<String, ProcessorDataDeclaration>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessorDeclaration {
+    #[serde(default)]
+    jar: String,
+    #[serde(default)]
+    classpath: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessorDataDeclaration {
+    #[serde(default)]
+    client: String,
 }
 
 pub(crate) fn plan_authenticated_installer(
@@ -146,9 +168,9 @@ pub(crate) fn plan_authenticated_installer(
 
     let mut authored_version_json = None;
     let mut install_profile_json = None;
-    let mut embedded = BTreeMap::new();
+    let mut embedded_candidates = Vec::new();
+    let mut embedded_casefold = HashMap::new();
     let mut source_entry_counts = HashMap::new();
-    let mut embedded_total = 0_u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         let name = entry.name().to_string();
@@ -183,10 +205,11 @@ pub(crate) fn plan_authenticated_installer(
                 }
                 let path = ArtifactRelativePath::new(relative)
                     .map_err(|_| ForgeInstallerError::InvalidEntryPath)?;
-                let bytes = read_embedded_entry(&mut entry, relative, &mut embedded_total)?;
-                if embedded.insert(path, bytes).is_some() {
-                    return Err(ForgeInstallerError::DuplicateEntry { name });
+                match insert_portable_path(&mut embedded_casefold, &path)? {
+                    true => {}
+                    false => return Err(ForgeInstallerError::DuplicateEntry { name }),
                 }
+                embedded_candidates.push((index, path, relative.to_string()));
             }
         }
     }
@@ -199,24 +222,11 @@ pub(crate) fn plan_authenticated_installer(
         (None, Some(profile)) => extract_legacy_version_info(profile)?,
         (None, None) => return Err(ForgeInstallerError::MissingVersionJson),
     };
-    let legacy_profile = install_profile_json
-        .as_deref()
-        .and_then(|profile| serde_json::from_slice::<LegacyInstallProfile>(profile).ok());
-    if let Some(profile) = legacy_profile.as_ref() {
-        add_legacy_root_artifact(
-            &mut archive,
-            profile,
-            &source_entry_counts,
-            &mut embedded,
-            &mut embedded_total,
-        )?;
-    }
-
     let version_fragment =
         serde_json::from_slice::<LoaderProfileFragment>(&effective_version_json)?;
     let install_info = install_profile_json
         .as_deref()
-        .map(serde_json::from_slice::<InstallProfileLibraries>)
+        .map(serde_json::from_slice::<InstallProfileDeclarations>)
         .transpose()?;
     let libraries = merge_libraries_by_name(
         &version_fragment.libraries,
@@ -225,6 +235,39 @@ pub(crate) fn plan_authenticated_installer(
             .map(|info| info.libraries.as_slice())
             .unwrap_or(&[]),
     )?;
+    let mut allowed = declared_embedded_maven_paths(&libraries, install_info.as_ref())?;
+    let legacy_profile = install_profile_json
+        .as_deref()
+        .and_then(|profile| serde_json::from_slice::<LegacyInstallProfile>(profile).ok());
+    let legacy_path = legacy_profile
+        .as_ref()
+        .map(legacy_root_artifact_path)
+        .transpose()?;
+    if let Some(path) = legacy_path.as_ref() {
+        insert_portable_path(&mut allowed, path)?;
+    }
+
+    let mut embedded = BTreeMap::new();
+    let mut embedded_total = 0_u64;
+    for (index, path, source_name) in embedded_candidates {
+        if !allowed.contains_key(&portable_path_key(path.as_str())) {
+            return Err(ForgeInstallerError::UndeclaredEmbeddedArtifact { name: source_name });
+        }
+        let mut entry = archive.by_index(index)?;
+        let bytes = read_embedded_entry(&mut entry, &source_name, &mut embedded_total)?;
+        embedded.insert(path, bytes);
+    }
+    if let (Some(profile), Some(path)) = (legacy_profile.as_ref(), legacy_path) {
+        add_legacy_root_artifact(
+            &mut archive,
+            profile,
+            path,
+            &source_entry_counts,
+            &mut embedded_casefold,
+            &mut embedded,
+            &mut embedded_total,
+        )?;
+    }
     drop(archive);
 
     Ok(AuthenticatedForgeInstallerPlan {
@@ -268,24 +311,113 @@ fn merge_libraries_by_name(
     Ok(merged)
 }
 
-fn add_legacy_root_artifact(
-    archive: &mut ZipArchive<std::io::Cursor<&[u8]>>,
-    profile: &LegacyInstallProfile,
-    source_entry_counts: &HashMap<String, usize>,
-    embedded: &mut BTreeMap<ArtifactRelativePath, Vec<u8>>,
-    embedded_total: &mut u64,
+fn declared_embedded_maven_paths(
+    libraries: &[Library],
+    install_profile: Option<&InstallProfileDeclarations>,
+) -> Result<HashMap<String, String>, ForgeInstallerError> {
+    let mut allowed = HashMap::new();
+    for library in libraries {
+        insert_coordinate_path(&mut allowed, &library.name)?;
+        if let Some(downloads) = library.downloads.as_ref() {
+            if let Some(artifact) = downloads.artifact.as_ref()
+                && !artifact.path.trim().is_empty()
+            {
+                insert_declared_path(&mut allowed, &artifact.path)?;
+            }
+            for artifact in downloads.classifiers.values() {
+                if !artifact.path.trim().is_empty() {
+                    insert_declared_path(&mut allowed, &artifact.path)?;
+                }
+            }
+        }
+    }
+    if let Some(profile) = install_profile {
+        for processor in &profile.processors {
+            insert_coordinate_path(&mut allowed, &processor.jar)?;
+            for coordinate in &processor.classpath {
+                insert_coordinate_path(&mut allowed, coordinate)?;
+            }
+        }
+        for data in profile.data.values() {
+            let value = data.client.trim();
+            if let Some(coordinate) = value
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+            {
+                insert_coordinate_path(&mut allowed, coordinate)?;
+            }
+        }
+    }
+    Ok(allowed)
+}
+
+fn insert_coordinate_path(
+    paths: &mut HashMap<String, String>,
+    coordinate: &str,
 ) -> Result<(), ForgeInstallerError> {
+    if coordinate.trim().is_empty() {
+        return Ok(());
+    }
+    let path = maven_to_path(coordinate);
+    if path.as_os_str().is_empty() {
+        return Err(ForgeInstallerError::InvalidEntryPath);
+    }
+    let path = ArtifactRelativePath::from_path(&path)
+        .map_err(|_| ForgeInstallerError::InvalidEntryPath)?;
+    insert_portable_path(paths, &path).map(|_| ())
+}
+
+fn insert_declared_path(
+    paths: &mut HashMap<String, String>,
+    path: &str,
+) -> Result<(), ForgeInstallerError> {
+    let path =
+        ArtifactRelativePath::new(path).map_err(|_| ForgeInstallerError::InvalidEntryPath)?;
+    insert_portable_path(paths, &path).map(|_| ())
+}
+
+fn insert_portable_path(
+    paths: &mut HashMap<String, String>,
+    path: &ArtifactRelativePath,
+) -> Result<bool, ForgeInstallerError> {
+    let key = portable_path_key(path.as_str());
+    match paths.get(&key) {
+        Some(existing) if existing == path.as_str() => Ok(false),
+        Some(_) => Err(ForgeInstallerError::PortablePathAlias),
+        None => {
+            paths.insert(key, path.as_str().to_string());
+            Ok(true)
+        }
+    }
+}
+
+fn portable_path_key(path: &str) -> String {
+    path.chars().flat_map(char::to_lowercase).collect()
+}
+
+fn legacy_root_artifact_path(
+    profile: &LegacyInstallProfile,
+) -> Result<ArtifactRelativePath, ForgeInstallerError> {
     let minecraft = legacy_profile_minecraft(profile);
-    let Some(normalized_library) = normalize_legacy_forge_library(
+    let normalized_library = normalize_legacy_forge_library(
         &profile.install.path,
         &profile.install.file_path,
         minecraft,
-    ) else {
-        return Err(ForgeInstallerError::InvalidEntryPath);
-    };
-    let artifact_path = ArtifactRelativePath::from_path(&maven_to_path(&normalized_library))
-        .map_err(|_| ForgeInstallerError::InvalidEntryPath)?;
+    )
+    .ok_or(ForgeInstallerError::InvalidEntryPath)?;
+    ArtifactRelativePath::from_path(&maven_to_path(&normalized_library))
+        .map_err(|_| ForgeInstallerError::InvalidEntryPath)
+}
 
+fn add_legacy_root_artifact(
+    archive: &mut ZipArchive<std::io::Cursor<&[u8]>>,
+    profile: &LegacyInstallProfile,
+    artifact_path: ArtifactRelativePath,
+    source_entry_counts: &HashMap<String, usize>,
+    embedded_casefold: &mut HashMap<String, String>,
+    embedded: &mut BTreeMap<ArtifactRelativePath, Vec<u8>>,
+    embedded_total: &mut u64,
+) -> Result<(), ForgeInstallerError> {
     let entry_name = profile.install.file_path.trim();
     if entry_name.is_empty() || entry_name.contains('/') || entry_name.contains('\\') {
         return Err(ForgeInstallerError::InvalidEntryPath);
@@ -310,7 +442,9 @@ fn add_legacy_root_artifact(
     } else {
         bytes
     };
-    if embedded.insert(artifact_path, bytes).is_some() {
+    if !insert_portable_path(embedded_casefold, &artifact_path)?
+        || embedded.insert(artifact_path, bytes).is_some()
+    {
         return Err(ForgeInstallerError::ConflictingEmbeddedArtifact);
     }
     Ok(())
@@ -388,6 +522,14 @@ fn read_embedded_entry(
     name: &str,
     total: &mut u64,
 ) -> Result<Vec<u8>, ForgeInstallerError> {
+    if file.size() > MAX_INSTALLER_EMBEDDED_ENTRY_BYTES {
+        return Err(ForgeInstallerError::EntryTooLarge {
+            name: name.to_string(),
+        });
+    }
+    if file.size() > MAX_INSTALLER_EMBEDDED_TOTAL_BYTES.saturating_sub(*total) {
+        return Err(ForgeInstallerError::EmbeddedEntriesTooLarge);
+    }
     let bytes = read_bounded_entry(file, name, MAX_INSTALLER_EMBEDDED_ENTRY_BYTES)?;
     *total = total
         .checked_add(bytes.len() as u64)
@@ -630,7 +772,7 @@ mod tests {
             "spec": 1,
             "profile": "forge",
             "version": "1.21.1-52.1.0",
-            "libraries": [],
+            "libraries": [{"name":"net.minecraftforge:forge:1.21.1-52.1.0:shim"}],
             "processors": []
         }"#;
         let jar = zip_with_entries(&[
@@ -659,7 +801,10 @@ mod tests {
             "libraries": [{"name":"example:version-lib:1.0"}]
         }"#;
         let install_profile = br#"{
-            "libraries": [{"name":"example:installer-lib:1.0"}],
+            "libraries": [
+                {"name":"example:installer-lib:1.0"},
+                {"name":"example:embedded:1.0"}
+            ],
             "processors": [{"args":["{ROOT}/output.jar","{INPUT}"]}],
             "data": {
                 "INPUT": {"client":"/data/input.bin"},
@@ -679,7 +824,7 @@ mod tests {
             plan.install_profile_json(),
             Some(install_profile.as_slice())
         );
-        assert_eq!(plan.libraries().len(), 2);
+        assert_eq!(plan.libraries().len(), 3);
     }
 
     #[test]
@@ -702,6 +847,32 @@ mod tests {
         assert!(matches!(
             plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(unsafe_path)),
             Err(ForgeInstallerError::InvalidEntryPath)
+        ));
+    }
+
+    #[test]
+    fn pure_plan_rejects_undeclared_and_portable_alias_maven_paths() {
+        let version_json = br#"{
+            "id":"forge",
+            "libraries":[{"name":"example:mod:1.0"}]
+        }"#;
+        let undeclared = zip_with_entries(&[
+            ("version.json", version_json.as_slice()),
+            ("maven/example/other/1.0/other-1.0.jar", b"undeclared"),
+        ]);
+        assert!(matches!(
+            plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(undeclared)),
+            Err(ForgeInstallerError::UndeclaredEmbeddedArtifact { .. })
+        ));
+
+        let alias = zip_with_entries(&[
+            ("version.json", version_json.as_slice()),
+            ("maven/example/mod/1.0/mod-1.0.jar", b"first"),
+            ("maven/Example/mod/1.0/mod-1.0.jar", b"second"),
+        ]);
+        assert!(matches!(
+            plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(alias)),
+            Err(ForgeInstallerError::PortablePathAlias)
         ));
     }
 
@@ -746,10 +917,13 @@ mod tests {
         let nonexistent = std::env::temp_dir().join(format!("axial-pure-installer-{nanos:x}"));
         assert!(!nonexistent.exists());
 
-        let version_json = br#"{"id":"forge","libraries":[]}"#;
+        let version_json = br#"{
+            "id":"forge",
+            "libraries":[{"name":"example:mod:1.0"}]
+        }"#;
         let valid = zip_with_entries(&[
             ("version.json", version_json.as_slice()),
-            ("maven/example/mod.jar", b"mod"),
+            ("maven/example/mod/1.0/mod-1.0.jar", b"mod"),
         ]);
         plan(&valid);
         assert!(!nonexistent.exists());
@@ -859,16 +1033,21 @@ mod tests {
 
     #[test]
     fn pure_plan_rejects_oversized_maven_entry_without_effects() {
-        let jar = zip_with_entry(
-            "maven/example/mod.jar",
-            vec![b'j'; (MAX_INSTALLER_EMBEDDED_ENTRY_BYTES + 1) as usize],
-        );
+        let version_json = br#"{
+            "id":"forge",
+            "libraries":[{"name":"example:mod:1.0"}]
+        }"#;
+        let oversized = vec![b'j'; (MAX_INSTALLER_EMBEDDED_ENTRY_BYTES + 1) as usize];
+        let jar = zip_with_entries(&[
+            ("version.json", version_json.as_slice()),
+            ("maven/example/mod/1.0/mod-1.0.jar", oversized.as_slice()),
+        ]);
 
         let error = plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(jar))
             .expect_err("oversized maven entry should fail");
 
         assert!(
-            matches!(error, ForgeInstallerError::EntryTooLarge { name } if name == "example/mod.jar")
+            matches!(error, ForgeInstallerError::EntryTooLarge { name } if name == "example/mod/1.0/mod-1.0.jar")
         );
     }
 
@@ -898,13 +1077,23 @@ mod tests {
             writer
                 .start_file("version.json", SimpleFileOptions::default())
                 .expect("start version json");
+            let libraries = (0..count)
+                .map(|index| serde_json::json!({"name": format!("example:artifact-{index}:1.0")}))
+                .collect::<Vec<_>>();
             writer
-                .write_all(br#"{"id":"forge","libraries":[]}"#)
+                .write_all(
+                    serde_json::to_string(&serde_json::json!({
+                        "id": "forge",
+                        "libraries": libraries
+                    }))
+                    .expect("serialize version json")
+                    .as_bytes(),
+                )
                 .expect("write version json");
             for index in 0..count {
                 writer
                     .start_file(
-                        format!("maven/example/artifact-{index}.jar"),
+                        format!("maven/example/artifact-{index}/1.0/artifact-{index}-1.0.jar"),
                         SimpleFileOptions::default(),
                     )
                     .expect("start Maven entry");

@@ -196,19 +196,20 @@ fn catalog_version_order(entries: &[crate::manifest::ManifestEntry]) -> HashMap<
 #[cfg(test)]
 mod tests {
     use super::{resolve_build_record_for_install_with, validate_build_index_identity};
-    use crate::loaders::installed_version_id_for;
     use crate::loaders::types::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
         LoaderComponentId, LoaderError, LoaderInstallSource, LoaderInstallStrategy,
         LoaderInstallability, LoaderProviderFailureKind, LoaderVersionIndex,
     };
+    use crate::loaders::{build_id_for, installed_version_id_for};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn catalog_rejects_noncanonical_installed_version_id() {
         let component_id = LoaderComponentId::Fabric;
-        let mut record = build_record(component_id, "fabric:1.21.5:0.16.14");
+        let build_id = build_id_for(component_id, "1.21.5", "0.16.14");
+        let mut record = build_record(component_id, &build_id);
         record.version_id = "fabric-loader-0.16.14-1.21.5".to_string();
 
         let error = validate_build_index_identity(
@@ -233,19 +234,20 @@ mod tests {
     #[tokio::test]
     async fn install_resolution_always_fetches_the_live_provider_index() {
         let component_id = LoaderComponentId::Fabric;
-        let build_id = "fabric:1.21.5:0.16.14";
+        let build_id = build_id_for(component_id, "1.21.5", "0.16.14");
+        let live_build_id = build_id.clone();
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch_calls = Arc::clone(&calls);
 
         let resolved = resolve_build_record_for_install_with(
             component_id,
-            build_id,
+            &build_id,
             move |minecraft_version| {
                 assert_eq!(minecraft_version, "1.21.5");
                 fetch_calls.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(LoaderVersionIndex {
                     component_id,
-                    builds: vec![build_record(component_id, build_id)],
+                    builds: vec![build_record(component_id, &live_build_id)],
                 }))
             },
         )
@@ -260,10 +262,11 @@ mod tests {
     async fn install_resolution_rejects_unsafe_version_before_provider_fetch() {
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch_calls = Arc::clone(&calls);
+        let build_id = build_id_for(LoaderComponentId::Fabric, "..", "0.16.14");
 
         let error = resolve_build_record_for_install_with(
             LoaderComponentId::Fabric,
-            "fabric:..:0.16.14",
+            &build_id,
             move |_| {
                 fetch_calls.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(LoaderVersionIndex {
