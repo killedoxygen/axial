@@ -35,6 +35,8 @@ mod outcome_snapshot;
 mod preflight_copy_snapshot;
 #[cfg(test)]
 mod preflight_decision_snapshot;
+#[cfg(test)]
+mod preset_stage_copy_snapshot;
 mod repair_terminal;
 mod rules;
 
@@ -46,15 +48,19 @@ pub use artifact_repair::{
     GuardianArtifactRepairMutation, GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest,
     GuardianArtifactRepairSource, GuardianArtifactRepairStatus, execute_guardian_artifact_repair,
 };
-pub use copy::GuardianUserOutcome;
-#[cfg(test)]
-pub(crate) use copy::guardian_user_outcome_for_test;
 pub(crate) use copy::{
     GuardianCopyRequest, GuardianLaunchAdmission, GuardianRuntimeRepairCopy, author_guardian_copy,
     guardian_directive_description, guardian_failed_launch_recovery_log,
-    guardian_summary_with_blocked_outcome, guardian_summary_with_intervention,
-    guardian_summary_with_observed_outcome, guardian_summary_with_suppressed_outcome,
+    guardian_launch_stage_evidence, guardian_summary_with_blocked_outcome,
+    guardian_summary_with_intervention, guardian_summary_with_observed_outcome,
+    guardian_summary_with_suppressed_outcome,
 };
+pub use copy::{
+    GuardianJvmPresetNotice, GuardianJvmPresetOption, GuardianUserOutcome,
+    guardian_jvm_preset_notice, guardian_jvm_preset_options,
+};
+#[cfg(test)]
+pub(crate) use copy::{guardian_launch_stage_evidence_for_test, guardian_user_outcome_for_test};
 pub use diagnosis::{Diagnosis, build_safety_case, diagnose};
 pub use directive::{
     GuardianDirective, GuardianManagedJavaReason, GuardianPresetDowngradeReason,
@@ -75,8 +81,7 @@ pub use install_evidence::{
     plan_install_artifact_failure_repair,
 };
 pub use jvm_preset::{
-    GuardianJvmPresetOption, GuardianJvmPresetResolution, guardian_jvm_preset_options,
-    normalize_create_jvm_preset,
+    GuardianJvmPresetId, GuardianJvmPresetResolution, normalize_create_jvm_preset,
 };
 pub use launch_decision::{
     GuardianLaunchFailureOutcome, GuardianObservedLaunchFailurePhase,

@@ -450,7 +450,9 @@ pub(crate) async fn handle_update_instance(
                 instance.window_height = value.max(0);
             }
             if let Some(value) = patch.jvm_preset {
-                instance.jvm_preset = normalize_create_jvm_preset(Some(&value)).stored_preset;
+                instance.jvm_preset = normalize_create_jvm_preset(Some(&value))
+                    .stored_preset()
+                    .to_string();
             }
             if let Some(value) = patch.performance_mode {
                 instance.performance_mode = value;

@@ -1,7 +1,8 @@
+use super::jvm_preset::{GuardianJvmPresetId, GuardianJvmPresetResolution};
 use super::{
     DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianDirective, GuardianFact,
     GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-    GuardianManagedJavaReason, GuardianObservedLaunchFailurePhase,
+    GuardianManagedJavaReason, GuardianMode, GuardianObservedLaunchFailurePhase,
     GuardianPerformanceSupervisionRejection, GuardianPreflightOutcome,
     GuardianPresetDowngradeReason, GuardianRepairStatus, GuardianStartupFailureObservation,
     GuardianStripJvmArgsReason,
@@ -10,7 +11,7 @@ use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_e
 use crate::state::contracts::OperationPhase;
 use axial_launcher::{
     CrashEvidence, GuardianDecision as LauncherGuardianDecision, GuardianInterventionKind,
-    GuardianSummary, LaunchFailureClass,
+    GuardianSummary, LaunchFailureClass, LaunchStageEvidence,
 };
 use chrono::{DateTime, Timelike, Utc};
 use serde::Serialize;
@@ -19,6 +20,208 @@ const MAX_SUMMARY_BYTES: usize = 180;
 const MAX_LINE_BYTES: usize = 240;
 const MAX_COLLECTION_LINES: usize = 6;
 const MAX_DYNAMIC_TOKEN_BYTES: usize = 64;
+const MAX_STAGE_SUMMARY_BYTES: usize = 160;
+const MAX_STAGE_DETAIL_BYTES: usize = 120;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GuardianJvmPresetOption {
+    id: String,
+    label: String,
+    detail: String,
+    default: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disabled_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GuardianJvmPresetNotice {
+    state_id: String,
+    tone: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+impl GuardianJvmPresetNotice {
+    pub fn state_id(&self) -> &str {
+        &self.state_id
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuardianJvmPresetCopyRule {
+    preset: GuardianJvmPresetId,
+    label: &'static str,
+    detail: &'static str,
+}
+
+const GUARDIAN_JVM_PRESET_COPY_RULES: [GuardianJvmPresetCopyRule; 8] = [
+    GuardianJvmPresetCopyRule {
+        preset: GuardianJvmPresetId::Auto,
+        label: "Auto",
+        detail: "Axial picks safe JVM flags automatically.",
+    },
+    GuardianJvmPresetCopyRule {
+        preset: GuardianJvmPresetId::Smooth,
+        label: "Smooth",
+        detail: "Balances throughput and steady frame times.",
+    },
+    GuardianJvmPresetCopyRule {
+        preset: GuardianJvmPresetId::Performance,
+        label: "Performance",
+        detail: "Pushes higher throughput on modern hardware.",
+    },
+    GuardianJvmPresetCopyRule {
+        preset: GuardianJvmPresetId::UltraLowLatency,
+        label: "Low latency",
+        detail: "Shortens JVM pauses, sometimes trading peak FPS.",
+    },
+    GuardianJvmPresetCopyRule {
+        preset: GuardianJvmPresetId::GraalVm,
+        label: "GraalVM",
+        detail: "Uses flags intended for GraalVM-based Java runtimes.",
+    },
+    GuardianJvmPresetCopyRule {
+        preset: GuardianJvmPresetId::Legacy,
+        label: "Legacy",
+        detail: "Keeps conservative flags for older Minecraft and Java stacks.",
+    },
+    GuardianJvmPresetCopyRule {
+        preset: GuardianJvmPresetId::LegacyPvp,
+        label: "Legacy PvP",
+        detail: "Legacy tuning biased toward fast input response.",
+    },
+    GuardianJvmPresetCopyRule {
+        preset: GuardianJvmPresetId::LegacyHeavy,
+        label: "Legacy heavy",
+        detail: "Legacy tuning for larger heaps and heavier old modpacks.",
+    },
+];
+
+pub fn guardian_jvm_preset_options() -> Vec<GuardianJvmPresetOption> {
+    GUARDIAN_JVM_PRESET_COPY_RULES
+        .iter()
+        .map(|rule| GuardianJvmPresetOption {
+            id: rule.preset.as_str().to_string(),
+            label: trusted_line(rule.label, MAX_SUMMARY_BYTES),
+            detail: trusted_line(rule.detail, MAX_LINE_BYTES),
+            default: rule.preset == GuardianJvmPresetId::Auto,
+            disabled_reason: None,
+        })
+        .collect()
+}
+
+pub fn guardian_jvm_preset_notice(
+    resolution: GuardianJvmPresetResolution,
+) -> Option<GuardianJvmPresetNotice> {
+    if resolution != GuardianJvmPresetResolution::UnknownResetToAutomatic {
+        return None;
+    }
+    Some(GuardianJvmPresetNotice {
+        state_id: "unknown_reset_to_auto".to_string(),
+        tone: "warn".to_string(),
+        message: trusted_line("Guardian adjusted the JVM preset", MAX_SUMMARY_BYTES),
+        detail: Some(trusted_line(
+            "Guardian reset an unknown JVM preset to Automatic so launch safety stays backend-owned.",
+            MAX_LINE_BYTES,
+        )),
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuardianLaunchStageEvidenceInput {
+    mode: GuardianMode,
+    decision: GuardianActionKind,
+    diagnosis_count: usize,
+}
+
+impl From<&GuardianPreflightOutcome> for GuardianLaunchStageEvidenceInput {
+    fn from(outcome: &GuardianPreflightOutcome) -> Self {
+        Self {
+            mode: outcome.guardian_decision.mode,
+            decision: outcome.user_outcome.decision(),
+            diagnosis_count: outcome.safety_case.diagnoses.len(),
+        }
+    }
+}
+
+pub(crate) fn guardian_launch_stage_evidence(
+    outcome: &GuardianPreflightOutcome,
+) -> LaunchStageEvidence {
+    author_guardian_launch_stage_evidence(outcome.into())
+}
+
+#[cfg(test)]
+pub(crate) fn guardian_launch_stage_evidence_for_test(
+    mode: GuardianMode,
+    decision: GuardianActionKind,
+    diagnosis_count: usize,
+) -> LaunchStageEvidence {
+    author_guardian_launch_stage_evidence(GuardianLaunchStageEvidenceInput {
+        mode,
+        decision,
+        diagnosis_count,
+    })
+}
+
+fn author_guardian_launch_stage_evidence(
+    input: GuardianLaunchStageEvidenceInput,
+) -> LaunchStageEvidence {
+    LaunchStageEvidence {
+        id: "guardian_launch_safety_decision".to_string(),
+        system: "guardian".to_string(),
+        summary: trusted_line(
+            "Guardian recorded the launch safety decision.",
+            MAX_STAGE_SUMMARY_BYTES,
+        ),
+        details: vec![
+            checked_stage_detail(format!("mode:{}", guardian_mode_label(input.mode))),
+            checked_stage_detail(format!(
+                "decision:{}",
+                guardian_action_label(input.decision)
+            )),
+            checked_stage_detail(format!("diagnoses:{}", input.diagnosis_count)),
+        ],
+    }
+}
+
+const fn guardian_mode_label(mode: GuardianMode) -> &'static str {
+    match mode {
+        GuardianMode::Managed => "Managed",
+        GuardianMode::Custom => "Custom",
+        GuardianMode::Disabled => "Disabled",
+    }
+}
+
+const fn guardian_action_label(action: GuardianActionKind) -> &'static str {
+    match action {
+        GuardianActionKind::Allow => "Allow",
+        GuardianActionKind::Warn => "Warn",
+        GuardianActionKind::Repair => "Repair",
+        GuardianActionKind::Retry => "Retry",
+        GuardianActionKind::Strip => "Strip",
+        GuardianActionKind::Downgrade => "Downgrade",
+        GuardianActionKind::Fallback => "Fallback",
+        GuardianActionKind::Quarantine => "Quarantine",
+        GuardianActionKind::AskUser => "AskUser",
+        GuardianActionKind::Block => "Block",
+        GuardianActionKind::RecordOnly => "RecordOnly",
+    }
+}
+
+fn checked_stage_detail(value: String) -> String {
+    sanitize_evidence_text(
+        &value,
+        RedactionAudience::UserVisible,
+        MAX_STAGE_DETAIL_BYTES,
+    )
+    .filter(|value| !value.is_empty() && value.len() <= MAX_STAGE_DETAIL_BYTES)
+    .expect("typed Guardian stage detail must stay public and bounded")
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct GuardianUserOutcome {
@@ -2608,18 +2811,36 @@ fn finalize_launch_lines(lines: impl IntoIterator<Item = String>) -> Vec<String>
 #[cfg(test)]
 mod tests {
     use super::{
-        CopyContextKey, GUARDIAN_COPY_RULES, GuardianCopyRequest, GuardianRuntimeRepairCopy,
-        MAX_COLLECTION_LINES, MAX_LINE_BYTES, MAX_SUMMARY_BYTES, PREFLIGHT_DIAGNOSIS_RULES,
-        PREFLIGHT_INVARIANT_DIAGNOSIS_RULES, PREFLIGHT_SUMMARY_RULES, author_guardian_copy,
-        finalize_lines,
+        CopyContextKey, GUARDIAN_COPY_RULES, GUARDIAN_JVM_PRESET_COPY_RULES, GuardianCopyRequest,
+        GuardianRuntimeRepairCopy, MAX_COLLECTION_LINES, MAX_LINE_BYTES, MAX_SUMMARY_BYTES,
+        PREFLIGHT_DIAGNOSIS_RULES, PREFLIGHT_INVARIANT_DIAGNOSIS_RULES, PREFLIGHT_SUMMARY_RULES,
+        author_guardian_copy, finalize_lines,
     };
     use crate::guardian::{
         DiagnosisId, GuardianActionKind, GuardianInstallArtifactFailureEvidence,
-        GuardianInstallArtifactFailureKind, GuardianPerformanceSupervisionRejection,
-        GuardianRepairStatus,
+        GuardianInstallArtifactFailureKind, GuardianJvmPresetId,
+        GuardianPerformanceSupervisionRejection, GuardianRepairStatus,
     };
     use crate::state::contracts::OperationPhase;
     use axial_launcher::{GuardianMode, GuardianSummary};
+
+    #[test]
+    fn jvm_preset_copy_table_is_unique_complete_and_bounded() {
+        assert_eq!(
+            GUARDIAN_JVM_PRESET_COPY_RULES.len(),
+            GuardianJvmPresetId::ALL.len()
+        );
+        for (index, rule) in GUARDIAN_JVM_PRESET_COPY_RULES.iter().enumerate() {
+            assert_eq!(rule.preset, GuardianJvmPresetId::ALL[index]);
+            assert!(
+                GUARDIAN_JVM_PRESET_COPY_RULES[index + 1..]
+                    .iter()
+                    .all(|other| other.preset != rule.preset)
+            );
+            assert!(!rule.label.is_empty() && rule.label.len() <= MAX_SUMMARY_BYTES);
+            assert!(!rule.detail.is_empty() && rule.detail.len() <= MAX_LINE_BYTES);
+        }
+    }
 
     #[test]
     fn copy_rule_table_is_unique_and_covers_the_five_migrated_families() {

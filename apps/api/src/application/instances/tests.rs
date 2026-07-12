@@ -1604,7 +1604,7 @@ async fn create_instance_unknown_preset_resets_to_auto_without_echoing_raw_value
             .guardian_notice
             .as_ref()
             .expect("guardian notice")
-            .state_id,
+            .state_id(),
         "unknown_reset_to_auto"
     );
     let public = serde_json::to_string(&created).expect("serialize create response");

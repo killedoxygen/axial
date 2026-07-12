@@ -885,6 +885,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn guardian_preset_and_launch_stage_copy_have_one_production_author() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("api crate must live under apps/ in the repository");
+        let copy = fs::read_to_string(repo_root.join("apps/api/src/guardian/copy.rs"))
+            .expect("read Guardian copy authority");
+        for marker in [
+            "Guardian adjusted the JVM preset",
+            "Guardian reset an unknown JVM preset to Automatic",
+            "Guardian recorded the launch safety decision.",
+        ] {
+            assert!(
+                copy.contains(marker),
+                "central copy authority is missing {marker:?}"
+            );
+        }
+
+        let api_root = repo_root.join("apps/api/src");
+        let copy_path = "apps/api/src/guardian/copy.rs";
+        let mut sources = Vec::new();
+        collect_rust_sources(&api_root, &mut sources);
+        sources.sort();
+        let mut violations = Vec::new();
+        for path in sources {
+            if is_test_source(&path)
+                || path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.ends_with("_snapshot.rs"))
+            {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(repo_root)
+                .expect("API source must be inside the repository")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative == copy_path {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("read API source");
+            let production = without_trailing_test_module(&source);
+            for marker in [
+                "Guardian adjusted the JVM preset",
+                "Guardian reset an unknown JVM preset to Automatic",
+                "Guardian recorded the launch safety decision.",
+                "guardian_launch_safety_decision",
+            ] {
+                if production.contains(marker) {
+                    violations.push(format!("{relative}: {marker}"));
+                }
+            }
+        }
+        let preset_source =
+            fs::read_to_string(repo_root.join("apps/api/src/guardian/jvm_preset.rs"))
+                .expect("read Guardian JVM preset source");
+        let preset_production = without_trailing_test_module(&preset_source);
+        for marker in [
+            "PresetCatalogEntry",
+            "preset_catalog",
+            "GuardianJvmPresetOption",
+            "label:",
+            "detail:",
+        ] {
+            if preset_production.contains(marker) {
+                violations.push(format!("apps/api/src/guardian/jvm_preset.rs: {marker}"));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "displaced Guardian copy authors:\n{}",
+            violations.join("\n")
+        );
+    }
+
     fn collect_rust_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
         for entry in fs::read_dir(directory).expect("read API source directory") {
             let entry = entry.expect("read API source entry");

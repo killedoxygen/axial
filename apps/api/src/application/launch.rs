@@ -8,7 +8,7 @@ use super::{
     ApplicationCommand, ApplicationCommandRequest, CommandResult, CommandResultCarriers,
     LaunchInstanceCommand, LaunchInstancePayload, SessionCommandCarrier,
 };
-use crate::guardian::GuardianPreflightOutcome;
+use crate::guardian::{GuardianPreflightOutcome, guardian_launch_stage_evidence};
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
 use crate::state::contracts::{CommandKind, OperationStatus};
 use axial_launcher::{LaunchStageEvidence, launch_notice};
@@ -125,16 +125,7 @@ pub(crate) fn launch_preflight_stage_evidence(
         sanitize_evidence_token(performance_mode, RedactionAudience::UserVisible, 64)
             .unwrap_or_else(|| "unknown".to_string());
     vec![
-        launch_stage_evidence(
-            "guardian_launch_safety_decision",
-            "guardian",
-            "Guardian recorded the launch safety decision.",
-            vec![
-                format!("mode:{:?}", outcome.guardian_decision.mode),
-                format!("decision:{:?}", outcome.user_outcome.decision()),
-                format!("diagnoses:{}", outcome.safety_case.diagnoses.len()),
-            ],
-        ),
+        guardian_launch_stage_evidence(outcome),
         launch_stage_evidence(
             "performance_launch_plan_input",
             "performance",

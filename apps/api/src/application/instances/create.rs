@@ -22,8 +22,8 @@ use crate::application::{
     InstallQueueStateResponse, enqueue_install_owned, loader_error_response,
 };
 use crate::guardian::{
-    GuardianJvmPresetOption, GuardianJvmPresetResolution, guardian_jvm_preset_options,
-    normalize_create_jvm_preset,
+    GuardianJvmPresetNotice, GuardianJvmPresetOption, GuardianJvmPresetResolution,
+    guardian_jvm_preset_notice, guardian_jvm_preset_options, normalize_create_jvm_preset,
 };
 use crate::observability::telemetry::TelemetryEvent;
 use crate::state::contracts::{CommandKind, OperationId, OperationStatus};
@@ -254,15 +254,6 @@ pub(crate) struct CreateQueuedInstallSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct CreateGuardianNotice {
-    pub state_id: String,
-    pub tone: String,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct CreateInstanceResponse {
     #[serde(flatten)]
     pub instance: EnrichedInstance,
@@ -273,7 +264,7 @@ pub(crate) struct CreateInstanceResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_install: Option<CreateQueuedInstallSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guardian_notice: Option<CreateGuardianNotice>,
+    pub guardian_notice: Option<GuardianJvmPresetNotice>,
 }
 
 pub(crate) async fn handle_create_instance_view(
@@ -499,7 +490,7 @@ pub(crate) async fn handle_create_instance_owned(
         enriched,
         install_queue,
         queued_install,
-        create_guardian_notice(&preset),
+        guardian_jvm_preset_notice(preset),
     ))
 }
 
@@ -756,7 +747,7 @@ fn build_created_instance(
     if let Some(window_height) = payload.window_height {
         instance.window_height = window_height.max(0);
     }
-    instance.jvm_preset = preset.stored_preset.clone();
+    instance.jvm_preset = preset.stored_preset().to_string();
     if let Some(auto_optimize) = payload.auto_optimize {
         instance.auto_optimize = auto_optimize;
     }
@@ -948,7 +939,7 @@ fn create_instance_response(
     instance: EnrichedInstance,
     install_queue: Option<InstallQueueStateResponse>,
     queued_install: Option<CreateQueuedInstallSummary>,
-    guardian_notice: Option<CreateGuardianNotice>,
+    guardian_notice: Option<GuardianJvmPresetNotice>,
 ) -> CreateInstanceResponse {
     let payload = CreateInstancePayload {
         instance_id: Some(instance.id.clone()),
@@ -994,21 +985,13 @@ fn create_instance_response(
             summary,
             detail: guardian_notice
                 .as_ref()
-                .and_then(|notice| notice.detail.clone()),
+                .and_then(GuardianJvmPresetNotice::detail)
+                .map(str::to_string),
         },
         install_queue,
         queued_install,
         guardian_notice,
     }
-}
-
-fn create_guardian_notice(preset: &GuardianJvmPresetResolution) -> Option<CreateGuardianNotice> {
-    preset.warning.then(|| CreateGuardianNotice {
-        state_id: preset.state_id.clone(),
-        tone: "warn".to_string(),
-        message: "Guardian adjusted the JVM preset".to_string(),
-        detail: preset.detail.clone(),
-    })
 }
 
 fn create_source_options(
