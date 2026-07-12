@@ -1,7 +1,7 @@
 use super::{
     FactReliability, GuardianActionKind, GuardianConfidence, GuardianDecision, GuardianDomain,
     GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianSeverity,
-    build_safety_case, decide_guardian_policy,
+    SafetyCase, build_safety_case, decide_guardian_policy,
 };
 use crate::observability::{
     EvidenceField, EvidenceSensitivity, RedactionAudience, sanitize_evidence_token,
@@ -71,23 +71,22 @@ pub fn plan_performance_supervision(
     if request.target.ownership != OwnershipClass::CompositionManaged {
         return Err(GuardianPerformanceSupervisionRejection::UnsafeOwnership);
     }
-    let decision = if request.facts.is_empty() {
-        GuardianDecision {
+    let safety_case = if request.facts.is_empty() {
+        SafetyCase {
             operation_id: request.operation_id.clone(),
             mode: request.mode,
-            kind: GuardianActionKind::Allow,
+            phase: request.phase,
             diagnoses: Vec::new(),
-            action_plan: None,
         }
     } else {
-        let safety_case = build_safety_case(
+        build_safety_case(
             request.operation_id.clone(),
             request.mode,
             request.phase,
             request.facts,
-        );
-        decide_guardian_policy(&safety_case, request.context)
+        )
     };
+    let decision = decide_guardian_policy(&safety_case, request.context);
 
     if !performance_supervision_allows(request.operation, decision.kind) {
         return Err(GuardianPerformanceSupervisionRejection::GuardianBlocked);
@@ -600,6 +599,9 @@ mod tests {
 
         assert!(!supervision.rollback_authorized);
         assert_eq!(supervision.decision.kind, GuardianActionKind::Allow);
+        assert_eq!(supervision.decision.mode, GuardianMode::Managed);
+        assert!(supervision.decision.diagnoses.is_empty());
+        assert!(supervision.decision.action_plan.is_none());
     }
 
     fn performance_target(id: &str, ownership: OwnershipClass) -> TargetDescriptor {

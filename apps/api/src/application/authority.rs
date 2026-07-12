@@ -754,6 +754,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn guardian_policy_is_the_only_production_decision_constructor() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("api crate must live under apps/ in the repository");
+        let guardian_root = repo_root.join("apps/api/src/guardian");
+        let policy_path = "apps/api/src/guardian/policy.rs";
+        let mut sources = Vec::new();
+        collect_rust_sources(&guardian_root, &mut sources);
+        sources.sort();
+
+        let marker = concat!("Guardian", "Decision{");
+        let declaration = concat!("pubstructGuardian", "Decision{");
+        let mut violations = Vec::new();
+        for path in sources {
+            if is_test_source(&path) {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(repo_root)
+                .expect("Guardian source must be inside the repository")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative == policy_path {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("read Guardian source");
+            let production = without_trailing_test_module(&source);
+            let mut compact = production
+                .chars()
+                .filter(|value| !value.is_whitespace())
+                .collect::<String>();
+            if relative == "apps/api/src/guardian/model.rs" {
+                let declaration_offset = compact
+                    .find(declaration)
+                    .expect("GuardianDecision model declaration");
+                compact.replace_range(
+                    declaration_offset..declaration_offset + declaration.len(),
+                    "",
+                );
+            }
+            if compact.contains(marker) {
+                violations.push(relative);
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "GuardianDecision production constructors outside policy.rs:\n{}",
+            violations.join("\n")
+        );
+    }
+
     fn collect_rust_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
         for entry in fs::read_dir(directory).expect("read API source directory") {
             let entry = entry.expect("read API source entry");
