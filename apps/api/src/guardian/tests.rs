@@ -2,15 +2,24 @@ use super::rules::{DIAGNOSIS_RULES, rule_for_diagnosis};
 use super::{
     DiagnosisId, FactReliability, GuardianAction, GuardianActionKind, GuardianActionPlan,
     GuardianConfidence, GuardianCopyRequest, GuardianDecision, GuardianDomain, GuardianFact,
-    GuardianFactId, GuardianMode, GuardianSeverity, GuardianSeverity::Repairable,
-    author_guardian_copy, build_safety_case, decide_guardian_policy, diagnose,
-    guardian_fact_from_execution,
+    GuardianFactId, GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
+    GuardianMode, GuardianPerformanceOperationKind, GuardianPerformanceSupervisionRejection,
+    GuardianPerformanceSupervisionRequest, GuardianPolicyContext, GuardianPreflightOutcomeRequest,
+    GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest, GuardianSeverity,
+    GuardianSeverity::Repairable, GuardianStartupFailureObservation, GuardianStartupFailureRequest,
+    assess_install_artifact_failure, author_guardian_copy, build_safety_case,
+    decide_guardian_policy, diagnose, guardian_fact_from_execution, guardian_preflight_outcome,
+    guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
+    guardian_startup_failure_outcome, persisted_state_load_guardian_outcome,
+    plan_performance_supervision, with_guardian_policy_evaluation_count,
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::{
-    OperationId, OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
+    OperationId, OperationPhase, OwnershipClass, RollbackState, StabilizationSystem,
+    TargetDescriptor, TargetKind,
 };
+use axial_launcher::LaunchFailureClass;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -1582,6 +1591,238 @@ fn would_block_file_error_reaches_managed_block_policy() {
         copy.guidance(),
         ["Close apps that may be using launcher files, then retry the install."]
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NamedPolicyBoundaryCase {
+    LaunchPreflight,
+    PrepareFailure,
+    PresetAdjustment,
+    StartupFailure,
+    InstallAssessment,
+    PerformanceSupervision,
+    PersistedStateLoad,
+    UnchangedPreset,
+    BlankPreset,
+    EmptyInstallEvidence,
+    CleanPersistedState,
+    RejectedPerformance,
+}
+
+impl NamedPolicyBoundaryCase {
+    fn exercise(self) {
+        match self {
+            Self::LaunchPreflight => {
+                let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest::new(
+                    GuardianMode::Managed,
+                    &[],
+                ));
+                assert_eq!(
+                    outcome.guardian_decision.kind(),
+                    GuardianActionKind::RecordOnly
+                );
+            }
+            Self::PrepareFailure => {
+                let outcome = guardian_prepare_failure_outcome(GuardianPrepareFailureRequest {
+                    mode: GuardianMode::Managed,
+                    failure_class: LaunchFailureClass::Unknown,
+                    public_error: "launch preparation failed",
+                    requested_java_present: false,
+                    explicit_java_override_present: false,
+                    explicit_jvm_args_present: false,
+                    runtime_intervention_applied: false,
+                    raw_jvm_args_intervention_applied: false,
+                });
+                assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Block);
+            }
+            Self::PresetAdjustment => {
+                let directive = guardian_prelaunch_preset_adjustment_directive(
+                    GuardianPresetAdjustmentRequest {
+                        mode: GuardianMode::Managed,
+                        requested_preset: "ultra_low_latency",
+                        effective_preset: "performance",
+                        explicit_jvm_preset_present: true,
+                    },
+                );
+                assert!(directive.is_some());
+            }
+            Self::StartupFailure => {
+                let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
+                    mode: GuardianMode::Managed,
+                    observation: GuardianStartupFailureObservation::Stalled,
+                    crash_evidence: None,
+                    target_version_id: "1.21.1",
+                    runtime_major: 21,
+                    requested_java_present: false,
+                    explicit_java_override_present: false,
+                    explicit_jvm_args_present: false,
+                    explicit_jvm_preset_present: false,
+                    startup_recovery_applied: false,
+                    disable_custom_gc: false,
+                    effective_preset: "performance",
+                });
+                assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Block);
+            }
+            Self::InstallAssessment => {
+                let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
+                    Some(OperationId::new("install-named-boundary")),
+                    "minecraft_client_1_21_1",
+                    GuardianInstallArtifactFailureKind::ProviderFailure,
+                );
+                let assessment = assess_install_artifact_failure(
+                    Some(OperationId::new("install-named-boundary")),
+                    GuardianMode::Managed,
+                    OperationPhase::Downloading,
+                    &[evidence],
+                );
+                assert!(assessment.is_some());
+            }
+            Self::PerformanceSupervision => {
+                let result = plan_performance_supervision(performance_supervision_request(
+                    OwnershipClass::CompositionManaged,
+                ));
+                assert!(result.is_ok());
+            }
+            Self::PersistedStateLoad => {
+                assert!(persisted_state_load_guardian_outcome(1).is_some());
+            }
+            Self::UnchangedPreset => {
+                let directive = guardian_prelaunch_preset_adjustment_directive(
+                    GuardianPresetAdjustmentRequest {
+                        mode: GuardianMode::Managed,
+                        requested_preset: "performance",
+                        effective_preset: "performance",
+                        explicit_jvm_preset_present: false,
+                    },
+                );
+                assert!(directive.is_none());
+            }
+            Self::BlankPreset => {
+                let directive = guardian_prelaunch_preset_adjustment_directive(
+                    GuardianPresetAdjustmentRequest {
+                        mode: GuardianMode::Managed,
+                        requested_preset: "   ",
+                        effective_preset: "performance",
+                        explicit_jvm_preset_present: false,
+                    },
+                );
+                assert!(directive.is_none());
+            }
+            Self::EmptyInstallEvidence => {
+                let assessment = assess_install_artifact_failure(
+                    Some(OperationId::new("install-empty-boundary")),
+                    GuardianMode::Managed,
+                    OperationPhase::Downloading,
+                    &[],
+                );
+                assert!(assessment.is_none());
+            }
+            Self::CleanPersistedState => {
+                assert!(persisted_state_load_guardian_outcome(0).is_none());
+            }
+            Self::RejectedPerformance => {
+                let result = plan_performance_supervision(performance_supervision_request(
+                    OwnershipClass::UserOwned,
+                ));
+                assert_eq!(
+                    result,
+                    Err(GuardianPerformanceSupervisionRejection::UnsafeOwnership)
+                );
+            }
+        }
+    }
+}
+
+fn performance_supervision_request(
+    ownership: OwnershipClass,
+) -> GuardianPerformanceSupervisionRequest<'static> {
+    GuardianPerformanceSupervisionRequest {
+        operation_id: Some(OperationId::new("performance-named-boundary")),
+        mode: GuardianMode::Managed,
+        phase: OperationPhase::Installing,
+        operation: GuardianPerformanceOperationKind::RemoveManagedComposition,
+        target: TargetDescriptor::new(
+            StabilizationSystem::Performance,
+            TargetKind::PerformanceComposition,
+            "managed-composition",
+            ownership,
+        ),
+        facts: &[],
+        fallback_chain_len: 0,
+        rollback_state: RollbackState::NotApplicable,
+        context: GuardianPolicyContext::current_operation(),
+    }
+}
+
+#[tokio::test]
+async fn named_synchronous_boundaries_evaluate_policy_once_or_short_circuit_before_policy() {
+    let cases = [
+        (
+            "launch_preflight",
+            NamedPolicyBoundaryCase::LaunchPreflight,
+            1,
+        ),
+        (
+            "prepare_failure",
+            NamedPolicyBoundaryCase::PrepareFailure,
+            1,
+        ),
+        (
+            "preset_adjustment",
+            NamedPolicyBoundaryCase::PresetAdjustment,
+            1,
+        ),
+        (
+            "startup_failure",
+            NamedPolicyBoundaryCase::StartupFailure,
+            1,
+        ),
+        (
+            "install_assessment",
+            NamedPolicyBoundaryCase::InstallAssessment,
+            1,
+        ),
+        (
+            "performance_supervision",
+            NamedPolicyBoundaryCase::PerformanceSupervision,
+            1,
+        ),
+        (
+            "persisted_state_load",
+            NamedPolicyBoundaryCase::PersistedStateLoad,
+            1,
+        ),
+        (
+            "unchanged_preset",
+            NamedPolicyBoundaryCase::UnchangedPreset,
+            0,
+        ),
+        ("blank_preset", NamedPolicyBoundaryCase::BlankPreset, 0),
+        (
+            "empty_install_evidence",
+            NamedPolicyBoundaryCase::EmptyInstallEvidence,
+            0,
+        ),
+        (
+            "clean_persisted_state",
+            NamedPolicyBoundaryCase::CleanPersistedState,
+            0,
+        ),
+        (
+            "rejected_performance",
+            NamedPolicyBoundaryCase::RejectedPerformance,
+            0,
+        ),
+    ];
+
+    for (name, boundary, expected_evaluations) in cases {
+        let ((), evaluations) =
+            with_guardian_policy_evaluation_count(async move { boundary.exercise() }).await;
+        assert_eq!(
+            evaluations, expected_evaluations,
+            "named Guardian assessment boundary {name}"
+        );
+    }
 }
 
 fn guardian_test_fact(

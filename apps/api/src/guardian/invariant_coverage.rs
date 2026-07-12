@@ -221,7 +221,7 @@ fn generate_coverage() -> InvariantCoverage {
             invariant("I6", "implemented_memory_trigger_rules_registered"),
             invariant(
                 "I7",
-                "typed_loader_worker_delegated_dispatch_and_single_install_assessment_complete",
+                "typed_loader_worker_delegated_dispatch_and_named_boundary_single_assessment_complete",
             ),
             invariant("I8", "preflight_costs_declared_measurement_pending_phase_4"),
             invariant("I9", "reserved_facts_unused_agent_demo_pending_phase_5"),
