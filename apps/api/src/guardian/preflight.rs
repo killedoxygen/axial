@@ -1,28 +1,16 @@
 use super::{
-    DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence, GuardianDecision,
+    FactReliability, GuardianActionKind, GuardianConfidence, GuardianCopyRequest, GuardianDecision,
     GuardianDomain, GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext,
     GuardianSeverity, GuardianUserOutcome, PreflightAdmission, SafetyCase, SafetyOutcome,
-    build_safety_case, decide_guardian_policy,
-    launch_failure_memory::{
-        RECENT_REPAIR_FAILED_FACT_ID, RECENT_STARTUP_FAILURE_FACT_ID,
-        REPAIR_SUPPRESSED_UNTIL_FACT_ID,
-    },
+    author_guardian_copy, build_safety_case, decide_guardian_policy,
 };
 use crate::observability::{
-    EvidenceField, EvidenceSensitivity, RedactionAudience, sanitize_evidence_text,
-    sanitize_evidence_token,
+    EvidenceField, EvidenceSensitivity, RedactionAudience, sanitize_evidence_token,
 };
 use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
-use axial_launcher::LaunchFailureClass;
-use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-
-const MAX_PREFLIGHT_DETAILS: usize = 6;
-const MAX_PREFLIGHT_GUIDANCE: usize = 6;
-const MAX_PREFLIGHT_SUMMARY_CHARS: usize = 180;
-const MAX_PREFLIGHT_DETAIL_CHARS: usize = 240;
 
 #[derive(Clone, Debug)]
 pub struct GuardianPreflightOutcomeRequest<'a> {
@@ -113,23 +101,22 @@ pub fn guardian_preflight_outcome(
         decide_guardian_policy(&safety_case, preflight_policy_context(&request, &facts));
     let preflight_decision = preflight_boundary_verdict(guardian_decision.kind);
     let directives = preflight_directives(guardian_decision.kind);
-    let (details, guidance) = preflight_copy(guardian_decision.kind, &safety_case, &facts);
-    let summary = public_text(
-        preflight_summary(guardian_decision.kind),
-        MAX_PREFLIGHT_SUMMARY_CHARS,
-    )
-    .unwrap_or_else(|| "Guardian recorded launch preflight readiness.".to_string());
-
-    let user_outcome = GuardianUserOutcome {
-        decision: preflight_decision,
-        phase: request.phase,
-        summary: summary.clone(),
-        details,
-        guidance,
-    };
+    let diagnosis_ids = safety_case
+        .diagnoses
+        .iter()
+        .map(|diagnosis| diagnosis.id())
+        .collect::<Vec<_>>();
+    let user_outcome = author_guardian_copy(GuardianCopyRequest::preflight(
+        guardian_decision.kind,
+        preflight_decision,
+        request.phase,
+        &diagnosis_ids,
+        &facts,
+    ))
+    .expect("preflight copy summary table covers every preflight verdict");
     let safety = SafetyOutcome {
         decision: preflight_decision,
-        summary,
+        summary: user_outcome.summary.clone(),
         detail: user_outcome.details.first().cloned(),
         diagnoses: guardian_decision.diagnoses.clone(),
     };
@@ -221,526 +208,6 @@ fn preflight_directives(decision: GuardianActionKind) -> Vec<GuardianPreflightDi
             vec![GuardianPreflightDirective::StripExplicitJvmArgsForAttempt]
         }
         _ => Vec::new(),
-    }
-}
-
-fn preflight_copy(
-    decision: GuardianActionKind,
-    safety_case: &SafetyCase,
-    facts: &[GuardianFact],
-) -> (Vec<String>, Vec<String>) {
-    let mut details = Vec::new();
-    let mut guidance = Vec::new();
-    if decision == GuardianActionKind::Warn {
-        push_historical_launch_copy(facts, &mut details, &mut guidance);
-    }
-    for diagnosis in &safety_case.diagnoses {
-        if let Some(detail) = detail_for_diagnosis(diagnosis.id(), decision) {
-            push_unique_public(&mut details, detail, MAX_PREFLIGHT_DETAILS);
-        }
-        if let Some(value) = guidance_for_diagnosis(diagnosis.id(), decision) {
-            push_unique_public(&mut guidance, value, MAX_PREFLIGHT_GUIDANCE);
-        }
-    }
-    if decision != GuardianActionKind::Warn {
-        push_historical_launch_copy(facts, &mut details, &mut guidance);
-    }
-    if details.is_empty() && decision == GuardianActionKind::Block {
-        push_unique_public(
-            &mut details,
-            "Guardian blocked launch because preflight readiness failed.",
-            MAX_PREFLIGHT_DETAILS,
-        );
-    }
-    (details, guidance)
-}
-
-fn push_historical_launch_copy(
-    facts: &[GuardianFact],
-    details: &mut Vec<String>,
-    guidance: &mut Vec<String>,
-) {
-    for fact in facts.iter().filter(|fact| is_historical_launch_fact(fact)) {
-        if let Some(detail) = historical_launch_detail(fact) {
-            push_unique_public(details, &detail, MAX_PREFLIGHT_DETAILS);
-        }
-        if let Some(value) = historical_launch_guidance(fact) {
-            push_unique_public(guidance, &value, MAX_PREFLIGHT_GUIDANCE);
-        }
-    }
-}
-
-fn is_historical_launch_fact(fact: &GuardianFact) -> bool {
-    matches!(
-        fact.id,
-        RECENT_STARTUP_FAILURE_FACT_ID
-            | RECENT_REPAIR_FAILED_FACT_ID
-            | REPAIR_SUPPRESSED_UNTIL_FACT_ID
-    )
-}
-
-fn historical_launch_detail(fact: &GuardianFact) -> Option<String> {
-    if fact.id == RECENT_STARTUP_FAILURE_FACT_ID {
-        recent_startup_failure_detail(fact)
-    } else if fact.id == RECENT_REPAIR_FAILED_FACT_ID {
-        repair_failure_copy(fact).map(|copy| copy.0.to_string())
-    } else if fact.id == REPAIR_SUPPRESSED_UNTIL_FACT_ID {
-        suppression_time_utc(fact)
-            .map(|time| format!("Guardian will not auto-repair this launch again until {time}."))
-    } else {
-        None
-    }
-}
-
-fn historical_launch_guidance(fact: &GuardianFact) -> Option<String> {
-    if fact.id == RECENT_STARTUP_FAILURE_FACT_ID {
-        recent_startup_failure_guidance(fact)
-    } else if fact.id == RECENT_REPAIR_FAILED_FACT_ID {
-        repair_failure_copy(fact).map(|copy| copy.1.to_string())
-    } else if fact.id == REPAIR_SUPPRESSED_UNTIL_FACT_ID {
-        suppression_time_utc(fact).map(|time| {
-            format!(
-                "Review the launch settings before retrying; unchanged settings will not trigger another automatic repair before {time}."
-            )
-        })
-    } else {
-        None
-    }
-}
-
-fn recent_startup_failure_detail(fact: &GuardianFact) -> Option<String> {
-    let failure_class =
-        fact_field(fact, "failure_class").and_then(LaunchFailureClass::from_name)?;
-    let label = launch_failure_plain_label(failure_class)?;
-    let occurrences = fact_field_u32(fact, "occurrences").filter(|count| *count > 0);
-    let latest_today = fact_field(fact, "latest_observed_today") == Some("true");
-    let occurrences_today = latest_today
-        .then(|| fact_field_u32(fact, "occurrences_today"))
-        .flatten()
-        .filter(|count| *count > 0)
-        .filter(|count| occurrences.is_none_or(|total| *count <= total));
-
-    Some(if let Some(count) = occurrences_today {
-        counted_failure_copy("had", count, label, " today")
-    } else if let Some(count) = occurrences {
-        let recency = if latest_today {
-            "; the latest was today"
-        } else {
-            "; the latest was within the past 24 hours"
-        };
-        counted_failure_copy("has recorded", count, label, recency)
-    } else {
-        format!("A recent launch ended with {}.", label.with_article)
-    })
-}
-
-fn counted_failure_copy(
-    verb: &str,
-    count: u32,
-    label: LaunchFailurePlainLabel,
-    suffix: &str,
-) -> String {
-    if count == 1 {
-        format!("This instance {verb} one {}{suffix}.", label.singular)
-    } else {
-        format!("This instance {verb} {count} {}{suffix}.", label.plural)
-    }
-}
-
-fn recent_startup_failure_guidance(fact: &GuardianFact) -> Option<String> {
-    let failure_class =
-        fact_field(fact, "failure_class").and_then(LaunchFailureClass::from_name)?;
-    match failure_class {
-        LaunchFailureClass::OutOfMemory => {
-            let current = fact_field_u32(fact, "current_memory_mb").filter(|value| *value > 0);
-            let suggested = fact_field_u32(fact, "suggested_memory_mb").filter(|value| *value > 0);
-            match (current, suggested) {
-                (Some(current), Some(suggested)) if suggested > current => Some(format!(
-                    "Increase this instance's maximum memory from {current} MB to {suggested} MB before relaunching."
-                )),
-                _ => Some(
-                    "Guardian could not verify safe headroom for a larger memory allocation. Close another session or free memory before relaunching."
-                        .to_string(),
-                ),
-            }
-        }
-        LaunchFailureClass::GraphicsDriverCrash => Some(
-            "Update the graphics driver and remove graphics overrides before relaunching."
-                .to_string(),
-        ),
-        LaunchFailureClass::MissingDependency => {
-            Some("Repair the instance dependencies before relaunching.".to_string())
-        }
-        LaunchFailureClass::ModTransformationFailure => Some(
-            "Review recently changed mods and their loader compatibility before relaunching."
-                .to_string(),
-        ),
-        LaunchFailureClass::ModAttributedCrash => Some(
-            "Review recently changed mods and disable the suspected mod before relaunching."
-                .to_string(),
-        ),
-        LaunchFailureClass::Unknown
-        | LaunchFailureClass::JvmUnsupportedOption
-        | LaunchFailureClass::JvmExperimentalUnlock
-        | LaunchFailureClass::JvmOptionOrdering
-        | LaunchFailureClass::JavaRuntimeMismatch
-        | LaunchFailureClass::ClasspathModuleConflict
-        | LaunchFailureClass::LauncherManagedArtifactSignature
-        | LaunchFailureClass::AuthModeIncompatible
-        | LaunchFailureClass::LoaderBootstrapFailure
-        | LaunchFailureClass::StartupStalled => None,
-    }
-}
-
-#[derive(Clone, Copy)]
-struct LaunchFailurePlainLabel {
-    singular: &'static str,
-    plural: &'static str,
-    with_article: &'static str,
-}
-
-fn launch_failure_plain_label(
-    failure_class: LaunchFailureClass,
-) -> Option<LaunchFailurePlainLabel> {
-    let label = match failure_class {
-        LaunchFailureClass::OutOfMemory => LaunchFailurePlainLabel {
-            singular: "out-of-memory crash",
-            plural: "out-of-memory crashes",
-            with_article: "an out-of-memory crash",
-        },
-        LaunchFailureClass::GraphicsDriverCrash => LaunchFailurePlainLabel {
-            singular: "graphics driver crash",
-            plural: "graphics driver crashes",
-            with_article: "a graphics driver crash",
-        },
-        LaunchFailureClass::MissingDependency => LaunchFailurePlainLabel {
-            singular: "missing-dependency crash",
-            plural: "missing-dependency crashes",
-            with_article: "a missing-dependency crash",
-        },
-        LaunchFailureClass::ModTransformationFailure => LaunchFailurePlainLabel {
-            singular: "mod transformation crash",
-            plural: "mod transformation crashes",
-            with_article: "a mod transformation crash",
-        },
-        LaunchFailureClass::ModAttributedCrash => LaunchFailurePlainLabel {
-            singular: "mod-attributed crash",
-            plural: "mod-attributed crashes",
-            with_article: "a mod-attributed crash",
-        },
-        LaunchFailureClass::Unknown
-        | LaunchFailureClass::JvmUnsupportedOption
-        | LaunchFailureClass::JvmExperimentalUnlock
-        | LaunchFailureClass::JvmOptionOrdering
-        | LaunchFailureClass::JavaRuntimeMismatch
-        | LaunchFailureClass::ClasspathModuleConflict
-        | LaunchFailureClass::LauncherManagedArtifactSignature
-        | LaunchFailureClass::AuthModeIncompatible
-        | LaunchFailureClass::LoaderBootstrapFailure
-        | LaunchFailureClass::StartupStalled => return None,
-    };
-    Some(label)
-}
-
-fn repair_failure_copy(fact: &GuardianFact) -> Option<(&'static str, &'static str)> {
-    match fact_field(fact, "diagnosis")? {
-        value if value == DiagnosisId::JavaRuntimeRecovery.as_str() => Some((
-            "The previous managed Java recovery attempt failed.",
-            "Review the selected Java runtime before relaunching.",
-        )),
-        value if value == DiagnosisId::JvmArgUnsupported.as_str() => Some((
-            "The previous JVM argument recovery attempt failed.",
-            "Review or remove explicit JVM arguments before relaunching.",
-        )),
-        value if value == DiagnosisId::JvmPresetRecovery.as_str() => Some((
-            "The previous JVM preset recovery attempt failed.",
-            "Review the JVM preset before relaunching.",
-        )),
-        _ => None,
-    }
-}
-
-fn suppression_time_utc(fact: &GuardianFact) -> Option<String> {
-    let timestamp = fact_field(fact, "suppression_until")?;
-    let timestamp = DateTime::parse_from_rfc3339(timestamp).ok()?;
-    let utc = timestamp.with_timezone(&Utc);
-    Some(format!("{:02}:{:02} UTC", utc.hour(), utc.minute()))
-}
-
-fn fact_field<'a>(fact: &'a GuardianFact, key: &str) -> Option<&'a str> {
-    let mut values = fact
-        .fields
-        .iter()
-        .filter(|field| field.key == key)
-        .filter_map(|field| field.value_for(RedactionAudience::UserVisible));
-    let value = values.next()?;
-    values.next().is_none().then_some(value)
-}
-
-fn fact_field_u32(fact: &GuardianFact, key: &str) -> Option<u32> {
-    fact_field(fact, key)?.parse().ok()
-}
-
-fn detail_for_diagnosis(
-    diagnosis_id: DiagnosisId,
-    decision: GuardianActionKind,
-) -> Option<&'static str> {
-    match diagnosis_id {
-        DiagnosisId::JavaOverrideUnavailable => match decision {
-            GuardianActionKind::Fallback => Some(
-                "Guardian will ignore the unavailable Java override and use managed Java for this launch.",
-            ),
-            GuardianActionKind::Block => {
-                Some("Guardian blocked launch because the selected Java override is unavailable.")
-            }
-            GuardianActionKind::AskUser => {
-                Some("Guardian needs confirmation before changing the selected Java override.")
-            }
-            _ => Some(
-                "Guardian detected an unavailable Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
-            ),
-        },
-        DiagnosisId::JavaProbeFailed => match decision {
-            GuardianActionKind::Fallback => Some(
-                "Guardian will ignore the Java override that failed probing and use managed Java for this launch.",
-            ),
-            GuardianActionKind::Block => Some(
-                "Guardian blocked launch because the selected Java override could not be probed.",
-            ),
-            GuardianActionKind::AskUser => Some(
-                "Guardian needs confirmation before bypassing a Java override that could not be probed.",
-            ),
-            _ => Some(
-                "Guardian could not verify the selected Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
-            ),
-        },
-        DiagnosisId::JavaRuntimeMajorMismatch => match decision {
-            GuardianActionKind::Fallback => Some(
-                "Guardian will ignore the incompatible Java override and use managed Java for this launch.",
-            ),
-            GuardianActionKind::Block => Some(
-                "Guardian blocked launch because the selected Java override has the wrong Java version.",
-            ),
-            GuardianActionKind::AskUser => {
-                Some("Guardian needs confirmation before bypassing an incompatible Java override.")
-            }
-            _ => Some(
-                "Guardian detected a Java override that does not match the version requirement.",
-            ),
-        },
-        DiagnosisId::JavaRuntimeUpdateTooOld => match decision {
-            GuardianActionKind::Fallback => Some(
-                "Guardian will ignore the outdated Java override and use managed Java for this launch.",
-            ),
-            GuardianActionKind::Block => {
-                Some("Guardian blocked launch because the selected Java 8 override is too old.")
-            }
-            GuardianActionKind::AskUser => {
-                Some("Guardian needs confirmation before bypassing an outdated Java override.")
-            }
-            _ => Some("Guardian detected a Java 8 override that is too old for this launch."),
-        },
-        DiagnosisId::JvmArgsMalformed => match decision {
-            GuardianActionKind::Strip => {
-                Some("Guardian removed malformed explicit JVM args for this launch.")
-            }
-            _ => Some(
-                "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
-            ),
-        },
-        DiagnosisId::JvmArgUnsupported => match decision {
-            GuardianActionKind::Strip => {
-                Some("Guardian removed unsupported explicit JVM args for this launch.")
-            }
-            _ => Some(
-                "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails.",
-            ),
-        },
-        DiagnosisId::JvmArgUnsafeOverride => match decision {
-            GuardianActionKind::Strip => Some(
-                "Guardian removed explicit JVM args that override launcher-owned settings for this launch.",
-            ),
-            _ => Some(
-                "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly.",
-            ),
-        },
-        DiagnosisId::InstalledVersionMetadataMissing => {
-            Some("Guardian blocked launch because installed version metadata is missing.")
-        }
-        DiagnosisId::ParentVersionMetadataMissing => {
-            Some("Guardian blocked launch because parent version metadata is missing.")
-        }
-        DiagnosisId::InstallIncomplete => {
-            Some("Guardian blocked launch because the install is incomplete.")
-        }
-        DiagnosisId::ClientJarMissing => {
-            Some("Guardian blocked launch because client game files are missing.")
-        }
-        DiagnosisId::LibrariesMissing => {
-            Some("Guardian blocked launch because required libraries are missing.")
-        }
-        DiagnosisId::AssetIndexMissing => {
-            Some("Guardian blocked launch because the asset index is missing.")
-        }
-        DiagnosisId::LauncherManagedArtifactCorrupt => {
-            Some("Guardian blocked launch because launcher-managed game files are corrupt.")
-        }
-        DiagnosisId::LauncherManagedArtifactSignatureCorrupt => Some(
-            "Guardian blocked launch because launcher-managed jar signatures are inconsistent.",
-        ),
-        DiagnosisId::ManagedRuntimeMissing => {
-            Some("Managed Java runtime is missing and can be prepared before launch.")
-        }
-        DiagnosisId::LaunchMemoryMinClamped => Some(
-            "Minimum memory was higher than maximum memory, so Axial clamped the launch minimum to match the maximum allocation.",
-        ),
-        DiagnosisId::LaunchMemoryAllocationLow => {
-            Some("Launch memory allocation is very low for Minecraft.")
-        }
-        DiagnosisId::LaunchResourceMemoryPressure => {
-            Some("Launch memory budget is tight for the current active sessions.")
-        }
-        DiagnosisId::LaunchResourceCpuPressure => Some(
-            "Launch concurrency may be tight: other active launch sessions can saturate low-end CPUs.",
-        ),
-        DiagnosisId::LaunchResourceInstallPressure => {
-            Some("Active install or download work may add pressure during startup.")
-        }
-        DiagnosisId::LaunchResourceDiskPressure => {
-            Some("Launch-relevant storage has low free space.")
-        }
-        DiagnosisId::CustomJavaOverridePresent => {
-            Some("Guardian Custom mode will keep the selected Java override for this launch.")
-        }
-        DiagnosisId::CustomJvmPresetPresent => {
-            Some("Guardian Custom mode will keep the selected JVM preset for this launch.")
-        }
-        DiagnosisId::CustomJvmArgsPresent => Some(
-            "Guardian Custom mode will keep explicit JVM args; remove them first if startup becomes unstable.",
-        ),
-        _ => None,
-    }
-}
-
-fn guidance_for_diagnosis(
-    diagnosis_id: DiagnosisId,
-    decision: GuardianActionKind,
-) -> Option<&'static str> {
-    match diagnosis_id {
-        DiagnosisId::JavaOverrideUnavailable => match decision {
-            GuardianActionKind::Fallback => Some(
-                "Update or remove the bad Java override after launch if you want to use Custom Java again.",
-            ),
-            GuardianActionKind::AskUser => {
-                Some("Confirm managed Java for this launch or choose a valid Java runtime.")
-            }
-            _ => Some(
-                "Guardian detected an unavailable Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
-            ),
-        },
-        DiagnosisId::JavaProbeFailed => match decision {
-            GuardianActionKind::Fallback => Some(
-                "Update or remove the Java override after launch if you want to use Custom Java again.",
-            ),
-            GuardianActionKind::AskUser => Some(
-                "Confirm managed Java for this launch or choose a Java runtime that can be probed.",
-            ),
-            _ => Some(
-                "Use a Java runtime that can run `java -version`, or switch back to Managed Java.",
-            ),
-        },
-        DiagnosisId::JavaRuntimeMajorMismatch => match decision {
-            GuardianActionKind::Fallback => Some(
-                "Choose a Java runtime matching this Minecraft version before re-enabling the override.",
-            ),
-            GuardianActionKind::AskUser => {
-                Some("Confirm managed Java for this launch or choose a compatible Java runtime.")
-            }
-            _ => Some("Choose a Java runtime matching this Minecraft version requirement."),
-        },
-        DiagnosisId::JavaRuntimeUpdateTooOld => match decision {
-            GuardianActionKind::Fallback => {
-                Some("Use Java 8u312 or newer before re-enabling this override.")
-            }
-            GuardianActionKind::AskUser => {
-                Some("Confirm managed Java for this launch or choose Java 8u312 or newer.")
-            }
-            _ => Some("Use Java 8u312 or newer for this legacy launch."),
-        },
-        DiagnosisId::JvmArgsMalformed => match decision {
-            GuardianActionKind::Strip => Some("Fix the saved JVM args before re-enabling them."),
-            _ => Some(
-                "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
-            ),
-        },
-        DiagnosisId::JvmArgUnsupported => match decision {
-            GuardianActionKind::Strip => Some(
-                "Use JVM flags supported by the selected Java runtime before re-enabling them.",
-            ),
-            _ => Some(
-                "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails.",
-            ),
-        },
-        DiagnosisId::JvmArgUnsafeOverride => match decision {
-            GuardianActionKind::Strip => Some(
-                "Remove memory, classpath, native-path, or agent overrides from saved JVM args before re-enabling them.",
-            ),
-            _ => Some(
-                "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly.",
-            ),
-        },
-        DiagnosisId::InstalledVersionMetadataMissing
-        | DiagnosisId::ParentVersionMetadataMissing
-        | DiagnosisId::InstallIncomplete
-        | DiagnosisId::ClientJarMissing
-        | DiagnosisId::LibrariesMissing
-        | DiagnosisId::AssetIndexMissing
-        | DiagnosisId::LauncherManagedArtifactCorrupt
-        | DiagnosisId::LauncherManagedArtifactSignatureCorrupt => {
-            Some("Install or repair the affected version before launching again.")
-        }
-        DiagnosisId::ManagedRuntimeMissing => {
-            Some("Let Axial prepare the managed Java runtime before launching.")
-        }
-        DiagnosisId::LaunchMemoryMinClamped => Some(
-            "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.",
-        ),
-        DiagnosisId::LaunchMemoryAllocationLow => Some(
-            "Raise the maximum memory allocation if Minecraft crashes during startup, stalls while loading, or exits with out-of-memory errors.",
-        ),
-        DiagnosisId::LaunchResourceMemoryPressure => {
-            Some("Close another running session or lower memory allocation if startup is unstable.")
-        }
-        DiagnosisId::LaunchResourceCpuPressure => Some(
-            "Multiple launches can saturate low-end CPUs; wait for another launch to finish if startup feels sluggish.",
-        ),
-        DiagnosisId::LaunchResourceInstallPressure => {
-            Some("Wait for active install or download work to finish if startup feels slow.")
-        }
-        DiagnosisId::LaunchResourceDiskPressure => {
-            Some("Free disk space before launching if caches or natives become unreliable.")
-        }
-        DiagnosisId::CustomJavaOverridePresent
-        | DiagnosisId::CustomJvmPresetPresent
-        | DiagnosisId::CustomJvmArgsPresent => {
-            Some("Switch Guardian back to Managed if you want Axial to adjust unsafe choices.")
-        }
-        _ => None,
-    }
-}
-
-fn preflight_summary(decision: GuardianActionKind) -> &'static str {
-    match decision {
-        GuardianActionKind::Allow | GuardianActionKind::RecordOnly => {
-            "Guardian recorded launch preflight readiness."
-        }
-        GuardianActionKind::Warn => "Guardian found launch preflight warnings.",
-        GuardianActionKind::AskUser => "Guardian needs confirmation before launch.",
-        GuardianActionKind::Block => "Guardian blocked launch preflight.",
-        GuardianActionKind::Fallback | GuardianActionKind::Strip => {
-            "Guardian adjusted launch preflight."
-        }
-        _ => "Guardian selected a guarded launch preflight action.",
     }
 }
 
@@ -922,41 +389,24 @@ fn public_safe_token(value: &str, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
-fn public_text(value: &str, max_chars: usize) -> Option<String> {
-    sanitize_evidence_text(value, RedactionAudience::UserVisible, max_chars)
-}
-
-fn push_unique_public(values: &mut Vec<String>, value: &str, max_values: usize) {
-    if values.len() >= max_values {
-        return;
-    }
-    let Some(value) = public_text(value, MAX_PREFLIGHT_DETAIL_CHARS) else {
-        return;
-    };
-    if value.is_empty() || values.iter().any(|existing| existing == &value) {
-        return;
-    }
-    values.push(value);
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         GuardianPreflightOutcomeRequest, GuardianPreflightReadiness,
-        GuardianPreflightResourceSignals, RECENT_REPAIR_FAILED_FACT_ID,
-        RECENT_STARTUP_FAILURE_FACT_ID, REPAIR_SUPPRESSED_UNTIL_FACT_ID,
-        guardian_preflight_outcome, launch_failure_plain_label,
+        GuardianPreflightResourceSignals, guardian_preflight_outcome,
     };
     use crate::guardian::{
         FactReliability, GuardianActionKind, GuardianConfidence, GuardianDomain, GuardianFact,
         GuardianFactId, GuardianMode, GuardianPreflightDirective, GuardianSeverity,
-        is_guardian_launch_crash_class,
+        launch_failure_memory::{
+            RECENT_REPAIR_FAILED_FACT_ID, RECENT_STARTUP_FAILURE_FACT_ID,
+            REPAIR_SUPPRESSED_UNTIL_FACT_ID,
+        },
     };
     use crate::observability::{EvidenceField, EvidenceSensitivity};
     use crate::state::contracts::{
         OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
     };
-    use axial_launcher::LaunchFailureClass;
 
     #[test]
     fn java_override_unavailable_blocks_when_readiness_says_launch_is_impossible() {
@@ -1006,6 +456,213 @@ mod tests {
             &"Confirm managed Java for this launch or choose a valid Java runtime.".to_string()
         ));
         assert!(outcome.directives.is_empty());
+    }
+
+    #[test]
+    fn secondary_malformed_jvm_copy_survives_managed_java_fallback() {
+        let facts = [
+            fact(
+                GuardianFactId::JavaOverrideMissing,
+                GuardianDomain::Runtime,
+                GuardianSeverity::Blocking,
+                OwnershipClass::UserOwned,
+                TargetKind::Config,
+                "explicit_java_override",
+            ),
+            fact(
+                GuardianFactId::JvmArgsParseFailed,
+                GuardianDomain::Jvm,
+                GuardianSeverity::Blocking,
+                OwnershipClass::UserOwned,
+                TargetKind::Config,
+                "explicit_jvm_args",
+            ),
+        ];
+
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest::new(
+            GuardianMode::Managed,
+            &facts,
+        ));
+
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Fallback);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Fallback);
+        assert_eq!(
+            &outcome.user_outcome.details[..2],
+            [
+                "Guardian will ignore the unavailable Java override and use managed Java for this launch.",
+                "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
+            ]
+        );
+        assert_eq!(
+            &outcome.user_outcome.guidance[..2],
+            [
+                "Update or remove the bad Java override after launch if you want to use Custom Java again.",
+                "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
+            ]
+        );
+        assert!(outcome.user_outcome.details.len() <= 6);
+        assert!(outcome.user_outcome.guidance.len() <= 6);
+    }
+
+    #[test]
+    fn secondary_malformed_jvm_copy_survives_custom_java_confirmation() {
+        let facts = [
+            fact(
+                GuardianFactId::JavaOverrideMissing,
+                GuardianDomain::Runtime,
+                GuardianSeverity::Blocking,
+                OwnershipClass::UserOwned,
+                TargetKind::Config,
+                "explicit_java_override",
+            ),
+            fact(
+                GuardianFactId::JvmArgsParseFailed,
+                GuardianDomain::Jvm,
+                GuardianSeverity::Blocking,
+                OwnershipClass::UserOwned,
+                TargetKind::Config,
+                "explicit_jvm_args",
+            ),
+        ];
+
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
+            explicit_user_intent: true,
+            ..GuardianPreflightOutcomeRequest::new(GuardianMode::Custom, &facts)
+        });
+
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::AskUser);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
+        assert_eq!(
+            &outcome.user_outcome.details[..2],
+            [
+                "Guardian needs confirmation before changing the selected Java override.",
+                "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
+            ]
+        );
+        assert_eq!(
+            &outcome.user_outcome.guidance[..2],
+            [
+                "Confirm managed Java for this launch or choose a valid Java runtime.",
+                "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
+            ]
+        );
+        assert!(outcome.user_outcome.details.len() <= 6);
+        assert!(outcome.user_outcome.guidance.len() <= 6);
+    }
+
+    #[test]
+    fn secondary_java_probe_copy_survives_managed_jvm_strip() {
+        let facts = [
+            fact(
+                GuardianFactId::JavaProbeFailed,
+                GuardianDomain::Runtime,
+                GuardianSeverity::Blocking,
+                OwnershipClass::UserOwned,
+                TargetKind::Config,
+                "explicit_java_override",
+            ),
+            fact(
+                GuardianFactId::JvmArgsParseFailed,
+                GuardianDomain::Jvm,
+                GuardianSeverity::Blocking,
+                OwnershipClass::UserOwned,
+                TargetKind::Config,
+                "explicit_jvm_args",
+            ),
+        ];
+
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest::new(
+            GuardianMode::Managed,
+            &facts,
+        ));
+
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Strip);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Strip);
+        assert_eq!(
+            &outcome.user_outcome.details[..2],
+            [
+                "Guardian could not verify the selected Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
+                "Guardian removed malformed explicit JVM args for this launch.",
+            ]
+        );
+        assert_eq!(
+            &outcome.user_outcome.guidance[..2],
+            [
+                "Use a Java runtime that can run `java -version`, or switch back to Managed Java.",
+                "Fix the saved JVM args before re-enabling them.",
+            ]
+        );
+    }
+
+    #[test]
+    fn secondary_java_probe_copy_survives_custom_jvm_warning() {
+        let facts = [
+            fact(
+                GuardianFactId::JavaProbeFailed,
+                GuardianDomain::Runtime,
+                GuardianSeverity::Blocking,
+                OwnershipClass::UserOwned,
+                TargetKind::Config,
+                "explicit_java_override",
+            ),
+            fact(
+                GuardianFactId::JvmArgsParseFailed,
+                GuardianDomain::Jvm,
+                GuardianSeverity::Blocking,
+                OwnershipClass::UserOwned,
+                TargetKind::Config,
+                "explicit_jvm_args",
+            ),
+        ];
+
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest::new(
+            GuardianMode::Custom,
+            &facts,
+        ));
+
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Warn);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Warn);
+        assert_eq!(
+            &outcome.user_outcome.details[..2],
+            [
+                "Guardian could not verify the selected Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
+                "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
+            ]
+        );
+        assert_eq!(
+            &outcome.user_outcome.guidance[..2],
+            [
+                "Use a Java runtime that can run `java -version`, or switch back to Managed Java.",
+                "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
+            ]
+        );
+    }
+
+    #[test]
+    fn blocked_repair_diagnosis_uses_table_owned_generic_detail() {
+        let runtime_fact = fact(
+            GuardianFactId::ManagedRuntimeCorrupt,
+            GuardianDomain::Runtime,
+            GuardianSeverity::Repairable,
+            OwnershipClass::LauncherManaged,
+            TargetKind::Runtime,
+            "managed_runtime",
+        );
+        let outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
+            readiness: GuardianPreflightReadiness::from_facts(false, &[]),
+            ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[runtime_fact])
+        });
+
+        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Block);
+        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
+        assert_eq!(
+            outcome.user_outcome.details,
+            ["Guardian blocked launch because preflight readiness failed."]
+        );
+        assert_eq!(
+            outcome.safety.detail.as_deref(),
+            Some("Guardian blocked launch because preflight readiness failed.")
+        );
     }
 
     #[test]
@@ -1333,34 +990,6 @@ mod tests {
             &"This instance has recorded one graphics driver crash; the latest was within the past 24 hours."
                 .to_string()
         ));
-    }
-
-    #[test]
-    fn launch_failure_plain_labels_cover_exactly_guardian_crash_classes() {
-        for failure_class in [
-            LaunchFailureClass::Unknown,
-            LaunchFailureClass::JvmUnsupportedOption,
-            LaunchFailureClass::JvmExperimentalUnlock,
-            LaunchFailureClass::JvmOptionOrdering,
-            LaunchFailureClass::JavaRuntimeMismatch,
-            LaunchFailureClass::OutOfMemory,
-            LaunchFailureClass::GraphicsDriverCrash,
-            LaunchFailureClass::MissingDependency,
-            LaunchFailureClass::ModTransformationFailure,
-            LaunchFailureClass::ModAttributedCrash,
-            LaunchFailureClass::ClasspathModuleConflict,
-            LaunchFailureClass::LauncherManagedArtifactSignature,
-            LaunchFailureClass::AuthModeIncompatible,
-            LaunchFailureClass::LoaderBootstrapFailure,
-            LaunchFailureClass::StartupStalled,
-        ] {
-            assert_eq!(
-                launch_failure_plain_label(failure_class).is_some(),
-                is_guardian_launch_crash_class(failure_class),
-                "plain label coverage diverged for {}",
-                failure_class.as_str()
-            );
-        }
     }
 
     #[test]

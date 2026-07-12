@@ -1,23 +1,25 @@
 use super::{
-    DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus,
+    DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianFact,
     GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
     GuardianPerformanceSupervisionRejection, GuardianRepairStatus, GuardianUserOutcome,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::OperationPhase;
+use axial_launcher::LaunchFailureClass;
+use chrono::{DateTime, Timelike, Utc};
 
 const MAX_SUMMARY_BYTES: usize = 180;
 const MAX_LINE_BYTES: usize = 240;
 const MAX_COLLECTION_LINES: usize = 6;
 const MAX_DYNAMIC_TOKEN_BYTES: usize = 64;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct GuardianCopyRequest<'a> {
     diagnosis_id: Option<DiagnosisId>,
     context: GuardianCopyContext<'a>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum GuardianCopyContext<'a> {
     RuntimeRepair {
         status: GuardianRepairStatus,
@@ -35,6 +37,13 @@ enum GuardianCopyContext<'a> {
     },
     PersistedStateLoad {
         decision: GuardianActionKind,
+    },
+    Preflight {
+        authored_decision: GuardianActionKind,
+        effective_decision: GuardianActionKind,
+        phase: OperationPhase,
+        diagnoses: Vec<DiagnosisId>,
+        history: Vec<PreflightHistory>,
     },
 }
 
@@ -104,6 +113,71 @@ impl<'a> GuardianCopyRequest<'a> {
             context: GuardianCopyContext::PersistedStateLoad { decision },
         }
     }
+
+    pub(crate) fn preflight(
+        authored_decision: GuardianActionKind,
+        effective_decision: GuardianActionKind,
+        phase: OperationPhase,
+        diagnoses: &[DiagnosisId],
+        facts: &[GuardianFact],
+    ) -> Self {
+        Self {
+            diagnosis_id: None,
+            context: GuardianCopyContext::Preflight {
+                authored_decision,
+                effective_decision,
+                phase,
+                diagnoses: diagnoses.to_vec(),
+                history: preflight_history(facts),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PreflightHistory {
+    StartupFailure {
+        class: PreflightCrashClass,
+        window: PreflightOccurrenceWindow,
+        oom_budget: Option<PreflightOomBudget>,
+    },
+    RepairFailed(PreflightRecoveryKind),
+    Suppressed(PreflightSuppressionTime),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreflightCrashClass {
+    OutOfMemory,
+    GraphicsDriverCrash,
+    MissingDependency,
+    ModTransformationFailure,
+    ModAttributedCrash,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreflightOccurrenceWindow {
+    Today(u32),
+    Total { count: u32, latest_today: bool },
+    Recent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreflightOomBudget {
+    Concrete { current_mb: u32, suggested_mb: u32 },
+    Unverified,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreflightRecoveryKind {
+    JavaRuntime,
+    JvmArgs,
+    JvmPreset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreflightSuppressionTime {
+    hour: u32,
+    minute: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -525,32 +599,538 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
     ),
 ];
 
+#[derive(Clone, Copy)]
+struct PreflightSummaryRule {
+    decision: GuardianActionKind,
+    summary: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreflightCopyCoordinate {
+    diagnosis_id: DiagnosisId,
+    decision: GuardianActionKind,
+}
+
+#[derive(Clone, Copy)]
+struct PreflightDiagnosisCopyRule {
+    coordinate: PreflightCopyCoordinate,
+    detail: Option<&'static str>,
+    guidance: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+struct PreflightInvariantDiagnosisCopyRule {
+    diagnosis_id: DiagnosisId,
+    decisions: &'static [GuardianActionKind],
+    detail: Option<&'static str>,
+    guidance: Option<&'static str>,
+}
+
+const fn preflight_summary_rule(
+    decision: GuardianActionKind,
+    summary: &'static str,
+) -> PreflightSummaryRule {
+    PreflightSummaryRule { decision, summary }
+}
+
+const fn preflight_diagnosis_rule(
+    diagnosis_id: DiagnosisId,
+    decision: GuardianActionKind,
+    detail: Option<&'static str>,
+    guidance: Option<&'static str>,
+) -> PreflightDiagnosisCopyRule {
+    PreflightDiagnosisCopyRule {
+        coordinate: PreflightCopyCoordinate {
+            diagnosis_id,
+            decision,
+        },
+        detail,
+        guidance,
+    }
+}
+
+const fn preflight_invariant_diagnosis_rule(
+    diagnosis_id: DiagnosisId,
+    decisions: &'static [GuardianActionKind],
+    detail: Option<&'static str>,
+    guidance: Option<&'static str>,
+) -> PreflightInvariantDiagnosisCopyRule {
+    PreflightInvariantDiagnosisCopyRule {
+        diagnosis_id,
+        decisions,
+        detail,
+        guidance,
+    }
+}
+
+const PREFLIGHT_SUMMARY_RULES: &[PreflightSummaryRule] = &[
+    preflight_summary_rule(
+        GuardianActionKind::RecordOnly,
+        "Guardian recorded launch preflight readiness.",
+    ),
+    preflight_summary_rule(
+        GuardianActionKind::Warn,
+        "Guardian found launch preflight warnings.",
+    ),
+    preflight_summary_rule(
+        GuardianActionKind::AskUser,
+        "Guardian needs confirmation before launch.",
+    ),
+    preflight_summary_rule(
+        GuardianActionKind::Block,
+        "Guardian blocked launch preflight.",
+    ),
+    preflight_summary_rule(
+        GuardianActionKind::Fallback,
+        "Guardian adjusted launch preflight.",
+    ),
+    preflight_summary_rule(
+        GuardianActionKind::Strip,
+        "Guardian adjusted launch preflight.",
+    ),
+    preflight_summary_rule(
+        GuardianActionKind::Repair,
+        "Guardian selected a guarded launch preflight action.",
+    ),
+];
+
+const INSTALL_REPAIR_GUIDANCE: &str =
+    "Install or repair the affected version before launching again.";
+const CUSTOM_MODE_GUIDANCE: &str =
+    "Switch Guardian back to Managed if you want Axial to adjust unsafe choices.";
+
+const PREFLIGHT_DIAGNOSIS_RULES: &[PreflightDiagnosisCopyRule] = &[
+    preflight_diagnosis_rule(
+        DiagnosisId::UnknownFailure(OperationPhase::Validating),
+        GuardianActionKind::RecordOnly,
+        None,
+        None,
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::UnknownFailure(OperationPhase::Validating),
+        GuardianActionKind::Block,
+        Some("Guardian blocked launch because preflight readiness failed."),
+        None,
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::UnknownFailure(OperationPhase::Validating),
+        GuardianActionKind::Warn,
+        None,
+        None,
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::ManagedRuntimeCorrupt,
+        GuardianActionKind::Repair,
+        None,
+        None,
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::ManagedRuntimeCorrupt,
+        GuardianActionKind::Block,
+        Some("Guardian blocked launch because preflight readiness failed."),
+        None,
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JavaOverrideUnavailable,
+        GuardianActionKind::Fallback,
+        Some(
+            "Guardian will ignore the unavailable Java override and use managed Java for this launch.",
+        ),
+        Some(
+            "Update or remove the bad Java override after launch if you want to use Custom Java again.",
+        ),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JavaOverrideUnavailable,
+        GuardianActionKind::Block,
+        Some("Guardian blocked launch because the selected Java override is unavailable."),
+        Some(
+            "Guardian detected an unavailable Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
+        ),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JavaOverrideUnavailable,
+        GuardianActionKind::AskUser,
+        Some("Guardian needs confirmation before changing the selected Java override."),
+        Some("Confirm managed Java for this launch or choose a valid Java runtime."),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JavaOverrideUnavailable,
+        GuardianActionKind::Warn,
+        Some(
+            "Guardian detected an unavailable Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
+        ),
+        Some(
+            "Guardian detected an unavailable Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
+        ),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JavaProbeFailed,
+        GuardianActionKind::Fallback,
+        Some(
+            "Guardian will ignore the Java override that failed probing and use managed Java for this launch.",
+        ),
+        Some(
+            "Update or remove the Java override after launch if you want to use Custom Java again.",
+        ),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JavaProbeFailed,
+        GuardianActionKind::Block,
+        Some("Guardian blocked launch because the selected Java override could not be probed."),
+        Some("Use a Java runtime that can run `java -version`, or switch back to Managed Java."),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JavaProbeFailed,
+        GuardianActionKind::Strip,
+        Some(
+            "Guardian could not verify the selected Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
+        ),
+        Some("Use a Java runtime that can run `java -version`, or switch back to Managed Java."),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JavaProbeFailed,
+        GuardianActionKind::Warn,
+        Some(
+            "Guardian could not verify the selected Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
+        ),
+        Some("Use a Java runtime that can run `java -version`, or switch back to Managed Java."),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JavaRuntimeMajorMismatch,
+        GuardianActionKind::Fallback,
+        Some(
+            "Guardian will ignore the incompatible Java override and use managed Java for this launch.",
+        ),
+        Some(
+            "Choose a Java runtime matching this Minecraft version before re-enabling the override.",
+        ),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JavaRuntimeMajorMismatch,
+        GuardianActionKind::Block,
+        Some(
+            "Guardian blocked launch because the selected Java override has the wrong Java version.",
+        ),
+        Some("Choose a Java runtime matching this Minecraft version requirement."),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JavaRuntimeUpdateTooOld,
+        GuardianActionKind::Fallback,
+        Some(
+            "Guardian will ignore the outdated Java override and use managed Java for this launch.",
+        ),
+        Some("Use Java 8u312 or newer before re-enabling this override."),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JavaRuntimeUpdateTooOld,
+        GuardianActionKind::Block,
+        Some("Guardian blocked launch because the selected Java 8 override is too old."),
+        Some("Use Java 8u312 or newer for this legacy launch."),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JvmArgsMalformed,
+        GuardianActionKind::Strip,
+        Some("Guardian removed malformed explicit JVM args for this launch."),
+        Some("Fix the saved JVM args before re-enabling them."),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JvmArgsMalformed,
+        GuardianActionKind::Block,
+        Some(
+            "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
+        ),
+        Some(
+            "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
+        ),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JvmArgsMalformed,
+        GuardianActionKind::Warn,
+        Some(
+            "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
+        ),
+        Some(
+            "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
+        ),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JvmArgUnsupported,
+        GuardianActionKind::Strip,
+        Some("Guardian removed unsupported explicit JVM args for this launch."),
+        Some("Use JVM flags supported by the selected Java runtime before re-enabling them."),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JvmArgUnsupported,
+        GuardianActionKind::Block,
+        Some(
+            "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails.",
+        ),
+        Some(
+            "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails.",
+        ),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JvmArgUnsupported,
+        GuardianActionKind::Warn,
+        Some(
+            "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails.",
+        ),
+        Some(
+            "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails.",
+        ),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JvmArgUnsafeOverride,
+        GuardianActionKind::Strip,
+        Some(
+            "Guardian removed explicit JVM args that override launcher-owned settings for this launch.",
+        ),
+        Some(
+            "Remove memory, classpath, native-path, or agent overrides from saved JVM args before re-enabling them.",
+        ),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JvmArgUnsafeOverride,
+        GuardianActionKind::Block,
+        Some(
+            "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly.",
+        ),
+        Some(
+            "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly.",
+        ),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::JvmArgUnsafeOverride,
+        GuardianActionKind::Warn,
+        Some(
+            "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly.",
+        ),
+        Some(
+            "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly.",
+        ),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::InstalledVersionMetadataMissing,
+        GuardianActionKind::Block,
+        Some("Guardian blocked launch because installed version metadata is missing."),
+        Some(INSTALL_REPAIR_GUIDANCE),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::ParentVersionMetadataMissing,
+        GuardianActionKind::Block,
+        Some("Guardian blocked launch because parent version metadata is missing."),
+        Some(INSTALL_REPAIR_GUIDANCE),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::InstallIncomplete,
+        GuardianActionKind::Block,
+        Some("Guardian blocked launch because the install is incomplete."),
+        Some(INSTALL_REPAIR_GUIDANCE),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::ClientJarMissing,
+        GuardianActionKind::Block,
+        Some("Guardian blocked launch because client game files are missing."),
+        Some(INSTALL_REPAIR_GUIDANCE),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::LibrariesMissing,
+        GuardianActionKind::Block,
+        Some("Guardian blocked launch because required libraries are missing."),
+        Some(INSTALL_REPAIR_GUIDANCE),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::AssetIndexMissing,
+        GuardianActionKind::Block,
+        Some("Guardian blocked launch because the asset index is missing."),
+        Some(INSTALL_REPAIR_GUIDANCE),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::LauncherManagedArtifactCorrupt,
+        GuardianActionKind::Block,
+        Some("Guardian blocked launch because launcher-managed game files are corrupt."),
+        Some(INSTALL_REPAIR_GUIDANCE),
+    ),
+    preflight_diagnosis_rule(
+        DiagnosisId::LauncherManagedArtifactSignatureCorrupt,
+        GuardianActionKind::Block,
+        Some("Guardian blocked launch because launcher-managed jar signatures are inconsistent."),
+        Some(INSTALL_REPAIR_GUIDANCE),
+    ),
+];
+
+const PREFLIGHT_SUPPORTING_VERDICTS: &[GuardianActionKind] = &[
+    GuardianActionKind::Warn,
+    GuardianActionKind::Block,
+    GuardianActionKind::Fallback,
+    GuardianActionKind::Strip,
+    GuardianActionKind::AskUser,
+];
+const PREFLIGHT_CUSTOM_VERDICTS: &[GuardianActionKind] = &[
+    GuardianActionKind::Warn,
+    GuardianActionKind::Block,
+    GuardianActionKind::AskUser,
+];
+const PREFLIGHT_JVM_SECONDARY_VERDICTS: &[GuardianActionKind] =
+    &[GuardianActionKind::Fallback, GuardianActionKind::AskUser];
+const PREFLIGHT_MANAGED_RUNTIME_MISSING_VERDICTS: &[GuardianActionKind] = &[
+    GuardianActionKind::RecordOnly,
+    GuardianActionKind::Warn,
+    GuardianActionKind::Block,
+    GuardianActionKind::Fallback,
+    GuardianActionKind::Strip,
+    GuardianActionKind::AskUser,
+    GuardianActionKind::Repair,
+];
+
+const PREFLIGHT_INVARIANT_DIAGNOSIS_RULES: &[PreflightInvariantDiagnosisCopyRule] = &[
+    preflight_invariant_diagnosis_rule(
+        DiagnosisId::ManagedRuntimeMissing,
+        PREFLIGHT_MANAGED_RUNTIME_MISSING_VERDICTS,
+        Some("Managed Java runtime is missing and can be prepared before launch."),
+        Some("Let Axial prepare the managed Java runtime before launching."),
+    ),
+    preflight_invariant_diagnosis_rule(
+        DiagnosisId::LaunchMemoryMinClamped,
+        PREFLIGHT_SUPPORTING_VERDICTS,
+        Some(
+            "Minimum memory was higher than maximum memory, so Axial clamped the launch minimum to match the maximum allocation.",
+        ),
+        Some(
+            "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.",
+        ),
+    ),
+    preflight_invariant_diagnosis_rule(
+        DiagnosisId::LaunchMemoryAllocationLow,
+        PREFLIGHT_SUPPORTING_VERDICTS,
+        Some("Launch memory allocation is very low for Minecraft."),
+        Some(
+            "Raise the maximum memory allocation if Minecraft crashes during startup, stalls while loading, or exits with out-of-memory errors.",
+        ),
+    ),
+    preflight_invariant_diagnosis_rule(
+        DiagnosisId::LaunchResourceMemoryPressure,
+        PREFLIGHT_SUPPORTING_VERDICTS,
+        Some("Launch memory budget is tight for the current active sessions."),
+        Some("Close another running session or lower memory allocation if startup is unstable."),
+    ),
+    preflight_invariant_diagnosis_rule(
+        DiagnosisId::LaunchResourceCpuPressure,
+        PREFLIGHT_SUPPORTING_VERDICTS,
+        Some(
+            "Launch concurrency may be tight: other active launch sessions can saturate low-end CPUs.",
+        ),
+        Some(
+            "Multiple launches can saturate low-end CPUs; wait for another launch to finish if startup feels sluggish.",
+        ),
+    ),
+    preflight_invariant_diagnosis_rule(
+        DiagnosisId::LaunchResourceInstallPressure,
+        PREFLIGHT_SUPPORTING_VERDICTS,
+        Some("Active install or download work may add pressure during startup."),
+        Some("Wait for active install or download work to finish if startup feels slow."),
+    ),
+    preflight_invariant_diagnosis_rule(
+        DiagnosisId::LaunchResourceDiskPressure,
+        PREFLIGHT_SUPPORTING_VERDICTS,
+        Some("Launch-relevant storage has low free space."),
+        Some("Free disk space before launching if caches or natives become unreliable."),
+    ),
+    preflight_invariant_diagnosis_rule(
+        DiagnosisId::CustomJavaOverridePresent,
+        PREFLIGHT_CUSTOM_VERDICTS,
+        Some("Guardian Custom mode will keep the selected Java override for this launch."),
+        Some(CUSTOM_MODE_GUIDANCE),
+    ),
+    preflight_invariant_diagnosis_rule(
+        DiagnosisId::CustomJvmPresetPresent,
+        PREFLIGHT_CUSTOM_VERDICTS,
+        Some("Guardian Custom mode will keep the selected JVM preset for this launch."),
+        Some(CUSTOM_MODE_GUIDANCE),
+    ),
+    preflight_invariant_diagnosis_rule(
+        DiagnosisId::CustomJvmArgsPresent,
+        PREFLIGHT_CUSTOM_VERDICTS,
+        Some(
+            "Guardian Custom mode will keep explicit JVM args; remove them first if startup becomes unstable.",
+        ),
+        Some(CUSTOM_MODE_GUIDANCE),
+    ),
+    preflight_invariant_diagnosis_rule(
+        DiagnosisId::JvmArgsMalformed,
+        PREFLIGHT_JVM_SECONDARY_VERDICTS,
+        Some(
+            "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
+        ),
+        Some(
+            "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
+        ),
+    ),
+    preflight_invariant_diagnosis_rule(
+        DiagnosisId::JvmArgUnsupported,
+        PREFLIGHT_JVM_SECONDARY_VERDICTS,
+        Some(
+            "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails.",
+        ),
+        Some(
+            "Guardian detected JVM flags that may fail on this Java runtime. Remove the explicit JVM args if startup fails.",
+        ),
+    ),
+    preflight_invariant_diagnosis_rule(
+        DiagnosisId::JvmArgUnsafeOverride,
+        PREFLIGHT_JVM_SECONDARY_VERDICTS,
+        Some(
+            "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly.",
+        ),
+        Some(
+            "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly.",
+        ),
+    ),
+];
+
 pub(crate) fn author_guardian_copy(
     request: GuardianCopyRequest<'_>,
 ) -> Option<GuardianUserOutcome> {
-    let decision = request.context.decision();
+    let GuardianCopyRequest {
+        diagnosis_id,
+        context,
+    } = request;
+    if let GuardianCopyContext::Preflight {
+        authored_decision,
+        effective_decision,
+        phase,
+        diagnoses,
+        history,
+    } = &context
+    {
+        return author_preflight_copy(
+            *authored_decision,
+            *effective_decision,
+            *phase,
+            diagnoses,
+            history,
+        );
+    }
+    let decision = context.decision();
     let rule_key = CopyRuleKey {
-        diagnosis_id: request.diagnosis_id,
+        diagnosis_id,
         decision,
-        context: request.context.key(),
+        context: context.key()?,
     };
     let rule = GUARDIAN_COPY_RULES
         .iter()
         .find(|rule| rule.key == rule_key)?;
     let phase = match rule.phase {
         CopyPhase::Fixed(phase) => phase,
-        CopyPhase::PerformanceContext => request.context.performance_phase()?,
+        CopyPhase::PerformanceContext => context.performance_phase()?,
     };
     let summary = trusted_line(rule.summary, MAX_SUMMARY_BYTES);
-    let details = finalize_lines(
-        rule.details
-            .iter()
-            .map(|line| render_line(*line, request.context)),
-    );
+    let details = finalize_lines(rule.details.iter().map(|line| render_line(*line, &context)));
     let guidance = finalize_lines(
         rule.guidance
             .iter()
-            .map(|line| render_line(*line, request.context)),
+            .map(|line| render_line(*line, &context)),
     );
 
     Some(GuardianUserOutcome {
@@ -563,7 +1143,7 @@ pub(crate) fn author_guardian_copy(
 }
 
 impl GuardianCopyContext<'_> {
-    fn decision(self) -> GuardianActionKind {
+    fn decision(&self) -> GuardianActionKind {
         match self {
             Self::RuntimeRepair {
                 status: GuardianRepairStatus::Repaired,
@@ -575,27 +1155,30 @@ impl GuardianCopyContext<'_> {
             | Self::ArtifactRepair { .. }
             | Self::PerformanceRejection { .. } => GuardianActionKind::Block,
             Self::InstallFailure { decision, .. } | Self::PersistedStateLoad { decision } => {
-                decision
+                *decision
             }
+            Self::Preflight {
+                effective_decision, ..
+            } => *effective_decision,
         }
     }
 
-    fn key(self) -> CopyContextKey {
+    fn key(&self) -> Option<CopyContextKey> {
         match self {
-            Self::RuntimeRepair { status } => match status {
+            Self::RuntimeRepair { status } => Some(match status {
                 GuardianRepairStatus::Repaired => CopyContextKey::RuntimeRepaired,
                 GuardianRepairStatus::Blocked => CopyContextKey::RuntimeBlocked,
                 GuardianRepairStatus::Failed => CopyContextKey::RuntimeFailed,
                 GuardianRepairStatus::Suppressed => CopyContextKey::RuntimeSuppressed,
-            },
-            Self::ArtifactRepair { status } => match status {
+            }),
+            Self::ArtifactRepair { status } => Some(match status {
                 GuardianArtifactRepairStatus::Repaired => CopyContextKey::ArtifactRepaired,
                 GuardianArtifactRepairStatus::Blocked => CopyContextKey::ArtifactBlocked,
                 GuardianArtifactRepairStatus::Failed => CopyContextKey::ArtifactFailed,
                 GuardianArtifactRepairStatus::Suppressed => CopyContextKey::ArtifactSuppressed,
-            },
-            Self::InstallFailure { .. } => CopyContextKey::InstallFailure,
-            Self::PerformanceRejection { rejection, .. } => match rejection {
+            }),
+            Self::InstallFailure { .. } => Some(CopyContextKey::InstallFailure),
+            Self::PerformanceRejection { rejection, .. } => Some(match rejection {
                 GuardianPerformanceSupervisionRejection::UnsafeOwnership => {
                     CopyContextKey::PerformanceUnsafeOwnership
                 }
@@ -614,20 +1197,21 @@ impl GuardianCopyContext<'_> {
                 GuardianPerformanceSupervisionRejection::RollbackUnavailable => {
                     CopyContextKey::PerformanceRollbackUnavailable
                 }
-            },
-            Self::PersistedStateLoad { .. } => CopyContextKey::PersistedStateLoad,
+            }),
+            Self::PersistedStateLoad { .. } => Some(CopyContextKey::PersistedStateLoad),
+            Self::Preflight { .. } => None,
         }
     }
 
-    fn performance_phase(self) -> Option<OperationPhase> {
+    fn performance_phase(&self) -> Option<OperationPhase> {
         match self {
-            Self::PerformanceRejection { phase, .. } => Some(phase),
+            Self::PerformanceRejection { phase, .. } => Some(*phase),
             _ => None,
         }
     }
 }
 
-fn render_line(line: CopyLine, context: GuardianCopyContext<'_>) -> String {
+fn render_line(line: CopyLine, context: &GuardianCopyContext<'_>) -> String {
     match line {
         CopyLine::Static(value) => trusted_line(value, MAX_LINE_BYTES),
         CopyLine::RuntimeUnavailableDetail => {
@@ -660,9 +1244,329 @@ fn render_line(line: CopyLine, context: GuardianCopyContext<'_>) -> String {
     }
 }
 
-fn install_dynamics(context: GuardianCopyContext<'_>) -> InstallCopyDynamics<'_> {
+fn author_preflight_copy(
+    authored_decision: GuardianActionKind,
+    effective_decision: GuardianActionKind,
+    phase: OperationPhase,
+    diagnoses: &[DiagnosisId],
+    history: &[PreflightHistory],
+) -> Option<GuardianUserOutcome> {
+    if authored_decision != effective_decision
+        && !(authored_decision == GuardianActionKind::AskUser
+            && effective_decision == GuardianActionKind::Block)
+    {
+        return None;
+    }
+    let summary = PREFLIGHT_SUMMARY_RULES
+        .iter()
+        .find(|rule| rule.decision == authored_decision)
+        .map(|rule| trusted_line(rule.summary, MAX_SUMMARY_BYTES))?;
+    let diagnosis_lines = diagnoses
+        .iter()
+        .filter_map(|diagnosis_id| preflight_diagnosis_copy(*diagnosis_id, authored_decision))
+        .collect::<Vec<_>>();
+    let history_lines = history
+        .iter()
+        .map(render_preflight_history)
+        .collect::<Vec<_>>();
+    let ordered = if authored_decision == GuardianActionKind::Warn {
+        history_lines.iter().chain(&diagnosis_lines)
+    } else {
+        diagnosis_lines.iter().chain(&history_lines)
+    };
+    let details = finalize_lines(ordered.clone().filter_map(|lines| lines.0.clone()));
+    let guidance = finalize_lines(ordered.filter_map(|lines| lines.1.clone()));
+
+    Some(GuardianUserOutcome {
+        decision: effective_decision,
+        phase,
+        summary,
+        details,
+        guidance,
+    })
+}
+
+fn preflight_diagnosis_copy(
+    diagnosis_id: DiagnosisId,
+    decision: GuardianActionKind,
+) -> Option<(Option<String>, Option<String>)> {
+    let coordinate = PreflightCopyCoordinate {
+        diagnosis_id,
+        decision,
+    };
+    if let Some(rule) = PREFLIGHT_DIAGNOSIS_RULES
+        .iter()
+        .find(|rule| rule.coordinate == coordinate)
+    {
+        return Some((
+            rule.detail.map(|line| trusted_line(line, MAX_LINE_BYTES)),
+            rule.guidance.map(|line| trusted_line(line, MAX_LINE_BYTES)),
+        ));
+    }
+    let rule = PREFLIGHT_INVARIANT_DIAGNOSIS_RULES
+        .iter()
+        .find(|rule| rule.diagnosis_id == diagnosis_id && rule.decisions.contains(&decision))?;
+    Some((
+        rule.detail.map(|line| trusted_line(line, MAX_LINE_BYTES)),
+        rule.guidance.map(|line| trusted_line(line, MAX_LINE_BYTES)),
+    ))
+}
+
+fn preflight_history(facts: &[GuardianFact]) -> Vec<PreflightHistory> {
+    facts.iter().filter_map(preflight_history_fact).collect()
+}
+
+fn preflight_history_fact(fact: &GuardianFact) -> Option<PreflightHistory> {
+    match fact.id {
+        super::GuardianFactId::RecentStartupFailure => preflight_startup_history(fact),
+        super::GuardianFactId::RecentRepairFailed => {
+            let recovery = match copy_fact_field(fact, "diagnosis")? {
+                value if value == DiagnosisId::JavaRuntimeRecovery.as_str() => {
+                    PreflightRecoveryKind::JavaRuntime
+                }
+                value if value == DiagnosisId::JvmArgUnsupported.as_str() => {
+                    PreflightRecoveryKind::JvmArgs
+                }
+                value if value == DiagnosisId::JvmPresetRecovery.as_str() => {
+                    PreflightRecoveryKind::JvmPreset
+                }
+                _ => return None,
+            };
+            Some(PreflightHistory::RepairFailed(recovery))
+        }
+        super::GuardianFactId::RepairSuppressedUntil => {
+            let timestamp =
+                DateTime::parse_from_rfc3339(copy_fact_field(fact, "suppression_until")?)
+                    .ok()?
+                    .with_timezone(&Utc);
+            Some(PreflightHistory::Suppressed(PreflightSuppressionTime {
+                hour: timestamp.hour(),
+                minute: timestamp.minute(),
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn preflight_startup_history(fact: &GuardianFact) -> Option<PreflightHistory> {
+    let class =
+        match copy_fact_field(fact, "failure_class").and_then(LaunchFailureClass::from_name)? {
+            LaunchFailureClass::OutOfMemory => PreflightCrashClass::OutOfMemory,
+            LaunchFailureClass::GraphicsDriverCrash => PreflightCrashClass::GraphicsDriverCrash,
+            LaunchFailureClass::MissingDependency => PreflightCrashClass::MissingDependency,
+            LaunchFailureClass::ModTransformationFailure => {
+                PreflightCrashClass::ModTransformationFailure
+            }
+            LaunchFailureClass::ModAttributedCrash => PreflightCrashClass::ModAttributedCrash,
+            _ => return None,
+        };
+    let occurrences = copy_fact_field_u32(fact, "occurrences").filter(|count| *count > 0);
+    let latest_today = copy_fact_field(fact, "latest_observed_today") == Some("true");
+    let occurrences_today = latest_today
+        .then(|| copy_fact_field_u32(fact, "occurrences_today"))
+        .flatten()
+        .filter(|count| *count > 0)
+        .filter(|count| occurrences.is_none_or(|total| *count <= total));
+    let window = if let Some(count) = occurrences_today {
+        PreflightOccurrenceWindow::Today(count)
+    } else if let Some(count) = occurrences {
+        PreflightOccurrenceWindow::Total {
+            count,
+            latest_today,
+        }
+    } else {
+        PreflightOccurrenceWindow::Recent
+    };
+    let oom_budget = (class == PreflightCrashClass::OutOfMemory).then(|| {
+        let current = copy_fact_field_u32(fact, "current_memory_mb").filter(|value| *value > 0);
+        let suggested = copy_fact_field_u32(fact, "suggested_memory_mb").filter(|value| *value > 0);
+        match (current, suggested) {
+            (Some(current_mb), Some(suggested_mb)) if suggested_mb > current_mb => {
+                PreflightOomBudget::Concrete {
+                    current_mb,
+                    suggested_mb,
+                }
+            }
+            _ => PreflightOomBudget::Unverified,
+        }
+    });
+    Some(PreflightHistory::StartupFailure {
+        class,
+        window,
+        oom_budget,
+    })
+}
+
+fn render_preflight_history(history: &PreflightHistory) -> (Option<String>, Option<String>) {
+    match history {
+        PreflightHistory::StartupFailure {
+            class,
+            window,
+            oom_budget,
+        } => (
+            Some(checked_rendered_line(render_startup_failure_detail(
+                *class, *window,
+            ))),
+            startup_failure_guidance(*class, *oom_budget).map(checked_rendered_line),
+        ),
+        PreflightHistory::RepairFailed(recovery) => {
+            let (detail, guidance) = match recovery {
+                PreflightRecoveryKind::JavaRuntime => (
+                    "The previous managed Java recovery attempt failed.",
+                    "Review the selected Java runtime before relaunching.",
+                ),
+                PreflightRecoveryKind::JvmArgs => (
+                    "The previous JVM argument recovery attempt failed.",
+                    "Review or remove explicit JVM arguments before relaunching.",
+                ),
+                PreflightRecoveryKind::JvmPreset => (
+                    "The previous JVM preset recovery attempt failed.",
+                    "Review the JVM preset before relaunching.",
+                ),
+            };
+            (
+                Some(trusted_line(detail, MAX_LINE_BYTES)),
+                Some(trusted_line(guidance, MAX_LINE_BYTES)),
+            )
+        }
+        PreflightHistory::Suppressed(time) => (
+            Some(checked_rendered_line(format!(
+                "Guardian will not auto-repair this launch again until {:02}:{:02} UTC.",
+                time.hour, time.minute
+            ))),
+            Some(checked_rendered_line(format!(
+                "Review the launch settings before retrying; unchanged settings will not trigger another automatic repair before {:02}:{:02} UTC.",
+                time.hour, time.minute
+            ))),
+        ),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PreflightCrashLabel {
+    singular: &'static str,
+    plural: &'static str,
+    with_article: &'static str,
+}
+
+fn render_startup_failure_detail(
+    class: PreflightCrashClass,
+    window: PreflightOccurrenceWindow,
+) -> String {
+    let label = preflight_crash_label(class);
+    match window {
+        PreflightOccurrenceWindow::Today(count) => {
+            counted_preflight_failure("had", count, label, " today")
+        }
+        PreflightOccurrenceWindow::Total {
+            count,
+            latest_today,
+        } => counted_preflight_failure(
+            "has recorded",
+            count,
+            label,
+            if latest_today {
+                "; the latest was today"
+            } else {
+                "; the latest was within the past 24 hours"
+            },
+        ),
+        PreflightOccurrenceWindow::Recent => {
+            format!("A recent launch ended with {}.", label.with_article)
+        }
+    }
+}
+
+fn counted_preflight_failure(
+    verb: &str,
+    count: u32,
+    label: PreflightCrashLabel,
+    suffix: &str,
+) -> String {
+    if count == 1 {
+        format!("This instance {verb} one {}{suffix}.", label.singular)
+    } else {
+        format!("This instance {verb} {count} {}{suffix}.", label.plural)
+    }
+}
+
+fn preflight_crash_label(class: PreflightCrashClass) -> PreflightCrashLabel {
+    match class {
+        PreflightCrashClass::OutOfMemory => PreflightCrashLabel {
+            singular: "out-of-memory crash",
+            plural: "out-of-memory crashes",
+            with_article: "an out-of-memory crash",
+        },
+        PreflightCrashClass::GraphicsDriverCrash => PreflightCrashLabel {
+            singular: "graphics driver crash",
+            plural: "graphics driver crashes",
+            with_article: "a graphics driver crash",
+        },
+        PreflightCrashClass::MissingDependency => PreflightCrashLabel {
+            singular: "missing-dependency crash",
+            plural: "missing-dependency crashes",
+            with_article: "a missing-dependency crash",
+        },
+        PreflightCrashClass::ModTransformationFailure => PreflightCrashLabel {
+            singular: "mod transformation crash",
+            plural: "mod transformation crashes",
+            with_article: "a mod transformation crash",
+        },
+        PreflightCrashClass::ModAttributedCrash => PreflightCrashLabel {
+            singular: "mod-attributed crash",
+            plural: "mod-attributed crashes",
+            with_article: "a mod-attributed crash",
+        },
+    }
+}
+
+fn startup_failure_guidance(
+    class: PreflightCrashClass,
+    oom_budget: Option<PreflightOomBudget>,
+) -> Option<String> {
+    Some(match class {
+        PreflightCrashClass::OutOfMemory => match oom_budget? {
+            PreflightOomBudget::Concrete {
+                current_mb,
+                suggested_mb,
+            } => format!(
+                "Increase this instance's maximum memory from {current_mb} MB to {suggested_mb} MB before relaunching."
+            ),
+            PreflightOomBudget::Unverified =>
+                "Guardian could not verify safe headroom for a larger memory allocation. Close another session or free memory before relaunching."
+                    .to_string(),
+        },
+        PreflightCrashClass::GraphicsDriverCrash =>
+            "Update the graphics driver and remove graphics overrides before relaunching."
+                .to_string(),
+        PreflightCrashClass::MissingDependency =>
+            "Repair the instance dependencies before relaunching.".to_string(),
+        PreflightCrashClass::ModTransformationFailure =>
+            "Review recently changed mods and their loader compatibility before relaunching."
+                .to_string(),
+        PreflightCrashClass::ModAttributedCrash =>
+            "Review recently changed mods and disable the suspected mod before relaunching."
+                .to_string(),
+    })
+}
+
+fn copy_fact_field<'a>(fact: &'a GuardianFact, key: &str) -> Option<&'a str> {
+    let mut values = fact
+        .fields
+        .iter()
+        .filter(|field| field.key == key)
+        .filter_map(|field| field.value_for(RedactionAudience::UserVisible));
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn copy_fact_field_u32(fact: &GuardianFact, key: &str) -> Option<u32> {
+    copy_fact_field(fact, key)?.parse().ok()
+}
+
+fn install_dynamics<'a>(context: &'a GuardianCopyContext<'a>) -> InstallCopyDynamics<'a> {
     match context {
-        GuardianCopyContext::InstallFailure { dynamics, .. } => dynamics,
+        GuardianCopyContext::InstallFailure { dynamics, .. } => *dynamics,
         _ => InstallCopyDynamics::None,
     }
 }
@@ -744,7 +1648,9 @@ fn finalize_lines(lines: impl IntoIterator<Item = String>) -> Vec<String> {
 mod tests {
     use super::{
         CopyContextKey, GUARDIAN_COPY_RULES, GuardianCopyRequest, MAX_COLLECTION_LINES,
-        MAX_LINE_BYTES, MAX_SUMMARY_BYTES, author_guardian_copy, finalize_lines,
+        MAX_LINE_BYTES, MAX_SUMMARY_BYTES, PREFLIGHT_DIAGNOSIS_RULES,
+        PREFLIGHT_INVARIANT_DIAGNOSIS_RULES, PREFLIGHT_SUMMARY_RULES, author_guardian_copy,
+        finalize_lines,
     };
     use crate::guardian::{
         DiagnosisId, GuardianActionKind, GuardianInstallArtifactFailureEvidence,
@@ -791,6 +1697,156 @@ mod tests {
             assert!(rule.guidance.len() <= MAX_COLLECTION_LINES);
         }
         assert_eq!(counts, [4, 4, 10, 6, 1]);
+    }
+
+    #[test]
+    fn preflight_copy_tables_are_unique_and_closed() {
+        assert_eq!(PREFLIGHT_SUMMARY_RULES.len(), 7);
+        for (index, rule) in PREFLIGHT_SUMMARY_RULES.iter().enumerate() {
+            assert!(
+                PREFLIGHT_SUMMARY_RULES[index + 1..]
+                    .iter()
+                    .all(|other| other.decision != rule.decision)
+            );
+            assert!(rule.summary.len() <= MAX_SUMMARY_BYTES);
+        }
+        assert_eq!(PREFLIGHT_DIAGNOSIS_RULES.len(), 34);
+        for (index, rule) in PREFLIGHT_DIAGNOSIS_RULES.iter().enumerate() {
+            assert!(
+                PREFLIGHT_DIAGNOSIS_RULES[index + 1..]
+                    .iter()
+                    .all(|other| other.coordinate != rule.coordinate)
+            );
+        }
+        assert_eq!(PREFLIGHT_INVARIANT_DIAGNOSIS_RULES.len(), 13);
+        for (index, rule) in PREFLIGHT_INVARIANT_DIAGNOSIS_RULES.iter().enumerate() {
+            assert!(!rule.decisions.is_empty());
+            for (decision_index, decision) in rule.decisions.iter().enumerate() {
+                assert!(!rule.decisions[decision_index + 1..].contains(decision));
+            }
+            assert!(
+                PREFLIGHT_INVARIANT_DIAGNOSIS_RULES[index + 1..]
+                    .iter()
+                    .all(|other| other.diagnosis_id != rule.diagnosis_id)
+            );
+            assert!(PREFLIGHT_DIAGNOSIS_RULES.iter().all(|exact| {
+                exact.coordinate.diagnosis_id != rule.diagnosis_id
+                    || !rule.decisions.contains(&exact.coordinate.decision)
+            }));
+        }
+    }
+
+    #[test]
+    fn preflight_copy_accepts_only_the_boundary_adapter_decision_pair() {
+        assert!(
+            author_guardian_copy(GuardianCopyRequest::preflight(
+                GuardianActionKind::Warn,
+                GuardianActionKind::Warn,
+                OperationPhase::Validating,
+                &[],
+                &[],
+            ))
+            .is_some()
+        );
+        assert!(
+            author_guardian_copy(GuardianCopyRequest::preflight(
+                GuardianActionKind::AskUser,
+                GuardianActionKind::Block,
+                OperationPhase::Validating,
+                &[],
+                &[],
+            ))
+            .is_some()
+        );
+
+        for (authored, effective) in [
+            (GuardianActionKind::Block, GuardianActionKind::AskUser),
+            (GuardianActionKind::Fallback, GuardianActionKind::Block),
+            (GuardianActionKind::AskUser, GuardianActionKind::Warn),
+        ] {
+            assert!(
+                author_guardian_copy(GuardianCopyRequest::preflight(
+                    authored,
+                    effective,
+                    OperationPhase::Validating,
+                    &[],
+                    &[],
+                ))
+                .is_none(),
+                "accepted invalid {authored:?} -> {effective:?} preflight pair"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_supporting_copy_survives_stronger_verdicts_in_diagnosis_order() {
+        let cases = [
+            (
+                GuardianActionKind::Block,
+                GuardianActionKind::Block,
+                DiagnosisId::LaunchResourceMemoryPressure,
+                "Guardian blocked launch preflight.",
+                "Launch memory budget is tight",
+            ),
+            (
+                GuardianActionKind::Fallback,
+                GuardianActionKind::Fallback,
+                DiagnosisId::LaunchResourceCpuPressure,
+                "Guardian adjusted launch preflight.",
+                "Launch concurrency may be tight",
+            ),
+            (
+                GuardianActionKind::AskUser,
+                GuardianActionKind::Block,
+                DiagnosisId::LaunchResourceDiskPressure,
+                "Guardian needs confirmation before launch.",
+                "Launch-relevant storage has low free space",
+            ),
+            (
+                GuardianActionKind::Block,
+                GuardianActionKind::Block,
+                DiagnosisId::CustomJavaOverridePresent,
+                "Guardian blocked launch preflight.",
+                "Guardian Custom mode will keep the selected Java override",
+            ),
+            (
+                GuardianActionKind::AskUser,
+                GuardianActionKind::Block,
+                DiagnosisId::CustomJvmArgsPresent,
+                "Guardian needs confirmation before launch.",
+                "Guardian Custom mode will keep explicit JVM args",
+            ),
+        ];
+        for (authored, effective, diagnosis, summary, detail) in cases {
+            let outcome = author_guardian_copy(GuardianCopyRequest::preflight(
+                authored,
+                effective,
+                OperationPhase::Validating,
+                &[diagnosis],
+                &[],
+            ))
+            .expect("supported preflight coordinate");
+
+            assert_eq!(outcome.decision, effective);
+            assert_eq!(outcome.summary, summary);
+            assert!(outcome.details[0].contains(detail));
+        }
+
+        let ordered = author_guardian_copy(GuardianCopyRequest::preflight(
+            GuardianActionKind::Fallback,
+            GuardianActionKind::Fallback,
+            OperationPhase::Validating,
+            &[
+                DiagnosisId::JavaOverrideUnavailable,
+                DiagnosisId::LaunchResourceMemoryPressure,
+                DiagnosisId::ManagedRuntimeMissing,
+            ],
+            &[],
+        ))
+        .expect("mixed fallback copy");
+        assert!(ordered.details[0].contains("unavailable Java override"));
+        assert!(ordered.details[1].contains("memory budget is tight"));
+        assert!(ordered.details[2].contains("Managed Java runtime is missing"));
     }
 
     #[test]
