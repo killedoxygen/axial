@@ -322,7 +322,7 @@ fn target_kind_for_install_failure(kind: GuardianInstallArtifactFailureKind) -> 
     }
 }
 
-fn install_failure_user_outcome_from_evidence(
+pub(super) fn install_failure_user_outcome_from_evidence(
     decision: GuardianActionKind,
     diagnosis_id: DiagnosisId,
     evidence: &[GuardianInstallArtifactFailureEvidence],

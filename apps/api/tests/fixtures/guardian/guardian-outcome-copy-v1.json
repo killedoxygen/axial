@@ -1,0 +1,529 @@
+{
+  "schema": "axial.guardian.outcome_copy.v1",
+  "cases": [
+    {
+      "id": "runtime_repair.repaired",
+      "input": {
+        "surface": "runtime_repair",
+        "status": "Repaired"
+      },
+      "outcome": {
+        "decision": "Repair",
+        "phase": "Repairing",
+        "summary": "Guardian repaired launch state before launch.",
+        "details": [
+          "Guardian repaired the managed Java runtime before launch."
+        ],
+        "guidance": []
+      }
+    },
+    {
+      "id": "runtime_repair.blocked",
+      "input": {
+        "surface": "runtime_repair",
+        "status": "Blocked"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Repairing",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian blocked managed Java runtime repair because it was not safe to apply."
+        ],
+        "guidance": [
+          "Reinstall or repair the affected version/runtime before launching again."
+        ]
+      }
+    },
+    {
+      "id": "runtime_repair.failed",
+      "input": {
+        "surface": "runtime_repair",
+        "status": "Failed"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Repairing",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian could not repair the managed Java runtime automatically."
+        ],
+        "guidance": [
+          "Reinstall or repair the affected version/runtime before launching again."
+        ]
+      }
+    },
+    {
+      "id": "runtime_repair.suppressed",
+      "input": {
+        "surface": "runtime_repair",
+        "status": "Suppressed"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Repairing",
+        "summary": "Guardian blocked launch preflight.",
+        "details": [
+          "Guardian suppressed managed Java runtime repair because the same repair failed recently."
+        ],
+        "guidance": [
+          "Reinstall or repair the affected version/runtime before launching again."
+        ]
+      }
+    },
+    {
+      "id": "install_artifact_repair.repaired",
+      "input": {
+        "surface": "install_artifact_repair",
+        "status": "Repaired"
+      },
+      "outcome": {
+        "decision": "Repair",
+        "phase": "Repairing",
+        "summary": "Guardian repaired a launcher-managed install artifact.",
+        "details": [
+          "Retry the install to continue from the repaired state."
+        ],
+        "guidance": []
+      }
+    },
+    {
+      "id": "install_artifact_repair.blocked",
+      "input": {
+        "surface": "install_artifact_repair",
+        "status": "Blocked"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Repairing",
+        "summary": "Guardian blocked automatic install repair because it was unsafe.",
+        "details": [
+          "The launcher did not mutate files that were not proven launcher-managed."
+        ],
+        "guidance": []
+      }
+    },
+    {
+      "id": "install_artifact_repair.failed",
+      "input": {
+        "surface": "install_artifact_repair",
+        "status": "Failed"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Repairing",
+        "summary": "Guardian could not repair the launcher-managed install artifact.",
+        "details": [
+          "Check connection and storage permissions before trying again."
+        ],
+        "guidance": []
+      }
+    },
+    {
+      "id": "install_artifact_repair.suppressed",
+      "input": {
+        "surface": "install_artifact_repair",
+        "status": "Suppressed"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Repairing",
+        "summary": "Guardian paused automatic install repair after repeated failure.",
+        "details": [
+          "Check connection and storage permissions before trying again."
+        ],
+        "guidance": []
+      }
+    },
+    {
+      "id": "install_failure.download_retry",
+      "input": {
+        "surface": "install_failure",
+        "diagnosis": "download_unavailable",
+        "decision": "Retry",
+        "component": null,
+        "platform": null
+      },
+      "outcome": {
+        "decision": "Retry",
+        "phase": "Downloading",
+        "summary": "Guardian classified the install download failure as retryable.",
+        "details": [
+          "The install stopped because a provider or network download was unavailable or interrupted."
+        ],
+        "guidance": [
+          "Retry the install after checking connection and storage availability."
+        ]
+      }
+    },
+    {
+      "id": "install_failure.download_block",
+      "input": {
+        "surface": "install_failure",
+        "diagnosis": "download_unavailable",
+        "decision": "Block",
+        "component": null,
+        "platform": null
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Downloading",
+        "summary": "Guardian paused install retry after repeated provider failure.",
+        "details": [
+          "The install stopped because the same provider or network download failure repeated within the retry cooldown."
+        ],
+        "guidance": [
+          "Wait a few minutes, then retry after checking connection and storage availability."
+        ]
+      }
+    },
+    {
+      "id": "install_failure.metadata_invalid",
+      "input": {
+        "surface": "install_failure",
+        "diagnosis": "install_artifact_metadata_invalid",
+        "decision": "Block",
+        "component": null,
+        "platform": null
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Downloading",
+        "summary": "Guardian blocked install because provider metadata could not be trusted.",
+        "details": [
+          "The install did not continue with invalid provider metadata."
+        ],
+        "guidance": [
+          "Retry later or choose another version source."
+        ]
+      }
+    },
+    {
+      "id": "install_failure.dependency_failed",
+      "input": {
+        "surface": "install_failure",
+        "diagnosis": "install_dependency_failed",
+        "decision": "Block",
+        "component": null,
+        "platform": null
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Downloading",
+        "summary": "Guardian blocked loader install because the required base install failed.",
+        "details": [
+          "The loader install did not continue after the base Minecraft install failed."
+        ],
+        "guidance": [
+          "Retry the base version install, then retry the loader install."
+        ]
+      }
+    },
+    {
+      "id": "install_failure.runtime_unavailable",
+      "input": {
+        "surface": "install_failure",
+        "diagnosis": "managed_runtime_unavailable_for_platform",
+        "decision": "Block",
+        "component": "java-runtime-gamma",
+        "platform": "linux-riscv64"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Downloading",
+        "summary": "This Minecraft version needs a Java runtime that is not available for this device.",
+        "details": [
+          "Java runtime component java-runtime-gamma is not available for linux-riscv64."
+        ],
+        "guidance": [
+          "This version cannot be installed on this device."
+        ]
+      }
+    },
+    {
+      "id": "install_failure.rosetta_required",
+      "input": {
+        "surface": "install_failure",
+        "diagnosis": "managed_runtime_rosetta_required",
+        "decision": "Block",
+        "component": "java-runtime-legacy",
+        "platform": null
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Downloading",
+        "summary": "This Minecraft version needs Rosetta 2 on Apple Silicon Macs.",
+        "details": [
+          "Java runtime component java-runtime-legacy needs Rosetta 2 on this Mac."
+        ],
+        "guidance": [
+          "Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then retry."
+        ]
+      }
+    },
+    {
+      "id": "install_failure.permission_denied",
+      "input": {
+        "surface": "install_failure",
+        "diagnosis": "filesystem_permission_denied",
+        "decision": "Block",
+        "component": null,
+        "platform": null
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Downloading",
+        "summary": "Guardian blocked install because Axial could not write launcher-managed files safely.",
+        "details": [
+          "The install did not mutate files after the filesystem refused the operation."
+        ],
+        "guidance": [
+          "Check app data permissions and retry the install."
+        ]
+      }
+    },
+    {
+      "id": "install_failure.temp_file_leftover",
+      "input": {
+        "surface": "install_failure",
+        "diagnosis": "temp_file_leftover",
+        "decision": "Block",
+        "component": null,
+        "platform": null
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Downloading",
+        "summary": "Guardian blocked install because temporary download state could not be written safely.",
+        "details": [
+          "The install did not continue after temporary download state could not be written or cleaned safely."
+        ],
+        "guidance": [
+          "Check app data permissions and disk availability before retrying the install."
+        ]
+      }
+    },
+    {
+      "id": "install_failure.atomic_promotion_failed",
+      "input": {
+        "surface": "install_failure",
+        "diagnosis": "atomic_promotion_failed",
+        "decision": "Block",
+        "component": null,
+        "platform": null
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Downloading",
+        "summary": "Guardian blocked install because verified download data could not be promoted safely.",
+        "details": [
+          "The install did not replace launcher-managed files after atomic promotion failed."
+        ],
+        "guidance": [
+          "Check app data permissions and retry the install."
+        ]
+      }
+    },
+    {
+      "id": "install_failure.unsafe_ownership",
+      "input": {
+        "surface": "install_failure",
+        "diagnosis": "artifact_ownership_unsafe",
+        "decision": "Block",
+        "component": null,
+        "platform": null
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Downloading",
+        "summary": "Guardian blocked install to protect user-owned or unknown files.",
+        "details": [
+          "The install did not automatically mutate a target whose ownership was unsafe."
+        ],
+        "guidance": [
+          "Move the affected files or choose a launcher-managed library location before retrying."
+        ]
+      }
+    },
+    {
+      "id": "launch_recovery_suppressed.managed_runtime",
+      "input": {
+        "surface": "launch_recovery_suppressed",
+        "kind": "SwitchManagedRuntime"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Repairing",
+        "summary": "Guardian suppressed a repeated launch self-healing retry for managed Java recovery because the same recovery failed recently.",
+        "details": [
+          "Guardian suppressed a repeated launch self-healing retry for managed Java recovery because the same recovery failed recently."
+        ],
+        "guidance": [
+          "Review the latest game log or change the affected launch setting before retrying."
+        ]
+      }
+    },
+    {
+      "id": "launch_recovery_suppressed.strip_jvm_args",
+      "input": {
+        "surface": "launch_recovery_suppressed",
+        "kind": "StripRawJvmArgs"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Repairing",
+        "summary": "Guardian suppressed a repeated launch self-healing retry for explicit JVM argument recovery because the same recovery failed recently.",
+        "details": [
+          "Guardian suppressed a repeated launch self-healing retry for explicit JVM argument recovery because the same recovery failed recently."
+        ],
+        "guidance": [
+          "Review the latest game log or change the affected launch setting before retrying."
+        ]
+      }
+    },
+    {
+      "id": "launch_recovery_suppressed.downgrade_preset",
+      "input": {
+        "surface": "launch_recovery_suppressed",
+        "kind": "DowngradePreset"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Repairing",
+        "summary": "Guardian suppressed a repeated launch self-healing retry for JVM preset recovery because the same recovery failed recently.",
+        "details": [
+          "Guardian suppressed a repeated launch self-healing retry for JVM preset recovery because the same recovery failed recently."
+        ],
+        "guidance": [
+          "Review the latest game log or change the affected launch setting before retrying."
+        ]
+      }
+    },
+    {
+      "id": "launch_recovery_suppressed.disable_custom_gc",
+      "input": {
+        "surface": "launch_recovery_suppressed",
+        "kind": "DisableCustomGc"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Repairing",
+        "summary": "Guardian suppressed a repeated launch self-healing retry for custom GC flag recovery because the same recovery failed recently.",
+        "details": [
+          "Guardian suppressed a repeated launch self-healing retry for custom GC flag recovery because the same recovery failed recently."
+        ],
+        "guidance": [
+          "Review the latest game log or change the affected launch setting before retrying."
+        ]
+      }
+    },
+    {
+      "id": "performance_rejection.unsafe_ownership",
+      "input": {
+        "surface": "performance_rejection",
+        "rejection": "unsafe_ownership",
+        "phase": "Installing"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Installing",
+        "summary": "performance update was blocked by Guardian safety supervision",
+        "details": [],
+        "guidance": []
+      }
+    },
+    {
+      "id": "performance_rejection.missing_journal",
+      "input": {
+        "surface": "performance_rejection",
+        "rejection": "missing_journal",
+        "phase": "Installing"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Installing",
+        "summary": "performance update was blocked by Guardian safety supervision",
+        "details": [],
+        "guidance": []
+      }
+    },
+    {
+      "id": "performance_rejection.unsafe_public_boundary",
+      "input": {
+        "surface": "performance_rejection",
+        "rejection": "unsafe_public_boundary",
+        "phase": "Installing"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Installing",
+        "summary": "performance update was blocked by Guardian safety supervision",
+        "details": [],
+        "guidance": []
+      }
+    },
+    {
+      "id": "performance_rejection.guardian_blocked",
+      "input": {
+        "surface": "performance_rejection",
+        "rejection": "guardian_blocked",
+        "phase": "Installing"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Installing",
+        "summary": "performance update was blocked by Guardian safety supervision",
+        "details": [],
+        "guidance": []
+      }
+    },
+    {
+      "id": "performance_rejection.fallback_unavailable",
+      "input": {
+        "surface": "performance_rejection",
+        "rejection": "fallback_unavailable",
+        "phase": "Installing"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Installing",
+        "summary": "performance update was blocked by Guardian safety supervision",
+        "details": [],
+        "guidance": []
+      }
+    },
+    {
+      "id": "performance_rejection.rollback_unavailable",
+      "input": {
+        "surface": "performance_rejection",
+        "rejection": "rollback_unavailable",
+        "phase": "Installing"
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Installing",
+        "summary": "performance update was blocked by Guardian safety supervision",
+        "details": [],
+        "guidance": []
+      }
+    },
+    {
+      "id": "persisted_state.schema_invalid",
+      "input": {
+        "surface": "persisted_state_load",
+        "decision": "Warn"
+      },
+      "outcome": {
+        "decision": "Warn",
+        "phase": "Startup",
+        "summary": "Guardian kept Axial running after persisted operation state could not be trusted.",
+        "details": [
+          "Some restart-resume records were ignored instead of resuming unsafe work."
+        ],
+        "guidance": [
+          "Retry the affected performance or benchmark operation if it is still needed."
+        ]
+      }
+    }
+  ]
+}
