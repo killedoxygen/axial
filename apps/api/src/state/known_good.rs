@@ -665,7 +665,22 @@ impl KnownGoodInventoryStore {
         match &self.owner {
             Some(owner) => owner.flush().await.map_err(io::Error::from),
             None => Ok(()),
+        }?;
+
+        // Persistence can finish before ticket observers clear the store's pending marker.
+        let writers = self
+            .state
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .writers
+            .iter()
+            .map(|(instance_id, writer)| (instance_id.clone(), writer.clone()))
+            .collect::<Vec<_>>();
+        for (instance_id, writer) in writers {
+            let revision = writer.flush().await.map_err(io::Error::from)?;
+            self.clear_committed_pending(&instance_id, revision.get());
         }
+        Ok(())
     }
 }
 
