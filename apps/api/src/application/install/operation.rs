@@ -9,7 +9,8 @@ use crate::application::{
 use crate::guardian::{
     DiagnosisId, GuardianActionKind, GuardianInstallArtifactFailureEvidence,
     GuardianInstallArtifactFailureKind, GuardianMode, GuardianPolicyContext, diagnose,
-    guardian_install_outcome_from_persisted_facts, guardian_install_outcome_persistence_facts,
+    guardian_install_outcome_fact_group, guardian_install_outcome_from_persisted_group,
+    guardian_install_outcome_persistence_facts,
     install_artifact_failure_from_minecraft_download_fact, install_artifact_failure_guardian_fact,
     install_artifact_failure_guardian_outcome_with_context, install_artifact_failure_safety_case,
 };
@@ -449,19 +450,16 @@ pub async fn record_loader_base_install_dependency_guardian_failure_outcome(
 pub fn install_guardian_outcome_summary_from_journal(
     entry: &OperationJournalEntry,
 ) -> Option<crate::guardian::GuardianInstallOutcomeSummary> {
+    let fact_group = entry.completed_steps.iter().rev().find_map(|step| {
+        guardian_install_outcome_fact_group(step.generated_facts.iter().map(String::as_str))
+    })?;
     let diagnosis_id = entry
         .guardian_diagnosis_ids
         .iter()
         .copied()
         .rev()
         .find(|id| *id != DiagnosisId::LauncherManagedArtifactCorrupt)?;
-    guardian_install_outcome_from_persisted_facts(
-        diagnosis_id,
-        entry
-            .completed_steps
-            .iter()
-            .flat_map(|step| step.generated_facts.iter().map(String::as_str)),
-    )
+    guardian_install_outcome_from_persisted_group(diagnosis_id, fact_group)
 }
 
 pub fn sanitize_install_progress(mut progress: DownloadProgress) -> DownloadProgress {

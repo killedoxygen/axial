@@ -409,6 +409,23 @@
         "surface": "install_persistence",
         "outcome": null
       }
+    },
+    {
+      "id": "install.duplicate_summary",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "download_unavailable",
+        "facts": [
+          "guardian_outcome_decision:retry",
+          "guardian_outcome_summary:Guardian classified the install download failure as retryable.",
+          "guardian_outcome_summary:Guardian classified the install download failure as retryable.",
+          "guardian_outcome_detail:The install stopped because a provider or network download was unavailable or interrupted."
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": null
+      }
     }
   ]
 }

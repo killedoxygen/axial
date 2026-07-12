@@ -6,7 +6,8 @@ use crate::guardian::{
     DiagnosisId, GuardianActionKind, GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus,
 };
 use crate::state::contracts::{
-    CommandKind, OperationId, OperationOutcome, OperationStatus, OperationStepResult,
+    CommandKind, JournalId, OperationId, OperationJournalStep, OperationOutcome, OperationPhase,
+    OperationStatus, OperationStepResult, OwnershipClass, RollbackState, StabilizationSystem,
     TargetDescriptor, TargetKind,
 };
 use crate::state::{
@@ -3291,6 +3292,70 @@ async fn install_journal_records_guardian_download_failure_outcome_without_raw_d
     );
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
     assert_no_sensitive_fragments(&serde_json::to_string(&summary).expect("summary json"));
+}
+
+fn persisted_download_outcome_entry() -> OperationJournalEntry {
+    let operation_id = OperationId::new("install-persisted-guardian-outcome");
+    let mut entry = OperationJournalEntry::new(
+        JournalId::new("journal-install-persisted-guardian-outcome"),
+        operation_id,
+        CommandKind::InstallVersion,
+        StabilizationSystem::Application,
+        OwnershipClass::LauncherManaged,
+        RollbackState::NotApplicable,
+    );
+    entry
+        .guardian_diagnosis_ids
+        .push(DiagnosisId::DownloadUnavailable);
+    let mut step = OperationJournalStep::new("guardian-outcome", OperationPhase::Downloading);
+    step.result = OperationStepResult::Failed;
+    step.generated_facts = vec![
+        "guardian_outcome_decision:retry".to_string(),
+        "guardian_outcome_summary:Guardian classified the install download failure as retryable."
+            .to_string(),
+        "guardian_outcome_detail:The install stopped because a provider or network download was unavailable or interrupted."
+            .to_string(),
+    ];
+    entry.completed_steps.push(step);
+    entry
+}
+
+#[test]
+fn install_journal_outcome_replay_does_not_borrow_facts_from_an_older_step() {
+    let mut entry = persisted_download_outcome_entry();
+    assert!(install_guardian_outcome_summary_from_journal(&entry).is_some());
+
+    let mut partial = OperationJournalStep::new("partial-guardian-outcome", OperationPhase::Failed);
+    partial.result = OperationStepResult::Failed;
+    partial.generated_facts = vec!["guardian_outcome_decision:block".to_string()];
+    entry.completed_steps.push(partial);
+
+    assert!(install_guardian_outcome_summary_from_journal(&entry).is_none());
+}
+
+#[test]
+fn install_journal_outcome_replay_rejects_duplicate_markers() {
+    let entry = persisted_download_outcome_entry();
+    for prefix in [
+        "guardian_outcome_decision:",
+        "guardian_outcome_summary:",
+        "guardian_outcome_detail:",
+    ] {
+        let mut duplicated = entry.clone();
+        let step = duplicated.completed_steps.last_mut().expect("outcome step");
+        let fact = step
+            .generated_facts
+            .iter()
+            .find(|fact| fact.starts_with(prefix))
+            .expect("outcome marker")
+            .clone();
+        step.generated_facts.push(fact);
+
+        assert!(
+            install_guardian_outcome_summary_from_journal(&duplicated).is_none(),
+            "duplicate marker was accepted: {prefix}"
+        );
+    }
 }
 
 #[tokio::test]

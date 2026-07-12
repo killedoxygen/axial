@@ -53,8 +53,9 @@ pub use artifact_repair::{
 pub(crate) use copy::{
     GuardianCopyRequest, GuardianLaunchAdmission, GuardianRuntimeRepairCopy, author_guardian_copy,
     guardian_directive_description, guardian_failed_launch_recovery_log,
-    guardian_install_outcome_from_persisted_facts, guardian_install_outcome_persistence_facts,
-    guardian_launch_stage_evidence, guardian_proof_evidence, guardian_summary_with_blocked_outcome,
+    guardian_install_outcome_fact_group, guardian_install_outcome_from_persisted_group,
+    guardian_install_outcome_persistence_facts, guardian_launch_stage_evidence,
+    guardian_proof_evidence, guardian_summary_with_blocked_outcome,
     guardian_summary_with_intervention, guardian_summary_with_observed_outcome,
     guardian_summary_with_suppressed_outcome,
 };

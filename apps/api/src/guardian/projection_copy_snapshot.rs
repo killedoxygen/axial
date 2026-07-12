@@ -1,4 +1,7 @@
-use super::{DiagnosisId, guardian_install_outcome_from_persisted_facts, guardian_proof_evidence};
+use super::{
+    DiagnosisId, guardian_install_outcome_fact_group,
+    guardian_install_outcome_from_persisted_group, guardian_proof_evidence,
+};
 use axial_launcher::{
     GuardianDecision, GuardianIntervention, GuardianInterventionKind, GuardianMode, GuardianSummary,
 };
@@ -9,7 +12,7 @@ const COPY_FIXTURE: &str = include_str!(concat!(
     "/tests/fixtures/guardian/guardian-projection-copy-v1.json"
 ));
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_PROJECTION_COPY_SNAPSHOT";
-const EXPECTED_CASE_IDS: [&str; 19] = [
+const EXPECTED_CASE_IDS: [&str; 20] = [
     "proof.blocked",
     "proof.warned",
     "proof.intervened",
@@ -29,6 +32,7 @@ const EXPECTED_CASE_IDS: [&str; 19] = [
     "install.malformed_summary",
     "install.missing_detail",
     "install.unsafe_detail",
+    "install.duplicate_summary",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -202,10 +206,10 @@ fn render_output(input: &GuardianProjectionCopyInput) -> GuardianProjectionCopyO
             diagnosis_id,
             facts,
         } => {
-            let outcome = guardian_install_outcome_from_persisted_facts(
-                *diagnosis_id,
-                facts.iter().map(String::as_str),
-            );
+            let outcome = guardian_install_outcome_fact_group(facts.iter().map(String::as_str))
+                .and_then(|group| {
+                    guardian_install_outcome_from_persisted_group(*diagnosis_id, group)
+                });
             let retry_disabled_reason = outcome
                 .as_ref()
                 .filter(|outcome| outcome.decision() == "block")

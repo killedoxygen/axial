@@ -347,15 +347,52 @@ pub(crate) fn guardian_install_outcome_persistence_facts(
     facts
 }
 
-pub(crate) fn guardian_install_outcome_from_persisted_facts<'a>(
-    diagnosis_id: DiagnosisId,
+pub(crate) struct GuardianInstallOutcomeFactGroup<'a> {
+    decision: Option<&'a str>,
+    summary: Option<&'a str>,
+    detail: Option<&'a str>,
+    has_duplicate: bool,
+}
+
+pub(crate) fn guardian_install_outcome_fact_group<'a>(
     facts: impl IntoIterator<Item = &'a str>,
+) -> Option<GuardianInstallOutcomeFactGroup<'a>> {
+    let mut group = GuardianInstallOutcomeFactGroup {
+        decision: None,
+        summary: None,
+        detail: None,
+        has_duplicate: false,
+    };
+    let mut has_marker = false;
+    for fact in facts {
+        let marker = if let Some(value) = fact.strip_prefix(GUARDIAN_OUTCOME_DECISION_PREFIX) {
+            Some((&mut group.decision, value))
+        } else if let Some(value) = fact.strip_prefix(GUARDIAN_OUTCOME_SUMMARY_PREFIX) {
+            Some((&mut group.summary, value))
+        } else {
+            fact.strip_prefix(GUARDIAN_OUTCOME_DETAIL_PREFIX)
+                .map(|value| (&mut group.detail, value))
+        };
+        if let Some((slot, value)) = marker {
+            has_marker = true;
+            if slot.replace(value).is_some() {
+                group.has_duplicate = true;
+            }
+        }
+    }
+    has_marker.then_some(group)
+}
+
+pub(crate) fn guardian_install_outcome_from_persisted_group(
+    diagnosis_id: DiagnosisId,
+    group: GuardianInstallOutcomeFactGroup<'_>,
 ) -> Option<GuardianInstallOutcomeSummary> {
-    let facts = facts.into_iter().collect::<Vec<_>>();
-    let decision = latest_prefixed_fact(&facts, GUARDIAN_OUTCOME_DECISION_PREFIX)
-        .and_then(guardian_action_from_persisted_id)?;
-    let persisted_summary = latest_prefixed_fact(&facts, GUARDIAN_OUTCOME_SUMMARY_PREFIX)?;
-    let persisted_detail = latest_prefixed_fact(&facts, GUARDIAN_OUTCOME_DETAIL_PREFIX);
+    if group.has_duplicate {
+        return None;
+    }
+    let decision = group.decision.and_then(guardian_action_from_persisted_id)?;
+    let persisted_summary = group.summary?;
+    let persisted_detail = group.detail;
     let canonical = author_guardian_copy(GuardianCopyRequest::install_failure_replay(
         diagnosis_id,
         decision,
@@ -380,13 +417,6 @@ pub(crate) fn guardian_install_outcome_from_persisted_facts<'a>(
         detail,
         guidance: canonical.guidance,
     })
-}
-
-fn latest_prefixed_fact<'a>(facts: &[&'a str], prefix: &str) -> Option<&'a str> {
-    facts
-        .iter()
-        .rev()
-        .find_map(|fact| fact.strip_prefix(prefix))
 }
 
 fn validated_persisted_copy_line(value: &str) -> Option<String> {
