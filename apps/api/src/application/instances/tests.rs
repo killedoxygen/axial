@@ -1735,13 +1735,20 @@ async fn create_instance_rejects_unknown_exact_loader_selection() {
     let fixture = TestFixture::new("create-unknown-loader-build-selection");
     let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
     write_fabric_loader_build_cache(&library_dir, "1.21.1", "0.16.14");
+    let unknown_build_id = axial_minecraft::build_id_for(
+        axial_minecraft::LoaderComponentId::Fabric,
+        "1.21.1",
+        "0.16.99",
+    );
 
     let (status, Json(body)) = handle_create_instance(
         &fixture.state,
         CreateInstanceRequest {
             name: "Unknown loader".to_string(),
-            selection_id: "loader_build|net.fabricmc.fabric-loader|fabric:1.21.1:0.16.99"
-                .to_string(),
+            selection_id: format!(
+                "loader_build|{}|{unknown_build_id}",
+                axial_minecraft::LoaderComponentId::Fabric.as_str()
+            ),
             ..CreateInstanceRequest::default()
         },
     )
@@ -2564,7 +2571,14 @@ async fn cached_loader_build_cannot_authorize_backend_install() {
         body["error"],
         "Loader catalog is unavailable. Check your connection and try again."
     );
-    assert_eq!(build_id, "fabric:1.21.99:0.16.14");
+    assert_eq!(
+        build_id,
+        axial_minecraft::build_id_for(
+            axial_minecraft::LoaderComponentId::Fabric,
+            "1.21.99",
+            "0.16.14"
+        )
+    );
     assert!(fixture.state.instances().list().is_empty());
     let queue = fixture.state.installs().queue_snapshot().await;
     assert_eq!(

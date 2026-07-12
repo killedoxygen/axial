@@ -22,7 +22,7 @@ use axial_minecraft::download::{
 };
 use axial_minecraft::{
     DownloadError, DownloadProgress, LoaderComponentId, LoaderError, LoaderInstallError,
-    LoaderProviderFailureKind,
+    LoaderProviderFailureKind, build_id_for,
 };
 use axial_performance::PerformanceManager;
 use axum::{body::to_bytes, response::IntoResponse};
@@ -589,7 +589,7 @@ async fn install_queue_status_authors_backend_queue_view_models() {
             "queue-loader".to_string(),
             InstallQueueSpec::loader(
                 LoaderComponentId::Fabric,
-                "fabric:1.21.5:0.16.10".to_string(),
+                build_id_for(LoaderComponentId::Fabric, "1.21.5", "0.16.10"),
                 "fabric-loader-1.21.5".to_string(),
                 "1.21.5".to_string(),
                 "0.16.10".to_string(),

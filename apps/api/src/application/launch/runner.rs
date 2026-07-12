@@ -2942,7 +2942,14 @@ mod tests {
             fabric_loader.component_id,
             axial_minecraft::LoaderComponentId::Fabric
         );
-        assert_eq!(fabric_loader.build_id, "fabric:1.21.1:0.16.10");
+        assert_eq!(
+            fabric_loader.build_id,
+            axial_minecraft::build_id_for(
+                axial_minecraft::LoaderComponentId::Fabric,
+                "1.21.1",
+                "0.16.10"
+            )
+        );
     }
 
     fn test_app_state(root: &Path) -> AppState {

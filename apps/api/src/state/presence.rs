@@ -295,6 +295,7 @@ mod tests {
     use axial_launcher::{LaunchSessionRecord, SessionId};
     use axial_minecraft::{
         MinecraftVersionMeta, VersionEntry, VersionLoaderAttachment, VersionSubjectKind,
+        build_id_for,
     };
     use axial_performance::PerformanceManager;
     use std::{fs, path::PathBuf, sync::Arc};
@@ -383,7 +384,11 @@ mod tests {
             loader: loader_name.map(|name| VersionLoaderAttachment {
                 component_id: axial_minecraft::LoaderComponentId::Fabric,
                 component_name: name.to_string(),
-                build_id: "fabric:1.21.1:0.16.10".to_string(),
+                build_id: build_id_for(
+                    axial_minecraft::LoaderComponentId::Fabric,
+                    "1.21.1",
+                    "0.16.10",
+                ),
                 loader_version: "0.16.10".to_string(),
                 build_meta: Default::default(),
             }),

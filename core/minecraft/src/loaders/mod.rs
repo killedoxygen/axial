@@ -130,7 +130,7 @@ mod tests {
     use super::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderComponentId, LoaderError,
         LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, MAX_VERSION_ID_BYTES,
-        install_build, installed_version_id_for, require_exact_live_build_record,
+        build_id_for, install_build, installed_version_id_for, require_exact_live_build_record,
         validate_version_id,
     };
     use crate::loaders::types::LoaderBuildSubjectKind;
@@ -188,11 +188,13 @@ mod tests {
         let component_id = LoaderComponentId::Fabric;
         let version_id = installed_version_id_for(component_id, "1.21.5", "0.16.14")
             .expect("canonical installed version id");
+        let mut build_id = build_id_for(component_id, "1.21.5", "0.16.14");
+        build_id.push('A');
         let record = LoaderBuildRecord {
             subject_kind: LoaderBuildSubjectKind::LoaderBuild,
             component_id,
             component_name: component_id.display_name().to_string(),
-            build_id: "fabric:1.21.5:different".to_string(),
+            build_id,
             minecraft_version: "1.21.5".to_string(),
             loader_version: "0.16.14".to_string(),
             version_id,

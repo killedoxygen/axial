@@ -253,6 +253,7 @@ pub(super) fn generate_session_id() -> SessionId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axial_minecraft::build_id_for;
 
     #[test]
     fn explicit_instance_memory_takes_precedence_over_request_and_derived_defaults() {
@@ -555,7 +556,11 @@ mod tests {
             loader: Some(axial_minecraft::VersionLoaderAttachment {
                 component_id: axial_minecraft::LoaderComponentId::Fabric,
                 component_name: "Fabric".to_string(),
-                build_id: "fabric:1.21.1:0.16.10".to_string(),
+                build_id: build_id_for(
+                    axial_minecraft::LoaderComponentId::Fabric,
+                    "1.21.1",
+                    "0.16.10",
+                ),
                 loader_version: "0.16.10".to_string(),
                 build_meta: axial_minecraft::LoaderBuildMetadata::default(),
             }),

@@ -725,6 +725,7 @@ impl Default for InstallStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axial_minecraft::build_id_for;
 
     #[tokio::test]
     async fn install_insert_or_existing_reuses_active_matching_key() {
@@ -1200,6 +1201,7 @@ mod tests {
     #[tokio::test]
     async fn install_identities_keep_vanilla_and_loader_work_independent() {
         let store = InstallStore::new();
+        let build_id = build_id_for(LoaderComponentId::Fabric, "1.21.5", "0.16.10");
         store
             .insert_or_existing_vanilla("vanilla-install".to_string(), "1.21.5".to_string())
             .await;
@@ -1208,14 +1210,14 @@ mod tests {
             .insert_or_existing_loader(
                 "loader-install".to_string(),
                 LoaderComponentId::Fabric,
-                "fabric:1.21.5:0.16.10".to_string(),
+                build_id.clone(),
             )
             .await;
         let (duplicate_loader_id, duplicate_loader_inserted) = store
             .insert_or_existing_loader(
                 "duplicate-loader-install".to_string(),
                 LoaderComponentId::Fabric,
-                " fabric:1.21.5:0.16.10 ".to_string(),
+                format!(" {build_id} "),
             )
             .await;
 
@@ -1232,7 +1234,7 @@ mod tests {
         let first = InstallQueueSpec::vanilla("1.21.5".to_string());
         let second = InstallQueueSpec::loader(
             LoaderComponentId::Fabric,
-            "fabric:1.21.6:0.16.10".to_string(),
+            build_id_for(LoaderComponentId::Fabric, "1.21.6", "0.16.10"),
             "fabric-loader-1.21.6".to_string(),
             "1.21.6".to_string(),
             "0.16.10".to_string(),
@@ -1321,7 +1323,7 @@ mod tests {
             .insert_or_existing_loader(
                 "loader-install".to_string(),
                 LoaderComponentId::Fabric,
-                "fabric:1.21.5:0.16.10".to_string(),
+                build_id_for(LoaderComponentId::Fabric, "1.21.5", "0.16.10"),
             )
             .await;
 

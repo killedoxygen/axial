@@ -165,7 +165,7 @@ const flagOverrides = new Map<string, boolean>();
 
 const FABRIC_COMPONENT_ID = 'net.fabricmc.fabric-loader';
 const MOCK_FABRIC_MC_VERSION = '1.21.5';
-const MOCK_FABRIC_BUILD_ID = 'fabric:1.21.5:0.16.14';
+const MOCK_FABRIC_BUILD_ID = 'loader-build-v1-YXhpYWwtbG9hZGVyLWJ1aWxkAAEAAAAAAAAABjEuMjEuNQAAAAAAAAAHMC4xNi4xNA';
 const MOCK_FABRIC_VERSION_ID = 'loader-v2-YXhpYWwtaW5zdGFsbGVkLWxvYWRlcgABAAYxLjIxLjUABzAuMTYuMTQ';
 const MOCK_FABRIC_LOADER_VERSION = '0.16.14';
 

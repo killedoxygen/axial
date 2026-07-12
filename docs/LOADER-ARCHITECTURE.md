@@ -57,7 +57,10 @@ Important fields:
 - `artifact_kind`
 - `install_source`
 
-`build_id` is Axial-owned. It is the stable selection key for install work.
+`build_id` is Axial-owned. It is the stable opaque selection key for install work. Current build
+ids use the canonical `loader-build-v1-<base64url>` encoding: a domain/version marker, explicit
+component byte, and length-prefixed exact UTF-8 Minecraft and loader versions. Delimiter-shaped
+legacy ids are rejected rather than parsed or upgraded.
 
 `version_id` is the installed local version id written into `versions/`.
 

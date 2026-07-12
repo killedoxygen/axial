@@ -1939,7 +1939,7 @@ mod tests {
     #[test]
     fn noncanonical_loader_build_identity_cannot_mint_inventory() {
         let mut fixture = fixture(FixtureShape::Quilt, false);
-        fixture.loader_record.as_mut().unwrap().build_id = "quilt:wrong:identity".to_string();
+        fixture.loader_record.as_mut().unwrap().build_id.push('A');
 
         let error = derive_known_good_inventory(fixture.input())
             .expect_err("noncanonical loader build identity");

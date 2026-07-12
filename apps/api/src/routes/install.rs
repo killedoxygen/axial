@@ -130,6 +130,11 @@ mod tests {
     #[tokio::test]
     async fn install_routes_reject_removed_and_cross_kind_fields() {
         let fixture = RouteInstallFixture::new("install-route-strict-request-shape");
+        let build_id = axial_minecraft::build_id_for(
+            axial_minecraft::LoaderComponentId::Fabric,
+            "1.21.6",
+            "0.16.10",
+        );
         let requests = [
             (
                 "/api/v1/install",
@@ -143,7 +148,7 @@ mod tests {
                 serde_json::json!({
                     "kind": "vanilla",
                     "version_id": "1.21.6",
-                    "build_id": "fabric:1.21.6:0.16.10"
+                    "build_id": &build_id
                 }),
             ),
             (
@@ -151,7 +156,7 @@ mod tests {
                 serde_json::json!({
                     "kind": "loader",
                     "component_id": "net.fabricmc.fabric-loader",
-                    "build_id": "fabric:1.21.6:0.16.10",
+                    "build_id": &build_id,
                     "version_id": "1.21.6"
                 }),
             ),
@@ -159,7 +164,7 @@ mod tests {
                 "/api/v1/loaders/install",
                 serde_json::json!({
                     "component_id": "net.fabricmc.fabric-loader",
-                    "build_id": "fabric:1.21.6:0.16.10",
+                    "build_id": &build_id,
                     "manifest_url": "https://example.invalid/version.json"
                 }),
             ),
@@ -167,7 +172,7 @@ mod tests {
                 "/api/v1/loaders/install",
                 serde_json::json!({
                     "component_id": "net.fabricmc.fabric-loader",
-                    "build_id": "fabric:1.21.6:0.16.10",
+                    "build_id": &build_id,
                     "version_id": "1.21.6"
                 }),
             ),
