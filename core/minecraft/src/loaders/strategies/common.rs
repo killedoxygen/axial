@@ -1613,7 +1613,7 @@ mod tests {
             entry.path().as_str() == artifact_path
                 && matches!(
                     entry.integrity(),
-                    KnownGoodIntegrity::Sha1 { digest: receipt_digest, size: Some(size) }
+                    KnownGoodIntegrity::Sha1 { digest: receipt_digest, size }
                         if receipt_digest.as_str() == digest && *size == library_bytes.len() as u64
                 )
         }));
@@ -2072,7 +2072,7 @@ mod tests {
             entry.integrity(),
             KnownGoodIntegrity::Sha1 { digest, size }
                 if digest.as_str() == sha1_hex(&fs::read(&library_path).expect("final library"))
-                    && *size == Some(fs::metadata(&library_path).expect("library metadata").len())
+                    && *size == fs::metadata(&library_path).expect("library metadata").len()
         ));
 
         installer_server.stop();
@@ -2324,7 +2324,7 @@ mod tests {
             panic!("client jar receipt must retain canonical source integrity");
         };
         assert_eq!(digest.as_str(), sha1_hex(&installed_jar_bytes));
-        assert_eq!(size, Some(installed_jar_bytes.len() as u64));
+        assert_eq!(size, installed_jar_bytes.len() as u64);
         let installed_version_json = fs::read_to_string(
             versions_dir(&root)
                 .join(&record.version_id)

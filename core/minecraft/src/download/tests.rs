@@ -390,7 +390,7 @@ async fn runtime_task_is_aborted_when_artifact_install_fails() {
         Duration::from_millis(100),
         finish_runtime_pipeline_after_artifacts(
             Some(runtime_pipeline(task)),
-            Err(artifact_error),
+            Err::<(), _>(artifact_error),
             &mut |_| {},
         ),
     )
@@ -440,7 +440,7 @@ async fn artifact_error_is_preserved_when_runtime_also_fails() {
 
     let result = finish_runtime_pipeline_after_artifacts(
         Some(runtime_pipeline(task)),
-        Err(artifact_error),
+        Err::<(), _>(artifact_error),
         &mut |_| {},
     )
     .await;
@@ -740,6 +740,40 @@ fn unique_asset_object_jobs_deduplicate_same_hash() {
     assert_eq!(jobs[1].hash, hash_b);
     assert_eq!(jobs[1].path, objects_dir.join("12").join(hash_b));
     assert_eq!(jobs[1].expected, ExpectedIntegrity::from_mojang(8, hash_b));
+}
+
+#[test]
+fn asset_index_requires_declared_object_size_but_accepts_explicit_zero() {
+    let hash = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+    assert!(
+        parse_asset_index(format!(r#"{{"objects":{{"empty":{{"hash":"{hash}"}}}}}}"#).as_bytes())
+            .is_err()
+    );
+
+    let index = parse_asset_index(
+        format!(r#"{{"objects":{{"empty":{{"hash":"{hash}","size":0}}}}}}"#).as_bytes(),
+    )
+    .expect("explicit zero-size asset object");
+    let jobs = unique_asset_object_jobs(
+        Path::new("/tmp/axial-test/assets/objects"),
+        index
+            .objects
+            .values()
+            .map(|object| (object.hash.as_str(), object.size)),
+    )
+    .expect("zero-size asset job");
+
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].expected.size, Some(0));
+}
+
+#[test]
+fn unique_asset_object_jobs_rejects_negative_size() {
+    let hash = "abcdef1234567890abcdef1234567890abcdef12";
+    let result =
+        unique_asset_object_jobs(Path::new("/tmp/axial-test/assets/objects"), [(hash, -1)]);
+
+    assert!(matches!(result, Err(DownloadError::Integrity(_))));
 }
 
 #[test]

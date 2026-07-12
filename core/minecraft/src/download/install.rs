@@ -3,23 +3,25 @@ use super::assets::{
     spawn_asset_download_pipeline,
 };
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
-use super::libraries::{DownloadJob, library_jobs_for};
+use super::libraries::{DownloadJob, decode_sha1, library_jobs_for};
 use super::model::{
-    DownloadError, DownloadProgress, ExecutionDownloadFact, ExecutionDownloadReport,
-    ExpectedIntegrity, SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
+    DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
+    ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactDescriptor,
+    SelectedDownloadArtifactKind, progress,
 };
 use super::plan::TransferPlan;
 use super::runtime::{
     finish_runtime_pipeline_after_artifacts, recv_runtime_progress, spawn_runtime_ensure_pipeline,
 };
 use super::transfer::{
-    VerifiedSelectedArtifactDownload, ensure_selected_artifact_with_client,
+    VerifiedSelectedArtifactDownload, ensure_selected_artifact_with_client_and_observed_size,
     fetch_verified_selected_artifact_bytes_with_client,
 };
 use crate::artifact_path::validate_artifact_path_segment;
 use crate::known_good::{
     KnownGoodInstallReceipt, KnownGoodInstallShape, KnownGoodInventoryInput,
     MAX_KNOWN_GOOD_ASSET_INDEX_BYTES, MAX_KNOWN_GOOD_VERSION_JSON_BYTES, RuntimeInventoryInput,
+    seal_verified_vanilla_library_authority,
 };
 use crate::launch::{VersionJson, effective_java_version_for};
 use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
@@ -27,7 +29,7 @@ use crate::paths::{assets_dir, versions_dir};
 use crate::rules::default_environment;
 use futures_util::StreamExt;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs as async_fs;
 use tokio::sync::mpsc;
@@ -37,6 +39,12 @@ pub struct Downloader {
     client: reqwest::Client,
     #[cfg(test)]
     install_manifest: Option<VersionManifest>,
+}
+
+struct VerifiedVanillaArtifacts {
+    client_size: u64,
+    library_proofs: Vec<ExactLibraryDownloadProof>,
+    log_config_size: Option<u64>,
 }
 
 impl Downloader {
@@ -268,7 +276,7 @@ impl Downloader {
                 let fact_tx = fact_tx.cloned();
                 let descriptor_tx = descriptor_tx.cloned();
                 Some(tokio::spawn(async move {
-                    ensure_selected_artifact_with_client(
+                    let (_, observed_size) = ensure_selected_artifact_with_client_and_observed_size(
                         SelectedDownloadArtifactKind::ClientJar,
                         &http_client,
                         &url,
@@ -278,7 +286,7 @@ impl Downloader {
                         descriptor_tx.as_ref(),
                     )
                     .await?;
-                    Ok::<(), DownloadError>(())
+                    Ok::<u64, DownloadError>(observed_size)
                 }))
             } else {
                 None
@@ -306,14 +314,14 @@ impl Downloader {
             let total_library_jobs = library_jobs.len() as i32;
             let mut completed_library_jobs = 0;
             let library_result = async {
+                let mut proofs = Vec::with_capacity(total_library_jobs as usize);
                 let mut library_downloads =
                     futures_util::stream::iter(library_jobs.into_iter().map(|job| {
                         let client = client.clone();
                         let fact_tx = fact_tx.cloned();
                         let descriptor_tx = descriptor_tx.cloned();
                         async move {
-                            let bytes = job.expected.size.unwrap_or(0);
-                            ensure_selected_artifact_with_client(
+                            let (_, observed_size) = ensure_selected_artifact_with_client_and_observed_size(
                                 SelectedDownloadArtifactKind::Library,
                                 &client,
                                 &job.url,
@@ -323,7 +331,18 @@ impl Downloader {
                                 descriptor_tx.as_ref(),
                             )
                             .await?;
-                            Ok::<(String, u64), DownloadError>((job.name, bytes))
+                            let sha1 = job
+                                .expected
+                                .sha1
+                                .as_deref()
+                                .and_then(decode_sha1)
+                                .ok_or(LibraryPlanError::InvalidChecksum)?;
+                            let proof = ExactLibraryDownloadProof::new(
+                                job.relative_path,
+                                observed_size,
+                                sha1,
+                            );
+                            Ok::<_, DownloadError>((job.name, observed_size, proof))
                         }
                     }))
                     .buffer_unordered(library_download_concurrency());
@@ -349,7 +368,8 @@ impl Downloader {
                             let Some(result) = result else {
                                 break;
                             };
-                            let (name, bytes) = result?;
+                            let (name, bytes, proof) = result?;
+                            proofs.push(proof);
                             plan.add_done(bytes);
                             completed_library_jobs += 1;
                             send(progress(
@@ -361,7 +381,7 @@ impl Downloader {
                         }
                     }
                 }
-                Ok::<(), DownloadError>(())
+                Ok::<_, DownloadError>(proofs)
             }
             .await;
             let client_jar_result = await_client_jar_download(client_jar_task).await;
@@ -379,10 +399,14 @@ impl Downloader {
             } else {
                 await_asset_download_pipeline(asset_pipeline, send).await?;
             }
-            client_jar_result?;
-            library_result?;
+            let client_size = client_jar_result?.ok_or_else(|| {
+                DownloadError::ResolveManifest(
+                    "installed version has no authenticated client artifact".to_string(),
+                )
+            })?;
+            let library_proofs = library_result?;
 
-            if let Some(logging) = version
+            let log_config_size = if let Some(logging) = version
                 .logging
                 .as_ref()
                 .and_then(|logging| logging.client.as_ref())
@@ -394,8 +418,9 @@ impl Downloader {
                 send(progress("log_config", 0, 1, Some(logging.file.id.clone())));
                 let expected =
                     ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1);
-                self.ensure_artifact(
+                let (_, observed_size) = ensure_selected_artifact_with_client_and_observed_size(
                     SelectedDownloadArtifactKind::LogConfig,
+                    &self.client,
                     &logging.file.url,
                     &log_config_path,
                     &expected,
@@ -404,12 +429,19 @@ impl Downloader {
                 )
                 .await?;
                 plan.add_done(log_config_bytes);
-            }
-            Ok::<(), DownloadError>(())
+                Some(observed_size)
+            } else {
+                None
+            };
+            Ok::<_, DownloadError>(VerifiedVanillaArtifacts {
+                client_size,
+                library_proofs,
+                log_config_size,
+            })
         }
         .await;
 
-        let runtime_receipt =
+        let (runtime_receipt, verified_artifacts) =
             finish_runtime_pipeline_after_artifacts(runtime_pipeline, artifact_result, send)
                 .await?;
 
@@ -417,9 +449,24 @@ impl Downloader {
             size: Some(receipt.expected_size()),
             sha1: Some(receipt.expected_sha1().to_string()),
         });
+        let environment = default_environment();
+        let library_authority = seal_verified_vanilla_library_authority(
+            &version.libraries,
+            &environment,
+            verified_artifacts.library_proofs,
+        )
+        .map_err(|error| {
+            DownloadError::ResolveManifest(format!(
+                "installed library authority could not be sealed: {error:?}"
+            ))
+        })?;
         KnownGoodInstallReceipt::from_verified_vanilla_source(
             KnownGoodInventoryInput {
                 resolved_version: &version,
+                version_metadata_size: version_json_bytes.len() as u64,
+                client_size: verified_artifacts.client_size,
+                libraries: &library_authority,
+                log_config_size: verified_artifacts.log_config_size,
                 asset_index_bytes: asset_index_bytes.as_deref(),
                 runtime: runtime_receipt.as_ref().zip(runtime_expected.as_ref()).map(
                     |(receipt, expected)| RuntimeInventoryInput {
@@ -431,7 +478,7 @@ impl Downloader {
                 shape: KnownGoodInstallShape {
                     version_manifest: &version_manifest_entry,
                 },
-                environment: &default_environment(),
+                environment: &environment,
             },
             &version_json_bytes,
         )
@@ -527,27 +574,6 @@ impl Downloader {
         let env = default_environment();
         Ok(library_jobs_for(&self.mc_dir, &version.libraries, &env)?)
     }
-
-    async fn ensure_artifact(
-        &self,
-        kind: SelectedDownloadArtifactKind,
-        url: &str,
-        destination: &Path,
-        expected: &ExpectedIntegrity,
-        fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-        descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-    ) -> Result<Option<ExecutionDownloadReport>, DownloadError> {
-        ensure_selected_artifact_with_client(
-            kind,
-            &self.client,
-            url,
-            destination,
-            expected,
-            fact_tx,
-            descriptor_tx,
-        )
-        .await
-    }
 }
 
 fn validate_install_version_id(version_id: &str) -> Result<(), DownloadError> {
@@ -595,14 +621,13 @@ fn parse_vanilla_version_source(
 }
 
 async fn await_client_jar_download(
-    task: Option<tokio::task::JoinHandle<Result<(), DownloadError>>>,
-) -> Result<(), DownloadError> {
+    task: Option<tokio::task::JoinHandle<Result<u64, DownloadError>>>,
+) -> Result<Option<u64>, DownloadError> {
     let Some(task) = task else {
-        return Ok(());
+        return Ok(None);
     };
 
-    task.await.map_err(client_jar_task_error)??;
-    Ok(())
+    task.await.map_err(client_jar_task_error)?.map(Some)
 }
 
 fn client_jar_task_error(error: tokio::task::JoinError) -> DownloadError {

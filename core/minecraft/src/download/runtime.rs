@@ -111,11 +111,11 @@ pub(super) async fn recv_runtime_progress(
     pipeline.as_mut()?.progress_rx.recv().await
 }
 
-pub(super) async fn finish_runtime_pipeline_after_artifacts<F>(
+pub(super) async fn finish_runtime_pipeline_after_artifacts<F, T>(
     pipeline: Option<RuntimeEnsurePipeline>,
-    artifact_result: Result<(), DownloadError>,
+    artifact_result: Result<T, DownloadError>,
     send: &mut F,
-) -> Result<Option<RuntimeSourceReceipt>, DownloadError>
+) -> Result<(Option<RuntimeSourceReceipt>, T), DownloadError>
 where
     F: FnMut(DownloadProgress),
 {
@@ -124,7 +124,7 @@ where
         mut progress_rx,
     }) = pipeline
     else {
-        return artifact_result.map(|_| None);
+        return artifact_result.map(|artifacts| (None, artifacts));
     };
 
     match artifact_result {
@@ -132,7 +132,7 @@ where
             task.abort();
             Err(error)
         }
-        Ok(()) => {
+        Ok(artifacts) => {
             let mut progress_open = true;
             loop {
                 tokio::select! {
@@ -151,7 +151,7 @@ where
                             Ok(result) => result.map_err(runtime_lookup_error_to_download_error),
                             Err(error) => Err(DownloadError::PrepareRuntime(error.to_string())),
                         };
-                        return runtime_result;
+                        return runtime_result.map(|receipt| (receipt, artifacts));
                     }
                 }
             }

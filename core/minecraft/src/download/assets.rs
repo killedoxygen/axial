@@ -36,7 +36,6 @@ pub(crate) struct AssetIndex {
 #[derive(Deserialize)]
 pub(crate) struct AssetObject {
     pub(crate) hash: String,
-    #[serde(default)]
     pub(crate) size: i64,
 }
 
@@ -248,13 +247,19 @@ pub(super) fn unique_asset_object_jobs<'a>(
 
     for (hash, size) in objects {
         let prefix = asset_object_hash_prefix(hash)?;
+        let size = u64::try_from(size).map_err(|_| {
+            DownloadError::Integrity("asset object has an invalid declared size".to_string())
+        })?;
         if !queued_hashes.insert(hash.to_string()) {
             continue;
         }
         jobs.push(AssetObjectDownloadJob {
             hash: hash.to_string(),
             path: objects_dir.join(prefix).join(hash),
-            expected: ExpectedIntegrity::from_mojang(size, hash),
+            expected: ExpectedIntegrity {
+                size: Some(size),
+                sha1: Some(hash.to_ascii_lowercase()),
+            },
         });
     }
 

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock};
 
-const KNOWN_GOOD_SCHEMA: &str = "axial.state.known_good_inventory.v2";
+const KNOWN_GOOD_SCHEMA: &str = "axial.state.known_good_inventory.v3";
 const KNOWN_GOOD_DIR: &str = "known-good";
 const MAX_KNOWN_GOOD_SNAPSHOT_BYTES: u64 = 256 << 20;
 const STORE_LOCK_INVARIANT: &str =
@@ -74,7 +74,7 @@ enum KnownGoodArtifactKindSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum KnownGoodIntegritySnapshot {
-    Sha1 { digest: String, size: Option<u64> },
+    Sha1 { digest: String, size: u64 },
     ExactBytes { digest: String, size: u64 },
     Directory,
     LinkTarget { target: String },
@@ -1155,7 +1155,7 @@ mod tests {
 
     #[test]
     fn strict_schema_rejects_unknown_fields_and_invalid_contracts() {
-        assert_eq!(KNOWN_GOOD_SCHEMA, "axial.state.known_good_inventory.v2");
+        assert_eq!(KNOWN_GOOD_SCHEMA, "axial.state.known_good_inventory.v3");
         let mut value =
             serde_json::to_value(snapshot("0000000000000001", "1.21.5")).expect("snapshot value");
         value["extra"] = serde_json::json!(true);
@@ -1169,9 +1169,23 @@ mod tests {
         duplicate.entries.push(duplicate.entries[0].clone());
         assert!(duplicate.validate().is_err());
 
-        let mut v1 = snapshot("0000000000000001", "1.21.5");
-        v1.schema = "axial.state.known_good_inventory.v1".to_string();
-        assert!(v1.validate().is_err());
+        let mut v2 = snapshot("0000000000000001", "1.21.5");
+        v2.schema = "axial.state.known_good_inventory.v2".to_string();
+        assert!(v2.validate().is_err());
+
+        for size in [serde_json::Value::Null, serde_json::json!(-1)] {
+            let mut invalid_size = serde_json::to_value(snapshot("0000000000000001", "1.21.5"))
+                .expect("snapshot value");
+            invalid_size["entries"][0]["integrity"]["size"] = size;
+            assert!(serde_json::from_value::<KnownGoodSnapshot>(invalid_size).is_err());
+        }
+        let mut missing_size =
+            serde_json::to_value(snapshot("0000000000000001", "1.21.5")).expect("snapshot value");
+        missing_size["entries"][0]["integrity"]
+            .as_object_mut()
+            .expect("integrity object")
+            .remove("size");
+        assert!(serde_json::from_value::<KnownGoodSnapshot>(missing_size).is_err());
 
         let mut structural =
             serde_json::to_value(snapshot("0000000000000001", "1.21.5")).expect("snapshot value");
@@ -1270,7 +1284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_corrupt_v1_and_stale_snapshots_are_replaced_without_warning_state() {
+    async fn missing_corrupt_v2_and_stale_snapshots_are_replaced_without_warning_state() {
         let (root, paths) = paths("replace");
         let backend = FileBackend::new(0);
         let store = store(&paths, backend.clone());
@@ -1289,15 +1303,15 @@ mod tests {
             .expect("reconcile corrupt snapshot");
         store.flush_for_test().await.expect("flush corrupt rebuild");
 
-        let mut v1 = current.clone();
-        v1.schema = "axial.state.known_good_inventory.v1".to_string();
-        fs::write(&path, serde_json::to_vec(&v1).expect("v1 bytes")).expect("v1 snapshot");
-        assert_eq!(read_snapshot(&path).expect("read v1 snapshot"), None);
+        let mut v2 = current.clone();
+        v2.schema = "axial.state.known_good_inventory.v2".to_string();
+        fs::write(&path, serde_json::to_vec(&v2).expect("v2 bytes")).expect("v2 snapshot");
+        assert_eq!(read_snapshot(&path).expect("read v2 snapshot"), None);
         store
             .reconcile_snapshot(current.clone())
             .await
-            .expect("reconcile v1 snapshot");
-        store.flush_for_test().await.expect("flush v1 rebuild");
+            .expect("reconcile v2 snapshot");
+        store.flush_for_test().await.expect("flush v2 rebuild");
 
         let stale = snapshot(&current.instance_id, "1.21.4");
         fs::write(&path, encode_snapshot(stale).expect("stale bytes")).expect("stale snapshot");
@@ -1580,7 +1594,7 @@ mod tests {
                 kind: KnownGoodArtifactKindSnapshot::ClientJar,
                 integrity: KnownGoodIntegritySnapshot::Sha1 {
                     digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                    size: Some(42),
+                    size: 42,
                 },
             }],
         }

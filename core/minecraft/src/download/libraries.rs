@@ -256,7 +256,7 @@ where
                         .ok_or(LibraryPlanError::InvalidChecksum)?,
                 )
                 .ok_or(LibraryPlanError::InvalidChecksum)?;
-                (Some(observed_size), sha1)
+                (observed_size, sha1)
             } else {
                 let download =
                     download_file_with_client_and_fact_sender_allowing_missing_checksum_with_authority(
@@ -269,7 +269,7 @@ where
                         descriptor_tx.as_ref(),
                     )
                     .await?;
-                (Some(download.report.bytes_written), download.sha1)
+                (download.report.bytes_written, download.sha1)
             };
             let authority = ExactLibraryDownloadProof::new(
                 job.relative_path.clone(),
@@ -291,7 +291,7 @@ where
     Ok(authorities.into_values().collect())
 }
 
-fn decode_sha1(value: &str) -> Option<[u8; 20]> {
+pub(crate) fn decode_sha1(value: &str) -> Option<[u8; 20]> {
     if !is_sha1_hex(value) {
         return None;
     }
@@ -705,7 +705,7 @@ mod exact_library_proof_tests {
             .expect("authority")
             .into_parts();
         assert_eq!(path.as_str(), relative);
-        assert_eq!(size, Some(body.len() as u64));
+        assert_eq!(size, body.len() as u64);
         let expected_digest: [u8; 20] = Sha1::digest(&body).into();
         assert_eq!(digest, expected_digest);
 
@@ -743,7 +743,7 @@ mod exact_library_proof_tests {
             .into_parts();
         assert_eq!(std::fs::read(destination).expect("promoted library"), fresh);
         assert_eq!(path.as_str(), relative);
-        assert_eq!(size, Some(fresh.len() as u64));
+        assert_eq!(size, fresh.len() as u64);
         let expected_digest: [u8; 20] = Sha1::digest(&fresh).into();
         assert_eq!(digest, expected_digest);
 
@@ -779,7 +779,7 @@ mod exact_library_proof_tests {
             .into_parts();
 
         assert_eq!(path.as_str(), relative);
-        assert_eq!(size, Some(fresh.len() as u64));
+        assert_eq!(size, fresh.len() as u64);
         assert_eq!(digest, <[u8; 20]>::from(Sha1::digest(&fresh)));
         assert_eq!(std::fs::read(destination).expect("promoted library"), fresh);
         let _ = std::fs::remove_dir_all(root);

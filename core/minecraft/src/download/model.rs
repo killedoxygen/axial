@@ -66,25 +66,21 @@ pub enum LibraryPlanError {
 
 pub(crate) struct ExactLibraryDownloadProof {
     path: ArtifactRelativePath,
-    size: Option<u64>,
+    size: u64,
     sha1: [u8; 20],
 }
 
 impl ExactLibraryDownloadProof {
-    pub(super) fn new(path: ArtifactRelativePath, size: Option<u64>, sha1: [u8; 20]) -> Self {
+    pub(super) fn new(path: ArtifactRelativePath, size: u64, sha1: [u8; 20]) -> Self {
         Self { path, size, sha1 }
     }
 
-    pub(crate) fn into_parts(self) -> (ArtifactRelativePath, Option<u64>, [u8; 20]) {
+    pub(crate) fn into_parts(self) -> (ArtifactRelativePath, u64, [u8; 20]) {
         (self.path, self.size, self.sha1)
     }
 
     #[cfg(test)]
-    pub(crate) fn new_for_test(
-        path: ArtifactRelativePath,
-        size: Option<u64>,
-        sha1: [u8; 20],
-    ) -> Self {
+    pub(crate) fn new_for_test(path: ArtifactRelativePath, size: u64, sha1: [u8; 20]) -> Self {
         Self::new(path, size, sha1)
     }
 }

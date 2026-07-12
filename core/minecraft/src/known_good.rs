@@ -75,14 +75,8 @@ pub enum KnownGoodArtifactKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KnownGoodIntegrity {
-    Sha1 {
-        digest: Sha1Digest,
-        size: Option<u64>,
-    },
-    ExactBytes {
-        digest: Sha1Digest,
-        size: u64,
-    },
+    Sha1 { digest: Sha1Digest, size: u64 },
+    ExactBytes { digest: Sha1Digest, size: u64 },
     Directory,
     LinkTarget(KnownGoodLinkTarget),
 }
@@ -136,15 +130,74 @@ pub(crate) struct VerifiedInstallerLibraryAuthority {
     entries: BTreeMap<ArtifactRelativePath, VerifiedInstallerLibraryFact>,
 }
 
+pub(crate) struct VerifiedVanillaLibraryAuthority {
+    libraries: Vec<Library>,
+    entries: BTreeMap<ArtifactRelativePath, VerifiedVanillaLibraryFact>,
+}
+
 pub(crate) struct VerifiedProfileLibraryAuthority {
     libraries: Vec<Library>,
     entries: BTreeMap<ArtifactRelativePath, VerifiedProfileLibraryFact>,
 }
 
 struct VerifiedProfileLibraryFact {
-    size: Option<u64>,
+    size: u64,
     sha1: [u8; 20],
     is_native: bool,
+}
+
+struct VerifiedVanillaLibraryFact {
+    size: u64,
+    sha1: [u8; 20],
+    is_native: bool,
+}
+
+pub(crate) fn seal_verified_vanilla_library_authority(
+    libraries: &[Library],
+    environment: &Environment,
+    downloads: Vec<ExactLibraryDownloadProof>,
+) -> Result<VerifiedVanillaLibraryAuthority, KnownGoodInventoryError> {
+    let plans = library_artifact_plans_for(libraries, environment)
+        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+    let expected = plans
+        .into_iter()
+        .map(|plan| (plan.relative_path.clone(), plan))
+        .collect::<BTreeMap<_, _>>();
+    let mut entries = BTreeMap::new();
+    for download in downloads {
+        let (path, size, sha1) = download.into_parts();
+        let plan = expected
+            .get(&path)
+            .ok_or(KnownGoodInventoryError::VanillaLibraryProofMismatch)?;
+        let expected_sha1 = plan
+            .expected
+            .sha1
+            .as_deref()
+            .ok_or(KnownGoodInventoryError::MissingChecksum)?;
+        if plan.expected.size.is_some_and(|expected| expected != size)
+            || !Sha1Digest::from_metadata(expected_sha1)
+                .is_ok_and(|expected| expected == sha1_array_digest(&sha1))
+            || entries
+                .insert(
+                    path,
+                    VerifiedVanillaLibraryFact {
+                        size,
+                        sha1,
+                        is_native: plan.is_native,
+                    },
+                )
+                .is_some()
+        {
+            return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
+        }
+    }
+    if entries.len() != expected.len() {
+        return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
+    }
+    Ok(VerifiedVanillaLibraryAuthority {
+        libraries: libraries.to_vec(),
+        entries,
+    })
 }
 
 pub(crate) fn seal_verified_profile_library_authority(
@@ -186,10 +239,7 @@ pub(crate) fn seal_verified_profile_library_authority(
             .get(path)
             .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
         if proof.is_native != plan.is_native
-            || plan
-                .expected
-                .size
-                .is_some_and(|size| proof.size != Some(size))
+            || plan.expected.size.is_some_and(|size| proof.size != size)
             || plan.expected.sha1.as_deref().is_some_and(|sha1| {
                 !Sha1Digest::from_metadata(sha1)
                     .is_ok_and(|expected| expected == sha1_array_digest(&proof.sha1))
@@ -222,7 +272,7 @@ pub(crate) fn seal_verified_profile_library_authority(
                 return true;
             };
             plan.is_native != proof.is_native
-                || plan.expected.size != proof.size
+                || plan.expected.size != Some(proof.size)
                 || plan.expected.sha1.as_deref().is_none_or(|sha1| {
                     !Sha1Digest::from_metadata(sha1)
                         .is_ok_and(|digest| digest == sha1_array_digest(&proof.sha1))
@@ -243,10 +293,7 @@ fn author_profile_library_integrity(
     plan: &LibraryArtifactPlan,
     proof: &VerifiedProfileLibraryFact,
 ) -> Result<(), KnownGoodInventoryError> {
-    let size = proof
-        .size
-        .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
-    let size = i64::try_from(size).map_err(|_| KnownGoodInventoryError::InputTooLarge)?;
+    let size = i64::try_from(proof.size).map_err(|_| KnownGoodInventoryError::InputTooLarge)?;
     let digest = sha1_array_digest(&proof.sha1).as_str().to_string();
     if !plan.is_native {
         library.sha1.clone_from(&digest);
@@ -285,7 +332,7 @@ impl VerifiedProfileLibraryAuthority {
 }
 
 struct VerifiedInstallerLibraryFact {
-    size: Option<u64>,
+    size: u64,
     sha1: [u8; 20],
     terminal_bytes: Option<Arc<[u8]>>,
 }
@@ -324,7 +371,7 @@ pub(crate) fn seal_verified_installer_library_authority(
             &mut entries,
             artifact.relative_path().clone(),
             VerifiedInstallerLibraryFact {
-                size: Some(artifact.bytes().len() as u64),
+                size: artifact.bytes().len() as u64,
                 sha1: Sha1::digest(artifact.bytes()).into(),
                 terminal_bytes: None,
             },
@@ -340,7 +387,7 @@ pub(crate) fn seal_verified_installer_library_authority(
             &mut entries,
             path,
             VerifiedInstallerLibraryFact {
-                size: Some(size),
+                size,
                 sha1,
                 terminal_bytes: Some(bytes),
             },
@@ -354,10 +401,7 @@ pub(crate) fn seal_verified_installer_library_authority(
         let fact = entries
             .get(&path)
             .ok_or(KnownGoodInventoryError::InstallerLibraryProofMismatch)?;
-        if plan
-            .expected
-            .size
-            .is_some_and(|size| fact.size != Some(size))
+        if plan.expected.size.is_some_and(|size| fact.size != size)
             || plan.expected.sha1.as_deref().is_some_and(|sha1| {
                 !Sha1Digest::from_metadata(sha1)
                     .is_ok_and(|expected| expected == sha1_array_digest(&fact.sha1))
@@ -416,9 +460,29 @@ impl KnownGoodInstallReceipt {
         effective_version: VersionJson,
         environment: Environment,
     ) -> Self {
+        let version_id = KnownGoodId::new(&effective_version.id).expect("safe test version id");
+        let client = effective_version
+            .downloads
+            .client
+            .as_ref()
+            .expect("test authenticated version client");
+        let mut inventory = InventoryBuilder::default();
+        inventory
+            .insert(KnownGoodEntry {
+                root: KnownGoodRoot::Versions,
+                path: KnownGoodRelativePath::new(&format!("{0}/{0}.jar", version_id.as_str()))
+                    .expect("safe test client path"),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: KnownGoodIntegrity::Sha1 {
+                    digest: Sha1Digest::from_metadata(&client.sha1)
+                        .expect("test authenticated client digest"),
+                    size: u64::try_from(client.size).expect("test authenticated client size"),
+                },
+            })
+            .expect("unique test client entry");
         Self {
-            version_id: KnownGoodId::new(&effective_version.id).expect("safe test version id"),
-            inventory: InventoryBuilder::default().finish(),
+            version_id,
+            inventory: inventory.finish(),
             effective_version,
             environment,
         }
@@ -434,8 +498,28 @@ impl KnownGoodInstallReceipt {
             .as_ref()
             .ok_or(KnownGoodInventoryError::MissingClient)?;
         let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
-        expected_integrity(&expected)?;
+        expected
+            .sha1
+            .as_deref()
+            .ok_or(KnownGoodInventoryError::MissingChecksum)
+            .and_then(Sha1Digest::from_metadata)?;
         Ok(expected)
+    }
+
+    fn authenticated_client_known_good_integrity(
+        &self,
+    ) -> Result<KnownGoodIntegrity, KnownGoodInventoryError> {
+        let path = format!("{0}/{0}.jar", self.version_id.as_str());
+        self.inventory
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.root == KnownGoodRoot::Versions
+                    && entry.path.as_str() == path
+                    && entry.kind == KnownGoodArtifactKind::ClientJar
+            })
+            .map(|entry| entry.integrity.clone())
+            .ok_or(KnownGoodInventoryError::ClientIntegrity)
     }
 
     pub(crate) fn authenticate_client_bytes(
@@ -508,13 +592,16 @@ impl KnownGoodInstallReceipt {
             kind: KnownGoodArtifactKind::ClientJar,
             integrity: KnownGoodIntegrity::Sha1 {
                 digest: child_digest,
-                size: Some(child_client_bytes.len() as u64),
+                size: child_client_bytes.len() as u64,
             },
         })?;
 
-        let libraries = library_artifact_plans_for(&resolved_version.libraries, &base.environment)
-            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-        add_library_plans(&mut builder, libraries)?;
+        add_exact_inherited_libraries(
+            &mut builder,
+            &resolved_version.libraries,
+            &base.environment,
+            &base.inventory,
+        )?;
 
         let expected_metadata = installed_loader_metadata_bytes(record)
             .map_err(|_| KnownGoodInventoryError::MetadataSerialization)?;
@@ -599,7 +686,7 @@ impl KnownGoodInstallReceipt {
             root: KnownGoodRoot::Versions,
             path: KnownGoodRelativePath::new(&format!("{0}/{0}.jar", version_id.as_str()))?,
             kind: KnownGoodArtifactKind::ClientJar,
-            integrity: expected_integrity(&base.authenticated_client_integrity()?)?,
+            integrity: base.authenticated_client_known_good_integrity()?,
         })?;
 
         if resolved_version.libraries.len() > MAX_KNOWN_GOOD_ENTRIES {
@@ -626,7 +713,7 @@ impl KnownGoodInstallReceipt {
             let integrity = if let Some(proof) = library_authority.entries.get(&plan.relative_path)
             {
                 if proof.is_native != plan.is_native
-                    || plan.expected.size != proof.size
+                    || plan.expected.size != Some(proof.size)
                     || plan.expected.sha1.as_deref().is_none_or(|sha1| {
                         !Sha1Digest::from_metadata(sha1)
                             .is_ok_and(|digest| digest == sha1_array_digest(&proof.sha1))
@@ -640,19 +727,7 @@ impl KnownGoodInstallReceipt {
                     size: proof.size,
                 }
             } else {
-                let expected = expected_integrity(&plan.expected)?;
-                base.inventory
-                    .entries
-                    .iter()
-                    .find(|entry| {
-                        entry.root == KnownGoodRoot::Libraries
-                            && entry.path == path
-                            && entry.kind == kind
-                            && entry.integrity == expected
-                    })
-                    .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?
-                    .integrity
-                    .clone()
+                matching_base_library_integrity(base, &plan, &path, kind)?
             };
             builder.insert(KnownGoodEntry {
                 root: KnownGoodRoot::Libraries,
@@ -791,7 +866,7 @@ impl KnownGoodInstallReceipt {
             kind: KnownGoodArtifactKind::ClientJar,
             integrity: KnownGoodIntegrity::Sha1 {
                 digest: child_digest,
-                size: Some(child_client_bytes.len() as u64),
+                size: child_client_bytes.len() as u64,
             },
         })?;
 
@@ -808,10 +883,7 @@ impl KnownGoodInstallReceipt {
                 KnownGoodArtifactKind::Library
             };
             let integrity = if let Some(proof) = proofs.get(&plan.relative_path) {
-                if plan
-                    .expected
-                    .size
-                    .is_some_and(|size| proof.size != Some(size))
+                if plan.expected.size.is_some_and(|size| proof.size != size)
                     || plan.expected.sha1.as_deref().is_some_and(|sha1| {
                         !Sha1Digest::from_metadata(sha1)
                             .is_ok_and(|expected| expected == sha1_array_digest(&proof.sha1))
@@ -824,17 +896,8 @@ impl KnownGoodInstallReceipt {
                     size: proof.size,
                 }
             } else {
-                let expected = expected_integrity(&plan.expected)?;
-                let base_entry = base.inventory.entries.iter().find(|entry| {
-                    entry.root == KnownGoodRoot::Libraries
-                        && entry.path.as_str() == path.as_str()
-                        && entry.kind == kind
-                        && entry.integrity == expected
-                });
-                base_entry
-                    .ok_or(KnownGoodInventoryError::InstallerLibraryProofMismatch)?
-                    .integrity
-                    .clone()
+                matching_base_library_integrity(&base, &plan, &path, kind)
+                    .map_err(|_| KnownGoodInventoryError::InstallerLibraryProofMismatch)?
             };
             builder.insert(KnownGoodEntry {
                 root: KnownGoodRoot::Libraries,
@@ -857,10 +920,7 @@ impl KnownGoodInstallReceipt {
             let proof = proofs
                 .get(&plan.relative_path)
                 .ok_or(KnownGoodInventoryError::InstallerLibraryProofMismatch)?;
-            if plan
-                .expected
-                .size
-                .is_some_and(|size| proof.size != Some(size))
+            if plan.expected.size.is_some_and(|size| proof.size != size)
                 || plan.expected.sha1.as_deref().is_some_and(|sha1| {
                     !Sha1Digest::from_metadata(sha1)
                         .is_ok_and(|expected| expected == sha1_array_digest(&proof.sha1))
@@ -998,6 +1058,10 @@ pub struct KnownGoodInstallShape<'a> {
 
 pub struct KnownGoodInventoryInput<'a> {
     pub(crate) resolved_version: &'a VersionJson,
+    pub(crate) version_metadata_size: u64,
+    pub(crate) client_size: u64,
+    pub(crate) libraries: &'a VerifiedVanillaLibraryAuthority,
+    pub(crate) log_config_size: Option<u64>,
     pub(crate) asset_index_bytes: Option<&'a [u8]>,
     pub(crate) runtime: Option<RuntimeInventoryInput<'a>>,
     pub(crate) shape: KnownGoodInstallShape<'a>,
@@ -1009,6 +1073,8 @@ pub enum KnownGoodInventoryError {
     UnsafePath,
     InvalidSha1,
     MissingChecksum,
+    MissingSize,
+    SizeMismatch,
     MissingAssetIndex,
     UnexpectedAssetIndex,
     AssetIndexIntegrity,
@@ -1027,6 +1093,8 @@ pub enum KnownGoodInventoryError {
     MissingClient,
     InputTooLarge,
     InvalidLibraryPlan,
+    VanillaArtifactProofMismatch,
+    VanillaLibraryProofMismatch,
     ProfileLibraryProofMismatch,
     InstallerLibraryProofMismatch,
     ConflictingEntry,
@@ -1045,7 +1113,11 @@ pub fn derive_known_good_inventory(
         root: KnownGoodRoot::Versions,
         path: KnownGoodRelativePath::new(&format!("{version_base}/{version_base}.json"))?,
         kind: KnownGoodArtifactKind::VersionMetadata,
-        integrity: version_metadata_integrity(input.shape, input.resolved_version)?,
+        integrity: version_metadata_integrity(
+            input.shape,
+            input.resolved_version,
+            input.version_metadata_size,
+        )?,
     })?;
 
     let client = input
@@ -1058,16 +1130,21 @@ pub fn derive_known_good_inventory(
         root: KnownGoodRoot::Versions,
         path: KnownGoodRelativePath::new(&format!("{version_base}/{version_base}.jar"))?,
         kind: KnownGoodArtifactKind::ClientJar,
-        integrity: expected_integrity(&ExpectedIntegrity::from_mojang(client.size, &client.sha1))?,
+        integrity: expected_integrity_with_observed_size(
+            &ExpectedIntegrity::from_mojang(client.size, &client.sha1),
+            input.client_size,
+        )?,
     })?;
 
     if input.resolved_version.libraries.len() > MAX_KNOWN_GOOD_ENTRIES {
         return Err(KnownGoodInventoryError::InputTooLarge);
     }
-    let libraries =
-        library_artifact_plans_for(&input.resolved_version.libraries, input.environment)
-            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-    add_library_plans(&mut builder, libraries)?;
+    add_verified_vanilla_libraries(
+        &mut builder,
+        input.resolved_version,
+        input.environment,
+        input.libraries,
+    )?;
 
     if let Some(logging) = input
         .resolved_version
@@ -1076,15 +1153,20 @@ pub fn derive_known_good_inventory(
         .and_then(|logging| logging.client.as_ref())
         && !logging.file.url.trim().is_empty()
     {
+        let observed_size = input
+            .log_config_size
+            .ok_or(KnownGoodInventoryError::MissingSize)?;
         builder.insert(KnownGoodEntry {
             root: KnownGoodRoot::Assets,
             path: KnownGoodRelativePath::new(&format!("log_configs/{}", logging.file.id))?,
             kind: KnownGoodArtifactKind::LogConfig,
-            integrity: expected_integrity(&ExpectedIntegrity::from_mojang(
-                logging.file.size,
-                &logging.file.sha1,
-            ))?,
+            integrity: expected_integrity_with_observed_size(
+                &ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1),
+                observed_size,
+            )?,
         })?;
+    } else if input.log_config_size.is_some() {
+        return Err(KnownGoodInventoryError::VanillaArtifactProofMismatch);
     }
 
     add_asset_index(
@@ -1106,32 +1188,126 @@ pub fn derive_known_good_inventory(
 fn version_metadata_integrity(
     shape: KnownGoodInstallShape<'_>,
     version: &VersionJson,
+    observed_size: u64,
 ) -> Result<KnownGoodIntegrity, KnownGoodInventoryError> {
     if shape.version_manifest.id != version.id {
         return Err(KnownGoodInventoryError::VersionIdentityMismatch);
     }
-    expected_integrity(&ExpectedIntegrity::from_sha1(&shape.version_manifest.sha1))
+    expected_integrity_with_observed_size(
+        &ExpectedIntegrity::from_sha1(&shape.version_manifest.sha1),
+        observed_size,
+    )
 }
 
-fn add_library_plans(
+fn add_verified_vanilla_libraries(
     builder: &mut InventoryBuilder,
-    plans: Vec<LibraryArtifactPlan>,
+    version: &VersionJson,
+    environment: &Environment,
+    authority: &VerifiedVanillaLibraryAuthority,
 ) -> Result<(), KnownGoodInventoryError> {
+    let plans = library_artifact_plans_for(&version.libraries, environment)
+        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+    if version.libraries != authority.libraries {
+        return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
+    }
+    if plans.len() != authority.entries.len() {
+        return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
+    }
     for plan in plans {
-        let path = KnownGoodRelativePath::new(plan.relative_path.as_str())?;
-        let integrity = expected_integrity(&plan.expected)?;
+        let proof = authority
+            .entries
+            .get(&plan.relative_path)
+            .ok_or(KnownGoodInventoryError::VanillaLibraryProofMismatch)?;
+        if proof.is_native != plan.is_native
+            || plan.expected.size.is_some_and(|size| size != proof.size)
+            || plan.expected.sha1.as_deref().is_none_or(|sha1| {
+                !Sha1Digest::from_metadata(sha1)
+                    .is_ok_and(|digest| digest == sha1_array_digest(&proof.sha1))
+            })
+        {
+            return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
+        }
         builder.insert(KnownGoodEntry {
             root: KnownGoodRoot::Libraries,
-            path,
+            path: KnownGoodRelativePath::new(plan.relative_path.as_str())?,
             kind: if plan.is_native {
                 KnownGoodArtifactKind::NativeLibrary
             } else {
                 KnownGoodArtifactKind::Library
             },
-            integrity,
+            integrity: KnownGoodIntegrity::Sha1 {
+                digest: sha1_array_digest(&proof.sha1),
+                size: proof.size,
+            },
         })?;
     }
     Ok(())
+}
+
+fn add_exact_inherited_libraries(
+    builder: &mut InventoryBuilder,
+    libraries: &[Library],
+    environment: &Environment,
+    base: &KnownGoodInventory,
+) -> Result<(), KnownGoodInventoryError> {
+    let plans = library_artifact_plans_for(libraries, environment)
+        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+    for plan in plans {
+        let path = KnownGoodRelativePath::new(plan.relative_path.as_str())?;
+        let kind = if plan.is_native {
+            KnownGoodArtifactKind::NativeLibrary
+        } else {
+            KnownGoodArtifactKind::Library
+        };
+        let entry = base
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.root == KnownGoodRoot::Libraries && entry.path == path && entry.kind == kind
+            })
+            .ok_or(KnownGoodInventoryError::VanillaLibraryProofMismatch)?;
+        let KnownGoodIntegrity::Sha1 { digest, size } = &entry.integrity else {
+            return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
+        };
+        if plan.expected.size.is_some_and(|expected| expected != *size)
+            || plan.expected.sha1.as_deref().is_some_and(|expected| {
+                !Sha1Digest::from_metadata(expected).is_ok_and(|expected| expected == *digest)
+            })
+        {
+            return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
+        }
+        builder.insert(entry.clone())?;
+    }
+    Ok(())
+}
+
+fn matching_base_library_integrity(
+    base: &KnownGoodInstallReceipt,
+    plan: &LibraryArtifactPlan,
+    path: &KnownGoodRelativePath,
+    kind: KnownGoodArtifactKind,
+) -> Result<KnownGoodIntegrity, KnownGoodInventoryError> {
+    let expected_digest = plan
+        .expected
+        .sha1
+        .as_deref()
+        .ok_or(KnownGoodInventoryError::MissingChecksum)
+        .and_then(Sha1Digest::from_metadata)?;
+    let entry = base
+        .inventory
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.root == KnownGoodRoot::Libraries && entry.path == *path && entry.kind == kind
+        })
+        .ok_or(KnownGoodInventoryError::VanillaLibraryProofMismatch)?;
+    let KnownGoodIntegrity::Sha1 { digest, size } = &entry.integrity else {
+        return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
+    };
+    if plan.expected.size.is_some_and(|expected| expected != *size) || expected_digest != *digest {
+        return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
+    }
+    Ok(entry.integrity.clone())
 }
 
 fn add_asset_index(
@@ -1158,14 +1334,15 @@ fn add_asset_index(
         root: KnownGoodRoot::Assets,
         path: KnownGoodRelativePath::new(&format!("indexes/{}.json", index_id.as_str()))?,
         kind: KnownGoodArtifactKind::AssetIndex,
-        integrity: expected_integrity(&expected)?,
+        integrity: expected_integrity_with_observed_size(&expected, bytes.len() as u64)?,
     })?;
 
     let index = parse_asset_index(bytes).map_err(|_| KnownGoodInventoryError::AssetIndexParse)?;
     for object in index.objects.values() {
         let digest = Sha1Digest::from_metadata(&object.hash)
             .map_err(|_| KnownGoodInventoryError::InvalidAssetObject)?;
-        let size = u64::try_from(object.size).ok().filter(|size| *size > 0);
+        let size =
+            u64::try_from(object.size).map_err(|_| KnownGoodInventoryError::InvalidAssetObject)?;
         builder.insert(KnownGoodEntry {
             root: KnownGoodRoot::Assets,
             path: KnownGoodRelativePath::new(&format!(
@@ -1290,13 +1467,25 @@ fn validate_runtime_path_tree(entries: &[KnownGoodEntry]) -> Result<(), KnownGoo
 fn expected_integrity(
     expected: &ExpectedIntegrity,
 ) -> Result<KnownGoodIntegrity, KnownGoodInventoryError> {
-    match expected.sha1.as_deref() {
-        Some(value) => Ok(KnownGoodIntegrity::Sha1 {
-            digest: Sha1Digest::from_metadata(value)?,
-            size: expected.size,
-        }),
-        None => Err(KnownGoodInventoryError::MissingChecksum),
+    let size = expected.size.ok_or(KnownGoodInventoryError::MissingSize)?;
+    expected_integrity_with_observed_size(expected, size)
+}
+
+fn expected_integrity_with_observed_size(
+    expected: &ExpectedIntegrity,
+    observed_size: u64,
+) -> Result<KnownGoodIntegrity, KnownGoodInventoryError> {
+    if expected.size.is_some_and(|size| size != observed_size) {
+        return Err(KnownGoodInventoryError::SizeMismatch);
     }
+    let value = expected
+        .sha1
+        .as_deref()
+        .ok_or(KnownGoodInventoryError::MissingChecksum)?;
+    Ok(KnownGoodIntegrity::Sha1 {
+        digest: Sha1Digest::from_metadata(value)?,
+        size: observed_size,
+    })
 }
 
 fn exact_bytes_integrity(bytes: &[u8]) -> KnownGoodIntegrity {
@@ -1765,7 +1954,7 @@ mod tests {
             KnownGoodArtifactKind::Library,
             &KnownGoodIntegrity::Sha1 {
                 digest: sha1_digest(&embedded_bytes),
-                size: Some(embedded_bytes.len() as u64),
+                size: embedded_bytes.len() as u64,
             },
         );
         assert_entry(
@@ -1775,7 +1964,7 @@ mod tests {
             KnownGoodArtifactKind::Library,
             &KnownGoodIntegrity::Sha1 {
                 digest: sha1_digest(&processor_bytes),
-                size: Some(processor_bytes.len() as u64),
+                size: processor_bytes.len() as u64,
             },
         );
         assert_entry(
@@ -1785,7 +1974,7 @@ mod tests {
             KnownGoodArtifactKind::Library,
             &KnownGoodIntegrity::Sha1 {
                 digest: sha1_digest(&terminal_bytes),
-                size: Some(terminal_bytes.len() as u64),
+                size: terminal_bytes.len() as u64,
             },
         );
     }
@@ -1850,7 +2039,7 @@ mod tests {
         let proof = || {
             ExactLibraryDownloadProof::new_for_test(
                 ArtifactRelativePath::new(path).expect("profile path"),
-                Some(23),
+                23,
                 [0xbb; 20],
             )
         };
@@ -1876,7 +2065,7 @@ mod tests {
                 vec![ExactLibraryDownloadProof::new_for_test(
                     ArtifactRelativePath::new("org/example/extra/1/extra-1.jar")
                         .expect("extra path"),
-                    Some(23),
+                    23,
                     [0xbb; 20],
                 )],
             )
@@ -1904,7 +2093,7 @@ mod tests {
                 std::slice::from_ref(&declared),
                 vec![ExactLibraryDownloadProof::new_for_test(
                     ArtifactRelativePath::new(path).expect("profile path"),
-                    Some(24),
+                    24,
                     [0xbb; 20],
                 )],
             )
@@ -1917,7 +2106,7 @@ mod tests {
                 std::slice::from_ref(&declared),
                 vec![ExactLibraryDownloadProof::new_for_test(
                     ArtifactRelativePath::new(path).expect("profile path"),
-                    Some(23),
+                    23,
                     [0xaa; 20],
                 )],
             )
@@ -1983,12 +2172,12 @@ mod tests {
             vec![
                 ExactLibraryDownloadProof::new_for_test(
                     ArtifactRelativePath::new(primary_path).expect("primary path"),
-                    Some(31),
+                    31,
                     [0xaa; 20],
                 ),
                 ExactLibraryDownloadProof::new_for_test(
                     ArtifactRelativePath::new(&native_path).expect("native path"),
-                    Some(47),
+                    47,
                     [0xcc; 20],
                 ),
             ],
@@ -2035,7 +2224,7 @@ mod tests {
                 &[library],
                 vec![ExactLibraryDownloadProof::new_for_test(
                     ArtifactRelativePath::new(&path).expect("profile path"),
-                    Some(53),
+                    53,
                     [0xcc; 20],
                 )],
             )
@@ -2058,7 +2247,7 @@ mod tests {
             base_version.libraries.clear();
             let base = KnownGoodInstallReceipt {
                 version_id: KnownGoodId::new(&record.minecraft_version).expect("base id"),
-                inventory: InventoryBuilder::default().finish(),
+                inventory: test_base_client_inventory(&base_version),
                 effective_version: base_version.clone(),
                 environment: fixture.environment.clone(),
             };
@@ -2094,7 +2283,7 @@ mod tests {
                     && entry.integrity()
                         == &KnownGoodIntegrity::Sha1 {
                             digest: Sha1Digest::from_metadata(SHA_C).expect("digest"),
-                            size: Some(53),
+                            size: 53,
                         }
             }));
         }
@@ -2114,7 +2303,7 @@ mod tests {
             vec![ExactLibraryDownloadProof::new_for_test(
                 ArtifactRelativePath::new("org/example/profile-proof/1/profile-proof-1.jar")
                     .expect("profile path"),
-                Some(17),
+                17,
                 [0xaa; 20],
             )],
         )
@@ -2130,7 +2319,7 @@ mod tests {
         }];
         let base = KnownGoodInstallReceipt {
             version_id: KnownGoodId::new(&record.minecraft_version).expect("base id"),
-            inventory: InventoryBuilder::default().finish(),
+            inventory: test_base_client_inventory(&base_version),
             effective_version: base_version.clone(),
             environment: fixture.environment,
         };
@@ -2170,7 +2359,7 @@ mod tests {
             std::slice::from_ref(&profile_library),
             vec![ExactLibraryDownloadProof::new_for_test(
                 ArtifactRelativePath::new("org/ow2/asm/asm/9.9/asm-9.9.jar").expect("profile path"),
-                Some(12),
+                12,
                 [0xaa; 20],
             )],
         )
@@ -2191,7 +2380,7 @@ mod tests {
         )];
         let base = KnownGoodInstallReceipt {
             version_id: KnownGoodId::new(&record.minecraft_version).expect("base id"),
-            inventory: InventoryBuilder::default().finish(),
+            inventory: test_base_client_inventory(&base_version),
             effective_version: base_version,
             environment: fixture.environment.clone(),
         };
@@ -2211,10 +2400,7 @@ mod tests {
 
         assert!(inventory.entries().iter().any(|entry| {
             entry.path().as_str() == "org/ow2/asm/asm/9.9/asm-9.9.jar"
-                && matches!(
-                    entry.integrity(),
-                    KnownGoodIntegrity::Sha1 { size: Some(12), .. }
-                )
+                && matches!(entry.integrity(), KnownGoodIntegrity::Sha1 { size: 12, .. })
         }));
         assert!(
             !inventory
@@ -2290,7 +2476,7 @@ mod tests {
             KnownGoodArtifactKind::ClientJar,
             &KnownGoodIntegrity::Sha1 {
                 digest: sha1_digest(child_client_bytes),
-                size: Some(child_client_bytes.len() as u64),
+                size: child_client_bytes.len() as u64,
             },
         );
         assert_entry(
@@ -2312,7 +2498,7 @@ mod tests {
             KnownGoodArtifactKind::Library,
             &KnownGoodIntegrity::Sha1 {
                 digest: Sha1Digest::from_metadata(SHA_A).expect("library digest"),
-                size: Some(10),
+                size: 10,
             },
         );
         assert!(!inventory.entries().iter().any(|entry| {
@@ -2354,7 +2540,7 @@ mod tests {
             KnownGoodArtifactKind::VersionMetadata,
             &KnownGoodIntegrity::Sha1 {
                 digest: Sha1Digest::from_metadata(SHA_C).unwrap(),
-                size: None,
+                size: fixture.version_metadata_size,
             },
         );
         assert_entry(
@@ -2364,7 +2550,7 @@ mod tests {
             KnownGoodArtifactKind::ClientJar,
             &KnownGoodIntegrity::Sha1 {
                 digest: Sha1Digest::from_metadata(SHA_A).unwrap(),
-                size: Some(40),
+                size: 40,
             },
         );
         assert_entry(
@@ -2374,7 +2560,7 @@ mod tests {
             KnownGoodArtifactKind::Library,
             &KnownGoodIntegrity::Sha1 {
                 digest: Sha1Digest::from_metadata(SHA_A).unwrap(),
-                size: Some(10),
+                size: 10,
             },
         );
         let asset_index = entry(
@@ -2387,7 +2573,7 @@ mod tests {
             asset_index.integrity(),
             &KnownGoodIntegrity::Sha1 {
                 digest: sha1_digest(&fixture.asset_index),
-                size: Some(fixture.asset_index.len() as u64),
+                size: fixture.asset_index.len() as u64,
             }
         );
         assert_entry(
@@ -2397,7 +2583,7 @@ mod tests {
             KnownGoodArtifactKind::AssetObject,
             &KnownGoodIntegrity::Sha1 {
                 digest: Sha1Digest::from_metadata(SHA_A).unwrap(),
-                size: Some(5),
+                size: 5,
             },
         );
         assert_entry(
@@ -2407,12 +2593,176 @@ mod tests {
             KnownGoodArtifactKind::LogConfig,
             &KnownGoodIntegrity::Sha1 {
                 digest: Sha1Digest::from_metadata(SHA_C).unwrap(),
-                size: Some(15),
+                size: 15,
             },
         );
         assert_runtime_entries(&inventory);
         assert!(!has_kind(&inventory, KnownGoodArtifactKind::LoaderMetadata));
         assert_sorted_unique(&inventory);
+    }
+
+    #[test]
+    fn vanilla_library_without_declared_size_uses_same_hash_observation() {
+        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let library = fixture
+            .version
+            .libraries
+            .first_mut()
+            .expect("fixture library");
+        library.size = 0;
+        library
+            .downloads
+            .as_mut()
+            .and_then(|downloads| downloads.artifact.as_mut())
+            .expect("fixture artifact")
+            .size = 0;
+        fixture.library_authority = seal_verified_vanilla_library_authority(
+            &fixture.version.libraries,
+            &fixture.environment,
+            vec![ExactLibraryDownloadProof::new_for_test(
+                ArtifactRelativePath::new("com/mojang/strict/1.0/strict-1.0.jar")
+                    .expect("library path"),
+                10,
+                [0xaa; 20],
+            )],
+        )
+        .expect("observed library authority");
+
+        let inventory = derive_known_good_inventory(fixture.input()).expect("inventory");
+        assert_entry(
+            &inventory,
+            &KnownGoodRoot::Libraries,
+            "com/mojang/strict/1.0/strict-1.0.jar",
+            KnownGoodArtifactKind::Library,
+            &KnownGoodIntegrity::Sha1 {
+                digest: Sha1Digest::from_metadata(SHA_A).expect("digest"),
+                size: 10,
+            },
+        );
+    }
+
+    #[test]
+    fn vanilla_declared_and_observed_size_drift_fails_closed() {
+        let fixture = fixture(FixtureShape::Vanilla, false);
+        let Err(error) = seal_verified_vanilla_library_authority(
+            &fixture.version.libraries,
+            &fixture.environment,
+            vec![ExactLibraryDownloadProof::new_for_test(
+                ArtifactRelativePath::new("com/mojang/strict/1.0/strict-1.0.jar")
+                    .expect("library path"),
+                11,
+                [0xaa; 20],
+            )],
+        ) else {
+            panic!("declared size drift must fail");
+        };
+        assert_eq!(error, KnownGoodInventoryError::VanillaLibraryProofMismatch);
+
+        let mut input = fixture.input();
+        input.client_size = 39;
+        assert_eq!(
+            derive_known_good_inventory(input),
+            Err(KnownGoodInventoryError::SizeMismatch)
+        );
+    }
+
+    #[test]
+    fn vanilla_authority_rejects_same_path_contract_and_rule_shadowing() {
+        let fixture = fixture(FixtureShape::Vanilla, false);
+        let mut variants = Vec::new();
+
+        let mut digest = fixture.version.clone();
+        digest.libraries[0].sha1 = SHA_B.to_string();
+        digest.libraries[0]
+            .downloads
+            .as_mut()
+            .and_then(|downloads| downloads.artifact.as_mut())
+            .expect("artifact")
+            .sha1 = SHA_B.to_string();
+        variants.push(digest);
+
+        let mut size = fixture.version.clone();
+        size.libraries[0].size = 11;
+        size.libraries[0]
+            .downloads
+            .as_mut()
+            .and_then(|downloads| downloads.artifact.as_mut())
+            .expect("artifact")
+            .size = 11;
+        variants.push(size);
+
+        let mut native = fixture.version.clone();
+        let path = native.libraries[0]
+            .downloads
+            .as_ref()
+            .and_then(|downloads| downloads.artifact.as_ref())
+            .expect("artifact")
+            .path
+            .clone();
+        native.libraries[0].downloads = Some(LibraryDownload {
+            artifact: None,
+            classifiers: HashMap::from([(
+                "natives-linux".to_string(),
+                LibraryArtifact {
+                    path,
+                    sha1: SHA_A.to_string(),
+                    size: 10,
+                    url: "https://example.invalid/library".to_string(),
+                },
+            )]),
+        });
+        native.libraries[0]
+            .natives
+            .insert("linux".to_string(), "natives-linux".to_string());
+        variants.push(native);
+
+        let mut rules = fixture.version.clone();
+        rules.libraries[0].rules = vec![Rule {
+            action: "allow".to_string(),
+            os: None,
+            features: None,
+        }];
+        variants.push(rules);
+
+        for version in variants {
+            let mut input = fixture.input();
+            input.resolved_version = &version;
+            assert_eq!(
+                derive_known_good_inventory(input),
+                Err(KnownGoodInventoryError::VanillaLibraryProofMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn vanilla_authority_rejects_missing_extra_and_duplicate_proofs() {
+        let fixture = fixture(FixtureShape::Vanilla, false);
+        let proof = || {
+            ExactLibraryDownloadProof::new_for_test(
+                ArtifactRelativePath::new("com/mojang/strict/1.0/strict-1.0.jar")
+                    .expect("library path"),
+                10,
+                [0xaa; 20],
+            )
+        };
+        let extra = || {
+            ExactLibraryDownloadProof::new_for_test(
+                ArtifactRelativePath::new("com/mojang/extra/1.0/extra-1.0.jar")
+                    .expect("extra path"),
+                10,
+                [0xaa; 20],
+            )
+        };
+        for proofs in [vec![], vec![proof(), extra()], vec![proof(), proof()]] {
+            assert!(
+                seal_verified_vanilla_library_authority(
+                    &fixture.version.libraries,
+                    &fixture.environment,
+                    proofs,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -2463,6 +2813,10 @@ mod tests {
         left.version.libraries.push(extra.clone());
         right.version.libraries.push(extra);
         right.version.libraries.reverse();
+        left.library_authority = fixture_library_authority(&left.version, &left.environment)
+            .expect("left library authority");
+        right.library_authority = fixture_library_authority(&right.version, &right.environment)
+            .expect("right library authority");
         let left = derive_known_good_inventory(left.input()).unwrap();
         let right = derive_known_good_inventory(right.input()).unwrap();
 
@@ -2481,7 +2835,7 @@ mod tests {
                 kind: KnownGoodArtifactKind::Library,
                 integrity: KnownGoodIntegrity::Sha1 {
                     digest: Sha1Digest::from_metadata(SHA_A).unwrap(),
-                    size: Some(10),
+                    size: 10,
                 },
             })
             .unwrap();
@@ -2492,7 +2846,7 @@ mod tests {
                 kind: KnownGoodArtifactKind::Library,
                 integrity: KnownGoodIntegrity::Sha1 {
                     digest: Sha1Digest::from_metadata(SHA_B).unwrap(),
-                    size: Some(10),
+                    size: 10,
                 },
             })
             .expect_err("conflicting contract");
@@ -2512,7 +2866,7 @@ mod tests {
             panic!("runtime executable must have raw integrity")
         };
         assert_eq!(digest.as_str(), SHA_B);
-        assert_eq!(*size, Some(20));
+        assert_eq!(*size, 20);
     }
 
     #[test]
@@ -2591,7 +2945,9 @@ mod tests {
             .libraries
             .push(checksumless_loader_library());
 
-        let error = derive_known_good_inventory(fixture.input()).expect_err("missing checksum");
+        let Err(error) = fixture_library_authority(&fixture.version, &fixture.environment) else {
+            panic!("missing checksum must fail");
+        };
         assert_eq!(error, KnownGoodInventoryError::MissingChecksum);
     }
 
@@ -2713,6 +3069,8 @@ mod tests {
     struct Fixture {
         version: VersionJson,
         version_manifest: ManifestEntry,
+        version_metadata_size: u64,
+        library_authority: VerifiedVanillaLibraryAuthority,
         asset_index: Vec<u8>,
         runtime_manifest_bytes: Vec<u8>,
         runtime_manifest_expected: ExpectedIntegrity,
@@ -2725,6 +3083,10 @@ mod tests {
         fn input(&self) -> KnownGoodInventoryInput<'_> {
             KnownGoodInventoryInput {
                 resolved_version: &self.version,
+                version_metadata_size: self.version_metadata_size,
+                client_size: 40,
+                libraries: &self.library_authority,
+                log_config_size: Some(15),
                 asset_index_bytes: Some(&self.asset_index),
                 runtime: Some(RuntimeInventoryInput {
                     component: &self.runtime_id,
@@ -2819,6 +3181,20 @@ mod tests {
                 }),
             }),
         };
+        let environment = Environment {
+            os_name: "linux".to_string(),
+            os_arch: "x86_64".to_string(),
+            os_version: String::new(),
+            features: HashMap::new(),
+        };
+        let library_authority = if shape == FixtureShape::Vanilla {
+            fixture_library_authority(&version, &environment).expect("fixture library authority")
+        } else {
+            VerifiedVanillaLibraryAuthority {
+                libraries: Vec::new(),
+                entries: BTreeMap::new(),
+            }
+        };
         let runtime_manifest_bytes = runtime_manifest_bytes(shuffled);
         let runtime_manifest_expected = expected_for(&runtime_manifest_bytes);
         Fixture {
@@ -2832,18 +3208,39 @@ mod tests {
                 sha1: SHA_C.to_string(),
                 compliance_level: 1,
             },
+            version_metadata_size: 128,
+            library_authority,
             asset_index,
             runtime_manifest_bytes,
             runtime_manifest_expected,
             runtime_id: RuntimeId::from("java-runtime-delta"),
             loader_record,
-            environment: Environment {
-                os_name: "linux".to_string(),
-                os_arch: "x86_64".to_string(),
-                os_version: String::new(),
-                features: HashMap::new(),
-            },
+            environment,
         }
+    }
+
+    fn fixture_library_authority(
+        version: &VersionJson,
+        environment: &Environment,
+    ) -> Result<VerifiedVanillaLibraryAuthority, KnownGoodInventoryError> {
+        let proofs = library_artifact_plans_for(&version.libraries, environment)
+            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?
+            .into_iter()
+            .map(|plan| {
+                let sha1 = plan
+                    .expected
+                    .sha1
+                    .as_deref()
+                    .and_then(crate::download::decode_sha1)
+                    .ok_or(KnownGoodInventoryError::MissingChecksum)?;
+                Ok(ExactLibraryDownloadProof::new_for_test(
+                    plan.relative_path,
+                    plan.expected.size.unwrap_or(12),
+                    sha1,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        seal_verified_vanilla_library_authority(&version.libraries, environment, proofs)
     }
 
     fn loader_record(shape: FixtureShape, component: LoaderComponentId) -> LoaderBuildRecord {
@@ -2894,6 +3291,24 @@ mod tests {
             }),
             ..Library::default()
         }
+    }
+
+    fn test_base_client_inventory(version: &VersionJson) -> KnownGoodInventory {
+        let client = version.downloads.client.as_ref().expect("base client");
+        let mut builder = InventoryBuilder::default();
+        builder
+            .insert(KnownGoodEntry {
+                root: KnownGoodRoot::Versions,
+                path: KnownGoodRelativePath::new(&format!("{0}/{0}.jar", version.id))
+                    .expect("base client path"),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: KnownGoodIntegrity::Sha1 {
+                    digest: Sha1Digest::from_metadata(&client.sha1).expect("base client digest"),
+                    size: u64::try_from(client.size).expect("base client size"),
+                },
+            })
+            .expect("base client entry");
+        builder.finish()
     }
 
     fn checksumless_loader_library() -> Library {
@@ -2983,7 +3398,7 @@ mod tests {
             KnownGoodArtifactKind::RuntimeExecutable,
             &KnownGoodIntegrity::Sha1 {
                 digest: Sha1Digest::from_metadata(SHA_B).unwrap(),
-                size: Some(20),
+                size: 20,
             },
         );
         assert_entry(
