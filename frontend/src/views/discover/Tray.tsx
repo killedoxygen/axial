@@ -57,6 +57,10 @@ export function Tray(): JSX.Element | null {
   return (
     <>
       <div class="cp-discover-tray" role="region" aria-label="Staged content">
+        <div class="cp-discover-tray-count">
+          <b>{items.length}</b>
+          <span>staged</span>
+        </div>
         <div class="cp-discover-tray-items">
           {items.slice(0, 6).map((item) => (
             <button
@@ -72,7 +76,7 @@ export function Tray(): JSX.Element | null {
               <Icon name="x" size={11} />
             </button>
           ))}
-          {items.length > 6 && <span class="cp-discover-tray-more">+{items.length - 6}</span>}
+          {items.length > 6 && <span class="cp-discover-tray-more">+{items.length - 6} more</span>}
         </div>
 
         <div class="cp-discover-tray-actions">
@@ -86,7 +90,7 @@ export function Tray(): JSX.Element | null {
           ) : (
             <>
               <ExistingInstancePicker />
-              <Button icon="sparkles" onClick={() => setPicking(true)} disabled={busy}>
+              <Button icon="plus" onClick={() => setPicking(true)} disabled={busy}>
                 Set up an instance
               </Button>
             </>

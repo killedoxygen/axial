@@ -33,11 +33,13 @@ import {
 import {
   compareMcDesc,
   ContentIcon,
+  formatAge,
   formatCount,
   isAddable,
   KIND_TABS,
   SkeletonCard,
   Spinner,
+  tagLabel,
   usesLoaderFilter,
 } from './shared';
 
@@ -102,8 +104,8 @@ function CardAction({ item, instance }: { item: SearchHit; instance: EnrichedIns
     );
   }
 
-  const label = item.kind === 'modpack' ? 'Set up' : instance ? 'Add' : staged ? 'Staged' : 'Stage';
-  const icon = item.kind === 'modpack' ? 'sparkles' : instance ? 'plus' : staged ? 'check' : 'plus';
+  const label =
+    item.kind === 'modpack' ? 'Set up an instance' : instance ? `Add to ${instance.name}` : staged ? 'Staged' : 'Stage';
 
   return (
     <button
@@ -121,8 +123,8 @@ function CardAction({ item, instance }: { item: SearchHit; instance: EnrichedIns
               : 'Add to selection'
       }
     >
-      {busy ? <Spinner size={12} /> : <Icon name={icon} size={13} />}
-      {busy ? 'Working…' : label}
+      {busy ? <Spinner size={12} /> : <Icon name={staged ? 'check' : 'plus'} size={13} />}
+      <span class="cp-discover-card-action-label">{busy ? 'Working…' : label}</span>
     </button>
   );
 }
@@ -133,37 +135,52 @@ function ContentCard({ item, instance }: { item: SearchHit; instance: EnrichedIn
   };
 
   return (
-    <div class="cp-discover-card" data-staged={isStaged(item.canonical_id)}>
+    <article class="cp-discover-card" data-staged={isStaged(item.canonical_id)}>
       <button class="cp-discover-card-open" onClick={open} aria-label={`Open ${item.title}`}>
         <div class="cp-discover-card-icon" aria-hidden="true">
           <ContentIcon url={item.icon_url} kind={item.kind} />
         </div>
         <div class="cp-discover-card-body">
-          <div class="cp-discover-card-title" title={item.title}>
-            {item.title}
+          <div class="cp-discover-card-head">
+            <span class="cp-discover-card-title" title={item.title}>
+              {item.title}
+            </span>
+            {item.author && <span class="cp-discover-card-author">by {item.author}</span>}
           </div>
-          {item.author && <div class="cp-discover-card-author">by {item.author}</div>}
           <p class="cp-discover-card-summary">{item.summary}</p>
+          <div class="cp-discover-card-tags">
+            {item.categories.slice(0, 3).map((category) => (
+              <span key={category} class="cp-discover-tag">
+                {tagLabel(category)}
+              </span>
+            ))}
+          </div>
           <div class="cp-discover-card-meta">
             <span title={`${item.downloads.toLocaleString()} downloads`}>
               <Icon name="download" size={12} /> {formatCount(item.downloads)}
             </span>
-            {item.categories.slice(0, 2).map((category) => (
-              <span key={category} class="cp-discover-tag">
-                {category}
+            <span title={`${item.follows.toLocaleString()} followers`}>
+              <Icon name="user" size={12} /> {formatCount(item.follows)}
+            </span>
+            {item.updated && (
+              <span title={`Updated ${formatAge(item.updated)}`}>
+                <Icon name="clock" size={12} /> {formatAge(item.updated)}
               </span>
-            ))}
+            )}
           </div>
         </div>
       </button>
-      {(isAddable(item.kind) || item.kind === 'modpack') && <CardAction item={item} instance={instance} />}
-    </div>
+      <div class="cp-discover-card-foot">
+        {(isAddable(item.kind) || item.kind === 'modpack') && <CardAction item={item} instance={instance} />}
+      </div>
+    </article>
   );
 }
 
 export function DiscoverView(): JSX.Element {
   const instance = targetInstance.value;
   const requestId = useRef(0);
+  const [attempt, setAttempt] = useState(0);
 
   // A targeted instance dictates the filters; they are facts about where the
   // content is going, not preferences.
@@ -236,7 +253,7 @@ export function DiscoverView(): JSX.Element {
         });
     }, SEARCH_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [currentKind, currentQuery, activeLoader, activeVersion, currentSort, instance?.id]);
+  }, [currentKind, currentQuery, activeLoader, activeVersion, currentSort, instance?.id, attempt]);
 
   const loadMore = (): void => {
     if (loadingMore.value || loading.value || results.value.length >= total.value) return;
@@ -289,7 +306,7 @@ export function DiscoverView(): JSX.Element {
 
       {instance && <TargetBar instance={instance} />}
 
-      <div class="cp-discover-search">
+      <div class="cp-discover-toolbar">
         <Input
           value={currentQuery}
           onChange={(value) => {
@@ -313,66 +330,73 @@ export function DiscoverView(): JSX.Element {
             ) : undefined
           }
         />
-      </div>
 
-      <div class="cp-discover-filters">
-        <Segmented
-          options={tabs}
-          value={currentKind}
-          onChange={changeKind}
-          size="sm"
-          ariaLabel="Content type"
-          role="tablist"
-        />
-        <div class="cp-discover-filters-spacer" />
-        {instance ? (
-          <span class="cp-discover-locked" title="Set by the instance you are adding to">
-            <Icon name="shield-check" size={11} />
-            {instance.version_display.summary_label}
-          </span>
-        ) : (
-          <>
-            {usesLoaderFilter(currentKind) && (
+        <div class="cp-discover-filters">
+          <Segmented
+            options={tabs}
+            value={currentKind}
+            onChange={changeKind}
+            size="sm"
+            ariaLabel="Content type"
+            role="tablist"
+          />
+          <div class="cp-discover-filters-spacer" />
+          {instance ? (
+            <span class="cp-discover-locked" title="Set by the instance you are adding to">
+              <Icon name="shield-check" size={11} />
+              {instance.version_display.summary_label}
+            </span>
+          ) : (
+            <>
+              {usesLoaderFilter(currentKind) && (
+                <SelectField
+                  value={loader.value}
+                  onChange={(value) => {
+                    loader.value = value;
+                  }}
+                  options={LOADER_OPTIONS}
+                  ariaLabel="Loader"
+                  width={140}
+                />
+              )}
               <SelectField
-                value={loader.value}
+                value={gameVersion.value}
                 onChange={(value) => {
-                  loader.value = value;
+                  gameVersion.value = value;
                 }}
-                options={LOADER_OPTIONS}
-                ariaLabel="Loader"
-                width={140}
+                options={gameVersionOptions}
+                ariaLabel="Minecraft version"
+                width={150}
               />
-            )}
-            <SelectField
-              value={gameVersion.value}
-              onChange={(value) => {
-                gameVersion.value = value;
-              }}
-              options={gameVersionOptions}
-              ariaLabel="Minecraft version"
-              width={150}
-            />
-          </>
-        )}
-        <SelectField
-          value={currentSort}
-          onChange={(value) => {
-            sort.value = value;
-          }}
-          options={SORT_OPTIONS}
-          ariaLabel="Sort by"
-          width={165}
-        />
+            </>
+          )}
+          <SelectField
+            value={currentSort}
+            onChange={(value) => {
+              sort.value = value;
+            }}
+            options={SORT_OPTIONS}
+            ariaLabel="Sort by"
+            width={165}
+          />
+        </div>
       </div>
 
       <div class="cp-discover-count" aria-live="polite">
-        {!isLoading && !error && total.value > 0 ? `${total.value.toLocaleString()} results` : ''}
+        {isLoading && items.length === 0
+          ? `Searching ${kindLabel}…`
+          : !error && total.value > 0
+            ? `${total.value.toLocaleString()} ${total.value === 1 ? 'result' : 'results'}`
+            : ''}
       </div>
 
       {error && (
         <div class="cp-discover-empty cp-discover-empty--pad">
-          <Icon name="alert" size={20} />
+          <Icon name="alert" size={22} />
           <div>{error}</div>
+          <Button variant="secondary" onClick={() => setAttempt((value) => value + 1)}>
+            Try again
+          </Button>
         </div>
       )}
 
@@ -386,8 +410,25 @@ export function DiscoverView(): JSX.Element {
 
       {!error && !isLoading && items.length === 0 && (
         <div class="cp-discover-empty cp-discover-empty--pad">
-          <Icon name="search" size={20} />
-          <div>No results. Try a different search or filter.</div>
+          <Icon name="search" size={22} />
+          <div class="cp-discover-empty-title">Nothing matched</div>
+          <div>
+            {currentQuery
+              ? `No ${kindLabel} named “${currentQuery}”${instance ? ` fit ${instance.version_display.summary_label}` : ''}.`
+              : `No ${kindLabel} to show here.`}
+          </div>
+          {(currentQuery || loader.value || gameVersion.value) && (
+            <Button
+              variant="secondary"
+              onClick={() => {
+                query.value = '';
+                loader.value = '';
+                gameVersion.value = '';
+              }}
+            >
+              Clear filters
+            </Button>
+          )}
         </div>
       )}
 

@@ -216,100 +216,323 @@ const scanState: ScanState = {
   degraded: false,
 };
 
-function mockContent(
-  id: string,
-  kind: ContentKind,
-  title: string,
-  author: string,
-  summary: string,
-  downloads: number,
-  categories: string[],
-): CanonicalContent {
+const MOCK_GAME_VERSIONS = ['1.20.1', '1.20.4', '1.21.1', '1.21.4', '1.21.5', '1.21.6'];
+
+function daysAgo(days: number): string {
+  return new Date(Date.now() - days * 86_400_000).toISOString();
+}
+
+function svgDataUri(svg: string): string {
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+function mockIcon(hue: number, glyph: string): string {
+  return svgDataUri(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">` +
+      `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">` +
+      `<stop offset="0" stop-color="hsl(${hue} 62% 46%)"/><stop offset="1" stop-color="hsl(${hue + 40} 58% 28%)"/>` +
+      `</linearGradient></defs>` +
+      `<rect width="96" height="96" rx="20" fill="url(#g)"/>` +
+      `<text x="48" y="62" font-family="Manrope, sans-serif" font-size="42" font-weight="700" fill="white" fill-opacity="0.92" text-anchor="middle">${glyph}</text>` +
+      `</svg>`,
+  );
+}
+
+function mockShot(hue: number, label: string): string {
+  return svgDataUri(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="270" viewBox="0 0 480 270">` +
+      `<defs><linearGradient id="s" x1="0" y1="0" x2="0" y2="1">` +
+      `<stop offset="0" stop-color="hsl(${hue} 55% 32%)"/><stop offset="1" stop-color="hsl(${hue + 30} 45% 14%)"/>` +
+      `</linearGradient></defs>` +
+      `<rect width="480" height="270" fill="url(#s)"/>` +
+      `<circle cx="380" cy="62" r="26" fill="white" fill-opacity="0.18"/>` +
+      `<path d="M0 200 L110 140 L200 190 L300 120 L400 175 L480 140 L480 270 L0 270 Z" fill="black" fill-opacity="0.32"/>` +
+      `<text x="24" y="248" font-family="Manrope, sans-serif" font-size="16" fill="white" fill-opacity="0.72">${label}</text>` +
+      `</svg>`,
+  );
+}
+
+interface MockVersionSeed {
+  number: string;
+  channel: 'release' | 'beta' | 'alpha';
+  days: number;
+  games: string[];
+  size: number;
+}
+
+interface MockSeed {
+  id: string;
+  kind: ContentKind;
+  title: string;
+  author: string;
+  summary: string;
+  downloads: number;
+  categories: string[];
+  hue: number;
+  loaders?: string[];
+  games?: string[];
+  updatedDays: number;
+  body: string;
+  gallery?: string[];
+  versions: MockVersionSeed[];
+}
+
+const MOCK_SEEDS: MockSeed[] = [
+  {
+    id: 'modrinth:AANobbMI',
+    kind: 'mod',
+    title: 'Sodium',
+    author: 'jellysquid3',
+    summary: 'A modern rendering engine that dramatically improves frame rates.',
+    downloads: 182_000_000,
+    categories: ['optimization', 'utility'],
+    hue: 210,
+    updatedDays: 6,
+    body:
+      '## What it does\n' +
+      'Sodium replaces the vanilla chunk renderer with one built for modern GPUs. Most machines see two to three ' +
+      'times the frame rate, and the gains are largest on integrated graphics.\n\n' +
+      '### Highlights\n' +
+      '- Rewritten chunk meshing and culling\n' +
+      '- Fewer stalls when loading terrain\n' +
+      '- Works alongside `Iris` for shader support\n\n' +
+      '> Requires Fabric API. Not compatible with OptiFine.\n',
+    gallery: ['Before: 60 fps', 'After: 180 fps', 'Chunk debug view'],
+    versions: [
+      { number: '0.7.3', channel: 'release', days: 6, games: ['1.21.6', '1.21.5'], size: 1_240_000 },
+      { number: '0.7.2', channel: 'release', days: 41, games: ['1.21.5', '1.21.4'], size: 1_210_000 },
+      { number: '0.7.0-beta.2', channel: 'beta', days: 78, games: ['1.21.4'], size: 1_180_000 },
+      { number: '0.6.13', channel: 'release', days: 160, games: ['1.21.1'], size: 1_090_000 },
+    ],
+  },
+  {
+    id: 'modrinth:P7dR8mSH',
+    kind: 'mod',
+    title: 'Fabric API',
+    author: 'modmuss50',
+    summary: 'Core hooks and interoperability utilities most Fabric mods depend on.',
+    downloads: 210_000_000,
+    categories: ['library'],
+    hue: 32,
+    updatedDays: 3,
+    body:
+      'Fabric API is the shared library nearly every Fabric mod builds on. It provides the event hooks, registries ' +
+      'and networking helpers the vanilla game does not expose.\n\n' +
+      'You rarely install it on purpose — it comes along as a dependency of the mods that need it.\n',
+    versions: [
+      { number: '0.130.0', channel: 'release', days: 3, games: ['1.21.6'], size: 2_400_000 },
+      { number: '0.129.0', channel: 'release', days: 24, games: ['1.21.5'], size: 2_380_000 },
+      { number: '0.115.4', channel: 'release', days: 190, games: ['1.21.1'], size: 2_150_000 },
+    ],
+  },
+  {
+    id: 'modrinth:gvQqBUqZ',
+    kind: 'mod',
+    title: 'Lithium',
+    author: 'jellysquid3',
+    summary: 'General-purpose optimization mod that improves server tick performance.',
+    downloads: 90_000_000,
+    categories: ['optimization'],
+    hue: 145,
+    updatedDays: 15,
+    body:
+      'Lithium optimizes the game logic itself — mob AI, block ticking, physics and chunk saving — without changing ' +
+      'behaviour. Worlds tick faster and hitches on busy farms get shorter.\n\n' +
+      '- No config needed\n' +
+      '- Safe on servers and singleplayer\n' +
+      '- Vanilla-identical results\n',
+    versions: [
+      { number: '0.17.2', channel: 'release', days: 15, games: ['1.21.6', '1.21.5'], size: 640_000 },
+      { number: '0.16.3', channel: 'release', days: 96, games: ['1.21.4', '1.21.1'], size: 610_000 },
+    ],
+  },
+  {
+    id: 'modrinth:YL57xq9U',
+    kind: 'mod',
+    title: 'Iris Shaders',
+    author: 'coderbot',
+    summary: 'Run OptiFine-style shader packs on Fabric, with Sodium support.',
+    downloads: 64_000_000,
+    categories: ['optimization', 'decoration'],
+    hue: 270,
+    updatedDays: 9,
+    body:
+      'Iris loads the shader packs you already have and runs them on top of Sodium, so you keep the frame rate and ' +
+      'get the lighting.\n\n### Notes\n- Pairs with any pack in the Shaders tab\n- Toggle shaders in-game without a restart\n',
+    gallery: ['Sunset with BSL', 'Underwater caustics'],
+    versions: [
+      { number: '1.9.1', channel: 'release', days: 9, games: ['1.21.6'], size: 3_100_000 },
+      { number: '1.8.8', channel: 'release', days: 70, games: ['1.21.4'], size: 3_020_000 },
+    ],
+  },
+  {
+    id: 'modrinth:mOgUt4GM',
+    kind: 'mod',
+    title: 'Mod Menu',
+    author: 'Prospector',
+    summary: 'Adds an in-game screen listing every mod you have, with their settings.',
+    downloads: 48_000_000,
+    categories: ['utility'],
+    hue: 340,
+    updatedDays: 21,
+    body: 'A menu that lists the mods you have installed and opens their config screens. Most config-capable mods look for it.\n',
+    versions: [
+      { number: '15.0.0', channel: 'release', days: 21, games: ['1.21.6', '1.21.5'], size: 780_000 },
+      { number: '14.0.0-rc.1', channel: 'alpha', days: 58, games: ['1.21.4'], size: 760_000 },
+    ],
+  },
+  {
+    id: 'modrinth:9eGKb6K1',
+    kind: 'mod',
+    title: 'Simple Voice Chat',
+    author: 'henkelmax',
+    summary: 'Proximity voice chat for vanilla-friendly servers, with no extra client needed.',
+    downloads: 31_000_000,
+    categories: ['social', 'utility'],
+    hue: 190,
+    updatedDays: 34,
+    body: 'Adds distance-based voice chat. Players nearby are loud, players far away are faint, and groups get their own channel.\n',
+    versions: [
+      { number: '2.5.31', channel: 'release', days: 34, games: ['1.21.6', '1.21.5', '1.21.1'], size: 2_900_000 },
+    ],
+  },
+  {
+    id: 'modrinth:1KVo5zza',
+    kind: 'modpack',
+    title: 'Fabulously Optimized',
+    author: 'robotkoer',
+    summary: 'A performance-first pack that keeps the vanilla feel and adds quality-of-life polish.',
+    downloads: 12_000_000,
+    categories: ['optimization', 'lightweight'],
+    hue: 48,
+    updatedDays: 11,
+    body:
+      'Fabulously Optimized keeps Minecraft looking like Minecraft, but faster. It bundles the usual performance ' +
+      'mods, sane defaults, and a handful of interface improvements.\n\n' +
+      '### Included\n- Sodium, Lithium and friends\n- Iris for shader support\n- Zoom, better screenshots, fixed bugs\n',
+    gallery: ['Main menu', 'Village at dawn', 'F3 overlay'],
+    versions: [
+      { number: '6.6.0', channel: 'release', days: 11, games: ['1.21.6'], size: 24_000_000 },
+      { number: '6.5.1', channel: 'release', days: 62, games: ['1.21.5'], size: 23_400_000 },
+    ],
+  },
+  {
+    id: 'modrinth:MdwFAVRL',
+    kind: 'modpack',
+    title: 'Cobblemon',
+    author: 'Cobblemon',
+    summary: 'A creature-collecting adventure pack, built for Fabric.',
+    downloads: 8_400_000,
+    categories: ['adventure', 'multiplayer'],
+    hue: 355,
+    updatedDays: 28,
+    body: 'Catch, train and battle creatures across the overworld. The pack ships with the mod, its models and a tuned world generator.\n',
+    gallery: ['Starter selection', 'A battle'],
+    versions: [{ number: '1.6.1', channel: 'release', days: 28, games: ['1.21.1'], size: 41_000_000 }],
+  },
+  {
+    id: 'modrinth:faithful32',
+    kind: 'resource_pack',
+    title: 'Faithful 32x',
+    author: 'Faithful Team',
+    summary: 'A higher-resolution take on the vanilla textures that keeps every shape intact.',
+    downloads: 40_000_000,
+    categories: ['32x', 'vanilla-like'],
+    hue: 96,
+    updatedDays: 19,
+    body: 'Every vanilla texture, redrawn at double the resolution. Nothing is restyled — blocks stay recognizable.\n',
+    gallery: ['Oak forest', 'Nether fortress', 'Item bar'],
+    versions: [
+      { number: '1.21.6a', channel: 'release', days: 19, games: ['1.21.6', '1.21.5'], size: 18_000_000 },
+      { number: '1.21.4a', channel: 'release', days: 88, games: ['1.21.4', '1.21.1'], size: 17_600_000 },
+    ],
+  },
+  {
+    id: 'modrinth:barebones',
+    kind: 'resource_pack',
+    title: 'Bare Bones',
+    author: 'RobotPants',
+    summary: 'Flat, trailer-style textures with no noise and heavy saturation.',
+    downloads: 9_200_000,
+    categories: ['16x', 'simplistic'],
+    hue: 20,
+    updatedDays: 44,
+    body: 'The look of the official trailers: flat colours, no grain, strong silhouettes.\n',
+    gallery: ['Plains', 'Cave'],
+    versions: [
+      { number: '1.21', channel: 'release', days: 44, games: ['1.21.6', '1.21.4', '1.20.1'], size: 4_100_000 },
+    ],
+  },
+  {
+    id: 'modrinth:complementary',
+    kind: 'shader_pack',
+    title: 'Complementary Shaders',
+    author: 'EminGT',
+    summary: 'A well-balanced shader pack with strong performance and a huge settings menu.',
+    downloads: 25_000_000,
+    categories: ['fantasy', 'reimagined'],
+    hue: 250,
+    updatedDays: 13,
+    body:
+      'Complementary aims for beauty that still runs. Volumetric light, soft shadows and water that reflects, with ' +
+      'presets from potato to ultra.\n\nNeeds Iris or OptiFine to load.\n',
+    gallery: ['Sunrise', 'Rain', 'Nether'],
+    versions: [
+      { number: 'r5.5.1', channel: 'release', days: 13, games: ['1.21.6', '1.21.5', '1.21.1'], size: 6_800_000 },
+      { number: 'r5.4.0', channel: 'release', days: 105, games: ['1.21.4'], size: 6_500_000 },
+    ],
+  },
+  {
+    id: 'modrinth:bsl',
+    kind: 'shader_pack',
+    title: 'BSL Shaders',
+    author: 'CaptTatsu',
+    summary: 'Warm, cinematic lighting with tone-mapped colour and soft reflections.',
+    downloads: 21_500_000,
+    categories: ['cartoon', 'semi-realistic'],
+    hue: 30,
+    updatedDays: 52,
+    body: 'A long-running pack known for its warm palette and its bloom. Heavier than Complementary, prettier at sunset.\n',
+    gallery: ['Golden hour', 'Ocean'],
+    versions: [{ number: 'v8.4.01', channel: 'release', days: 52, games: ['1.21.6', '1.21.1'], size: 5_200_000 }],
+  },
+];
+
+function seedContent(seed: MockSeed): CanonicalContent {
+  const projectId = seed.id.replace('modrinth:', '');
+  const loaders = seed.loaders ?? (seed.kind === 'mod' || seed.kind === 'modpack' ? ['fabric'] : []);
   return {
-    canonical_id: id,
-    kind,
+    canonical_id: seed.id,
+    kind: seed.kind,
     provider: 'modrinth',
-    project_id: id.replace('modrinth:', ''),
-    title,
-    author,
-    summary,
-    downloads,
-    follows: Math.round(downloads / 100),
-    categories,
-    game_versions: ['1.21.6', '1.21.5'],
-    loaders: kind === 'mod' || kind === 'modpack' ? ['fabric'] : [],
-    sources: [{ provider: 'modrinth', project_id: id.replace('modrinth:', '') }],
+    project_id: projectId,
+    slug: projectId,
+    title: seed.title,
+    author: seed.author,
+    summary: seed.summary,
+    icon_url: mockIcon(seed.hue, seed.title.slice(0, 1)),
+    downloads: seed.downloads,
+    follows: Math.round(seed.downloads / 90),
+    categories: seed.categories,
+    game_versions: seed.games ?? MOCK_GAME_VERSIONS,
+    loaders,
+    updated: daysAgo(seed.updatedDays),
+    sources: [{ provider: 'modrinth', project_id: projectId, slug: projectId }],
   };
 }
 
 const mockContentCatalog: Record<ContentKind, CanonicalContent[]> = {
-  mod: [
-    mockContent(
-      'modrinth:AANobbMI',
-      'mod',
-      'Sodium',
-      'jellysquid3',
-      'A modern rendering engine that dramatically improves frame rates.',
-      182_000_000,
-      ['optimization', 'fabric'],
-    ),
-    mockContent(
-      'modrinth:P7dR8mSH',
-      'mod',
-      'Fabric API',
-      'modmuss50',
-      'Core hooks and interoperability utilities most Fabric mods depend on.',
-      210_000_000,
-      ['library', 'fabric'],
-    ),
-    mockContent(
-      'modrinth:gvQqBUqZ',
-      'mod',
-      'Lithium',
-      'jellysquid3',
-      'General-purpose optimization mod that improves server tick performance.',
-      90_000_000,
-      ['optimization'],
-    ),
-  ],
-  modpack: [
-    mockContent(
-      'modrinth:1KVo5zza',
-      'modpack',
-      'Fabulously Optimized',
-      'robotkoer',
-      'A modpack focused on performance and vanilla-plus visuals.',
-      12_000_000,
-      ['optimization'],
-    ),
-  ],
-  resource_pack: [
-    mockContent(
-      'modrinth:faithful32',
-      'resource_pack',
-      'Faithful 32x',
-      'Faithful Team',
-      'A higher-resolution take on the vanilla textures.',
-      40_000_000,
-      ['32x', 'realistic'],
-    ),
-  ],
-  shader_pack: [
-    mockContent(
-      'modrinth:complementary',
-      'shader_pack',
-      'Complementary Shaders',
-      'EminGT',
-      'A well-balanced shader pack with strong performance.',
-      25_000_000,
-      ['fantasy'],
-    ),
-  ],
+  mod: MOCK_SEEDS.filter((seed) => seed.kind === 'mod').map(seedContent),
+  modpack: MOCK_SEEDS.filter((seed) => seed.kind === 'modpack').map(seedContent),
+  resource_pack: MOCK_SEEDS.filter((seed) => seed.kind === 'resource_pack').map(seedContent),
+  shader_pack: MOCK_SEEDS.filter((seed) => seed.kind === 'shader_pack').map(seedContent),
 };
 
 const mockDependencies: Record<string, string[]> = {
   'modrinth:AANobbMI': ['modrinth:P7dR8mSH'],
   'modrinth:gvQqBUqZ': ['modrinth:P7dR8mSH'],
+  'modrinth:YL57xq9U': ['modrinth:P7dR8mSH'],
+  'modrinth:mOgUt4GM': ['modrinth:P7dR8mSH'],
 };
 
 const mockInstanceContent: Record<string, InstanceContentEntry[]> = {
@@ -347,35 +570,42 @@ function mockContentSearch(request: MockRequest | undefined): ContentPage {
 
 function mockContentDetail(request: MockRequest | undefined): ContentDetail {
   const id = request?.searchParams.get('id') ?? '';
+  const seed = MOCK_SEEDS.find((entry) => entry.id === id);
   const item = mockCatalogItem(id);
-  if (!item) throw apiError(404, 'Not Found', { error: 'content not found' });
+  if (!seed || !item) throw apiError(404, 'Not Found', { error: 'content not found' });
+
+  const dependencies = (mockDependencies[item.canonical_id] ?? []).map((projectId) => ({
+    project_id: projectId.replace('modrinth:', ''),
+    kind: 'required' as const,
+  }));
+  const extension = seed.kind === 'mod' ? 'jar' : seed.kind === 'modpack' ? 'mrpack' : 'zip';
+
   return {
     ...item,
-    body: item.summary,
-    gallery: [],
-    versions: [
-      {
-        id: `${item.project_id}-v1`,
-        name: `${item.title} 1.0`,
-        version_number: '1.0.0',
-        game_versions: ['1.21.6'],
-        loaders: item.loaders,
-        channel: 'release',
-        downloads: item.downloads,
-        files: [
-          {
-            url: 'https://example.invalid/file.jar',
-            filename: `${item.project_id}.jar`,
-            primary: true,
-            size: 512_000,
-          },
-        ],
-        dependencies: (mockDependencies[item.canonical_id] ?? []).map((projectId) => ({
-          project_id: projectId.replace('modrinth:', ''),
-          kind: 'required' as const,
-        })),
-      },
-    ],
+    body: seed.body,
+    gallery: (seed.gallery ?? []).map((title, index) => ({
+      url: mockShot(seed.hue + index * 18, title),
+      title,
+    })),
+    versions: seed.versions.map((version, index) => ({
+      id: `${item.project_id}-${version.number}`,
+      name: `${seed.title} ${version.number}`,
+      version_number: version.number,
+      game_versions: version.games,
+      loaders: item.loaders,
+      channel: version.channel,
+      published: daysAgo(version.days),
+      downloads: Math.round(seed.downloads / (index + 1) / 3),
+      files: [
+        {
+          url: `https://example.invalid/${item.project_id}-${version.number}.${extension}`,
+          filename: `${item.project_id}-${version.number}.${extension}`,
+          primary: true,
+          size: version.size,
+        },
+      ],
+      dependencies,
+    })),
   };
 }
 
@@ -396,16 +626,20 @@ function mockResolvePlan(instanceId: string | undefined, selections: ContentSele
     })
     .map((entry) => {
       const item = mockCatalogItem(entry.id);
+      const seed = MOCK_SEEDS.find((candidate) => candidate.id === entry.id);
+      const latest = seed?.versions[0];
       const already = installed.some((installedEntry) => installedEntry.canonical_id === entry.id);
+      const projectId = entry.id.replace('modrinth:', '');
+      const extension = seed?.kind === 'resource_pack' || seed?.kind === 'shader_pack' ? 'zip' : 'jar';
       return {
         canonical_id: entry.id,
         title: item?.title ?? entry.id,
-        kind: 'mod' as ContentKind,
-        project_id: entry.id.replace('modrinth:', ''),
-        version_id: `${entry.id.replace('modrinth:', '')}-v1`,
-        version_number: '1.0.0',
-        filename: `${entry.id.replace('modrinth:', '')}.jar`,
-        size: 512_000,
+        kind: item?.kind ?? ('mod' as ContentKind),
+        project_id: projectId,
+        version_id: `${projectId}-${latest?.number ?? '1.0.0'}`,
+        version_number: latest?.number ?? '1.0.0',
+        filename: `${projectId}-${latest?.number ?? '1.0.0'}.${extension}`,
+        size: latest?.size ?? 512_000,
         reason: entry.dependency ? ('dependency' as const) : ('selected' as const),
         already_installed: already,
         update: false,

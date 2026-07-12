@@ -263,7 +263,7 @@ export function DevLabView(): JSX.Element {
           </button>
         )}
         <button type="button" data-active={activeTab === 'playground'} onClick={() => setTab('playground')}>
-          <Icon name="sparkles" size={15} stroke={1.8} />
+          <Icon name="cube" size={15} stroke={1.8} />
           Playground
         </button>
       </div>

@@ -23,6 +23,7 @@ import './views/onboarding/onboarding.css';
 import './views/settings/accent.css';
 import './views/create/create.css';
 import './views/instance/instance.css';
+import './views/discover/discover.css';
 import './views/settings/settings.css';
 import './views/accounts/accounts.css';
 import './views/views.css';
