@@ -184,6 +184,10 @@ pub(crate) async fn write_exact_managed_version_artifact(
     path: &Path,
     source_bytes: &[u8],
 ) -> Result<(), LoaderError> {
+    let parent = path.parent().ok_or_else(|| {
+        LoaderError::Verify("managed loader artifact has no version directory".to_string())
+    })?;
+    require_exact_directory(parent, "managed version directory")?;
     let temp_path = managed_artifact_temp_path(path);
     let mut output = async_fs::OpenOptions::new()
         .write(true)

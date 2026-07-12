@@ -20,7 +20,9 @@ use crate::loaders::http::fetch_bytes;
 use crate::loaders::http::fetch_bytes_for_test as fetch_bytes;
 use crate::loaders::processors::run_processors;
 use crate::loaders::providers::{self, ProfileInstallProof};
+use crate::loaders::source::{VerifiedLoaderSource, fetch_sha1_verified_source};
 use crate::loaders::types::{LoaderBuildRecord, LoaderError, LoaderInstallPlan};
+use crate::loaders::workspace::cleanup::{prepare_fresh_work_dir, remove_work_dir};
 use crate::loaders::{
     installed_loader_metadata_bytes, validate_provider_version_id, validate_version_id,
 };
@@ -39,7 +41,6 @@ use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
 const MAX_INSTALLER_DOWNLOAD_SIZE: u64 = 50 << 20;
-const MAX_SOURCE_SHA1_PROOF_BYTES: u64 = 128;
 const MAX_LEGACY_OVERLAY_ENTRIES: usize = 65_536;
 const MAX_LEGACY_OVERLAY_ENTRY_BYTES: u64 = 64 << 20;
 const MAX_LEGACY_OVERLAY_PAYLOAD_BYTES: u64 = 256 << 20;
@@ -183,6 +184,21 @@ pub async fn install_from_installer_source<F>(
 where
     F: FnMut(DownloadProgress),
 {
+    send(progress(
+        "artifacts",
+        0,
+        1,
+        Some(format!(
+            "Downloading {} installer...",
+            plan.record.component_name
+        )),
+    ));
+    let installer_source = fetch_sha1_verified_source(
+        installer_url,
+        MAX_INSTALLER_DOWNLOAD_SIZE,
+        "loader installer",
+    )
+    .await?;
     let base_receipt = Box::pin(ensure_base_version(
         library_dir,
         &plan.record.minecraft_version,
@@ -193,38 +209,30 @@ where
         .authenticated_client_integrity()
         .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
     drop(base_receipt);
-    Box::pin(install_installer_source_after_authenticated_base(
+    let result = Box::pin(install_installer_source_after_authenticated_base(
         library_dir,
         plan,
-        installer_url,
+        installer_source,
         &authenticated_client,
         send,
     ))
-    .await
+    .await;
+    remove_work_dir(&plan.stage_dir);
+    result
 }
 
 async fn install_installer_source_after_authenticated_base<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
-    installer_url: &str,
+    installer_source: VerifiedLoaderSource,
     authenticated_client: &ExpectedIntegrity,
     send: &mut F,
 ) -> Result<String, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
-    send(progress(
-        "artifacts",
-        0,
-        1,
-        Some(format!(
-            "Downloading {} installer...",
-            plan.record.component_name
-        )),
-    ));
-    let installer_data = download_to_memory(installer_url).await?;
-    let (installer_data, extracted) =
-        extract_installer_blocking(installer_data, plan.record.component_name.clone()).await?;
+    let (installer_source, extracted) =
+        extract_installer_blocking(installer_source, plan.record.component_name.clone()).await?;
 
     send(progress(
         "profile",
@@ -260,9 +268,9 @@ where
         library_dir,
         &installed_version_id,
     )?;
-    let installer_data = cleanup_on_error(
+    let installer_source = cleanup_on_error(
         extract_maven_entries_blocking(
-            installer_data,
+            installer_source,
             library_dir.to_path_buf(),
             plan.record.component_name.clone(),
         )
@@ -280,9 +288,15 @@ where
     cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
 
     if let Some(install_profile_json) = extracted.install_profile_json.as_deref() {
+        let stage_dir = prepare_fresh_work_dir(library_dir, &installed_version_id)?;
+        if stage_dir != plan.stage_dir {
+            remove_work_dir(&stage_dir);
+            return Err(LoaderError::InvalidProfile(
+                "installer workspace does not match its canonical install plan".to_string(),
+            ));
+        }
         let installer_path = plan.stage_dir.join("source-installer.jar");
-        async_fs::create_dir_all(&plan.stage_dir).await?;
-        async_fs::write(&installer_path, &installer_data).await?;
+        async_fs::write(&installer_path, installer_source.bytes()).await?;
         send(progress(
             "processors",
             0,
@@ -293,7 +307,7 @@ where
             library_dir,
             &plan.record.minecraft_version,
             install_profile_json,
-            &installer_data,
+            installer_source.bytes(),
             &plan.stage_dir,
             &installer_path,
             |current, total, detail| {
@@ -373,34 +387,6 @@ pub async fn install_from_legacy_archive<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let base_receipt = Box::pin(ensure_base_version(
-        library_dir,
-        &plan.record.minecraft_version,
-        send,
-    ))
-    .await?;
-    Box::pin(install_legacy_archive_after_authenticated_base(
-        library_dir,
-        plan,
-        archive_url,
-        &base_receipt,
-        send,
-    ))
-    .await
-}
-
-async fn install_legacy_archive_after_authenticated_base<F>(
-    library_dir: &Path,
-    plan: &LoaderInstallPlan,
-    archive_url: &str,
-    base_receipt: &KnownGoodInstallReceipt,
-    send: &mut F,
-) -> Result<KnownGoodInstallReceipt, LoaderError>
-where
-    F: FnMut(DownloadProgress),
-{
-    validate_version_id(&plan.record.version_id, "installed loader version id")?;
-
     send(progress(
         "artifacts",
         0,
@@ -410,8 +396,39 @@ where
             plan.record.component_name
         )),
     ));
-    let archive_data = download_to_memory(archive_url).await?;
-    authenticate_legacy_archive_source(archive_url, &archive_data).await?;
+    let archive_source = fetch_sha1_verified_source(
+        archive_url,
+        MAX_INSTALLER_DOWNLOAD_SIZE,
+        "legacy Forge archive",
+    )
+    .await?;
+    let base_receipt = Box::pin(ensure_base_version(
+        library_dir,
+        &plan.record.minecraft_version,
+        send,
+    ))
+    .await?;
+    Box::pin(install_legacy_archive_after_authenticated_base(
+        library_dir,
+        plan,
+        archive_source,
+        &base_receipt,
+        send,
+    ))
+    .await
+}
+
+async fn install_legacy_archive_after_authenticated_base<F>(
+    library_dir: &Path,
+    plan: &LoaderInstallPlan,
+    archive_source: VerifiedLoaderSource,
+    base_receipt: &KnownGoodInstallReceipt,
+    send: &mut F,
+) -> Result<KnownGoodInstallReceipt, LoaderError>
+where
+    F: FnMut(DownloadProgress),
+{
+    validate_version_id(&plan.record.version_id, "installed loader version id")?;
 
     let base_client_path = versions_dir(library_dir)
         .join(&plan.record.minecraft_version)
@@ -421,7 +438,8 @@ where
         .authenticate_client_bytes(&base_client_bytes)
         .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
     let child_client_bytes =
-        overlay_legacy_archive_bytes_blocking(base_client_bytes, archive_data).await?;
+        overlay_legacy_archive_bytes_blocking(base_client_bytes, archive_source.into_bytes())
+            .await?;
 
     let mut version = base_receipt.effective_version().clone();
     version.id = plan.record.version_id.clone();
@@ -633,33 +651,6 @@ async fn download_to_memory(url: &str) -> Result<Vec<u8>, LoaderError> {
     fetch_bytes(url, MAX_INSTALLER_DOWNLOAD_SIZE).await
 }
 
-async fn authenticate_legacy_archive_source(
-    archive_url: &str,
-    archive_bytes: &[u8],
-) -> Result<(), LoaderError> {
-    let proof_url = format!("{archive_url}.sha1");
-    let proof_bytes = fetch_bytes(&proof_url, MAX_SOURCE_SHA1_PROOF_BYTES).await?;
-    let proof = std::str::from_utf8(&proof_bytes)
-        .map_err(|_| legacy_archive_proof_error("is not UTF-8"))?
-        .trim();
-    if proof.len() != 40 || !proof.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(legacy_archive_proof_error(
-            "must contain exactly one 40-hex digest",
-        ));
-    }
-    let actual = format!("{:x}", Sha1::digest(archive_bytes));
-    if !proof.eq_ignore_ascii_case(&actual) {
-        return Err(LoaderError::Verify(
-            "legacy Forge archive does not match its live sha1 proof".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn legacy_archive_proof_error(reason: &str) -> LoaderError {
-    LoaderError::InvalidProfile(format!("legacy Forge archive sha1 proof {reason}"))
-}
-
 fn parse_profile_json(
     bytes: &[u8],
     component_name: &str,
@@ -772,27 +763,27 @@ fn enrich_library_integrity(
 }
 
 async fn extract_installer_blocking(
-    installer_data: Vec<u8>,
+    installer_source: VerifiedLoaderSource,
     component_name: String,
-) -> Result<(Vec<u8>, ExtractedForgeInstaller), LoaderError> {
+) -> Result<(VerifiedLoaderSource, ExtractedForgeInstaller), LoaderError> {
     tokio::task::spawn_blocking(move || {
-        let extracted = extract_installer(&installer_data)
+        let extracted = extract_installer(installer_source.bytes())
             .map_err(|error| installer_extract_error(&component_name, error))?;
-        Ok((installer_data, extracted))
+        Ok((installer_source, extracted))
     })
     .await
     .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
 }
 
 async fn extract_maven_entries_blocking(
-    installer_data: Vec<u8>,
+    installer_source: VerifiedLoaderSource,
     library_dir: PathBuf,
     component_name: String,
-) -> Result<Vec<u8>, LoaderError> {
+) -> Result<VerifiedLoaderSource, LoaderError> {
     tokio::task::spawn_blocking(move || {
-        extract_maven_entries(&installer_data, &library_dir)
+        extract_maven_entries(installer_source.bytes(), &library_dir)
             .map_err(|error| installer_extract_error(&component_name, error))?;
-        Ok(installer_data)
+        Ok(installer_source)
     })
     .await
     .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
@@ -1156,8 +1147,9 @@ mod tests {
     use super::{
         base_version_install_lock_from_map, cleanup_on_error,
         download_loader_libraries_with_evidence, download_profile_loader_libraries_with_evidence,
-        ensure_base_version, install_from_installer_source, install_from_legacy_archive,
-        install_from_profile_source, install_installer_source_after_authenticated_base,
+        ensure_base_version, fetch_sha1_verified_source, install_from_installer_source,
+        install_from_legacy_archive, install_from_profile_source,
+        install_installer_source_after_authenticated_base,
         install_legacy_archive_after_authenticated_base, overlay_legacy_archive_bytes,
         strip_child_client_jar_meta, validate_and_enrich_profile_source,
         write_patched_client_jar_integrity,
@@ -1173,6 +1165,7 @@ mod tests {
     };
     use crate::loaders::compose::LoaderProfileFragment;
     use crate::loaders::providers::{ProfileInstallProof, ProfileLibraryProof};
+    use crate::loaders::source::VerifiedLoaderSource;
     use crate::loaders::types::LoaderError;
     use crate::loaders::types::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
@@ -1552,21 +1545,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_installer_strategy_rejects_sha1_mismatch_before_base_effects() {
+        for (component, strategy) in [
+            (
+                LoaderComponentId::Forge,
+                LoaderInstallStrategy::ForgeLegacyInstaller,
+            ),
+            (LoaderComponentId::Forge, LoaderInstallStrategy::ForgeModern),
+            (
+                LoaderComponentId::NeoForge,
+                LoaderInstallStrategy::NeoForgeModern,
+            ),
+        ] {
+            let root = temp_dir("installer-source-sha1-mismatch");
+            let server = TestByteServer::start_with_sha1_proof(
+                installer_jar("upstream-installer-id"),
+                vec![b'0'; 40],
+            );
+            let mut record = installer_record();
+            record.component_id = component;
+            record.component_name = component.display_name().to_string();
+            record.strategy = strategy;
+            canonicalize_record_identity(&mut record);
+            let plan = LoaderInstallPlan {
+                record,
+                stage_dir: root.join("stage"),
+            };
+
+            let error = install_from_installer_source(&root, &plan, &server.url, &mut |_| {})
+                .await
+                .expect_err("mismatched proof must fail");
+
+            assert!(
+                matches!(error, LoaderError::Verify(message) if message.contains("live sha1 proof"))
+            );
+            assert!(!root.exists());
+            assert_eq!(server.request_count(), 2);
+            server.stop();
+        }
+    }
+
+    #[tokio::test]
+    async fn installer_source_rejects_malformed_sha1_proof_before_base_effects() {
+        let root = temp_dir("installer-source-sha1-malformed");
+        let server = TestByteServer::start_with_sha1_proof(
+            installer_jar("upstream-installer-id"),
+            b"not-a-digest installer.jar".to_vec(),
+        );
+        let record = installer_record();
+        let plan = LoaderInstallPlan {
+            record,
+            stage_dir: root.join("stage"),
+        };
+
+        let error = install_from_installer_source(&root, &plan, &server.url, &mut |_| {})
+            .await
+            .expect_err("malformed proof must fail");
+
+        assert!(
+            matches!(error, LoaderError::InvalidProfile(message) if message.contains("exactly one 40-hex digest"))
+        );
+        assert!(!root.exists());
+        assert_eq!(server.request_count(), 2);
+        server.stop();
+    }
+
+    #[tokio::test]
     async fn installer_source_installs_to_backend_version_id_when_upstream_id_differs() {
         let root = temp_dir("installer-upstream-id-mismatch");
         write_base_version(&root, "1.21.5");
         let record = installer_record();
-        let installer_server = TestByteServer::start(installer_jar("upstream-installer-id"));
+        let installer_server =
+            TestByteServer::start_with_sha1(installer_jar("upstream-installer-id"));
         let plan = LoaderInstallPlan {
             record: record.clone(),
             stage_dir: root.join("stage"),
         };
         let mut progress = |_progress: DownloadProgress| {};
+        let installer_source =
+            verified_test_source(&installer_server.url, "loader installer").await;
 
         let installed_version_id = install_installer_source_after_authenticated_base(
             &root,
             &plan,
-            &installer_server.url,
+            installer_source,
             &test_client_integrity(&root, &record.minecraft_version),
             &mut progress,
         )
@@ -1575,7 +1637,7 @@ mod tests {
 
         assert_eq!(installed_version_id, record.version_id);
         assert_backend_version_was_written(&root, &record.version_id, "upstream-installer-id");
-        assert_eq!(installer_server.request_count(), 1);
+        assert_eq!(installer_server.request_count(), 2);
         installer_server.stop();
         let _ = fs::remove_dir_all(root);
     }
@@ -1591,7 +1653,7 @@ mod tests {
         record.minecraft_version = minecraft_version.to_string();
         record.loader_version = "10.13.4.1614-1.7.10".to_string();
         canonicalize_record_identity(&mut record);
-        let installer_server = TestByteServer::start(installer_jar_with_profile_json(
+        let installer_server = TestByteServer::start_with_sha1(installer_jar_with_profile_json(
                 format!(
                     r#"{{
                         "id":"upstream-forge-1.7.10",
@@ -1611,11 +1673,13 @@ mod tests {
             record: record.clone(),
             stage_dir: root.join("stage"),
         };
+        let installer_source =
+            verified_test_source(&installer_server.url, "loader installer").await;
 
         let installed_version_id = install_installer_source_after_authenticated_base(
             &root,
             &plan,
-            &installer_server.url,
+            installer_source,
             &test_client_integrity(&root, &record.minecraft_version),
             &mut |_| {},
         )
@@ -1623,7 +1687,7 @@ mod tests {
         .expect("install legacy installer-backed loader");
 
         assert_eq!(installed_version_id, record.version_id);
-        assert_eq!(installer_server.request_count(), 1);
+        assert_eq!(installer_server.request_count(), 2);
         assert_eq!(library_server.request_count(), 1);
         let library_path = root.join("libraries").join(
             "net/minecraftforge/forge/1.7.10-10.13.4.1614-1.7.10/forge-1.7.10-10.13.4.1614-1.7.10.jar",
@@ -1800,16 +1864,18 @@ mod tests {
         canonicalize_record_identity(&mut record);
         assert_eq!(record.version_id, version_id);
         record.strategy = LoaderInstallStrategy::ForgeLegacyInstaller;
-        let installer_server = TestByteServer::start(installer);
+        let installer_server = TestByteServer::start_with_sha1(installer);
         let plan = LoaderInstallPlan {
             record: record.clone(),
-            stage_dir: root.join("stage"),
+            stage_dir: crate::paths::loader_work_dir(&root).join(&record.version_id),
         };
+        let installer_source =
+            verified_test_source(&installer_server.url, "loader installer").await;
 
         install_installer_source_after_authenticated_base(
             &root,
             &plan,
-            &installer_server.url,
+            installer_source,
             &test_client_integrity(&root, &record.minecraft_version),
             &mut |_| {},
         )
@@ -1863,7 +1929,7 @@ mod tests {
         );
         assert_eq!(version["downloads"]["client"]["url"], "");
 
-        assert_eq!(installer_server.request_count(), 1);
+        assert_eq!(installer_server.request_count(), 2);
         installer_server.stop();
         let _ = fs::remove_dir_all(root);
     }
@@ -1909,11 +1975,12 @@ mod tests {
             stage_dir: root.join("stage"),
         };
 
+        let archive_source = verified_test_source(&server.url, "legacy Forge archive").await;
         let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
         let receipt = install_legacy_archive_after_authenticated_base(
             &root,
             &plan,
-            &server.url,
+            archive_source,
             &base_receipt,
             &mut |_progress| {},
         )
@@ -1953,11 +2020,11 @@ mod tests {
             .expect("client jar receipt")
             .integrity()
             .clone();
-        let KnownGoodIntegrity::ExactBytes { digest, size } = installed_jar_receipt else {
-            panic!("client jar receipt must retain exact source bytes");
+        let KnownGoodIntegrity::Sha1 { digest, size } = installed_jar_receipt else {
+            panic!("client jar receipt must retain canonical source integrity");
         };
         assert_eq!(digest.as_str(), sha1_hex(&installed_jar_bytes));
-        assert_eq!(size, installed_jar_bytes.len() as u64);
+        assert_eq!(size, Some(installed_jar_bytes.len() as u64));
         let installed_version_json = fs::read_to_string(
             versions_dir(&root)
                 .join(&record.version_id)
@@ -2013,11 +2080,12 @@ mod tests {
             record: record.clone(),
             stage_dir: root.join("stage"),
         };
+        let archive_source = verified_test_source(&server.url, "legacy Forge archive").await;
 
         let error = install_legacy_archive_after_authenticated_base(
             &root,
             &plan,
-            &server.url,
+            archive_source,
             &base_receipt,
             &mut |_| {},
         )
@@ -2035,9 +2103,6 @@ mod tests {
     #[tokio::test]
     async fn legacy_archive_rejects_mismatched_live_sha1_proof() {
         let root = temp_dir("legacy-archive-sha1-mismatch");
-        let base_version_id = "1.2.5";
-        write_base_version(&root, base_version_id);
-        let base_receipt = test_authenticated_receipt(&root, base_version_id);
         let archive = zip_entries(&[("net/minecraftforge/Forge.class", b"forge".as_slice())]);
         let server = TestByteServer::start_with_sha1_proof(archive, vec![b'0'; 40]);
         let record = legacy_archive_record();
@@ -2045,21 +2110,14 @@ mod tests {
             record: record.clone(),
             stage_dir: root.join("stage"),
         };
-
-        let error = install_legacy_archive_after_authenticated_base(
-            &root,
-            &plan,
-            &server.url,
-            &base_receipt,
-            &mut |_| {},
-        )
-        .await
-        .expect_err("mismatched proof must fail");
+        let error = install_from_legacy_archive(&root, &plan, &server.url, &mut |_| {})
+            .await
+            .expect_err("mismatched proof must fail");
 
         assert!(
             matches!(error, LoaderError::Verify(message) if message.contains("live sha1 proof"))
         );
-        assert!(!versions_dir(&root).join(record.version_id).exists());
+        assert!(!root.exists());
         server.stop();
         let _ = fs::remove_dir_all(root);
     }
@@ -2067,9 +2125,6 @@ mod tests {
     #[tokio::test]
     async fn legacy_archive_rejects_malformed_live_sha1_proof() {
         let root = temp_dir("legacy-archive-sha1-malformed");
-        let base_version_id = "1.2.5";
-        write_base_version(&root, base_version_id);
-        let base_receipt = test_authenticated_receipt(&root, base_version_id);
         let archive = zip_entries(&[("net/minecraftforge/Forge.class", b"forge".as_slice())]);
         let server = TestByteServer::start_with_sha1_proof(
             archive,
@@ -2081,20 +2136,14 @@ mod tests {
             stage_dir: root.join("stage"),
         };
 
-        let error = install_legacy_archive_after_authenticated_base(
-            &root,
-            &plan,
-            &server.url,
-            &base_receipt,
-            &mut |_| {},
-        )
-        .await
-        .expect_err("malformed proof must fail");
+        let error = install_from_legacy_archive(&root, &plan, &server.url, &mut |_| {})
+            .await
+            .expect_err("malformed proof must fail");
 
         assert!(
             matches!(error, LoaderError::InvalidProfile(message) if message.contains("exactly one 40-hex digest"))
         );
-        assert!(!versions_dir(&root).join(record.version_id).exists());
+        assert!(!root.exists());
         server.stop();
         let _ = fs::remove_dir_all(root);
     }
@@ -2128,11 +2177,12 @@ mod tests {
             record: record.clone(),
             stage_dir: root.join("stage"),
         };
+        let archive_source = verified_test_source(&server.url, "legacy Forge archive").await;
 
         let error = install_legacy_archive_after_authenticated_base(
             &root,
             &plan,
-            &server.url,
+            archive_source,
             &base_receipt,
             &mut |_| {},
         )
@@ -2273,6 +2323,12 @@ mod tests {
             size: Some(client.len() as u64),
             sha1: Some(sha1_hex(&client)),
         }
+    }
+
+    async fn verified_test_source(url: &str, label: &'static str) -> VerifiedLoaderSource {
+        fetch_sha1_verified_source(url, super::MAX_INSTALLER_DOWNLOAD_SIZE, label)
+            .await
+            .expect("verified test source")
     }
 
     fn test_authenticated_receipt(

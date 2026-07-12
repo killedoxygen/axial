@@ -8,6 +8,7 @@ mod installed_metadata;
 pub mod legacy;
 mod processors;
 pub mod providers;
+mod source;
 pub mod strategies;
 pub mod types;
 pub mod workspace;
@@ -36,7 +37,6 @@ use crate::artifact_path::MAX_ARTIFACT_PATH_SEGMENT_BYTES;
 use crate::download::DownloadProgress;
 use crate::known_good::KnownGoodInstallReceipt;
 use crate::paths::loader_work_dir;
-use std::fs;
 use std::path::{Component, Path};
 
 pub(crate) const MAX_VERSION_ID_BYTES: usize = MAX_ARTIFACT_PATH_SEGMENT_BYTES - ".json".len();
@@ -73,17 +73,10 @@ where
     let record =
         require_exact_live_build_record(&record, live_record).map_err(LoaderInstallError::from)?;
     let stage_dir = loader_work_dir(library_dir).join(&record.version_id);
-    if stage_dir.exists() {
-        let _ = fs::remove_dir_all(&stage_dir);
-    }
-    fs::create_dir_all(&stage_dir)
-        .map_err(LoaderError::from)
-        .map_err(LoaderInstallError::from)?;
-
     let plan = LoaderInstallPlan { record, stage_dir };
-    let result = Box::pin(strategies::install_build(library_dir, &plan, send)).await;
-    let _ = fs::remove_dir_all(&plan.stage_dir);
-    result.map_err(LoaderInstallError::from)
+    Box::pin(strategies::install_build(library_dir, &plan, send))
+        .await
+        .map_err(LoaderInstallError::from)
 }
 
 fn require_exact_live_build_record(
