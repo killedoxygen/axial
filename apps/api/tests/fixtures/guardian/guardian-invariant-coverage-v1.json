@@ -11,7 +11,7 @@
     },
     {
       "id": "I3",
-      "status": "pending_prepare_failure_guidance"
+      "status": "public_launch_failure_guidance_complete"
     },
     {
       "id": "I4",
@@ -6613,21 +6613,6 @@
     }
   ],
   "known_gaps": [
-    {
-      "invariant": "I3",
-      "boundary": "prepare_failure_guidance",
-      "missing_variants": [
-        "Unknown",
-        "OutOfMemory",
-        "GraphicsDriverCrash",
-        "MissingDependency",
-        "ModTransformationFailure",
-        "ModAttributedCrash",
-        "ClasspathModuleConflict",
-        "AuthModeIncompatible",
-        "LoaderBootstrapFailure"
-      ]
-    },
     {
       "invariant": "I7",
       "boundary": "loader_preoperation_and_delegated_failures",

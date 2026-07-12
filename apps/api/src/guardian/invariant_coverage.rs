@@ -197,7 +197,7 @@ fn generate_coverage() -> InvariantCoverage {
         invariants: vec![
             invariant("I1", "launch_failure_matrix_and_rules_registered"),
             invariant("I2", "current_typed_hands_registered"),
-            invariant("I3", "pending_prepare_failure_guidance"),
+            invariant("I3", "public_launch_failure_guidance_complete"),
             invariant("I4", "current_hand_attempt_bounds_registered"),
             invariant("I5", "launch_failure_surfaces_bounded_and_redacted"),
             invariant("I6", "launch_failure_mapping_round_trip_only"),
@@ -243,36 +243,19 @@ fn generate_coverage() -> InvariantCoverage {
                 status: "agent_fallback_execution_pending".to_string(),
             },
         ],
-        known_gaps: vec![
-            KnownGap {
-                invariant: "I3".to_string(),
-                boundary: "prepare_failure_guidance".to_string(),
-                missing_variants: vec![
-                    "Unknown".to_string(),
-                    "OutOfMemory".to_string(),
-                    "GraphicsDriverCrash".to_string(),
-                    "MissingDependency".to_string(),
-                    "ModTransformationFailure".to_string(),
-                    "ModAttributedCrash".to_string(),
-                    "ClasspathModuleConflict".to_string(),
-                    "AuthModeIncompatible".to_string(),
-                    "LoaderBootstrapFailure".to_string(),
-                ],
-            },
-            KnownGap {
-                invariant: "I7".to_string(),
-                boundary: "loader_preoperation_and_delegated_failures".to_string(),
-                missing_variants: vec![
-                    "InvalidMinecraftVersion".to_string(),
-                    "InvalidBuildId".to_string(),
-                    "CatalogUnavailable".to_string(),
-                    "CatalogStale".to_string(),
-                    "BuildNotFound".to_string(),
-                    "BaseInstallFailed".to_string(),
-                    "ArtifactDownloadFailed".to_string(),
-                ],
-            },
-        ],
+        known_gaps: vec![KnownGap {
+            invariant: "I7".to_string(),
+            boundary: "loader_preoperation_and_delegated_failures".to_string(),
+            missing_variants: vec![
+                "InvalidMinecraftVersion".to_string(),
+                "InvalidBuildId".to_string(),
+                "CatalogUnavailable".to_string(),
+                "CatalogStale".to_string(),
+                "BuildNotFound".to_string(),
+                "BaseInstallFailed".to_string(),
+                "ArtifactDownloadFailed".to_string(),
+            ],
+        }],
     }
 }
 
@@ -338,6 +321,7 @@ fn assert_reachable_public_copy(cells: &[KernelCell]) {
                 raw_jvm_args_intervention_applied: true,
             });
             assert_public_outcome(
+                prepare.user_outcome.decision(),
                 prepare.user_outcome.summary(),
                 prepare.user_outcome.details(),
                 prepare.user_outcome.guidance(),
@@ -370,6 +354,7 @@ fn assert_reachable_public_copy(cells: &[KernelCell]) {
                 effective_preset: "performance",
             });
             assert_public_outcome(
+                startup.user_outcome.decision(),
                 startup.user_outcome.summary(),
                 startup.user_outcome.details(),
                 startup.user_outcome.guidance(),
@@ -385,11 +370,19 @@ fn assert_reachable_public_copy(cells: &[KernelCell]) {
     }
 }
 
-fn assert_public_outcome(summary: &str, details: &[String], guidance: &[String]) {
+fn assert_public_outcome(
+    decision: GuardianActionKind,
+    summary: &str,
+    details: &[String],
+    guidance: &[String],
+) {
     assert!(!summary.is_empty() && summary.len() <= 180);
     assert!(!evidence_text_looks_sensitive(summary));
     assert!(details.len() <= 6);
     assert!(guidance.len() <= 6);
+    if decision != GuardianActionKind::Allow {
+        assert!(!guidance.is_empty());
+    }
     assert!(
         details
             .iter()
@@ -629,6 +622,7 @@ fn loader_adapter_coverage() -> Vec<LoaderAdapterCell> {
                     )
                     .expect("loader evidence reaches a blocking Guardian outcome");
                     assert_public_outcome(
+                        outcome.user_outcome.decision(),
                         outcome.user_outcome.summary(),
                         outcome.user_outcome.details(),
                         outcome.user_outcome.guidance(),

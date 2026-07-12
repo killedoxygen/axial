@@ -2767,7 +2767,6 @@ struct AcceptedLaunchFailureCopy {
     startup_detail: String,
     running_summary: String,
     running_detail: String,
-    guidance: String,
 }
 
 fn first_suspected_mod(crash_evidence: Option<&CrashEvidence>) -> Option<String> {
@@ -2777,9 +2776,9 @@ fn first_suspected_mod(crash_evidence: Option<&CrashEvidence>) -> Option<String>
             sanitize_evidence_text(
                 suspected_mod.name.as_str(),
                 RedactionAudience::UserVisible,
-                MAX_LINE_BYTES,
+                MAX_DYNAMIC_TOKEN_BYTES,
             )
-            .filter(|suspected_mod| suspected_mod.len() <= MAX_LINE_BYTES)
+            .filter(|suspected_mod| suspected_mod.len() <= MAX_DYNAMIC_TOKEN_BYTES)
         })
 }
 
@@ -2792,25 +2791,21 @@ fn accepted_failure_copy(
             "Minecraft exited before startup completed after running out of memory.",
             "Minecraft stopped after running out of memory.",
             "Guardian detected an out-of-memory crash after startup completed.",
-            "Review the instance memory allocation and close memory-heavy apps before retrying.",
         ),
         LaunchFailureClass::GraphicsDriverCrash => (
             "Minecraft exited before startup completed with a detected graphics driver crash.",
             "Minecraft stopped after a graphics driver crash.",
             "Guardian detected a native graphics driver crash after startup completed.",
-            "Update or reinstall the graphics driver, then retry without graphics overlays.",
         ),
         LaunchFailureClass::MissingDependency => (
             "Minecraft exited before startup completed because a required dependency was missing.",
             "Minecraft stopped because a dependency was missing.",
             "Guardian detected a missing class or dependency after startup completed.",
-            "Check the installed mods for missing or incompatible dependencies before retrying.",
         ),
         LaunchFailureClass::ModTransformationFailure => (
             "Minecraft exited before startup completed with a detected mod transformation or mixin failure.",
             "Minecraft stopped during mod transformation.",
             "Guardian detected a mod transformation or mixin failure after startup completed.",
-            "Update or remove the recently changed mod before retrying.",
         ),
         LaunchFailureClass::ModAttributedCrash => {
             return Some(AcceptedLaunchFailureCopy {
@@ -2823,9 +2818,6 @@ fn accepted_failure_copy(
                 running_detail: suspected_mod
                     .map(|name| format!("Guardian attributes the crash to the installed mod {name}."))
                     .unwrap_or_else(|| "Guardian found typed crash evidence that attributes the failure to an installed mod.".to_string()),
-                guidance: suspected_mod
-                    .map(|name| format!("Update or remove {name} before retrying."))
-                    .unwrap_or_else(|| "Update or remove the suspected mod before retrying.".to_string()),
             });
         }
         LaunchFailureClass::Unknown
@@ -2843,7 +2835,6 @@ fn accepted_failure_copy(
         startup_detail: copy.0.to_string(),
         running_summary: copy.1.to_string(),
         running_detail: copy.2.to_string(),
-        guidance: copy.3.to_string(),
     })
 }
 
@@ -2873,57 +2864,134 @@ fn prepare_failure_reason(failure_class: LaunchFailureClass) -> &'static str {
     }
 }
 
-fn prepare_failure_guidance(
-    failure_class: LaunchFailureClass,
+#[derive(Clone, Copy)]
+struct LaunchFailureGuidanceContext<'a> {
+    phase: OperationPhase,
     explicit_java: bool,
     explicit_jvm_args: bool,
     explicit_jvm_preset: bool,
-) -> Vec<String> {
-    let value = match failure_class {
-        LaunchFailureClass::JavaRuntimeMismatch if explicit_java => {
-            Some("Remove the Java override or switch Guardian Mode back to Managed.")
-        }
-        LaunchFailureClass::JavaRuntimeMismatch => {
-            Some("Use a compatible Java runtime or let Axial use the managed runtime.")
-        }
-        LaunchFailureClass::JvmUnsupportedOption
-        | LaunchFailureClass::JvmExperimentalUnlock
-        | LaunchFailureClass::JvmOptionOrdering
-            if explicit_jvm_args =>
-        {
-            Some("Remove the explicit JVM args or switch Guardian Mode back to Managed.")
-        }
-        LaunchFailureClass::JvmUnsupportedOption
-        | LaunchFailureClass::JvmExperimentalUnlock
-        | LaunchFailureClass::JvmOptionOrdering
-            if explicit_jvm_preset =>
-        {
-            Some("Choose a safer JVM preset or switch Guardian Mode back to Managed.")
-        }
-        LaunchFailureClass::JvmUnsupportedOption
-        | LaunchFailureClass::JvmExperimentalUnlock
-        | LaunchFailureClass::JvmOptionOrdering => {
-            Some("Use safer launch settings or let Axial manage compatibility.")
-        }
-        LaunchFailureClass::StartupStalled => {
-            Some("Launch stalled before startup. Review recent override changes first.")
-        }
-        LaunchFailureClass::LauncherManagedArtifactSignature => Some(
-            "Repair the installed version so Axial can replace the affected launcher-managed jars.",
-        ),
+    suspected_mod: Option<&'a str>,
+}
+
+fn launch_failure_guidance(
+    failure_class: LaunchFailureClass,
+    context: LaunchFailureGuidanceContext<'_>,
+) -> String {
+    match failure_class {
         LaunchFailureClass::Unknown
-        | LaunchFailureClass::ClasspathModuleConflict
-        | LaunchFailureClass::AuthModeIncompatible
-        | LaunchFailureClass::LoaderBootstrapFailure
-        | LaunchFailureClass::OutOfMemory
-        | LaunchFailureClass::GraphicsDriverCrash
-        | LaunchFailureClass::MissingDependency
-        | LaunchFailureClass::ModTransformationFailure
-        | LaunchFailureClass::ModAttributedCrash => None,
-    };
-    value
-        .map(|line| vec![trusted_line(line, MAX_LINE_BYTES)])
-        .unwrap_or_default()
+            if context.explicit_java
+                || context.explicit_jvm_args
+                || context.explicit_jvm_preset =>
+        {
+            trusted_line(
+                "Review recent Java, JVM preset, or JVM argument overrides before retrying.",
+                MAX_LINE_BYTES,
+            )
+        }
+        LaunchFailureClass::Unknown if context.phase == OperationPhase::Preparing => trusted_line(
+            "Review the reported failure and recent launch-setting changes before retrying.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::Unknown => trusted_line(
+            "Review the latest game log before retrying.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering
+            if context.explicit_jvm_args =>
+        {
+            trusted_line(
+                "Remove the explicit JVM args or switch Guardian Mode back to Managed.",
+                MAX_LINE_BYTES,
+            )
+        }
+        LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering
+            if context.explicit_jvm_preset =>
+        {
+            trusted_line(
+                "Choose a safer JVM preset or switch Guardian Mode back to Managed.",
+                MAX_LINE_BYTES,
+            )
+        }
+        LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering => trusted_line(
+            "Use safer launch settings or let Axial manage compatibility.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::JavaRuntimeMismatch if context.explicit_java => trusted_line(
+            "Remove the Java override or switch Guardian Mode back to Managed.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::JavaRuntimeMismatch => trusted_line(
+            "Use a compatible Java runtime or let Axial use the managed runtime.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::OutOfMemory => trusted_line(
+            "Review the instance memory allocation and close memory-heavy apps before retrying.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::GraphicsDriverCrash => trusted_line(
+            "Update or reinstall the graphics driver, then retry without graphics overlays.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::MissingDependency => trusted_line(
+            "Check the installed mods for missing or incompatible dependencies before retrying.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::ModTransformationFailure => trusted_line(
+            "Update or remove the recently changed mod before retrying.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::ModAttributedCrash => context
+            .suspected_mod
+            .map(|name| checked_rendered_line(format!("Update or remove {name} before retrying.")))
+            .unwrap_or_else(|| {
+                trusted_line(
+                    "Update or remove the suspected mod before retrying.",
+                    MAX_LINE_BYTES,
+                )
+            }),
+        LaunchFailureClass::ClasspathModuleConflict => trusted_line(
+            "Check for incompatible mods or libraries that alter the classpath before retrying.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::LauncherManagedArtifactSignature => trusted_line(
+            "Repair the installed version so Axial can replace the affected launcher-managed jars.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::AuthModeIncompatible => trusted_line(
+            "Verify the selected account and authentication mode before retrying.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::LoaderBootstrapFailure => trusted_line(
+            "Repair or reinstall the selected mod loader before retrying.",
+            MAX_LINE_BYTES,
+        ),
+        LaunchFailureClass::StartupStalled
+            if context.explicit_java
+                || context.explicit_jvm_args
+                || context.explicit_jvm_preset =>
+        {
+            trusted_line(
+                "Review recent Java, JVM preset, or JVM argument overrides before retrying.",
+                MAX_LINE_BYTES,
+            )
+        }
+        LaunchFailureClass::StartupStalled if context.phase == OperationPhase::Preparing => {
+            trusted_line(
+                "Launch stalled before startup. Review recent override changes first.",
+                MAX_LINE_BYTES,
+            )
+        }
+        LaunchFailureClass::StartupStalled => trusted_line(
+            "Review the latest game log before retrying.",
+            MAX_LINE_BYTES,
+        ),
+    }
 }
 
 fn author_prepare_failure_copy(
@@ -2951,7 +3019,16 @@ fn author_prepare_failure_copy(
         OperationPhase::Preparing,
         trusted_line(summary, MAX_SUMMARY_BYTES),
         finalize_launch_lines([detail]),
-        prepare_failure_guidance(failure_class, explicit_java, explicit_jvm_args, false),
+        finalize_launch_lines([launch_failure_guidance(
+            failure_class,
+            LaunchFailureGuidanceContext {
+                phase: OperationPhase::Preparing,
+                explicit_java,
+                explicit_jvm_args,
+                explicit_jvm_preset: false,
+                suspected_mod: None,
+            },
+        )]),
     )
 }
 
@@ -3009,33 +3086,16 @@ fn author_startup_failure_copy(input: StartupFailureCopyInput<'_>) -> GuardianUs
         explicit_jvm_preset,
         directive,
     } = input;
-    let explicit_intent = explicit_java || explicit_jvm_args || explicit_jvm_preset;
-    let guidance = if let Some(copy) = accepted_failure_copy(failure_class, suspected_mod) {
-        vec![copy.guidance]
-    } else if failure_class == LaunchFailureClass::StartupStalled {
-        vec![if explicit_intent {
-            "Review recent Java, JVM preset, or JVM argument overrides before retrying.".to_string()
-        } else {
-            "Review the latest game log before retrying.".to_string()
-        }]
-    } else {
-        let specific = prepare_failure_guidance(
-            failure_class,
+    let guidance = launch_failure_guidance(
+        failure_class,
+        LaunchFailureGuidanceContext {
+            phase: OperationPhase::Launching,
             explicit_java,
             explicit_jvm_args,
             explicit_jvm_preset,
-        );
-        if specific.is_empty() {
-            vec![if explicit_intent {
-                "Review recent Java, JVM preset, or JVM argument overrides before retrying."
-                    .to_string()
-            } else {
-                "Review the latest game log before retrying.".to_string()
-            }]
-        } else {
-            specific
-        }
-    };
+            suspected_mod,
+        },
+    );
     let summary = match decision {
         GuardianActionKind::Downgrade
         | GuardianActionKind::Strip
@@ -3051,7 +3111,7 @@ fn author_startup_failure_copy(input: StartupFailureCopyInput<'_>) -> GuardianUs
         finalize_launch_lines([directive
             .map(guardian_directive_description)
             .unwrap_or_else(|| startup_failure_reason(failure_class, stalled, suspected_mod))]),
-        finalize_launch_lines(guidance),
+        finalize_launch_lines([guidance]),
     )
 }
 
@@ -3080,7 +3140,16 @@ fn author_observed_launch_failure_copy(
         phase,
         launch_summary(&summary),
         finalize_launch_lines([detail]),
-        finalize_launch_lines([copy.guidance]),
+        finalize_launch_lines([launch_failure_guidance(
+            failure_class,
+            LaunchFailureGuidanceContext {
+                phase,
+                explicit_java: false,
+                explicit_jvm_args: false,
+                explicit_jvm_preset: false,
+                suspected_mod,
+            },
+        )]),
     ))
 }
 

@@ -16,7 +16,9 @@
           "details": [
             "Launch preparation failed."
           ],
-          "guidance": []
+          "guidance": [
+            "Verify the selected account and authentication mode before retrying."
+          ]
         }
       }
     },
@@ -35,7 +37,9 @@
           "details": [
             "Launch preparation failed."
           ],
-          "guidance": []
+          "guidance": [
+            "Check for incompatible mods or libraries that alter the classpath before retrying."
+          ]
         }
       }
     },
@@ -54,7 +58,9 @@
           "details": [
             "Launch preparation failed."
           ],
-          "guidance": []
+          "guidance": [
+            "Update or reinstall the graphics driver, then retry without graphics overlays."
+          ]
         }
       }
     },
@@ -383,7 +389,9 @@
           "details": [
             "Launch preparation failed."
           ],
-          "guidance": []
+          "guidance": [
+            "Repair or reinstall the selected mod loader before retrying."
+          ]
         }
       }
     },
@@ -402,7 +410,9 @@
           "details": [
             "Launch preparation failed."
           ],
-          "guidance": []
+          "guidance": [
+            "Check the installed mods for missing or incompatible dependencies before retrying."
+          ]
         }
       }
     },
@@ -421,7 +431,9 @@
           "details": [
             "Launch preparation failed."
           ],
-          "guidance": []
+          "guidance": [
+            "Update or remove the suspected mod before retrying."
+          ]
         }
       }
     },
@@ -440,7 +452,9 @@
           "details": [
             "Launch preparation failed."
           ],
-          "guidance": []
+          "guidance": [
+            "Update or remove the recently changed mod before retrying."
+          ]
         }
       }
     },
@@ -459,7 +473,9 @@
           "details": [
             "Launch preparation failed."
           ],
-          "guidance": []
+          "guidance": [
+            "Review the instance memory allocation and close memory-heavy apps before retrying."
+          ]
         }
       }
     },
@@ -499,7 +515,9 @@
           "details": [
             "Launch preparation failed."
           ],
-          "guidance": []
+          "guidance": [
+            "Review the reported failure and recent launch-setting changes before retrying."
+          ]
         }
       }
     },
@@ -583,7 +601,7 @@
             "Minecraft exited before startup completed because the selected auth mode was not launch-ready."
           ],
           "guidance": [
-            "Review the latest game log before retrying."
+            "Verify the selected account and authentication mode before retrying."
           ]
         }
       }
@@ -604,7 +622,7 @@
             "Minecraft exited before startup completed with a detected classpath or module conflict."
           ],
           "guidance": [
-            "Review the latest game log before retrying."
+            "Check for incompatible mods or libraries that alter the classpath before retrying."
           ]
         }
       }
@@ -751,7 +769,7 @@
             "Minecraft exited before startup completed with a detected loader bootstrap failure."
           ],
           "guidance": [
-            "Review the latest game log before retrying."
+            "Repair or reinstall the selected mod loader before retrying."
           ]
         }
       }
@@ -1406,7 +1424,9 @@
           "details": [
             "Launch preparation failed before Minecraft could start."
           ],
-          "guidance": []
+          "guidance": [
+            "Review recent Java, JVM preset, or JVM argument overrides before retrying."
+          ]
         }
       }
     },
