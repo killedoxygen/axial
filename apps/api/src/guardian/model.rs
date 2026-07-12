@@ -779,15 +779,6 @@ pub struct ActionPlanPrerequisite {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GuardianDecision {
-    pub operation_id: Option<OperationId>,
-    pub mode: GuardianMode,
-    pub kind: GuardianActionKind,
-    pub diagnoses: Vec<DiagnosisId>,
-    pub action_plan: Option<GuardianActionPlan>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GuardianActionPlan {
     pub owner: StabilizationSystem,
     pub prerequisite: ActionPlanPrerequisite,

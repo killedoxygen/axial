@@ -286,17 +286,16 @@ fn kernel_cells() -> Vec<KernelCell> {
             for &mode in GuardianMode::ALL {
                 let decision = failure_class_matrix_decision(failure_class, phase, mode);
                 let diagnosis = decision
-                    .action_plan
-                    .as_ref()
+                    .action_plan()
                     .map(|plan| plan.prerequisite.diagnosis_id)
-                    .or_else(|| decision.diagnoses.first().copied())
+                    .or_else(|| decision.diagnoses().first().copied())
                     .expect("total kernel decision has a diagnosis");
                 cells.push(KernelCell {
                     failure_class: failure_class.as_str().to_string(),
                     phase: debug_name(&phase),
                     mode: debug_name(&mode),
                     diagnosis: diagnosis.as_str().to_string(),
-                    decision: debug_name(&decision.kind),
+                    decision: debug_name(&decision.kind()),
                     public_surface: matches!(
                         phase,
                         OperationPhase::Preparing | OperationPhase::Launching
@@ -344,7 +343,7 @@ fn assert_reachable_public_copy(cells: &[KernelCell]) {
                 failure_class,
                 OperationPhase::Preparing,
                 mode,
-                prepare.guardian_decision.kind,
+                prepare.guardian_decision.kind(),
             );
 
             let observation = if failure_class == LaunchFailureClass::StartupStalled {
@@ -377,7 +376,7 @@ fn assert_reachable_public_copy(cells: &[KernelCell]) {
                 failure_class,
                 OperationPhase::Launching,
                 mode,
-                startup.guardian_decision.kind,
+                startup.guardian_decision.kind(),
             );
         }
     }

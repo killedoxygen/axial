@@ -8,8 +8,30 @@ use super::{
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::{
-    OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
+    OperationId, OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct GuardianDecisionFixture {
+    operation_id: Option<OperationId>,
+    mode: GuardianMode,
+    kind: GuardianActionKind,
+    diagnoses: Vec<DiagnosisId>,
+    action_plan: Option<GuardianActionPlan>,
+}
+
+impl GuardianDecisionFixture {
+    fn into_decision(self) -> GuardianDecision {
+        GuardianDecision::for_test(
+            self.operation_id,
+            self.mode,
+            self.kind,
+            self.diagnoses,
+            self.action_plan,
+        )
+    }
+}
 
 const GUARDIAN_DECISION_ACTIONS_FIXTURE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -23,8 +45,11 @@ const GUARDIAN_FACT_IDS_FIXTURE: &str = include_str!(concat!(
 #[test]
 fn checked_in_guardian_decision_actions_fixture_is_byte_stable() {
     let decisions =
-        serde_json::from_str::<Vec<GuardianDecision>>(GUARDIAN_DECISION_ACTIONS_FIXTURE)
-            .expect("decision fixture");
+        serde_json::from_str::<Vec<GuardianDecisionFixture>>(GUARDIAN_DECISION_ACTIONS_FIXTURE)
+            .expect("decision fixture")
+            .into_iter()
+            .map(GuardianDecisionFixture::into_decision)
+            .collect::<Vec<_>>();
     let expected_kinds = [
         GuardianActionKind::Allow,
         GuardianActionKind::Warn,
@@ -41,17 +66,17 @@ fn checked_in_guardian_decision_actions_fixture_is_byte_stable() {
     assert_eq!(
         decisions
             .iter()
-            .map(|decision| decision.kind)
+            .map(GuardianDecision::kind)
             .collect::<Vec<_>>(),
         expected_kinds
     );
     for decision in &decisions {
-        assert_fixture_action_kind(decision.kind);
-        let plan = decision.action_plan.as_ref().expect("fixture action plan");
+        assert_fixture_action_kind(decision.kind());
+        let plan = decision.action_plan().expect("fixture action plan");
         let action = plan.actions.as_slice().first().expect("fixture action");
         assert_eq!(plan.actions.len(), 1);
         assert_eq!(
-            decision.diagnoses.as_slice(),
+            decision.diagnoses(),
             std::slice::from_ref(&plan.prerequisite.diagnosis_id)
         );
         assert_eq!(action.reason, plan.prerequisite.diagnosis_id);
@@ -64,7 +89,7 @@ fn checked_in_guardian_decision_actions_fixture_is_byte_stable() {
             plan.prerequisite.affected_targets.first()
         );
 
-        let decision_kind = serde_json::to_string(&decision.kind).expect("decision kind");
+        let decision_kind = serde_json::to_string(&decision.kind()).expect("decision kind");
         let action_kind = serde_json::to_string(&action.kind).expect("action kind");
         assert_eq!(decision_kind, action_kind);
     }
@@ -73,8 +98,8 @@ fn checked_in_guardian_decision_actions_fixture_is_byte_stable() {
     assert_eq!(format!("{pretty}\n"), GUARDIAN_DECISION_ACTIONS_FIXTURE);
 
     let compact = serde_json::to_string(&decisions).expect("compact decision fixture");
-    let decoded =
-        serde_json::from_str::<Vec<GuardianDecision>>(&compact).expect("decode compact decisions");
+    let decoded = serde_json::from_str::<Vec<GuardianDecisionFixture>>(&compact)
+        .expect("decode compact decisions");
     assert_eq!(
         serde_json::to_string(&decoded).expect("re-encode compact decisions"),
         compact

@@ -1400,7 +1400,8 @@ pub fn trace_launch_event(session_id: &str, message: &str) {
 mod tests {
     use super::*;
     use crate::guardian::{
-        GuardianActionKind, GuardianDomain, GuardianMode, guardian_user_outcome_for_test,
+        GuardianActionKind, GuardianDomain, GuardianMode, GuardianSummaryDecision,
+        guardian_summary_for_test, guardian_user_outcome_for_test,
     };
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
     use crate::state::contracts::{
@@ -1427,6 +1428,17 @@ mod tests {
     const TEST_TELEMETRY_KEY: &str = "phc_test";
     const CRASH_E2E_INSTANCE_ID: &str = "0123456789abcdef";
     const CRASH_E2E_FABRIC_VERSION_ID: &str = "fabric-loader-0.16.10-1.21.1";
+
+    fn empty_guardian_summary(mode: axial_launcher::GuardianMode) -> GuardianSummary {
+        guardian_summary_for_test(
+            mode,
+            GuardianSummaryDecision::Allowed,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
 
     #[tokio::test]
     async fn launch_loop_caps_a_prepare_directive_that_never_marks_itself_applied() {
@@ -1559,14 +1571,14 @@ mod tests {
         assert!(error.message.chars().count() <= 180);
         let guardian = error.guardian.as_ref().expect("OOM Guardian summary");
         assert_eq!(
-            guardian.decision,
-            crate::guardian::summary::GuardianDecision::Blocked
+            guardian.decision(),
+            crate::guardian::GuardianSummaryDecision::Blocked
         );
-        assert_eq!(guardian.message.as_deref(), Some(error.message.as_str()));
-        assert!(guardian.details.iter().any(|detail| {
+        assert_eq!(guardian.message(), Some(error.message.as_str()));
+        assert!(guardian.details().iter().any(|detail| {
             detail == "Minecraft exited before startup completed after running out of memory."
         }));
-        assert!(guardian.guidance.iter().any(|detail| {
+        assert!(guardian.guidance().iter().any(|detail| {
             detail
                 == "Review the instance memory allocation and close memory-heavy apps before retrying."
         }));
@@ -1668,8 +1680,8 @@ mod tests {
             preflight.readiness.reasons
         );
         assert_eq!(
-            preflight.guardian.decision,
-            crate::guardian::summary::GuardianDecision::Warned
+            preflight.guardian.decision(),
+            crate::guardian::GuardianSummaryDecision::Warned
         );
         let recent_failure = preflight
             .guardian_facts
@@ -1683,7 +1695,7 @@ mod tests {
                 .any(|field| { field.key == "failure_class" && field.value == "out_of_memory" })
         );
         assert!(
-            preflight.guardian.details.iter().any(|detail| {
+            preflight.guardian.details().iter().any(|detail| {
                 detail.contains("out-of-memory crash") && detail.contains("today")
             })
         );
@@ -1703,8 +1715,8 @@ mod tests {
             .expect("prepare low-end preflight after Fabric OOM crash");
         assert!(low_end_preflight.readiness.launchable);
         assert_eq!(
-            low_end_preflight.guardian.decision,
-            crate::guardian::summary::GuardianDecision::Warned
+            low_end_preflight.guardian.decision(),
+            crate::guardian::GuardianSummaryDecision::Warned
         );
         assert_eq!(low_end_preflight.memory.max_memory_mb, 1024);
         assert_eq!(
@@ -1728,11 +1740,11 @@ mod tests {
             Some("2048")
         );
         assert!(
-            low_end_preflight.guardian.details.iter().any(|detail| {
+            low_end_preflight.guardian.details().iter().any(|detail| {
                 detail.contains("out-of-memory crash") && detail.contains("today")
             })
         );
-        assert!(low_end_preflight.guardian.guidance.iter().any(|guidance| {
+        assert!(low_end_preflight.guardian.guidance().iter().any(|guidance| {
             guidance
                 == "Increase this instance's maximum memory from 1024 MB to 2048 MB before relaunching."
         }));
@@ -2099,8 +2111,8 @@ mod tests {
         assert_eq!(preflight.status, "ready");
         assert!(preflight.readiness.launchable);
         assert_eq!(
-            preflight.guardian.decision,
-            crate::guardian::summary::GuardianDecision::Warned
+            preflight.guardian.decision(),
+            crate::guardian::GuardianSummaryDecision::Warned
         );
         let recent_failure = preflight
             .guardian_facts
@@ -2111,11 +2123,11 @@ mod tests {
             field.key == "failure_class" && field.value == "mod_attributed_crash"
         }));
         assert!(
-            preflight.guardian.details.iter().any(|detail| {
+            preflight.guardian.details().iter().any(|detail| {
                 detail.contains("mod-attributed crash") && detail.contains("today")
             })
         );
-        assert!(preflight.guardian.guidance.iter().any(|guidance| {
+        assert!(preflight.guardian.guidance().iter().any(|guidance| {
             guidance
                 == "Review recently changed mods and disable the suspected mod before relaunching."
         }));
@@ -2134,8 +2146,8 @@ mod tests {
             .expect("prepare normal-host preflight after Fabric mod crash");
         assert!(normal_preflight.readiness.launchable);
         assert_eq!(
-            normal_preflight.guardian.decision,
-            crate::guardian::summary::GuardianDecision::Warned
+            normal_preflight.guardian.decision(),
+            crate::guardian::GuardianSummaryDecision::Warned
         );
         assert_eq!(normal_preflight.memory.max_memory_mb, 4096);
         assert_eq!(
@@ -2155,11 +2167,11 @@ mod tests {
             Some("mod_attributed_crash")
         );
         assert!(
-            normal_preflight.guardian.details.iter().any(|detail| {
+            normal_preflight.guardian.details().iter().any(|detail| {
                 detail.contains("mod-attributed crash") && detail.contains("today")
             })
         );
-        assert!(normal_preflight.guardian.guidance.iter().any(|guidance| {
+        assert!(normal_preflight.guardian.guidance().iter().any(|guidance| {
             guidance
                 == "Review recently changed mods and disable the suspected mod before relaunching."
         }));
@@ -2267,7 +2279,7 @@ mod tests {
         assert!(
             handoff_tx
                 .send(TerminalObservationHandoff::Observe {
-                    guardian: GuardianSummary::new(axial_launcher::GuardianMode::Managed),
+                    guardian: empty_guardian_summary(axial_launcher::GuardianMode::Managed),
                 })
                 .is_ok(),
             "handoff observed startup failure"
@@ -2401,7 +2413,7 @@ mod tests {
             .insert(test_record(session_id))
             .await
             .expect("insert session");
-        let mut guardian = GuardianSummary::new(axial_launcher::GuardianMode::Managed);
+        let mut guardian = empty_guardian_summary(axial_launcher::GuardianMode::Managed);
         let user_outcome = guardian_user_outcome_for_test(
             GuardianActionKind::Block,
             OperationPhase::Preparing,
@@ -2430,8 +2442,8 @@ mod tests {
 
         assert_eq!(error.message, user_outcome.summary());
         assert_eq!(
-            guardian.decision,
-            crate::guardian::summary::GuardianDecision::Blocked
+            guardian.decision(),
+            crate::guardian::GuardianSummaryDecision::Blocked
         );
         let record = state
             .sessions()
@@ -2864,7 +2876,7 @@ mod tests {
                 },
                 performance_mode: "managed".to_string(),
             },
-            guardian: GuardianSummary::new(axial_launcher::GuardianMode::Managed),
+            guardian: empty_guardian_summary(axial_launcher::GuardianMode::Managed),
             launched_at: "2026-01-01T00:00:00Z".to_string(),
             benchmark: None,
             resource_budget: None,
@@ -3365,7 +3377,7 @@ exit 1
         assert!(
             preflight
                 .guardian
-                .guidance
+                .guidance()
                 .iter()
                 .any(|guidance| guidance == &expected),
             "missing OOM next-launch guidance: {expected}"

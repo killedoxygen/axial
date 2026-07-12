@@ -945,7 +945,7 @@ mod tests {
         assert!(result.is_err());
         assert!(!runtime_root.join(".axial-ready").exists());
         assert!(stores.failure_memory.list().is_empty());
-        let operation_id = decision.operation_id.as_ref().expect("repair operation id");
+        let operation_id = decision.operation_id().expect("repair operation id");
         let journal = stores
             .journals
             .get(operation_id)
@@ -1012,7 +1012,7 @@ mod tests {
             fs::read(runtime_root.join(".axial-ready")).expect("ready marker"),
             b"sentinel-after-effect"
         );
-        let operation_id = decision.operation_id.as_ref().expect("repair operation id");
+        let operation_id = decision.operation_id().expect("repair operation id");
         let journal = stores
             .journals
             .get(operation_id)
@@ -1048,8 +1048,7 @@ mod tests {
         let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let target = decision
-            .action_plan
-            .as_ref()
+            .action_plan()
             .expect("plan")
             .prerequisite
             .affected_targets[0]
@@ -1257,30 +1256,48 @@ mod tests {
         write_fake_java(&runtime_root);
         for decision in [
             {
-                let mut decision = repair_decision(OwnershipClass::LauncherManaged);
-                decision.kind = GuardianActionKind::Block;
-                decision
+                let decision = repair_decision(OwnershipClass::LauncherManaged);
+                GuardianDecision::for_test(
+                    decision.operation_id().cloned(),
+                    decision.mode(),
+                    GuardianActionKind::Block,
+                    decision.diagnoses().to_vec(),
+                    decision.action_plan().cloned(),
+                )
             },
             {
-                let mut decision = repair_decision(OwnershipClass::LauncherManaged);
-                decision.mode = GuardianMode::Disabled;
-                decision
+                let decision = repair_decision(OwnershipClass::LauncherManaged);
+                GuardianDecision::for_test(
+                    decision.operation_id().cloned(),
+                    GuardianMode::Disabled,
+                    decision.kind(),
+                    decision.diagnoses().to_vec(),
+                    decision.action_plan().cloned(),
+                )
             },
             {
-                let mut decision = repair_decision(OwnershipClass::LauncherManaged);
-                decision
-                    .action_plan
-                    .as_mut()
-                    .expect("plan")
-                    .prerequisite
-                    .confidence = crate::guardian::GuardianConfidence::High;
-                decision
+                let decision = repair_decision(OwnershipClass::LauncherManaged);
+                let mut action_plan = decision.action_plan().cloned().expect("plan");
+                action_plan.prerequisite.confidence = crate::guardian::GuardianConfidence::High;
+                GuardianDecision::for_test(
+                    decision.operation_id().cloned(),
+                    decision.mode(),
+                    decision.kind(),
+                    decision.diagnoses().to_vec(),
+                    Some(action_plan),
+                )
             },
             {
-                let mut decision = repair_decision(OwnershipClass::LauncherManaged);
-                decision.action_plan.as_mut().expect("plan").actions[0].reason =
-                    DiagnosisId::DownloadUnavailable;
-                decision
+                let decision = repair_decision(OwnershipClass::LauncherManaged);
+                let mut action_plan = decision.action_plan().cloned().expect("plan");
+                action_plan.actions[0].reason = DiagnosisId::DownloadUnavailable;
+                GuardianDecision::for_test(
+                    decision.operation_id().cloned(),
+                    decision.mode(),
+                    decision.kind(),
+                    decision.diagnoses().to_vec(),
+                    Some(action_plan),
+                )
             },
         ] {
             let _ = fs::remove_file(runtime_root.join(".axial-ready"));
@@ -1450,8 +1467,14 @@ mod tests {
         let java_executable = write_fake_java(&runtime_root);
         write_runtime_manifest_proof(&runtime_root, &java_executable);
         let stores = stores();
-        let mut decision = repair_decision(OwnershipClass::LauncherManaged);
-        decision.operation_id = Some(OperationId::new("/home/alice/token/operation"));
+        let decision = repair_decision(OwnershipClass::LauncherManaged);
+        let decision = GuardianDecision::for_test(
+            Some(OperationId::new("/home/alice/token/operation")),
+            decision.mode(),
+            decision.kind(),
+            decision.diagnoses().to_vec(),
+            decision.action_plan().cloned(),
+        );
 
         let outcome = execute_repair(
             &decision,
@@ -1504,8 +1527,7 @@ mod tests {
             crate::guardian::GuardianDomain::Runtime,
             &DiagnosisId::ManagedRuntimeCorrupt,
             &decision
-                .action_plan
-                .as_ref()
+                .action_plan()
                 .expect("plan")
                 .prerequisite
                 .affected_targets[0],
@@ -1568,7 +1590,7 @@ mod tests {
         .expect("runtime repair authorization");
         execute_managed_runtime_ready_marker_repair(
             authorization,
-            decision.operation_id.clone(),
+            decision.operation_id().cloned(),
             runtime_root_binding(paths, runtime_root, java_executable),
             &stores.journals,
             &stores.failure_memory,
@@ -1583,8 +1605,7 @@ mod tests {
 
     fn decision_target(decision: &GuardianDecision) -> TargetDescriptor {
         decision
-            .action_plan
-            .as_ref()
+            .action_plan()
             .expect("plan")
             .prerequisite
             .affected_targets[0]
@@ -1611,12 +1632,12 @@ mod tests {
             affected_targets: vec![target.clone()],
             candidate_actions: vec![GuardianActionKind::Repair],
         };
-        GuardianDecision {
-            operation_id: Some(operation_id),
-            mode: GuardianMode::Managed,
-            kind: GuardianActionKind::Repair,
-            diagnoses: vec![diagnosis_id],
-            action_plan: Some(GuardianActionPlan::new(
+        GuardianDecision::for_test(
+            Some(operation_id),
+            GuardianMode::Managed,
+            GuardianActionKind::Repair,
+            vec![diagnosis_id],
+            Some(GuardianActionPlan::new(
                 StabilizationSystem::Guardian,
                 prerequisite,
                 vec![GuardianAction {
@@ -1625,7 +1646,7 @@ mod tests {
                     reason: diagnosis_id,
                 }],
             )),
-        }
+        )
     }
 
     struct Stores {

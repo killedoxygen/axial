@@ -1,13 +1,11 @@
 use super::jvm_preset::{GuardianJvmPresetId, GuardianJvmPresetResolution};
-use super::summary::GuardianDecision as LauncherGuardianDecision;
 use super::{
     DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianDirective, GuardianFact,
     GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-    GuardianIntervention, GuardianInterventionKind, GuardianManagedJavaReason, GuardianMode,
-    GuardianObservedLaunchFailurePhase, GuardianPerformanceSupervisionRejection,
-    GuardianPreflightOutcome, GuardianPresetDowngradeReason, GuardianPresetValue,
-    GuardianRepairStatus, GuardianStartupFailureObservation, GuardianStripJvmArgsReason,
-    GuardianSummary,
+    GuardianManagedJavaReason, GuardianMode, GuardianObservedLaunchFailurePhase,
+    GuardianPerformanceSupervisionRejection, GuardianPreflightOutcome,
+    GuardianPresetDowngradeReason, GuardianPresetValue, GuardianRepairStatus,
+    GuardianStartupFailureObservation, GuardianStripJvmArgsReason,
 };
 use crate::observability::{
     RedactionAudience, sanitize_evidence_text, sanitize_evidence_token,
@@ -21,12 +19,155 @@ use axial_launcher::{
     LaunchStatusEvent,
 };
 use chrono::{DateTime, Timelike, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GuardianSummaryDecision {
+    Allowed,
+    Warned,
+    Blocked,
+    Intervened,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum GuardianInterventionKind {
+    SwitchManagedRuntime,
+    StripJvmArgs,
+    DowngradePreset,
+    DisableCustomGc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct GuardianIntervention {
+    kind: GuardianInterventionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    silent: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GuardianSummary {
+    mode: LauncherGuardianMode,
+    decision: GuardianSummaryDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    details: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    guidance: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    interventions: Vec<GuardianIntervention>,
+}
+
+impl GuardianSummary {
+    #[cfg(test)]
+    pub(crate) const fn mode(&self) -> LauncherGuardianMode {
+        self.mode
+    }
+
+    pub(crate) const fn decision(&self) -> GuardianSummaryDecision {
+        self.decision
+    }
+
+    #[cfg(test)]
+    pub(crate) fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn details(&self) -> &[String] {
+        &self.details
+    }
+
+    #[cfg(test)]
+    pub(crate) fn guidance(&self) -> &[String] {
+        &self.guidance
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_interventions(&self) -> bool {
+        !self.interventions.is_empty()
+    }
+}
+
+#[derive(Deserialize)]
+struct PersistedGuardianSummary {
+    mode: LauncherGuardianMode,
+    decision: PersistedGuardianSummaryDecision,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    details: Vec<String>,
+    #[serde(default)]
+    guidance: Vec<String>,
+    #[serde(default)]
+    interventions: Vec<PersistedGuardianIntervention>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedGuardianIntervention {
+    kind: PersistedGuardianInterventionKind,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    public_detail: Option<String>,
+    #[serde(default)]
+    silent: Option<bool>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedGuardianSummaryDecision {
+    Allowed,
+    Warned,
+    Blocked,
+    Intervened,
+}
+
+impl From<PersistedGuardianSummaryDecision> for GuardianSummaryDecision {
+    fn from(decision: PersistedGuardianSummaryDecision) -> Self {
+        match decision {
+            PersistedGuardianSummaryDecision::Allowed => Self::Allowed,
+            PersistedGuardianSummaryDecision::Warned => Self::Warned,
+            PersistedGuardianSummaryDecision::Blocked => Self::Blocked,
+            PersistedGuardianSummaryDecision::Intervened => Self::Intervened,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedGuardianInterventionKind {
+    SwitchManagedRuntime,
+    StripJvmArgs,
+    DowngradePreset,
+    DisableCustomGc,
+}
+
+impl From<PersistedGuardianInterventionKind> for GuardianInterventionKind {
+    fn from(kind: PersistedGuardianInterventionKind) -> Self {
+        match kind {
+            PersistedGuardianInterventionKind::SwitchManagedRuntime => Self::SwitchManagedRuntime,
+            PersistedGuardianInterventionKind::StripJvmArgs => Self::StripJvmArgs,
+            PersistedGuardianInterventionKind::DowngradePreset => Self::DowngradePreset,
+            PersistedGuardianInterventionKind::DisableCustomGc => Self::DisableCustomGc,
+        }
+    }
+}
 
 const MAX_SUMMARY_BYTES: usize = 180;
 const MAX_LINE_BYTES: usize = 240;
 const MAX_COLLECTION_LINES: usize = 6;
+const MAX_EXPORT_SUMMARY_BYTES: usize = 180;
+const MAX_EXPORT_LINE_BYTES: usize = 180;
+const MAX_EXPORT_COLLECTION_LINES: usize = 8;
 const MAX_DYNAMIC_TOKEN_BYTES: usize = 64;
 const MAX_STAGE_SUMMARY_BYTES: usize = 160;
 const MAX_STAGE_DETAIL_BYTES: usize = 120;
@@ -38,6 +179,107 @@ const PRIVATE_NOTICE_FALLBACK: &str = "Launch status details were hidden for pri
 const GUARDIAN_OUTCOME_DECISION_PREFIX: &str = "guardian_outcome_decision:";
 const GUARDIAN_OUTCOME_SUMMARY_PREFIX: &str = "guardian_outcome_summary:";
 const GUARDIAN_OUTCOME_DETAIL_PREFIX: &str = "guardian_outcome_detail:";
+
+pub(crate) fn guardian_summary_from_persisted_value(value: &Value) -> Option<GuardianSummary> {
+    guardian_summary_from_persisted_value_with_limits(
+        value,
+        RedactionAudience::UserVisible,
+        MAX_SUMMARY_BYTES,
+        MAX_LINE_BYTES,
+        MAX_COLLECTION_LINES,
+    )
+}
+
+pub(crate) fn guardian_summary_from_persisted_export_value(
+    value: &Value,
+) -> Option<GuardianSummary> {
+    guardian_summary_from_persisted_value_with_limits(
+        value,
+        RedactionAudience::ExportableProof,
+        MAX_EXPORT_SUMMARY_BYTES,
+        MAX_EXPORT_LINE_BYTES,
+        MAX_EXPORT_COLLECTION_LINES,
+    )
+}
+
+fn guardian_summary_from_persisted_value_with_limits(
+    value: &Value,
+    audience: RedactionAudience,
+    max_summary_bytes: usize,
+    max_line_bytes: usize,
+    max_collection_lines: usize,
+) -> Option<GuardianSummary> {
+    let persisted = serde_json::from_value::<PersistedGuardianSummary>(value.clone()).ok()?;
+    let message = persisted
+        .message
+        .as_deref()
+        .and_then(|message| sanitize_evidence_text(message, audience, max_summary_bytes));
+    let details = persisted
+        .details
+        .iter()
+        .filter_map(|detail| sanitize_evidence_text(detail, audience, max_line_bytes))
+        .take(max_collection_lines)
+        .collect();
+    let guidance = persisted
+        .guidance
+        .iter()
+        .filter_map(|detail| sanitize_evidence_text(detail, audience, max_line_bytes))
+        .take(max_collection_lines)
+        .collect();
+    let interventions = persisted
+        .interventions
+        .into_iter()
+        .map(|intervention| GuardianIntervention {
+            kind: intervention.kind.into(),
+            detail: intervention
+                .detail
+                .as_deref()
+                .and_then(|detail| sanitize_evidence_text(detail, audience, max_line_bytes)),
+            public_detail: intervention
+                .public_detail
+                .as_deref()
+                .and_then(|detail| sanitize_evidence_text(detail, audience, max_line_bytes)),
+            silent: intervention.silent,
+        })
+        .take(max_collection_lines)
+        .collect();
+
+    Some(GuardianSummary {
+        mode: persisted.mode,
+        decision: persisted.decision.into(),
+        message,
+        details,
+        guidance,
+        interventions,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn guardian_summary_for_test(
+    mode: LauncherGuardianMode,
+    decision: GuardianSummaryDecision,
+    message: Option<String>,
+    details: Vec<String>,
+    guidance: Vec<String>,
+    intervention_details: Vec<String>,
+) -> GuardianSummary {
+    GuardianSummary {
+        mode,
+        decision,
+        message,
+        details,
+        guidance,
+        interventions: intervention_details
+            .into_iter()
+            .map(|detail| GuardianIntervention {
+                kind: GuardianInterventionKind::SwitchManagedRuntime,
+                public_detail: Some(detail.clone()),
+                detail: Some(detail),
+                silent: Some(false),
+            })
+            .collect(),
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct GuardianJvmPresetOption {
@@ -158,7 +400,7 @@ struct GuardianLaunchStageEvidenceInput {
 impl From<&GuardianPreflightOutcome> for GuardianLaunchStageEvidenceInput {
     fn from(outcome: &GuardianPreflightOutcome) -> Self {
         Self {
-            mode: outcome.guardian_decision.mode,
+            mode: outcome.guardian_decision.mode(),
             decision: outcome.user_outcome.decision(),
             diagnosis_count: outcome.safety_case.diagnoses.len(),
         }
@@ -267,19 +509,19 @@ pub(crate) fn guardian_proof_evidence(
     );
     let actionable = matches!(
         guardian.decision,
-        LauncherGuardianDecision::Blocked
-            | LauncherGuardianDecision::Warned
-            | LauncherGuardianDecision::Intervened
+        GuardianSummaryDecision::Blocked
+            | GuardianSummaryDecision::Warned
+            | GuardianSummaryDecision::Intervened
     );
     if !actionable && detail.is_none() {
         return None;
     }
 
     let (tone, label) = match guardian.decision {
-        LauncherGuardianDecision::Blocked => ("err", "Guardian blocked"),
-        LauncherGuardianDecision::Warned => ("warn", "Guardian warned"),
-        LauncherGuardianDecision::Intervened => ("info", "Guardian intervened"),
-        LauncherGuardianDecision::Allowed => ("info", "Guardian note"),
+        GuardianSummaryDecision::Blocked => ("err", "Guardian blocked"),
+        GuardianSummaryDecision::Warned => ("warn", "Guardian warned"),
+        GuardianSummaryDecision::Intervened => ("info", "Guardian intervened"),
+        GuardianSummaryDecision::Allowed => ("info", "Guardian note"),
     };
     Some(GuardianProofEvidenceProjection {
         tone: trusted_line(tone, MAX_SUMMARY_BYTES),
@@ -307,7 +549,7 @@ pub(crate) fn launch_notice_from_values(
     lead_detail: Option<&str>,
     fallback_message: Option<&str>,
 ) -> Option<LaunchNotice> {
-    let guardian = guardian.and_then(|value| serde_json::from_value(value.clone()).ok());
+    let guardian = guardian.and_then(guardian_summary_from_persisted_value);
     let healing = healing.and_then(|value| serde_json::from_value(value.clone()).ok());
     launch_notice(
         guardian.as_ref(),
@@ -329,9 +571,9 @@ pub(crate) fn launch_notice(
     let guardian_actionable = guardian.is_some_and(|guardian| {
         matches!(
             guardian.decision,
-            LauncherGuardianDecision::Blocked
-                | LauncherGuardianDecision::Warned
-                | LauncherGuardianDecision::Intervened
+            GuardianSummaryDecision::Blocked
+                | GuardianSummaryDecision::Warned
+                | GuardianSummaryDecision::Intervened
         ) && (guardian
             .message
             .as_deref()
@@ -448,7 +690,7 @@ fn guardian_notice_details(guardian: Option<&GuardianSummary>) -> Vec<String> {
 
 fn guardian_notice_message(guardian: Option<&GuardianSummary>) -> Option<String> {
     let guardian = guardian?;
-    if guardian.decision == LauncherGuardianDecision::Allowed {
+    if guardian.decision == GuardianSummaryDecision::Allowed {
         return None;
     }
     if let Some(message) = guardian
@@ -460,16 +702,16 @@ fn guardian_notice_message(guardian: Option<&GuardianSummary>) -> Option<String>
         return Some(message.to_string());
     }
     match guardian.decision {
-        LauncherGuardianDecision::Blocked => {
+        GuardianSummaryDecision::Blocked => {
             Some("Guardian blocked an unsafe launch setup.".to_string())
         }
-        LauncherGuardianDecision::Warned => {
+        GuardianSummaryDecision::Warned => {
             Some("Guardian found launch settings to review.".to_string())
         }
-        LauncherGuardianDecision::Intervened => {
+        GuardianSummaryDecision::Intervened => {
             Some("Guardian adjusted launch settings for safety.".to_string())
         }
-        LauncherGuardianDecision::Allowed => None,
+        GuardianSummaryDecision::Allowed => None,
     }
 }
 
@@ -556,10 +798,10 @@ fn launch_notice_tone(
     outcome: Option<&LaunchSessionOutcome>,
 ) -> LaunchNoticeTone {
     match guardian.map(|guardian| guardian.decision) {
-        Some(LauncherGuardianDecision::Blocked) => return LaunchNoticeTone::Error,
-        Some(LauncherGuardianDecision::Warned) => return LaunchNoticeTone::Warned,
-        Some(LauncherGuardianDecision::Intervened) => return LaunchNoticeTone::Intervened,
-        Some(LauncherGuardianDecision::Allowed) | None => {}
+        Some(GuardianSummaryDecision::Blocked) => return LaunchNoticeTone::Error,
+        Some(GuardianSummaryDecision::Warned) => return LaunchNoticeTone::Warned,
+        Some(GuardianSummaryDecision::Intervened) => return LaunchNoticeTone::Intervened,
+        Some(GuardianSummaryDecision::Allowed) | None => {}
     }
     if outcome.is_some_and(|outcome| {
         matches!(
@@ -1015,7 +1257,7 @@ fn repaired_runtime_guardian_summary(
     let mut summary = current.clone();
     let previous_details = summary.details.clone();
     let previous_guidance = summary.guidance.clone();
-    summary.decision = LauncherGuardianDecision::Intervened;
+    summary.decision = GuardianSummaryDecision::Intervened;
     summary.message = Some(outcome.summary.clone());
     summary.details.clear();
     for detail in &outcome.details {
@@ -1054,7 +1296,7 @@ fn blocked_runtime_guardian_summary(
     }
     GuardianSummary {
         mode: current.mode,
-        decision: LauncherGuardianDecision::Blocked,
+        decision: GuardianSummaryDecision::Blocked,
         message: Some(outcome.summary.clone()),
         details,
         guidance,
@@ -1095,7 +1337,7 @@ pub(crate) fn guardian_summary_with_blocked_outcome(
     {
         push_unique_copy_line(&mut details, detail);
     }
-    projected.decision = LauncherGuardianDecision::Blocked;
+    projected.decision = GuardianSummaryDecision::Blocked;
     projected.message = Some(outcome.summary.clone());
     projected.details = details;
     projected.guidance = guidance;
@@ -1125,7 +1367,7 @@ pub(crate) fn guardian_summary_with_suppressed_outcome(
     }
     GuardianSummary {
         mode: current.mode,
-        decision: LauncherGuardianDecision::Blocked,
+        decision: GuardianSummaryDecision::Blocked,
         message: Some("Guardian blocked an unsafe launch setup.".to_string()),
         details,
         guidance,
@@ -1141,7 +1383,7 @@ pub(crate) fn guardian_summary_with_observed_outcome(
         return guardian_summary_with_blocked_outcome(current, outcome);
     }
     let mut projected = current.clone();
-    projected.decision = LauncherGuardianDecision::Warned;
+    projected.decision = GuardianSummaryDecision::Warned;
     projected.message = Some(outcome.summary.clone());
     let mut details = Vec::new();
     for detail in current.details.iter().chain(outcome.details.iter()) {
@@ -1164,10 +1406,10 @@ pub(crate) fn guardian_summary_from_admission(
     let public_lines = admission.public_lines();
     let decision = match outcome.decision {
         GuardianActionKind::Allow | GuardianActionKind::RecordOnly => {
-            LauncherGuardianDecision::Allowed
+            GuardianSummaryDecision::Allowed
         }
-        GuardianActionKind::Warn => LauncherGuardianDecision::Warned,
-        GuardianActionKind::Block => LauncherGuardianDecision::Blocked,
+        GuardianActionKind::Warn => GuardianSummaryDecision::Warned,
+        GuardianActionKind::Block => GuardianSummaryDecision::Blocked,
         GuardianActionKind::AskUser => {
             unreachable!("preflight boundary must resolve confirmation before launch conversion")
         }
@@ -1176,7 +1418,7 @@ pub(crate) fn guardian_summary_from_admission(
         | GuardianActionKind::Strip
         | GuardianActionKind::Downgrade
         | GuardianActionKind::Fallback
-        | GuardianActionKind::Quarantine => LauncherGuardianDecision::Intervened,
+        | GuardianActionKind::Quarantine => GuardianSummaryDecision::Intervened,
     };
     GuardianSummary {
         mode,
@@ -1222,7 +1464,7 @@ pub(crate) fn guardian_summary_with_intervention(
     });
     GuardianSummary {
         mode: current.mode,
-        decision: LauncherGuardianDecision::Intervened,
+        decision: GuardianSummaryDecision::Intervened,
         message: Some("Guardian adjusted launch settings for safety.".to_string()),
         details,
         guidance,
@@ -3621,13 +3863,13 @@ fn finalize_launch_lines(lines: impl IntoIterator<Item = String>) -> Vec<String>
 
 #[cfg(test)]
 mod tests {
-    use super::super::summary::GuardianDecision;
-    use super::super::{GuardianInterventionKind, GuardianSummary};
     use super::{
         CopyContextKey, GUARDIAN_COPY_RULES, GUARDIAN_JVM_PRESET_COPY_RULES, GuardianCopyRequest,
-        GuardianRuntimeRepairCopy, MAX_COLLECTION_LINES, MAX_LINE_BYTES, MAX_SUMMARY_BYTES,
+        GuardianInterventionKind, GuardianRuntimeRepairCopy, GuardianSummary,
+        GuardianSummaryDecision, MAX_COLLECTION_LINES, MAX_LINE_BYTES, MAX_SUMMARY_BYTES,
         PREFLIGHT_DIAGNOSIS_RULES, PREFLIGHT_INVARIANT_DIAGNOSIS_RULES, PREFLIGHT_SUMMARY_RULES,
         author_guardian_copy, finalize_lines, guardian_install_outcome_persistence_facts,
+        guardian_summary_for_test, guardian_summary_from_persisted_value,
     };
     use crate::guardian::{
         DiagnosisId, GuardianActionKind, GuardianInstallArtifactFailureEvidence,
@@ -3644,7 +3886,7 @@ mod tests {
     fn warning_summary() -> GuardianSummary {
         GuardianSummary {
             mode: GuardianMode::Managed,
-            decision: GuardianDecision::Warned,
+            decision: GuardianSummaryDecision::Warned,
             message: Some("Guardian flagged launch settings for review.".to_string()),
             details: vec!["Keep existing launch guidance.".to_string()],
             guidance: vec!["Keep existing launch guidance.".to_string()],
@@ -3652,11 +3894,74 @@ mod tests {
         }
     }
 
+    fn empty_summary(mode: GuardianMode) -> GuardianSummary {
+        guardian_summary_for_test(
+            mode,
+            GuardianSummaryDecision::Allowed,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn persisted_guardian_summary_round_trips_the_current_wire_shape() {
+        let expected = warning_summary();
+        let value = serde_json::to_value(&expected).expect("serialize Guardian summary");
+        let parsed = guardian_summary_from_persisted_value(&value).expect("current Guardian shape");
+
+        assert_eq!(
+            serde_json::to_value(parsed).expect("serialize parsed summary"),
+            value
+        );
+    }
+
+    #[test]
+    fn persisted_guardian_summary_is_strict_redacted_and_bounded() {
+        let user_visible_only = "x".repeat(200);
+        let mut value = serde_json::json!({
+            "mode": "managed",
+            "decision": "warned",
+            "message": "/home/alice/.axial token=secret",
+            "details": std::iter::once(user_visible_only.clone())
+                .chain((0..8).map(|index| format!("detail {index}")))
+                .collect::<Vec<_>>(),
+            "guidance": ["C:\\Users\\Alice\\secret", "Safe guidance"],
+            "interventions": [{
+                "kind": "switch_managed_runtime",
+                "detail": "--accessToken secret",
+                "public_detail": "Managed Java selected.",
+                "silent": false
+            }]
+        });
+        let parsed = guardian_summary_from_persisted_value(&value).expect("bounded Guardian shape");
+        let encoded = serde_json::to_string(&parsed).expect("serialize bounded Guardian summary");
+
+        assert_eq!(parsed.details.len(), MAX_COLLECTION_LINES);
+        assert_eq!(parsed.details.first(), Some(&user_visible_only));
+        assert!(parsed.guidance.len() <= MAX_COLLECTION_LINES);
+        assert!(
+            parsed
+                .details
+                .iter()
+                .all(|line| line.len() <= MAX_LINE_BYTES)
+        );
+        assert!(!encoded.to_ascii_lowercase().contains("secret"));
+        assert!(!encoded.contains("/home/alice"));
+        assert!(!encoded.contains("C:\\\\Users"));
+
+        value["unknown"] = serde_json::json!(true);
+        let parsed = guardian_summary_from_persisted_value(&value).expect("known Guardian fields");
+        let encoded = serde_json::to_value(parsed).expect("serialize known Guardian fields");
+        assert!(encoded.get("unknown").is_none());
+    }
+
     #[test]
     fn launch_notice_preserves_guardian_precedence_and_healing_fallback() {
         let guardian = GuardianSummary {
             mode: GuardianMode::Managed,
-            decision: GuardianDecision::Blocked,
+            decision: GuardianSummaryDecision::Blocked,
             message: Some("Guardian blocked an unsafe launch setup.".to_string()),
             details: vec!["Custom Java path is unavailable.".to_string()],
             guidance: Vec::new(),
@@ -3709,7 +4014,7 @@ mod tests {
             reason: GuardianManagedJavaReason::PrepareFailure,
         };
         let visible = super::guardian_summary_with_intervention(
-            &GuardianSummary::new(GuardianMode::Managed),
+            &empty_summary(GuardianMode::Managed),
             &directive,
             false,
         );
@@ -3727,7 +4032,7 @@ mod tests {
         );
 
         let silent = super::guardian_summary_with_intervention(
-            &GuardianSummary::new(GuardianMode::Managed),
+            &empty_summary(GuardianMode::Managed),
             &directive,
             true,
         );
@@ -3740,7 +4045,7 @@ mod tests {
     fn launch_notice_enforces_privacy_and_bounds_at_the_authority() {
         let guardian = GuardianSummary {
             mode: GuardianMode::Managed,
-            decision: GuardianDecision::Warned,
+            decision: GuardianSummaryDecision::Warned,
             message: Some(
                 "Leaked /home/alice/.minecraft --accessToken raw-secret-token".to_string(),
             ),
@@ -3841,7 +4146,7 @@ mod tests {
         let summary = super::guardian_summary_from_admission(GuardianMode::Custom, &admission);
 
         assert_eq!(summary.mode, GuardianMode::Custom);
-        assert_eq!(summary.decision, GuardianDecision::Warned);
+        assert_eq!(summary.decision, GuardianSummaryDecision::Warned);
         assert_eq!(
             summary.message.as_deref(),
             Some("Guardian flagged launch settings for review.")
@@ -3902,7 +4207,7 @@ mod tests {
         for (directive, kind, raw_detail, public_detail) in cases {
             let summary =
                 super::guardian_summary_with_intervention(&warning_summary(), &directive, false);
-            assert_eq!(summary.decision, GuardianDecision::Intervened);
+            assert_eq!(summary.decision, GuardianSummaryDecision::Intervened);
             assert_eq!(
                 summary.message.as_deref(),
                 Some("Guardian adjusted launch settings for safety.")
@@ -4335,7 +4640,7 @@ mod tests {
 
     #[test]
     fn runtime_repair_composition_bounds_and_redacts_prior_copy() {
-        let mut prior = GuardianSummary::new(GuardianMode::Managed);
+        let mut prior = empty_summary(GuardianMode::Managed);
         prior.details = vec![
             "/home/alice/private/runtime".to_string(),
             "é".repeat(121),
@@ -4378,7 +4683,7 @@ mod tests {
     #[test]
     fn suppressed_recovery_preserves_visible_intervention_detail_order() {
         let current = super::guardian_summary_with_intervention(
-            &GuardianSummary::new(GuardianMode::Managed),
+            &empty_summary(GuardianMode::Managed),
             &crate::guardian::GuardianDirective::compatibility_preset_downgrade(
                 "graalvm",
                 "performance",

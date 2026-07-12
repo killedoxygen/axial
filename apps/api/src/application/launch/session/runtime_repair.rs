@@ -120,7 +120,7 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
     let state_task = state.clone();
     let runtime_root_path = candidate.runtime_root.clone();
     let java_executable = candidate.java_executable.clone();
-    let operation_id = repair_outcome.guardian_decision.operation_id.clone();
+    let operation_id = repair_outcome.guardian_decision.operation_id().cloned();
     let abandoned = Arc::new(AtomicBool::new(false));
     let request_guard = RuntimeRepairRequestGuard::new(abandoned.clone());
     let terminal_failure = Arc::new(tokio::sync::Notify::new());

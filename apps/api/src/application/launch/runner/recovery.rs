@@ -459,9 +459,9 @@ mod tests {
     use super::*;
     use crate::application::guardian_conversion::api_guardian_mode;
     use crate::guardian::{
-        GuardianStartupFailureObservation, GuardianStartupFailureRequest,
-        guardian_startup_failure_outcome, guardian_summary_with_blocked_outcome,
-        summary::GuardianDecision,
+        GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianSummaryDecision,
+        guardian_startup_failure_outcome, guardian_summary_for_test,
+        guardian_summary_with_blocked_outcome,
     };
     use crate::state::contracts::{OperationOutcome, OperationStatus, TargetKind};
     use crate::state::failure_memory::FailureMemoryActionOutcome;
@@ -483,14 +483,25 @@ mod tests {
     }
 
     fn guardian_with_warning(mode: GuardianMode, warning: &str) -> GuardianSummary {
-        GuardianSummary {
+        guardian_summary_for_test(
             mode,
-            decision: GuardianDecision::Warned,
-            message: Some("Guardian flagged launch settings for review.".to_string()),
-            details: vec![warning.to_string()],
-            guidance: vec![warning.to_string()],
-            interventions: Vec::new(),
-        }
+            GuardianSummaryDecision::Warned,
+            Some("Guardian flagged launch settings for review.".to_string()),
+            vec![warning.to_string()],
+            vec![warning.to_string()],
+            Vec::new(),
+        )
+    }
+
+    fn empty_guardian(mode: GuardianMode) -> GuardianSummary {
+        guardian_summary_for_test(
+            mode,
+            GuardianSummaryDecision::Allowed,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     #[test]
@@ -506,15 +517,15 @@ mod tests {
             false,
         );
 
-        assert!(guardian.guidance.iter().any(|detail| detail == &warning));
-        assert!(guardian.details.iter().any(|detail| detail == &warning));
+        assert!(guardian.guidance().iter().any(|detail| detail == &warning));
+        assert!(guardian.details().iter().any(|detail| detail == &warning));
     }
 
     #[test]
     fn recovery_executors_apply_every_closed_directive_effect() {
         let intent = test_launch_intent(Path::new("/tmp/axial-test"), "executor-effects");
 
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        let mut guardian = empty_guardian(GuardianMode::Managed);
         let mut attempt = axial_launcher::service::AttemptOverrides::default();
         let managed_prepare = test_recovery_plan_for_directive(
             &intent,
@@ -531,7 +542,7 @@ mod tests {
         assert!(attempt.force_managed_runtime);
         assert!(attempt.runtime_intervention_applied);
 
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        let mut guardian = empty_guardian(GuardianMode::Managed);
         let mut attempt = axial_launcher::service::AttemptOverrides::default();
         let strip_prepare = test_recovery_plan(&intent, RecoveryCase::StripRawJvmArgs);
         assert!(apply_prepare_recovery_directive(
@@ -542,7 +553,7 @@ mod tests {
         assert!(attempt.ignore_extra_jvm_args);
         assert!(attempt.raw_jvm_args_intervention_applied);
 
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        let mut guardian = empty_guardian(GuardianMode::Managed);
         let mut attempt = axial_launcher::service::AttemptOverrides::default();
         let managed_startup = test_recovery_plan(&intent, RecoveryCase::SwitchManagedRuntime);
         assert!(apply_startup_recovery_directive(
@@ -554,7 +565,7 @@ mod tests {
         assert!(attempt.startup_recovery_applied);
         assert_eq!(attempt.retry_count, 1);
 
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        let mut guardian = empty_guardian(GuardianMode::Managed);
         let mut attempt = axial_launcher::service::AttemptOverrides::default();
         let preset_startup = test_recovery_plan(&intent, RecoveryCase::DowngradePreset);
         assert!(apply_startup_recovery_directive(
@@ -565,7 +576,7 @@ mod tests {
         assert_eq!(attempt.preset_override.as_deref(), Some("performance"));
         assert!(!attempt.disable_custom_gc);
 
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        let mut guardian = empty_guardian(GuardianMode::Managed);
         let mut attempt = axial_launcher::service::AttemptOverrides::default();
         let gc_startup = test_recovery_plan(&intent, RecoveryCase::DisableCustomGc);
         assert!(apply_startup_recovery_directive(
@@ -576,7 +587,7 @@ mod tests {
         assert_eq!(attempt.preset_override, None);
         assert!(attempt.disable_custom_gc);
 
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        let mut guardian = empty_guardian(GuardianMode::Managed);
         let mut attempt = axial_launcher::service::AttemptOverrides::default();
         assert!(!apply_startup_recovery_directive(
             &mut guardian,
@@ -616,19 +627,16 @@ mod tests {
         let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
 
         assert_eq!(outcome.failure_class, LaunchFailureClass::StartupStalled);
-        assert_eq!(guardian.decision, GuardianDecision::Blocked);
+        assert_eq!(guardian.decision(), GuardianSummaryDecision::Blocked);
+        assert_eq!(guardian.message(), Some(outcome.user_outcome.summary()));
         assert_eq!(
-            guardian.message.as_deref(),
-            Some(outcome.user_outcome.summary())
-        );
-        assert_eq!(
-            guardian.details.first(),
+            guardian.details().first(),
             outcome.user_outcome.details().first()
         );
-        assert!(guardian.details.iter().any(|detail| detail == &warning));
+        assert!(guardian.details().iter().any(|detail| detail == &warning));
         assert!(
             guardian
-                .details
+                .details()
                 .iter()
                 .any(|detail| detail == "Review the latest game log before retrying.")
         );
@@ -645,7 +653,7 @@ mod tests {
 
     #[test]
     fn startup_exited_blocks_with_observed_failure_guardian_summary() {
-        let mut guardian = GuardianSummary::new(GuardianMode::Custom);
+        let mut guardian = empty_guardian(GuardianMode::Custom);
         let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
             mode: api_guardian_mode(GuardianMode::Custom),
             observation: GuardianStartupFailureObservation::Exited {
@@ -670,13 +678,10 @@ mod tests {
             LaunchFailureClass::JvmUnsupportedOption
         );
         assert!(outcome.directive.is_none());
-        assert_eq!(guardian.decision, GuardianDecision::Blocked);
+        assert_eq!(guardian.decision(), GuardianSummaryDecision::Blocked);
+        assert_eq!(guardian.message(), Some("Guardian blocked launch startup."));
         assert_eq!(
-            guardian.message.as_deref(),
-            Some("Guardian blocked launch startup.")
-        );
-        assert_eq!(
-            guardian.details,
+            guardian.details(),
             vec![
                 "Minecraft exited before startup completed with a detected JVM option compatibility failure.",
                 "Remove the explicit JVM args or switch Guardian Mode back to Managed.",
@@ -691,7 +696,7 @@ mod tests {
 
     #[test]
     fn custom_preset_startup_failure_blocks_without_recovery_directive() {
-        let mut guardian = GuardianSummary::new(GuardianMode::Custom);
+        let mut guardian = empty_guardian(GuardianMode::Custom);
         let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
             mode: api_guardian_mode(GuardianMode::Custom),
             observation: GuardianStartupFailureObservation::Exited {
@@ -712,7 +717,7 @@ mod tests {
         let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
 
         assert_eq!(
-            outcome.guardian_decision.kind,
+            outcome.guardian_decision.kind(),
             crate::guardian::GuardianActionKind::Block
         );
         assert_eq!(
@@ -720,16 +725,13 @@ mod tests {
             crate::guardian::GuardianActionKind::Block
         );
         assert!(outcome.directive.is_none());
-        assert_eq!(guardian.decision, GuardianDecision::Blocked);
-        assert_eq!(
-            guardian.message.as_deref(),
-            Some("Guardian blocked launch startup.")
-        );
-        assert!(guardian.details.iter().any(|detail| {
+        assert_eq!(guardian.decision(), GuardianSummaryDecision::Blocked);
+        assert_eq!(guardian.message(), Some("Guardian blocked launch startup."));
+        assert!(guardian.details().iter().any(|detail| {
             detail
                 == "Minecraft exited before startup completed with a detected JVM option compatibility failure."
         }));
-        assert!(guardian.details.iter().any(|detail| {
+        assert!(guardian.details().iter().any(|detail| {
             detail == "Choose a safer JVM preset or switch Guardian Mode back to Managed."
         }));
         assert_eq!(payload["decision"], serde_json::json!("blocked"));
@@ -748,17 +750,17 @@ mod tests {
         record_prelaunch_preset_adjustment_directive(&mut guardian, &directive);
         let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
 
-        assert_eq!(guardian.decision, GuardianDecision::Intervened);
+        assert_eq!(guardian.decision(), GuardianSummaryDecision::Intervened);
         assert_eq!(
-            guardian.message.as_deref(),
+            guardian.message(),
             Some("Guardian adjusted launch settings for safety.")
         );
-        assert!(guardian.details.iter().any(|detail| {
+        assert!(guardian.details().iter().any(|detail| {
             detail == "JVM preset changed from GraalVM to Performance for compatibility."
         }));
         assert!(
             guardian
-                .guidance
+                .guidance()
                 .iter()
                 .any(|detail| detail == "Keep existing launch guidance.")
         );
@@ -877,18 +879,18 @@ mod tests {
         };
         assert_eq!(returned, expected);
         assert_eq!(recovery_attempts, 1);
-        assert_eq!(guardian.decision, GuardianDecision::Blocked);
+        assert_eq!(guardian.decision(), GuardianSummaryDecision::Blocked);
         assert_eq!(
-            guardian.message.as_deref(),
+            guardian.message(),
             Some("Guardian blocked an unsafe launch setup.")
         );
         assert!(
             guardian
-                .details
+                .details()
                 .iter()
                 .any(|detail| detail == &expected.details()[0])
         );
-        assert!(guardian.guidance.iter().any(|detail| {
+        assert!(guardian.guidance().iter().any(|detail| {
             detail == "Review the latest game log or change the affected launch setting before retrying."
         }));
         let log = match events.try_recv().expect("suppression recovery log") {
@@ -964,16 +966,16 @@ mod tests {
         guardian = guardian_summary_with_suppressed_outcome(&guardian, &user_outcome);
         let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
 
-        assert_eq!(guardian.decision, GuardianDecision::Blocked);
-        assert!(guardian.interventions.is_empty());
+        assert_eq!(guardian.decision(), GuardianSummaryDecision::Blocked);
+        assert!(!guardian.has_interventions());
         assert_eq!(
-            guardian.message.as_deref(),
+            guardian.message(),
             Some("Guardian blocked an unsafe launch setup.")
         );
-        assert!(guardian.details.iter().any(|detail| {
+        assert!(guardian.details().iter().any(|detail| {
             detail == "Guardian suppressed a repeated launch self-healing retry for explicit JVM argument recovery because the same recovery failed recently."
         }));
-        assert!(guardian.guidance.iter().any(|detail| {
+        assert!(guardian.guidance().iter().any(|detail| {
             detail == "Review the latest game log or change the affected launch setting before retrying."
         }));
         assert_eq!(payload["decision"], serde_json::json!("blocked"));
@@ -1342,19 +1344,19 @@ mod tests {
 
         guardian = guardian_summary_with_suppressed_outcome(&guardian, &outcome);
 
-        assert_eq!(guardian.decision, GuardianDecision::Blocked);
+        assert_eq!(guardian.decision(), GuardianSummaryDecision::Blocked);
         assert_eq!(
-            guardian.message.as_deref(),
+            guardian.message(),
             Some("Guardian blocked an unsafe launch setup.")
         );
-        assert!(guardian.details.iter().any(|detail| detail == &reason));
+        assert!(guardian.details().iter().any(|detail| detail == &reason));
         assert!(
             guardian
-                .guidance
+                .guidance()
                 .iter()
                 .any(|detail| detail == "Keep existing launch guidance.")
         );
-        assert!(guardian.guidance.iter().any(|detail| {
+        assert!(guardian.guidance().iter().any(|detail| {
             detail == "Review the latest game log or change the affected launch setting before retrying."
         }));
     }

@@ -3,7 +3,9 @@ use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
 };
-use crate::guardian::{GuardianSummary, launch_session_outcome};
+use crate::guardian::{
+    GuardianSummary, guardian_summary_from_persisted_export_value, launch_session_outcome,
+};
 use crate::logging::timestamp_utc;
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
 use crate::state::benchmark_suites::{
@@ -861,37 +863,7 @@ fn sanitized_stage_evidence(
 }
 
 fn sanitized_guardian(value: &Value) -> Option<GuardianSummary> {
-    let mut guardian = serde_json::from_value::<GuardianSummary>(value.clone()).ok()?;
-    guardian.message = guardian.message.as_deref().and_then(sanitized_bounded_text);
-    guardian.details = guardian
-        .details
-        .iter()
-        .filter_map(|detail| sanitized_bounded_text(detail))
-        .take(MAX_EXPORT_DETAILS)
-        .collect();
-    guardian.guidance = guardian
-        .guidance
-        .iter()
-        .filter_map(|detail| sanitized_bounded_text(detail))
-        .take(MAX_EXPORT_DETAILS)
-        .collect();
-    guardian.interventions = guardian
-        .interventions
-        .into_iter()
-        .map(|mut intervention| {
-            intervention.detail = intervention
-                .detail
-                .as_deref()
-                .and_then(sanitized_bounded_text);
-            intervention.public_detail = intervention
-                .public_detail
-                .as_deref()
-                .and_then(sanitized_bounded_text);
-            intervention
-        })
-        .take(MAX_EXPORT_DETAILS)
-        .collect();
-    Some(guardian)
+    guardian_summary_from_persisted_export_value(value)
 }
 
 fn sanitized_healing(value: &Value) -> Option<LaunchHealingSummary> {
@@ -2197,6 +2169,32 @@ mod tests {
     }
 
     struct WriteGateHandle(Arc<WriteGate>);
+
+    #[test]
+    fn guardian_proof_export_preserves_export_specific_bounds() {
+        let user_visible_only = "x".repeat(200);
+        let value = json!({
+            "mode": "managed",
+            "decision": "warned",
+            "details": std::iter::once(user_visible_only.clone())
+                .chain((0..8).map(|index| format!("detail {index}")))
+                .collect::<Vec<_>>(),
+            "unknown_outer_field": "discarded"
+        });
+
+        let guardian = sanitized_guardian(&value).expect("strict persisted Guardian summary");
+        assert_eq!(guardian.details().len(), MAX_EXPORT_DETAILS);
+        assert!(
+            guardian
+                .details()
+                .iter()
+                .all(|line| line.len() <= MAX_EXPORT_DETAIL_CHARS)
+        );
+        assert!(!guardian.details().contains(&user_visible_only));
+
+        let exported = serde_json::to_value(guardian).expect("serialize Guardian proof summary");
+        assert!(exported.get("unknown_outer_field").is_none());
+    }
 
     impl RecordingBackend {
         fn new() -> Self {

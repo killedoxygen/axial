@@ -160,7 +160,7 @@ impl PerformanceJournalTransition {
                 .iter()
                 .map(|fact_id| fact_id.as_str().to_string())
                 .collect(),
-            diagnosis_ids: supervision.decision.diagnoses.to_vec(),
+            diagnosis_ids: supervision.decision.diagnoses().to_vec(),
         }
     }
 
@@ -3209,7 +3209,7 @@ pub(super) async fn record_performance_guardian_supervision(
                 .iter()
                 .map(|fact_id| fact_id.as_str().to_string())
                 .collect(),
-            supervision.decision.diagnoses.to_vec(),
+            supervision.decision.diagnoses().to_vec(),
         )
         .await
 }

@@ -555,7 +555,7 @@ fn prepare_case(
     let outcome = guardian_prepare_failure_outcome(request);
     let copy = LaunchBoundaryCopySource {
         id: id.clone(),
-        authored_decision: Some(outcome.guardian_decision.kind),
+        authored_decision: Some(outcome.guardian_decision.kind()),
         outcome: Some(outcome.user_outcome.clone()),
         directive: outcome.directive.clone(),
     };
@@ -580,7 +580,7 @@ fn startup_case(
     let outcome = guardian_startup_failure_outcome(request);
     let copy = LaunchBoundaryCopySource {
         id: id.clone(),
-        authored_decision: Some(outcome.guardian_decision.kind),
+        authored_decision: Some(outcome.guardian_decision.kind()),
         outcome: Some(outcome.user_outcome.clone()),
         directive: outcome.directive.clone(),
     };

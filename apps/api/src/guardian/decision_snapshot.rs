@@ -363,8 +363,8 @@ pub(super) fn decision_projection(
     safety_case: &SafetyCase,
 ) -> PolicyDecisionCell {
     PolicyDecisionCell {
-        decision_kind: decision.kind,
-        plan_present: decision.action_plan.is_some(),
+        decision_kind: decision.kind(),
+        plan_present: decision.action_plan().is_some(),
         plan_integrity: decision_plan_integrity(decision, safety_case, false),
     }
 }
@@ -374,8 +374,8 @@ pub(super) fn scoped_decision_projection(
     safety_case: &SafetyCase,
 ) -> PolicyDecisionCell {
     PolicyDecisionCell {
-        decision_kind: decision.kind,
-        plan_present: decision.action_plan.is_some(),
+        decision_kind: decision.kind(),
+        plan_present: decision.action_plan().is_some(),
         plan_integrity: decision_plan_integrity(decision, safety_case, true),
     }
 }
@@ -385,9 +385,9 @@ fn decision_plan_integrity(
     safety_case: &SafetyCase,
     allow_selected_append: bool,
 ) -> bool {
-    if decision.operation_id != safety_case.operation_id
-        || decision.mode != safety_case.mode
-        || decision.diagnoses
+    if decision.operation_id() != safety_case.operation_id.as_ref()
+        || decision.mode() != safety_case.mode
+        || decision.diagnoses()
             != safety_case
                 .diagnoses
                 .iter()
@@ -396,7 +396,7 @@ fn decision_plan_integrity(
     {
         return false;
     }
-    let Some(plan) = &decision.action_plan else {
+    let Some(plan) = decision.action_plan() else {
         return true;
     };
     let [action] = plan.actions.as_slice() else {
@@ -407,10 +407,10 @@ fn decision_plan_integrity(
         let base_candidates = diagnosis.candidate_actions();
         let candidates_match = candidates == base_candidates
             || (allow_selected_append
-                && !base_candidates.contains(&decision.kind)
+                && !base_candidates.contains(&decision.kind())
                 && candidates.len() == base_candidates.len() + 1
                 && candidates.starts_with(base_candidates)
-                && candidates.last() == Some(&decision.kind));
+                && candidates.last() == Some(&decision.kind()));
         plan.prerequisite.diagnosis_id == diagnosis.id()
             && plan.prerequisite.ownership == diagnosis.ownership()
             && plan.prerequisite.confidence == diagnosis.confidence()
@@ -420,7 +420,7 @@ fn decision_plan_integrity(
 
     plan.owner == StabilizationSystem::Guardian
         && prerequisite_matches
-        && action.kind == decision.kind
+        && action.kind == decision.kind()
         && action.reason == plan.prerequisite.diagnosis_id
         && action.target.as_ref() == plan.prerequisite.affected_targets.first()
 }

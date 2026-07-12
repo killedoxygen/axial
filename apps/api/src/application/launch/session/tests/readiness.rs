@@ -21,7 +21,7 @@ async fn launch_preflight_ready_payload_for_managed_instance_does_not_create_ses
 
     assert_eq!(preflight.status, "ready");
     assert_eq!(preflight.mode, GuardianMode::Managed);
-    assert_eq!(preflight.guardian.mode, GuardianMode::Managed);
+    assert_eq!(preflight.guardian.mode(), GuardianMode::Managed);
     assert!(!preflight.overrides.java.present);
     assert_eq!(preflight.overrides.java.origin, None);
     assert!(!preflight.overrides.preset.present);
@@ -78,7 +78,7 @@ async fn launch_preflight_surfaces_current_instance_crash_memory_without_creatin
             fact_field(fact, "failure_class"),
             Some(failure_class.as_str())
         );
-        assert!(preflight.guardian.details.iter().any(|line| {
+        assert!(preflight.guardian.details().iter().any(|line| {
             line.contains(if failure_class == LaunchFailureClass::OutOfMemory {
                 "out-of-memory crash"
             } else {
@@ -88,7 +88,7 @@ async fn launch_preflight_surfaces_current_instance_crash_memory_without_creatin
         assert!(
             preflight
                 .guardian
-                .guidance
+                .guidance()
                 .iter()
                 .any(|line| line.contains(expected_guidance))
         );
@@ -212,7 +212,7 @@ async fn launch_preflight_surfaces_only_active_suppression_for_the_exact_current
 
         assert_eq!(suppression_fact.is_some(), expected_visible);
         assert_eq!(
-            preflight.guardian.details.iter().any(|line| {
+            preflight.guardian.details().iter().any(|line| {
                 line.contains("Guardian will not auto-repair this launch again until")
                     && line.ends_with(" UTC.")
             }),
@@ -241,9 +241,12 @@ async fn launch_preflight_readiness_reports_missing_version_json() {
     assert!(!preflight.readiness.launchable);
     assert_eq!(preflight.readiness.reasons.len(), 1);
     assert_readiness_reason(&preflight, LaunchReadinessReasonId::VersionJsonMissing);
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Blocked
+    );
     assert_guardian_fact(&preflight, "version_json_missing");
-    assert!(preflight.guardian.details.iter().any(|detail| {
+    assert!(preflight.guardian.details().iter().any(|detail| {
         detail == "Guardian blocked launch because installed version metadata is missing."
     }));
 }
@@ -322,10 +325,13 @@ async fn launch_preflight_readiness_reports_missing_client_jar() {
         runtime_reason.severity,
         LaunchReadinessSeverity::Recoverable
     );
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Blocked
+    );
     assert_guardian_fact(&preflight, "client_jar_missing");
     assert_guardian_fact(&preflight, "managed_runtime_missing");
-    assert!(preflight.guardian.details.iter().any(|detail| {
+    assert!(preflight.guardian.details().iter().any(|detail| {
         detail == "Guardian blocked launch because client game files are missing."
     }));
 }
@@ -363,7 +369,10 @@ async fn launch_preflight_readiness_reports_missing_library_metadata_as_corrupt_
 
     assert!(!preflight.readiness.launchable);
     assert_readiness_reason(&preflight, LaunchReadinessReasonId::LibrariesCorrupt);
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Blocked
+    );
     assert!(preflight.guardian_facts.iter().any(|fact| {
         fact.id.as_str() == "artifact_checksum_mismatch"
             && fact
@@ -371,7 +380,7 @@ async fn launch_preflight_readiness_reports_missing_library_metadata_as_corrupt_
                 .as_ref()
                 .is_some_and(|target| target.id == "libraries")
     }));
-    assert!(preflight.guardian.details.iter().any(|detail| {
+    assert!(preflight.guardian.details().iter().any(|detail| {
         detail == "Guardian blocked launch because launcher-managed game files are corrupt."
     }));
 }
@@ -401,10 +410,13 @@ async fn launch_preflight_readiness_reports_missing_asset_index_as_guardian_fact
 
     assert!(!preflight.readiness.launchable);
     assert_readiness_reason(&preflight, LaunchReadinessReasonId::AssetIndexMissing);
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Blocked
+    );
     assert_guardian_fact(&preflight, "asset_index_missing");
     assert!(
-        preflight.guardian.details.iter().any(|detail| {
+        preflight.guardian.details().iter().any(|detail| {
             detail == "Guardian blocked launch because the asset index is missing."
         })
     );
@@ -476,7 +488,10 @@ async fn launch_preflight_readiness_reports_corrupt_launcher_artifacts_as_guardi
     assert_readiness_reason(&preflight, LaunchReadinessReasonId::ClientJarCorrupt);
     assert_readiness_reason(&preflight, LaunchReadinessReasonId::LibrariesCorrupt);
     assert_readiness_reason(&preflight, LaunchReadinessReasonId::AssetIndexCorrupt);
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Blocked
+    );
     for target_id in ["client_jar", "libraries", "asset_index"] {
         assert!(preflight.guardian_facts.iter().any(|fact| {
             fact.id.as_str() == "artifact_checksum_mismatch"
@@ -486,10 +501,10 @@ async fn launch_preflight_readiness_reports_corrupt_launcher_artifacts_as_guardi
                     .is_some_and(|target| target.id == target_id)
         }));
     }
-    assert!(preflight.guardian.details.iter().any(|detail| {
+    assert!(preflight.guardian.details().iter().any(|detail| {
         detail == "Guardian blocked launch because launcher-managed game files are corrupt."
     }));
-    assert!(preflight.guardian.guidance.iter().any(|detail| {
+    assert!(preflight.guardian.guidance().iter().any(|detail| {
         detail == "Install or repair the affected version before launching again."
     }));
 
@@ -524,8 +539,8 @@ async fn launch_preflight_readiness_reports_missing_managed_runtime_as_recoverab
 
     assert!(preflight.readiness.launchable);
     assert!(matches!(
-        preflight.guardian.decision,
-        GuardianDecision::Allowed | GuardianDecision::Warned
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Allowed | GuardianSummaryDecision::Warned
     ));
     assert_eq!(
         readiness_reason(&preflight, LaunchReadinessReasonId::ManagedRuntimeMissing).severity,
@@ -612,11 +627,11 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
     assert_eq!(fixture.state.installed_versions_walk_count(), 1);
     assert!(runtime_root.join(".axial-ready").is_file());
     assert_eq!(
-        repaired.guardian_summary.decision,
-        GuardianDecision::Intervened
+        repaired.guardian_summary.decision(),
+        GuardianSummaryDecision::Intervened
     );
     assert!(
-        repaired.guardian_summary.details.iter().any(|detail| {
+        repaired.guardian_summary.details().iter().any(|detail| {
             detail == "Guardian repaired the managed Java runtime before launch."
         })
     );
@@ -701,11 +716,11 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
 
     assert!(runtime_root.join(".axial-ready").is_file());
     assert_eq!(
-        repaired.guardian_summary.decision,
-        GuardianDecision::Intervened
+        repaired.guardian_summary.decision(),
+        GuardianSummaryDecision::Intervened
     );
     assert!(
-        repaired.guardian_summary.details.iter().any(|detail| {
+        repaired.guardian_summary.details().iter().any(|detail| {
             detail == "Guardian repaired the managed Java runtime before launch."
         })
     );
@@ -928,8 +943,8 @@ async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
     .await
     .expect("persist managed-runtime repair journal");
     assert_eq!(
-        repaired.guardian_summary.decision,
-        GuardianDecision::Intervened
+        repaired.guardian_summary.decision(),
+        GuardianSummaryDecision::Intervened
     );
     fs::remove_file(runtime_root.join(".axial-ready")).expect("remove ready marker");
 
@@ -993,10 +1008,13 @@ async fn launch_preflight_readiness_reports_incomplete_install_marker() {
     assert!(!preflight.readiness.launchable);
     assert_eq!(preflight.readiness.reasons.len(), 1);
     assert_readiness_reason(&preflight, LaunchReadinessReasonId::IncompleteInstall);
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Blocked
+    );
     assert_guardian_fact(&preflight, "incomplete_install");
     assert!(
-        preflight.guardian.details.iter().any(|detail| {
+        preflight.guardian.details().iter().any(|detail| {
             detail == "Guardian blocked launch because the install is incomplete."
         })
     );

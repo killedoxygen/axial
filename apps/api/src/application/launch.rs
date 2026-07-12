@@ -9,14 +9,13 @@ use super::{
     LaunchInstanceCommand, LaunchInstancePayload, SessionCommandCarrier,
 };
 use crate::guardian::{
-    GuardianPreflightOutcome, guardian_launch_stage_evidence,
-    summary::GuardianDecision as GuardianSummaryDecision,
+    GuardianPreflightOutcome, GuardianSummaryDecision, guardian_launch_stage_evidence,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
 use crate::state::contracts::{CommandKind, OperationStatus};
 use axial_launcher::LaunchStageEvidence;
 use axum::{Json, http::StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 mod benchmark;
@@ -71,7 +70,7 @@ pub(crate) fn launch_shutdown_error_response(
     )
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LaunchInstanceStaging {
     pub command: ApplicationCommand,
     pub result: CommandResult<LaunchInstancePayload>,
@@ -230,7 +229,7 @@ pub fn launch_request_error_status(error: &LaunchRequestError) -> StatusCode {
     if error
         .guardian
         .as_ref()
-        .is_some_and(|guardian| guardian.decision == GuardianSummaryDecision::Blocked)
+        .is_some_and(|guardian| guardian.decision() == GuardianSummaryDecision::Blocked)
     {
         StatusCode::UNPROCESSABLE_ENTITY
     } else {
@@ -388,7 +387,7 @@ mod tests {
         );
 
         assert_eq!(
-            outcome.guardian_decision.kind,
+            outcome.guardian_decision.kind(),
             crate::guardian::GuardianActionKind::Warn
         );
         assert_eq!(

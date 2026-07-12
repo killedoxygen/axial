@@ -1,5 +1,5 @@
 use super::*;
-use crate::guardian::{GuardianSeverity, summary::GuardianDecision};
+use crate::guardian::{GuardianSeverity, GuardianSummaryDecision};
 use crate::state::contracts::{CommandKind, OperationOutcome, OperationStatus, OwnershipClass};
 use crate::state::{
     AppStateInit, AuthLoginMinecraftProfile, InstallStore, NewAuthLoginMinecraftAccount,
@@ -523,11 +523,11 @@ fn assert_has_memory_clamp_warning(guardian: &GuardianSummary) {
         "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.",
     ] {
         assert!(
-            guardian.guidance.iter().any(|detail| detail == expected),
+            guardian.guidance().iter().any(|detail| detail == expected),
             "missing clamp guidance: {expected}"
         );
         assert!(
-            guardian.details.iter().any(|detail| detail == expected),
+            guardian.details().iter().any(|detail| detail == expected),
             "missing clamp detail: {expected}"
         );
     }
@@ -539,11 +539,14 @@ fn assert_no_memory_clamp_warning(guardian: &GuardianSummary) {
         "Lower the minimum memory setting or raise the maximum memory allocation if this was intentional.",
     ] {
         assert!(
-            !guardian.guidance.iter().any(|detail| detail == unexpected),
+            !guardian
+                .guidance()
+                .iter()
+                .any(|detail| detail == unexpected),
             "unexpected clamp guidance: {unexpected}"
         );
         assert!(
-            !guardian.details.iter().any(|detail| detail == unexpected),
+            !guardian.details().iter().any(|detail| detail == unexpected),
             "unexpected clamp detail: {unexpected}"
         );
     }
@@ -555,11 +558,11 @@ fn assert_has_low_memory_allocation_warning(guardian: &GuardianSummary, _max_mem
         "Raise the maximum memory allocation if Minecraft crashes during startup, stalls while loading, or exits with out-of-memory errors.".to_string(),
     ] {
         assert!(
-            guardian.guidance.iter().any(|detail| detail == &expected),
+            guardian.guidance().iter().any(|detail| detail == &expected),
             "missing low-memory guidance: {expected}"
         );
         assert!(
-            guardian.details.iter().any(|detail| detail == &expected),
+            guardian.details().iter().any(|detail| detail == &expected),
             "missing low-memory detail: {expected}"
         );
     }

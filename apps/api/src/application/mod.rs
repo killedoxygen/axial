@@ -132,7 +132,7 @@ impl ApplicationCommand {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CommandResult<TPayload = EmptyPayload> {
     pub command: CommandKind,
     pub operation_id: Option<OperationId>,
@@ -144,7 +144,7 @@ pub struct CommandResult<TPayload = EmptyPayload> {
     pub view_model: Option<ApplicationViewModel>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ApplicationOutcome<TPayload = EmptyPayload> {
     pub result: CommandResult<TPayload>,
     pub next_actions: Vec<CommandKind>,
@@ -154,7 +154,7 @@ pub struct ApplicationOutcome<TPayload = EmptyPayload> {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EmptyPayload;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct CommandResultCarriers {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardian: Option<GuardianCommandCarrier>,
@@ -175,7 +175,7 @@ impl CommandResultCarriers {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct GuardianCommandCarrier {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<GuardianDecision>,

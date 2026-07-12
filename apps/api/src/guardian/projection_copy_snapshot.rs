@@ -1,8 +1,7 @@
-use super::summary::GuardianDecision;
 use super::{
-    DiagnosisId, GuardianIntervention, GuardianInterventionKind, GuardianSummary,
-    guardian_install_outcome_fact_group, guardian_install_outcome_from_persisted_group,
-    guardian_proof_evidence,
+    DiagnosisId, GuardianSummaryDecision, guardian_install_outcome_fact_group,
+    guardian_install_outcome_from_persisted_group, guardian_proof_evidence,
+    guardian_summary_for_test,
 };
 use axial_launcher::GuardianMode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -56,11 +55,31 @@ struct GuardianProjectionCopyCase {
     output: GuardianProjectionCopyOutput,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GuardianSummaryDecisionFixture {
+    Allowed,
+    Warned,
+    Blocked,
+    Intervened,
+}
+
+impl From<GuardianSummaryDecisionFixture> for GuardianSummaryDecision {
+    fn from(decision: GuardianSummaryDecisionFixture) -> Self {
+        match decision {
+            GuardianSummaryDecisionFixture::Allowed => Self::Allowed,
+            GuardianSummaryDecisionFixture::Warned => Self::Warned,
+            GuardianSummaryDecisionFixture::Blocked => Self::Blocked,
+            GuardianSummaryDecisionFixture::Intervened => Self::Intervened,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "surface", rename_all = "snake_case", deny_unknown_fields)]
 enum GuardianProjectionCopyInput {
     Proof {
-        decision: GuardianDecision,
+        decision: GuardianSummaryDecisionFixture,
         message: Option<String>,
         #[serde(default)]
         details: Vec<String>,
@@ -182,23 +201,14 @@ fn render_output(input: &GuardianProjectionCopyInput) -> GuardianProjectionCopyO
             guidance,
             intervention_details,
         } => {
-            let guardian = GuardianSummary {
-                mode: GuardianMode::Managed,
-                decision: *decision,
-                message: message.clone(),
-                details: details.clone(),
-                guidance: guidance.clone(),
-                interventions: intervention_details
-                    .iter()
-                    .cloned()
-                    .map(|detail| GuardianIntervention {
-                        kind: GuardianInterventionKind::SwitchManagedRuntime,
-                        public_detail: Some(detail.clone()),
-                        detail: Some(detail),
-                        silent: Some(false),
-                    })
-                    .collect(),
-            };
+            let guardian = guardian_summary_for_test(
+                GuardianMode::Managed,
+                (*decision).into(),
+                message.clone(),
+                details.clone(),
+                guidance.clone(),
+                intervention_details.clone(),
+            );
             GuardianProjectionCopyOutput::Proof {
                 evidence: guardian_proof_evidence(&guardian).map(project_serialized),
             }

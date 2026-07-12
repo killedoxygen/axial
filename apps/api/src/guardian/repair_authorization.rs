@@ -228,13 +228,12 @@ pub(crate) fn authorize_managed_runtime_ready_marker_repair(
     context: RepairAuthorizationContext,
 ) -> Result<RepairAuthorization<ReadyMarker>, RepairAuthorizationRejection> {
     authorize_context(context)?;
-    if decision.kind != GuardianActionKind::Repair || decision.mode == GuardianMode::Disabled {
+    if decision.kind() != GuardianActionKind::Repair || decision.mode() == GuardianMode::Disabled {
         return Err(RepairAuthorizationRejection::NonRepairDecision);
     }
 
     let plan = decision
-        .action_plan
-        .as_ref()
+        .action_plan()
         .ok_or(RepairAuthorizationRejection::MissingActionPlan)?;
     let (diagnosis_id, action) = supported_runtime_ready_marker_repair(decision, plan)?;
     let target = action
@@ -254,14 +253,14 @@ pub(crate) fn authorize_managed_runtime_ready_marker_repair(
     Ok(RepairAuthorization {
         diagnosis_id,
         ownership: target.ownership,
-        mode: decision.mode,
+        mode: decision.mode(),
         action: action.kind,
         max_attempts: RUNTIME_REPAIR_MAX_ATTEMPTS,
         suppression_key: FailureMemoryKey::for_observation(
             super::GuardianDomain::Runtime,
             &diagnosis_id,
             &target,
-            decision.mode,
+            decision.mode(),
             None,
         ),
         target,
@@ -278,13 +277,12 @@ where
     K: ArtifactRepairKind,
 {
     authorize_context(context)?;
-    if decision.kind != GuardianActionKind::Repair {
+    if decision.kind() != GuardianActionKind::Repair {
         return Err(RepairAuthorizationRejection::NonRepairDecision);
     }
 
     let plan = decision
-        .action_plan
-        .as_ref()
+        .action_plan()
         .ok_or(RepairAuthorizationRejection::MissingActionPlan)?;
     let diagnosis_id = supported_artifact_diagnosis(decision, plan)?;
     let action = repair_action(plan)?;
@@ -308,14 +306,14 @@ where
     Ok(RepairAuthorization {
         diagnosis_id,
         ownership: target.ownership,
-        mode: decision.mode,
+        mode: decision.mode(),
         action: action.kind,
         max_attempts: ARTIFACT_REPAIR_MAX_ATTEMPTS,
         suppression_key: FailureMemoryKey::for_observation(
             super::GuardianDomain::Install,
             &diagnosis_id,
             &target,
-            decision.mode,
+            decision.mode(),
             None,
         ),
         target,
@@ -347,7 +345,7 @@ fn supported_artifact_diagnosis(
 ) -> Result<DiagnosisId, RepairAuthorizationRejection> {
     if plan.prerequisite.diagnosis_id != DiagnosisId::LauncherManagedArtifactCorrupt
         || !decision
-            .diagnoses
+            .diagnoses()
             .contains(&DiagnosisId::LauncherManagedArtifactCorrupt)
         || !plan
             .prerequisite
@@ -366,7 +364,7 @@ fn supported_runtime_ready_marker_repair<'a>(
     if plan.owner != StabilizationSystem::Guardian
         || plan.prerequisite.diagnosis_id != DiagnosisId::ManagedRuntimeCorrupt
         || !decision
-            .diagnoses
+            .diagnoses()
             .contains(&DiagnosisId::ManagedRuntimeCorrupt)
         || !plan
             .prerequisite
@@ -525,8 +523,14 @@ mod tests {
     #[test]
     fn authorization_rejects_non_repair_missing_plan_diagnosis_action_and_target() {
         let context = RepairAuthorizationContext::current_operation();
-        let mut non_repair = repair_decision(OwnershipClass::LauncherManaged);
-        non_repair.kind = GuardianActionKind::Block;
+        let decision = repair_decision(OwnershipClass::LauncherManaged);
+        let non_repair = GuardianDecision::for_test(
+            decision.operation_id().cloned(),
+            decision.mode(),
+            GuardianActionKind::Block,
+            decision.diagnoses().to_vec(),
+            decision.action_plan().cloned(),
+        );
         assert_eq!(
             authorize_launcher_managed_artifact_repair(
                 &non_repair,
@@ -537,8 +541,14 @@ mod tests {
             RepairAuthorizationRejection::NonRepairDecision
         );
 
-        let mut missing_plan = repair_decision(OwnershipClass::LauncherManaged);
-        missing_plan.action_plan = None;
+        let decision = repair_decision(OwnershipClass::LauncherManaged);
+        let missing_plan = GuardianDecision::for_test(
+            decision.operation_id().cloned(),
+            decision.mode(),
+            decision.kind(),
+            decision.diagnoses().to_vec(),
+            None,
+        );
         assert_eq!(
             authorize_launcher_managed_artifact_repair(
                 &missing_plan,
@@ -549,8 +559,14 @@ mod tests {
             RepairAuthorizationRejection::MissingActionPlan
         );
 
-        let mut unsupported = repair_decision(OwnershipClass::LauncherManaged);
-        unsupported.diagnoses = vec![DiagnosisId::ManagedRuntimeCorrupt];
+        let decision = repair_decision(OwnershipClass::LauncherManaged);
+        let unsupported = GuardianDecision::for_test(
+            decision.operation_id().cloned(),
+            decision.mode(),
+            decision.kind(),
+            vec![DiagnosisId::ManagedRuntimeCorrupt],
+            decision.action_plan().cloned(),
+        );
         assert_eq!(
             authorize_launcher_managed_artifact_repair(
                 &unsupported,
@@ -561,13 +577,16 @@ mod tests {
             RepairAuthorizationRejection::UnsupportedDiagnosis
         );
 
-        let mut missing_action = repair_decision(OwnershipClass::LauncherManaged);
-        missing_action
-            .action_plan
-            .as_mut()
-            .expect("plan")
-            .actions
-            .clear();
+        let decision = repair_decision(OwnershipClass::LauncherManaged);
+        let mut action_plan = decision.action_plan().cloned().expect("plan");
+        action_plan.actions.clear();
+        let missing_action = GuardianDecision::for_test(
+            decision.operation_id().cloned(),
+            decision.mode(),
+            decision.kind(),
+            decision.diagnoses().to_vec(),
+            Some(action_plan),
+        );
         assert_eq!(
             authorize_launcher_managed_artifact_repair(
                 &missing_action,
@@ -578,10 +597,17 @@ mod tests {
             RepairAuthorizationRejection::MissingTarget
         );
 
-        let mut missing_target = repair_decision(OwnershipClass::LauncherManaged);
-        let plan = missing_target.action_plan.as_mut().expect("plan");
-        plan.actions[0].target = None;
-        plan.prerequisite.affected_targets.clear();
+        let decision = repair_decision(OwnershipClass::LauncherManaged);
+        let mut action_plan = decision.action_plan().cloned().expect("plan");
+        action_plan.actions[0].target = None;
+        action_plan.prerequisite.affected_targets.clear();
+        let missing_target = GuardianDecision::for_test(
+            decision.operation_id().cloned(),
+            decision.mode(),
+            decision.kind(),
+            decision.diagnoses().to_vec(),
+            Some(action_plan),
+        );
         assert_eq!(
             authorize_launcher_managed_artifact_repair(
                 &missing_target,
@@ -643,38 +669,62 @@ mod tests {
     #[test]
     fn ready_marker_authorization_rejects_mode_confidence_reason_owner_and_target_shape() {
         let context = RepairAuthorizationContext::current_operation();
-        let mut disabled = runtime_repair_decision(OwnershipClass::LauncherManaged);
-        disabled.mode = GuardianMode::Disabled;
+        let decision = runtime_repair_decision(OwnershipClass::LauncherManaged);
+        let disabled = GuardianDecision::for_test(
+            decision.operation_id().cloned(),
+            GuardianMode::Disabled,
+            decision.kind(),
+            decision.diagnoses().to_vec(),
+            decision.action_plan().cloned(),
+        );
         assert_eq!(
             authorize_managed_runtime_ready_marker_repair(&disabled, context)
                 .expect_error_without_debug("disabled mode"),
             RepairAuthorizationRejection::NonRepairDecision
         );
 
-        let mut low_confidence = runtime_repair_decision(OwnershipClass::LauncherManaged);
-        low_confidence
-            .action_plan
-            .as_mut()
-            .expect("plan")
-            .prerequisite
-            .confidence = GuardianConfidence::Low;
+        let decision = runtime_repair_decision(OwnershipClass::LauncherManaged);
+        let mut action_plan = decision.action_plan().cloned().expect("plan");
+        action_plan.prerequisite.confidence = GuardianConfidence::Low;
+        let low_confidence = GuardianDecision::for_test(
+            decision.operation_id().cloned(),
+            decision.mode(),
+            decision.kind(),
+            decision.diagnoses().to_vec(),
+            Some(action_plan),
+        );
         assert_eq!(
             authorize_managed_runtime_ready_marker_repair(&low_confidence, context)
                 .expect_error_without_debug("low confidence"),
             RepairAuthorizationRejection::UnsupportedDiagnosis
         );
 
-        let mut wrong_reason = runtime_repair_decision(OwnershipClass::LauncherManaged);
-        wrong_reason.action_plan.as_mut().expect("plan").actions[0].reason =
-            DiagnosisId::ManagedRuntimeMissing;
+        let decision = runtime_repair_decision(OwnershipClass::LauncherManaged);
+        let mut action_plan = decision.action_plan().cloned().expect("plan");
+        action_plan.actions[0].reason = DiagnosisId::ManagedRuntimeMissing;
+        let wrong_reason = GuardianDecision::for_test(
+            decision.operation_id().cloned(),
+            decision.mode(),
+            decision.kind(),
+            decision.diagnoses().to_vec(),
+            Some(action_plan),
+        );
         assert_eq!(
             authorize_managed_runtime_ready_marker_repair(&wrong_reason, context)
                 .expect_error_without_debug("wrong action reason"),
             RepairAuthorizationRejection::UnsupportedDiagnosis
         );
 
-        let mut wrong_owner = runtime_repair_decision(OwnershipClass::LauncherManaged);
-        wrong_owner.action_plan.as_mut().expect("plan").owner = StabilizationSystem::Application;
+        let decision = runtime_repair_decision(OwnershipClass::LauncherManaged);
+        let mut action_plan = decision.action_plan().cloned().expect("plan");
+        action_plan.owner = StabilizationSystem::Application;
+        let wrong_owner = GuardianDecision::for_test(
+            decision.operation_id().cloned(),
+            decision.mode(),
+            decision.kind(),
+            decision.diagnoses().to_vec(),
+            Some(action_plan),
+        );
         assert_eq!(
             authorize_managed_runtime_ready_marker_repair(&wrong_owner, context)
                 .expect_error_without_debug("wrong action-plan owner"),
@@ -716,12 +766,12 @@ mod tests {
 
     fn repair_decision_for_target(target: TargetDescriptor) -> GuardianDecision {
         let ownership = target.ownership;
-        GuardianDecision {
-            operation_id: Some(OperationId::new("operation-install-repair")),
-            mode: GuardianMode::Managed,
-            kind: GuardianActionKind::Repair,
-            diagnoses: vec![DiagnosisId::LauncherManagedArtifactCorrupt],
-            action_plan: Some(GuardianActionPlan::new(
+        GuardianDecision::for_test(
+            Some(OperationId::new("operation-install-repair")),
+            GuardianMode::Managed,
+            GuardianActionKind::Repair,
+            vec![DiagnosisId::LauncherManagedArtifactCorrupt],
+            Some(GuardianActionPlan::new(
                 StabilizationSystem::Guardian,
                 ActionPlanPrerequisite {
                     diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
@@ -740,7 +790,7 @@ mod tests {
                     reason: DiagnosisId::LauncherManagedArtifactCorrupt,
                 }],
             )),
-        }
+        )
     }
 
     fn artifact_descriptor(target_id: &str) -> GuardianMinecraftArtifactRepairDescriptor {
@@ -773,12 +823,12 @@ mod tests {
     fn runtime_repair_decision_for_target(target: TargetDescriptor) -> GuardianDecision {
         let ownership = target.ownership;
         let diagnosis_id = DiagnosisId::ManagedRuntimeCorrupt;
-        GuardianDecision {
-            operation_id: Some(OperationId::new(format!("operation-runtime-{ownership:?}"))),
-            mode: GuardianMode::Managed,
-            kind: GuardianActionKind::Repair,
-            diagnoses: vec![diagnosis_id],
-            action_plan: Some(GuardianActionPlan::new(
+        GuardianDecision::for_test(
+            Some(OperationId::new(format!("operation-runtime-{ownership:?}"))),
+            GuardianMode::Managed,
+            GuardianActionKind::Repair,
+            vec![diagnosis_id],
+            Some(GuardianActionPlan::new(
                 StabilizationSystem::Guardian,
                 ActionPlanPrerequisite {
                     diagnosis_id,
@@ -793,6 +843,6 @@ mod tests {
                     reason: diagnosis_id,
                 }],
             )),
-        }
+        )
     }
 }

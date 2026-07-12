@@ -573,13 +573,12 @@ fn boundary_case(id: impl Into<String>, family: BoundaryFamily, spec: CaseSpec) 
     assert_eq!(outcome.safety.decision, outcome.user_outcome.decision());
     let plan = outcome
         .guardian_decision
-        .action_plan
-        .as_ref()
+        .action_plan()
         .expect("preflight decision has an action plan");
     assert!(
         plan.prerequisite
             .candidate_actions
-            .contains(&outcome.guardian_decision.kind),
+            .contains(&outcome.guardian_decision.kind()),
         "scoped verdict is absent from prerequisite candidates"
     );
     BoundaryCase {

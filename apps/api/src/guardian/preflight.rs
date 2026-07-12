@@ -94,15 +94,15 @@ pub fn guardian_preflight_outcome(
     let safety_case = build_safety_case(operation_id, request.mode, request.phase, &facts);
     let guardian_decision =
         decide_guardian_policy(&safety_case, preflight_policy_context(&request, &facts));
-    let preflight_decision = preflight_boundary_verdict(guardian_decision.kind);
-    let directives = preflight_directives(guardian_decision.kind);
+    let preflight_decision = preflight_boundary_verdict(guardian_decision.kind());
+    let directives = preflight_directives(guardian_decision.kind());
     let diagnosis_ids = safety_case
         .diagnoses
         .iter()
         .map(|diagnosis| diagnosis.id())
         .collect::<Vec<_>>();
     let user_outcome = author_guardian_copy(GuardianCopyRequest::preflight(
-        guardian_decision.kind,
+        guardian_decision.kind(),
         preflight_decision,
         request.phase,
         &diagnosis_ids,
@@ -113,7 +113,7 @@ pub fn guardian_preflight_outcome(
         decision: preflight_decision,
         summary: user_outcome.summary().to_string(),
         detail: user_outcome.details().first().cloned(),
-        diagnoses: guardian_decision.diagnoses.clone(),
+        diagnoses: guardian_decision.diagnoses().to_vec(),
     };
 
     GuardianPreflightOutcome {
@@ -441,7 +441,10 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Custom, &[fact])
         });
 
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::AskUser);
+        assert_eq!(
+            outcome.guardian_decision.kind(),
+            GuardianActionKind::AskUser
+        );
         assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Block);
         assert_eq!(
             outcome.user_outcome.summary(),
@@ -479,7 +482,10 @@ mod tests {
             &facts,
         ));
 
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Fallback);
+        assert_eq!(
+            outcome.guardian_decision.kind(),
+            GuardianActionKind::Fallback
+        );
         assert_eq!(
             outcome.user_outcome.decision(),
             GuardianActionKind::Fallback
@@ -528,7 +534,10 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Custom, &facts)
         });
 
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::AskUser);
+        assert_eq!(
+            outcome.guardian_decision.kind(),
+            GuardianActionKind::AskUser
+        );
         assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Block);
         assert_eq!(
             &outcome.user_outcome.details()[..2],
@@ -574,7 +583,7 @@ mod tests {
             &facts,
         ));
 
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Strip);
+        assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Strip);
         assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Strip);
         assert_eq!(
             &outcome.user_outcome.details()[..2],
@@ -618,7 +627,7 @@ mod tests {
             &facts,
         ));
 
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Warn);
+        assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Warn);
         assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Warn);
         assert_eq!(
             &outcome.user_outcome.details()[..2],
@@ -651,7 +660,7 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[runtime_fact])
         });
 
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Block);
+        assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Block);
         assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Block);
         assert_eq!(
             outcome.user_outcome.details(),
@@ -680,7 +689,7 @@ mod tests {
             ),
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[])
         });
-        assert_eq!(blocked.guardian_decision.kind, GuardianActionKind::Block);
+        assert_eq!(blocked.guardian_decision.kind(), GuardianActionKind::Block);
         assert_eq!(blocked.user_outcome.decision(), GuardianActionKind::Block);
 
         readiness_fact.severity = Some(GuardianSeverity::Warning);
@@ -688,7 +697,10 @@ mod tests {
             readiness: GuardianPreflightReadiness::from_facts(true, &[readiness_fact]),
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[])
         });
-        assert_eq!(ready.guardian_decision.kind, GuardianActionKind::RecordOnly);
+        assert_eq!(
+            ready.guardian_decision.kind(),
+            GuardianActionKind::RecordOnly
+        );
         assert_eq!(
             ready.user_outcome.decision(),
             GuardianActionKind::RecordOnly
@@ -713,7 +725,7 @@ mod tests {
                 std::slice::from_ref(&fact),
             )
         });
-        assert_eq!(managed.guardian_decision.kind, GuardianActionKind::Strip);
+        assert_eq!(managed.guardian_decision.kind(), GuardianActionKind::Strip);
         assert_eq!(managed.user_outcome.decision(), GuardianActionKind::Strip);
         assert_eq!(
             managed.directives,
@@ -901,7 +913,7 @@ mod tests {
         ));
 
         assert_eq!(outcome.safety_case.diagnoses.len(), 1);
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Warn);
+        assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Warn);
         assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Warn);
         assert!(outcome.user_outcome.details().iter().any(|detail| {
             detail == "This instance has recorded one out-of-memory crash; the latest was today."

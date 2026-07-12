@@ -39,10 +39,10 @@ pub fn persisted_state_load_guardian_outcome(
 
     let user_outcome = author_guardian_copy(GuardianCopyRequest::persisted_state_load(
         diagnosis_id,
-        decision.kind,
+        decision.kind(),
     ))?;
     Some(GuardianStateLoadOutcome {
-        decision: decision.kind,
+        decision: decision.kind(),
         diagnosis_id,
         user_outcome,
     })

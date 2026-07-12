@@ -7,7 +7,7 @@ use crate::application::performance::{
 };
 use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
-use crate::guardian::{GuardianSummary, summary::GuardianDecision};
+use crate::guardian::{GuardianSummaryDecision, guardian_summary_for_test};
 use crate::state::contracts::TargetDescriptor;
 use crate::state::{AppStateInit, InstallStore, SessionStopError, SessionStore};
 use axial_config::{AppPaths, ConfigStore, Instance, InstanceStore};
@@ -96,7 +96,7 @@ fn launch_prepared_response_payload_exposes_queued_session_metadata() {
 
 #[test]
 fn launch_request_error_status_maps_guardian_blocked_to_unprocessable_entity() {
-    let error = launch_request_error(Some(GuardianDecision::Blocked));
+    let error = launch_request_error(Some(GuardianSummaryDecision::Blocked));
 
     assert_eq!(
         launch_request_error_status(&error),
@@ -115,7 +115,7 @@ fn launch_request_error_status_maps_guardian_blocked_to_unprocessable_entity() {
 fn launch_request_error_status_keeps_non_guardian_blocked_errors_internal() {
     for error in [
         launch_request_error(None),
-        launch_request_error(Some(GuardianDecision::Warned)),
+        launch_request_error(Some(GuardianSummaryDecision::Warned)),
     ] {
         assert_eq!(
             launch_request_error_status(&error),
@@ -4123,17 +4123,21 @@ fn test_manifest_run(
     }
 }
 
-fn launch_request_error(decision: Option<GuardianDecision>) -> launch_app::LaunchRequestError {
+fn launch_request_error(
+    decision: Option<GuardianSummaryDecision>,
+) -> launch_app::LaunchRequestError {
     launch_app::LaunchRequestError {
         message: "launch rejected".to_string(),
         healing: None,
-        guardian: decision.map(|decision| GuardianSummary {
-            mode: axial_launcher::GuardianMode::Managed,
-            decision,
-            message: None,
-            details: Vec::new(),
-            guidance: Vec::new(),
-            interventions: Vec::new(),
+        guardian: decision.map(|decision| {
+            guardian_summary_for_test(
+                axial_launcher::GuardianMode::Managed,
+                decision,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
         }),
     }
 }
@@ -4305,7 +4309,14 @@ fn test_launch_session_task() -> launch_app::LaunchSessionTask {
             guardian: LaunchGuardianContext::default(),
             performance_mode: "managed".to_string(),
         },
-        guardian: GuardianSummary::new(GuardianMode::Managed),
+        guardian: guardian_summary_for_test(
+            GuardianMode::Managed,
+            GuardianSummaryDecision::Allowed,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
         launched_at: "2026-05-30T00:00:00Z".to_string(),
         benchmark: None,
         resource_budget: None,

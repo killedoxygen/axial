@@ -14,7 +14,7 @@ pub struct CommandEnvelope {
     pub command: ApplicationCommand,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AdapterResponse {
     pub adapter: InterfaceAdapter,
     pub outcome: ApplicationOutcome,

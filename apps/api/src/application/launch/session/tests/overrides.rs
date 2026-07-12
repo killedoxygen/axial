@@ -314,7 +314,10 @@ async fn launch_preflight_custom_override_warns_with_bounded_override_payload() 
 
     assert_eq!(preflight.status, "ready");
     assert_eq!(preflight.mode, GuardianMode::Custom);
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Warned);
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Warned
+    );
     assert_eq!(
         preflight.overrides.java.origin,
         Some(OverrideOrigin::Instance)
@@ -323,9 +326,9 @@ async fn launch_preflight_custom_override_warns_with_bounded_override_payload() 
         preflight.overrides.raw_jvm_args.origin,
         Some(OverrideOrigin::Instance)
     );
-    assert!(preflight.guardian.guidance.iter().any(|detail| detail
+    assert!(preflight.guardian.guidance().iter().any(|detail| detail
         == "Guardian Custom mode will keep the selected Java override for this launch."));
-    assert!(preflight.guardian.guidance.iter().any(|detail| detail
+    assert!(preflight.guardian.guidance().iter().any(|detail| detail
         == "Guardian Custom mode will keep explicit JVM args; remove them first if startup becomes unstable."));
 
     let payload = serde_json::to_string(&preflight).expect("serialize preflight");
@@ -363,7 +366,10 @@ async fn launch_preflight_bad_custom_java_override_blocks_with_guardian_fact() {
 
     assert!(!preflight.readiness.launchable);
     assert_readiness_reason(&preflight, LaunchReadinessReasonId::JavaOverrideMissing);
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Blocked);
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Blocked
+    );
     let fact = guardian_fact(&preflight, "java_override_missing");
     assert_eq!(fact.domain, crate::guardian::GuardianDomain::Runtime);
     assert_eq!(fact.ownership, OwnershipClass::UserOwned);
@@ -371,7 +377,7 @@ async fn launch_preflight_bad_custom_java_override_blocks_with_guardian_fact() {
         fact.target.as_ref().map(|target| target.id.as_str()),
         Some("instance_java_override")
     );
-    assert!(preflight.guardian.details.iter().any(|detail| {
+    assert!(preflight.guardian.details().iter().any(|detail| {
         detail == "Guardian blocked launch because the selected Java override is unavailable."
     }));
 
@@ -448,8 +454,11 @@ async fn launch_preflight_malformed_jvm_args_exposes_redacted_guardian_fact() {
         .await
         .expect("prepare preflight");
 
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Intervened);
-    assert!(preflight.guardian.guidance.iter().any(|detail| {
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Intervened
+    );
+    assert!(preflight.guardian.guidance().iter().any(|detail| {
         detail == "Guardian removed malformed explicit JVM args for this launch."
     }));
     let fact = preflight
@@ -483,8 +492,11 @@ async fn launch_preflight_unsupported_jvm_gc_flags_exposes_guardian_fact() {
         .await
         .expect("prepare preflight");
 
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Intervened);
-    assert!(preflight.guardian.guidance.iter().any(|detail| {
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Intervened
+    );
+    assert!(preflight.guardian.guidance().iter().any(|detail| {
         detail == "Guardian removed unsupported explicit JVM args for this launch."
     }));
     let fact = preflight
@@ -522,7 +534,10 @@ async fn unsafe_jvm_override_families_are_guardian_stripped_in_managed_mode() {
         .await
         .expect("prepare preflight");
 
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Intervened);
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Intervened
+    );
     for expected in [
         "jvm_arg_unsafe_classpath_override",
         "jvm_arg_unsafe_native_path_override",
@@ -535,10 +550,10 @@ async fn unsafe_jvm_override_families_are_guardian_stripped_in_managed_mode() {
             Some("explicit_jvm_args")
         );
     }
-    assert!(preflight.guardian.details.iter().any(|detail| {
+    assert!(preflight.guardian.details().iter().any(|detail| {
         detail == "Guardian removed explicit JVM args that override launcher-owned settings for this launch."
     }));
-    assert!(preflight.guardian.guidance.iter().any(|detail| {
+    assert!(preflight.guardian.guidance().iter().any(|detail| {
         detail == "Remove memory, classpath, native-path, or agent overrides from saved JVM args before re-enabling them."
     }));
 
@@ -556,8 +571,8 @@ async fn unsafe_jvm_override_families_are_guardian_stripped_in_managed_mode() {
     .expect("prepare launch session");
 
     assert_eq!(
-        prepared.task.guardian.decision,
-        GuardianDecision::Intervened
+        prepared.task.guardian.decision(),
+        GuardianSummaryDecision::Intervened
     );
     assert!(prepared.task.intent.extra_jvm_args.is_empty());
 
@@ -586,7 +601,10 @@ async fn unsafe_jvm_override_families_are_preserved_but_warned_in_custom_mode() 
         .expect("prepare preflight");
 
     assert_eq!(preflight.mode, GuardianMode::Custom);
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Warned);
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Warned
+    );
     assert_eq!(
         preflight.overrides.raw_jvm_args.origin,
         Some(OverrideOrigin::Instance)
@@ -599,10 +617,10 @@ async fn unsafe_jvm_override_families_are_preserved_but_warned_in_custom_mode() 
         let fact = guardian_fact(&preflight, expected);
         assert_eq!(fact.domain, crate::guardian::GuardianDomain::Jvm);
     }
-    assert!(preflight.guardian.details.iter().any(|detail| {
+    assert!(preflight.guardian.details().iter().any(|detail| {
         detail == "Guardian detected JVM arguments that override launcher-owned runtime settings. Remove them if startup fails or behaves unexpectedly."
     }));
-    assert!(preflight.guardian.guidance.iter().any(|detail| {
+    assert!(preflight.guardian.guidance().iter().any(|detail| {
         detail == "Guardian Custom mode will keep explicit JVM args; remove them first if startup becomes unstable."
     }));
     let payload = serde_json::to_string(&preflight).expect("serialize preflight");
@@ -621,7 +639,10 @@ async fn unsafe_jvm_override_families_are_preserved_but_warned_in_custom_mode() 
     .await
     .expect("prepare launch session");
 
-    assert_eq!(prepared.task.guardian.decision, GuardianDecision::Warned);
+    assert_eq!(
+        prepared.task.guardian.decision(),
+        GuardianSummaryDecision::Warned
+    );
     assert_eq!(
         prepared.task.intent.extra_jvm_args,
         vec![
@@ -655,12 +676,15 @@ async fn launch_preflight_undefined_java_override_exposes_guardian_fact() {
         .await
         .expect("prepare preflight");
 
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Intervened);
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Intervened
+    );
     assert_eq!(
         preflight.overrides.java.origin,
         Some(OverrideOrigin::Instance)
     );
-    assert!(preflight.guardian.guidance.iter().any(|detail| {
+    assert!(preflight.guardian.guidance().iter().any(|detail| {
         detail == "Guardian will ignore the unavailable Java override and use managed Java for this launch."
     }));
     let fact = preflight
@@ -693,7 +717,10 @@ async fn launch_preflight_null_java_override_exposes_guardian_fact() {
         .await
         .expect("prepare preflight");
 
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Intervened);
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Intervened
+    );
     let fact = preflight
         .guardian_facts
         .iter()
@@ -730,11 +757,11 @@ async fn prepare_launch_session_uses_managed_java_for_undefined_java_override() 
     .expect("prepare launch session");
 
     assert_eq!(
-        prepared.task.guardian.decision,
-        GuardianDecision::Intervened
+        prepared.task.guardian.decision(),
+        GuardianSummaryDecision::Intervened
     );
     assert_eq!(prepared.task.intent.requested_java, "");
-    assert!(prepared.task.guardian.details.iter().any(|detail| {
+    assert!(prepared.task.guardian.details().iter().any(|detail| {
         detail == "Guardian will ignore the unavailable Java override and use managed Java for this launch."
     }));
     let payload = serde_json::to_string(&prepared.task.guardian).expect("guardian json");
@@ -754,11 +781,14 @@ async fn launch_preflight_missing_managed_java_override_falls_back_without_raw_p
         .await
         .expect("prepare preflight");
 
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Intervened);
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Intervened
+    );
     let fact = guardian_fact(&preflight, "java_override_missing");
     assert_eq!(fact.domain, crate::guardian::GuardianDomain::Runtime);
     assert_eq!(fact.ownership, OwnershipClass::UserOwned);
-    assert!(preflight.guardian.details.iter().any(|detail| {
+    assert!(preflight.guardian.details().iter().any(|detail| {
         detail == "Guardian will ignore the unavailable Java override and use managed Java for this launch."
     }));
 
@@ -790,11 +820,11 @@ async fn prepare_launch_session_uses_managed_java_for_missing_managed_java_overr
     .expect("prepare launch session");
 
     assert_eq!(
-        prepared.task.guardian.decision,
-        GuardianDecision::Intervened
+        prepared.task.guardian.decision(),
+        GuardianSummaryDecision::Intervened
     );
     assert_eq!(prepared.task.intent.requested_java, "");
-    assert!(prepared.task.guardian.details.iter().any(|detail| {
+    assert!(prepared.task.guardian.details().iter().any(|detail| {
         detail == "Guardian will ignore the unavailable Java override and use managed Java for this launch."
     }));
     let payload = serde_json::to_string(&prepared.task.guardian).expect("guardian json");
@@ -815,8 +845,11 @@ async fn launch_preflight_conflicting_memory_jvm_args_are_guardian_stripped() {
         .await
         .expect("prepare preflight");
 
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Intervened);
-    assert!(preflight.guardian.details.iter().any(|detail| {
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Intervened
+    );
+    assert!(preflight.guardian.details().iter().any(|detail| {
         detail == "Guardian removed explicit JVM args that override launcher-owned settings for this launch."
     }));
     let fact = guardian_fact(&preflight, "jvm_arg_memory_conflict");
@@ -836,8 +869,8 @@ async fn launch_preflight_conflicting_memory_jvm_args_are_guardian_stripped() {
     .expect("prepare launch session");
 
     assert_eq!(
-        prepared.task.guardian.decision,
-        GuardianDecision::Intervened
+        prepared.task.guardian.decision(),
+        GuardianSummaryDecision::Intervened
     );
     assert!(prepared.task.intent.extra_jvm_args.is_empty());
     let payload = serde_json::to_string(&prepared.task.guardian).expect("guardian json");
@@ -893,8 +926,11 @@ async fn launch_preflight_wrong_java_major_override_falls_back_with_guardian_fac
         .await
         .expect("prepare preflight");
 
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Intervened);
-    assert!(preflight.guardian.details.iter().any(|detail| {
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Intervened
+    );
+    assert!(preflight.guardian.details().iter().any(|detail| {
         detail == "Guardian will ignore the incompatible Java override and use managed Java for this launch."
     }));
     let fact = guardian_fact(&preflight, "java_major_mismatch");
@@ -942,8 +978,11 @@ async fn launch_preflight_probe_failing_java_override_falls_back_without_raw_pat
         .await
         .expect("prepare preflight");
 
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Intervened);
-    assert!(preflight.guardian.details.iter().any(|detail| {
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Intervened
+    );
+    assert!(preflight.guardian.details().iter().any(|detail| {
         detail == "Guardian will ignore the Java override that failed probing and use managed Java for this launch."
     }));
     let fact = guardian_fact(&preflight, "java_probe_failed");
@@ -991,8 +1030,11 @@ async fn launch_preflight_old_java8_update_falls_back_with_guardian_fact() {
         .await
         .expect("prepare preflight");
 
-    assert_eq!(preflight.guardian.decision, GuardianDecision::Intervened);
-    assert!(preflight.guardian.details.iter().any(|detail| {
+    assert_eq!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Intervened
+    );
+    assert!(preflight.guardian.details().iter().any(|detail| {
         detail == "Guardian will ignore the outdated Java override and use managed Java for this launch."
     }));
     let fact = guardian_fact(&preflight, "java_update_too_old");

@@ -423,7 +423,7 @@ fn render_output(
                 preset_adjustment_snapshot(&request).expect("fixture preset adjustment coordinate");
             let directive = super::guardian_prelaunch_preset_adjustment_directive(request)
                 .expect("fixture preset adjustment directive");
-            project_output(Some(decision.kind), None, Some(directive))
+            project_output(Some(decision.kind()), None, Some(directive))
         }
         GuardianLaunchCopyInput::RecoverySuppressed { kind } => project_output(
             None,
@@ -442,7 +442,7 @@ fn project_launch_failure_output(
     outcome: super::GuardianLaunchFailureOutcome,
 ) -> GuardianLaunchCopyOutput {
     project_output(
-        Some(outcome.guardian_decision.kind),
+        Some(outcome.guardian_decision.kind()),
         Some(outcome.user_outcome),
         outcome.directive,
     )

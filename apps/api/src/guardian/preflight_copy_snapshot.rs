@@ -557,7 +557,7 @@ fn replay_historical_composition(
 
 fn output_projection(outcome: GuardianPreflightOutcome) -> PreflightCopyOutput {
     PreflightCopyOutput {
-        kernel_decision: outcome.guardian_decision.kind,
+        kernel_decision: outcome.guardian_decision.kind(),
         effective_decision: outcome.user_outcome.decision(),
         phase: outcome.user_outcome.phase(),
         summary: outcome.user_outcome.summary().to_string(),

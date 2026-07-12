@@ -5,7 +5,7 @@ use crate::state::contracts::OperationId;
 use axial_minecraft::{DownloadProgress, LoaderComponentId};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InstallVersionStaging {
     pub command: ApplicationCommand,
     pub result: CommandResult<InstallVersionPayload>,

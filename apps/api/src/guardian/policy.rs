@@ -1,10 +1,58 @@
 use super::rules::rule_order;
 use super::{
     ActionPlanPrerequisite, Diagnosis, DiagnosisId, GuardianAction, GuardianActionKind,
-    GuardianActionPlan, GuardianDecision, GuardianFact, GuardianFactId, GuardianMode,
-    GuardianSeverity, SafetyCase,
+    GuardianActionPlan, GuardianFact, GuardianFactId, GuardianMode, GuardianSeverity, SafetyCase,
 };
-use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor};
+use crate::state::contracts::{OperationId, OwnershipClass, StabilizationSystem, TargetDescriptor};
+use serde::Serialize;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GuardianDecision {
+    operation_id: Option<OperationId>,
+    mode: GuardianMode,
+    kind: GuardianActionKind,
+    diagnoses: Vec<DiagnosisId>,
+    action_plan: Option<GuardianActionPlan>,
+}
+
+impl GuardianDecision {
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        self.operation_id.as_ref()
+    }
+
+    pub const fn mode(&self) -> GuardianMode {
+        self.mode
+    }
+
+    pub const fn kind(&self) -> GuardianActionKind {
+        self.kind
+    }
+
+    pub fn diagnoses(&self) -> &[DiagnosisId] {
+        &self.diagnoses
+    }
+
+    pub fn action_plan(&self) -> Option<&GuardianActionPlan> {
+        self.action_plan.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        operation_id: Option<OperationId>,
+        mode: GuardianMode,
+        kind: GuardianActionKind,
+        diagnoses: Vec<DiagnosisId>,
+        action_plan: Option<GuardianActionPlan>,
+    ) -> Self {
+        Self {
+            operation_id,
+            mode,
+            kind,
+            diagnoses,
+            action_plan,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuardianPolicyContext {

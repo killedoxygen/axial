@@ -88,10 +88,10 @@ pub fn plan_performance_supervision(
     };
     let decision = decide_guardian_policy(&safety_case, request.context);
 
-    if !performance_supervision_allows(request.operation, decision.kind) {
+    if !performance_supervision_allows(request.operation, decision.kind()) {
         return Err(GuardianPerformanceSupervisionRejection::GuardianBlocked);
     }
-    if decision.kind == GuardianActionKind::Fallback && request.fallback_chain_len == 0 {
+    if decision.kind() == GuardianActionKind::Fallback && request.fallback_chain_len == 0 {
         return Err(GuardianPerformanceSupervisionRejection::FallbackUnavailable);
     }
 
@@ -548,7 +548,7 @@ mod tests {
         })
         .expect("fallback supervision plan");
 
-        assert_eq!(supervision.decision.kind, GuardianActionKind::Warn);
+        assert_eq!(supervision.decision.kind(), GuardianActionKind::Warn);
         assert!(supervision.fallback_authorized);
         assert_eq!(supervision.max_fallback_attempts, 1);
         assert_eq!(
@@ -598,10 +598,10 @@ mod tests {
         .expect("rollback supervision plan");
 
         assert!(!supervision.rollback_authorized);
-        assert_eq!(supervision.decision.kind, GuardianActionKind::Allow);
-        assert_eq!(supervision.decision.mode, GuardianMode::Managed);
-        assert!(supervision.decision.diagnoses.is_empty());
-        assert!(supervision.decision.action_plan.is_none());
+        assert_eq!(supervision.decision.kind(), GuardianActionKind::Allow);
+        assert_eq!(supervision.decision.mode(), GuardianMode::Managed);
+        assert!(supervision.decision.diagnoses().is_empty());
+        assert!(supervision.decision.action_plan().is_none());
     }
 
     fn performance_target(id: &str, ownership: OwnershipClass) -> TargetDescriptor {

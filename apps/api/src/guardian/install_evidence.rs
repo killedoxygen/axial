@@ -188,29 +188,28 @@ pub fn install_artifact_failure_guardian_outcome_with_context(
     let safety_case = install_artifact_failure_safety_case(operation_id, mode, phase, evidence);
     let decision = decide_guardian_policy(&safety_case, context);
     if matches!(
-        decision.kind,
+        decision.kind(),
         GuardianActionKind::Allow | GuardianActionKind::RecordOnly | GuardianActionKind::Repair
     ) {
         return None;
     }
 
     let diagnosis_id = decision
-        .action_plan
-        .as_ref()
+        .action_plan()
         .map(|plan| plan.prerequisite.diagnosis_id)
-        .or_else(|| decision.diagnoses.first().copied())?;
+        .or_else(|| decision.diagnoses().first().copied())?;
     if diagnosis_id == DiagnosisId::LauncherManagedArtifactCorrupt {
         return None;
     }
 
     let user_outcome = author_guardian_copy(GuardianCopyRequest::install_failure(
         diagnosis_id,
-        decision.kind,
+        decision.kind(),
         evidence,
     ))?;
     Some(GuardianInstallFailureOutcome {
         diagnosis_id,
-        decision: decision.kind,
+        decision: decision.kind(),
         user_outcome,
     })
 }
@@ -254,7 +253,7 @@ fn install_artifact_repair_decision(
     }
     let safety_case = install_artifact_failure_safety_case(operation_id, mode, phase, evidence);
     let decision = decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
-    if decision.kind != GuardianActionKind::Repair {
+    if decision.kind() != GuardianActionKind::Repair {
         return Err(GuardianInstallArtifactRepairAuthorizationRejection::PolicyDidNotSelectRepair);
     }
     Ok(decision)

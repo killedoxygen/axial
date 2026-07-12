@@ -1803,12 +1803,12 @@ mod tests {
 
     fn artifact_repair_decision() -> GuardianDecision {
         let target = artifact_repair_target();
-        GuardianDecision {
-            operation_id: Some(OperationId::new("operation-install-repair")),
-            mode: GuardianMode::Managed,
-            kind: GuardianActionKind::Repair,
-            diagnoses: vec![DiagnosisId::LauncherManagedArtifactCorrupt],
-            action_plan: Some(GuardianActionPlan::new(
+        GuardianDecision::for_test(
+            Some(OperationId::new("operation-install-repair")),
+            GuardianMode::Managed,
+            GuardianActionKind::Repair,
+            vec![DiagnosisId::LauncherManagedArtifactCorrupt],
+            Some(GuardianActionPlan::new(
                 StabilizationSystem::Guardian,
                 ActionPlanPrerequisite {
                     diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
@@ -1827,7 +1827,7 @@ mod tests {
                     reason: DiagnosisId::LauncherManagedArtifactCorrupt,
                 }],
             )),
-        }
+        )
     }
 
     fn artifact_repair_target() -> TargetDescriptor {

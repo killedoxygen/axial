@@ -72,7 +72,7 @@ pub fn guardian_prepare_failure_outcome(
     );
     let directive = prepare_failure_directive(&request, &guardian_decision);
     let user_outcome = author_guardian_copy(GuardianCopyRequest::prepare_failure(
-        guardian_decision.kind,
+        guardian_decision.kind(),
         request.failure_class,
         request.public_error,
         request.explicit_java_override_present,
@@ -130,7 +130,7 @@ fn preset_adjustment_directive(
     request: &GuardianPresetAdjustmentRequest<'_>,
     decision: &GuardianDecision,
 ) -> Option<GuardianDirective> {
-    (decision.kind == GuardianActionKind::Downgrade).then(|| {
+    (decision.kind() == GuardianActionKind::Downgrade).then(|| {
         GuardianDirective::compatibility_preset_downgrade(
             request.requested_preset,
             request.effective_preset,
@@ -160,7 +160,7 @@ pub fn guardian_startup_failure_outcome(
     );
     let directive = startup_failure_directive(recovery_options, &guardian_decision);
     let user_outcome = author_guardian_copy(GuardianCopyRequest::startup_failure(
-        guardian_decision.kind,
+        guardian_decision.kind(),
         request.observation,
         request.crash_evidence,
         request.explicit_java_override_present,
@@ -392,7 +392,7 @@ fn prepare_failure_directive(
     request: &GuardianPrepareFailureRequest<'_>,
     decision: &GuardianDecision,
 ) -> Option<GuardianDirective> {
-    match (request.failure_class, decision.kind) {
+    match (request.failure_class, decision.kind()) {
         (LaunchFailureClass::JavaRuntimeMismatch, GuardianActionKind::Fallback)
             if request.requested_java_present
                 && request.explicit_java_override_present
@@ -420,7 +420,7 @@ fn startup_failure_directive(
     recovery_options: StartupRecoveryOptions,
     decision: &GuardianDecision,
 ) -> Option<GuardianDirective> {
-    let template = match decision.kind {
+    let template = match decision.kind() {
         GuardianActionKind::Fallback => recovery_options.runtime_fallback,
         GuardianActionKind::Downgrade => recovery_options.jvm_preset_downgrade,
         GuardianActionKind::Strip => recovery_options.disable_custom_gc,
@@ -702,7 +702,7 @@ mod tests {
             effective_preset: "legacy",
         });
 
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Block);
+        assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Block);
         assert_eq!(
             outcome.safety_case.diagnoses[0].id().as_str(),
             "launcher_managed_artifact_signature_corrupt"
@@ -736,7 +736,7 @@ mod tests {
         });
 
         assert_eq!(outcome.failure_class, LaunchFailureClass::OutOfMemory);
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Block);
+        assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Block);
         assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Block);
         assert_eq!(
             outcome.safety_case.diagnoses[0].id().as_str(),
@@ -927,7 +927,7 @@ mod tests {
             effective_preset: "performance",
         });
 
-        assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Block);
+        assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Block);
         assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Block);
         assert_eq!(
             outcome.user_outcome.summary(),

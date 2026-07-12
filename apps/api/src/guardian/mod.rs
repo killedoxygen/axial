@@ -19,7 +19,6 @@ pub mod policy;
 pub mod preflight;
 mod repair_authorization;
 pub mod state_evidence;
-pub(crate) mod summary;
 
 #[cfg(test)]
 mod decision_snapshot;
@@ -53,22 +52,27 @@ pub use artifact_repair::{GuardianArtifactRepairOutcome, GuardianArtifactRepairS
 pub(crate) use artifact_repair::{
     execute_guardian_missing_download, execute_guardian_quarantine_redownload,
 };
+pub(crate) use copy::GuardianSummaryDecision;
 pub(crate) use copy::{
     GuardianCopyRequest, GuardianLaunchAdmission, GuardianRuntimeRepairCopy, author_guardian_copy,
     guardian_directive_description, guardian_failed_launch_recovery_log,
     guardian_install_outcome_fact_group, guardian_install_outcome_from_persisted_group,
     guardian_install_outcome_persistence_facts, guardian_launch_stage_evidence,
     guardian_proof_evidence, guardian_summary_from_admission,
-    guardian_summary_with_blocked_outcome, guardian_summary_with_intervention,
-    guardian_summary_with_observed_outcome, guardian_summary_with_suppressed_outcome,
-    launch_notice, launch_notice_from_values, launch_session_outcome, launch_status_snapshot,
+    guardian_summary_from_persisted_export_value, guardian_summary_with_blocked_outcome,
+    guardian_summary_with_intervention, guardian_summary_with_observed_outcome,
+    guardian_summary_with_suppressed_outcome, launch_notice, launch_notice_from_values,
+    launch_session_outcome, launch_status_snapshot,
 };
 pub use copy::{
     GuardianInstallOutcomeSummary, GuardianJvmPresetNotice, GuardianJvmPresetOption,
-    GuardianUserOutcome, guardian_jvm_preset_notice, guardian_jvm_preset_options,
+    GuardianSummary, GuardianUserOutcome, guardian_jvm_preset_notice, guardian_jvm_preset_options,
 };
 #[cfg(test)]
-pub(crate) use copy::{guardian_launch_stage_evidence_for_test, guardian_user_outcome_for_test};
+pub(crate) use copy::{
+    guardian_launch_stage_evidence_for_test, guardian_summary_for_test,
+    guardian_user_outcome_for_test,
+};
 pub use diagnosis::{Diagnosis, build_safety_case, diagnose};
 pub use directive::{
     GuardianDirective, GuardianManagedJavaReason, GuardianPresetDowngradeReason,
@@ -114,8 +118,8 @@ pub use launch_recovery::{
 };
 pub use model::{
     ActionPlanPrerequisite, DiagnosisId, FactReliability, GuardianAction, GuardianActionKind,
-    GuardianActionPlan, GuardianConfidence, GuardianDecision, GuardianDomain, GuardianFact,
-    GuardianFactId, GuardianMode, GuardianSeverity, SafetyCase, SafetyOutcome,
+    GuardianActionPlan, GuardianConfidence, GuardianDomain, GuardianFact, GuardianFactId,
+    GuardianMode, GuardianSeverity, SafetyCase, SafetyOutcome,
 };
 pub use performance::{
     GuardianPerformanceOperationKind, GuardianPerformanceSupervisionPlan,
@@ -125,7 +129,7 @@ pub use performance::{
     performance_state_error_guardian_fact, plan_performance_supervision,
 };
 pub(super) use policy::PreflightAdmission;
-pub use policy::{GuardianPolicyContext, decide_guardian_policy};
+pub use policy::{GuardianDecision, GuardianPolicyContext, decide_guardian_policy};
 pub use preflight::{
     GuardianPreflightOutcome, GuardianPreflightOutcomeRequest, GuardianPreflightOverrideSignals,
     GuardianPreflightReadiness, GuardianPreflightResourceSignals, guardian_preflight_outcome,
@@ -137,5 +141,3 @@ pub(crate) use repair_authorization::{
     authorize_managed_runtime_ready_marker_repair,
 };
 pub use state_evidence::{GuardianStateLoadOutcome, persisted_state_load_guardian_outcome};
-pub use summary::GuardianSummary;
-pub(crate) use summary::{GuardianIntervention, GuardianInterventionKind};
