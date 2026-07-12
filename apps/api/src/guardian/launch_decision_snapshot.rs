@@ -5,8 +5,8 @@ use super::{
     GuardianFactId, GuardianLaunchFailureOutcome, GuardianLaunchRecoveryDirective,
     GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind, GuardianMode,
     GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest, GuardianSeverity,
-    GuardianStartupFailureObservation, GuardianStartupFailureRequest, SafetyCase,
-    guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
+    GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianUserOutcome,
+    SafetyCase, guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
     guardian_startup_failure_outcome,
 };
 use crate::state::contracts::OwnershipClass;
@@ -129,6 +129,18 @@ struct BoundaryCase {
     directive: Option<DirectiveProjection>,
 }
 
+pub(super) struct LaunchBoundaryCopySource {
+    pub id: String,
+    pub authored_decision: Option<GuardianActionKind>,
+    pub outcome: Option<GuardianUserOutcome>,
+    pub directive: Option<GuardianLaunchRecoveryDirective>,
+}
+
+struct BoundarySnapshotCase {
+    boundary: BoundaryCase,
+    copy: LaunchBoundaryCopySource,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BoundarySurface {
@@ -230,17 +242,38 @@ fn regenerate_guardian_launch_boundary_snapshot_fixture() {
 }
 
 fn build_snapshot() -> GuardianLaunchBoundarySnapshot {
-    let mut cases = prepare_cases();
-    cases.extend(startup_cases());
-    cases.extend(preset_cases());
-    cases.sort_by(|left, right| left.id.cmp(&right.id));
+    let cases = snapshot_cases()
+        .into_iter()
+        .map(|case| case.boundary)
+        .collect();
     GuardianLaunchBoundarySnapshot {
         schema: SnapshotSchema::V1,
         cases,
     }
 }
 
-fn prepare_cases() -> Vec<BoundaryCase> {
+pub(super) fn launch_boundary_copy_sources() -> Vec<LaunchBoundaryCopySource> {
+    snapshot_cases().into_iter().map(|case| case.copy).collect()
+}
+
+pub(super) fn committed_launch_boundary_case_ids() -> Vec<String> {
+    serde_json::from_str::<GuardianLaunchBoundarySnapshot>(SNAPSHOT_FIXTURE)
+        .expect("strict committed Guardian launch boundary snapshot fixture")
+        .cases
+        .into_iter()
+        .map(|case| case.id)
+        .collect()
+}
+
+fn snapshot_cases() -> Vec<BoundarySnapshotCase> {
+    let mut cases = prepare_cases();
+    cases.extend(startup_cases());
+    cases.extend(preset_cases());
+    cases.sort_by(|left, right| left.boundary.id.cmp(&right.boundary.id));
+    cases
+}
+
+fn prepare_cases() -> Vec<BoundarySnapshotCase> {
     let mut cases = FAILURE_CLASSES
         .into_iter()
         .map(|failure_class| {
@@ -335,7 +368,7 @@ fn prepare_cases() -> Vec<BoundaryCase> {
     cases
 }
 
-fn startup_cases() -> Vec<BoundaryCase> {
+fn startup_cases() -> Vec<BoundarySnapshotCase> {
     let mut cases = FAILURE_CLASSES
         .into_iter()
         .map(|failure_class| {
@@ -447,7 +480,7 @@ fn startup_cases() -> Vec<BoundaryCase> {
     cases
 }
 
-fn preset_cases() -> Vec<BoundaryCase> {
+fn preset_cases() -> Vec<BoundarySnapshotCase> {
     let cases = vec![
         preset_case(
             "preset--managed-explicit-changed",
@@ -496,28 +529,54 @@ fn preset_cases() -> Vec<BoundaryCase> {
     cases
 }
 
-fn prepare_case(id: impl Into<String>, request: GuardianPrepareFailureRequest<'_>) -> BoundaryCase {
+fn prepare_case(
+    id: impl Into<String>,
+    request: GuardianPrepareFailureRequest<'_>,
+) -> BoundarySnapshotCase {
+    let id = id.into();
     let mode = request.mode;
     let outcome = guardian_prepare_failure_outcome(request);
-    outcome_case(
-        id,
-        BoundarySurface::Prepare,
-        mode,
-        outcome.failure_class,
-        outcome,
-    )
+    let copy = LaunchBoundaryCopySource {
+        id: id.clone(),
+        authored_decision: Some(outcome.guardian_decision.kind),
+        outcome: Some(outcome.user_outcome.clone()),
+        directive: outcome.directive.clone(),
+    };
+    BoundarySnapshotCase {
+        boundary: outcome_case(
+            id,
+            BoundarySurface::Prepare,
+            mode,
+            outcome.failure_class,
+            outcome,
+        ),
+        copy,
+    }
 }
 
-fn startup_case(id: impl Into<String>, request: GuardianStartupFailureRequest<'_>) -> BoundaryCase {
+fn startup_case(
+    id: impl Into<String>,
+    request: GuardianStartupFailureRequest<'_>,
+) -> BoundarySnapshotCase {
+    let id = id.into();
     let mode = request.mode;
     let outcome = guardian_startup_failure_outcome(request);
-    outcome_case(
-        id,
-        BoundarySurface::Startup,
-        mode,
-        outcome.failure_class,
-        outcome,
-    )
+    let copy = LaunchBoundaryCopySource {
+        id: id.clone(),
+        authored_decision: Some(outcome.guardian_decision.kind),
+        outcome: Some(outcome.user_outcome.clone()),
+        directive: outcome.directive.clone(),
+    };
+    BoundarySnapshotCase {
+        boundary: outcome_case(
+            id,
+            BoundarySurface::Startup,
+            mode,
+            outcome.failure_class,
+            outcome,
+        ),
+        copy,
+    }
 }
 
 fn outcome_case(
@@ -551,7 +610,8 @@ fn preset_case(
     requested_preset: &str,
     effective_preset: &str,
     explicit_jvm_preset_present: bool,
-) -> BoundaryCase {
+) -> BoundarySnapshotCase {
+    let id = id.into();
     let request = GuardianPresetAdjustmentRequest {
         mode,
         requested_preset,
@@ -578,15 +638,24 @@ fn preset_case(
         public_directive.as_ref().map(DirectiveProjection::from),
         directive
     );
-    BoundaryCase {
-        id: id.into(),
-        surface: BoundarySurface::Preset,
-        mode,
-        applicable,
-        failure_class: None,
-        diagnosis,
-        decision,
-        directive,
+    let copy = LaunchBoundaryCopySource {
+        id: id.clone(),
+        authored_decision: decision.map(|decision| decision.decision_kind),
+        outcome: None,
+        directive: public_directive,
+    };
+    BoundarySnapshotCase {
+        boundary: BoundaryCase {
+            id,
+            surface: BoundarySurface::Preset,
+            mode,
+            applicable,
+            failure_class: None,
+            diagnosis,
+            decision,
+            directive,
+        },
+        copy,
     }
 }
 

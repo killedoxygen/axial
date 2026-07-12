@@ -1,0 +1,1713 @@
+{
+  "schema": "axial.guardian.launch_copy.v1",
+  "cases": [
+    {
+      "id": "boundary.prepare--auth_mode_incompatible--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--auth_mode_incompatible--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": []
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--classpath_module_conflict--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--classpath_module_conflict--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": []
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--graphics_driver_crash--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--graphics_driver_crash--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": []
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--java-runtime-mismatch--custom-explicit",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--java-runtime-mismatch--custom-explicit"
+      },
+      "output": {
+        "authored_decision": "AskUser",
+        "outcome": {
+          "decision": "AskUser",
+          "phase": "Preparing",
+          "summary": "Guardian needs confirmation before launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": [
+            "Remove the Java override or switch Guardian Mode back to Managed."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--java-runtime-mismatch--managed-already-applied",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--java-runtime-mismatch--managed-already-applied"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": [
+            "Remove the Java override or switch Guardian Mode back to Managed."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--java-runtime-mismatch--managed-recover",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--java-runtime-mismatch--managed-recover"
+      },
+      "output": {
+        "authored_decision": "Fallback",
+        "outcome": {
+          "decision": "Fallback",
+          "phase": "Preparing",
+          "summary": "Guardian adjusted launch preparation.",
+          "details": [
+            "Guardian switched to managed Java before launch"
+          ],
+          "guidance": [
+            "Remove the Java override or switch Guardian Mode back to Managed."
+          ]
+        },
+        "directive": {
+          "kind": "SwitchManagedRuntime",
+          "description": "Guardian switched to managed Java before launch"
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--java_runtime_mismatch--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--java_runtime_mismatch--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": [
+            "Use a compatible Java runtime or let Axial use the managed runtime."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--jvm-experimental-unlock--managed-recover",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--jvm-experimental-unlock--managed-recover"
+      },
+      "output": {
+        "authored_decision": "Strip",
+        "outcome": {
+          "decision": "Strip",
+          "phase": "Preparing",
+          "summary": "Guardian adjusted launch preparation.",
+          "details": [
+            "Guardian removed incompatible explicit JVM args before launch"
+          ],
+          "guidance": [
+            "Remove the explicit JVM args or switch Guardian Mode back to Managed."
+          ]
+        },
+        "directive": {
+          "kind": "StripRawJvmArgs",
+          "description": "Guardian removed incompatible explicit JVM args before launch"
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--jvm-option-ordering--managed-recover",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--jvm-option-ordering--managed-recover"
+      },
+      "output": {
+        "authored_decision": "Strip",
+        "outcome": {
+          "decision": "Strip",
+          "phase": "Preparing",
+          "summary": "Guardian adjusted launch preparation.",
+          "details": [
+            "Guardian removed incompatible explicit JVM args before launch"
+          ],
+          "guidance": [
+            "Remove the explicit JVM args or switch Guardian Mode back to Managed."
+          ]
+        },
+        "directive": {
+          "kind": "StripRawJvmArgs",
+          "description": "Guardian removed incompatible explicit JVM args before launch"
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--jvm-unsupported-option--custom-explicit",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--jvm-unsupported-option--custom-explicit"
+      },
+      "output": {
+        "authored_decision": "AskUser",
+        "outcome": {
+          "decision": "AskUser",
+          "phase": "Preparing",
+          "summary": "Guardian needs confirmation before launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": [
+            "Remove the explicit JVM args or switch Guardian Mode back to Managed."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--jvm-unsupported-option--disabled",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--jvm-unsupported-option--disabled"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": [
+            "Remove the explicit JVM args or switch Guardian Mode back to Managed."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--jvm-unsupported-option--managed-already-applied",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--jvm-unsupported-option--managed-already-applied"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": [
+            "Remove the explicit JVM args or switch Guardian Mode back to Managed."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--jvm-unsupported-option--managed-recover",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--jvm-unsupported-option--managed-recover"
+      },
+      "output": {
+        "authored_decision": "Strip",
+        "outcome": {
+          "decision": "Strip",
+          "phase": "Preparing",
+          "summary": "Guardian adjusted launch preparation.",
+          "details": [
+            "Guardian removed incompatible explicit JVM args before launch"
+          ],
+          "guidance": [
+            "Remove the explicit JVM args or switch Guardian Mode back to Managed."
+          ]
+        },
+        "directive": {
+          "kind": "StripRawJvmArgs",
+          "description": "Guardian removed incompatible explicit JVM args before launch"
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--jvm_experimental_unlock--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--jvm_experimental_unlock--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": [
+            "Use safer launch settings or let Axial manage compatibility."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--jvm_option_ordering--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--jvm_option_ordering--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": [
+            "Use safer launch settings or let Axial manage compatibility."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--jvm_unsupported_option--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--jvm_unsupported_option--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": [
+            "Use safer launch settings or let Axial manage compatibility."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--launcher_managed_artifact_signature--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--launcher_managed_artifact_signature--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": [
+            "Repair the installed version so Axial can replace the affected launcher-managed jars."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--loader_bootstrap_failure--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--loader_bootstrap_failure--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": []
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--missing_dependency--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--missing_dependency--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": []
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--mod_attributed_crash--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--mod_attributed_crash--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": []
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--mod_transformation_failure--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--mod_transformation_failure--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": []
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--out_of_memory--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--out_of_memory--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": []
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--startup_stalled--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--startup_stalled--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": [
+            "Launch stalled before startup. Review recent override changes first."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.prepare--unknown--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "prepare--unknown--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed."
+          ],
+          "guidance": []
+        }
+      }
+    },
+    {
+      "id": "boundary.preset--custom-explicit-changed",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "preset--custom-explicit-changed"
+      },
+      "output": {
+        "authored_decision": "AskUser"
+      }
+    },
+    {
+      "id": "boundary.preset--disabled-explicit-changed",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "preset--disabled-explicit-changed"
+      },
+      "output": {
+        "authored_decision": "RecordOnly"
+      }
+    },
+    {
+      "id": "boundary.preset--managed-empty-requested",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "preset--managed-empty-requested"
+      },
+      "output": {}
+    },
+    {
+      "id": "boundary.preset--managed-explicit-changed",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "preset--managed-explicit-changed"
+      },
+      "output": {
+        "authored_decision": "Downgrade",
+        "directive": {
+          "kind": "DowngradePreset",
+          "description": "Guardian downgraded JVM preset from \"ultra_low_latency\" to \"performance\" before launch"
+        }
+      }
+    },
+    {
+      "id": "boundary.preset--managed-owned-changed",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "preset--managed-owned-changed"
+      },
+      "output": {
+        "authored_decision": "Downgrade",
+        "directive": {
+          "kind": "DowngradePreset",
+          "description": "Guardian downgraded JVM preset from \"ultra_low_latency\" to \"performance\" before launch"
+        }
+      }
+    },
+    {
+      "id": "boundary.preset--managed-unchanged",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "preset--managed-unchanged"
+      },
+      "output": {}
+    },
+    {
+      "id": "boundary.startup--exited-auth_mode_incompatible--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-auth_mode_incompatible--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed because the selected auth mode was not launch-ready."
+          ],
+          "guidance": [
+            "Review the latest game log before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-classpath_module_conflict--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-classpath_module_conflict--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected classpath or module conflict."
+          ],
+          "guidance": [
+            "Review the latest game log before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-graphics_driver_crash--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-graphics_driver_crash--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected graphics driver crash."
+          ],
+          "guidance": [
+            "Update or reinstall the graphics driver, then retry without graphics overlays."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-java_runtime_mismatch--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-java_runtime_mismatch--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected Java runtime mismatch."
+          ],
+          "guidance": [
+            "Use a compatible Java runtime or let Axial use the managed runtime."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-jvm_experimental_unlock--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-jvm_experimental_unlock--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected JVM option compatibility failure."
+          ],
+          "guidance": [
+            "Use safer launch settings or let Axial manage compatibility."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-jvm_option_ordering--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-jvm_option_ordering--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected JVM option compatibility failure."
+          ],
+          "guidance": [
+            "Use safer launch settings or let Axial manage compatibility."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-jvm_unsupported_option--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-jvm_unsupported_option--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected JVM option compatibility failure."
+          ],
+          "guidance": [
+            "Use safer launch settings or let Axial manage compatibility."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-launcher_managed_artifact_signature--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-launcher_managed_artifact_signature--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with detected launcher-managed jar signature corruption."
+          ],
+          "guidance": [
+            "Repair the installed version so Axial can replace the affected launcher-managed jars."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-loader_bootstrap_failure--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-loader_bootstrap_failure--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected loader bootstrap failure."
+          ],
+          "guidance": [
+            "Review the latest game log before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-missing_dependency--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-missing_dependency--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed because a required dependency was missing."
+          ],
+          "guidance": [
+            "Check the installed mods for missing or incompatible dependencies before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-mod_attributed_crash--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-mod_attributed_crash--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a crash attributed to an installed mod."
+          ],
+          "guidance": [
+            "Update or remove the suspected mod before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-mod_transformation_failure--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-mod_transformation_failure--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected mod transformation or mixin failure."
+          ],
+          "guidance": [
+            "Update or remove the recently changed mod before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-out_of_memory--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-out_of_memory--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed after running out of memory."
+          ],
+          "guidance": [
+            "Review the instance memory allocation and close memory-heavy apps before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-startup_stalled--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-startup_stalled--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed after startup activity stalled."
+          ],
+          "guidance": [
+            "Review the latest game log before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--exited-unknown--managed-default",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--exited-unknown--managed-default"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before Guardian could verify a completed startup."
+          ],
+          "guidance": [
+            "Review the latest game log before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--java-runtime-mismatch--custom-explicit",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--java-runtime-mismatch--custom-explicit"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected Java runtime mismatch."
+          ],
+          "guidance": [
+            "Remove the Java override or switch Guardian Mode back to Managed."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--java-runtime-mismatch--managed-already-applied",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--java-runtime-mismatch--managed-already-applied"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected Java runtime mismatch."
+          ],
+          "guidance": [
+            "Remove the Java override or switch Guardian Mode back to Managed."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--java-runtime-mismatch--managed-recover",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--java-runtime-mismatch--managed-recover"
+      },
+      "output": {
+        "authored_decision": "Fallback",
+        "outcome": {
+          "decision": "Fallback",
+          "phase": "Launching",
+          "summary": "Guardian selected a guarded startup retry.",
+          "details": [
+            "Automatic retry: switched to managed Java after runtime mismatch"
+          ],
+          "guidance": [
+            "Remove the Java override or switch Guardian Mode back to Managed."
+          ]
+        },
+        "directive": {
+          "kind": "SwitchManagedRuntime",
+          "description": "Automatic retry: switched to managed Java after runtime mismatch"
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--jvm-unsupported-option--custom-explicit",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--jvm-unsupported-option--custom-explicit"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected JVM option compatibility failure."
+          ],
+          "guidance": [
+            "Choose a safer JVM preset or switch Guardian Mode back to Managed."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--jvm-unsupported-option--disabled",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--jvm-unsupported-option--disabled"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected JVM option compatibility failure."
+          ],
+          "guidance": [
+            "Choose a safer JVM preset or switch Guardian Mode back to Managed."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--jvm-unsupported-option--managed-disable-gc",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--jvm-unsupported-option--managed-disable-gc"
+      },
+      "output": {
+        "authored_decision": "Strip",
+        "outcome": {
+          "decision": "Strip",
+          "phase": "Launching",
+          "summary": "Guardian selected a guarded startup retry.",
+          "details": [
+            "Automatic retry: disabled custom GC flags after startup failure"
+          ],
+          "guidance": [
+            "Use safer launch settings or let Axial manage compatibility."
+          ]
+        },
+        "directive": {
+          "kind": "DisableCustomGc",
+          "description": "Automatic retry: disabled custom GC flags after startup failure"
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--jvm-unsupported-option--managed-downgrade",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--jvm-unsupported-option--managed-downgrade"
+      },
+      "output": {
+        "authored_decision": "Downgrade",
+        "outcome": {
+          "decision": "Downgrade",
+          "phase": "Launching",
+          "summary": "Guardian selected a guarded startup retry.",
+          "details": [
+            "Automatic retry: downgraded JVM preset to \"performance\" after startup failure"
+          ],
+          "guidance": [
+            "Use safer launch settings or let Axial manage compatibility."
+          ]
+        },
+        "directive": {
+          "kind": "DowngradePreset",
+          "description": "Automatic retry: downgraded JVM preset to \"performance\" after startup failure"
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--jvm-unsupported-option--managed-gc-already-disabled",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--jvm-unsupported-option--managed-gc-already-disabled"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected JVM option compatibility failure."
+          ],
+          "guidance": [
+            "Use safer launch settings or let Axial manage compatibility."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--jvm-unsupported-option--managed-recovery-already-applied",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--jvm-unsupported-option--managed-recovery-already-applied"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected JVM option compatibility failure."
+          ],
+          "guidance": [
+            "Use safer launch settings or let Axial manage compatibility."
+          ]
+        }
+      }
+    },
+    {
+      "id": "boundary.startup--stalled-observation--managed",
+      "input": {
+        "surface": "boundary_reference",
+        "boundary_id": "startup--stalled-observation--managed"
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "No startup activity was observed before the startup window ended."
+          ],
+          "guidance": [
+            "Review the latest game log before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "observed.graphics_driver_crash.after_boot.generic",
+      "input": {
+        "surface": "observed_crash",
+        "failure_class": "graphics_driver_crash",
+        "phase": "after_boot",
+        "suspected_mods": []
+      },
+      "output": {
+        "outcome": {
+          "decision": "Warn",
+          "phase": "Running",
+          "summary": "Minecraft stopped after a graphics driver crash.",
+          "details": [
+            "Guardian detected a native graphics driver crash after startup completed."
+          ],
+          "guidance": [
+            "Update or reinstall the graphics driver, then retry without graphics overlays."
+          ]
+        }
+      }
+    },
+    {
+      "id": "observed.graphics_driver_crash.before_boot.generic",
+      "input": {
+        "surface": "observed_crash",
+        "failure_class": "graphics_driver_crash",
+        "phase": "before_boot",
+        "suspected_mods": []
+      },
+      "output": {
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected graphics driver crash."
+          ],
+          "guidance": [
+            "Update or reinstall the graphics driver, then retry without graphics overlays."
+          ]
+        }
+      }
+    },
+    {
+      "id": "observed.missing_dependency.after_boot.generic",
+      "input": {
+        "surface": "observed_crash",
+        "failure_class": "missing_dependency",
+        "phase": "after_boot",
+        "suspected_mods": []
+      },
+      "output": {
+        "outcome": {
+          "decision": "Warn",
+          "phase": "Running",
+          "summary": "Minecraft stopped because a dependency was missing.",
+          "details": [
+            "Guardian detected a missing class or dependency after startup completed."
+          ],
+          "guidance": [
+            "Check the installed mods for missing or incompatible dependencies before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "observed.missing_dependency.before_boot.generic",
+      "input": {
+        "surface": "observed_crash",
+        "failure_class": "missing_dependency",
+        "phase": "before_boot",
+        "suspected_mods": []
+      },
+      "output": {
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed because a required dependency was missing."
+          ],
+          "guidance": [
+            "Check the installed mods for missing or incompatible dependencies before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "observed.mod_attributed_crash.after_boot.generic",
+      "input": {
+        "surface": "observed_crash",
+        "failure_class": "mod_attributed_crash",
+        "phase": "after_boot",
+        "suspected_mods": []
+      },
+      "output": {
+        "outcome": {
+          "decision": "Warn",
+          "phase": "Running",
+          "summary": "Minecraft stopped in a mod-attributed crash.",
+          "details": [
+            "Guardian found typed crash evidence that attributes the failure to an installed mod."
+          ],
+          "guidance": [
+            "Update or remove the suspected mod before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "observed.mod_attributed_crash.after_boot.public_safe_first",
+      "input": {
+        "surface": "observed_crash",
+        "failure_class": "mod_attributed_crash",
+        "phase": "after_boot",
+        "suspected_mods": [
+          "Example Machines",
+          "Ignored Safe Mod"
+        ]
+      },
+      "output": {
+        "outcome": {
+          "decision": "Warn",
+          "phase": "Running",
+          "summary": "Minecraft stopped in a crash attributed to Example Machines.",
+          "details": [
+            "Guardian attributes the crash to the installed mod Example Machines."
+          ],
+          "guidance": [
+            "Update or remove Example Machines before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "observed.mod_attributed_crash.before_boot.generic",
+      "input": {
+        "surface": "observed_crash",
+        "failure_class": "mod_attributed_crash",
+        "phase": "before_boot",
+        "suspected_mods": []
+      },
+      "output": {
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a crash attributed to an installed mod."
+          ],
+          "guidance": [
+            "Update or remove the suspected mod before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "observed.mod_attributed_crash.before_boot.public_safe_first",
+      "input": {
+        "surface": "observed_crash",
+        "failure_class": "mod_attributed_crash",
+        "phase": "before_boot",
+        "suspected_mods": [
+          "Example Machines",
+          "Ignored Safe Mod"
+        ]
+      },
+      "output": {
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a crash attributed to Example Machines."
+          ],
+          "guidance": [
+            "Update or remove Example Machines before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "observed.mod_transformation_failure.after_boot.generic",
+      "input": {
+        "surface": "observed_crash",
+        "failure_class": "mod_transformation_failure",
+        "phase": "after_boot",
+        "suspected_mods": []
+      },
+      "output": {
+        "outcome": {
+          "decision": "Warn",
+          "phase": "Running",
+          "summary": "Minecraft stopped during mod transformation.",
+          "details": [
+            "Guardian detected a mod transformation or mixin failure after startup completed."
+          ],
+          "guidance": [
+            "Update or remove the recently changed mod before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "observed.mod_transformation_failure.before_boot.generic",
+      "input": {
+        "surface": "observed_crash",
+        "failure_class": "mod_transformation_failure",
+        "phase": "before_boot",
+        "suspected_mods": []
+      },
+      "output": {
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a detected mod transformation or mixin failure."
+          ],
+          "guidance": [
+            "Update or remove the recently changed mod before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "observed.out_of_memory.after_boot.generic",
+      "input": {
+        "surface": "observed_crash",
+        "failure_class": "out_of_memory",
+        "phase": "after_boot",
+        "suspected_mods": []
+      },
+      "output": {
+        "outcome": {
+          "decision": "Warn",
+          "phase": "Running",
+          "summary": "Minecraft stopped after running out of memory.",
+          "details": [
+            "Guardian detected an out-of-memory crash after startup completed."
+          ],
+          "guidance": [
+            "Review the instance memory allocation and close memory-heavy apps before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "observed.out_of_memory.before_boot.generic",
+      "input": {
+        "surface": "observed_crash",
+        "failure_class": "out_of_memory",
+        "phase": "before_boot",
+        "suspected_mods": []
+      },
+      "output": {
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed after running out of memory."
+          ],
+          "guidance": [
+            "Review the instance memory allocation and close memory-heavy apps before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "observed.unknown.after_boot.generic",
+      "input": {
+        "surface": "observed_crash",
+        "failure_class": "unknown",
+        "phase": "after_boot",
+        "suspected_mods": []
+      },
+      "output": {}
+    },
+    {
+      "id": "prepare.public_error.hostile_unknown",
+      "input": {
+        "surface": "prepare_failure",
+        "mode": "Managed",
+        "failure_class": "unknown",
+        "public_error": "/home/alice/.jdks/java.exe --accessToken secret -Xmx8192M --username Alice",
+        "requested_java_present": true,
+        "explicit_java_override_present": true,
+        "explicit_jvm_args_present": true,
+        "runtime_intervention_applied": true,
+        "raw_jvm_args_intervention_applied": true
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "Launch preparation failed before Minecraft could start."
+          ],
+          "guidance": []
+        }
+      }
+    },
+    {
+      "id": "prepare.public_error.rejected_java_runtime_mismatch",
+      "input": {
+        "surface": "prepare_failure",
+        "mode": "Managed",
+        "failure_class": "java_runtime_mismatch",
+        "public_error": "/home/alice/.jdks/java.exe --accessToken secret -Xmx8192M --username Alice",
+        "requested_java_present": true,
+        "explicit_java_override_present": true,
+        "explicit_jvm_args_present": false,
+        "runtime_intervention_applied": true,
+        "raw_jvm_args_intervention_applied": true
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "The selected Java runtime is not compatible with this version."
+          ],
+          "guidance": [
+            "Remove the Java override or switch Guardian Mode back to Managed."
+          ]
+        }
+      }
+    },
+    {
+      "id": "prepare.public_error.rejected_jvm_unsupported_option",
+      "input": {
+        "surface": "prepare_failure",
+        "mode": "Managed",
+        "failure_class": "jvm_unsupported_option",
+        "public_error": "/home/alice/.jdks/java.exe --accessToken secret -Xmx8192M --username Alice",
+        "requested_java_present": false,
+        "explicit_java_override_present": false,
+        "explicit_jvm_args_present": true,
+        "runtime_intervention_applied": true,
+        "raw_jvm_args_intervention_applied": true
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Preparing",
+          "summary": "Guardian blocked launch preparation.",
+          "details": [
+            "The selected JVM settings are not compatible with this Java runtime."
+          ],
+          "guidance": [
+            "Remove the explicit JVM args or switch Guardian Mode back to Managed."
+          ]
+        }
+      }
+    },
+    {
+      "id": "preset.bounded_labels",
+      "input": {
+        "surface": "preset_adjustment",
+        "mode": "Managed",
+        "requested_preset": "requested_preset_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "effective_preset": "performance-beta",
+        "explicit_jvm_preset_present": true
+      },
+      "output": {
+        "authored_decision": "Downgrade",
+        "directive": {
+          "kind": "DowngradePreset",
+          "description": "Guardian downgraded JVM preset from \"requested_preset_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\" to \"performance-beta\" before launch"
+        }
+      }
+    },
+    {
+      "id": "recovery_suppressed.disable_custom_gc",
+      "input": {
+        "surface": "recovery_suppressed",
+        "kind": "DisableCustomGc"
+      },
+      "output": {
+        "outcome": {
+          "decision": "Block",
+          "phase": "Repairing",
+          "summary": "Guardian suppressed a repeated launch self-healing retry for custom GC flag recovery because the same recovery failed recently.",
+          "details": [
+            "Guardian suppressed a repeated launch self-healing retry for custom GC flag recovery because the same recovery failed recently."
+          ],
+          "guidance": [
+            "Review the latest game log or change the affected launch setting before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "recovery_suppressed.downgrade_preset",
+      "input": {
+        "surface": "recovery_suppressed",
+        "kind": "DowngradePreset"
+      },
+      "output": {
+        "outcome": {
+          "decision": "Block",
+          "phase": "Repairing",
+          "summary": "Guardian suppressed a repeated launch self-healing retry for JVM preset recovery because the same recovery failed recently.",
+          "details": [
+            "Guardian suppressed a repeated launch self-healing retry for JVM preset recovery because the same recovery failed recently."
+          ],
+          "guidance": [
+            "Review the latest game log or change the affected launch setting before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "recovery_suppressed.managed_runtime",
+      "input": {
+        "surface": "recovery_suppressed",
+        "kind": "SwitchManagedRuntime"
+      },
+      "output": {
+        "outcome": {
+          "decision": "Block",
+          "phase": "Repairing",
+          "summary": "Guardian suppressed a repeated launch self-healing retry for managed Java recovery because the same recovery failed recently.",
+          "details": [
+            "Guardian suppressed a repeated launch self-healing retry for managed Java recovery because the same recovery failed recently."
+          ],
+          "guidance": [
+            "Review the latest game log or change the affected launch setting before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "recovery_suppressed.strip_jvm_args",
+      "input": {
+        "surface": "recovery_suppressed",
+        "kind": "StripRawJvmArgs"
+      },
+      "output": {
+        "outcome": {
+          "decision": "Block",
+          "phase": "Repairing",
+          "summary": "Guardian suppressed a repeated launch self-healing retry for explicit JVM argument recovery because the same recovery failed recently.",
+          "details": [
+            "Guardian suppressed a repeated launch self-healing retry for explicit JVM argument recovery because the same recovery failed recently."
+          ],
+          "guidance": [
+            "Review the latest game log or change the affected launch setting before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "startup.guidance.generic_explicit_override",
+      "input": {
+        "surface": "startup_failure",
+        "mode": "Managed",
+        "observation": {
+          "kind": "exited",
+          "failure_class": "unknown"
+        },
+        "suspected_mods": [],
+        "target_version_id": "1.21.1",
+        "runtime_major": 21,
+        "requested_java_present": false,
+        "explicit_java_override_present": true,
+        "explicit_jvm_args_present": false,
+        "explicit_jvm_preset_present": false,
+        "startup_recovery_applied": false,
+        "disable_custom_gc": true,
+        "effective_preset": ""
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before Guardian could verify a completed startup."
+          ],
+          "guidance": [
+            "Review recent Java, JVM preset, or JVM argument overrides before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "startup.guidance.stalled_explicit_override",
+      "input": {
+        "surface": "startup_failure",
+        "mode": "Managed",
+        "observation": {
+          "kind": "stalled"
+        },
+        "suspected_mods": [],
+        "target_version_id": "1.21.1",
+        "runtime_major": 21,
+        "requested_java_present": false,
+        "explicit_java_override_present": true,
+        "explicit_jvm_args_present": false,
+        "explicit_jvm_preset_present": false,
+        "startup_recovery_applied": false,
+        "disable_custom_gc": true,
+        "effective_preset": ""
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "No startup activity was observed before the startup window ended."
+          ],
+          "guidance": [
+            "Review recent Java, JVM preset, or JVM argument overrides before retrying."
+          ]
+        }
+      }
+    },
+    {
+      "id": "startup.jvm_unsupported_option.legacy_preset_downgrade",
+      "input": {
+        "surface": "startup_failure",
+        "mode": "Managed",
+        "observation": {
+          "kind": "exited",
+          "failure_class": "jvm_unsupported_option"
+        },
+        "suspected_mods": [],
+        "target_version_id": "1.12.2",
+        "runtime_major": 17,
+        "requested_java_present": false,
+        "explicit_java_override_present": false,
+        "explicit_jvm_args_present": false,
+        "explicit_jvm_preset_present": false,
+        "startup_recovery_applied": false,
+        "disable_custom_gc": true,
+        "effective_preset": "ultra_low_latency"
+      },
+      "output": {
+        "authored_decision": "Downgrade",
+        "outcome": {
+          "decision": "Downgrade",
+          "phase": "Launching",
+          "summary": "Guardian selected a guarded startup retry.",
+          "details": [
+            "Automatic retry: downgraded JVM preset to \"legacy\" after startup failure"
+          ],
+          "guidance": [
+            "Use safer launch settings or let Axial manage compatibility."
+          ]
+        },
+        "directive": {
+          "kind": "DowngradePreset",
+          "description": "Automatic retry: downgraded JVM preset to \"legacy\" after startup failure"
+        }
+      }
+    },
+    {
+      "id": "startup.mod_attributed_crash.public_safe_first",
+      "input": {
+        "surface": "startup_failure",
+        "mode": "Managed",
+        "observation": {
+          "kind": "exited",
+          "failure_class": "mod_attributed_crash"
+        },
+        "suspected_mods": [
+          "Example Machines",
+          "Ignored Safe Mod"
+        ],
+        "target_version_id": "1.21.1",
+        "runtime_major": 21,
+        "requested_java_present": false,
+        "explicit_java_override_present": false,
+        "explicit_jvm_args_present": false,
+        "explicit_jvm_preset_present": false,
+        "startup_recovery_applied": false,
+        "disable_custom_gc": true,
+        "effective_preset": ""
+      },
+      "output": {
+        "authored_decision": "Block",
+        "outcome": {
+          "decision": "Block",
+          "phase": "Launching",
+          "summary": "Guardian blocked launch startup.",
+          "details": [
+            "Minecraft exited before startup completed with a crash attributed to Example Machines."
+          ],
+          "guidance": [
+            "Update or remove Example Machines before retrying."
+          ]
+        }
+      }
+    }
+  ]
+}

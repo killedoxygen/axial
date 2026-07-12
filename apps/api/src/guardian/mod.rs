@@ -25,6 +25,8 @@ mod decision_snapshot;
 mod diagnosis;
 mod facts;
 #[cfg(test)]
+mod launch_copy_snapshot;
+#[cfg(test)]
 mod launch_decision_snapshot;
 mod model;
 #[cfg(test)]
