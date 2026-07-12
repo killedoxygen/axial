@@ -348,15 +348,17 @@ fn release_asset_name(latest_version: &str, os: &str, arch: &str) -> Option<Stri
     let platform = match os {
         "linux" => "linux",
         "windows" => "windows",
+        "macos" => "macos",
         _ => return None,
     };
     let archive_ext = match os {
-        "linux" => "tar.gz",
+        "linux" | "macos" => "tar.gz",
         "windows" => "zip",
         _ => return None,
     };
-    let package_arch = match arch {
-        "x86_64" => "amd64",
+    let package_arch = match (os, arch) {
+        ("linux" | "windows" | "macos", "x86_64") => "amd64",
+        ("macos", "aarch64") => "arm64",
         _ => return None,
     };
 
@@ -701,6 +703,34 @@ mod tests {
         assert_eq!(
             asset_url,
             "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-windows-amd64-1.2.4.zip"
+        );
+    }
+
+    #[test]
+    fn macos_asset_selection_matches_native_architecture() {
+        let assets = [
+            release_asset(
+                "axial-macos-amd64-1.2.4.tar.gz",
+                "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-macos-amd64-1.2.4.tar.gz",
+            ),
+            release_asset(
+                "axial-macos-arm64-1.2.4.tar.gz",
+                "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-macos-arm64-1.2.4.tar.gz",
+            ),
+        ];
+
+        let intel = matching_release_asset_url(&assets, "1.2.4", "macos", "x86_64")
+            .expect("macOS x86_64 should select amd64 asset");
+        assert_eq!(
+            intel,
+            "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-macos-amd64-1.2.4.tar.gz"
+        );
+
+        let apple_silicon = matching_release_asset_url(&assets, "1.2.4", "macos", "aarch64")
+            .expect("macOS aarch64 should select arm64 asset");
+        assert_eq!(
+            apple_silicon,
+            "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-macos-arm64-1.2.4.tar.gz"
         );
     }
 

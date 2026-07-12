@@ -516,6 +516,10 @@ mod tests {
             staged_binary_name("1.2.4", "axial-windows-amd64-1.2.4.zip"),
             "axial-staged-1.2.4.exe"
         );
+        assert_eq!(
+            staged_binary_name("1.2.4", "axial-macos-arm64-1.2.4.tar.gz"),
+            "axial-staged-1.2.4"
+        );
     }
 
     #[test]
