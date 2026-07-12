@@ -22,6 +22,7 @@ use std::path::{Component, Path};
 pub const MAX_KNOWN_GOOD_RELATIVE_PATH_BYTES: usize = MAX_ARTIFACT_RELATIVE_PATH_BYTES;
 pub const MAX_KNOWN_GOOD_PATH_SEGMENT_BYTES: usize = MAX_ARTIFACT_PATH_SEGMENT_BYTES;
 pub const MAX_KNOWN_GOOD_ENTRIES: usize = 200_000;
+pub const MAX_KNOWN_GOOD_VERSION_JSON_BYTES: usize = 16 << 20;
 pub const MAX_KNOWN_GOOD_ASSET_INDEX_BYTES: usize = 64 << 20;
 pub const MAX_KNOWN_GOOD_RUNTIME_MANIFEST_BYTES: usize = 16 << 20;
 
@@ -120,6 +121,42 @@ pub struct KnownGoodInventory {
 impl KnownGoodInventory {
     pub fn entries(&self) -> &[KnownGoodEntry] {
         &self.entries
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KnownGoodInstallReceipt {
+    version_id: KnownGoodId,
+    inventory: KnownGoodInventory,
+}
+
+impl KnownGoodInstallReceipt {
+    pub fn version_id(&self) -> &str {
+        self.version_id.as_str()
+    }
+
+    pub fn into_inventory(self) -> KnownGoodInventory {
+        self.inventory
+    }
+
+    pub(crate) fn from_verified_vanilla_source(
+        input: KnownGoodInventoryInput<'_>,
+        version_json_bytes: &[u8],
+    ) -> Result<Self, KnownGoodInventoryError> {
+        let KnownGoodInstallShape::Vanilla { version_manifest } = input.shape else {
+            return Err(KnownGoodInventoryError::VersionIdentityMismatch);
+        };
+        validate_bytes(
+            version_json_bytes,
+            &ExpectedIntegrity::from_sha1(&version_manifest.sha1),
+        )
+        .map_err(|_| KnownGoodInventoryError::VersionMetadataIntegrity)?;
+        let version_id = KnownGoodId::new(&input.resolved_version.id)?;
+        let inventory = derive_known_good_inventory(input)?;
+        Ok(Self {
+            version_id,
+            inventory,
+        })
     }
 }
 
@@ -283,6 +320,7 @@ pub enum KnownGoodInventoryError {
     MissingAssetIndex,
     UnexpectedAssetIndex,
     AssetIndexIntegrity,
+    VersionMetadataIntegrity,
     AssetIndexParse,
     InvalidAssetObject,
     UnsupportedRuntimeEntry,

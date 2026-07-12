@@ -4,10 +4,15 @@ use super::discovery::{
 };
 use super::file_download::runtime_filesystem_path;
 use super::install::install_managed_runtime;
-use super::layout::runtime_cache_dir;
+use super::layout::{runtime_cache_dir, runtime_os_arch};
+use super::manifest::{
+    COMPONENT_MANIFEST_PROOF_FILE, RuntimeSourceReceipt, acquire_runtime_source,
+    component_manifest_proof_bytes,
+};
 use super::model::{
     JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureAction, RuntimeEnsureEvent,
     RuntimeEnsureResult, RuntimeOverride, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement,
+    RuntimeSource,
 };
 use super::probe::JavaRuntimeProbeReceipt;
 use crate::launch::JavaVersion;
@@ -83,13 +88,22 @@ where
     };
 
     if let Some(requested_runtime) = requested.clone() {
+        let requested_record = requested_runtime.clone();
+        let refreshed = refresh_ready_managed_runtime(
+            library_dir,
+            requested_runtime,
+            java_version.major_version,
+            &mut observer,
+        )
+        .await?;
         return Ok(RuntimeEnsureResult {
-            requested: Some(requested_runtime.clone()),
-            effective: requested_runtime,
+            requested: Some(requested_record),
+            effective: refreshed.effective,
             bypassed_requested_runtime: false,
-            install_performed: false,
+            install_performed: refreshed.install_performed,
             action: RuntimeEnsureAction::UseRequested,
             probe_usage,
+            source_receipt: refreshed.source_receipt,
         });
     }
 
@@ -103,11 +117,13 @@ where
         install_performed: managed.install_performed,
         action: RuntimeEnsureAction::UseManaged,
         probe_usage,
+        source_receipt: managed.source_receipt,
     })
 }
 struct ManagedEnsure {
     effective: RuntimeRecord,
     install_performed: bool,
+    source_receipt: Option<RuntimeSourceReceipt>,
 }
 
 async fn ensure_managed_runtime_with_events<F>(
@@ -121,12 +137,22 @@ where
     let preferred = &requirement.preferred_component;
     match resolve_managed_runtime(library_dir, preferred) {
         Ok(runtime) => {
-            observer(RuntimeEnsureEvent::ManagedRuntimeReady {
-                component: preferred.as_str().to_string(),
-            });
+            let refreshed = refresh_ready_managed_runtime(
+                library_dir,
+                runtime,
+                requirement.required_java.major_version,
+                observer,
+            )
+            .await?;
+            if !refreshed.install_performed {
+                observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+                    component: preferred.as_str().to_string(),
+                });
+            }
             return Ok(ManagedEnsure {
-                effective: runtime,
-                install_performed: false,
+                effective: refreshed.effective,
+                install_performed: refreshed.install_performed,
+                source_receipt: refreshed.source_receipt,
             });
         }
         // reinstalling produces the same x86_64 build, so a missing-Rosetta
@@ -135,6 +161,10 @@ where
         Err(_) => {}
     }
 
+    // Acquire and authenticate the source before creating or removing any
+    // runtime install paths. The same parsed receipt is consumed below.
+    let source_receipt = acquire_runtime_source(preferred, &runtime_os_arch()).await?;
+
     let install_root = runtime_cache_dir().join(preferred.as_str());
     let install_lock = runtime_install_lock(preferred.as_str());
     let _guard = install_lock.lock().await;
@@ -142,13 +172,26 @@ where
 
     match resolve_managed_runtime(library_dir, preferred) {
         Ok(runtime) => {
-            observer(RuntimeEnsureEvent::ManagedRuntimeReady {
-                component: preferred.as_str().to_string(),
-            });
-            return Ok(ManagedEnsure {
-                effective: runtime,
-                install_performed: false,
-            });
+            if runtime.source != RuntimeSource::Managed {
+                observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+                    component: preferred.as_str().to_string(),
+                });
+                return Ok(ManagedEnsure {
+                    effective: runtime,
+                    install_performed: false,
+                    source_receipt: None,
+                });
+            }
+            if runtime_record_matches_source(&runtime, &source_receipt).await {
+                observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+                    component: preferred.as_str().to_string(),
+                });
+                return Ok(ManagedEnsure {
+                    effective: runtime,
+                    install_performed: false,
+                    source_receipt: Some(source_receipt),
+                });
+            }
         }
         Err(error @ JavaRuntimeLookupError::RosettaRequired { .. }) => return Err(error),
         Err(_) => {}
@@ -157,16 +200,119 @@ where
     observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
         component: preferred.as_str().to_string(),
     });
-    install_managed_runtime(preferred, &install_root, observer).await?;
+    install_managed_runtime(preferred, &install_root, &source_receipt, observer).await?;
     let runtime = resolve_component_runtime(
         library_dir,
         preferred,
         requirement.required_java.major_version,
     )?;
+    if !runtime_record_matches_source(&runtime, &source_receipt).await {
+        return Err(JavaRuntimeLookupError::Download(
+            "installed runtime does not match its authenticated source".to_string(),
+        ));
+    }
     Ok(ManagedEnsure {
         effective: runtime,
         install_performed: true,
+        source_receipt: Some(source_receipt),
     })
+}
+
+struct RefreshedRuntime {
+    effective: RuntimeRecord,
+    install_performed: bool,
+    source_receipt: Option<RuntimeSourceReceipt>,
+}
+
+async fn refresh_ready_managed_runtime<F>(
+    library_dir: &Path,
+    runtime: RuntimeRecord,
+    required_major: i32,
+    observer: &mut F,
+) -> Result<RefreshedRuntime, JavaRuntimeLookupError>
+where
+    F: FnMut(RuntimeEnsureEvent),
+{
+    if runtime.source != RuntimeSource::Managed {
+        return Ok(RefreshedRuntime {
+            effective: runtime,
+            install_performed: false,
+            source_receipt: None,
+        });
+    }
+    let source_receipt = acquire_runtime_source(&runtime.id, &runtime_os_arch()).await?;
+    let component = runtime.id.clone();
+    let install_root = runtime_cache_dir().join(component.as_str());
+    let install_lock = runtime_install_lock(component.as_str());
+    let _guard = install_lock.lock().await;
+    let _file_lock = acquire_runtime_install_file_lock(&install_root).await?;
+    if let Ok(current) = resolve_component_runtime(library_dir, &component, required_major) {
+        if current.source != RuntimeSource::Managed {
+            return Ok(RefreshedRuntime {
+                effective: current,
+                install_performed: false,
+                source_receipt: None,
+            });
+        }
+        if runtime_record_matches_source(&current, &source_receipt).await {
+            return Ok(RefreshedRuntime {
+                effective: current,
+                install_performed: false,
+                source_receipt: Some(source_receipt),
+            });
+        }
+    }
+
+    observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
+        component: component.as_str().to_string(),
+    });
+    install_managed_runtime(&component, &install_root, &source_receipt, observer).await?;
+    let effective = resolve_component_runtime(library_dir, &component, required_major)?;
+    if !runtime_record_matches_source(&effective, &source_receipt).await {
+        return Err(JavaRuntimeLookupError::Download(
+            "installed runtime does not match its authenticated source".to_string(),
+        ));
+    }
+    Ok(RefreshedRuntime {
+        effective,
+        install_performed: true,
+        source_receipt: Some(source_receipt),
+    })
+}
+
+async fn runtime_record_matches_source(
+    runtime: &RuntimeRecord,
+    source: &RuntimeSourceReceipt,
+) -> bool {
+    if runtime.source != RuntimeSource::Managed || &runtime.id != source.component() {
+        return false;
+    }
+    let Ok(expected) = component_manifest_proof_bytes(source.manifest()) else {
+        return false;
+    };
+    let proof_path = PathBuf::from(&runtime.root_dir).join(COMPONENT_MANIFEST_PROOF_FILE);
+    let Ok(metadata) =
+        tokio::fs::symlink_metadata(runtime_filesystem_path(&proof_path).as_ref()).await
+    else {
+        return false;
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() != expected.len() as u64
+    {
+        return false;
+    }
+    tokio::fs::read(runtime_filesystem_path(&proof_path).as_ref())
+        .await
+        .is_ok_and(|actual| actual == expected)
+}
+
+#[cfg(test)]
+pub(super) async fn runtime_record_matches_source_for_test(
+    runtime: &RuntimeRecord,
+    source: &RuntimeSourceReceipt,
+) -> bool {
+    runtime_record_matches_source(runtime, source).await
 }
 
 pub(super) fn runtime_install_lock(component: &str) -> Arc<Mutex<()>> {

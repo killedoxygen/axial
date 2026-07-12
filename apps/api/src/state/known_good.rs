@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock};
@@ -96,6 +96,65 @@ struct StoreState {
     pending: HashMap<String, PendingSnapshot>,
 }
 
+struct ActiveInventory<T> {
+    version_id: String,
+    library_root: PathBuf,
+    inventory: Arc<T>,
+}
+
+struct ActiveInventories<T> {
+    by_instance: HashMap<String, ActiveInventory<T>>,
+}
+
+impl<T> Default for ActiveInventories<T> {
+    fn default() -> Self {
+        Self {
+            by_instance: HashMap::new(),
+        }
+    }
+}
+
+impl<T> ActiveInventories<T> {
+    fn activate(
+        &mut self,
+        instance_id: &str,
+        version_id: &str,
+        library_root: PathBuf,
+        inventory: Arc<T>,
+    ) {
+        self.by_instance.insert(
+            instance_id.to_string(),
+            ActiveInventory {
+                version_id: version_id.to_string(),
+                library_root,
+                inventory,
+            },
+        );
+    }
+
+    fn get(&self, instance_id: &str, version_id: &str, library_root: &Path) -> Option<Arc<T>> {
+        let active = self.by_instance.get(instance_id)?;
+        (active.version_id == version_id && active.library_root == library_root)
+            .then(|| active.inventory.clone())
+    }
+
+    fn remove(&mut self, instance_id: &str) {
+        self.by_instance.remove(instance_id);
+    }
+
+    fn remove_exact(&mut self, instance_id: &str, version_id: &str, library_root: &Path) {
+        if self.by_instance.get(instance_id).is_some_and(|active| {
+            active.version_id == version_id && active.library_root == library_root
+        }) {
+            self.by_instance.remove(instance_id);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.by_instance.clear();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 enum StorePhase {
@@ -133,6 +192,7 @@ pub(super) struct KnownGoodInventoryStore {
     root: PathBuf,
     owner: Option<PersistenceOwnerLease>,
     state: Arc<Mutex<StoreState>>,
+    active: Mutex<ActiveInventories<KnownGoodInventory>>,
     gates: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     lifecycle: Arc<AsyncRwLock<()>>,
     close_gate: AsyncMutex<()>,
@@ -166,6 +226,7 @@ impl KnownGoodInventoryStore {
             root,
             owner: Some(owner),
             state: Arc::new(Mutex::new(StoreState::default())),
+            active: Mutex::new(ActiveInventories::default()),
             gates: Mutex::new(HashMap::new()),
             lifecycle: Arc::new(AsyncRwLock::new(())),
             close_gate: AsyncMutex::new(()),
@@ -178,6 +239,7 @@ impl KnownGoodInventoryStore {
             root,
             owner: None,
             state: Arc::new(Mutex::new(StoreState::default())),
+            active: Mutex::new(ActiveInventories::default()),
             gates: Mutex::new(HashMap::new()),
             lifecycle: Arc::new(AsyncRwLock::new(())),
             close_gate: AsyncMutex::new(()),
@@ -189,9 +251,11 @@ impl KnownGoodInventoryStore {
         &self,
         instance_id: &str,
         version_id: &str,
-        inventory: KnownGoodInventory,
-    ) -> io::Result<KnownGoodInventory> {
+        library_root: &Path,
+        inventory: Arc<KnownGoodInventory>,
+    ) -> io::Result<()> {
         validate_identity(instance_id, version_id)?;
+        let library_root = normalize_library_root(library_root)?;
         let _lifecycle = self.lifecycle.clone().read_owned().await;
         if self.phase() != StorePhase::Running {
             return Err(closed_error());
@@ -201,9 +265,15 @@ impl KnownGoodInventoryStore {
             return Err(closed_error());
         }
 
+        self.active.lock().expect(STORE_LOCK_INVARIANT).activate(
+            instance_id,
+            version_id,
+            library_root,
+            inventory.clone(),
+        );
         let snapshot = snapshot_from_inventory(instance_id, version_id, &inventory);
         if snapshot.validate().is_err() {
-            return Ok(inventory);
+            return Ok(());
         }
         let path = self.snapshot_path(instance_id);
         let read_path = path.clone();
@@ -213,7 +283,71 @@ impl KnownGoodInventoryStore {
             .unwrap_or(None);
 
         self.reconcile_persistence(instance_id, path, persisted.as_ref(), snapshot);
-        Ok(inventory)
+        Ok(())
+    }
+
+    pub(super) fn active_inventory(
+        &self,
+        instance_id: &str,
+        version_id: &str,
+        library_root: &Path,
+    ) -> Option<Arc<KnownGoodInventory>> {
+        if !is_canonical_instance_id(instance_id) {
+            return None;
+        }
+        let library_root = normalize_library_root(library_root).ok()?;
+        self.active
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .get(instance_id, version_id, &library_root)
+    }
+
+    pub(super) fn library_roots_match(left: &Path, right: &Path) -> bool {
+        normalize_library_root(left)
+            .ok()
+            .zip(normalize_library_root(right).ok())
+            .is_some_and(|(left, right)| left == right)
+    }
+
+    pub(super) fn deactivate_exact(
+        &self,
+        instance_id: &str,
+        version_id: &str,
+        library_root: &Path,
+    ) {
+        let Ok(library_root) = normalize_library_root(library_root) else {
+            return;
+        };
+        self.active
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .remove_exact(instance_id, version_id, &library_root);
+    }
+
+    pub(super) fn clear_active(&self) {
+        self.active.lock().expect(STORE_LOCK_INVARIANT).clear();
+    }
+
+    pub(super) fn retain_active(
+        &self,
+        library_root: &Path,
+        instances: impl IntoIterator<Item = (String, String)>,
+    ) {
+        let Ok(library_root) = normalize_library_root(library_root) else {
+            self.clear_active();
+            return;
+        };
+        let instances = instances.into_iter().collect::<HashMap<_, _>>();
+        self.active
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .by_instance
+            .retain(|instance_id, active| {
+                active.library_root == library_root
+                    && instances
+                        .get(instance_id)
+                        .is_some_and(|version_id| version_id == &active.version_id)
+            });
     }
 
     pub(super) async fn retire(&self, instance_id: &str) -> io::Result<()> {
@@ -229,6 +363,10 @@ impl KnownGoodInventoryStore {
             return Err(closed_error());
         }
 
+        self.active
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .remove(instance_id);
         let writer = self
             .state
             .lock()
@@ -267,6 +405,7 @@ impl KnownGoodInventoryStore {
         let _lifecycle = self.lifecycle.write().await;
         self.phase
             .store(StorePhase::Closing as u8, Ordering::Release);
+        self.clear_active();
         let transition = CloseTransition::new(self.phase.clone());
         let result = match self.settle_writers().await {
             Ok(()) => match &self.owner {
@@ -842,6 +981,27 @@ fn known_good_target(instance_id: &str) -> TargetDescriptor {
     )
 }
 
+fn normalize_library_root(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Ok(normalized)
+}
+
 fn invalid_snapshot(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -957,6 +1117,67 @@ mod tests {
         assert!(duplicate.validate().is_err());
     }
 
+    #[test]
+    fn active_authority_requires_exact_identity_and_replaces_only_its_instance() {
+        let root = PathBuf::from("/library");
+        let other_root = PathBuf::from("/other-library");
+        let first = Arc::new(1_u8);
+        let replacement = Arc::new(2_u8);
+        let unrelated = Arc::new(3_u8);
+        let mut active = ActiveInventories::default();
+
+        active.activate("0000000000000001", "1.21.5", root.clone(), first);
+        active.activate(
+            "0000000000000002",
+            "1.21.6",
+            root.clone(),
+            unrelated.clone(),
+        );
+        assert!(active.get("0000000000000001", "1.21.4", &root).is_none());
+        assert!(
+            active
+                .get("0000000000000001", "1.21.5", &other_root)
+                .is_none()
+        );
+
+        active.activate(
+            "0000000000000001",
+            "1.21.7",
+            other_root.clone(),
+            replacement.clone(),
+        );
+        assert!(active.get("0000000000000001", "1.21.5", &root).is_none());
+        assert!(Arc::ptr_eq(
+            &active
+                .get("0000000000000001", "1.21.7", &other_root)
+                .expect("replacement authority"),
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(
+            &active
+                .get("0000000000000002", "1.21.6", &root)
+                .expect("unrelated authority"),
+            &unrelated
+        ));
+    }
+
+    #[test]
+    fn retirement_exact_removal_and_clear_are_fail_closed() {
+        let root = PathBuf::from("/library");
+        let mut active = ActiveInventories::default();
+        active.activate("0000000000000001", "1.21.5", root.clone(), Arc::new(1_u8));
+        active.activate("0000000000000002", "1.21.6", root.clone(), Arc::new(2_u8));
+
+        active.remove_exact("0000000000000001", "1.21.4", &root);
+        assert!(active.get("0000000000000001", "1.21.5", &root).is_some());
+        active.remove("0000000000000001");
+        assert!(active.get("0000000000000001", "1.21.5", &root).is_none());
+        assert!(active.get("0000000000000002", "1.21.6", &root).is_some());
+
+        active.clear();
+        assert!(active.get("0000000000000002", "1.21.6", &root).is_none());
+    }
+
     #[tokio::test]
     async fn missing_corrupt_and_stale_snapshots_are_replaced_without_warning_state() {
         let (root, paths) = paths("replace");
@@ -1009,6 +1230,33 @@ mod tests {
             .expect("reconcile equal snapshot");
 
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn persisted_snapshot_never_hydrates_runtime_authority() {
+        let (root, paths) = paths("disk-is-not-authority");
+        let backend = FileBackend::new(0);
+        let current = snapshot("0000000000000002", "1.21.5");
+        let snapshot_root = paths.config_dir.join("state").join(KNOWN_GOOD_DIR);
+        fs::create_dir_all(&snapshot_root).expect("snapshot root");
+        fs::write(
+            snapshot_root.join(format!("{}.json", current.instance_id)),
+            encode_snapshot(current.clone()).expect("snapshot bytes"),
+        )
+        .expect("seed snapshot");
+
+        let store = store(&paths, backend);
+        assert!(
+            store
+                .active_inventory(
+                    &current.instance_id,
+                    &current.version_id,
+                    &paths.library_dir,
+                )
+                .is_none()
+        );
         drop(store);
         let _ = fs::remove_dir_all(root);
     }

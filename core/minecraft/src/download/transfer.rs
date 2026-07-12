@@ -27,6 +27,7 @@ use sha1::{Digest as _, Sha1};
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs as async_fs;
 use tokio::io::AsyncWriteExt;
@@ -54,6 +55,272 @@ struct SelectedArtifactDownload<'a> {
     expected: &'a ExpectedIntegrity,
     fact_tx: Option<&'a mpsc::UnboundedSender<ExecutionDownloadFact>>,
     descriptor_tx: Option<&'a mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+}
+
+pub(super) struct VerifiedSelectedArtifactDownload<'a> {
+    pub(super) kind: SelectedDownloadArtifactKind,
+    pub(super) client: &'a reqwest::Client,
+    pub(super) url: &'a str,
+    pub(super) destination: &'a Path,
+    pub(super) expected: &'a ExpectedIntegrity,
+    pub(super) max_bytes: usize,
+    pub(super) fact_tx: Option<&'a mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    pub(super) descriptor_tx: Option<&'a mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+}
+
+pub(super) async fn fetch_verified_selected_artifact_bytes_with_client(
+    request: VerifiedSelectedArtifactDownload<'_>,
+) -> Result<Arc<[u8]>, DownloadError> {
+    let retry_delays = default_download_retry_delays();
+    fetch_verified_selected_artifact_bytes_with_retry_delays(request, &retry_delays).await
+}
+
+async fn fetch_verified_selected_artifact_bytes_with_retry_delays(
+    request: VerifiedSelectedArtifactDownload<'_>,
+    retry_delays: &[Duration],
+) -> Result<Arc<[u8]>, DownloadError> {
+    let VerifiedSelectedArtifactDownload {
+        kind,
+        client,
+        url,
+        destination,
+        expected,
+        max_bytes,
+        fact_tx,
+        descriptor_tx,
+    } = request;
+    guard_existing_unsupported_selected_artifact(
+        kind,
+        destination,
+        url,
+        expected,
+        fact_tx,
+        descriptor_tx,
+    )
+    .await?;
+    let Some(expected_sha1) = expected.sha1.as_deref() else {
+        emit_selected_metadata_failure(
+            kind,
+            destination,
+            expected,
+            fact_tx,
+            ExecutionDownloadFactKind::MetadataMissing,
+            "sha1",
+        );
+        return Err(selected_artifact_metadata_error(destination, "missing"));
+    };
+    if !is_sha1_hex(expected_sha1) {
+        emit_selected_metadata_failure(
+            kind,
+            destination,
+            expected,
+            fact_tx,
+            ExecutionDownloadFactKind::MetadataInvalid,
+            "sha1",
+        );
+        return Err(selected_artifact_metadata_error(destination, "invalid"));
+    }
+
+    emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
+    emit_selected_artifact_missing_fact_if_absent(fact_tx, kind, destination, expected).await;
+    let target = selected_download_target_label(kind, destination);
+    let max_bytes = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    let mut next_delay = 0_usize;
+    let body = loop {
+        match fetch_verified_selected_artifact_bytes_attempt(
+            client,
+            url,
+            destination,
+            expected,
+            max_bytes,
+            fact_tx,
+            &target,
+        )
+        .await
+        {
+            Ok(body) => break body,
+            Err(error) if error.retryable && next_delay < retry_delays.len() => {
+                let delay = retry_delays[next_delay];
+                next_delay += 1;
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => return Err(error.error),
+        }
+    };
+
+    let temp_path = download_temp_path(destination);
+    let report = write_launcher_managed_artifact_bytes_to_temp(destination, &temp_path, &body)
+        .await
+        .map_err(ExecutionDownloadError::into_download_error)?;
+    let mut facts = selected_execution_download_facts(kind, destination, &report.facts)
+        .into_iter()
+        .filter(|fact| fact.kind != ExecutionDownloadFactKind::MetadataMissing)
+        .collect::<Vec<_>>();
+    facts.extend(metadata_facts(expected, &target));
+    facts.push(execution_download_fact(
+        ExecutionDownloadFactKind::ArtifactVerified,
+        &target,
+        no_download_fact_fields(),
+    ));
+    emit_execution_download_facts(fact_tx, &facts);
+    Ok(Arc::from(body))
+}
+
+#[cfg(test)]
+pub(super) async fn fetch_verified_selected_artifact_bytes_with_retry_delays_for_test(
+    kind: SelectedDownloadArtifactKind,
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+    max_bytes: usize,
+    retry_delays: &[Duration],
+) -> Result<Arc<[u8]>, DownloadError> {
+    fetch_verified_selected_artifact_bytes_with_retry_delays(
+        VerifiedSelectedArtifactDownload {
+            kind,
+            client,
+            url,
+            destination,
+            expected,
+            max_bytes,
+            fact_tx: None,
+            descriptor_tx: None,
+        },
+        retry_delays,
+    )
+    .await
+}
+
+struct VerifiedSelectedBytesAttemptError {
+    error: DownloadError,
+    retryable: bool,
+}
+
+async fn fetch_verified_selected_artifact_bytes_attempt(
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+    max_bytes: u64,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    target: &str,
+) -> Result<Vec<u8>, VerifiedSelectedBytesAttemptError> {
+    let response = client.get(url).send().await.map_err(|error| {
+        emit_execution_download_facts(
+            fact_tx,
+            &[execution_download_fact(
+                ExecutionDownloadFactKind::NetworkFailure,
+                target,
+                no_download_fact_fields(),
+            )],
+        );
+        VerifiedSelectedBytesAttemptError {
+            error: DownloadError::Request(error),
+            retryable: true,
+        }
+    })?;
+    if let Err(error) = response.error_for_status_ref() {
+        let status = response.status();
+        emit_execution_download_facts(
+            fact_tx,
+            &[execution_download_fact(
+                ExecutionDownloadFactKind::ProviderFailure,
+                target,
+                vec![("status", status.as_u16().to_string())],
+            )],
+        );
+        return Err(VerifiedSelectedBytesAttemptError {
+            error: DownloadError::Request(error),
+            retryable: is_retryable_provider_status(status.as_u16()),
+        });
+    }
+    let declared_content_length = response.content_length();
+    if declared_content_length.is_some_and(|length| length > max_bytes) {
+        emit_execution_download_facts(
+            fact_tx,
+            &[size_mismatch_fact(
+                target,
+                max_bytes,
+                declared_content_length.unwrap_or(0),
+            )],
+        );
+        return Err(VerifiedSelectedBytesAttemptError {
+            error: DownloadError::Integrity(format!(
+                "{} exceeds the safe in-memory size limit",
+                bounded_download_file_label(destination)
+            )),
+            retryable: false,
+        });
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            emit_execution_download_facts(
+                fact_tx,
+                &[execution_download_fact(
+                    ExecutionDownloadFactKind::NetworkFailure,
+                    target,
+                    no_download_fact_fields(),
+                )],
+            );
+            VerifiedSelectedBytesAttemptError {
+                error: DownloadError::Request(error),
+                retryable: true,
+            }
+        })?;
+        let next_len = body.len().saturating_add(chunk.len());
+        if u64::try_from(next_len).unwrap_or(u64::MAX) > max_bytes {
+            emit_execution_download_facts(
+                fact_tx,
+                &[size_mismatch_fact(
+                    target,
+                    max_bytes,
+                    u64::try_from(next_len).unwrap_or(u64::MAX),
+                )],
+            );
+            return Err(VerifiedSelectedBytesAttemptError {
+                error: DownloadError::Integrity(format!(
+                    "{} exceeds the safe in-memory size limit",
+                    bounded_download_file_label(destination)
+                )),
+                retryable: false,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if declared_content_length.is_some_and(|length| length != body.len() as u64) {
+        emit_execution_download_facts(
+            fact_tx,
+            &[execution_download_fact(
+                ExecutionDownloadFactKind::Interrupted,
+                target,
+                no_download_fact_fields(),
+            )],
+        );
+        return Err(VerifiedSelectedBytesAttemptError {
+            error: DownloadError::Integrity(format!(
+                "{} download ended before the declared content length",
+                bounded_download_file_label(destination)
+            )),
+            retryable: true,
+        });
+    }
+
+    let actual = ActualIntegrity {
+        size: body.len() as u64,
+        sha1: Some(format!("{:x}", Sha1::digest(&body))),
+    };
+    if let Err(error) = verify_download_integrity(destination, expected, &actual) {
+        emit_execution_download_facts(fact_tx, &[integrity_mismatch_fact(target, &error)]);
+        return Err(VerifiedSelectedBytesAttemptError {
+            error: DownloadError::Integrity(error.to_string()),
+            retryable: false,
+        });
+    }
+    Ok(body)
 }
 
 #[derive(Clone, Copy)]

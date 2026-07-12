@@ -12,9 +12,16 @@ use super::plan::TransferPlan;
 use super::runtime::{
     finish_runtime_pipeline_after_artifacts, recv_runtime_progress, spawn_runtime_ensure_pipeline,
 };
-use super::transfer::ensure_selected_artifact_with_client;
+use super::transfer::{
+    VerifiedSelectedArtifactDownload, ensure_selected_artifact_with_client,
+    fetch_verified_selected_artifact_bytes_with_client,
+};
 use crate::artifact_path::validate_artifact_path_segment;
-use crate::launch::{VersionJson, resolve_version};
+use crate::known_good::{
+    KnownGoodInstallReceipt, KnownGoodInstallShape, KnownGoodInventoryInput,
+    MAX_KNOWN_GOOD_ASSET_INDEX_BYTES, MAX_KNOWN_GOOD_VERSION_JSON_BYTES, RuntimeInventoryInput,
+};
+use crate::launch::{VersionJson, effective_java_version_for};
 use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
 use crate::paths::{assets_dir, versions_dir};
 use crate::rules::default_environment;
@@ -25,22 +32,12 @@ use std::sync::Arc;
 use tokio::fs as async_fs;
 use tokio::sync::mpsc;
 
-#[derive(Debug, Clone)]
-pub(super) struct VersionJsonDownload {
-    pub(super) url: String,
-    pub(super) expected: ExpectedIntegrity,
-}
-
 pub struct Downloader {
     mc_dir: PathBuf,
     client: reqwest::Client,
     #[cfg(test)]
-    install_manifest_receipt: Option<InstallManifestReceipt>,
+    install_manifest: Option<VersionManifest>,
 }
-
-#[cfg(test)]
-#[derive(Clone)]
-struct InstallManifestReceipt(VersionManifest);
 
 impl Downloader {
     pub fn new(mc_dir: impl Into<PathBuf>) -> Self {
@@ -48,7 +45,7 @@ impl Downloader {
             mc_dir: mc_dir.into(),
             client: standard_minecraft_download_client(),
             #[cfg(test)]
-            install_manifest_receipt: None,
+            install_manifest: None,
         }
     }
 
@@ -60,7 +57,7 @@ impl Downloader {
         Self {
             mc_dir: mc_dir.into(),
             client: standard_minecraft_download_client(),
-            install_manifest_receipt: Some(InstallManifestReceipt(manifest)),
+            install_manifest: Some(manifest),
         }
     }
 
@@ -68,25 +65,11 @@ impl Downloader {
         &self,
         version_id: &str,
         mut send: F,
-    ) -> Result<(), DownloadError>
+    ) -> Result<KnownGoodInstallReceipt, DownloadError>
     where
         F: FnMut(DownloadProgress),
     {
         self.install_version_with_fact_sender(version_id, &mut send, None, None)
-            .await
-    }
-
-    pub async fn install_version_with_facts<F, G>(
-        &self,
-        version_id: &str,
-        send: F,
-        send_fact: G,
-    ) -> Result<(), DownloadError>
-    where
-        F: FnMut(DownloadProgress),
-        G: FnMut(ExecutionDownloadFact),
-    {
-        self.install_version_with_facts_and_descriptors(version_id, send, send_fact, |_| {})
             .await
     }
 
@@ -96,7 +79,7 @@ impl Downloader {
         mut send: F,
         mut send_fact: G,
         mut send_descriptor: H,
-    ) -> Result<(), DownloadError>
+    ) -> Result<KnownGoodInstallReceipt, DownloadError>
     where
         F: FnMut(DownloadProgress),
         G: FnMut(ExecutionDownloadFact),
@@ -127,7 +110,7 @@ impl Downloader {
         send: &mut F,
         fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
         descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-    ) -> Result<(), DownloadError>
+    ) -> Result<KnownGoodInstallReceipt, DownloadError>
     where
         F: FnMut(DownloadProgress),
     {
@@ -141,12 +124,12 @@ impl Downloader {
 
         let install_result = async {
             validate_install_version_id(version_id)?;
-            let version_json_download = self.resolve_manifest_download(version_id).await?;
+            let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
             async_fs::create_dir_all(&version_dir).await?;
             async_fs::write(&marker_path, b"installing").await?;
             self.install_version_inner(
                 version_id,
-                version_json_download,
+                version_manifest_entry,
                 &mut send,
                 &plan,
                 fact_tx.as_ref(),
@@ -157,7 +140,7 @@ impl Downloader {
         .await;
 
         match install_result {
-            Ok(()) => {
+            Ok(receipt) => {
                 let _ = async_fs::remove_file(&marker_path).await;
                 send(DownloadProgress {
                     phase: "done".to_string(),
@@ -169,7 +152,7 @@ impl Downloader {
                     bytes_done: None,
                     bytes_total: None,
                 });
-                Ok(())
+                Ok(receipt)
             }
             Err(error) => {
                 send(DownloadProgress {
@@ -190,12 +173,12 @@ impl Downloader {
     async fn install_version_inner<F>(
         &self,
         version_id: &str,
-        version_json_download: VersionJsonDownload,
+        version_manifest_entry: ManifestEntry,
         send: &mut F,
         plan: &Arc<TransferPlan>,
         fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
         descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-    ) -> Result<(), DownloadError>
+    ) -> Result<KnownGoodInstallReceipt, DownloadError>
     where
         F: FnMut(DownloadProgress),
     {
@@ -208,18 +191,24 @@ impl Downloader {
             Some(format!("{version_id}.json")),
         ));
 
-        self.ensure_artifact(
-            SelectedDownloadArtifactKind::VersionJson,
-            &version_json_download.url,
-            &json_path,
-            &version_json_download.expected,
-            fact_tx,
-            descriptor_tx,
-        )
-        .await?;
+        let version_json_expected = ExpectedIntegrity::from_sha1(&version_manifest_entry.sha1);
+        let version_json_bytes =
+            fetch_verified_selected_artifact_bytes_with_client(VerifiedSelectedArtifactDownload {
+                kind: SelectedDownloadArtifactKind::VersionJson,
+                client: &self.client,
+                url: &version_manifest_entry.url,
+                destination: &json_path,
+                expected: &version_json_expected,
+                max_bytes: MAX_KNOWN_GOOD_VERSION_JSON_BYTES,
+                fact_tx,
+                descriptor_tx,
+            })
+            .await?;
 
-        let version = resolve_version(&self.mc_dir, version_id)
-            .map_err(|error| DownloadError::ResolveManifest(error.to_string()))?;
+        let version = parse_vanilla_version_source(&version_json_bytes, version_id)?;
+        let asset_index_bytes = self
+            .fetch_asset_index_source(&version, send, plan, fact_tx, descriptor_tx)
+            .await?;
         let client_jar_bytes = version
             .downloads
             .client
@@ -294,14 +283,16 @@ impl Downloader {
             } else {
                 None
             };
-            let mut asset_pipeline = spawn_asset_download_pipeline(
-                self.mc_dir.clone(),
-                self.client.clone(),
-                version.asset_index.clone(),
-                fact_tx.cloned(),
-                descriptor_tx.cloned(),
-                plan.clone(),
-            );
+            let mut asset_pipeline = asset_index_bytes.clone().map(|verified_index_bytes| {
+                spawn_asset_download_pipeline(
+                    self.mc_dir.clone(),
+                    self.client.clone(),
+                    verified_index_bytes,
+                    fact_tx.cloned(),
+                    descriptor_tx.cloned(),
+                    plan.clone(),
+                )
+            });
 
             let library_jobs = self.library_jobs(&version)?;
             plan.contribute_total(
@@ -418,16 +409,94 @@ impl Downloader {
         }
         .await;
 
-        let _ = finish_runtime_pipeline_after_artifacts(runtime_pipeline, artifact_result, send)
-            .await?;
+        let runtime_receipt =
+            finish_runtime_pipeline_after_artifacts(runtime_pipeline, artifact_result, send)
+                .await?;
 
-        Ok(())
+        let runtime_expected = runtime_receipt.as_ref().map(|receipt| ExpectedIntegrity {
+            size: Some(receipt.expected_size()),
+            sha1: Some(receipt.expected_sha1().to_string()),
+        });
+        KnownGoodInstallReceipt::from_verified_vanilla_source(
+            KnownGoodInventoryInput {
+                resolved_version: &version,
+                asset_index_bytes: asset_index_bytes.as_deref(),
+                runtime: runtime_receipt.as_ref().zip(runtime_expected.as_ref()).map(
+                    |(receipt, expected)| RuntimeInventoryInput {
+                        component: receipt.component(),
+                        manifest_bytes: receipt.bytes(),
+                        manifest_expected: expected,
+                    },
+                ),
+                shape: KnownGoodInstallShape::Vanilla {
+                    version_manifest: &version_manifest_entry,
+                },
+                environment: &default_environment(),
+            },
+            &version_json_bytes,
+        )
+        .map_err(|error| {
+            DownloadError::ResolveManifest(format!(
+                "installed source inventory could not be derived: {error:?}"
+            ))
+        })
     }
 
-    async fn resolve_manifest_download(
+    async fn fetch_asset_index_source<F>(
+        &self,
+        version: &VersionJson,
+        send: &mut F,
+        plan: &TransferPlan,
+        fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+        descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+    ) -> Result<Option<Arc<[u8]>>, DownloadError>
+    where
+        F: FnMut(DownloadProgress),
+    {
+        if version.asset_index.url.trim().is_empty() {
+            return if version.asset_index.id.trim().is_empty() {
+                Ok(None)
+            } else {
+                Err(DownloadError::ResolveManifest(
+                    "version asset index has no download source".to_string(),
+                ))
+            };
+        }
+        let index_name = format!("{}.json", version.asset_index.id);
+        if validate_artifact_path_segment(&version.asset_index.id).is_err()
+            || validate_artifact_path_segment(&index_name).is_err()
+        {
+            return Err(DownloadError::ResolveManifest(
+                "version asset index has an invalid identity".to_string(),
+            ));
+        }
+        let index_path = assets_dir(&self.mc_dir).join("indexes").join(&index_name);
+        let expected =
+            ExpectedIntegrity::from_mojang(version.asset_index.size, &version.asset_index.sha1);
+        let planned_bytes = expected.size.unwrap_or(0);
+        plan.contribute_total(planned_bytes);
+        send(progress("asset_index", 0, 1, Some(index_name.clone())));
+        let bytes =
+            fetch_verified_selected_artifact_bytes_with_client(VerifiedSelectedArtifactDownload {
+                kind: SelectedDownloadArtifactKind::AssetIndex,
+                client: &self.client,
+                url: &version.asset_index.url,
+                destination: &index_path,
+                expected: &expected,
+                max_bytes: MAX_KNOWN_GOOD_ASSET_INDEX_BYTES,
+                fact_tx,
+                descriptor_tx,
+            })
+            .await?;
+        plan.add_done(planned_bytes);
+        send(progress("asset_index", 1, 1, Some(index_name)));
+        Ok(Some(bytes))
+    }
+
+    async fn resolve_manifest_entry(
         &self,
         version_id: &str,
-    ) -> Result<VersionJsonDownload, DownloadError> {
+    ) -> Result<ManifestEntry, DownloadError> {
         let manifest = self
             .fresh_install_manifest()
             .await
@@ -436,7 +505,8 @@ impl Downloader {
             .versions
             .into_iter()
             .find(|entry| entry.id == version_id)
-            .map(version_json_download_from_manifest_entry)
+            .map(validate_version_manifest_entry)
+            .transpose()?
             .ok_or_else(|| {
                 DownloadError::ResolveManifest(format!(
                     "version {version_id} not found in manifest"
@@ -446,8 +516,8 @@ impl Downloader {
 
     async fn fresh_install_manifest(&self) -> Result<VersionManifest, String> {
         #[cfg(test)]
-        if let Some(receipt) = &self.install_manifest_receipt {
-            return Ok(receipt.0.clone());
+        if let Some(manifest) = &self.install_manifest {
+            return Ok(manifest.clone());
         }
 
         fetch_fresh_install_version_manifest().await
@@ -498,13 +568,35 @@ fn validate_install_version_id(version_id: &str) -> Result<(), DownloadError> {
     Ok(())
 }
 
-pub(super) fn version_json_download_from_manifest_entry(
-    entry: ManifestEntry,
-) -> VersionJsonDownload {
-    VersionJsonDownload {
-        url: entry.url,
-        expected: ExpectedIntegrity::from_sha1(&entry.sha1),
+fn validate_version_manifest_entry(entry: ManifestEntry) -> Result<ManifestEntry, DownloadError> {
+    let expected = ExpectedIntegrity::from_sha1(&entry.sha1);
+    if entry.url.trim().is_empty() || !expected.has_checksum() {
+        return Err(DownloadError::ResolveManifest(
+            "version manifest entry has invalid source metadata".to_string(),
+        ));
     }
+    Ok(entry)
+}
+
+fn parse_vanilla_version_source(
+    bytes: &[u8],
+    expected_version_id: &str,
+) -> Result<VersionJson, DownloadError> {
+    let mut version = serde_json::from_slice::<VersionJson>(bytes)?;
+    if version.id != expected_version_id
+        || !version.inherits_from.is_empty()
+        || version.materialized
+    {
+        return Err(DownloadError::ResolveManifest(
+            "version metadata identity does not match the selected manifest entry".to_string(),
+        ));
+    }
+    if version.asset_index.id.is_empty() && !version.assets.is_empty() {
+        version.asset_index.id = version.assets.clone();
+    }
+    version.java_version =
+        effective_java_version_for(&version.id, &version.kind, &version.java_version);
+    Ok(version)
 }
 
 async fn await_client_jar_download(
@@ -529,4 +621,34 @@ fn client_jar_task_error(error: tokio::task::JoinError) -> DownloadError {
     DownloadError::FileOperation(io::Error::other(format!(
         "client jar download task {reason}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_vanilla_metadata_only_for_the_selected_identity() {
+        let bytes = br#"{"id":"1.21.1","type":"release","assets":"legacy"}"#;
+        let version = parse_vanilla_version_source(bytes, "1.21.1").expect("valid source");
+
+        assert_eq!(version.id, "1.21.1");
+        assert_eq!(version.asset_index.id, "legacy");
+        assert!(parse_vanilla_version_source(bytes, "1.21.2").is_err());
+    }
+
+    #[test]
+    fn rejects_unverified_manifest_entry_source_metadata() {
+        let entry = ManifestEntry {
+            id: "1.21.1".to_string(),
+            kind: "release".to_string(),
+            url: "https://example.invalid/version.json".to_string(),
+            time: String::new(),
+            release_time: String::new(),
+            sha1: "not-a-sha1".to_string(),
+            compliance_level: 1,
+        };
+
+        assert!(validate_version_manifest_entry(entry).is_err());
+    }
 }

@@ -2,10 +2,10 @@
 use crate::download::download_libraries_with_facts_and_descriptors;
 use crate::download::{
     DownloadError, DownloadProgress, Downloader, ExecutionDownloadError, ExecutionDownloadReport,
-    LauncherManagedArtifactReadiness, LibraryChecksumPolicy,
-    download_libraries_allowing_missing_checksums_with_facts_and_descriptors, library_jobs_for,
-    verify_existing_launcher_managed_artifact, write_launcher_managed_artifact_bytes_to_temp,
+    download_libraries_allowing_missing_checksums_with_facts_and_descriptors,
+    write_launcher_managed_artifact_bytes_to_temp,
 };
+use crate::known_good::KnownGoodInstallReceipt;
 use crate::launch::{DownloadEntry, VersionJson, resolve_version};
 use crate::loaders::compose::{
     LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
@@ -54,6 +54,24 @@ pub async fn install_from_profile_source<F>(
 where
     F: FnMut(DownloadProgress),
 {
+    let _base_receipt = Box::pin(ensure_base_version(
+        library_dir,
+        &plan.record.minecraft_version,
+        send,
+    ))
+    .await?;
+    install_profile_source_after_authenticated_base(library_dir, plan, profile_url, send).await
+}
+
+async fn install_profile_source_after_authenticated_base<F>(
+    library_dir: &Path,
+    plan: &LoaderInstallPlan,
+    profile_url: &str,
+    send: &mut F,
+) -> Result<String, LoaderError>
+where
+    F: FnMut(DownloadProgress),
+{
     send(progress(
         "profile",
         0,
@@ -88,17 +106,6 @@ where
     ))
     .await;
     cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
-    cleanup_on_error(
-        Box::pin(ensure_base_version(
-            library_dir,
-            &plan.record.minecraft_version,
-            send,
-        ))
-        .await,
-        library_dir,
-        &installed_version_id,
-    )?;
-
     let version = cleanup_on_error(
         compose_loader_version(
             library_dir,
@@ -154,12 +161,24 @@ pub async fn install_from_installer_source<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    Box::pin(ensure_base_version(
+    let _base_receipt = Box::pin(ensure_base_version(
         library_dir,
         &plan.record.minecraft_version,
         send,
     ))
     .await?;
+    install_installer_source_after_authenticated_base(library_dir, plan, installer_url, send).await
+}
+
+async fn install_installer_source_after_authenticated_base<F>(
+    library_dir: &Path,
+    plan: &LoaderInstallPlan,
+    installer_url: &str,
+    send: &mut F,
+) -> Result<String, LoaderError>
+where
+    F: FnMut(DownloadProgress),
+{
     let installer_path = cached_installer_path(library_dir, &plan.record);
 
     send(progress(
@@ -315,12 +334,24 @@ pub async fn install_from_legacy_archive<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    Box::pin(ensure_base_version(
+    let _base_receipt = Box::pin(ensure_base_version(
         library_dir,
         &plan.record.minecraft_version,
         send,
     ))
     .await?;
+    install_legacy_archive_after_authenticated_base(library_dir, plan, archive_url, send).await
+}
+
+async fn install_legacy_archive_after_authenticated_base<F>(
+    library_dir: &Path,
+    plan: &LoaderInstallPlan,
+    archive_url: &str,
+    send: &mut F,
+) -> Result<String, LoaderError>
+where
+    F: FnMut(DownloadProgress),
+{
     validate_version_id(&plan.record.version_id, "installed loader version id")?;
 
     let archive_path = cached_legacy_archive_path(library_dir, &plan.record);
@@ -402,19 +433,12 @@ async fn ensure_base_version<F>(
     library_dir: &Path,
     version_id: &str,
     send: &mut F,
-) -> Result<(), LoaderError>
+) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
-    if is_base_game_installed(library_dir, version_id).await {
-        return Ok(());
-    }
-
     let install_lock = base_version_install_lock(library_dir, version_id);
     let _guard = install_lock.lock().await;
-    if is_base_game_installed(library_dir, version_id).await {
-        return Ok(());
-    }
 
     let downloader = Downloader::new(library_dir.to_path_buf());
     let mut facts = Vec::new();
@@ -431,7 +455,7 @@ where
     ))
     .await;
     match result {
-        Ok(()) => Ok(()),
+        Ok(receipt) => Ok(receipt),
         Err(error) => Err(LoaderError::BaseInstallFailed {
             error: Box::new(error),
             facts,
@@ -461,46 +485,6 @@ fn base_version_install_lock_from_map(
         .entry(key)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
-}
-
-async fn is_base_game_installed(library_dir: &Path, game_version: &str) -> bool {
-    let version_dir = versions_dir(library_dir).join(game_version);
-    let json_path = version_dir.join(format!("{game_version}.json"));
-    let jar_path = version_dir.join(format!("{game_version}.jar"));
-    let marker_path = version_dir.join(".incomplete");
-    if !json_path.is_file() || !jar_path.is_file() || marker_path.exists() {
-        return false;
-    }
-
-    let Ok(version) = resolve_version(library_dir, game_version) else {
-        return false;
-    };
-    let Ok(jobs) = library_jobs_for(
-        library_dir,
-        &version.libraries,
-        &crate::rules::default_environment(),
-        LibraryChecksumPolicy::Strict,
-    ) else {
-        return false;
-    };
-    for job in jobs {
-        if verify_existing_launcher_managed_artifact_on_blocking_thread(job.path, job.expected)
-            .await
-            != LauncherManagedArtifactReadiness::Verified
-        {
-            return false;
-        }
-    }
-    true
-}
-
-async fn verify_existing_launcher_managed_artifact_on_blocking_thread(
-    path: PathBuf,
-    expected: crate::download::ExpectedIntegrity,
-) -> LauncherManagedArtifactReadiness {
-    tokio::task::spawn_blocking(move || verify_existing_launcher_managed_artifact(&path, &expected))
-        .await
-        .unwrap_or(LauncherManagedArtifactReadiness::Corrupt)
 }
 
 #[cfg(test)]
@@ -1040,7 +1024,9 @@ mod tests {
         base_version_install_lock_from_map, cleanup_on_error,
         download_loader_libraries_with_evidence, download_profile_loader_libraries_with_evidence,
         ensure_base_version, install_from_installer_source, install_from_legacy_archive,
-        install_from_profile_source, is_base_game_installed, promote_cached_artifact_tmp,
+        install_from_profile_source, install_installer_source_after_authenticated_base,
+        install_legacy_archive_after_authenticated_base,
+        install_profile_source_after_authenticated_base, promote_cached_artifact_tmp,
         read_cached_artifact, read_valid_installer, read_valid_legacy_archive,
         read_valid_profile_json, strip_child_client_jar_meta, write_cached_artifact,
         write_patched_client_jar_integrity,
@@ -1251,46 +1237,6 @@ mod tests {
                 .contains(".tmp-")
         }));
 
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn base_game_installed_requires_selected_libraries() {
-        let root = temp_dir("base-installed-requires-libraries");
-        let version_id = "1.16";
-        let library_bytes = b"library jar";
-        write_base_version_with_library(&root, version_id, library_bytes);
-
-        assert!(
-            !is_base_game_installed(&root, version_id).await,
-            "base install must not be considered complete while selected libraries are missing"
-        );
-
-        let library_path = root
-            .join("libraries")
-            .join("com/example/base/1.0.0/base-1.0.0.jar");
-        fs::create_dir_all(library_path.parent().expect("library parent"))
-            .expect("create library parent");
-        fs::write(&library_path, library_bytes).expect("write library");
-
-        assert!(is_base_game_installed(&root, version_id).await);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn base_game_installed_rejects_corrupt_selected_libraries() {
-        let root = temp_dir("base-installed-rejects-corrupt-libraries");
-        let version_id = "1.16";
-        write_base_version_with_library(&root, version_id, b"library jar");
-
-        let library_path = root
-            .join("libraries")
-            .join("com/example/base/1.0.0/base-1.0.0.jar");
-        fs::create_dir_all(library_path.parent().expect("library parent"))
-            .expect("create library parent");
-        fs::write(&library_path, b"wrong").expect("write corrupt library");
-
-        assert!(!is_base_game_installed(&root, version_id).await);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1816,7 +1762,7 @@ mod tests {
         };
         let mut progress = |_progress: DownloadProgress| {};
 
-        let installed_version_id = install_from_profile_source(
+        let installed_version_id = install_profile_source_after_authenticated_base(
             &root,
             &plan,
             "http://127.0.0.1:9/profile/json",
@@ -1851,7 +1797,7 @@ mod tests {
         };
         let mut progress = |_progress: DownloadProgress| {};
 
-        install_from_profile_source(
+        install_profile_source_after_authenticated_base(
             &root,
             &plan,
             "http://127.0.0.1:9/profile/json",
@@ -1894,7 +1840,7 @@ mod tests {
         };
         let mut progress = |_progress: DownloadProgress| {};
 
-        let installed_version_id = install_from_installer_source(
+        let installed_version_id = install_installer_source_after_authenticated_base(
             &root,
             &plan,
             "http://127.0.0.1:9/installer.jar",
@@ -1947,7 +1893,7 @@ mod tests {
             stage_dir: root.join("stage"),
         };
 
-        let installed_version_id = install_from_installer_source(
+        let installed_version_id = install_installer_source_after_authenticated_base(
             &root,
             &plan,
             "http://127.0.0.1:9/installer.jar",
@@ -2141,7 +2087,7 @@ mod tests {
             stage_dir: root.join("stage"),
         };
 
-        install_from_installer_source(
+        install_installer_source_after_authenticated_base(
             &root,
             &plan,
             "http://127.0.0.1:9/installer.jar",
@@ -2241,10 +2187,14 @@ mod tests {
             stage_dir: root.join("stage"),
         };
 
-        let installed_version_id =
-            install_from_legacy_archive(&root, &plan, &server.url, &mut |_progress| {})
-                .await
-                .expect("install legacy archive");
+        let installed_version_id = install_legacy_archive_after_authenticated_base(
+            &root,
+            &plan,
+            &server.url,
+            &mut |_progress| {},
+        )
+        .await
+        .expect("install legacy archive");
 
         assert_eq!(installed_version_id, record.version_id);
         let installed_jar = versions_dir(&root)
@@ -2395,42 +2345,6 @@ mod tests {
                     "assetIndex":{{"id":"{version_id}","url":"","sha1":"","size":0,"totalSize":0}},
                     "libraries":[]
                 }}"#
-            ),
-        )
-        .expect("write base version json");
-        fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
-            .expect("write base jar");
-    }
-
-    fn write_base_version_with_library(
-        root: &std::path::Path,
-        version_id: &str,
-        library_bytes: &[u8],
-    ) {
-        let version_dir = versions_dir(root).join(version_id);
-        fs::create_dir_all(&version_dir).expect("create base version dir");
-        fs::write(
-            version_dir.join(format!("{version_id}.json")),
-            format!(
-                r#"{{
-                    "id":"{version_id}",
-                    "type":"release",
-                    "mainClass":"net.minecraft.client.main.Main",
-                    "assetIndex":{{"id":"{version_id}","url":"","sha1":"","size":0,"totalSize":0}},
-                    "libraries":[{{
-                        "name":"com.example:base:1.0.0",
-                        "downloads":{{
-                            "artifact":{{
-                                "path":"com/example/base/1.0.0/base-1.0.0.jar",
-                                "url":"https://example.invalid/base-1.0.0.jar",
-                                "sha1":"{}",
-                                "size":{}
-                            }}
-                        }}
-                    }}]
-                }}"#,
-                sha1_hex(library_bytes),
-                library_bytes.len()
             ),
         )
         .expect("write base version json");

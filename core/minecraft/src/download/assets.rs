@@ -12,7 +12,6 @@ use super::path_safety::{
 use super::plan::TransferPlan;
 use super::transfer::ensure_selected_artifact_with_client;
 use crate::asset_index::AssetIndexFlags;
-use crate::launch::AssetIndex as VersionAssetIndex;
 use crate::paths::assets_dir;
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -44,47 +43,21 @@ pub(crate) struct AssetObject {
 pub(super) fn spawn_asset_download_pipeline(
     mc_dir: PathBuf,
     client: reqwest::Client,
-    asset_index: VersionAssetIndex,
+    verified_index_bytes: Arc<[u8]>,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
     descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
     plan: Arc<TransferPlan>,
-) -> Option<AssetDownloadPipeline> {
-    if asset_index.url.is_empty() {
-        return None;
-    }
+) -> AssetDownloadPipeline {
     // Asset-object bytes are unknown until the index is parsed; reserve the
     // contribution so partial totals are not stamped as near-complete.
     plan.expect_contribution();
 
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
-        let asset_index_path = assets_dir(&mc_dir)
-            .join("indexes")
-            .join(format!("{}.json", asset_index.id));
-        let _ = progress_tx.send(progress(
-            "asset_index",
-            0,
-            1,
-            Some(format!("{}.json", asset_index.id)),
-        ));
-        let expected = ExpectedIntegrity::from_mojang(asset_index.size, &asset_index.sha1);
-        let index_bytes = expected.size.unwrap_or(0);
-        plan.contribute_total(index_bytes);
-        ensure_selected_artifact_with_client(
-            SelectedDownloadArtifactKind::AssetIndex,
-            &client,
-            &asset_index.url,
-            &asset_index_path,
-            &expected,
-            fact_tx.as_ref(),
-            descriptor_tx.as_ref(),
-        )
-        .await?;
-        plan.add_done(index_bytes);
         download_asset_objects_with_client(
             &mc_dir,
             client,
-            &asset_index_path,
+            verified_index_bytes,
             fact_tx,
             descriptor_tx,
             &plan,
@@ -95,7 +68,7 @@ pub(super) fn spawn_asset_download_pipeline(
         .await
     });
 
-    Some(AssetDownloadPipeline { task, progress_rx })
+    AssetDownloadPipeline { task, progress_rx }
 }
 
 pub(super) async fn await_asset_download_pipeline<F>(
@@ -142,7 +115,7 @@ pub(super) async fn abort_asset_download_pipeline(pipeline: Option<AssetDownload
 async fn download_asset_objects_with_client<F>(
     mc_dir: &Path,
     client: reqwest::Client,
-    asset_index_path: &Path,
+    verified_index_bytes: Arc<[u8]>,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
     descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
     plan: &TransferPlan,
@@ -151,7 +124,7 @@ async fn download_asset_objects_with_client<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let index = read_asset_index(asset_index_path).await?;
+    let index = parse_asset_index(&verified_index_bytes).map_err(DownloadError::ParseVersion)?;
     let objects_dir = assets_dir(mc_dir).join("objects");
     let jobs = unique_asset_object_jobs(
         &objects_dir,
@@ -226,7 +199,7 @@ pub async fn repair_virtual_assets_from_index(
     mc_dir: &Path,
     asset_index_path: &Path,
 ) -> Result<bool, DownloadError> {
-    let index = read_asset_index(asset_index_path).await?;
+    let index = read_asset_index_for_repair(asset_index_path).await?;
     if !index.flags.requires_virtual_repair() {
         return Ok(false);
     }
@@ -244,7 +217,7 @@ pub async fn repair_virtual_assets_from_index(
     Ok(true)
 }
 
-async fn read_asset_index(asset_index_path: &Path) -> Result<AssetIndex, DownloadError> {
+async fn read_asset_index_for_repair(asset_index_path: &Path) -> Result<AssetIndex, DownloadError> {
     let bytes = async_fs::read(filesystem_path(asset_index_path).as_ref()).await?;
     parse_asset_index(&bytes).map_err(DownloadError::ParseVersion)
 }
@@ -407,4 +380,49 @@ fn unsafe_virtual_asset_path_error(asset_name: &str) -> DownloadError {
         "unsafe virtual asset path: {}",
         bounded_provider_path_label(asset_name)
     ))
+}
+
+#[cfg(test)]
+mod source_first_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn asset_pipeline_parses_supplied_verified_bytes_without_a_disk_index() {
+        let plan = TransferPlan::shared();
+        let pipeline = spawn_asset_download_pipeline(
+            PathBuf::from("/path/that/is/not/read"),
+            reqwest::Client::new(),
+            Arc::from(br#"{"objects":{}}"#.as_slice()),
+            None,
+            None,
+            plan,
+        );
+        let mut progress = Vec::new();
+
+        await_asset_download_pipeline(Some(pipeline), &mut |event| progress.push(event))
+            .await
+            .expect("empty supplied asset index should succeed");
+
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].phase, "assets");
+        assert_eq!(progress[0].total, 0);
+    }
+
+    #[tokio::test]
+    async fn asset_pipeline_rejects_malformed_supplied_bytes() {
+        let pipeline = spawn_asset_download_pipeline(
+            PathBuf::from("/path/that/is/not/read"),
+            reqwest::Client::new(),
+            Arc::from(b"not json".as_slice()),
+            None,
+            None,
+            TransferPlan::shared(),
+        );
+
+        let error = await_asset_download_pipeline(Some(pipeline), &mut |_| {})
+            .await
+            .expect_err("malformed supplied index must fail");
+
+        assert!(matches!(error, DownloadError::ParseVersion(_)));
+    }
 }

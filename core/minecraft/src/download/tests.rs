@@ -5,7 +5,6 @@ use super::assets::{
 };
 use super::client::{adaptive_download_concurrency, build_http_client};
 use super::facts::{ExecutionDownloadRequest, execution_download_fact};
-use super::install::version_json_download_from_manifest_entry;
 use super::integrity::{
     download_size_mismatch, existing_asset_object_satisfies, existing_file_satisfies, hash_file,
     observe_hash_file_calls, verify_download_integrity,
@@ -22,14 +21,14 @@ use super::runtime::{
 use super::transfer::{
     download_file_with_client, download_file_with_client_report_with_retry_delays,
     download_temp_path, ensure_selected_artifact_with_client, execute_download_to_temp,
-    remove_stale_download_temp,
+    fetch_verified_selected_artifact_bytes_with_retry_delays_for_test, remove_stale_download_temp,
 };
 use super::*;
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
-use crate::manifest::{ManifestEntry, VersionManifest};
+use crate::manifest::VersionManifest;
 use crate::paths::versions_dir;
 use crate::rules::Environment;
-use crate::runtime::RuntimeEnsureEvent;
+use crate::runtime::{RuntimeEnsureEvent, RuntimeSourceReceipt};
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -115,7 +114,7 @@ async fn install_version_with_facts_emits_private_download_facts_only() {
     let mut facts = Vec::new();
     let mut descriptors = Vec::new();
 
-    downloader
+    let receipt = downloader
         .install_version_with_facts_and_descriptors(
             "overlap",
             |progress| events.push(progress),
@@ -124,6 +123,9 @@ async fn install_version_with_facts_emits_private_download_facts_only() {
         )
         .await
         .expect("install should succeed");
+
+    assert_eq!(receipt.version_id(), "overlap");
+    assert!(!receipt.into_inventory().entries().is_empty());
 
     assert!(
         events
@@ -375,7 +377,10 @@ async fn runtime_task_is_aborted_when_artifact_install_fails() {
     let task = tokio::spawn(async move {
         let _guard = RuntimeGuard(cancelled_in_task);
         let _ = started_tx.send(());
-        std::future::pending::<Result<JavaVersion, crate::runtime::JavaRuntimeLookupError>>().await
+        std::future::pending::<
+            Result<Option<RuntimeSourceReceipt>, crate::runtime::JavaRuntimeLookupError>,
+        >()
+        .await
     });
     started_rx.await.expect("runtime task should start");
     let artifact_error = DownloadError::ResolveManifest("artifact failed".to_string());
@@ -407,7 +412,7 @@ async fn runtime_task_is_aborted_when_artifact_install_fails() {
 #[tokio::test]
 async fn runtime_error_is_reported_when_artifact_install_succeeds() {
     let task = tokio::spawn(async {
-        Err::<JavaVersion, _>(crate::runtime::JavaRuntimeLookupError::Download(
+        Err::<Option<RuntimeSourceReceipt>, _>(crate::runtime::JavaRuntimeLookupError::Download(
             "runtime failed".to_string(),
         ))
     });
@@ -426,7 +431,7 @@ async fn runtime_error_is_reported_when_artifact_install_succeeds() {
 #[tokio::test]
 async fn artifact_error_is_preserved_when_runtime_also_fails() {
     let task = tokio::spawn(async {
-        Err::<JavaVersion, _>(crate::runtime::JavaRuntimeLookupError::Download(
+        Err::<Option<RuntimeSourceReceipt>, _>(crate::runtime::JavaRuntimeLookupError::Download(
             "runtime failed".to_string(),
         ))
     });
@@ -446,7 +451,9 @@ async fn artifact_error_is_preserved_when_runtime_also_fails() {
 }
 
 fn runtime_pipeline(
-    task: tokio::task::JoinHandle<Result<JavaVersion, crate::runtime::JavaRuntimeLookupError>>,
+    task: tokio::task::JoinHandle<
+        Result<Option<RuntimeSourceReceipt>, crate::runtime::JavaRuntimeLookupError>,
+    >,
 ) -> RuntimeEnsurePipeline {
     let (_progress_tx, progress_rx) = mpsc::unbounded_channel();
     RuntimeEnsurePipeline { task, progress_rx }
@@ -2030,23 +2037,6 @@ fn expected_integrity_ignores_default_mojang_metadata() {
     assert!(!expected.has_evidence());
 }
 
-#[test]
-fn manifest_entry_download_carries_sha1() {
-    let sha1 = "abcdef1234567890abcdef1234567890abcdef12";
-    let download = version_json_download_from_manifest_entry(ManifestEntry {
-        id: "1.20.1".to_string(),
-        kind: "release".to_string(),
-        url: "https://example.invalid/1.20.1.json".to_string(),
-        time: String::new(),
-        release_time: String::new(),
-        sha1: sha1.to_string(),
-        compliance_level: 1,
-    });
-
-    assert_eq!(download.url, "https://example.invalid/1.20.1.json");
-    assert_eq!(download.expected, ExpectedIntegrity::from_sha1(sha1));
-}
-
 #[tokio::test]
 async fn install_version_rejects_unlisted_local_version_json() {
     let root = temp_dir("unlisted-local-version-json");
@@ -2211,10 +2201,19 @@ async fn spawn_overlapped_install_server() -> (
     let (release_library_tx, release_library_rx) = oneshot::channel();
     let library_body = b"library".to_vec();
     let library_sha1 = sha1_hex(&library_body);
+    let client_body = b"client".to_vec();
+    let client_sha1 = sha1_hex(&client_body);
     let asset_index_body = br#"{"objects":{}}"#.to_vec();
     let asset_index_sha1 = sha1_hex(&asset_index_body);
     let version_body = serde_json::json!({
         "id": "overlap",
+        "downloads": {
+            "client": {
+                "url": format!("{base_url}/client.jar"),
+                "sha1": client_sha1,
+                "size": client_body.len()
+            }
+        },
         "assetIndex": {
             "id": "overlap-assets",
             "sha1": asset_index_sha1,
@@ -2239,7 +2238,7 @@ async fn spawn_overlapped_install_server() -> (
 
     tokio::spawn(async move {
         let release_library_rx = Arc::new(Mutex::new(Some(release_library_rx)));
-        for _ in 0..4 {
+        for _ in 0..5 {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
@@ -2251,6 +2250,7 @@ async fn spawn_overlapped_install_server() -> (
             let body = match request_path.as_str() {
                 "/version.json" => version_body.clone(),
                 "/asset-index.json" => asset_index_body.clone(),
+                "/client.jar" => client_body.clone(),
                 "/libraries/lib.jar" => {
                     let release_library_rx = Arc::clone(&release_library_rx);
                     let library_body = library_body.clone();
@@ -2428,6 +2428,67 @@ async fn download_file_with_client_report_retries_interrupted_body_stream() {
     assert_eq!(fs::read(&destination).expect("read artifact"), body);
     assert!(!download_temp_path(&destination).exists());
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn verified_source_bytes_retry_provider_failure_and_preserve_successful_bytes() {
+    let root = temp_dir("verified-source-retry-provider");
+    let destination = root.join("version.json");
+    let body = br#"{"id":"1.21.1"}"#.to_vec();
+    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+    let (url, requests) = spawn_scripted_download_server(vec![
+        ScriptedDownloadResponse::full("503 Service Unavailable", b"temporary".to_vec()),
+        ScriptedDownloadResponse::full("200 OK", body.clone()),
+    ])
+    .await;
+
+    let verified = fetch_verified_selected_artifact_bytes_with_retry_delays_for_test(
+        SelectedDownloadArtifactKind::VersionJson,
+        &build_http_client(Duration::from_secs(5)),
+        &url,
+        &destination,
+        &expected,
+        1024,
+        &[Duration::ZERO],
+    )
+    .await
+    .expect("retryable provider failure should recover");
+
+    assert_eq!(verified.as_ref(), body);
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(fs::read(&destination).expect("promoted source"), body);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn verified_source_bytes_retry_interrupted_stream_without_retaining_partial_bytes() {
+    let root = temp_dir("verified-source-retry-interrupted");
+    let destination = root.join("asset-index.json");
+    let body = br#"{"objects":{}}"#.to_vec();
+    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+    let (url, requests) = spawn_scripted_download_server(vec![
+        ScriptedDownloadResponse::partial("200 OK", body.len(), b"{\"objects".to_vec()),
+        ScriptedDownloadResponse::full("200 OK", body.clone()),
+    ])
+    .await;
+
+    let verified = fetch_verified_selected_artifact_bytes_with_retry_delays_for_test(
+        SelectedDownloadArtifactKind::AssetIndex,
+        &build_http_client(Duration::from_secs(5)),
+        &url,
+        &destination,
+        &expected,
+        1024,
+        &[Duration::ZERO],
+    )
+    .await
+    .expect("interrupted source stream should recover");
+
+    assert_eq!(verified.as_ref(), body);
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(fs::read(&destination).expect("promoted source"), body);
+    assert!(!download_temp_path(&destination).exists());
     let _ = fs::remove_dir_all(root);
 }
 

@@ -137,6 +137,8 @@ pub struct RuntimeEnsureResult {
     pub action: RuntimeEnsureAction,
     #[serde(skip)]
     pub probe_usage: RuntimeProbeUsage,
+    #[serde(skip)]
+    pub(crate) source_receipt: Option<super::manifest::RuntimeSourceReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

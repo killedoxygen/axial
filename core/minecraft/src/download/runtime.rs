@@ -1,13 +1,16 @@
 use super::model::{DownloadError, DownloadProgress, progress};
 use super::plan::TransferPlan;
 use crate::launch::JavaVersion;
-use crate::runtime::{JavaRuntimeLookupError, RuntimeEnsureEvent, ensure_runtime_with_events};
+use crate::runtime::{
+    JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeSourceReceipt, ensure_runtime_with_events,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub(super) struct RuntimeEnsurePipeline {
-    pub(super) task: tokio::task::JoinHandle<Result<JavaVersion, JavaRuntimeLookupError>>,
+    pub(super) task:
+        tokio::task::JoinHandle<Result<Option<RuntimeSourceReceipt>, JavaRuntimeLookupError>>,
     pub(super) progress_rx: mpsc::UnboundedReceiver<DownloadProgress>,
 }
 
@@ -57,8 +60,7 @@ pub(super) fn spawn_runtime_ensure_pipeline(
         if !plan_contribution_resolved {
             plan.resolve_contribution(0);
         }
-        ensure_result?;
-        Ok::<_, JavaRuntimeLookupError>(java_version)
+        Ok::<_, JavaRuntimeLookupError>(ensure_result?.source_receipt)
     });
 
     RuntimeEnsurePipeline { task, progress_rx }
@@ -113,7 +115,7 @@ pub(super) async fn finish_runtime_pipeline_after_artifacts<F>(
     pipeline: Option<RuntimeEnsurePipeline>,
     artifact_result: Result<(), DownloadError>,
     send: &mut F,
-) -> Result<Option<JavaVersion>, DownloadError>
+) -> Result<Option<RuntimeSourceReceipt>, DownloadError>
 where
     F: FnMut(DownloadProgress),
 {
@@ -149,7 +151,7 @@ where
                             Ok(result) => result.map_err(runtime_lookup_error_to_download_error),
                             Err(error) => Err(DownloadError::PrepareRuntime(error.to_string())),
                         };
-                        return runtime_result.map(Some);
+                        return runtime_result;
                     }
                 }
             }

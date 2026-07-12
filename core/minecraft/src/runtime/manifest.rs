@@ -1,8 +1,9 @@
 use super::model::JavaRuntimeLookupError;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 pub(super) const RUNTIME_MANIFEST_URL: &str = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 pub(super) const MAX_RUNTIME_MANIFEST_BYTES: u64 = 16 << 20;
@@ -10,15 +11,46 @@ pub(crate) const COMPONENT_MANIFEST_PROOF_FILE: &str = ".axial-runtime-manifest.
 const RUNTIME_MANIFEST_CONNECT_TIMEOUT_SECS: u64 = 10;
 const RUNTIME_MANIFEST_READ_TIMEOUT_SECS: u64 = 30;
 
-pub(super) async fn fetch_runtime_json<T>(url: &str) -> Result<T, JavaRuntimeLookupError>
-where
-    T: serde::de::DeserializeOwned,
-{
+#[derive(Clone, Copy)]
+enum RuntimeSourceTransportPolicy {
+    HttpsOnly,
+    #[cfg(test)]
+    AllowHttpForTest,
+}
+
+impl RuntimeSourceTransportPolicy {
+    fn requires_https(self) -> bool {
+        match self {
+            Self::HttpsOnly => true,
+            #[cfg(test)]
+            Self::AllowHttpForTest => false,
+        }
+    }
+}
+
+fn runtime_source_url_is_secure(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| url.scheme() == "https" && url.host_str().is_some())
+}
+
+async fn fetch_bounded_runtime_bytes(
+    url: &str,
+    policy: RuntimeSourceTransportPolicy,
+) -> Result<Vec<u8>, JavaRuntimeLookupError> {
+    if policy.requires_https() && !runtime_source_url_is_secure(url) {
+        return Err(JavaRuntimeLookupError::Download(
+            "runtime source must use HTTPS".to_string(),
+        ));
+    }
     let response = runtime_manifest_client()
         .get(url)
         .send()
         .await
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    if policy.requires_https() && response.url().scheme() != "https" {
+        return Err(JavaRuntimeLookupError::Download(
+            "runtime source redirected to an insecure URL".to_string(),
+        ));
+    }
     let status = response.status();
     if !status.is_success() {
         return Err(JavaRuntimeLookupError::Download(format!("HTTP {status}")));
@@ -44,8 +76,68 @@ where
         body.extend_from_slice(&chunk);
     }
 
-    serde_json::from_slice::<T>(&body)
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
+    Ok(body)
+}
+
+pub(super) async fn acquire_runtime_source(
+    component: &super::model::RuntimeId,
+    primary_platform: &str,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    let catalog_bytes = fetch_bounded_runtime_bytes(
+        RUNTIME_MANIFEST_URL,
+        RuntimeSourceTransportPolicy::HttpsOnly,
+    )
+    .await?;
+    let catalog = serde_json::from_slice::<RuntimeManifest>(&catalog_bytes)
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    let expected = select_runtime_manifest(&catalog, component, primary_platform)?.clone();
+    acquire_runtime_source_from_descriptor(
+        component.clone(),
+        expected,
+        RuntimeSourceTransportPolicy::HttpsOnly,
+    )
+    .await
+}
+
+async fn acquire_runtime_source_from_descriptor(
+    component: super::model::RuntimeId,
+    expected: RuntimeDownloadManifest,
+    policy: RuntimeSourceTransportPolicy,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    let bytes = fetch_bounded_runtime_bytes(&expected.url, policy).await?;
+    verify_component_manifest_bytes(&bytes, &expected)?;
+    let manifest = serde_json::from_slice::<ComponentManifest>(&bytes)
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+
+    Ok(RuntimeSourceReceipt {
+        component,
+        bytes: Arc::from(bytes),
+        expected,
+        manifest,
+    })
+}
+
+fn verify_component_manifest_bytes(
+    bytes: &[u8],
+    expected: &RuntimeDownloadManifest,
+) -> Result<(), JavaRuntimeLookupError> {
+    if bytes.len() as u64 != expected.size {
+        return Err(JavaRuntimeLookupError::Download(
+            "runtime component manifest size mismatch".to_string(),
+        ));
+    }
+    if expected.sha1.len() != 40 || !expected.sha1.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(JavaRuntimeLookupError::Download(
+            "runtime component manifest has invalid checksum proof".to_string(),
+        ));
+    }
+    let actual_sha1 = format!("{:x}", Sha1::digest(bytes));
+    if !actual_sha1.eq_ignore_ascii_case(&expected.sha1) {
+        return Err(JavaRuntimeLookupError::Download(
+            "runtime component manifest checksum mismatch".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn runtime_manifest_client() -> &'static reqwest::Client {
@@ -58,6 +150,15 @@ pub(super) fn runtime_manifest_client() -> &'static reqwest::Client {
             .read_timeout(std::time::Duration::from_secs(
                 RUNTIME_MANIFEST_READ_TIMEOUT_SECS,
             ))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 {
+                    attempt.error("runtime source redirect limit exceeded")
+                } else if attempt.url().scheme() == "https" {
+                    attempt.follow()
+                } else {
+                    attempt.error("runtime source redirect must use HTTPS")
+                }
+            }))
             .user_agent("axial/0.3")
             .build()
             .expect("runtime manifest HTTP client configuration should be valid")
@@ -68,19 +169,100 @@ pub(super) struct RuntimeManifestEntry {
     pub(super) manifest: RuntimeDownloadManifest,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(super) struct RuntimeDownloadManifest {
     pub(super) url: String,
+    pub(super) sha1: String,
+    pub(super) size: u64,
 }
 
 pub(super) type RuntimeManifest = HashMap<String, HashMap<String, Vec<RuntimeManifestEntry>>>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeSourceReceipt {
+    component: super::model::RuntimeId,
+    bytes: Arc<[u8]>,
+    expected: RuntimeDownloadManifest,
+    manifest: ComponentManifest,
+}
+
+impl RuntimeSourceReceipt {
+    pub(crate) fn component(&self) -> &super::model::RuntimeId {
+        &self.component
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn expected_sha1(&self) -> &str {
+        &self.expected.sha1
+    }
+
+    pub(crate) fn expected_size(&self) -> u64 {
+        self.expected.size
+    }
+
+    pub(super) fn manifest(&self) -> &ComponentManifest {
+        &self.manifest
+    }
+}
+
+pub(super) fn select_runtime_manifest<'a>(
+    all_runtimes: &'a RuntimeManifest,
+    component: &super::model::RuntimeId,
+    primary_platform: &str,
+) -> Result<&'a RuntimeDownloadManifest, JavaRuntimeLookupError> {
+    std::iter::once(primary_platform)
+        .chain(
+            super::layout::runtime_platform_fallbacks(primary_platform)
+                .iter()
+                .copied(),
+        )
+        .find_map(|platform| {
+            all_runtimes
+                .get(platform)?
+                .get(component.as_str())?
+                .first()
+                .map(|entry| &entry.manifest)
+        })
+        .ok_or_else(|| JavaRuntimeLookupError::UnsupportedPlatform {
+            component: component.as_str().to_string(),
+            platform: primary_platform.to_string(),
+        })
+}
+
+#[cfg(test)]
+pub(super) async fn acquire_runtime_source_for_test(
+    component: super::model::RuntimeId,
+    expected: RuntimeDownloadManifest,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    acquire_runtime_source_from_descriptor(
+        component,
+        expected,
+        RuntimeSourceTransportPolicy::AllowHttpForTest,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(super) async fn fetch_runtime_manifest_bytes_for_test(
+    url: &str,
+) -> Result<Vec<u8>, JavaRuntimeLookupError> {
+    fetch_bounded_runtime_bytes(url, RuntimeSourceTransportPolicy::AllowHttpForTest).await
+}
+
+#[cfg(test)]
+pub(super) fn runtime_source_url_is_secure_for_test(url: &str) -> bool {
+    runtime_source_url_is_secure(url)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ComponentManifest {
     pub(crate) files: HashMap<String, ComponentManifestFile>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ComponentManifestFile {
     #[serde(rename = "type")]
     pub(crate) kind: String,
@@ -93,7 +275,7 @@ pub(crate) struct ComponentManifestFile {
     pub(crate) target: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ComponentManifestDownloads {
     #[serde(default)]
     pub(crate) raw: Option<ComponentManifestDownload>,
@@ -101,7 +283,7 @@ pub(crate) struct ComponentManifestDownloads {
     pub(crate) lzma: Option<ComponentManifestDownload>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ComponentManifestDownload {
     pub(crate) url: String,
     #[serde(default)]

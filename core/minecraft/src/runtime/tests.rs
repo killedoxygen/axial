@@ -1,17 +1,20 @@
 use super::{
     ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
-    ComponentManifestFile, JavaRuntimeLookupError, MachOArm64Compatibility, RosettaRuntimeDecision,
-    RuntimeDownloadActual, RuntimeDownloadEvidence, RuntimeDownloadIntegrityError,
-    RuntimeEnsureEvent, RuntimeId, RuntimeInstallState, RuntimeManifest,
-    component_manifest_destination, detect_distribution, detect_runtime_state, ensure_java_runtime,
-    fetch_runtime_file, fetch_runtime_json, install_managed_runtime_from_manifest_url,
+    ComponentManifestFile, JavaRuntimeInfo, JavaRuntimeLookupError, MachOArm64Compatibility,
+    RosettaRuntimeDecision, RuntimeDownloadActual, RuntimeDownloadEvidence,
+    RuntimeDownloadIntegrityError, RuntimeDownloadManifest, RuntimeEnsureEvent, RuntimeId,
+    RuntimeInstallState, RuntimeManifest, RuntimeRecord, RuntimeSource,
+    acquire_runtime_source_for_test, component_manifest_destination,
+    component_manifest_proof_bytes, detect_distribution, detect_runtime_state, ensure_java_runtime,
+    fetch_runtime_file, fetch_runtime_manifest_bytes_for_test, install_managed_runtime,
     install_runtime_manifest_file, install_runtime_manifest_files, java_executable,
     java_executable_for_os, parse_mach_o_arm64_compatibility, plan_runtime_manifest_files,
     remove_runtime_install_path, remove_runtime_install_path_async,
     resolve_component_runtime_from_roots, rosetta_requirement_for_managed_runtime,
     runtime_download_client, runtime_file_download_concurrency_for, runtime_install_lock_file_path,
-    runtime_install_lock_from_map, runtime_os_arch_for, runtime_windows_verbatim_path_string,
-    select_runtime_manifest_url, verify_runtime_download,
+    runtime_install_lock_from_map, runtime_os_arch_for, runtime_record_matches_source_for_test,
+    runtime_source_url_is_secure_for_test, runtime_windows_verbatim_path_string,
+    select_runtime_manifest, verify_runtime_download,
 };
 use crate::JavaVersion;
 use serde::Deserialize;
@@ -485,9 +488,11 @@ async fn runtime_manifest_json_fetch_reads_async_http_body() {
 
     let url = serve_runtime_json(200, r#"{"ok":true}"#.as_bytes().to_vec(), None).await;
 
-    let manifest = fetch_runtime_json::<SampleRuntimeManifest>(&url)
+    let bytes = fetch_runtime_manifest_bytes_for_test(&url)
         .await
-        .expect("runtime manifest json");
+        .expect("runtime manifest bytes");
+    let manifest =
+        serde_json::from_slice::<SampleRuntimeManifest>(&bytes).expect("runtime manifest json");
 
     assert!(manifest.ok);
 }
@@ -496,7 +501,7 @@ async fn runtime_manifest_json_fetch_reads_async_http_body() {
 async fn runtime_manifest_json_fetch_rejects_http_errors() {
     let url = serve_runtime_json(503, b"unavailable".to_vec(), None).await;
 
-    let error = fetch_runtime_json::<serde_json::Value>(&url)
+    let error = fetch_runtime_manifest_bytes_for_test(&url)
         .await
         .expect_err("HTTP error should fail");
 
@@ -512,7 +517,7 @@ async fn runtime_manifest_json_fetch_rejects_oversized_content_length() {
     )
     .await;
 
-    let error = fetch_runtime_json::<serde_json::Value>(&url)
+    let error = fetch_runtime_manifest_bytes_for_test(&url)
         .await
         .expect_err("oversized manifest should fail");
 
@@ -520,6 +525,176 @@ async fn runtime_manifest_json_fetch_rejects_oversized_content_length() {
         error.to_string(),
         "failed to install java runtime: runtime manifest response too large"
     );
+}
+
+#[test]
+fn production_runtime_source_policy_accepts_only_https_urls() {
+    assert!(runtime_source_url_is_secure_for_test(
+        "https://launchermeta.mojang.com/runtime.json"
+    ));
+    assert!(!runtime_source_url_is_secure_for_test(
+        "http://launchermeta.mojang.com/runtime.json"
+    ));
+    assert!(!runtime_source_url_is_secure_for_test(
+        "file:///tmp/runtime.json"
+    ));
+    assert!(!runtime_source_url_is_secure_for_test("not a URL"));
+}
+
+#[tokio::test]
+async fn runtime_source_receipt_preserves_verified_authored_bytes() {
+    let bytes = br#"{"files":{}}"#.to_vec();
+    let url = serve_runtime_json(200, bytes.clone(), None).await;
+    let expected_sha1 = sha1_hex(&bytes);
+    let receipt = acquire_runtime_source_for_test(
+        RuntimeId::from("java-runtime-delta"),
+        RuntimeDownloadManifest {
+            url,
+            sha1: expected_sha1.clone(),
+            size: bytes.len() as u64,
+        },
+    )
+    .await
+    .expect("authenticated runtime source");
+
+    assert_eq!(receipt.component().as_str(), "java-runtime-delta");
+    assert_eq!(receipt.bytes(), bytes);
+    assert_eq!(receipt.expected_sha1(), expected_sha1);
+    assert_eq!(receipt.expected_size(), bytes.len() as u64);
+}
+
+#[tokio::test]
+async fn ready_managed_runtime_matches_only_the_exact_receipt_proof() {
+    let root = unique_temp_root("axial-runtime-exact-receipt-proof");
+    fs::create_dir_all(&root).expect("runtime root");
+    let manifest = ComponentManifest {
+        files: HashMap::new(),
+    };
+    let bytes = serde_json::to_vec(&manifest).expect("component manifest");
+    let receipt = acquire_runtime_source_for_test(
+        RuntimeId::from("java-runtime-delta"),
+        RuntimeDownloadManifest {
+            url: serve_runtime_json(200, bytes.clone(), None).await,
+            sha1: sha1_hex(&bytes),
+            size: bytes.len() as u64,
+        },
+    )
+    .await
+    .expect("runtime source receipt");
+    let proof = component_manifest_proof_bytes(&manifest).expect("canonical proof");
+    fs::write(root.join(super::COMPONENT_MANIFEST_PROOF_FILE), &proof)
+        .expect("persist exact proof");
+    let runtime = RuntimeRecord {
+        id: RuntimeId::from("java-runtime-delta"),
+        java_path: root.join("bin/java").to_string_lossy().into_owned(),
+        info: JavaRuntimeInfo {
+            id: "java-runtime-delta".to_string(),
+            major: 21,
+            update: 0,
+            distribution: "test".to_string(),
+            path: root.join("bin/java").to_string_lossy().into_owned(),
+        },
+        source: RuntimeSource::Managed,
+        install_state: RuntimeInstallState::Ready,
+        root_dir: root.to_string_lossy().into_owned(),
+    };
+
+    assert!(runtime_record_matches_source_for_test(&runtime, &receipt).await);
+    fs::write(
+        root.join(super::COMPONENT_MANIFEST_PROOF_FILE),
+        b"different authenticated generation",
+    )
+    .expect("replace proof");
+    assert!(!runtime_record_matches_source_for_test(&runtime, &receipt).await);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn runtime_source_receipt_rejects_size_mismatch_before_parse() {
+    let bytes = b"not json".to_vec();
+    let url = serve_runtime_json(200, bytes.clone(), None).await;
+    let error = acquire_runtime_source_for_test(
+        RuntimeId::from("java-runtime-delta"),
+        RuntimeDownloadManifest {
+            url,
+            sha1: sha1_hex(&bytes),
+            size: bytes.len() as u64 + 1,
+        },
+    )
+    .await
+    .expect_err("size mismatch must reject the source");
+
+    assert_eq!(
+        error.to_string(),
+        "failed to install java runtime: runtime component manifest size mismatch"
+    );
+}
+
+#[tokio::test]
+async fn runtime_source_receipt_rejects_checksum_mismatch_before_parse() {
+    let bytes = b"not json".to_vec();
+    let url = serve_runtime_json(200, bytes.clone(), None).await;
+    let error = acquire_runtime_source_for_test(
+        RuntimeId::from("java-runtime-delta"),
+        RuntimeDownloadManifest {
+            url,
+            sha1: "0000000000000000000000000000000000000000".to_string(),
+            size: bytes.len() as u64,
+        },
+    )
+    .await
+    .expect_err("checksum mismatch must reject the source");
+
+    assert_eq!(
+        error.to_string(),
+        "failed to install java runtime: runtime component manifest checksum mismatch"
+    );
+}
+
+#[tokio::test]
+async fn runtime_source_receipt_parses_only_after_integrity_validation() {
+    let bytes = b"not json".to_vec();
+    let url = serve_runtime_json(200, bytes.clone(), None).await;
+    let error = acquire_runtime_source_for_test(
+        RuntimeId::from("java-runtime-delta"),
+        RuntimeDownloadManifest {
+            url,
+            sha1: sha1_hex(&bytes),
+            size: bytes.len() as u64,
+        },
+    )
+    .await
+    .expect_err("authenticated malformed JSON must fail parsing");
+
+    assert!(error.to_string().contains("expected ident"), "{error}");
+}
+
+#[test]
+fn runtime_catalog_requires_component_manifest_integrity_proof() {
+    let missing_sha1 = serde_json::from_value::<RuntimeManifest>(serde_json::json!({
+        "linux": {
+            "java-runtime-delta": [{
+                "manifest": {
+                    "url": "https://example.invalid/runtime.json",
+                    "size": 1
+                }
+            }]
+        }
+    }));
+    let missing_size = serde_json::from_value::<RuntimeManifest>(serde_json::json!({
+        "linux": {
+            "java-runtime-delta": [{
+                "manifest": {
+                    "url": "https://example.invalid/runtime.json",
+                    "sha1": "0000000000000000000000000000000000000000"
+                }
+            }]
+        }
+    }));
+
+    assert!(missing_sha1.is_err());
+    assert!(missing_size.is_err());
 }
 
 #[test]
@@ -766,16 +941,23 @@ fn runtime_manifest_selection_falls_back_from_macos_arm64_to_macos() {
         },
         "mac-os": {
             "jre-legacy": [
-                { "manifest": { "url": "https://example.invalid/mac-os/jre-legacy.json" } }
+                { "manifest": {
+                    "url": "https://example.invalid/mac-os/jre-legacy.json",
+                    "sha1": "0000000000000000000000000000000000000000",
+                    "size": 1
+                } }
             ]
         }
     }));
 
-    let url =
-        select_runtime_manifest_url(&manifest, &RuntimeId::from("jre-legacy"), "mac-os-arm64")
-            .expect("fallback runtime manifest url");
+    let descriptor =
+        select_runtime_manifest(&manifest, &RuntimeId::from("jre-legacy"), "mac-os-arm64")
+            .expect("fallback runtime manifest descriptor");
 
-    assert_eq!(url, "https://example.invalid/mac-os/jre-legacy.json");
+    assert_eq!(
+        descriptor.url,
+        "https://example.invalid/mac-os/jre-legacy.json"
+    );
 }
 
 #[test]
@@ -783,21 +965,33 @@ fn runtime_manifest_selection_uses_native_entries_before_fallbacks() {
     let manifest = runtime_manifest_fixture(serde_json::json!({
         "mac-os-arm64": {
             "jre-legacy": [
-                { "manifest": { "url": "https://example.invalid/mac-os-arm64/jre-legacy.json" } }
+                { "manifest": {
+                    "url": "https://example.invalid/mac-os-arm64/jre-legacy.json",
+                    "sha1": "1111111111111111111111111111111111111111",
+                    "size": 2
+                } }
             ]
         },
         "mac-os": {
             "jre-legacy": [
-                { "manifest": { "url": "https://example.invalid/mac-os/jre-legacy.json" } }
+                { "manifest": {
+                    "url": "https://example.invalid/mac-os/jre-legacy.json",
+                    "sha1": "2222222222222222222222222222222222222222",
+                    "size": 3
+                } }
             ]
         }
     }));
 
-    let url =
-        select_runtime_manifest_url(&manifest, &RuntimeId::from("jre-legacy"), "mac-os-arm64")
-            .expect("native runtime manifest url");
+    let descriptor =
+        select_runtime_manifest(&manifest, &RuntimeId::from("jre-legacy"), "mac-os-arm64")
+            .expect("native runtime manifest descriptor");
 
-    assert_eq!(url, "https://example.invalid/mac-os-arm64/jre-legacy.json");
+    assert_eq!(
+        descriptor.url,
+        "https://example.invalid/mac-os-arm64/jre-legacy.json"
+    );
+    assert_eq!(descriptor.size, 2);
 }
 
 #[test]
@@ -811,9 +1005,8 @@ fn runtime_manifest_selection_reports_unsupported_platform_after_empty_fallbacks
         }
     }));
 
-    let error =
-        select_runtime_manifest_url(&manifest, &RuntimeId::from("jre-legacy"), "mac-os-arm64")
-            .expect_err("empty native and fallback runtimes should fail");
+    let error = select_runtime_manifest(&manifest, &RuntimeId::from("jre-legacy"), "mac-os-arm64")
+        .expect_err("empty native and fallback runtimes should fail");
 
     assert!(matches!(
         error,
@@ -1070,34 +1263,35 @@ async fn fallback_selected_runtime_install_is_ready_with_manifest_proof() {
         downloadable_manifest_file(&cfg_url, cfg_bytes.len() as u64, &sha1_hex(&cfg_bytes)),
     );
     let component_manifest = ComponentManifest { files };
-    let component_manifest_url = serve_runtime_json(
-        200,
-        serde_json::to_vec(&component_manifest).expect("component manifest json"),
-        None,
-    )
-    .await;
+    let component_manifest_bytes =
+        serde_json::to_vec(&component_manifest).expect("component manifest json");
+    let component_manifest_url =
+        serve_runtime_json(200, component_manifest_bytes.clone(), None).await;
     let manifest = runtime_manifest_fixture(serde_json::json!({
         "mac-os-arm64": {
             "jre-legacy": []
         },
         "mac-os": {
             "jre-legacy": [
-                { "manifest": { "url": component_manifest_url } }
+                { "manifest": {
+                    "url": component_manifest_url,
+                    "sha1": sha1_hex(&component_manifest_bytes),
+                    "size": component_manifest_bytes.len()
+                } }
             ]
         }
     }));
-    let manifest_url = select_runtime_manifest_url(&manifest, &component, "mac-os-arm64")
-        .expect("fallback manifest url");
+    let descriptor = select_runtime_manifest(&manifest, &component, "mac-os-arm64")
+        .expect("fallback manifest descriptor")
+        .clone();
+    let receipt = acquire_runtime_source_for_test(component.clone(), descriptor)
+        .await
+        .expect("verified runtime source receipt");
     let mut events = Vec::new();
 
-    install_managed_runtime_from_manifest_url(
-        &component,
-        &root,
-        std::future::ready(Ok::<_, JavaRuntimeLookupError>(manifest_url)),
-        &mut |event| events.push(event),
-    )
-    .await
-    .expect("fallback runtime install");
+    install_managed_runtime(&component, &root, &receipt, &mut |event| events.push(event))
+        .await
+        .expect("fallback runtime install");
 
     assert_eq!(
         detect_runtime_state(&root, true),

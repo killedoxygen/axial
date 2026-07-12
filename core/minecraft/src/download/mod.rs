@@ -24,7 +24,7 @@ pub use integrity::{
 };
 #[cfg(test)]
 pub(crate) use libraries::DownloadJob;
-pub(crate) use libraries::{LibraryArtifactPlan, library_artifact_plans_for, library_jobs_for};
+pub(crate) use libraries::{LibraryArtifactPlan, library_artifact_plans_for};
 pub use libraries::{
     LibraryChecksumPolicy, LibraryVerificationPlan, download_libraries,
     download_libraries_allowing_missing_checksums_with_facts_and_descriptors,

@@ -36,6 +36,8 @@ pub use probe::{
 #[cfg(test)]
 use discovery::{detect_runtime_state, resolve_component_runtime_from_roots};
 #[cfg(test)]
+use ensure::runtime_record_matches_source_for_test;
+#[cfg(test)]
 use ensure::{runtime_install_lock_file_path, runtime_install_lock_from_map};
 #[cfg(test)]
 use file_download::{
@@ -47,21 +49,25 @@ use file_download::{
 pub(crate) use install::plan_runtime_manifest_files;
 #[cfg(test)]
 use install::{
-    install_managed_runtime_from_manifest_url, install_runtime_manifest_file,
-    install_runtime_manifest_files, remove_runtime_install_path, remove_runtime_install_path_async,
-    select_runtime_manifest_url,
+    install_managed_runtime, install_runtime_manifest_file, install_runtime_manifest_files,
+    remove_runtime_install_path, remove_runtime_install_path_async,
 };
 #[cfg(test)]
 use layout::{java_executable, java_executable_for_os, runtime_os_arch_for};
 pub(crate) use manifest::{
-    COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, component_manifest_proof_bytes,
+    COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, RuntimeSourceReceipt,
+    component_manifest_proof_bytes,
 };
 #[cfg(test)]
 pub(crate) use manifest::{
     ComponentManifestDownload, ComponentManifestDownloads, ComponentManifestFile,
 };
 #[cfg(test)]
-use manifest::{MAX_RUNTIME_MANIFEST_BYTES, RuntimeManifest, fetch_runtime_json};
+use manifest::{
+    MAX_RUNTIME_MANIFEST_BYTES, RuntimeDownloadManifest, RuntimeManifest,
+    acquire_runtime_source_for_test, fetch_runtime_manifest_bytes_for_test,
+    runtime_source_url_is_secure_for_test, select_runtime_manifest,
+};
 #[cfg(test)]
 use probe::detect_distribution;
 #[cfg(test)]

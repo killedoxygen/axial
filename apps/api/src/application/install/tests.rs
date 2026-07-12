@@ -72,6 +72,26 @@ fn install_staging_builds_command_operation_and_payload() {
 }
 
 #[test]
+fn known_good_acceptance_failure_replaces_terminal_success_with_bounded_failure() {
+    let error = known_good_acceptance_download_error(io::Error::other(
+        "/private/library/state/known-good write failed",
+    ));
+    let progress = install_progress_with_terminal_error(
+        terminal_failure_progress_or_default(Some(done_progress())),
+        &error,
+    );
+    let progress = sanitize_install_progress(progress);
+
+    assert!(progress.done);
+    assert_eq!(progress.error.as_deref(), Some(INSTALL_FAILURE_MESSAGE));
+    assert!(
+        !serde_json::to_string(&progress)
+            .expect("progress json")
+            .contains("/private/library")
+    );
+}
+
+#[test]
 fn effective_install_version_id_trims_version_id() {
     let payload = InstallVersionStartRequest {
         version_id: " 1.21.5 ".to_string(),

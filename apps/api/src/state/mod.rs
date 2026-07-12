@@ -405,40 +405,95 @@ impl AppState {
         &self.java_probe_failures
     }
 
-    pub async fn reconcile_known_good_inventory(
+    pub(crate) async fn accept_known_good_install_receipt(
+        &self,
+        installed_library_root: &Path,
+        receipt: axial_minecraft::known_good::KnownGoodInstallReceipt,
+    ) -> std::io::Result<usize> {
+        let Some(configured_library_root) = self.library_dir().map(PathBuf::from) else {
+            return Ok(0);
+        };
+        if !known_good::KnownGoodInventoryStore::library_roots_match(
+            &configured_library_root,
+            installed_library_root,
+        ) {
+            return Ok(0);
+        }
+
+        let version_id = receipt.version_id().to_string();
+        let inventory = Arc::new(receipt.into_inventory());
+        let candidates = self
+            .instances
+            .list()
+            .into_iter()
+            .filter(|instance| {
+                matches_known_good_identity(Some(instance), &instance.id, &version_id)
+            })
+            .map(|instance| instance.id)
+            .collect::<Vec<_>>();
+        let mut accepted = 0;
+        for instance_id in candidates {
+            let _lifecycle = self.acquire_instance_lifecycle(&instance_id).await;
+            let current = self.instances.get(&instance_id);
+            let current_root = self.library_dir().map(PathBuf::from);
+            if !matches_known_good_identity(current.as_ref(), &instance_id, &version_id)
+                || current_root.as_ref().is_none_or(|current_root| {
+                    !known_good::KnownGoodInventoryStore::library_roots_match(
+                        current_root,
+                        installed_library_root,
+                    )
+                })
+            {
+                continue;
+            }
+
+            self.known_good
+                .reconcile(
+                    &instance_id,
+                    &version_id,
+                    installed_library_root,
+                    inventory.clone(),
+                )
+                .await?;
+            let current = self.instances.get(&instance_id);
+            let current_root = self.library_dir().map(PathBuf::from);
+            if !matches_known_good_identity(current.as_ref(), &instance_id, &version_id)
+                || current_root.as_ref().is_none_or(|current_root| {
+                    !known_good::KnownGoodInventoryStore::library_roots_match(
+                        current_root,
+                        installed_library_root,
+                    )
+                })
+            {
+                self.known_good
+                    .deactivate_exact(&instance_id, &version_id, installed_library_root);
+                continue;
+            }
+            accepted += 1;
+        }
+        Ok(accepted)
+    }
+
+    #[allow(dead_code, reason = "consumed by the next R1 readiness slice")]
+    pub(crate) fn active_known_good_inventory(
         &self,
         instance_id: &str,
         version_id: &str,
-        inventory: axial_minecraft::known_good::KnownGoodInventory,
-    ) -> std::io::Result<axial_minecraft::known_good::KnownGoodInventory> {
-        if !is_canonical_instance_id(instance_id) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "invalid instance identity",
-            ));
+        library_root: &Path,
+    ) -> Option<Arc<axial_minecraft::known_good::KnownGoodInventory>> {
+        let configured_library_root = self.library_dir().map(PathBuf::from)?;
+        if !known_good::KnownGoodInventoryStore::library_roots_match(
+            &configured_library_root,
+            library_root,
+        ) || !matches_known_good_identity(
+            self.instances.get(instance_id).as_ref(),
+            instance_id,
+            version_id,
+        ) {
+            return None;
         }
-        let _lifecycle = self.acquire_instance_lifecycle(instance_id).await;
-        let instance = self.instances.get(instance_id).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "instance not found")
-        })?;
-        if !matches_known_good_identity(Some(&instance), instance_id, version_id) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "instance version identity changed",
-            ));
-        }
-        let inventory = self
-            .known_good
-            .reconcile(instance_id, version_id, inventory)
-            .await?;
-        let current = self.instances.get(instance_id);
-        if !matches_known_good_identity(current.as_ref(), instance_id, version_id) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "instance identity changed during known-good reconciliation",
-            ));
-        }
-        Ok(inventory)
+        self.known_good
+            .active_inventory(instance_id, version_id, library_root)
     }
 
     pub fn performance(&self) -> &Arc<AppPerformanceStore> {
@@ -524,6 +579,9 @@ impl AppState {
     #[cfg(test)]
     pub fn set_library_dir_for_test(&self, value: String) {
         let mut config = self.config.current();
+        if config.library_dir != value {
+            self.known_good.clear_active();
+        }
         config.library_dir = value;
         self.config
             .replace_for_test(config)
@@ -578,11 +636,15 @@ impl AppState {
             let result = instances.mutate_with_gate(mutation, gate).await;
             let _ = completed_tx.send(result);
         });
-        completed_rx.await.map_err(|_| {
+        let result = completed_rx.await.map_err(|_| {
             InstanceStoreError::Persistence(std::io::Error::other(
                 "instance registry mutation owner stopped before reporting completion",
             ))
-        })?
+        })?;
+        if result.is_ok() {
+            self.prune_known_good_inventories();
+        }
+        result
     }
 
     pub(crate) async fn create_instance(
@@ -779,12 +841,31 @@ impl AppState {
     fn config_commit_observer(&self) -> Arc<dyn Fn(AppConfig, AppConfig) + Send + Sync> {
         let telemetry = self.telemetry.clone();
         let changes = self.config_changes.clone();
+        let known_good = self.known_good.clone();
         Arc::new(move |previous: AppConfig, current: AppConfig| {
             if previous.telemetry_enabled && !current.telemetry_enabled {
                 telemetry.clear_queue();
             }
+            if previous.library_dir != current.library_dir {
+                known_good.clear_active();
+            }
             let _ = changes.send(());
         })
+    }
+
+    fn prune_known_good_inventories(&self) {
+        let Some(library_root) = self.library_dir().map(PathBuf::from) else {
+            self.known_good.clear_active();
+            return;
+        };
+        self.known_good.retain_active(
+            &library_root,
+            self.instances
+                .list()
+                .into_iter()
+                .filter(|instance| is_canonical_instance_id(&instance.id))
+                .map(|instance| (instance.id, instance.version_id)),
+        );
     }
 
     pub fn flag_enabled(&self, key: &str) -> bool {
