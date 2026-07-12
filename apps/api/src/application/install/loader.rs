@@ -30,9 +30,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-const LOADER_INSTALL_SCOPE: &str = "loader";
-const VANILLA_INSTALL_SCOPE: &str = "vanilla";
-
 pub(super) async fn start_loader_install_owned(
     state: &AppState,
     request: LoaderInstallStartRequest,
@@ -58,19 +55,12 @@ pub(super) async fn start_loader_install_owned(
         .await
         .map_err(loader_pre_operation_error_response)?;
 
-    let (install_version_key, install_manifest_key) =
-        loader_install_key_fields(build.component_id, &build.build_id, &build.version_id);
     let target_version_id = build.version_id.clone();
     let install_id = loop {
         let candidate = generate_install_id("loader-install");
         let (install_id, inserted) = state
             .installs()
-            .insert_or_existing_active_scoped(
-                LOADER_INSTALL_SCOPE.to_string(),
-                candidate,
-                install_version_key.clone(),
-                install_manifest_key.clone(),
-            )
+            .insert_or_existing_loader(candidate, build.component_id, build.build_id.clone())
             .await;
         if inserted {
             break install_id;
@@ -93,7 +83,6 @@ pub(super) async fn start_loader_install_owned(
     let staging = stage_install_version_command(
         InstallVersionCommand {
             version_id: target_version_id.clone(),
-            manifest_url: None,
         },
         install_id.clone(),
         operation_id.clone(),
@@ -440,26 +429,12 @@ pub async fn loader_game_versions(
         .map_err(loader_pre_operation_error_response)
 }
 
-pub(crate) fn loader_install_key_fields(
-    component_id: LoaderComponentId,
-    build_id: &str,
-    version_id: &str,
-) -> (String, String) {
-    (
-        format!("loader:{}:{}", component_id.as_str(), version_id.trim()),
-        format!("loader:{}:{}", component_id.as_str(), build_id.trim()),
-    )
-}
-
 pub(crate) async fn wait_for_active_vanilla_base_install(
     store: &InstallStore,
     version_id: &str,
     progress_tx: &mpsc::UnboundedSender<DownloadProgress>,
 ) -> Result<(), DownloadProgress> {
-    let Some(install_id) = store
-        .active_install_for_scope_and_version(VANILLA_INSTALL_SCOPE, version_id)
-        .await
-    else {
+    let Some(install_id) = store.active_vanilla_install(version_id).await else {
         return Ok(());
     };
 

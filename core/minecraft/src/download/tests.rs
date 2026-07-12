@@ -20,13 +20,13 @@ use super::runtime::{
     RuntimeEnsurePipeline, finish_runtime_pipeline_after_artifacts, runtime_ensure_progress,
 };
 use super::transfer::{
-    download_file_with_client, download_file_with_client_and_fact_sender,
-    download_file_with_client_report_with_retry_delays, download_temp_path,
-    ensure_selected_artifact_with_client, execute_download_to_temp, remove_stale_download_temp,
+    download_file_with_client, download_file_with_client_report_with_retry_delays,
+    download_temp_path, ensure_selected_artifact_with_client, execute_download_to_temp,
+    remove_stale_download_temp,
 };
 use super::*;
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
-use crate::manifest::ManifestEntry;
+use crate::manifest::{ManifestEntry, VersionManifest};
 use crate::paths::versions_dir;
 use crate::rules::Environment;
 use crate::runtime::RuntimeEnsureEvent;
@@ -49,10 +49,15 @@ async fn install_version_emits_terminal_error_when_setup_fails() {
     fs::create_dir_all(&root).expect("create root");
     fs::write(versions_dir(&root), b"not a directory").expect("write versions sentinel");
 
-    let downloader = Downloader::new(&root);
+    let downloader = test_manifest_downloader(
+        &root,
+        "1.20.1",
+        "https://example.invalid/1.20.1.json",
+        "abcdef1234567890abcdef1234567890abcdef12",
+    );
     let mut events = Vec::new();
     let result = downloader
-        .install_version("1.20.1", None, |progress| events.push(progress))
+        .install_version("1.20.1", |progress| events.push(progress))
         .await;
 
     assert!(result.is_err());
@@ -72,13 +77,10 @@ async fn install_version_emits_terminal_error_when_setup_fails() {
 #[tokio::test]
 async fn install_version_starts_asset_index_before_library_download_finishes() {
     let root = temp_dir("overlap-assets-libraries");
-    let (version_url, mut requests, release_library) = spawn_overlapped_install_server().await;
-    let downloader = Downloader::new(&root);
-    let install = tokio::spawn(async move {
-        downloader
-            .install_version("overlap", Some(&version_url), |_| {})
-            .await
-    });
+    let (version_url, version_sha1, mut requests, release_library) =
+        spawn_overlapped_install_server().await;
+    let downloader = test_manifest_downloader(&root, "overlap", &version_url, &version_sha1);
+    let install = tokio::spawn(async move { downloader.install_version("overlap", |_| {}).await });
 
     let mut saw_asset_index = false;
     while !saw_asset_index {
@@ -103,11 +105,12 @@ async fn install_version_starts_asset_index_before_library_download_finishes() {
 #[tokio::test]
 async fn install_version_with_facts_emits_private_download_facts_only() {
     let root = temp_dir("install-private-facts");
-    let (version_url, _requests, release_library) = spawn_overlapped_install_server().await;
+    let (version_url, version_sha1, _requests, release_library) =
+        spawn_overlapped_install_server().await;
     release_library
         .send(())
         .expect("release library response before request");
-    let downloader = Downloader::new(&root);
+    let downloader = test_manifest_downloader(&root, "overlap", &version_url, &version_sha1);
     let mut events = Vec::new();
     let mut facts = Vec::new();
     let mut descriptors = Vec::new();
@@ -115,7 +118,6 @@ async fn install_version_with_facts_emits_private_download_facts_only() {
     downloader
         .install_version_with_facts_and_descriptors(
             "overlap",
-            Some(&version_url),
             |progress| events.push(progress),
             |fact| facts.push(fact),
             |descriptor| descriptors.push(descriptor),
@@ -186,7 +188,7 @@ async fn selected_missing_artifact_fact_is_emitted_before_download_failure() {
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
 
-    let result = download_file_with_client_and_fact_sender(
+    let result = ensure_selected_artifact_with_client(
         SelectedDownloadArtifactKind::ClientJar,
         &client,
         &url,
@@ -313,7 +315,7 @@ async fn selected_existing_unsupported_artifact_blocks_without_network() {
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
 
-    let result = download_file_with_client_and_fact_sender(
+    let result = ensure_selected_artifact_with_client(
         SelectedDownloadArtifactKind::ClientJar,
         &client,
         "http://127.0.0.1:9/artifact.jar",
@@ -1343,7 +1345,7 @@ fn download_integrity_futures_stay_small_enough_for_tokio_workers() {
     let root = temp_dir("install-version-future-size");
     let downloader = Downloader::new(&root);
     assert!(
-        std::mem::size_of_val(&downloader.install_version("1.21.1", None, |_| {})) < 8192,
+        std::mem::size_of_val(&downloader.install_version("1.21.1", |_| {})) < 8192,
         "version-install future should stay comfortably below tokio worker stack limits"
     );
 }
@@ -2029,7 +2031,7 @@ fn expected_integrity_ignores_default_mojang_metadata() {
 }
 
 #[test]
-fn manifest_entry_download_carries_sha1_without_forcing_download() {
+fn manifest_entry_download_carries_sha1() {
     let sha1 = "abcdef1234567890abcdef1234567890abcdef12";
     let download = version_json_download_from_manifest_entry(ManifestEntry {
         id: "1.20.1".to_string(),
@@ -2043,7 +2045,69 @@ fn manifest_entry_download_carries_sha1_without_forcing_download() {
 
     assert_eq!(download.url, "https://example.invalid/1.20.1.json");
     assert_eq!(download.expected, ExpectedIntegrity::from_sha1(sha1));
-    assert!(!download.force_download);
+}
+
+#[tokio::test]
+async fn install_version_rejects_unlisted_local_version_json() {
+    let root = temp_dir("unlisted-local-version-json");
+    let version_dir = versions_dir(&root).join("custom");
+    fs::create_dir_all(&version_dir).expect("create version directory");
+    fs::write(version_dir.join("custom.json"), br#"{"id":"custom"}"#)
+        .expect("write local version json");
+    let error = Downloader::with_test_install_manifest(&root, empty_test_install_manifest())
+        .install_version("custom", |_| {})
+        .await
+        .expect_err("unlisted local metadata must not become install authority");
+
+    assert!(error.to_string().contains("not found in manifest"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn install_version_rejects_unsafe_identity_before_filesystem_effects() {
+    let root = temp_dir("unsafe-version-identity");
+    let absolute = root
+        .with_file_name(format!(
+            "{}-absolute",
+            root.file_name()
+                .and_then(|value| value.to_str())
+                .expect("temporary root file name")
+        ))
+        .to_string_lossy()
+        .to_string();
+    let traversal_name = format!(
+        "{}-escape",
+        root.file_name()
+            .and_then(|value| value.to_str())
+            .expect("temporary root file name")
+    );
+    let traversal_id = format!("../{traversal_name}");
+    let traversal_target = root
+        .parent()
+        .expect("temporary root parent")
+        .join(&traversal_name);
+    let oversized =
+        "a".repeat(crate::artifact_path::MAX_ARTIFACT_PATH_SEGMENT_BYTES - ".json".len() + 1);
+
+    for version_id in [traversal_id.as_str(), absolute.as_str(), oversized.as_str()] {
+        let mut events = Vec::new();
+        let error = Downloader::with_test_install_manifest(&root, empty_test_install_manifest())
+            .install_version(version_id, |progress| events.push(progress))
+            .await
+            .expect_err("unsafe version identity must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid Minecraft version identity")
+        );
+        assert_eq!(events.len(), 1);
+        assert!(events[0].done);
+        assert_eq!(events[0].phase, "error");
+        assert!(!root.exists());
+        assert!(!traversal_target.exists());
+        assert!(!Path::new(&absolute).exists());
+    }
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {
@@ -2133,8 +2197,12 @@ async fn spawn_download_response_server(
     url
 }
 
-async fn spawn_overlapped_install_server()
--> (String, mpsc::UnboundedReceiver<String>, oneshot::Sender<()>) {
+async fn spawn_overlapped_install_server() -> (
+    String,
+    String,
+    mpsc::UnboundedReceiver<String>,
+    oneshot::Sender<()>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind install overlap server");
@@ -2167,6 +2235,7 @@ async fn spawn_overlapped_install_server()
     })
     .to_string()
     .into_bytes();
+    let version_sha1 = sha1_hex(&version_body);
 
     tokio::spawn(async move {
         let release_library_rx = Arc::new(Mutex::new(Some(release_library_rx)));
@@ -2204,9 +2273,40 @@ async fn spawn_overlapped_install_server()
 
     (
         format!("{base_url}/version.json"),
+        version_sha1,
         request_rx,
         release_library_tx,
     )
+}
+
+fn test_manifest_downloader(
+    root: &Path,
+    version_id: &str,
+    version_url: &str,
+    version_sha1: &str,
+) -> Downloader {
+    let manifest = serde_json::json!({
+        "latest": { "release": version_id, "snapshot": version_id },
+        "versions": [{
+            "id": version_id,
+            "type": "release",
+            "url": version_url,
+            "sha1": version_sha1,
+            "complianceLevel": 1
+        }]
+    });
+    Downloader::with_test_install_manifest(
+        root,
+        serde_json::from_value(manifest).expect("valid test install manifest"),
+    )
+}
+
+fn empty_test_install_manifest() -> VersionManifest {
+    serde_json::from_value(serde_json::json!({
+        "latest": { "release": "", "snapshot": "" },
+        "versions": []
+    }))
+    .expect("valid empty test install manifest")
 }
 
 async fn read_request_path(socket: &mut tokio::net::TcpStream) -> Option<String> {

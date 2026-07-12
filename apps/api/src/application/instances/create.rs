@@ -518,22 +518,15 @@ impl CreateSelection {
 
     fn install_queue_request(&self) -> Option<InstallQueueRequest> {
         match self {
-            Self::Vanilla { version_id } => Some(InstallQueueRequest {
-                kind: "vanilla".to_string(),
+            Self::Vanilla { version_id } => Some(InstallQueueRequest::Vanilla {
                 version_id: version_id.clone(),
-                manifest_url: String::new(),
-                component_id: String::new(),
-                build_id: String::new(),
             }),
             Self::Loader {
                 component_id,
                 build_id,
                 ..
-            } => Some(InstallQueueRequest {
-                kind: "loader".to_string(),
-                version_id: String::new(),
-                manifest_url: String::new(),
-                component_id: component_id.as_str().to_string(),
+            } => Some(InstallQueueRequest::Loader {
+                component_id: *component_id,
                 build_id: build_id.clone(),
             }),
         }
@@ -926,12 +919,16 @@ fn install_queue_item_matches_request(
     item: &InstallQueueInstallItemViewModel,
     request: &InstallQueueRequest,
 ) -> bool {
-    match request.kind.trim() {
-        "vanilla" | "minecraft" => item.loader.is_none() && item.version_id == request.version_id,
-        "loader" => item.loader.as_ref().is_some_and(|loader| {
-            loader.component_id == request.component_id && loader.build_id == request.build_id
+    match request {
+        InstallQueueRequest::Vanilla { version_id } => {
+            item.loader.is_none() && item.version_id == *version_id
+        }
+        InstallQueueRequest::Loader {
+            component_id,
+            build_id,
+        } => item.loader.as_ref().is_some_and(|loader| {
+            loader.component_id == component_id.as_str() && loader.build_id == *build_id
         }),
-        _ => false,
     }
 }
 

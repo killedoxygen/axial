@@ -552,7 +552,6 @@ mod tests {
             needs_install: String::new(),
             java_component: String::new(),
             java_major: 21,
-            manifest_url: String::new(),
             loader: Some(axial_minecraft::VersionLoaderAttachment {
                 component_id: axial_minecraft::LoaderComponentId::Fabric,
                 component_name: "Fabric".to_string(),

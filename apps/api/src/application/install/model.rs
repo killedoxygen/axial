@@ -24,8 +24,6 @@ pub struct InstallGuardianRepairSummary {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstallVersionStartRequest {
     pub version_id: String,
-    #[serde(default)]
-    pub manifest_url: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -124,16 +122,16 @@ pub struct InstallFailureViewModel {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InstallQueueRequest {
-    pub kind: String,
-    #[serde(default)]
-    pub version_id: String,
-    #[serde(default)]
-    pub manifest_url: String,
-    #[serde(default)]
-    pub component_id: String,
-    #[serde(default)]
-    pub build_id: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum InstallQueueRequest {
+    Vanilla {
+        version_id: String,
+    },
+    Loader {
+        component_id: LoaderComponentId,
+        build_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

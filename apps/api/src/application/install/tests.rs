@@ -45,7 +45,6 @@ fn install_staging_builds_command_operation_and_payload() {
     let staging = stage_install_version_command(
         InstallVersionCommand {
             version_id: "1.21.5".to_string(),
-            manifest_url: None,
         },
         "install-1".to_string(),
         operation_id.clone(),
@@ -73,36 +72,12 @@ fn install_staging_builds_command_operation_and_payload() {
 }
 
 #[test]
-fn effective_install_fields_trims_version_id_and_manifest_url() {
+fn effective_install_version_id_trims_version_id() {
     let payload = InstallVersionStartRequest {
         version_id: " 1.21.5 ".to_string(),
-        manifest_url: " https://example.invalid/manifest.json ".to_string(),
     };
 
-    assert_eq!(
-        effective_install_fields(&payload),
-        (
-            "1.21.5".to_string(),
-            "https://example.invalid/manifest.json".to_string()
-        )
-    );
-}
-
-#[test]
-fn effective_install_fields_preserves_explicit_manifest_url() {
-    let normal = InstallVersionStartRequest {
-        version_id: "1.21.5".to_string(),
-        manifest_url: String::new(),
-    };
-    let explicit = InstallVersionStartRequest {
-        version_id: "1.21.5".to_string(),
-        manifest_url: "https://example.invalid/manifest.json".to_string(),
-    };
-
-    assert_ne!(
-        effective_install_fields(&normal),
-        effective_install_fields(&explicit)
-    );
+    assert_eq!(effective_install_version_id(&payload), "1.21.5");
 }
 
 #[test]
@@ -550,11 +525,7 @@ async fn install_existing_active_response_includes_backend_operation_id() {
     configure_library_dir(&state, &root.join("library"));
     state
         .installs()
-        .insert_or_existing_active(
-            "existing-install".to_string(),
-            "1.21.5".to_string(),
-            String::new(),
-        )
+        .insert_or_existing_vanilla("existing-install".to_string(), "1.21.5".to_string())
         .await;
     let operation_id = install_operation_id("existing-install");
     begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
@@ -567,7 +538,6 @@ async fn install_existing_active_response_includes_backend_operation_id() {
         &state,
         InstallVersionStartRequest {
             version_id: "1.21.5".to_string(),
-            manifest_url: String::new(),
         },
         &producer,
     )
@@ -589,7 +559,7 @@ async fn install_queue_status_authors_backend_queue_view_models() {
         .installs()
         .enqueue_queued_install(
             "queue-vanilla".to_string(),
-            InstallQueueSpec::vanilla("1.21.5".to_string(), String::new()),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
             InstallQueuePlacement::Back,
         )
         .await;
@@ -656,12 +626,8 @@ async fn enqueue_prestart_failure_does_not_insert_pending_queue_item() {
     let admitted = state.try_admit_request().expect("admit install request");
     let error = enqueue_install_owned(
         &state,
-        InstallQueueRequest {
-            kind: "vanilla".to_string(),
+        InstallQueueRequest::Vanilla {
             version_id: "1.21.5".to_string(),
-            manifest_url: String::new(),
-            component_id: String::new(),
-            build_id: String::new(),
         },
         admitted.producer_handoff(),
     )
@@ -684,7 +650,7 @@ async fn install_queue_state_shows_reserved_item_while_starting() {
         .installs()
         .enqueue_queued_install(
             "queue-starting".to_string(),
-            InstallQueueSpec::vanilla("1.21.5".to_string(), String::new()),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
             InstallQueuePlacement::Back,
         )
         .await;
@@ -715,17 +681,13 @@ async fn queue_monitor_advances_only_after_terminal_progress_and_discards_start_
     let state = build_test_state(&root);
     state
         .installs()
-        .insert_or_existing_active(
-            "active-install".to_string(),
-            "1.21.5".to_string(),
-            String::new(),
-        )
+        .insert_or_existing_vanilla("active-install".to_string(), "1.21.5".to_string())
         .await;
     state
         .installs()
         .enqueue_queued_install(
             "queue-active".to_string(),
-            InstallQueueSpec::vanilla("1.21.5".to_string(), String::new()),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
             InstallQueuePlacement::Back,
         )
         .await;
@@ -745,7 +707,7 @@ async fn queue_monitor_advances_only_after_terminal_progress_and_discards_start_
         .installs()
         .enqueue_queued_install(
             "queue-pending".to_string(),
-            InstallQueueSpec::vanilla("1.21.6".to_string(), String::new()),
+            InstallQueueSpec::vanilla("1.21.6".to_string()),
             InstallQueuePlacement::Back,
         )
         .await;
@@ -787,17 +749,13 @@ async fn queue_monitor_does_not_start_successor_while_requests_are_draining() {
     let state = build_test_state(&root);
     state
         .installs()
-        .insert_or_existing_active(
-            "draining-active-install".to_string(),
-            "1.21.5".to_string(),
-            String::new(),
-        )
+        .insert_or_existing_vanilla("draining-active-install".to_string(), "1.21.5".to_string())
         .await;
     state
         .installs()
         .enqueue_queued_install(
             "draining-active-queue".to_string(),
-            InstallQueueSpec::vanilla("1.21.5".to_string(), String::new()),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
             InstallQueuePlacement::Back,
         )
         .await;
@@ -820,7 +778,7 @@ async fn queue_monitor_does_not_start_successor_while_requests_are_draining() {
         .installs()
         .enqueue_queued_install(
             "draining-pending-queue".to_string(),
-            InstallQueueSpec::vanilla("1.21.6".to_string(), String::new()),
+            InstallQueueSpec::vanilla("1.21.6".to_string()),
             InstallQueuePlacement::Back,
         )
         .await;
@@ -2281,54 +2239,11 @@ async fn loader_install_events_return_bounded_not_found_for_unknown_install() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[test]
-fn loader_install_key_fields_are_scoped_to_component_and_build() {
-    let fabric_key = loader_install_key_fields(
-        LoaderComponentId::Fabric,
-        "fabric:1.21.5:0.16.14",
-        "fabric-loader-0.16.14-1.21.5",
-    );
-    let quilt_key = loader_install_key_fields(
-        LoaderComponentId::Quilt,
-        "quilt:1.21.5:0.16.14",
-        "fabric-loader-0.16.14-1.21.5",
-    );
-    let next_build_key = loader_install_key_fields(
-        LoaderComponentId::Fabric,
-        "fabric:1.21.5:0.16.15",
-        "fabric-loader-0.16.14-1.21.5",
-    );
-
-    assert_ne!(fabric_key, quilt_key);
-    assert_ne!(fabric_key, next_build_key);
-    assert!(fabric_key.0.starts_with("loader:"));
-    assert!(fabric_key.1.starts_with("loader:"));
-}
-
-#[test]
-fn loader_install_key_fields_trim_resolved_fields() {
-    assert_eq!(
-        loader_install_key_fields(
-            LoaderComponentId::Forge,
-            " forge:1.20.1:47.4.0 ",
-            " 1.20.1-forge-47.4.0 ",
-        ),
-        (
-            "loader:net.minecraftforge:1.20.1-forge-47.4.0".to_string(),
-            "loader:net.minecraftforge:forge:1.20.1:47.4.0".to_string()
-        )
-    );
-}
-
 #[tokio::test]
 async fn wait_for_active_vanilla_base_install_waits_and_forwards_progress() {
     let store = Arc::new(InstallStore::new());
     store
-        .insert_or_existing_active(
-            "vanilla-install".to_string(),
-            "1.21.5".to_string(),
-            String::new(),
-        )
+        .insert_or_existing_vanilla("vanilla-install".to_string(), "1.21.5".to_string())
         .await;
     let (progress_tx, mut progress_rx) = tokio_mpsc::unbounded_channel();
 
@@ -2369,11 +2284,7 @@ async fn wait_for_active_vanilla_base_install_does_not_block_done_removed_or_fai
     let (progress_tx, _progress_rx) = tokio_mpsc::unbounded_channel();
 
     store
-        .insert_or_existing_active(
-            "done-install".to_string(),
-            "1.21.5".to_string(),
-            String::new(),
-        )
+        .insert_or_existing_vanilla("done-install".to_string(), "1.21.5".to_string())
         .await;
     store.emit("done-install", done_progress()).await;
     timeout(
@@ -2385,11 +2296,7 @@ async fn wait_for_active_vanilla_base_install_does_not_block_done_removed_or_fai
     .expect("done session should not fail loader wait");
 
     store
-        .insert_or_existing_active(
-            "failed-install".to_string(),
-            "1.21.5".to_string(),
-            String::new(),
-        )
+        .insert_or_existing_vanilla("failed-install".to_string(), "1.21.5".to_string())
         .await;
     store.emit("failed-install", failed_progress()).await;
     timeout(
@@ -2401,11 +2308,7 @@ async fn wait_for_active_vanilla_base_install_does_not_block_done_removed_or_fai
     .expect("already failed session should not fail loader wait");
 
     store
-        .insert_or_existing_active(
-            "removed-install".to_string(),
-            "1.21.5".to_string(),
-            String::new(),
-        )
+        .insert_or_existing_vanilla("removed-install".to_string(), "1.21.5".to_string())
         .await;
     store.remove("removed-install").await;
     timeout(
@@ -2421,11 +2324,7 @@ async fn wait_for_active_vanilla_base_install_does_not_block_done_removed_or_fai
 async fn wait_for_active_vanilla_base_install_fails_loader_when_base_fails_while_waiting() {
     let store = Arc::new(InstallStore::new());
     store
-        .insert_or_existing_active(
-            "vanilla-install".to_string(),
-            "1.21.5".to_string(),
-            String::new(),
-        )
+        .insert_or_existing_vanilla("vanilla-install".to_string(), "1.21.5".to_string())
         .await;
     let (progress_tx, mut progress_rx) = tokio_mpsc::unbounded_channel();
 
@@ -2466,7 +2365,7 @@ async fn cancelled_initial_commit_releases_reservation_for_duplicate_retry() {
     let operation_id = install_operation_id(&install_id);
     assert!(
         installs
-            .insert_or_existing_active(install_id.clone(), "1.21.5".to_string(), String::new(),)
+            .insert_or_existing_vanilla(install_id.clone(), "1.21.5".to_string())
             .await
             .1
     );
@@ -2485,11 +2384,7 @@ async fn cancelled_initial_commit_releases_reservation_for_duplicate_retry() {
     let duplicate_id = install_id.clone();
     let duplicate = tokio::spawn(async move {
         let (existing, inserted) = duplicate_store
-            .insert_or_existing_active(
-                "duplicate-waiter".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("duplicate-waiter".to_string(), "1.21.5".to_string())
             .await;
         assert!(!inserted);
         assert_eq!(existing, duplicate_id);
@@ -2500,11 +2395,7 @@ async fn cancelled_initial_commit_releases_reservation_for_duplicate_retry() {
         ));
         wait_for_install_removal(&duplicate_store, &existing).await;
         duplicate_store
-            .insert_or_existing_active(
-                "duplicate-retry".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("duplicate-retry".to_string(), "1.21.5".to_string())
             .await
     });
 
@@ -2550,7 +2441,7 @@ async fn cancelled_initialized_result_before_worker_handoff_releases_reservation
     let assertion_operation_id = operation_id.clone();
     assert!(
         installs
-            .insert_or_existing_active(install_id.clone(), "1.21.5".to_string(), String::new(),)
+            .insert_or_existing_vanilla(install_id.clone(), "1.21.5".to_string())
             .await
             .1
     );
@@ -2608,7 +2499,7 @@ async fn transient_initial_failure_reconciles_then_allows_retry() {
     let operation_id = install_operation_id(&install_id);
     assert!(
         installs
-            .insert_or_existing_active(install_id.clone(), "1.21.5".to_string(), String::new(),)
+            .insert_or_existing_vanilla(install_id.clone(), "1.21.5".to_string())
             .await
             .1
     );
@@ -2632,11 +2523,7 @@ async fn transient_initial_failure_reconciles_then_allows_retry() {
         InstallInitializationStatus::Reconciling
     );
     let (existing, inserted) = installs
-        .insert_or_existing_active(
-            "bounded-duplicate".to_string(),
-            "1.21.5".to_string(),
-            String::new(),
-        )
+        .insert_or_existing_vanilla("bounded-duplicate".to_string(), "1.21.5".to_string())
         .await;
     assert!(!inserted);
     assert_eq!(existing, install_id);
@@ -2658,10 +2545,9 @@ async fn transient_initial_failure_reconciles_then_allows_retry() {
     );
     assert!(
         installs
-            .insert_or_existing_active(
+            .insert_or_existing_vanilla(
                 "post-reconciliation-retry".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
+                "1.21.5".to_string()
             )
             .await
             .1
@@ -2680,7 +2566,7 @@ async fn persistent_initial_failure_keeps_live_owner_and_bounds_duplicates() {
     let operation_id = install_operation_id(&install_id);
     assert!(
         installs
-            .insert_or_existing_active(install_id.clone(), "1.21.5".to_string(), String::new(),)
+            .insert_or_existing_vanilla(install_id.clone(), "1.21.5".to_string())
             .await
             .1
     );
@@ -3729,81 +3615,6 @@ async fn install_guardian_repair_repairs_matching_checksum_failure() {
 }
 
 #[tokio::test]
-async fn install_worker_self_heals_corrupt_launcher_artifact_without_guardian_repair() {
-    let root = temp_root("execution-install-self-heal");
-    let state = build_test_state(&root);
-    let library_dir = root.join("library");
-    configure_library_dir(&state, &library_dir);
-    write_bundled_runtime_fixture(&library_dir, "java-runtime-delta");
-
-    let version_id = "repair-rerun";
-    let replacement = b"fresh client from execution self-heal".to_vec();
-    let client_server = TestByteServer::start(replacement.clone());
-    let version_body = serde_json::json!({
-        "id": version_id,
-        "type": "release",
-        "mainClass": "net.minecraft.client.main.Main",
-        "downloads": {
-            "client": {
-                "url": client_server.url,
-                "sha1": sha1_hex(&replacement),
-                "size": replacement.len()
-            }
-        },
-        "libraries": []
-    })
-    .to_string()
-    .into_bytes();
-    let version_server = TestByteServer::start(version_body);
-    let client_jar = library_dir
-        .join("versions")
-        .join(version_id)
-        .join(format!("{version_id}.jar"));
-    fs::create_dir_all(client_jar.parent().expect("client jar parent")).expect("client jar parent");
-    fs::write(&client_jar, vec![b'X'; replacement.len()]).expect("corrupt client jar");
-
-    let producer = state.try_claim_producer().expect("claim install producer");
-    let response = start_install_version_owned(
-        &state,
-        InstallVersionStartRequest {
-            version_id: version_id.to_string(),
-            manifest_url: version_server.url.clone(),
-        },
-        &producer,
-    )
-    .await
-    .expect("start install");
-    let status = wait_for_install_done(&state, &response.install_id).await;
-
-    assert!(status.done);
-    assert!(status.view_model.terminal);
-    assert!(!status.view_model.failed);
-    assert_eq!(status.view_model.phase_id, "done");
-    assert!(
-        status.guardian_repair.is_none(),
-        "Execution self-heal should not produce a Guardian repair summary"
-    );
-    assert_eq!(
-        fs::read(&client_jar).expect("self-healed client jar"),
-        replacement
-    );
-    assert_eq!(
-        client_server.request_count(),
-        1,
-        "client artifact should be downloaded once by the first install attempt"
-    );
-    assert_eq!(
-        version_server.request_count(),
-        1,
-        "explicit version json should be fetched once because the install does not rerun"
-    );
-
-    client_server.stop();
-    version_server.stop();
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
 async fn install_guardian_repair_restores_missing_matching_artifact() {
     let root = temp_root("guardian-install-missing-repair");
     let destination = root.join("missing-client.jar");
@@ -4406,68 +4217,6 @@ async fn wait_for_queue_empty(state: &AppState) {
         state.installs().queue_snapshot().await
     );
 }
-
-async fn wait_for_install_done(state: &AppState, install_id: &str) -> InstallStatusResponse {
-    for _ in 0..120 {
-        let status = install_status(state, install_id)
-            .await
-            .expect("install status");
-        if status.done {
-            return status;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    panic!(
-        "install did not finish: {:?}",
-        install_status(state, install_id)
-            .await
-            .expect("install status")
-    );
-}
-
-fn write_bundled_runtime_fixture(library_dir: &Path, component: &str) {
-    let runtime_root = library_dir.join("runtime").join(component);
-    let java = runtime_fixture_java_path(&runtime_root);
-    fs::create_dir_all(java.parent().expect("java parent")).expect("java parent dir");
-    fs::write(&java, b"java").expect("java executable");
-    make_runtime_fixture_executable(&java);
-    if cfg!(target_os = "windows") {
-        let config = runtime_root.join("lib").join("jvm.cfg");
-        fs::create_dir_all(config.parent().expect("runtime config parent"))
-            .expect("runtime config parent");
-        fs::write(config, b"jvm").expect("runtime config");
-    }
-}
-
-fn runtime_fixture_java_path(runtime_root: &Path) -> PathBuf {
-    if cfg!(target_os = "windows") {
-        runtime_root.join("bin").join("javaw.exe")
-    } else if cfg!(target_os = "macos") {
-        runtime_root
-            .join("jre.bundle")
-            .join("Contents")
-            .join("Home")
-            .join("bin")
-            .join("java")
-    } else {
-        runtime_root.join("bin").join("java")
-    }
-}
-
-#[cfg(unix)]
-fn make_runtime_fixture_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = fs::metadata(path)
-        .expect("runtime fixture metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("runtime fixture executable");
-}
-
-#[cfg(not(unix))]
-fn make_runtime_fixture_executable(_path: &Path) {}
 
 fn temp_root(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(

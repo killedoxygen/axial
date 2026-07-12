@@ -380,7 +380,6 @@ mod tests {
             needs_install: String::new(),
             java_component: String::new(),
             java_major: 21,
-            manifest_url: String::new(),
             loader: loader_name.map(|name| VersionLoaderAttachment {
                 component_id: axial_minecraft::LoaderComponentId::Fabric,
                 component_name: name.to_string(),

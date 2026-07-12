@@ -8,18 +8,14 @@ use super::model::{
     DownloadError, DownloadProgress, ExecutionDownloadFact, ExecutionDownloadReport,
     ExpectedIntegrity, SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
 };
-use super::path_safety::path_is_file;
 use super::plan::TransferPlan;
 use super::runtime::{
     finish_runtime_pipeline_after_artifacts, recv_runtime_progress, spawn_runtime_ensure_pipeline,
 };
-use super::transfer::{
-    download_file_with_client_and_fact_sender,
-    download_file_with_client_and_fact_sender_allowing_missing_checksum,
-    ensure_selected_artifact_with_client,
-};
+use super::transfer::ensure_selected_artifact_with_client;
+use crate::artifact_path::validate_artifact_path_segment;
 use crate::launch::{VersionJson, resolve_version};
-use crate::manifest::{ManifestEntry, fetch_version_manifest_cached};
+use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
 use crate::paths::{assets_dir, versions_dir};
 use crate::rules::default_environment;
 use futures_util::StreamExt;
@@ -33,39 +29,56 @@ use tokio::sync::mpsc;
 pub(super) struct VersionJsonDownload {
     pub(super) url: String,
     pub(super) expected: ExpectedIntegrity,
-    pub(super) force_download: bool,
 }
 
 pub struct Downloader {
     mc_dir: PathBuf,
     client: reqwest::Client,
+    #[cfg(test)]
+    install_manifest_receipt: Option<InstallManifestReceipt>,
 }
+
+#[cfg(test)]
+#[derive(Clone)]
+struct InstallManifestReceipt(VersionManifest);
 
 impl Downloader {
     pub fn new(mc_dir: impl Into<PathBuf>) -> Self {
         Self {
             mc_dir: mc_dir.into(),
             client: standard_minecraft_download_client(),
+            #[cfg(test)]
+            install_manifest_receipt: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_install_manifest(
+        mc_dir: impl Into<PathBuf>,
+        manifest: VersionManifest,
+    ) -> Self {
+        Self {
+            mc_dir: mc_dir.into(),
+            client: standard_minecraft_download_client(),
+            install_manifest_receipt: Some(InstallManifestReceipt(manifest)),
         }
     }
 
     pub async fn install_version<F>(
         &self,
         version_id: &str,
-        manifest_url: Option<&str>,
         mut send: F,
     ) -> Result<(), DownloadError>
     where
         F: FnMut(DownloadProgress),
     {
-        self.install_version_with_fact_sender(version_id, manifest_url, &mut send, None, None)
+        self.install_version_with_fact_sender(version_id, &mut send, None, None)
             .await
     }
 
     pub async fn install_version_with_facts<F, G>(
         &self,
         version_id: &str,
-        manifest_url: Option<&str>,
         send: F,
         send_fact: G,
     ) -> Result<(), DownloadError>
@@ -73,20 +86,13 @@ impl Downloader {
         F: FnMut(DownloadProgress),
         G: FnMut(ExecutionDownloadFact),
     {
-        self.install_version_with_facts_and_descriptors(
-            version_id,
-            manifest_url,
-            send,
-            send_fact,
-            |_| {},
-        )
-        .await
+        self.install_version_with_facts_and_descriptors(version_id, send, send_fact, |_| {})
+            .await
     }
 
     pub async fn install_version_with_facts_and_descriptors<F, G, H>(
         &self,
         version_id: &str,
-        manifest_url: Option<&str>,
         mut send: F,
         mut send_fact: G,
         mut send_descriptor: H,
@@ -101,7 +107,6 @@ impl Downloader {
         let result = self
             .install_version_with_fact_sender(
                 version_id,
-                manifest_url,
                 &mut send,
                 Some(fact_tx),
                 Some(descriptor_tx),
@@ -119,7 +124,6 @@ impl Downloader {
     async fn install_version_with_fact_sender<F>(
         &self,
         version_id: &str,
-        manifest_url: Option<&str>,
         send: &mut F,
         fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
         descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
@@ -136,11 +140,13 @@ impl Downloader {
         };
 
         let install_result = async {
+            validate_install_version_id(version_id)?;
+            let version_json_download = self.resolve_manifest_download(version_id).await?;
             async_fs::create_dir_all(&version_dir).await?;
             async_fs::write(&marker_path, b"installing").await?;
             self.install_version_inner(
                 version_id,
-                manifest_url,
+                version_json_download,
                 &mut send,
                 &plan,
                 fact_tx.as_ref(),
@@ -184,7 +190,7 @@ impl Downloader {
     async fn install_version_inner<F>(
         &self,
         version_id: &str,
-        manifest_url: Option<&str>,
+        version_json_download: VersionJsonDownload,
         send: &mut F,
         plan: &Arc<TransferPlan>,
         fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
@@ -202,60 +208,15 @@ impl Downloader {
             Some(format!("{version_id}.json")),
         ));
 
-        let version_json_download =
-            if let Some(url) = manifest_url.filter(|value| !value.trim().is_empty()) {
-                VersionJsonDownload {
-                    url: url.to_string(),
-                    expected: ExpectedIntegrity::default(),
-                    force_download: true,
-                }
-            } else {
-                match self.resolve_manifest_download(version_id).await {
-                    Ok(download) => download,
-                    Err(_) if path_is_file(&json_path).await => VersionJsonDownload {
-                        url: String::new(),
-                        expected: ExpectedIntegrity::default(),
-                        force_download: false,
-                    },
-                    Err(error) => return Err(error),
-                }
-            };
-        let should_download_version_json =
-            !version_json_download.url.is_empty() && version_json_download.force_download;
-        if should_download_version_json {
-            if version_json_download.expected.sha1.is_none() {
-                download_file_with_client_and_fact_sender_allowing_missing_checksum(
-                    SelectedDownloadArtifactKind::VersionJson,
-                    &self.client,
-                    &version_json_download.url,
-                    &json_path,
-                    &version_json_download.expected,
-                    fact_tx,
-                    descriptor_tx,
-                )
-                .await?;
-            } else {
-                self.download_file(
-                    SelectedDownloadArtifactKind::VersionJson,
-                    &version_json_download.url,
-                    &json_path,
-                    &version_json_download.expected,
-                    fact_tx,
-                    descriptor_tx,
-                )
-                .await?;
-            }
-        } else if !version_json_download.url.is_empty() {
-            self.ensure_artifact(
-                SelectedDownloadArtifactKind::VersionJson,
-                &version_json_download.url,
-                &json_path,
-                &version_json_download.expected,
-                fact_tx,
-                descriptor_tx,
-            )
-            .await?;
-        }
+        self.ensure_artifact(
+            SelectedDownloadArtifactKind::VersionJson,
+            &version_json_download.url,
+            &json_path,
+            &version_json_download.expected,
+            fact_tx,
+            descriptor_tx,
+        )
+        .await?;
 
         let version = resolve_version(&self.mc_dir, version_id)
             .map_err(|error| DownloadError::ResolveManifest(error.to_string()))?;
@@ -467,7 +428,8 @@ impl Downloader {
         &self,
         version_id: &str,
     ) -> Result<VersionJsonDownload, DownloadError> {
-        let manifest = fetch_version_manifest_cached(&self.mc_dir)
+        let manifest = self
+            .fresh_install_manifest()
             .await
             .map_err(|error| DownloadError::ResolveManifest(error.to_string()))?;
         manifest
@@ -482,6 +444,15 @@ impl Downloader {
             })
     }
 
+    async fn fresh_install_manifest(&self) -> Result<VersionManifest, String> {
+        #[cfg(test)]
+        if let Some(receipt) = &self.install_manifest_receipt {
+            return Ok(receipt.0.clone());
+        }
+
+        fetch_fresh_install_version_manifest().await
+    }
+
     fn library_jobs(&self, version: &VersionJson) -> Result<Vec<DownloadJob>, DownloadError> {
         let env = default_environment();
         Ok(library_jobs_for(
@@ -490,27 +461,6 @@ impl Downloader {
             &env,
             LibraryChecksumPolicy::Strict,
         )?)
-    }
-
-    async fn download_file(
-        &self,
-        kind: SelectedDownloadArtifactKind,
-        url: &str,
-        destination: &Path,
-        expected: &ExpectedIntegrity,
-        fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-        descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-    ) -> Result<ExecutionDownloadReport, DownloadError> {
-        download_file_with_client_and_fact_sender(
-            kind,
-            &self.client,
-            url,
-            destination,
-            expected,
-            fact_tx,
-            descriptor_tx,
-        )
-        .await
     }
 
     async fn ensure_artifact(
@@ -535,13 +485,25 @@ impl Downloader {
     }
 }
 
+fn validate_install_version_id(version_id: &str) -> Result<(), DownloadError> {
+    let json_name = format!("{version_id}.json");
+    if version_id != version_id.trim()
+        || validate_artifact_path_segment(version_id).is_err()
+        || validate_artifact_path_segment(&json_name).is_err()
+    {
+        return Err(DownloadError::ResolveManifest(
+            "invalid Minecraft version identity".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn version_json_download_from_manifest_entry(
     entry: ManifestEntry,
 ) -> VersionJsonDownload {
     VersionJsonDownload {
         url: entry.url,
         expected: ExpectedIntegrity::from_sha1(&entry.sha1),
-        force_download: false,
     }
 }
 

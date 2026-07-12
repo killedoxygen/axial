@@ -421,7 +421,6 @@ where
     let mut descriptors = Vec::new();
     let result = Box::pin(downloader.install_version_with_facts_and_descriptors(
         version_id,
-        None,
         |progress| {
             if !progress.done {
                 send(progress);

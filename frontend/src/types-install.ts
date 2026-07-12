@@ -81,13 +81,16 @@ export interface InstallStartResponse {
   view_model: InstallProgressViewModel;
 }
 
-export interface InstallQueueRequest {
-  kind: 'vanilla' | 'loader';
-  version_id?: string;
-  manifest_url?: string;
-  component_id?: LoaderComponentId;
-  build_id?: string;
-}
+export type InstallQueueRequest =
+  | {
+      kind: 'vanilla';
+      version_id: string;
+    }
+  | {
+      kind: 'loader';
+      component_id: LoaderComponentId;
+      build_id: string;
+    };
 
 export interface InstallQueueLoaderItemViewModel {
   component_id: LoaderComponentId;

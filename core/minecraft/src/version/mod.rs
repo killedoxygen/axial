@@ -516,7 +516,6 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
             needs_install,
             java_component: resolved_java.component,
             java_major: resolved_java.major_version,
-            manifest_url: String::new(),
             loader,
         });
     }

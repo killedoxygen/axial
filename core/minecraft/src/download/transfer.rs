@@ -46,39 +46,6 @@ pub(super) async fn download_file_with_client(
         .map_err(ExecutionDownloadError::into_download_error)
 }
 
-pub(super) async fn download_file_with_client_and_fact_sender(
-    kind: SelectedDownloadArtifactKind,
-    client: &reqwest::Client,
-    url: &str,
-    destination: &Path,
-    expected: &ExpectedIntegrity,
-    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-) -> Result<ExecutionDownloadReport, DownloadError> {
-    let existing_corrupt = guard_existing_unsafe_selected_artifact(
-        kind,
-        destination,
-        url,
-        expected,
-        fact_tx,
-        descriptor_tx,
-    )
-    .await?;
-    download_selected_artifact_with_client(
-        SelectedArtifactDownload {
-            kind,
-            client,
-            url,
-            destination,
-            expected,
-            fact_tx,
-            descriptor_tx,
-        },
-        existing_corrupt,
-    )
-    .await
-}
-
 struct SelectedArtifactDownload<'a> {
     kind: SelectedDownloadArtifactKind,
     client: &'a reqwest::Client,
@@ -335,53 +302,6 @@ async fn checksumless_artifact_is_structurally_usable(
         return checksumless_jar_is_readable_async(destination.to_path_buf()).await;
     }
     Ok(true)
-}
-
-async fn guard_existing_unsafe_selected_artifact(
-    kind: SelectedDownloadArtifactKind,
-    destination: &Path,
-    url: &str,
-    expected: &ExpectedIntegrity,
-    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-) -> Result<Option<DownloadIntegrityError>, DownloadError> {
-    match selected_existing_artifact_integrity(kind, destination, expected).await? {
-        ExistingArtifactIntegrity::MetadataInvalid => {
-            emit_selected_metadata_failure(
-                kind,
-                destination,
-                expected,
-                fact_tx,
-                ExecutionDownloadFactKind::MetadataInvalid,
-                "sha1",
-            );
-            Err(selected_artifact_metadata_error(destination, "invalid"))
-        }
-        ExistingArtifactIntegrity::MetadataMissing => {
-            emit_selected_metadata_failure(
-                kind,
-                destination,
-                expected,
-                fact_tx,
-                ExecutionDownloadFactKind::MetadataMissing,
-                "sha1",
-            );
-            Err(selected_artifact_metadata_error(destination, "missing"))
-        }
-        ExistingArtifactIntegrity::Corrupt(error) => Ok(Some(error)),
-        ExistingArtifactIntegrity::UnsupportedExisting => {
-            emit_unsupported_selected_artifact(
-                kind,
-                destination,
-                url,
-                expected,
-                fact_tx,
-                descriptor_tx,
-            );
-            Err(unsupported_selected_artifact_error(destination))
-        }
-        ExistingArtifactIntegrity::Missing | ExistingArtifactIntegrity::Verified => Ok(None),
-    }
 }
 
 async fn selected_existing_artifact_integrity(

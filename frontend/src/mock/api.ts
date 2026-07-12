@@ -755,7 +755,6 @@ function vanillaVersion(id: string, releaseTime: string, installed: boolean): Ve
     needs_install: installed ? '' : 'client',
     java_component: 'java-runtime-delta',
     java_major: 21,
-    manifest_url: '',
     loader: null,
   };
 }

@@ -35,7 +35,7 @@ use crate::state::{
 };
 use crate::state::{AppState, ProducerLease, RequestProducerHandoff};
 use axial_minecraft::{
-    DownloadError, DownloadProgress, Downloader, LoaderComponentId,
+    DownloadError, DownloadProgress, Downloader,
     download::{ExecutionDownloadFact, SelectedDownloadArtifactDescriptor},
     resolve_build_record,
 };
@@ -237,7 +237,7 @@ use loader::start_loader_install_owned;
 #[cfg(test)]
 use loader::{
     dispatch_loader_install_failure, loader_install_done_progress, loader_install_error_progress,
-    loader_install_key_fields, wait_for_active_vanilla_base_install,
+    wait_for_active_vanilla_base_install,
 };
 pub use loader::{
     loader_builds, loader_components, loader_game_versions, loader_pre_operation_error_response,
@@ -279,7 +279,7 @@ pub(crate) async fn start_install_version_owned(
     request: InstallVersionStartRequest,
     producer: &ProducerLease,
 ) -> Result<InstallStartResponse, InstallApplicationError> {
-    let (version_id, manifest_url) = effective_install_fields(&request);
+    let version_id = effective_install_version_id(&request);
     if version_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -298,7 +298,7 @@ pub(crate) async fn start_install_version_owned(
         let candidate = generate_install_id("install");
         let (install_id, inserted) = state
             .installs()
-            .insert_or_existing_active(candidate, version_id.clone(), manifest_url.clone())
+            .insert_or_existing_vanilla(candidate, version_id.clone())
             .await;
         if inserted {
             break install_id;
@@ -321,7 +321,6 @@ pub(crate) async fn start_install_version_owned(
     let staging = stage_install_version_command(
         InstallVersionCommand {
             version_id: version_id.clone(),
-            manifest_url: (!manifest_url.is_empty()).then_some(manifest_url.clone()),
         },
         install_id.clone(),
         operation_id.clone(),
@@ -422,7 +421,6 @@ pub(crate) async fn start_install_version_owned(
                 let install_result = {
                     let install = downloader.install_version_with_facts_and_descriptors(
                         &version_id,
-                        (!manifest_url.is_empty()).then_some(manifest_url.as_str()),
                         move |progress| {
                             if progress.done {
                                 if let Ok(mut terminal_progress) =
@@ -876,13 +874,9 @@ async fn install_queue_spec_from_request(
     state: &AppState,
     request: InstallQueueRequest,
 ) -> Result<InstallQueueSpec, InstallApplicationError> {
-    match request.kind.trim() {
-        "vanilla" | "minecraft" => {
-            let (version_id, manifest_url) =
-                effective_install_fields(&InstallVersionStartRequest {
-                    version_id: request.version_id,
-                    manifest_url: request.manifest_url,
-                });
+    match request {
+        InstallQueueRequest::Vanilla { version_id } => {
+            let version_id = version_id.trim().to_string();
             if version_id.is_empty() {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -895,17 +889,13 @@ async fn install_queue_spec_from_request(
                     Json(serde_json::json!({ "error": "Axial library is not configured" })),
                 )
             })?;
-            Ok(InstallQueueSpec::vanilla(version_id, manifest_url))
+            Ok(InstallQueueSpec::vanilla(version_id))
         }
-        "loader" => {
-            let component_id =
-                LoaderComponentId::parse(request.component_id.trim()).ok_or_else(|| {
-                    (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({ "error": "unknown loader component" })),
-                    )
-                })?;
-            let build_id = request.build_id.trim().to_string();
+        InstallQueueRequest::Loader {
+            component_id,
+            build_id,
+        } => {
+            let build_id = build_id.trim().to_string();
             if build_id.is_empty() {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -933,10 +923,6 @@ async fn install_queue_spec_from_request(
                 build.loader_version,
             ))
         }
-        _ => Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "install kind is required" })),
-        )),
     }
 }
 
@@ -1004,15 +990,11 @@ async fn start_queued_install(
     producer: &ProducerLease,
 ) -> Result<InstallStartResponse, InstallApplicationError> {
     match spec {
-        InstallQueueSpec::Vanilla {
-            version_id,
-            manifest_url,
-        } => {
+        InstallQueueSpec::Vanilla { version_id } => {
             start_install_version_owned(
                 state,
                 InstallVersionStartRequest {
                     version_id: version_id.clone(),
-                    manifest_url: manifest_url.clone(),
                 },
                 producer,
             )
@@ -1362,7 +1344,7 @@ fn install_queue_kind(spec: &InstallQueueSpec) -> &'static str {
 
 fn install_queue_label(spec: &InstallQueueSpec) -> String {
     match spec {
-        InstallQueueSpec::Vanilla { version_id, .. } => {
+        InstallQueueSpec::Vanilla { version_id } => {
             if version_id.trim().is_empty() {
                 "Minecraft".to_string()
             } else {
@@ -1392,7 +1374,7 @@ fn install_queue_label(spec: &InstallQueueSpec) -> String {
 
 fn install_queue_install_item(spec: &InstallQueueSpec) -> InstallQueueInstallItemViewModel {
     match spec {
-        InstallQueueSpec::Vanilla { version_id, .. } => InstallQueueInstallItemViewModel {
+        InstallQueueSpec::Vanilla { version_id } => InstallQueueInstallItemViewModel {
             version_id: version_id.clone(),
             loader: None,
         },
@@ -1414,11 +1396,8 @@ fn install_queue_install_item(spec: &InstallQueueSpec) -> InstallQueueInstallIte
     }
 }
 
-pub(crate) fn effective_install_fields(request: &InstallVersionStartRequest) -> (String, String) {
-    (
-        request.version_id.trim().to_string(),
-        request.manifest_url.trim().to_string(),
-    )
+pub(crate) fn effective_install_version_id(request: &InstallVersionStartRequest) -> String {
+    request.version_id.trim().to_string()
 }
 
 fn install_failure_view_model(

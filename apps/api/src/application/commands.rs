@@ -269,8 +269,6 @@ pub struct CreateInstanceCommand {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstallVersionCommand {
     pub version_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

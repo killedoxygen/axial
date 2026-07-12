@@ -13,10 +13,9 @@ use axum::{
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InstallRequest {
     version_id: String,
-    #[serde(default)]
-    manifest_url: String,
 }
 
 pub fn router() -> Router<AppState> {
@@ -45,12 +44,8 @@ async fn handle_install(
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
     enqueue_install_owned(
         &state,
-        InstallQueueRequest {
-            kind: "vanilla".to_string(),
+        InstallQueueRequest::Vanilla {
             version_id: payload.version_id,
-            manifest_url: payload.manifest_url,
-            component_id: String::new(),
-            build_id: String::new(),
         },
         handoff,
     )
@@ -131,6 +126,60 @@ mod tests {
     use serde_json::Value;
     use std::{fs, path::PathBuf, sync::Arc};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn install_routes_reject_removed_and_cross_kind_fields() {
+        let fixture = RouteInstallFixture::new("install-route-strict-request-shape");
+        let requests = [
+            (
+                "/api/v1/install",
+                serde_json::json!({
+                    "version_id": "1.21.6",
+                    "manifest_url": "https://example.invalid/version.json"
+                }),
+            ),
+            (
+                "/api/v1/install/queue",
+                serde_json::json!({
+                    "kind": "vanilla",
+                    "version_id": "1.21.6",
+                    "build_id": "fabric:1.21.6:0.16.10"
+                }),
+            ),
+            (
+                "/api/v1/install/queue",
+                serde_json::json!({
+                    "kind": "loader",
+                    "component_id": "net.fabricmc.fabric-loader",
+                    "build_id": "fabric:1.21.6:0.16.10",
+                    "version_id": "1.21.6"
+                }),
+            ),
+            (
+                "/api/v1/loaders/install",
+                serde_json::json!({
+                    "component_id": "net.fabricmc.fabric-loader",
+                    "build_id": "fabric:1.21.6:0.16.10",
+                    "manifest_url": "https://example.invalid/version.json"
+                }),
+            ),
+            (
+                "/api/v1/loaders/install",
+                serde_json::json!({
+                    "component_id": "net.fabricmc.fabric-loader",
+                    "build_id": "fabric:1.21.6:0.16.10",
+                    "version_id": "1.21.6"
+                }),
+            ),
+        ];
+
+        for (path, payload) in requests {
+            let status = fixture
+                .request_status_body(Method::POST, path, payload)
+                .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
 
     #[tokio::test]
     async fn install_status_route_serializes_guardian_repair_status_payload() {
@@ -262,11 +311,7 @@ mod tests {
         fixture
             .state
             .installs()
-            .insert_or_existing_active(
-                "active-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("active-install".to_string(), "1.21.5".to_string())
             .await;
         let install_started_at_ms = fixture
             .state
@@ -279,7 +324,7 @@ mod tests {
             .installs()
             .enqueue_queued_install(
                 "queue-active".to_string(),
-                crate::state::InstallQueueSpec::vanilla("1.21.5".to_string(), String::new()),
+                crate::state::InstallQueueSpec::vanilla("1.21.5".to_string()),
                 crate::state::InstallQueuePlacement::Back,
             )
             .await;
@@ -302,8 +347,7 @@ mod tests {
                 Method::POST,
                 "/api/v1/install",
                 serde_json::json!({
-                    "version_id": "1.21.6",
-                    "manifest_url": ""
+                    "version_id": "1.21.6"
                 }),
             )
             .await;
@@ -344,8 +388,7 @@ mod tests {
                 "/api/v1/install/queue",
                 serde_json::json!({
                     "kind": "vanilla",
-                    "version_id": "1.21.6",
-                    "manifest_url": "http://127.0.0.1:9/version.json"
+                    "version_id": "1.21.6"
                 }),
             )
             .await;
@@ -407,13 +450,20 @@ mod tests {
             Self { state, root }
         }
 
+        fn router(&self) -> Router {
+            Router::new()
+                .merge(router())
+                .merge(crate::routes::loaders::router())
+                .with_state(self.state.clone())
+        }
+
         async fn request_json(&self, method: Method, uri: &str) -> (StatusCode, Value) {
             let request_lease = self
                 .state
                 .try_admit_request()
                 .expect("admit route install request");
-            let response = router()
-                .with_state(self.state.clone())
+            let response = self
+                .router()
                 .oneshot(
                     Request::builder()
                         .extension(request_lease.producer_handoff())
@@ -442,8 +492,8 @@ mod tests {
                 .state
                 .try_admit_request()
                 .expect("admit route install request");
-            let response = router()
-                .with_state(self.state.clone())
+            let response = self
+                .router()
                 .oneshot(
                     Request::builder()
                         .extension(request_lease.producer_handoff())
@@ -461,6 +511,31 @@ mod tests {
                 .expect("read body");
             let payload = serde_json::from_slice(&body).expect("json response");
             (status, payload)
+        }
+
+        async fn request_status_body(
+            &self,
+            method: Method,
+            uri: &str,
+            payload: Value,
+        ) -> StatusCode {
+            let request_lease = self
+                .state
+                .try_admit_request()
+                .expect("admit route install request");
+            self.router()
+                .oneshot(
+                    Request::builder()
+                        .extension(request_lease.producer_handoff())
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .expect("request"),
+                )
+                .await
+                .expect("route response")
+                .status()
         }
     }
 

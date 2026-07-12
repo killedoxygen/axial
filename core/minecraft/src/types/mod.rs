@@ -55,8 +55,6 @@ pub struct VersionEntry {
     pub java_component: String,
     #[serde(default)]
     pub java_major: i32,
-    #[serde(default)]
-    pub manifest_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loader: Option<VersionLoaderAttachment>,
 }

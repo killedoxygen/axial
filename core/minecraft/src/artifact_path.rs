@@ -31,6 +31,14 @@ impl ArtifactRelativePath {
     }
 }
 
+pub(crate) fn validate_artifact_path_segment(value: &str) -> Result<(), ArtifactRelativePathError> {
+    if unsafe_segment(value) {
+        Err(ArtifactRelativePathError::Unsafe)
+    } else {
+        Ok(())
+    }
+}
+
 fn canonical_relative_path(value: &str) -> Result<String, ArtifactRelativePathError> {
     if value.is_empty()
         || value.len() > MAX_ARTIFACT_RELATIVE_PATH_BYTES
@@ -92,5 +100,20 @@ mod tests {
                 Err(ArtifactRelativePathError::Unsafe)
             );
         }
+    }
+
+    #[test]
+    fn validates_single_bounded_portable_segments() {
+        assert_eq!(validate_artifact_path_segment("1.21.6"), Ok(()));
+        for value in ["", ".", "..", "../escape", "/absolute", "C:drive"] {
+            assert_eq!(
+                validate_artifact_path_segment(value),
+                Err(ArtifactRelativePathError::Unsafe)
+            );
+        }
+        assert_eq!(
+            validate_artifact_path_segment(&"a".repeat(MAX_ARTIFACT_PATH_SEGMENT_BYTES + 1)),
+            Err(ArtifactRelativePathError::Unsafe)
+        );
     }
 }

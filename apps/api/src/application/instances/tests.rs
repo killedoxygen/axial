@@ -1448,19 +1448,15 @@ async fn create_queue_failure_rolls_back_created_instance() {
     let (status, Json(body)) = super::create::queue_create_install_or_rollback(
         &fixture.state,
         &instance.id,
-        Some(crate::application::InstallQueueRequest {
-            kind: String::new(),
+        Some(crate::application::InstallQueueRequest::Vanilla {
             version_id: String::new(),
-            manifest_url: String::new(),
-            component_id: String::new(),
-            build_id: String::new(),
         }),
     )
     .await
     .expect_err("invalid staged install request should fail");
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_bounded_error_body(&body, "install kind is required");
+    assert_bounded_error_body(&body, "version_id is required");
     assert!(fixture.state.instances().get(&instance.id).is_none());
     assert!(!fixture.state.instances().game_dir(&instance.id).exists());
 }
@@ -1477,12 +1473,8 @@ async fn create_queue_failure_surfaces_compensation_persistence_failure() {
     let (status, Json(body)) = super::create::queue_create_install_or_rollback(
         &fixture.state,
         &instance.id,
-        Some(crate::application::InstallQueueRequest {
-            kind: String::new(),
+        Some(crate::application::InstallQueueRequest::Vanilla {
             version_id: String::new(),
-            manifest_url: String::new(),
-            component_id: String::new(),
-            build_id: String::new(),
         }),
     )
     .await
@@ -1823,7 +1815,7 @@ async fn create_instance_loader_version_uses_beta_build_when_only_beta_builds_ex
         .installs()
         .enqueue_queued_install(
             "busy-beta-queue".to_string(),
-            crate::state::InstallQueueSpec::vanilla("busy".to_string(), String::new()),
+            crate::state::InstallQueueSpec::vanilla("busy".to_string()),
             crate::state::InstallQueuePlacement::Back,
         )
         .await;
@@ -1875,7 +1867,7 @@ async fn create_instance_quilt_java25_default_uses_compatible_beta_fallback() {
         .installs()
         .enqueue_queued_install(
             "busy-quilt-beta-queue".to_string(),
-            crate::state::InstallQueueSpec::vanilla("busy".to_string(), String::new()),
+            crate::state::InstallQueueSpec::vanilla("busy".to_string()),
             crate::state::InstallQueuePlacement::Back,
         )
         .await;
@@ -2349,7 +2341,7 @@ async fn create_instance_vanilla_selection_returns_backend_queue_state() {
         .installs()
         .enqueue_queued_install(
             "busy-queue".to_string(),
-            crate::state::InstallQueueSpec::vanilla("busy".to_string(), String::new()),
+            crate::state::InstallQueueSpec::vanilla("busy".to_string()),
             crate::state::InstallQueuePlacement::Back,
         )
         .await;
@@ -2364,7 +2356,7 @@ async fn create_instance_vanilla_selection_returns_backend_queue_state() {
         .installs()
         .enqueue_queued_install(
             "older-pending-queue".to_string(),
-            crate::state::InstallQueueSpec::vanilla("1.20.1".to_string(), String::new()),
+            crate::state::InstallQueueSpec::vanilla("1.20.1".to_string()),
             crate::state::InstallQueuePlacement::Back,
         )
         .await;
@@ -2497,7 +2489,7 @@ async fn create_instance_loader_selection_resolves_cached_build_and_queues_backe
         .installs()
         .enqueue_queued_install(
             "busy-loader-queue".to_string(),
-            crate::state::InstallQueueSpec::vanilla("busy".to_string(), String::new()),
+            crate::state::InstallQueueSpec::vanilla("busy".to_string()),
             crate::state::InstallQueuePlacement::Back,
         )
         .await;
@@ -2932,7 +2924,6 @@ fn installed_loader_entry(build: &axial_minecraft::LoaderBuildRecord) -> Version
         needs_install: String::new(),
         java_component: String::new(),
         java_major: 0,
-        manifest_url: String::new(),
         loader: Some(axial_minecraft::VersionLoaderAttachment {
             component_id: build.component_id,
             component_name: build.component_name.clone(),

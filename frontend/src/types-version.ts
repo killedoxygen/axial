@@ -52,7 +52,6 @@ export interface Version {
   needs_install?: string;
   java_component?: string;
   java_major?: number;
-  manifest_url?: string;
   loader?: VersionLoaderAttachment | null;
 }
 

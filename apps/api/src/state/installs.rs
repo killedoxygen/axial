@@ -77,7 +77,6 @@ impl InstallProgressRecord {
 pub enum InstallQueueSpec {
     Vanilla {
         version_id: String,
-        manifest_url: String,
     },
     Loader {
         component_id: LoaderComponentId,
@@ -89,10 +88,9 @@ pub enum InstallQueueSpec {
 }
 
 impl InstallQueueSpec {
-    pub fn vanilla(version_id: String, manifest_url: String) -> Self {
+    pub fn vanilla(version_id: String) -> Self {
         Self::Vanilla {
             version_id: version_id.trim().to_string(),
-            manifest_url: manifest_url.trim().to_string(),
         }
     }
 
@@ -170,20 +168,14 @@ struct InstallQueueInner {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct InstallKey {
-    scope: String,
-    version_id: String,
-    manifest_url: String,
-}
-
-impl InstallKey {
-    fn new(scope: String, version_id: String, manifest_url: String) -> Self {
-        Self {
-            scope: scope.trim().to_string(),
-            version_id: version_id.trim().to_string(),
-            manifest_url: manifest_url.trim().to_string(),
-        }
-    }
+enum InstallKey {
+    Vanilla {
+        version_id: String,
+    },
+    Loader {
+        component_id: LoaderComponentId,
+        build_id: String,
+    },
 }
 
 pub struct InstallStore {
@@ -203,29 +195,37 @@ impl InstallStore {
         self.insert_entry(install_id, None).await;
     }
 
-    pub async fn insert_or_existing_active(
+    pub async fn insert_or_existing_vanilla(
         &self,
         install_id: String,
         version_id: String,
-        manifest_url: String,
     ) -> (String, bool) {
-        self.insert_or_existing_active_scoped(
-            "vanilla".to_string(),
+        self.insert_with_identity(
             install_id,
-            version_id,
-            manifest_url,
+            InstallKey::Vanilla {
+                version_id: version_id.trim().to_string(),
+            },
         )
         .await
     }
 
-    pub async fn insert_or_existing_active_scoped(
+    pub async fn insert_or_existing_loader(
         &self,
-        scope: String,
         install_id: String,
-        version_id: String,
-        manifest_url: String,
+        component_id: LoaderComponentId,
+        build_id: String,
     ) -> (String, bool) {
-        let key = InstallKey::new(scope, version_id, manifest_url);
+        self.insert_with_identity(
+            install_id,
+            InstallKey::Loader {
+                component_id,
+                build_id: build_id.trim().to_string(),
+            },
+        )
+        .await
+    }
+
+    async fn insert_with_identity(&self, install_id: String, key: InstallKey) -> (String, bool) {
         let mut installs = self.installs.write().await;
         prune_done_entries(&mut installs);
         if let Some(existing_id) = installs.iter().find_map(|(existing_id, entry)| {
@@ -521,12 +521,7 @@ impl InstallStore {
             .map(|entry| entry.started_at_ms)
     }
 
-    pub async fn active_install_for_scope_and_version(
-        &self,
-        scope: &str,
-        version_id: &str,
-    ) -> Option<String> {
-        let scope = scope.trim();
+    pub async fn active_vanilla_install(&self, version_id: &str) -> Option<String> {
         let version_id = version_id.trim();
         self.installs
             .read()
@@ -534,8 +529,14 @@ impl InstallStore {
             .iter()
             .find_map(|(install_id, entry)| {
                 let key = entry.key.as_ref()?;
-                (!entry.done && key.scope == scope && key.version_id == version_id)
-                    .then(|| install_id.clone())
+                (!entry.done
+                    && matches!(
+                        key,
+                        InstallKey::Vanilla {
+                            version_id: existing_version_id
+                        } if existing_version_id == version_id
+                    ))
+                .then(|| install_id.clone())
             })
     }
 
@@ -729,18 +730,10 @@ mod tests {
     async fn install_insert_or_existing_reuses_active_matching_key() {
         let store = InstallStore::new();
         let (first_id, first_inserted) = store
-            .insert_or_existing_active(
-                "first-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("first-install".to_string(), "1.21.5".to_string())
             .await;
         let (second_id, second_inserted) = store
-            .insert_or_existing_active(
-                "second-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("second-install".to_string(), "1.21.5".to_string())
             .await;
 
         assert_eq!(first_id, "first-install");
@@ -776,18 +769,10 @@ mod tests {
     async fn install_insert_or_existing_prunes_done_entries_and_reuses_active_match() {
         let store = InstallStore::new();
         store
-            .insert_or_existing_active(
-                "done-install".to_string(),
-                "1.21.4".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("done-install".to_string(), "1.21.4".to_string())
             .await;
         store
-            .insert_or_existing_active(
-                "active-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("active-install".to_string(), "1.21.5".to_string())
             .await;
         store.emit("done-install", done_progress()).await;
         let (snapshot, _) = store
@@ -798,10 +783,9 @@ mod tests {
         assert_eq!(latest_phase(&snapshot), Some("done"));
 
         let (install_id, inserted) = store
-            .insert_or_existing_active(
+            .insert_or_existing_vanilla(
                 "duplicate-active-install".to_string(),
                 "1.21.5".to_string(),
-                String::new(),
             )
             .await;
 
@@ -821,19 +805,11 @@ mod tests {
     async fn install_insert_or_existing_trims_matching_key_fields() {
         let store = InstallStore::new();
         store
-            .insert_or_existing_active(
-                "trimmed-install".to_string(),
-                " 1.21.5 ".to_string(),
-                " https://example.invalid/manifest.json ".to_string(),
-            )
+            .insert_or_existing_vanilla("trimmed-install".to_string(), " 1.21.5 ".to_string())
             .await;
 
         let (install_id, inserted) = store
-            .insert_or_existing_active(
-                "duplicate-install".to_string(),
-                "1.21.5".to_string(),
-                "https://example.invalid/manifest.json".to_string(),
-            )
+            .insert_or_existing_vanilla("duplicate-install".to_string(), "1.21.5".to_string())
             .await;
 
         assert_eq!(install_id, "trimmed-install");
@@ -844,11 +820,7 @@ mod tests {
     async fn install_insert_or_existing_allows_fresh_install_after_done() {
         let store = InstallStore::new();
         store
-            .insert_or_existing_active(
-                "done-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("done-install".to_string(), "1.21.5".to_string())
             .await;
         store.emit("done-install", done_progress()).await;
         let (snapshot, _) = store
@@ -859,11 +831,7 @@ mod tests {
         assert_eq!(latest_phase(&snapshot), Some("done"));
 
         let (install_id, inserted) = store
-            .insert_or_existing_active(
-                "fresh-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("fresh-install".to_string(), "1.21.5".to_string())
             .await;
 
         assert_eq!(install_id, "fresh-install");
@@ -877,20 +845,12 @@ mod tests {
     async fn install_insert_or_existing_allows_fresh_install_after_remove() {
         let store = InstallStore::new();
         store
-            .insert_or_existing_active(
-                "removed-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("removed-install".to_string(), "1.21.5".to_string())
             .await;
         store.remove("removed-install").await;
 
         let (install_id, inserted) = store
-            .insert_or_existing_active(
-                "fresh-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("fresh-install".to_string(), "1.21.5".to_string())
             .await;
 
         assert_eq!(install_id, "fresh-install");
@@ -902,11 +862,7 @@ mod tests {
     async fn finish_if_active_marks_session_done_and_allows_fresh_retry() {
         let store = InstallStore::new();
         store
-            .insert_or_existing_active(
-                "interrupted-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("interrupted-install".to_string(), "1.21.5".to_string())
             .await;
 
         assert!(
@@ -917,11 +873,7 @@ mod tests {
         assert_eq!(store.active_install_count().await, 0);
 
         let (install_id, inserted) = store
-            .insert_or_existing_active(
-                "fresh-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("fresh-install".to_string(), "1.21.5".to_string())
             .await;
 
         assert_eq!(install_id, "fresh-install");
@@ -1014,7 +966,7 @@ mod tests {
     #[tokio::test]
     async fn release_active_queued_install_to_front_restores_pending_item() {
         let store = InstallStore::new();
-        let spec = InstallQueueSpec::vanilla("1.21.5".to_string(), String::new());
+        let spec = InstallQueueSpec::vanilla("1.21.5".to_string());
         store
             .enqueue_queued_install(
                 "queue-install".to_string(),
@@ -1044,13 +996,9 @@ mod tests {
     #[tokio::test]
     async fn mark_queued_install_started_copies_install_session_start_time() {
         let store = InstallStore::new();
-        let spec = InstallQueueSpec::vanilla("1.21.5".to_string(), String::new());
+        let spec = InstallQueueSpec::vanilla("1.21.5".to_string());
         store
-            .insert_or_existing_active(
-                "active-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("active-install".to_string(), "1.21.5".to_string())
             .await;
         let install_started_at_ms = store
             .install_started_at_ms("active-install")
@@ -1085,11 +1033,7 @@ mod tests {
     async fn tracked_worker_finishes_active_session_after_panic() {
         let store = Arc::new(InstallStore::new());
         store
-            .insert_or_existing_active(
-                "panic-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("panic-install".to_string(), "1.21.5".to_string())
             .await;
 
         InstallStore::spawn_tracked_worker(
@@ -1110,11 +1054,7 @@ mod tests {
     async fn tracked_worker_finishes_active_session_after_early_return() {
         let store = Arc::new(InstallStore::new());
         store
-            .insert_or_existing_active(
-                "early-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("early-install".to_string(), "1.21.5".to_string())
             .await;
 
         InstallStore::spawn_tracked_worker(
@@ -1133,11 +1073,7 @@ mod tests {
     async fn tracked_worker_interruption_handler_runs_only_for_active_finish() {
         let store = Arc::new(InstallStore::new());
         store
-            .insert_or_existing_active(
-                "early-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("early-install".to_string(), "1.21.5".to_string())
             .await;
         let interrupted = Arc::new(std::sync::Mutex::new(None));
         let interrupted_capture = interrupted.clone();
@@ -1181,11 +1117,7 @@ mod tests {
     async fn duplicate_install_waits_for_initialization_and_observes_removal() {
         let store = Arc::new(InstallStore::new());
         let (install_id, inserted) = store
-            .insert_or_existing_active(
-                "initializing-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("initializing-install".to_string(), "1.21.5".to_string())
             .await;
         assert!(inserted);
         let waiting_store = store.clone();
@@ -1198,11 +1130,7 @@ mod tests {
         assert!(waiting.await.expect("initialization waiter"));
 
         let (removed_id, inserted) = store
-            .insert_or_existing_active(
-                "removed-initialization".to_string(),
-                "1.21.6".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("removed-initialization".to_string(), "1.21.6".to_string())
             .await;
         assert!(inserted);
         let removed_store = store.clone();
@@ -1257,19 +1185,11 @@ mod tests {
     async fn install_insert_or_existing_keeps_different_versions_independent() {
         let store = InstallStore::new();
         store
-            .insert_or_existing_active(
-                "first-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("first-install".to_string(), "1.21.5".to_string())
             .await;
 
         let (install_id, inserted) = store
-            .insert_or_existing_active(
-                "second-install".to_string(),
-                "1.21.6".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("second-install".to_string(), "1.21.6".to_string())
             .await;
 
         assert_eq!(install_id, "second-install");
@@ -1278,63 +1198,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_insert_or_existing_keeps_manifest_urls_independent() {
+    async fn install_identities_keep_vanilla_and_loader_work_independent() {
         let store = InstallStore::new();
         store
-            .insert_or_existing_active(
-                "normal-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
-            .await;
-
-        let (explicit_id, explicit_inserted) = store
-            .insert_or_existing_active(
-                "explicit-install".to_string(),
-                "1.21.5".to_string(),
-                "https://example.invalid/manifest.json".to_string(),
-            )
-            .await;
-        let (duplicate_explicit_id, duplicate_explicit_inserted) = store
-            .insert_or_existing_active(
-                "duplicate-explicit-install".to_string(),
-                "1.21.5".to_string(),
-                "https://example.invalid/manifest.json".to_string(),
-            )
-            .await;
-
-        assert_eq!(explicit_id, "explicit-install");
-        assert!(explicit_inserted);
-        assert_eq!(duplicate_explicit_id, "explicit-install");
-        assert!(!duplicate_explicit_inserted);
-        assert_eq!(store.active_install_count().await, 2);
-    }
-
-    #[tokio::test]
-    async fn install_insert_or_existing_keeps_scopes_independent() {
-        let store = InstallStore::new();
-        store
-            .insert_or_existing_active(
-                "vanilla-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("vanilla-install".to_string(), "1.21.5".to_string())
             .await;
 
         let (loader_id, loader_inserted) = store
-            .insert_or_existing_active_scoped(
-                "loader".to_string(),
+            .insert_or_existing_loader(
                 "loader-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
+                LoaderComponentId::Fabric,
+                "fabric:1.21.5:0.16.10".to_string(),
             )
             .await;
         let (duplicate_loader_id, duplicate_loader_inserted) = store
-            .insert_or_existing_active_scoped(
-                " loader ".to_string(),
+            .insert_or_existing_loader(
                 "duplicate-loader-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
+                LoaderComponentId::Fabric,
+                " fabric:1.21.5:0.16.10 ".to_string(),
             )
             .await;
 
@@ -1348,7 +1229,7 @@ mod tests {
     #[tokio::test]
     async fn install_queue_dedupes_and_moves_retry_to_front() {
         let store = InstallStore::new();
-        let first = InstallQueueSpec::vanilla("1.21.5".to_string(), String::new());
+        let first = InstallQueueSpec::vanilla("1.21.5".to_string());
         let second = InstallQueueSpec::loader(
             LoaderComponentId::Fabric,
             "fabric:1.21.6:0.16.10".to_string(),
@@ -1431,86 +1312,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_install_for_scope_and_version_finds_active_vanilla_by_version() {
+    async fn active_vanilla_install_finds_only_vanilla_identity_by_version() {
         let store = InstallStore::new();
         store
-            .insert_or_existing_active(
-                "vanilla-install".to_string(),
-                "1.21.5".to_string(),
-                "https://example.invalid/manifest.json".to_string(),
-            )
+            .insert_or_existing_vanilla("vanilla-install".to_string(), "1.21.5".to_string())
             .await;
         store
-            .insert_or_existing_active_scoped(
-                "loader".to_string(),
+            .insert_or_existing_loader(
                 "loader-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
+                LoaderComponentId::Fabric,
+                "fabric:1.21.5:0.16.10".to_string(),
             )
             .await;
 
         assert_eq!(
-            store
-                .active_install_for_scope_and_version(" vanilla ", " 1.21.5 ")
-                .await,
+            store.active_vanilla_install(" 1.21.5 ").await,
             Some("vanilla-install".to_string())
         );
     }
 
     #[tokio::test]
-    async fn active_install_for_scope_and_version_ignores_done_removed_and_failed_sessions() {
+    async fn active_vanilla_install_ignores_done_removed_and_failed_sessions() {
         let store = InstallStore::new();
         store
-            .insert_or_existing_active(
-                "done-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("done-install".to_string(), "1.21.5".to_string())
             .await;
         store.emit("done-install", done_progress()).await;
-        assert_eq!(
-            store
-                .active_install_for_scope_and_version("vanilla", "1.21.5")
-                .await,
-            None
-        );
+        assert_eq!(store.active_vanilla_install("1.21.5").await, None);
 
         store
-            .insert_or_existing_active(
-                "failed-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("failed-install".to_string(), "1.21.5".to_string())
             .await;
         store.emit("failed-install", failed_progress()).await;
-        assert_eq!(
-            store
-                .active_install_for_scope_and_version("vanilla", "1.21.5")
-                .await,
-            None
-        );
+        assert_eq!(store.active_vanilla_install("1.21.5").await, None);
 
         store
-            .insert_or_existing_active(
-                "removed-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("removed-install".to_string(), "1.21.5".to_string())
             .await;
         store.remove("removed-install").await;
-        assert_eq!(
-            store
-                .active_install_for_scope_and_version("vanilla", "1.21.5")
-                .await,
-            None
-        );
+        assert_eq!(store.active_vanilla_install("1.21.5").await, None);
 
         let (install_id, inserted) = store
-            .insert_or_existing_active(
-                "fresh-install".to_string(),
-                "1.21.5".to_string(),
-                String::new(),
-            )
+            .insert_or_existing_vanilla("fresh-install".to_string(), "1.21.5".to_string())
             .await;
 
         assert_eq!(install_id, "fresh-install");

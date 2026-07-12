@@ -73,6 +73,10 @@ pub async fn fetch_version_manifest() -> Result<VersionManifest, String> {
     Ok(manifest)
 }
 
+pub(crate) async fn fetch_fresh_install_version_manifest() -> Result<VersionManifest, String> {
+    fetch_manifest_live().await
+}
+
 pub async fn fetch_version_manifest_cached(library_dir: &Path) -> Result<VersionManifest, String> {
     let cache_path = version_manifest_cache_path(library_dir);
 
@@ -155,15 +159,26 @@ async fn fetch_manifest_live() -> Result<VersionManifest, String> {
 }
 
 async fn fetch_manifest_live_body() -> Result<Vec<u8>, String> {
-    fetch_manifest_live_body_from_url(MANIFEST_URL).await
+    fetch_manifest_live_body_with_policy(MANIFEST_URL, true).await
 }
 
+#[cfg(test)]
 async fn fetch_manifest_live_body_from_url(url: &str) -> Result<Vec<u8>, String> {
+    fetch_manifest_live_body_with_policy(url, false).await
+}
+
+async fn fetch_manifest_live_body_with_policy(
+    url: &str,
+    require_https: bool,
+) -> Result<Vec<u8>, String> {
     let response = manifest_client()
         .get(url)
         .send()
         .await
         .map_err(|error| format!("fetching version manifest: {error}"))?;
+    if require_https && response.url().scheme() != "https" {
+        return Err("fetching version manifest: insecure redirect".to_string());
+    }
     let status = response.status();
     if !status.is_success() {
         return Err(format!("fetching version manifest: HTTP {status}"));

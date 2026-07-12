@@ -18,6 +18,7 @@ struct LoaderBuildQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LoaderInstallRequest {
     component_id: String,
     build_id: String,
@@ -81,11 +82,8 @@ async fn handle_loader_install(
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
     enqueue_install_owned(
         &state,
-        InstallQueueRequest {
-            kind: "loader".to_string(),
-            version_id: String::new(),
-            manifest_url: String::new(),
-            component_id: payload.component_id,
+        InstallQueueRequest::Loader {
+            component_id: parse_component_id(&payload.component_id)?,
             build_id: payload.build_id,
         },
         handoff,
