@@ -18,9 +18,17 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
-pub struct DownloadJob {
+pub(crate) struct DownloadJob {
+    pub(crate) path: PathBuf,
+    pub(crate) url: String,
+    pub(crate) name: String,
+    pub(crate) expected: ExpectedIntegrity,
+    pub(crate) allow_missing_checksum: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryVerificationPlan {
     pub path: PathBuf,
-    pub url: String,
     pub name: String,
     pub expected: ExpectedIntegrity,
     pub allow_missing_checksum: bool,
@@ -49,6 +57,15 @@ pub(crate) struct LibraryArtifactPlan {
 }
 
 impl LibraryArtifactPlan {
+    fn into_verification_plan(self, mc_dir: &Path) -> LibraryVerificationPlan {
+        LibraryVerificationPlan {
+            path: self.relative_path.join_under(&libraries_dir(mc_dir)),
+            name: self.name,
+            expected: self.expected,
+            allow_missing_checksum: self.allow_missing_checksum,
+        }
+    }
+
     fn into_download_job(self, mc_dir: &Path) -> Result<DownloadJob, LibraryPlanError> {
         let url = self
             .source_url
@@ -374,7 +391,7 @@ fn native_classifier_candidates(lib: &Library, os_name: &str, os_arch: &str) -> 
     candidates
 }
 
-pub fn library_jobs_for(
+pub(crate) fn library_jobs_for(
     mc_dir: &Path,
     libraries: &[Library],
     env: &Environment,
@@ -384,6 +401,18 @@ pub fn library_jobs_for(
         .into_iter()
         .map(|plan| plan.into_download_job(mc_dir))
         .collect()
+}
+
+pub fn library_verification_plans_for(
+    mc_dir: &Path,
+    libraries: &[Library],
+    env: &Environment,
+    checksum_policy: LibraryChecksumPolicy,
+) -> Result<Vec<LibraryVerificationPlan>, LibraryPlanError> {
+    Ok(library_artifact_plans_for(libraries, env, checksum_policy)?
+        .into_iter()
+        .map(|plan| plan.into_verification_plan(mc_dir))
+        .collect())
 }
 
 pub(crate) fn library_artifact_plans_for(

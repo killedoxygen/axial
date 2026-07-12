@@ -2,7 +2,7 @@ use crate::GuardianMode;
 use crate::build::find_client_jar;
 use axial_minecraft::download::{
     ExpectedIntegrity, LauncherManagedArtifactReadiness, LibraryChecksumPolicy,
-    asset_object_hash_prefix, jar_contains_signed_metadata, library_jobs_for,
+    asset_object_hash_prefix, jar_contains_signed_metadata, library_verification_plans_for,
     verify_existing_launcher_managed_artifact,
     verify_existing_launcher_managed_artifact_allowing_missing_checksum,
 };
@@ -216,14 +216,14 @@ fn inspect_version_files(
     } else {
         LibraryChecksumPolicy::Strict
     };
-    let planned_library_jobs = library_jobs_for(
+    let planned_libraries = library_verification_plans_for(
         library_dir,
         &version.libraries,
         &default_environment(),
         checksum_policy,
     );
-    let library_planning_failed = planned_library_jobs.is_err();
-    let library_jobs: Vec<ArtifactVerificationJob> = planned_library_jobs
+    let library_planning_failed = planned_libraries.is_err();
+    let library_jobs: Vec<ArtifactVerificationJob> = planned_libraries
         .unwrap_or_default()
         .into_iter()
         .map(|library| ArtifactVerificationJob {
@@ -1012,6 +1012,77 @@ mod tests {
         assert!(readiness.reasons.iter().any(|reason| {
             reason.id == LaunchReadinessReasonId::LibrariesCorrupt
                 && reason.severity == LaunchReadinessSeverity::Blocking
+        }));
+        cleanup(&library_dir);
+    }
+
+    #[test]
+    fn url_less_library_is_verified_for_launch_readiness() {
+        let library_dir = temp_library("url-less-library-ready");
+        let client = b"client";
+        let library = b"library";
+        write_version_json(
+            &library_dir,
+            "1.21.1",
+            &format!(
+                r#"{{
+                    "id": "1.21.1",
+                    "type": "release",
+                    "mainClass": "net.minecraft.client.main.Main",
+                    "assetIndex": {{}},
+                    "downloads": {{
+                        "client": {{ "sha1": "{}", "size": {} }}
+                    }},
+                    "javaVersion": {{
+                        "component": "java-runtime-delta",
+                        "majorVersion": 21
+                    }},
+                    "libraries": [{{
+                        "name": "com.example:offline:1.0.0",
+                        "downloads": {{
+                            "artifact": {{
+                                "path": "com/example/offline/1.0.0/offline-1.0.0.jar",
+                                "url": "",
+                                "sha1": "{}",
+                                "size": {}
+                            }}
+                        }}
+                    }}]
+                }}"#,
+                sha1_hex(client),
+                client.len(),
+                sha1_hex(library),
+                library.len()
+            ),
+        );
+        fs::write(
+            library_dir
+                .join("versions")
+                .join("1.21.1")
+                .join("1.21.1.jar"),
+            client,
+        )
+        .expect("write client jar");
+        let library_path = library_dir
+            .join("libraries")
+            .join("com/example/offline/1.0.0/offline-1.0.0.jar");
+        fs::create_dir_all(library_path.parent().expect("library parent")).expect("library dir");
+        fs::write(&library_path, library).expect("write library");
+
+        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
+            library_dir: library_dir.clone(),
+            version_id: "1.21.1".to_string(),
+            requested_java: String::new(),
+            guardian_mode: GuardianMode::Managed,
+        });
+
+        assert!(readiness.launchable, "{:?}", readiness.reasons);
+        assert!(!readiness.reasons.iter().any(|reason| {
+            matches!(
+                reason.id,
+                LaunchReadinessReasonId::LibrariesMissing
+                    | LaunchReadinessReasonId::LibrariesCorrupt
+            )
         }));
         cleanup(&library_dir);
     }

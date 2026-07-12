@@ -10,7 +10,7 @@ use super::integrity::{
     download_size_mismatch, existing_asset_object_satisfies, existing_file_satisfies, hash_file,
     observe_hash_file_calls, verify_download_integrity,
 };
-use super::libraries::library_jobs_for;
+use super::libraries::{library_jobs_for, library_verification_plans_for};
 use super::model::{ActualIntegrity, DownloadIntegrityError};
 use super::path_safety::{
     bounded_download_file_label, safe_download_target_label, windows_verbatim_path_string,
@@ -619,7 +619,7 @@ fn library_planning_rejects_unsafe_applicable_path() {
         ..Library::default()
     };
 
-    let error = library_jobs_for(
+    let error = library_verification_plans_for(
         Path::new("/tmp/axial-test"),
         &[lib],
         &crate::rules::default_environment(),
@@ -631,7 +631,7 @@ fn library_planning_rejects_unsafe_applicable_path() {
 }
 
 #[test]
-fn url_less_library_is_inventory_visible_but_not_downloadable() {
+fn url_less_library_is_inventory_and_verification_visible_but_not_downloadable() {
     let path = "org/example/offline/1.0.0/offline-1.0.0.jar";
     let lib = Library {
         name: "org.example:offline:1.0.0".to_string(),
@@ -656,6 +656,19 @@ fn url_less_library_is_inventory_visible_but_not_downloadable() {
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].relative_path.as_str(), path);
     assert_eq!(plans[0].source_url, None);
+
+    let verification_plans = library_verification_plans_for(
+        Path::new("/tmp/axial-test"),
+        std::slice::from_ref(&lib),
+        &env,
+        LibraryChecksumPolicy::Strict,
+    )
+    .expect("verification plan");
+    assert_eq!(verification_plans.len(), 1);
+    assert_eq!(
+        verification_plans[0].path,
+        Path::new("/tmp/axial-test").join("libraries").join(path)
+    );
 
     let error = library_jobs_for(
         Path::new("/tmp/axial-test"),

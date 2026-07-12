@@ -22,12 +22,14 @@ pub use integrity::{
     jar_contains_signed_metadata,
     verify_existing_launcher_managed_artifact_allowing_missing_checksum,
 };
+#[cfg(test)]
+pub(crate) use libraries::DownloadJob;
+pub(crate) use libraries::{LibraryArtifactPlan, library_artifact_plans_for, library_jobs_for};
 pub use libraries::{
-    DownloadJob, LibraryChecksumPolicy, download_libraries,
+    LibraryChecksumPolicy, LibraryVerificationPlan, download_libraries,
     download_libraries_allowing_missing_checksums_with_facts_and_descriptors,
-    download_libraries_with_facts_and_descriptors, library_jobs_for,
+    download_libraries_with_facts_and_descriptors, library_verification_plans_for,
 };
-pub(crate) use libraries::{LibraryArtifactPlan, library_artifact_plans_for};
 pub use model::{
     DownloadError, DownloadProgress, ExecutionDownloadError, ExecutionDownloadFact,
     ExecutionDownloadFactKind, ExecutionDownloadOwnership, ExecutionDownloadReport,

@@ -16,7 +16,7 @@ use crate::runtime::{
     plan_runtime_manifest_files, preferred_runtime_component,
 };
 use sha1::{Digest as _, Sha1};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
 pub const MAX_KNOWN_GOOD_RELATIVE_PATH_BYTES: usize = MAX_ARTIFACT_RELATIVE_PATH_BYTES;
@@ -195,9 +195,11 @@ pub enum KnownGoodInstallShape<'a> {
     },
     Fabric {
         record: &'a LoaderBuildRecord,
+        profile_libraries: &'a [Library],
     },
     Quilt {
         record: &'a LoaderBuildRecord,
+        profile_libraries: &'a [Library],
     },
     Forge {
         record: &'a LoaderBuildRecord,
@@ -213,8 +215,8 @@ impl<'a> KnownGoodInstallShape<'a> {
     fn loader_record(&self) -> Option<&'a LoaderBuildRecord> {
         match self {
             Self::Vanilla { .. } => None,
-            Self::Fabric { record }
-            | Self::Quilt { record }
+            Self::Fabric { record, .. }
+            | Self::Quilt { record, .. }
             | Self::Forge { record, .. }
             | Self::NeoForge { record, .. } => Some(record),
         }
@@ -231,6 +233,26 @@ impl<'a> KnownGoodInstallShape<'a> {
                 ..
             } => installer_libraries,
             _ => &[],
+        }
+    }
+
+    fn structural_libraries(&self) -> &'a [Library] {
+        match self {
+            Self::Fabric {
+                profile_libraries, ..
+            }
+            | Self::Quilt {
+                profile_libraries, ..
+            } => profile_libraries,
+            Self::Forge {
+                installer_libraries,
+                ..
+            }
+            | Self::NeoForge {
+                installer_libraries,
+                ..
+            } => installer_libraries,
+            Self::Vanilla { .. } => &[],
         }
     }
 
@@ -275,6 +297,7 @@ pub enum KnownGoodInventoryError {
     InputTooLarge,
     InvalidLibraryPlan,
     ConflictingEntry,
+    ConflictingRuntimePath,
     TooManyEntries,
 }
 
@@ -309,34 +332,40 @@ pub fn derive_known_good_inventory(
         )?,
     })?;
 
-    let checksum_policy = if input.shape.loader_record().is_some() {
-        LibraryChecksumPolicy::AllowMissing
-    } else {
-        LibraryChecksumPolicy::Strict
-    };
     if input
         .resolved_version
         .libraries
         .len()
         .saturating_add(input.shape.installer_libraries().len())
+        .saturating_add(input.shape.structural_libraries().len())
         > MAX_KNOWN_GOOD_ENTRIES
     {
         return Err(KnownGoodInventoryError::InputTooLarge);
     }
+    let structural_paths = library_artifact_plans_for(
+        input.shape.structural_libraries(),
+        input.environment,
+        LibraryChecksumPolicy::AllowMissing,
+    )
+    .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?
+    .into_iter()
+    .filter(|plan| plan.expected.sha1.is_none())
+    .map(|plan| plan.relative_path.as_str().to_string())
+    .collect::<BTreeSet<_>>();
     let libraries = library_artifact_plans_for(
         &input.resolved_version.libraries,
         input.environment,
-        checksum_policy,
+        LibraryChecksumPolicy::Strict,
     )
     .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-    add_library_plans(&mut builder, libraries)?;
+    add_library_plans(&mut builder, libraries, &structural_paths)?;
     let installer_libraries = library_artifact_plans_for(
         input.shape.installer_libraries(),
         input.environment,
-        checksum_policy,
+        LibraryChecksumPolicy::Strict,
     )
     .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-    add_library_plans(&mut builder, installer_libraries)?;
+    add_library_plans(&mut builder, installer_libraries, &structural_paths)?;
 
     if let Some(logging) = input
         .resolved_version
@@ -440,11 +469,15 @@ fn loader_strategy_matches(component: LoaderComponentId, strategy: LoaderInstall
 fn add_library_plans(
     builder: &mut InventoryBuilder,
     plans: Vec<LibraryArtifactPlan>,
+    structural_paths: &BTreeSet<String>,
 ) -> Result<(), KnownGoodInventoryError> {
     for plan in plans {
         let path = KnownGoodRelativePath::new(plan.relative_path.as_str())?;
-        let integrity =
-            expected_integrity(&plan.expected, plan.allow_missing_checksum, path.as_str())?;
+        let integrity = expected_integrity(
+            &plan.expected,
+            structural_paths.contains(path.as_str()),
+            path.as_str(),
+        )?;
         builder.insert(KnownGoodEntry {
             root: KnownGoodRoot::Libraries,
             path,
@@ -521,30 +554,30 @@ fn add_runtime(
     let root = KnownGoodRoot::ManagedRuntime {
         component: KnownGoodId::new(input.component.as_str())?,
     };
-    builder.insert(KnownGoodEntry {
+    let mut entries = vec![KnownGoodEntry {
         root: root.clone(),
         path: KnownGoodRelativePath::new(COMPONENT_MANIFEST_PROOF_FILE)?,
         kind: KnownGoodArtifactKind::RuntimeManifestProof,
         integrity: exact_bytes_integrity(&manifest_proof),
-    })?;
-    builder.insert(KnownGoodEntry {
+    }];
+    entries.push(KnownGoodEntry {
         root: root.clone(),
         path: KnownGoodRelativePath::new(".axial-ready")?,
         kind: KnownGoodArtifactKind::RuntimeReadyMarker,
         integrity: exact_bytes_integrity(b"ready"),
-    })?;
+    });
 
     let plan = plan_runtime_manifest_files(manifest.files);
     if plan.file_entries.is_empty() {
         return Err(KnownGoodInventoryError::MissingRuntimeDownload);
     }
     for (path, _) in plan.directory_entries {
-        builder.insert(KnownGoodEntry {
+        entries.push(KnownGoodEntry {
             root: root.clone(),
             path: KnownGoodRelativePath::new(&path)?,
             kind: KnownGoodArtifactKind::RuntimeDirectory,
             integrity: KnownGoodIntegrity::Directory,
-        })?;
+        });
     }
     for (path, file) in plan.file_entries {
         let raw = file
@@ -555,7 +588,7 @@ fn add_runtime(
             size: raw.size,
             sha1: raw.sha1,
         };
-        builder.insert(KnownGoodEntry {
+        entries.push(KnownGoodEntry {
             root: root.clone(),
             path: KnownGoodRelativePath::new(&path)?,
             kind: if file.executable {
@@ -564,21 +597,50 @@ fn add_runtime(
                 KnownGoodArtifactKind::RuntimeFile
             },
             integrity: expected_integrity(&expected, false, &path)?,
-        })?;
+        });
     }
     for (path, file) in plan.link_entries {
         let target = file
             .target
             .ok_or(KnownGoodInventoryError::UnsupportedRuntimeEntry)?;
-        builder.insert(KnownGoodEntry {
+        entries.push(KnownGoodEntry {
             root: root.clone(),
             path: KnownGoodRelativePath::new(&path)?,
             kind: KnownGoodArtifactKind::RuntimeLink,
             integrity: KnownGoodIntegrity::LinkTarget(KnownGoodLinkTarget::new(&path, &target)?),
-        })?;
+        });
     }
     if !plan.other_entries.is_empty() {
         return Err(KnownGoodInventoryError::UnsupportedRuntimeEntry);
+    }
+    validate_runtime_path_tree(&entries)?;
+    for entry in entries {
+        builder.insert(entry)?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_path_tree(entries: &[KnownGoodEntry]) -> Result<(), KnownGoodInventoryError> {
+    let mut entries_by_path = BTreeMap::new();
+    for entry in entries {
+        let key = (&entry.root, entry.path.as_str());
+        if let Some(existing) = entries_by_path.insert(key, entry)
+            && existing != entry
+        {
+            return Err(KnownGoodInventoryError::ConflictingRuntimePath);
+        }
+    }
+
+    for entry in entries {
+        for (separator, _) in entry.path.as_str().match_indices('/') {
+            let ancestor_path = &entry.path.as_str()[..separator];
+            if entries_by_path
+                .get(&(&entry.root, ancestor_path))
+                .is_some_and(|ancestor| ancestor.integrity != KnownGoodIntegrity::Directory)
+            {
+                return Err(KnownGoodInventoryError::ConflictingRuntimePath);
+            }
+        }
     }
     Ok(())
 }
@@ -954,6 +1016,61 @@ mod tests {
     }
 
     #[test]
+    fn runtime_path_tree_allows_directory_ancestor() {
+        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
+            runtime_directory_entry("bin"),
+            runtime_file_entry("bin/java"),
+        ]));
+
+        let inventory = derive_known_good_inventory(fixture.input()).expect("valid runtime tree");
+
+        assert_entry(
+            &inventory,
+            &runtime_root(),
+            "bin",
+            KnownGoodArtifactKind::RuntimeDirectory,
+            &KnownGoodIntegrity::Directory,
+        );
+        assert!(has_kind(&inventory, KnownGoodArtifactKind::RuntimeFile));
+    }
+
+    #[test]
+    fn runtime_path_tree_rejects_file_ancestor() {
+        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
+            runtime_file_entry("bin"),
+            runtime_file_entry("bin/java"),
+        ]));
+
+        let error = derive_known_good_inventory(fixture.input()).expect_err("file ancestor");
+        assert_eq!(error, KnownGoodInventoryError::ConflictingRuntimePath);
+    }
+
+    #[test]
+    fn runtime_path_tree_rejects_link_ancestor() {
+        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
+            runtime_link_entry("bin", "java"),
+            runtime_file_entry("bin/java"),
+        ]));
+
+        let error = derive_known_good_inventory(fixture.input()).expect_err("link ancestor");
+        assert_eq!(error, KnownGoodInventoryError::ConflictingRuntimePath);
+    }
+
+    #[test]
+    fn runtime_path_tree_rejects_incompatible_exact_path() {
+        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[runtime_file_entry(
+            ".axial-ready",
+        )]));
+
+        let error = derive_known_good_inventory(fixture.input()).expect_err("reserved path");
+        assert_eq!(error, KnownGoodInventoryError::ConflictingRuntimePath);
+    }
+
+    #[test]
     fn asset_objects_deduplicate_by_content_address() {
         let fixture = fixture(FixtureShape::Vanilla, false);
         let inventory = derive_known_good_inventory(fixture.input()).unwrap();
@@ -975,6 +1092,22 @@ mod tests {
             .push(checksumless_loader_library());
 
         let error = derive_known_good_inventory(fixture.input()).expect_err("missing checksum");
+        assert_eq!(error, KnownGoodInventoryError::MissingChecksum);
+    }
+
+    #[test]
+    fn loader_shape_does_not_authorize_checksumless_base_library() {
+        let mut fixture = fixture(FixtureShape::Fabric, false);
+        fixture.version.libraries[0]
+            .downloads
+            .as_mut()
+            .and_then(|downloads| downloads.artifact.as_mut())
+            .expect("base library artifact")
+            .sha1
+            .clear();
+
+        let error = derive_known_good_inventory(fixture.input())
+            .expect_err("checksumless base library must remain strict");
         assert_eq!(error, KnownGoodInventoryError::MissingChecksum);
     }
 
@@ -1188,6 +1321,7 @@ mod tests {
         runtime_id: RuntimeId,
         shape: FixtureShape,
         loader_record: Option<LoaderBuildRecord>,
+        profile_libraries: Vec<Library>,
         installer_libraries: Vec<Library>,
         environment: Environment,
     }
@@ -1201,9 +1335,11 @@ mod tests {
                 },
                 FixtureShape::Fabric => KnownGoodInstallShape::Fabric {
                     record: record.expect("fabric record"),
+                    profile_libraries: &self.profile_libraries,
                 },
                 FixtureShape::Quilt => KnownGoodInstallShape::Quilt {
                     record: record.expect("quilt record"),
+                    profile_libraries: &self.profile_libraries,
                 },
                 FixtureShape::Forge => KnownGoodInstallShape::Forge {
                     record: record.expect("forge record"),
@@ -1226,6 +1362,11 @@ mod tests {
                 environment: &self.environment,
             }
         }
+
+        fn replace_runtime_manifest(&mut self, bytes: Vec<u8>) {
+            self.runtime_manifest_expected = expected_for(&bytes);
+            self.runtime_manifest_bytes = bytes;
+        }
     }
 
     fn fixture(shape: FixtureShape, shuffled: bool) -> Fixture {
@@ -1240,11 +1381,30 @@ mod tests {
             SHA_A,
             10,
         )];
-        if shape.component().is_some() {
+        let profile_libraries = matches!(shape, FixtureShape::Fabric | FixtureShape::Quilt)
+            .then(|| vec![checksumless_loader_library()])
+            .unwrap_or_default();
+        let mut installer_libraries =
+            if matches!(shape, FixtureShape::Forge | FixtureShape::NeoForge) {
+                vec![
+                    checksum_library(
+                        "net.example:installer-only:1.0",
+                        "net/example/installer-only/1.0/installer-only-1.0.jar",
+                        SHA_C,
+                        30,
+                    ),
+                    checksumless_loader_library(),
+                ]
+            } else {
+                Vec::new()
+            };
+        libraries.extend(profile_libraries.iter().cloned());
+        if matches!(shape, FixtureShape::Forge | FixtureShape::NeoForge) {
             libraries.push(checksumless_loader_library());
         }
         if shuffled {
             libraries.reverse();
+            installer_libraries.reverse();
         }
         let version = VersionJson {
             id: "fixture-version".to_string(),
@@ -1296,16 +1456,6 @@ mod tests {
         let loader_record = shape
             .component()
             .map(|component| loader_record(shape, component));
-        let installer_libraries = if matches!(shape, FixtureShape::Forge | FixtureShape::NeoForge) {
-            vec![checksum_library(
-                "net.example:installer-only:1.0",
-                "net/example/installer-only/1.0/installer-only-1.0.jar",
-                SHA_C,
-                30,
-            )]
-        } else {
-            Vec::new()
-        };
         Fixture {
             version,
             version_manifest: ManifestEntry {
@@ -1323,6 +1473,7 @@ mod tests {
             runtime_id: RuntimeId::from("java-runtime-delta"),
             shape,
             loader_record,
+            profile_libraries,
             installer_libraries,
             environment: Environment {
                 os_name: "linux".to_string(),
@@ -1392,17 +1543,39 @@ mod tests {
     }
 
     fn runtime_manifest_bytes(shuffled: bool) -> Vec<u8> {
-        let executable = format!(
-            r#""bin/java":{{"type":"file","executable":true,"downloads":{{"raw":{{"url":"https://example.invalid/java","sha1":"{SHA_B}","size":20}},"lzma":{{"url":"https://example.invalid/java.lzma","sha1":"{SHA_C}","size":10}}}}}}"#
-        );
-        let directory = r#""bin":{"type":"directory"}"#;
-        let link = r#""java-link":{"type":"link","target":"./bin/../bin/java"}"#;
+        let executable = runtime_executable_entry("bin/java");
+        let directory = runtime_directory_entry("bin");
+        let link = runtime_link_entry("java-link", "./bin/../bin/java");
         let files = if shuffled {
             format!("{link},{executable},{directory}")
         } else {
             format!("{directory},{executable},{link}")
         };
         format!(r#"{{"files":{{{files}}}}}"#).into_bytes()
+    }
+
+    fn runtime_manifest_with_entries(entries: &[String]) -> Vec<u8> {
+        format!(r#"{{"files":{{{}}}}}"#, entries.join(",")).into_bytes()
+    }
+
+    fn runtime_directory_entry(path: &str) -> String {
+        format!(r#""{path}":{{"type":"directory"}}"#)
+    }
+
+    fn runtime_file_entry(path: &str) -> String {
+        format!(
+            r#""{path}":{{"type":"file","downloads":{{"raw":{{"url":"https://example.invalid/file","sha1":"{SHA_B}","size":20}}}}}}"#
+        )
+    }
+
+    fn runtime_executable_entry(path: &str) -> String {
+        format!(
+            r#""{path}":{{"type":"file","executable":true,"downloads":{{"raw":{{"url":"https://example.invalid/java","sha1":"{SHA_B}","size":20}},"lzma":{{"url":"https://example.invalid/java.lzma","sha1":"{SHA_C}","size":10}}}}}}"#
+        )
+    }
+
+    fn runtime_link_entry(path: &str, target: &str) -> String {
+        format!(r#""{path}":{{"type":"link","target":"{target}"}}"#)
     }
 
     fn expected_for(bytes: &[u8]) -> ExpectedIntegrity {
