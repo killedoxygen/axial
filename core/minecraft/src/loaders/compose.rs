@@ -1,5 +1,6 @@
 use crate::download::{
-    ExpectedIntegrity, LauncherManagedArtifactReadiness, verify_existing_launcher_managed_artifact,
+    ExpectedIntegrity, LauncherManagedArtifactReadiness,
+    promote_launcher_managed_artifact_temp_once, verify_existing_launcher_managed_artifact,
 };
 use crate::launch::{
     ArgumentsSection, AssetIndex, Downloads, JavaVersion, Library, LoggingConf, VersionJson,
@@ -8,8 +9,11 @@ use crate::launch::{
 use crate::paths::versions_dir;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs as async_fs;
+use tokio::io::AsyncWriteExt;
 
 use super::types::LoaderError;
 use super::validate_version_id;
@@ -164,12 +168,11 @@ pub async fn write_composed_version(
             "composed loader profile identity does not match its install target".to_string(),
         ));
     }
-    let version_dir = versions_dir(mc_dir).join(version_id);
-    async_fs::create_dir_all(&version_dir).await?;
+    let version_dir = prepare_managed_version_dir(mc_dir, version_id)?;
     let marker = version_dir.join(".incomplete");
-    async_fs::write(&marker, b"installing").await?;
-    async_fs::write(
-        version_dir.join(format!("{version_id}.json")),
+    write_exact_managed_version_artifact(&marker, b"installing").await?;
+    write_exact_managed_version_artifact(
+        &version_dir.join(format!("{version_id}.json")),
         version_bytes,
     )
     .await?;
@@ -177,9 +180,96 @@ pub async fn write_composed_version(
     Ok(())
 }
 
-pub fn finalize_version_install(mc_dir: &Path, version_id: &str) -> Result<(), LoaderError> {
+pub(crate) async fn write_exact_managed_version_artifact(
+    path: &Path,
+    source_bytes: &[u8],
+) -> Result<(), LoaderError> {
+    let temp_path = managed_artifact_temp_path(path);
+    let mut output = async_fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .await?;
+    if let Err(error) = async {
+        output.write_all(source_bytes).await?;
+        output.flush().await?;
+        output.sync_all().await
+    }
+    .await
+    {
+        drop(output);
+        let _ = async_fs::remove_file(&temp_path).await;
+        return Err(LoaderError::Io(error));
+    }
+    drop(output);
+    if async_fs::read(&temp_path).await? != source_bytes {
+        let _ = async_fs::remove_file(&temp_path).await;
+        return Err(LoaderError::Verify(
+            "temporary loader artifact differs from authenticated source bytes".to_string(),
+        ));
+    }
+    if let Err(error) = promote_launcher_managed_artifact_temp_once(&temp_path, path).await {
+        let _ = async_fs::remove_file(&temp_path).await;
+        return Err(LoaderError::Io(error));
+    }
+    if async_fs::read(path).await? != source_bytes {
+        let _ = async_fs::remove_file(path).await;
+        return Err(LoaderError::Verify(
+            "installed loader artifact differs from authenticated source bytes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn managed_artifact_temp_path(path: &Path) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    path.with_extension(format!("tmp-{}-{nanos:x}", std::process::id()))
+}
+
+pub(crate) fn prepare_managed_version_dir(
+    mc_dir: &Path,
+    version_id: &str,
+) -> Result<PathBuf, LoaderError> {
     validate_version_id(version_id, "installed loader version id")?;
-    let version_dir = versions_dir(mc_dir).join(version_id);
+    require_exact_directory(mc_dir, "minecraft root")?;
+    let versions = versions_dir(mc_dir);
+    create_exact_directory_if_missing(&versions, "versions root")?;
+    let version_dir = versions.join(version_id);
+    create_exact_directory_if_missing(&version_dir, "managed version directory")?;
+    Ok(version_dir)
+}
+
+fn create_exact_directory_if_missing(path: &Path, label: &str) -> Result<(), LoaderError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => require_directory_metadata(metadata, label),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path)?;
+            require_exact_directory(path, label)
+        }
+        Err(error) => Err(LoaderError::Io(error)),
+    }
+}
+
+fn require_exact_directory(path: &Path, label: &str) -> Result<(), LoaderError> {
+    let metadata = fs::symlink_metadata(path)?;
+    require_directory_metadata(metadata, label)
+}
+
+fn require_directory_metadata(metadata: fs::Metadata, label: &str) -> Result<(), LoaderError> {
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        Ok(())
+    } else {
+        Err(LoaderError::Verify(format!(
+            "{label} is not an exact managed directory"
+        )))
+    }
+}
+
+pub fn finalize_version_install(mc_dir: &Path, version_id: &str) -> Result<(), LoaderError> {
+    let version_dir = prepare_managed_version_dir(mc_dir, version_id)?;
     let marker = version_dir.join(".incomplete");
     if marker.exists() {
         let _ = fs::remove_file(marker);
@@ -281,7 +371,8 @@ async fn link_or_copy_base_jar(
 mod tests {
     use super::{
         LoaderProfileFragment, cleanup_incomplete_version,
-        compose_loader_version_from_installed_base, write_composed_version,
+        compose_loader_version_from_installed_base, prepare_managed_version_dir,
+        write_composed_version,
     };
     use crate::LoaderError;
     use crate::download::ExpectedIntegrity;
@@ -303,6 +394,26 @@ mod tests {
         }"#;
         let fragment = serde_json::from_str::<LoaderProfileFragment>(json).expect("fragment");
         assert!(fragment.asset_index.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_version_directory_rejects_symlinked_versions_root() {
+        let root = temp_dir("symlinked-versions-root");
+        let outside = temp_dir("symlinked-versions-outside");
+        fs::create_dir_all(&root).expect("minecraft root");
+        fs::create_dir_all(&outside).expect("outside root");
+        std::os::unix::fs::symlink(&outside, root.join("versions")).expect("symlink versions root");
+
+        let error = prepare_managed_version_dir(&root, "managed-child")
+            .expect_err("symlinked versions root must fail");
+
+        assert!(
+            matches!(error, LoaderError::Verify(message) if message.contains("exact managed directory"))
+        );
+        assert_eq!(fs::read_dir(&outside).expect("outside root").count(), 0);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
     }
 
     #[test]

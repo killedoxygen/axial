@@ -41,7 +41,7 @@ where
         LoaderInstallStrategy::ForgeEarliestLegacy => {
             Box::pin(forge_earliest_legacy::install(library_dir, plan, &mut send))
                 .await
-                .map(|version_id| LoaderInstallOutcome::PendingAuthority { version_id })
+                .map(|receipt| LoaderInstallOutcome::KnownGood(Box::new(receipt)))
         }
         LoaderInstallStrategy::NeoForgeModern => {
             Box::pin(neoforge_modern::install(library_dir, plan, &mut send))

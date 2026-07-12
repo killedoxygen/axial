@@ -8,7 +8,8 @@ use crate::known_good::KnownGoodInstallReceipt;
 use crate::launch::{DownloadEntry, VersionJson, library_merge_key, resolve_version};
 use crate::loaders::compose::{
     LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
-    compose_loader_version_from_installed_base, finalize_version_install, write_composed_version,
+    compose_loader_version_from_installed_base, finalize_version_install,
+    prepare_managed_version_dir, write_composed_version, write_exact_managed_version_artifact,
 };
 use crate::loaders::forge_installer::{
     ExtractedForgeInstaller, extract_installer, extract_maven_entries,
@@ -28,17 +29,23 @@ use crate::profiles::ensure_launcher_profiles;
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{Read, Write, sink};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs as async_fs;
 use zip::ZipArchive;
 use zip::ZipWriter;
-use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
 
 const MAX_INSTALLER_DOWNLOAD_SIZE: u64 = 50 << 20;
+const MAX_SOURCE_SHA1_PROOF_BYTES: u64 = 128;
+const MAX_LEGACY_OVERLAY_ENTRIES: usize = 65_536;
+const MAX_LEGACY_OVERLAY_ENTRY_BYTES: u64 = 64 << 20;
+const MAX_LEGACY_OVERLAY_PAYLOAD_BYTES: u64 = 256 << 20;
+const MAX_LEGACY_OVERLAY_NAME_BYTES: usize = 16 << 20;
+const MAX_LEGACY_OVERLAY_OVERHEAD_BYTES: usize = 16 << 20;
+const MAX_LEGACY_OVERLAY_OUTPUT_BYTES: usize = 272 << 20;
 const LOADER_METADATA_FILE: &str = ".axial-loader.json";
 
 // Profile-source loaders ship a ready version JSON and then download its libraries.
@@ -362,7 +369,7 @@ pub async fn install_from_legacy_archive<F>(
     plan: &LoaderInstallPlan,
     archive_url: &str,
     send: &mut F,
-) -> Result<String, LoaderError>
+) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
@@ -372,15 +379,11 @@ where
         send,
     ))
     .await?;
-    let authenticated_client = base_receipt
-        .authenticated_client_integrity()
-        .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
-    drop(base_receipt);
     Box::pin(install_legacy_archive_after_authenticated_base(
         library_dir,
         plan,
         archive_url,
-        &authenticated_client,
+        &base_receipt,
         send,
     ))
     .await
@@ -390,9 +393,9 @@ async fn install_legacy_archive_after_authenticated_base<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
     archive_url: &str,
-    authenticated_client: &ExpectedIntegrity,
+    base_receipt: &KnownGoodInstallReceipt,
     send: &mut F,
-) -> Result<String, LoaderError>
+) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
@@ -408,56 +411,55 @@ where
         )),
     ));
     let archive_data = download_to_memory(archive_url).await?;
-    if let Err(error) = validate_legacy_archive(&archive_data) {
-        return Err(legacy_archive_error(&plan.record.component_name, error));
-    }
+    authenticate_legacy_archive_source(archive_url, &archive_data).await?;
 
-    let fragment = LoaderProfileFragment {
-        id: plan.record.version_id.clone(),
-        ..LoaderProfileFragment::default()
-    };
-    let version = compose_loader_version_from_installed_base(
-        library_dir,
-        &plan.record.minecraft_version,
-        &plan.record.version_id,
-        &fragment,
-    )?;
+    let base_client_path = versions_dir(library_dir)
+        .join(&plan.record.minecraft_version)
+        .join(format!("{}.jar", plan.record.minecraft_version));
+    let base_client_bytes = async_fs::read(&base_client_path).await?;
+    base_receipt
+        .authenticate_client_bytes(&base_client_bytes)
+        .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
+    let child_client_bytes =
+        overlay_legacy_archive_bytes_blocking(base_client_bytes, archive_data).await?;
+
+    let mut version = base_receipt.effective_version().clone();
+    version.id = plan.record.version_id.clone();
+    version.inherits_from = plan.record.minecraft_version.clone();
+    version.materialized = true;
+    let client = version.downloads.client.as_mut().ok_or_else(|| {
+        LoaderError::Verify("authenticated base version has no client download".to_string())
+    })?;
+    client.sha1 = format!("{:x}", Sha1::digest(&child_client_bytes));
+    client.size = i64::try_from(child_client_bytes.len())
+        .map_err(|_| LoaderError::Verify("legacy client is too large".to_string()))?;
+    client.url.clear();
     let version_bytes = serde_json::to_vec_pretty(&version)?;
+    let loader_metadata_bytes = installed_loader_metadata_bytes(&plan.record)?;
+    let receipt = KnownGoodInstallReceipt::from_verified_legacy_archive_source(
+        base_receipt,
+        &plan.record,
+        version,
+        &version_bytes,
+        &child_client_bytes,
+        &loader_metadata_bytes,
+    )
+    .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
+
+    let version_dir = prepare_managed_version_dir(library_dir, &plan.record.version_id)?;
     cleanup_on_error(
-        write_composed_version(
-            library_dir,
+        write_legacy_archive_install_effects(
+            &version_dir,
             &plan.record.version_id,
-            &version,
             &version_bytes,
-            &plan.record.minecraft_version,
-            authenticated_client,
+            &child_client_bytes,
+            &loader_metadata_bytes,
         )
         .await,
         library_dir,
         &plan.record.version_id,
     )?;
 
-    cleanup_on_error(
-        overlay_legacy_archive_onto_base_client(
-            library_dir,
-            &plan.record.minecraft_version,
-            &plan.record.version_id,
-            archive_data,
-        )
-        .await,
-        library_dir,
-        &plan.record.version_id,
-    )?;
-    cleanup_on_error(
-        write_patched_client_jar_integrity(library_dir, &plan.record.version_id).await,
-        library_dir,
-        &plan.record.version_id,
-    )?;
-    cleanup_on_error(
-        write_installed_loader_metadata(library_dir, &plan.record.version_id, &plan.record).await,
-        library_dir,
-        &plan.record.version_id,
-    )?;
     cleanup_on_error(
         verify_install(library_dir, &plan.record.version_id),
         library_dir,
@@ -474,7 +476,7 @@ where
         &plan.record.version_id,
     )?;
     send(done());
-    Ok(plan.record.version_id.clone())
+    Ok(receipt)
 }
 
 async fn ensure_base_version<F>(
@@ -623,16 +625,39 @@ async fn write_installed_loader_metadata_bytes(
     version_id: &str,
     metadata: &[u8],
 ) -> Result<(), LoaderError> {
-    validate_version_id(version_id, "installed loader version id")?;
-    let path = versions_dir(library_dir)
-        .join(version_id)
-        .join(LOADER_METADATA_FILE);
-    async_fs::write(path, metadata).await?;
-    Ok(())
+    let path = prepare_managed_version_dir(library_dir, version_id)?.join(LOADER_METADATA_FILE);
+    write_exact_managed_version_artifact(&path, metadata).await
 }
 
 async fn download_to_memory(url: &str) -> Result<Vec<u8>, LoaderError> {
     fetch_bytes(url, MAX_INSTALLER_DOWNLOAD_SIZE).await
+}
+
+async fn authenticate_legacy_archive_source(
+    archive_url: &str,
+    archive_bytes: &[u8],
+) -> Result<(), LoaderError> {
+    let proof_url = format!("{archive_url}.sha1");
+    let proof_bytes = fetch_bytes(&proof_url, MAX_SOURCE_SHA1_PROOF_BYTES).await?;
+    let proof = std::str::from_utf8(&proof_bytes)
+        .map_err(|_| legacy_archive_proof_error("is not UTF-8"))?
+        .trim();
+    if proof.len() != 40 || !proof.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(legacy_archive_proof_error(
+            "must contain exactly one 40-hex digest",
+        ));
+    }
+    let actual = format!("{:x}", Sha1::digest(archive_bytes));
+    if !proof.eq_ignore_ascii_case(&actual) {
+        return Err(LoaderError::Verify(
+            "legacy Forge archive does not match its live sha1 proof".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn legacy_archive_proof_error(reason: &str) -> LoaderError {
+    LoaderError::InvalidProfile(format!("legacy Forge archive sha1 proof {reason}"))
 }
 
 fn parse_profile_json(
@@ -746,15 +771,6 @@ fn enrich_library_integrity(
     Ok(())
 }
 
-fn validate_legacy_archive(bytes: &[u8]) -> Result<(), ZipError> {
-    let mut archive = ZipArchive::new(std::io::Cursor::new(bytes))?;
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
-        std::io::copy(&mut entry, &mut sink()).map_err(ZipError::Io)?;
-    }
-    Ok(())
-}
-
 async fn extract_installer_blocking(
     installer_data: Vec<u8>,
     component_name: String,
@@ -782,29 +798,41 @@ async fn extract_maven_entries_blocking(
     .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
 }
 
-async fn overlay_legacy_archive_onto_base_client(
-    library_dir: &Path,
-    base_version_id: &str,
-    version_id: &str,
+async fn overlay_legacy_archive_bytes_blocking(
+    base_client_bytes: Vec<u8>,
     archive_data: Vec<u8>,
-) -> Result<(), LoaderError> {
-    validate_version_id(base_version_id, "base minecraft version id")?;
-    validate_version_id(version_id, "installed loader version id")?;
-    let base_jar = versions_dir(library_dir)
-        .join(base_version_id)
-        .join(format!("{base_version_id}.jar"));
-    let output_jar = versions_dir(library_dir)
-        .join(version_id)
-        .join(format!("{version_id}.jar"));
-    let temp_jar = artifact_tmp_path(&output_jar);
-    let blocking_temp_jar = temp_jar.clone();
+) -> Result<Vec<u8>, LoaderError> {
     tokio::task::spawn_blocking(move || {
-        overlay_legacy_archive_blocking(&base_jar, &blocking_temp_jar, &archive_data)
+        overlay_legacy_archive_bytes(&base_client_bytes, &archive_data)
     })
     .await
-    .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))??;
-    async_fs::rename(&temp_jar, &output_jar).await?;
-    Ok(())
+    .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
+}
+
+async fn write_legacy_archive_install_effects(
+    version_dir: &Path,
+    version_id: &str,
+    version_bytes: &[u8],
+    child_client_bytes: &[u8],
+    loader_metadata_bytes: &[u8],
+) -> Result<(), LoaderError> {
+    validate_version_id(version_id, "installed loader version id")?;
+    write_exact_managed_version_artifact(&version_dir.join(".incomplete"), b"installing").await?;
+    write_exact_managed_version_artifact(
+        &version_dir.join(format!("{version_id}.json")),
+        version_bytes,
+    )
+    .await?;
+    write_exact_managed_version_artifact(
+        &version_dir.join(format!("{version_id}.jar")),
+        child_client_bytes,
+    )
+    .await?;
+    write_exact_managed_version_artifact(
+        &version_dir.join(LOADER_METADATA_FILE),
+        loader_metadata_bytes,
+    )
+    .await
 }
 
 async fn write_patched_client_jar_integrity(
@@ -887,48 +915,156 @@ fn strip_zip_metadata_blocking(source_jar: &Path, temp_jar: &Path) -> Result<(),
     Ok(())
 }
 
-fn overlay_legacy_archive_blocking(
-    base_jar: &Path,
-    temp_jar: &Path,
+fn overlay_legacy_archive_bytes(
+    base_client_bytes: &[u8],
     archive_data: &[u8],
-) -> Result<(), LoaderError> {
-    if let Some(parent) = temp_jar.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let base_file = File::open(base_jar)?;
-    let mut base_archive = ZipArchive::new(base_file)
+) -> Result<Vec<u8>, LoaderError> {
+    let mut base_archive = ZipArchive::new(std::io::Cursor::new(base_client_bytes))
         .map_err(|error| legacy_archive_error("base Minecraft", error))?;
     let mut forge_archive = ZipArchive::new(std::io::Cursor::new(archive_data))
         .map_err(|error| legacy_archive_error("Forge", error))?;
-    let forge_names = archive_entry_names(&mut forge_archive)?;
-    let output_file = File::create(temp_jar)?;
-    let mut writer = ZipWriter::new(output_file);
+    let forge_names = legacy_overlay_entry_names(&mut forge_archive)?;
+    let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let mut budget = LegacyOverlayBudget::default();
 
-    copy_zip_entries(&mut base_archive, &mut writer, Some(&forge_names))?;
+    copy_legacy_overlay_entries(
+        &mut base_archive,
+        &mut writer,
+        Some(&forge_names),
+        &mut budget,
+    )?;
     let mut forge_archive = ZipArchive::new(std::io::Cursor::new(archive_data))
         .map_err(|error| legacy_archive_error("Forge", error))?;
-    copy_zip_entries(&mut forge_archive, &mut writer, None)?;
-    writer
+    copy_legacy_overlay_entries(&mut forge_archive, &mut writer, None, &mut budget)?;
+    let output = writer
         .finish()
+        .map(|cursor| cursor.into_inner())
         .map_err(|error| legacy_archive_error("legacy Forge overlay", error))?;
-    Ok(())
+    if output.len() > MAX_LEGACY_OVERLAY_OUTPUT_BYTES {
+        return Err(legacy_overlay_limit_error());
+    }
+    Ok(output)
 }
 
-fn archive_entry_names<R: std::io::Read + std::io::Seek>(
+fn legacy_overlay_entry_names<R: std::io::Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
 ) -> Result<HashSet<String>, LoaderError> {
     let mut names = HashSet::new();
+    let mut name_bytes = 0usize;
     for index in 0..archive.len() {
         let entry = archive
             .by_index(index)
             .map_err(|error| legacy_archive_error("Forge", error))?;
+        if index >= MAX_LEGACY_OVERLAY_ENTRIES {
+            return Err(legacy_overlay_limit_error());
+        }
+        name_bytes = name_bytes
+            .checked_add(entry.name().len())
+            .ok_or_else(legacy_overlay_limit_error)?;
+        if name_bytes > MAX_LEGACY_OVERLAY_NAME_BYTES {
+            return Err(legacy_overlay_limit_error());
+        }
         if legacy_archive_entry_is_skipped(entry.name()) {
             continue;
         }
         names.insert(entry.name().to_string());
     }
     Ok(names)
+}
+
+#[derive(Default)]
+struct LegacyOverlayBudget {
+    entries: usize,
+    payload_bytes: u64,
+    name_bytes: usize,
+    output_overhead_bytes: usize,
+}
+
+impl LegacyOverlayBudget {
+    fn reserve(&mut self, name: &str, size: u64) -> Result<(), LoaderError> {
+        if size > MAX_LEGACY_OVERLAY_ENTRY_BYTES {
+            return Err(legacy_overlay_limit_error());
+        }
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .ok_or_else(legacy_overlay_limit_error)?;
+        self.payload_bytes = self
+            .payload_bytes
+            .checked_add(size)
+            .ok_or_else(legacy_overlay_limit_error)?;
+        self.name_bytes = self
+            .name_bytes
+            .checked_add(name.len())
+            .ok_or_else(legacy_overlay_limit_error)?;
+        self.output_overhead_bytes = self
+            .output_overhead_bytes
+            .checked_add(
+                name.len()
+                    .checked_mul(2)
+                    .and_then(|bytes| bytes.checked_add(256))
+                    .ok_or_else(legacy_overlay_limit_error)?,
+            )
+            .ok_or_else(legacy_overlay_limit_error)?;
+        if self.entries > MAX_LEGACY_OVERLAY_ENTRIES
+            || self.payload_bytes > MAX_LEGACY_OVERLAY_PAYLOAD_BYTES
+            || self.name_bytes > MAX_LEGACY_OVERLAY_NAME_BYTES
+            || self.output_overhead_bytes > MAX_LEGACY_OVERLAY_OVERHEAD_BYTES
+        {
+            return Err(legacy_overlay_limit_error());
+        }
+        Ok(())
+    }
+}
+
+fn copy_legacy_overlay_entries<
+    R: std::io::Read + std::io::Seek,
+    W: std::io::Write + std::io::Seek,
+>(
+    archive: &mut ZipArchive<R>,
+    writer: &mut ZipWriter<W>,
+    replaced_names: Option<&HashSet<String>>,
+    budget: &mut LegacyOverlayBudget,
+) -> Result<(), LoaderError> {
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| legacy_archive_error("legacy Forge", error))?;
+        let name = entry.name().to_string();
+        if legacy_archive_entry_is_skipped(&name)
+            || replaced_names.is_some_and(|names| names.contains(&name))
+        {
+            continue;
+        }
+        budget.reserve(&name, entry.size())?;
+        if entry.is_dir() || name.ends_with('/') {
+            writer
+                .add_directory(&name, SimpleFileOptions::default())
+                .map_err(|error| legacy_archive_error("legacy Forge overlay", error))?;
+            continue;
+        }
+
+        let expected_size = entry.size();
+        let capacity = usize::try_from(expected_size).map_err(|_| legacy_overlay_limit_error())?;
+        let mut bytes = Vec::with_capacity(capacity);
+        entry
+            .by_ref()
+            .take(expected_size.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(LoaderError::Io)?;
+        if bytes.len() as u64 != expected_size {
+            return Err(legacy_overlay_limit_error());
+        }
+        writer
+            .start_file(&name, SimpleFileOptions::default())
+            .map_err(|error| legacy_archive_error("legacy Forge overlay", error))?;
+        writer.write_all(&bytes).map_err(LoaderError::Io)?;
+    }
+    Ok(())
+}
+
+fn legacy_overlay_limit_error() -> LoaderError {
+    LoaderError::InvalidProfile("legacy Forge overlay exceeds bounded output limits".to_string())
 }
 
 fn copy_zip_entries<R: std::io::Read + std::io::Seek, W: std::io::Write + std::io::Seek>(
@@ -1022,15 +1158,18 @@ mod tests {
         download_loader_libraries_with_evidence, download_profile_loader_libraries_with_evidence,
         ensure_base_version, install_from_installer_source, install_from_legacy_archive,
         install_from_profile_source, install_installer_source_after_authenticated_base,
-        install_legacy_archive_after_authenticated_base, strip_child_client_jar_meta,
-        validate_and_enrich_profile_source, write_patched_client_jar_integrity,
+        install_legacy_archive_after_authenticated_base, overlay_legacy_archive_bytes,
+        strip_child_client_jar_meta, validate_and_enrich_profile_source,
+        write_patched_client_jar_integrity,
     };
     use crate::download::{
         DownloadProgress, ExecutionDownloadFactKind, ExpectedIntegrity,
         SelectedDownloadArtifactKind,
     };
+    use crate::known_good::{KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity};
     use crate::launch::{
         AssetIndex, Downloads, JavaVersion, Library, LibraryArtifact, LibraryDownload, LoggingConf,
+        resolve_version,
     };
     use crate::loaders::compose::LoaderProfileFragment;
     use crate::loaders::providers::{ProfileInstallProof, ProfileLibraryProof};
@@ -1042,6 +1181,7 @@ mod tests {
     };
     use crate::loaders::{build_id_for, installed_version_id_for, validate_version_id};
     use crate::paths::versions_dir;
+    use crate::rules::default_environment;
     use sha1::{Digest as _, Sha1};
     use std::collections::HashMap;
     use std::fs;
@@ -1760,7 +1900,7 @@ mod tests {
             ("com/example/Replaced.class", b"forge".as_slice()),
             ("META-INF/TEST.SF", b"signature".as_slice()),
         ]);
-        let server = TestByteServer::start(forge_archive);
+        let server = TestByteServer::start_with_sha1(forge_archive.clone());
         let mut record = legacy_archive_record();
         record.minecraft_version = base_version_id.to_string();
         canonicalize_record_identity(&mut record);
@@ -1769,17 +1909,18 @@ mod tests {
             stage_dir: root.join("stage"),
         };
 
-        let installed_version_id = install_legacy_archive_after_authenticated_base(
+        let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
+        let receipt = install_legacy_archive_after_authenticated_base(
             &root,
             &plan,
             &server.url,
-            &test_client_integrity(&root, &record.minecraft_version),
+            &base_receipt,
             &mut |_progress| {},
         )
         .await
         .expect("install legacy archive");
 
-        assert_eq!(installed_version_id, record.version_id);
+        assert_eq!(receipt.version_id(), record.version_id);
         let installed_jar = versions_dir(&root)
             .join(&record.version_id)
             .join(format!("{}.jar", record.version_id));
@@ -1797,6 +1938,26 @@ mod tests {
         );
         assert!(!zip_contains(&installed_jar, "META-INF/TEST.SF"));
         let installed_jar_bytes = fs::read(&installed_jar).expect("read installed jar");
+        let expected_child_bytes = overlay_legacy_archive_bytes(
+            &fs::read(base_dir.join(format!("{base_version_id}.jar")))
+                .expect("read authenticated base source"),
+            &forge_archive,
+        )
+        .expect("derive expected child source");
+        assert_eq!(installed_jar_bytes, expected_child_bytes);
+        let installed_jar_receipt = receipt
+            .into_inventory()
+            .entries()
+            .iter()
+            .find(|entry| entry.kind() == KnownGoodArtifactKind::ClientJar)
+            .expect("client jar receipt")
+            .integrity()
+            .clone();
+        let KnownGoodIntegrity::ExactBytes { digest, size } = installed_jar_receipt else {
+            panic!("client jar receipt must retain exact source bytes");
+        };
+        assert_eq!(digest.as_str(), sha1_hex(&installed_jar_bytes));
+        assert_eq!(size, installed_jar_bytes.len() as u64);
         let installed_version_json = fs::read_to_string(
             versions_dir(&root)
                 .join(&record.version_id)
@@ -1828,6 +1989,184 @@ mod tests {
 
         server.stop();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn legacy_archive_rejects_corrupt_authenticated_base_client() {
+        let root = temp_dir("legacy-archive-corrupt-base");
+        let base_version_id = "1.2.5";
+        write_base_version(&root, base_version_id);
+        let base_receipt = test_authenticated_receipt(&root, base_version_id);
+        fs::write(
+            versions_dir(&root)
+                .join(base_version_id)
+                .join(format!("{base_version_id}.jar")),
+            b"corrupt base client",
+        )
+        .expect("corrupt base client");
+        let server = TestByteServer::start_with_sha1(zip_entries(&[(
+            "net/minecraftforge/Forge.class",
+            b"forge".as_slice(),
+        )]));
+        let record = legacy_archive_record();
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+            stage_dir: root.join("stage"),
+        };
+
+        let error = install_legacy_archive_after_authenticated_base(
+            &root,
+            &plan,
+            &server.url,
+            &base_receipt,
+            &mut |_| {},
+        )
+        .await
+        .expect_err("corrupt base must fail");
+
+        assert!(
+            matches!(error, LoaderError::Verify(message) if message.contains("authenticate base client"))
+        );
+        assert!(!versions_dir(&root).join(record.version_id).exists());
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn legacy_archive_rejects_mismatched_live_sha1_proof() {
+        let root = temp_dir("legacy-archive-sha1-mismatch");
+        let base_version_id = "1.2.5";
+        write_base_version(&root, base_version_id);
+        let base_receipt = test_authenticated_receipt(&root, base_version_id);
+        let archive = zip_entries(&[("net/minecraftforge/Forge.class", b"forge".as_slice())]);
+        let server = TestByteServer::start_with_sha1_proof(archive, vec![b'0'; 40]);
+        let record = legacy_archive_record();
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+            stage_dir: root.join("stage"),
+        };
+
+        let error = install_legacy_archive_after_authenticated_base(
+            &root,
+            &plan,
+            &server.url,
+            &base_receipt,
+            &mut |_| {},
+        )
+        .await
+        .expect_err("mismatched proof must fail");
+
+        assert!(
+            matches!(error, LoaderError::Verify(message) if message.contains("live sha1 proof"))
+        );
+        assert!(!versions_dir(&root).join(record.version_id).exists());
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn legacy_archive_rejects_malformed_live_sha1_proof() {
+        let root = temp_dir("legacy-archive-sha1-malformed");
+        let base_version_id = "1.2.5";
+        write_base_version(&root, base_version_id);
+        let base_receipt = test_authenticated_receipt(&root, base_version_id);
+        let archive = zip_entries(&[("net/minecraftforge/Forge.class", b"forge".as_slice())]);
+        let server = TestByteServer::start_with_sha1_proof(
+            archive,
+            b"not-a-strict-sha1 artifact.jar".to_vec(),
+        );
+        let record = legacy_archive_record();
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+            stage_dir: root.join("stage"),
+        };
+
+        let error = install_legacy_archive_after_authenticated_base(
+            &root,
+            &plan,
+            &server.url,
+            &base_receipt,
+            &mut |_| {},
+        )
+        .await
+        .expect_err("malformed proof must fail");
+
+        assert!(
+            matches!(error, LoaderError::InvalidProfile(message) if message.contains("exactly one 40-hex digest"))
+        );
+        assert!(!versions_dir(&root).join(record.version_id).exists());
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_archive_rejects_symlinked_child_version_without_outside_write() {
+        let root = temp_dir("legacy-archive-symlink-child");
+        let outside = temp_dir("legacy-archive-symlink-outside");
+        let sentinel = outside.join("sentinel");
+        fs::create_dir_all(&outside).expect("outside dir");
+        fs::write(&sentinel, b"untouched").expect("outside sentinel");
+        let base_version_id = "1.2.5";
+        write_base_version(&root, base_version_id);
+        fs::write(
+            versions_dir(&root)
+                .join(base_version_id)
+                .join(format!("{base_version_id}.jar")),
+            zip_entries(&[("net/minecraft/client/Minecraft.class", b"base".as_slice())]),
+        )
+        .expect("valid base client");
+        let base_receipt = test_authenticated_receipt(&root, base_version_id);
+        let record = legacy_archive_record();
+        let child_path = versions_dir(&root).join(&record.version_id);
+        std::os::unix::fs::symlink(&outside, &child_path).expect("symlink child version");
+        let server = TestByteServer::start_with_sha1(zip_entries(&[(
+            "net/minecraftforge/Forge.class",
+            b"forge".as_slice(),
+        )]));
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+            stage_dir: root.join("stage"),
+        };
+
+        let error = install_legacy_archive_after_authenticated_base(
+            &root,
+            &plan,
+            &server.url,
+            &base_receipt,
+            &mut |_| {},
+        )
+        .await
+        .expect_err("symlinked child must fail");
+
+        assert!(
+            matches!(&error, LoaderError::Verify(message) if message.contains("exact managed directory")),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(fs::read(&sentinel).expect("read sentinel"), b"untouched");
+        assert_eq!(fs::read_dir(&outside).expect("outside dir").count(), 1);
+        server.stop();
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn legacy_overlay_rejects_declared_entry_expansion_over_limit() {
+        let base_client =
+            zip_entries(&[("net/minecraft/client/Minecraft.class", b"base".as_slice())]);
+        let mut archive = zip_entries(&[("oversized.class", b"".as_slice())]);
+        set_first_zip_entry_declared_size(
+            &mut archive,
+            u32::try_from(super::MAX_LEGACY_OVERLAY_ENTRY_BYTES + 1)
+                .expect("test limit fits zip32"),
+        );
+
+        let error = overlay_legacy_archive_bytes(&base_client, &archive)
+            .expect_err("declared expansion must be rejected before decompression");
+
+        assert!(
+            matches!(error, LoaderError::InvalidProfile(message) if message.contains("bounded output limits"))
+        );
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
@@ -1868,6 +2207,19 @@ mod tests {
         }
         archive.finish().expect("finish zip");
         cursor.into_inner()
+    }
+
+    fn set_first_zip_entry_declared_size(bytes: &mut [u8], size: u32) {
+        let local = bytes
+            .windows(4)
+            .position(|window| window == [0x50, 0x4b, 0x03, 0x04])
+            .expect("local zip header");
+        let central = bytes
+            .windows(4)
+            .position(|window| window == [0x50, 0x4b, 0x01, 0x02])
+            .expect("central zip header");
+        bytes[local + 22..local + 26].copy_from_slice(&size.to_le_bytes());
+        bytes[central + 24..central + 28].copy_from_slice(&size.to_le_bytes());
     }
 
     fn zip_contains(path: &std::path::Path, name: &str) -> bool {
@@ -1921,6 +2273,19 @@ mod tests {
             size: Some(client.len() as u64),
             sha1: Some(sha1_hex(&client)),
         }
+    }
+
+    fn test_authenticated_receipt(
+        root: &std::path::Path,
+        version_id: &str,
+    ) -> KnownGoodInstallReceipt {
+        let integrity = test_client_integrity(root, version_id);
+        let mut version = resolve_version(root, version_id).expect("resolve test base version");
+        let client = version.downloads.client.get_or_insert_default();
+        client.size = integrity.size.expect("test client size") as i64;
+        client.sha1 = integrity.sha1.expect("test client sha1");
+        client.url = "https://example.invalid/client.jar".to_string();
+        KnownGoodInstallReceipt::from_test_authenticated_version(version, default_environment())
     }
 
     fn assert_backend_version_was_written(
@@ -2069,6 +2434,19 @@ mod tests {
 
     impl TestByteServer {
         fn start(body: Vec<u8>) -> Self {
+            Self::start_with_optional_sha1(body, None)
+        }
+
+        fn start_with_sha1(body: Vec<u8>) -> Self {
+            let proof = sha1_hex(&body).into_bytes();
+            Self::start_with_optional_sha1(body, Some(proof))
+        }
+
+        fn start_with_sha1_proof(body: Vec<u8>, proof: Vec<u8>) -> Self {
+            Self::start_with_optional_sha1(body, Some(proof))
+        }
+
+        fn start_with_optional_sha1(body: Vec<u8>, sha1_proof: Option<Vec<u8>>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
             listener
                 .set_nonblocking(true)
@@ -2085,7 +2463,7 @@ mod tests {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             server_request_count.fetch_add(1, Ordering::SeqCst);
-                            respond_ok(stream, &body);
+                            respond_ok(stream, &body, sha1_proof.as_deref());
                         }
                         Err(error) if error.kind() == ErrorKind::WouldBlock => {
                             if server_stopped.try_recv().is_ok() {
@@ -2116,9 +2494,19 @@ mod tests {
         }
     }
 
-    fn respond_ok(mut stream: TcpStream, body: &[u8]) {
+    fn respond_ok(mut stream: TcpStream, body: &[u8], sha1_proof: Option<&[u8]>) {
         let mut buffer = [0_u8; 1024];
-        let _ = stream.read(&mut buffer);
+        let read = stream.read(&mut buffer).unwrap_or_default();
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        let body = if request.lines().next().is_some_and(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|path| path.ends_with(".sha1"))
+        }) {
+            sha1_proof.unwrap_or(body)
+        } else {
+            body
+        };
         let header = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()

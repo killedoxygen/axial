@@ -1,5 +1,6 @@
 use super::common::install_from_legacy_archive;
 use crate::download::DownloadProgress;
+use crate::known_good::KnownGoodInstallReceipt;
 use crate::loaders::types::{LoaderError, LoaderInstallPlan, LoaderInstallSource};
 use std::path::Path;
 
@@ -7,7 +8,7 @@ pub async fn install<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
     send: &mut F,
-) -> Result<String, LoaderError>
+) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {

@@ -213,6 +213,19 @@ impl KnownGoodInstallReceipt {
         &self.effective_version
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_test_authenticated_version(
+        effective_version: VersionJson,
+        environment: Environment,
+    ) -> Self {
+        Self {
+            version_id: KnownGoodId::new(&effective_version.id).expect("safe test version id"),
+            inventory: InventoryBuilder::default().finish(),
+            effective_version,
+            environment,
+        }
+    }
+
     pub(crate) fn authenticated_client_integrity(
         &self,
     ) -> Result<ExpectedIntegrity, KnownGoodInventoryError> {
@@ -225,6 +238,107 @@ impl KnownGoodInstallReceipt {
         let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
         expected_integrity(&expected, false, "authenticated client")?;
         Ok(expected)
+    }
+
+    pub(crate) fn authenticate_client_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(), KnownGoodInventoryError> {
+        validate_bytes(bytes, &self.authenticated_client_integrity()?)
+            .map_err(|_| KnownGoodInventoryError::ClientIntegrity)
+    }
+
+    pub(crate) fn from_verified_legacy_archive_source(
+        base: &Self,
+        record: &LoaderBuildRecord,
+        resolved_version: VersionJson,
+        version_bytes: &[u8],
+        child_client_bytes: &[u8],
+        loader_metadata_bytes: &[u8],
+    ) -> Result<Self, KnownGoodInventoryError> {
+        if base.version_id.as_str() != record.minecraft_version
+            || base.effective_version.id != record.minecraft_version
+            || record.component_id != LoaderComponentId::Forge
+            || record.strategy != LoaderInstallStrategy::ForgeEarliestLegacy
+            || crate::loaders::api::validate_loader_build_record_identity(record).is_err()
+        {
+            return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
+        }
+
+        let child_size = i64::try_from(child_client_bytes.len())
+            .map_err(|_| KnownGoodInventoryError::InputTooLarge)?;
+        let child_sha1 = sha1_digest(child_client_bytes).as_str().to_string();
+        let mut expected_version = base.effective_version.clone();
+        expected_version.id = record.version_id.clone();
+        expected_version.inherits_from = record.minecraft_version.clone();
+        expected_version.materialized = true;
+        let client = expected_version
+            .downloads
+            .client
+            .as_mut()
+            .ok_or(KnownGoodInventoryError::MissingClient)?;
+        client.sha1 = child_sha1;
+        client.size = child_size;
+        client.url.clear();
+        if resolved_version != expected_version
+            || !serde_json::from_slice::<VersionJson>(version_bytes)
+                .is_ok_and(|version| version == resolved_version)
+        {
+            return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
+        }
+
+        let version_id = KnownGoodId::new(&resolved_version.id)?;
+        let mut builder = InventoryBuilder::default();
+        for entry in base.inventory.entries.iter().filter(|entry| {
+            matches!(
+                &entry.root,
+                KnownGoodRoot::Assets | KnownGoodRoot::ManagedRuntime { .. }
+            )
+        }) {
+            builder.insert(entry.clone())?;
+        }
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Versions,
+            path: KnownGoodRelativePath::new(&format!("{0}/{0}.json", version_id.as_str()))?,
+            kind: KnownGoodArtifactKind::VersionMetadata,
+            integrity: exact_bytes_integrity(version_bytes),
+        })?;
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Versions,
+            path: KnownGoodRelativePath::new(&format!("{0}/{0}.jar", version_id.as_str()))?,
+            kind: KnownGoodArtifactKind::ClientJar,
+            integrity: exact_bytes_integrity(child_client_bytes),
+        })?;
+
+        let libraries = library_artifact_plans_for(
+            &resolved_version.libraries,
+            &base.environment,
+            LibraryChecksumPolicy::Strict,
+        )
+        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+        add_library_plans(&mut builder, libraries, &BTreeMap::new())?;
+
+        let expected_metadata = installed_loader_metadata_bytes(record)
+            .map_err(|_| KnownGoodInventoryError::MetadataSerialization)?;
+        if expected_metadata != loader_metadata_bytes {
+            return Err(KnownGoodInventoryError::MetadataSerialization);
+        }
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Versions,
+            path: KnownGoodRelativePath::new(&format!(
+                "{}/.axial-loader.json",
+                version_id.as_str()
+            ))?,
+            kind: KnownGoodArtifactKind::LoaderMetadata,
+            integrity: exact_bytes_integrity(loader_metadata_bytes),
+        })?;
+
+        Ok(Self {
+            version_id,
+            inventory: builder.finish(),
+            effective_version: resolved_version,
+            environment: base.environment.clone(),
+        })
     }
 
     pub(crate) fn from_verified_profile_source(
@@ -527,6 +641,7 @@ pub enum KnownGoodInventoryError {
     UnexpectedAssetIndex,
     AssetIndexIntegrity,
     VersionMetadataIntegrity,
+    ClientIntegrity,
     AssetIndexParse,
     InvalidAssetObject,
     UnsupportedRuntimeEntry,
@@ -1313,6 +1428,117 @@ mod tests {
                 .entries()
                 .iter()
                 .any(|entry| entry.path().as_str().contains("/asm/9.6/"))
+        );
+    }
+
+    #[test]
+    fn legacy_archive_receipt_is_derived_from_exact_child_sources_and_base_authority() {
+        let fixture = fixture(FixtureShape::Vanilla, false);
+        let mut record = LoaderBuildRecord {
+            subject_kind: LoaderBuildSubjectKind::LoaderBuild,
+            component_id: LoaderComponentId::Forge,
+            component_name: "Forge".to_string(),
+            build_id: String::new(),
+            minecraft_version: fixture.version.id.clone(),
+            loader_version: "3.4.9.171".to_string(),
+            version_id: String::new(),
+            build_meta: LoaderBuildMetadata::default(),
+            strategy: LoaderInstallStrategy::ForgeEarliestLegacy,
+            artifact_kind: LoaderArtifactKind::LegacyArchive,
+            installability: LoaderInstallability::Installable,
+            install_source: LoaderInstallSource::LegacyArchive {
+                url: "https://example.invalid/legacy.jar".to_string(),
+            },
+        };
+        record.build_id = build_id_for(
+            record.component_id,
+            &record.minecraft_version,
+            &record.loader_version,
+        );
+        record.version_id = installed_version_id_for(
+            record.component_id,
+            &record.minecraft_version,
+            &record.loader_version,
+        )
+        .expect("canonical child id");
+        let base = KnownGoodInstallReceipt {
+            version_id: KnownGoodId::new(&fixture.version.id).expect("base id"),
+            inventory: derive_known_good_inventory(fixture.input()).expect("base inventory"),
+            effective_version: fixture.version.clone(),
+            environment: fixture.environment.clone(),
+        };
+        let child_client_bytes = b"deterministic legacy child bytes";
+        let mut child = fixture.version.clone();
+        child.id = record.version_id.clone();
+        child.inherits_from = record.minecraft_version.clone();
+        child.materialized = true;
+        let child_download = child.downloads.client.as_mut().expect("client download");
+        child_download.sha1 = sha1_digest(child_client_bytes).as_str().to_string();
+        child_download.size = child_client_bytes.len() as i64;
+        child_download.url.clear();
+        let version_bytes = serde_json::to_vec_pretty(&child).expect("version bytes");
+        let metadata = installed_loader_metadata_bytes(&record).expect("loader metadata");
+
+        let receipt = KnownGoodInstallReceipt::from_verified_legacy_archive_source(
+            &base,
+            &record,
+            child,
+            &version_bytes,
+            child_client_bytes,
+            &metadata,
+        )
+        .expect("legacy receipt");
+        let inventory = receipt.into_inventory();
+
+        assert_entry(
+            &inventory,
+            &KnownGoodRoot::Versions,
+            &format!("{0}/{0}.jar", record.version_id),
+            KnownGoodArtifactKind::ClientJar,
+            &exact_bytes_integrity(child_client_bytes),
+        );
+        assert_entry(
+            &inventory,
+            &KnownGoodRoot::Versions,
+            &format!("{0}/{0}.json", record.version_id),
+            KnownGoodArtifactKind::VersionMetadata,
+            &exact_bytes_integrity(&version_bytes),
+        );
+        assert!(has_kind(&inventory, KnownGoodArtifactKind::AssetIndex));
+        assert!(has_kind(
+            &inventory,
+            KnownGoodArtifactKind::RuntimeExecutable
+        ));
+        assert_entry(
+            &inventory,
+            &KnownGoodRoot::Libraries,
+            "com/mojang/strict/1.0/strict-1.0.jar",
+            KnownGoodArtifactKind::Library,
+            &KnownGoodIntegrity::Sha1 {
+                digest: Sha1Digest::from_metadata(SHA_A).expect("library digest"),
+                size: Some(10),
+            },
+        );
+        assert!(!inventory.entries().iter().any(|entry| {
+            entry.root() == &KnownGoodRoot::Versions
+                && entry.path().as_str().starts_with(&fixture.version.id)
+        }));
+        assert_sorted_unique(&inventory);
+    }
+
+    #[test]
+    fn authenticated_base_receipt_rejects_corrupt_client_bytes() {
+        let fixture = fixture(FixtureShape::Vanilla, false);
+        let base = KnownGoodInstallReceipt {
+            version_id: KnownGoodId::new(&fixture.version.id).expect("base id"),
+            inventory: InventoryBuilder::default().finish(),
+            effective_version: fixture.version,
+            environment: fixture.environment,
+        };
+
+        assert_eq!(
+            base.authenticate_client_bytes(b"not the authenticated client"),
+            Err(KnownGoodInventoryError::ClientIntegrity)
         );
     }
 
