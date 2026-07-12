@@ -8,9 +8,11 @@ use super::types::{
 use crate::artifact_path::ArtifactRelativePath;
 use crate::download::DownloadError;
 use crate::launch::{Library, maven_to_path};
-use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use serde::{Deserialize, Deserializer, de};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::io::{Read, Write};
+use std::marker::PhantomData;
 use std::path::Path;
 use thiserror::Error;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
@@ -31,6 +33,42 @@ const MAX_INSTALLER_ENTRY_COUNT: usize = 64;
 const MAX_INSTALLER_EMBEDDED_TOTAL_BYTES: u64 = 512 << 20;
 #[cfg(test)]
 const MAX_INSTALLER_EMBEDDED_TOTAL_BYTES: u64 = 4096;
+#[cfg(not(test))]
+const MAX_FORGE_PROCESSORS: usize = 256;
+#[cfg(test)]
+const MAX_FORGE_PROCESSORS: usize = 8;
+#[cfg(not(test))]
+const MAX_FORGE_PROCESSOR_DATA: usize = 256;
+#[cfg(test)]
+const MAX_FORGE_PROCESSOR_DATA: usize = 8;
+#[cfg(not(test))]
+const MAX_FORGE_PROCESSOR_OUTPUTS: usize = 1024;
+#[cfg(test)]
+const MAX_FORGE_PROCESSOR_OUTPUTS: usize = 16;
+#[cfg(not(test))]
+const MAX_FORGE_PROCESSOR_CLASSPATH: usize = 256;
+#[cfg(test)]
+const MAX_FORGE_PROCESSOR_CLASSPATH: usize = 16;
+#[cfg(not(test))]
+const MAX_FORGE_PROCESSOR_ARGS: usize = 256;
+#[cfg(test)]
+const MAX_FORGE_PROCESSOR_ARGS: usize = 16;
+#[cfg(not(test))]
+const MAX_FORGE_PROCESSOR_STRING_BYTES: usize = 4096;
+#[cfg(test)]
+const MAX_FORGE_PROCESSOR_STRING_BYTES: usize = 256;
+#[cfg(not(test))]
+const MAX_FORGE_PROCESSOR_DECLARATION_BYTES: usize = 2 << 20;
+#[cfg(test)]
+const MAX_FORGE_PROCESSOR_DECLARATION_BYTES: usize = 4096;
+#[cfg(not(test))]
+const MAX_FORGE_PROCESSOR_DATA_ENTRY_BYTES: u64 = 128 << 20;
+#[cfg(test)]
+const MAX_FORGE_PROCESSOR_DATA_ENTRY_BYTES: u64 = 1024;
+#[cfg(not(test))]
+const MAX_FORGE_PROCESSOR_DATA_TOTAL_BYTES: u64 = 512 << 20;
+#[cfg(test)]
+const MAX_FORGE_PROCESSOR_DATA_TOTAL_BYTES: u64 = 4096;
 
 #[derive(Debug, Error)]
 pub enum ForgeInstallerError {
@@ -64,6 +102,34 @@ pub enum ForgeInstallerError {
     PortablePathAlias,
     #[error("installer identity does not match the live loader build")]
     IdentityMismatch,
+    #[error("Forge installer declares too many processors")]
+    TooManyForgeProcessors,
+    #[error("Forge installer declares too many processor data entries")]
+    TooManyForgeProcessorData,
+    #[error("Forge installer declares too many processor outputs")]
+    TooManyForgeProcessorOutputs,
+    #[error("Forge processor declarations exceed their structural limits")]
+    ForgeProcessorDeclarationsTooLarge,
+    #[error("Forge processor declaration is invalid")]
+    InvalidForgeProcessor,
+    #[error("Forge processor data declaration is invalid")]
+    InvalidForgeProcessorData,
+    #[error("Forge processor installer data entry is missing")]
+    MissingForgeProcessorData,
+    #[error("Forge processor installer data entry is too large")]
+    ForgeProcessorDataEntryTooLarge,
+    #[error("Forge processor installer data exceeds the aggregate size limit")]
+    ForgeProcessorDataTooLarge,
+    #[error("Forge client processor does not declare authenticated outputs")]
+    MissingForgeProcessorOutputs,
+    #[error("Forge processor output declaration is invalid")]
+    InvalidForgeProcessorOutput,
+    #[error("multiple Forge processors declare the same output")]
+    MultipleForgeProcessorProducers,
+    #[error("Forge processor declarations contain a portable case-fold alias")]
+    ForgeProcessorPortableAlias,
+    #[error("Forge processor declarations contain a dependency cycle")]
+    ForgeProcessorDependencyCycle,
     #[error("download failed: {0}")]
     Download(#[from] DownloadError),
 }
@@ -78,9 +144,62 @@ pub(crate) struct AuthenticatedForgeInstallerPlan {
     strip_client_meta: bool,
 }
 
-#[derive(Debug)]
 pub(crate) struct BoundForgeInstallerPlan {
     authenticated: AuthenticatedForgeInstallerPlan,
+    processor_plan: Option<BoundProcessorPlan>,
+}
+
+struct BoundProcessorPlan {
+    steps: Vec<BoundProcessorStep>,
+    data: BTreeMap<String, BoundProcessorData>,
+    installer_data: BTreeMap<ArtifactRelativePath, Vec<u8>>,
+}
+
+struct BoundProcessorStep {
+    jar: BoundProcessorArtifact,
+    classpath: Vec<BoundProcessorArtifact>,
+    args: Vec<BoundProcessorArgument>,
+    outputs: Vec<BoundProcessorOutput>,
+}
+
+enum BoundProcessorArgument {
+    Artifact(BoundProcessorArtifact),
+    OutputArtifact(BoundProcessorArtifact),
+    Template(Vec<BoundProcessorArgumentPart>),
+}
+
+enum BoundProcessorArgumentPart {
+    Literal(String),
+    DataToken(String),
+    OutputToken(String),
+    BuiltinToken(ProcessorBuiltinToken),
+}
+
+#[derive(Clone, Copy)]
+enum ProcessorBuiltinToken {
+    MinecraftJar,
+    Side,
+    MinecraftVersion,
+    Root,
+    LibraryDir,
+    Installer,
+}
+
+#[derive(Clone)]
+struct BoundProcessorArtifact {
+    coordinate: String,
+    relative_path: ArtifactRelativePath,
+}
+
+enum BoundProcessorData {
+    Artifact(BoundProcessorArtifact),
+    InstallerData(ArtifactRelativePath),
+    Literal(String),
+}
+
+struct BoundProcessorOutput {
+    artifact: BoundProcessorArtifact,
+    sha1: [u8; 20],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +241,11 @@ impl BoundForgeInstallerPlan {
     }
 
     pub(crate) fn install_profile_json(&self) -> Option<&[u8]> {
+        debug_assert!(
+            self.processor_plan
+                .as_ref()
+                .is_none_or(BoundProcessorPlan::is_structurally_complete)
+        );
         self.authenticated.install_profile_json.as_deref()
     }
 
@@ -185,8 +309,8 @@ struct InstallProfileDeclarations {
     libraries: Vec<Library>,
     #[serde(default)]
     processors: Vec<ProcessorDeclaration>,
-    #[serde(default)]
-    data: HashMap<String, ProcessorDataDeclaration>,
+    #[serde(default, deserialize_with = "deserialize_unique_map")]
+    data: BTreeMap<String, ProcessorDataDeclaration>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,12 +319,52 @@ struct ProcessorDeclaration {
     jar: String,
     #[serde(default)]
     classpath: Vec<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    sides: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_unique_map")]
+    outputs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ProcessorDataDeclaration {
     #[serde(default)]
     client: String,
+}
+
+fn deserialize_unique_map<'de, D, V>(deserializer: D) -> Result<BTreeMap<String, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    struct UniqueMapVisitor<V>(PhantomData<V>);
+
+    impl<'de, V> de::Visitor<'de> for UniqueMapVisitor<V>
+    where
+        V: Deserialize<'de>,
+    {
+        type Value = BTreeMap<String, V>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map with unique keys")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::MapAccess<'de>,
+        {
+            let mut values = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, V>()? {
+                if values.insert(key, value).is_some() {
+                    return Err(de::Error::custom("duplicate map key"));
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueMapVisitor(PhantomData))
 }
 
 pub(crate) fn plan_authenticated_installer(
@@ -357,7 +521,7 @@ pub(crate) fn bind_authenticated_installer_plan(
         .as_deref()
         .and_then(|profile| serde_json::from_slice::<LegacyInstallProfile>(profile).ok());
 
-    let root_artifact = match (record.component_id, record.strategy) {
+    let (root_artifact, bind_processors) = match (record.component_id, record.strategy) {
         (LoaderComponentId::Forge, LoaderInstallStrategy::ForgeModern) => {
             if legacy_profile.is_some() {
                 return Err(ForgeInstallerError::IdentityMismatch);
@@ -383,7 +547,7 @@ pub(crate) fn bind_authenticated_installer_plan(
                 &expected_version,
                 Some(&expected_path),
             )?;
-            RootArtifact::Universal
+            (RootArtifact::Universal, true)
         }
         (LoaderComponentId::NeoForge, LoaderInstallStrategy::NeoForgeModern) => {
             if legacy_profile.is_some() {
@@ -402,7 +566,7 @@ pub(crate) fn bind_authenticated_installer_plan(
                 &format!("neoforge-{}", record.loader_version),
                 None,
             )?;
-            RootArtifact::Universal
+            (RootArtifact::Universal, false)
         }
         (LoaderComponentId::Forge, LoaderInstallStrategy::ForgeLegacyInstaller) => {
             if let Some(legacy_profile) = legacy_profile.as_ref() {
@@ -412,7 +576,7 @@ pub(crate) fn bind_authenticated_installer_plan(
                     EffectiveProfileShape::LegacyVersionInfo,
                 )?;
                 validate_legacy_install_profile(legacy_profile, record, &authenticated.version)?;
-                RootArtifact::Universal
+                (RootArtifact::Universal, false)
             } else {
                 validate_effective_version_identity(
                     &mut authenticated.version,
@@ -435,14 +599,780 @@ pub(crate) fn bind_authenticated_installer_plan(
                     &expected_version,
                     Some(&expected_path),
                 )?;
-                RootArtifact::Plain
+                (RootArtifact::Plain, true)
             }
         }
         _ => return Err(ForgeInstallerError::IdentityMismatch),
     };
     validate_component_root_libraries(&authenticated.libraries, record, root_artifact)?;
+    let processor_plan = if bind_processors {
+        Some(bind_forge_processor_plan(
+            authenticated.source.bytes(),
+            install_profile
+                .as_ref()
+                .ok_or(ForgeInstallerError::IdentityMismatch)?,
+            &authenticated.libraries,
+            &authenticated.embedded_maven_artifacts,
+        )?)
+    } else {
+        None
+    };
 
-    Ok(BoundForgeInstallerPlan { authenticated })
+    Ok(BoundForgeInstallerPlan {
+        authenticated,
+        processor_plan,
+    })
+}
+
+impl BoundProcessorPlan {
+    fn is_structurally_complete(&self) -> bool {
+        self.steps.iter().all(|step| {
+            processor_artifact_is_valid(&step.jar)
+                && step.classpath.iter().all(processor_artifact_is_valid)
+                && step.args.iter().all(|arg| match arg {
+                    BoundProcessorArgument::Artifact(artifact)
+                    | BoundProcessorArgument::OutputArtifact(artifact) => {
+                        processor_artifact_is_valid(artifact)
+                    }
+                    BoundProcessorArgument::Template(parts) => {
+                        !parts.is_empty()
+                            && parts.iter().all(|part| match part {
+                                BoundProcessorArgumentPart::Literal(value) => !value.is_empty(),
+                                BoundProcessorArgumentPart::DataToken(token) => {
+                                    self.data.contains_key(token)
+                                }
+                                BoundProcessorArgumentPart::OutputToken(token) => {
+                                    self.data.contains_key(token)
+                                }
+                                BoundProcessorArgumentPart::BuiltinToken(token) => matches!(
+                                    token,
+                                    ProcessorBuiltinToken::MinecraftJar
+                                        | ProcessorBuiltinToken::Side
+                                        | ProcessorBuiltinToken::MinecraftVersion
+                                        | ProcessorBuiltinToken::Root
+                                        | ProcessorBuiltinToken::LibraryDir
+                                        | ProcessorBuiltinToken::Installer
+                                ),
+                            })
+                    }
+                })
+                && !step.outputs.is_empty()
+                && step
+                    .outputs
+                    .iter()
+                    .all(|output| processor_artifact_is_valid(&output.artifact))
+        }) && self.data.iter().all(|(key, value)| {
+            valid_processor_token(key)
+                && match value {
+                    BoundProcessorData::Artifact(artifact) => processor_artifact_is_valid(artifact),
+                    BoundProcessorData::InstallerData(path) => {
+                        self.installer_data.contains_key(path)
+                    }
+                    BoundProcessorData::Literal(value) => !value.is_empty(),
+                }
+        }) && self.installer_data.iter().all(|(path, bytes)| {
+            !path.as_str().is_empty() && bytes.len() as u64 <= MAX_FORGE_PROCESSOR_DATA_ENTRY_BYTES
+        })
+    }
+}
+
+fn processor_artifact_is_valid(artifact: &BoundProcessorArtifact) -> bool {
+    !artifact.coordinate.is_empty() && !artifact.relative_path.as_str().is_empty()
+}
+
+fn bind_forge_processor_plan(
+    installer: &[u8],
+    profile: &InstallProfileDeclarations,
+    libraries: &[Library],
+    embedded: &[AuthenticatedEmbeddedMavenArtifact],
+) -> Result<BoundProcessorPlan, ForgeInstallerError> {
+    if profile.processors.len() > MAX_FORGE_PROCESSORS {
+        return Err(ForgeInstallerError::TooManyForgeProcessors);
+    }
+    if profile.data.len() > MAX_FORGE_PROCESSOR_DATA {
+        return Err(ForgeInstallerError::TooManyForgeProcessorData);
+    }
+    let output_count = profile
+        .processors
+        .iter()
+        .try_fold(0_usize, |count, processor| {
+            count.checked_add(processor.outputs.len())
+        })
+        .ok_or(ForgeInstallerError::TooManyForgeProcessorOutputs)?;
+    if output_count > MAX_FORGE_PROCESSOR_OUTPUTS {
+        return Err(ForgeInstallerError::TooManyForgeProcessorOutputs);
+    }
+    validate_processor_declaration_bounds(profile)?;
+    let declared_artifacts = declared_processor_artifacts(libraries, embedded)?;
+
+    validate_processor_data_keys(&profile.data)?;
+    let referenced_data = referenced_client_processor_data(profile)?;
+    let data = referenced_data
+        .into_iter()
+        .map(|key| {
+            let declaration = profile
+                .data
+                .get(&key)
+                .ok_or(ForgeInstallerError::InvalidForgeProcessorData)?;
+            parse_processor_data(&declaration.client).map(|value| (key, value))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let requested_data = data
+        .values()
+        .filter_map(|value| match value {
+            BoundProcessorData::InstallerData(path) => Some(path.clone()),
+            BoundProcessorData::Artifact(_) | BoundProcessorData::Literal(_) => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let installer_data = extract_authenticated_processor_data(installer, &requested_data)?;
+
+    let mut steps = Vec::new();
+    let mut producers = HashMap::<String, (String, usize, [u8; 20])>::new();
+    let mut dependencies = Vec::<BTreeMap<String, String>>::new();
+    for declaration in &profile.processors {
+        let is_client = validate_processor_sides(&declaration.sides)?;
+        if !is_client {
+            continue;
+        }
+        if declaration.outputs.is_empty() {
+            return Err(ForgeInstallerError::MissingForgeProcessorOutputs);
+        }
+
+        let jar = parse_processor_artifact(&declaration.jar)?;
+        let classpath = declaration
+            .classpath
+            .iter()
+            .map(|coordinate| parse_processor_artifact(coordinate))
+            .collect::<Result<Vec<_>, _>>()?;
+        let step_index = steps.len();
+        let mut outputs = Vec::with_capacity(declaration.outputs.len());
+        let mut current_outputs = BTreeMap::new();
+        for (target, sha1) in &declaration.outputs {
+            let artifact = resolve_processor_output_artifact(target, &data)?;
+            let sha1 = resolve_processor_output_sha1(sha1, &data)?;
+            let portable = portable_path_key(artifact.relative_path.as_str());
+            let output = BoundProcessorOutput { artifact, sha1 };
+            let output_sha1 = output.sha1;
+            match producers.get(&portable) {
+                Some((existing, _, _)) if existing == output.artifact.relative_path.as_str() => {
+                    return Err(ForgeInstallerError::MultipleForgeProcessorProducers);
+                }
+                Some(_) => return Err(ForgeInstallerError::ForgeProcessorPortableAlias),
+                None => {
+                    producers.insert(
+                        portable.clone(),
+                        (
+                            output.artifact.relative_path.as_str().to_string(),
+                            step_index,
+                            output_sha1,
+                        ),
+                    );
+                }
+            }
+            current_outputs.insert(portable, output.artifact.relative_path.as_str().to_string());
+            outputs.push(output);
+        }
+
+        let mut consumed = BTreeMap::new();
+        record_processor_dependency(&mut consumed, &jar)?;
+        for artifact in &classpath {
+            record_processor_dependency(&mut consumed, artifact)?;
+        }
+        let args = declaration
+            .args
+            .iter()
+            .map(|arg| parse_processor_argument(arg, &data, &current_outputs, &mut consumed))
+            .collect::<Result<Vec<_>, _>>()?;
+        dependencies.push(consumed);
+        steps.push(BoundProcessorStep {
+            jar,
+            classpath,
+            args,
+            outputs,
+        });
+    }
+
+    validate_processor_dependency_order(&dependencies, &producers, &declared_artifacts)?;
+    let plan = BoundProcessorPlan {
+        steps,
+        data,
+        installer_data,
+    };
+    if !plan.is_structurally_complete() {
+        return Err(ForgeInstallerError::InvalidForgeProcessor);
+    }
+    Ok(plan)
+}
+
+fn validate_processor_declaration_bounds(
+    profile: &InstallProfileDeclarations,
+) -> Result<(), ForgeInstallerError> {
+    let mut total = 0_usize;
+    let mut account = |value: &str| -> Result<(), ForgeInstallerError> {
+        if value.len() > MAX_FORGE_PROCESSOR_STRING_BYTES {
+            return Err(ForgeInstallerError::ForgeProcessorDeclarationsTooLarge);
+        }
+        total = total
+            .checked_add(value.len())
+            .ok_or(ForgeInstallerError::ForgeProcessorDeclarationsTooLarge)?;
+        if total > MAX_FORGE_PROCESSOR_DECLARATION_BYTES {
+            return Err(ForgeInstallerError::ForgeProcessorDeclarationsTooLarge);
+        }
+        Ok(())
+    };
+    for processor in &profile.processors {
+        if processor.classpath.len() > MAX_FORGE_PROCESSOR_CLASSPATH
+            || processor.args.len() > MAX_FORGE_PROCESSOR_ARGS
+            || processor.sides.len() > 3
+        {
+            return Err(ForgeInstallerError::ForgeProcessorDeclarationsTooLarge);
+        }
+        account(&processor.jar)?;
+        for value in processor
+            .classpath
+            .iter()
+            .chain(&processor.args)
+            .chain(&processor.sides)
+        {
+            account(value)?;
+        }
+        for (target, digest) in &processor.outputs {
+            account(target)?;
+            account(digest)?;
+        }
+    }
+    for (key, value) in &profile.data {
+        account(key)?;
+        account(&value.client)?;
+    }
+    Ok(())
+}
+
+fn declared_processor_artifacts(
+    libraries: &[Library],
+    embedded: &[AuthenticatedEmbeddedMavenArtifact],
+) -> Result<HashMap<String, String>, ForgeInstallerError> {
+    let mut declared = HashMap::new();
+    for artifact in embedded {
+        insert_unique_processor_artifact(&mut declared, artifact.relative_path())?;
+    }
+    for library in libraries {
+        let artifact = parse_processor_artifact(&library.name)?;
+        if library_declares_integrity(library, &artifact.relative_path) {
+            insert_unique_processor_artifact(&mut declared, &artifact.relative_path)?;
+        }
+    }
+    Ok(declared)
+}
+
+fn library_declares_integrity(library: &Library, path: &ArtifactRelativePath) -> bool {
+    valid_sha1(&library.sha1)
+        || (library.sha256.len() == 64
+            && library.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        || library
+            .checksums
+            .iter()
+            .any(|checksum| valid_sha1(checksum))
+        || library.downloads.as_ref().is_some_and(|downloads| {
+            downloads.artifact.as_ref().is_some_and(|artifact| {
+                artifact.path == path.as_str() && valid_sha1(&artifact.sha1)
+            }) || downloads
+                .classifiers
+                .values()
+                .any(|artifact| artifact.path == path.as_str() && valid_sha1(&artifact.sha1))
+        })
+}
+
+fn valid_sha1(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn insert_unique_processor_artifact(
+    declared: &mut HashMap<String, String>,
+    path: &ArtifactRelativePath,
+) -> Result<(), ForgeInstallerError> {
+    let portable = portable_path_key(path.as_str());
+    match declared.get(&portable) {
+        Some(existing) if existing != path.as_str() => {
+            Err(ForgeInstallerError::ForgeProcessorPortableAlias)
+        }
+        Some(_) => Ok(()),
+        None => {
+            declared.insert(portable, path.as_str().to_string());
+            Ok(())
+        }
+    }
+}
+
+fn validate_processor_data_keys(
+    data: &BTreeMap<String, ProcessorDataDeclaration>,
+) -> Result<(), ForgeInstallerError> {
+    let mut casefold = HashSet::new();
+    for key in data.keys() {
+        if !valid_processor_token(key)
+            || processor_builtin_token(key)
+            || !casefold.insert(key.to_ascii_lowercase())
+        {
+            return Err(ForgeInstallerError::InvalidForgeProcessorData);
+        }
+    }
+    Ok(())
+}
+
+fn referenced_client_processor_data(
+    profile: &InstallProfileDeclarations,
+) -> Result<BTreeSet<String>, ForgeInstallerError> {
+    let mut referenced = BTreeSet::new();
+    for processor in &profile.processors {
+        if !validate_processor_sides(&processor.sides)? {
+            continue;
+        }
+        for value in processor.outputs.keys().chain(processor.outputs.values()) {
+            if let Some(token) = exact_delimited(value, '{', '}') {
+                if !valid_processor_token(token) {
+                    return Err(ForgeInstallerError::InvalidForgeProcessor);
+                }
+                referenced.insert(token.to_string());
+            }
+        }
+        for arg in &processor.args {
+            collect_processor_argument_tokens(arg, &mut referenced)?;
+        }
+    }
+    referenced.retain(|token| !processor_builtin_token(token));
+    Ok(referenced)
+}
+
+fn collect_processor_argument_tokens(
+    arg: &str,
+    referenced: &mut BTreeSet<String>,
+) -> Result<(), ForgeInstallerError> {
+    let mut chars = arg.chars().peekable();
+    let mut quoted = false;
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => {
+                chars
+                    .next()
+                    .ok_or(ForgeInstallerError::InvalidForgeProcessor)?;
+            }
+            '\'' => quoted = !quoted,
+            '{' if !quoted => {
+                let mut token = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some('{' | '[' | ']') | None => {
+                            return Err(ForgeInstallerError::InvalidForgeProcessor);
+                        }
+                        Some(value) => token.push(value),
+                    }
+                }
+                if !valid_processor_token(&token) {
+                    return Err(ForgeInstallerError::InvalidForgeProcessor);
+                }
+                referenced.insert(token);
+            }
+            _ => {}
+        }
+    }
+    if quoted {
+        return Err(ForgeInstallerError::InvalidForgeProcessor);
+    }
+    Ok(())
+}
+
+fn valid_processor_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 64
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn processor_builtin_token(token: &str) -> bool {
+    processor_builtin_token_kind(token).is_some()
+}
+
+fn processor_builtin_token_kind(token: &str) -> Option<ProcessorBuiltinToken> {
+    match token {
+        "MINECRAFT_JAR" => Some(ProcessorBuiltinToken::MinecraftJar),
+        "SIDE" => Some(ProcessorBuiltinToken::Side),
+        "MINECRAFT_VERSION" => Some(ProcessorBuiltinToken::MinecraftVersion),
+        "ROOT" => Some(ProcessorBuiltinToken::Root),
+        "LIBRARY_DIR" => Some(ProcessorBuiltinToken::LibraryDir),
+        "INSTALLER" => Some(ProcessorBuiltinToken::Installer),
+        _ => None,
+    }
+}
+
+fn parse_processor_data(value: &str) -> Result<BoundProcessorData, ForgeInstallerError> {
+    if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+        return Err(ForgeInstallerError::InvalidForgeProcessorData);
+    }
+    if value.starts_with('[') || value.ends_with(']') {
+        let coordinate = exact_delimited(value, '[', ']')
+            .ok_or(ForgeInstallerError::InvalidForgeProcessorData)?;
+        return parse_processor_artifact(coordinate).map(BoundProcessorData::Artifact);
+    }
+    if let Some(source_path) = value.strip_prefix('/') {
+        if source_path.is_empty() || source_path.starts_with('/') || source_path.contains('\\') {
+            return Err(ForgeInstallerError::InvalidForgeProcessorData);
+        }
+        let path = ArtifactRelativePath::new(source_path)
+            .map_err(|_| ForgeInstallerError::InvalidForgeProcessorData)?;
+        if path.as_str() != source_path {
+            return Err(ForgeInstallerError::InvalidForgeProcessorData);
+        }
+        return Ok(BoundProcessorData::InstallerData(path));
+    }
+    let literal =
+        exact_delimited(value, '\'', '\'').ok_or(ForgeInstallerError::InvalidForgeProcessorData)?;
+    Ok(BoundProcessorData::Literal(literal.to_string()))
+}
+
+fn validate_processor_sides(sides: &[String]) -> Result<bool, ForgeInstallerError> {
+    let mut seen = HashSet::new();
+    for side in sides {
+        if !matches!(side.as_str(), "client" | "server" | "extract") || !seen.insert(side.as_str())
+        {
+            return Err(ForgeInstallerError::InvalidForgeProcessor);
+        }
+    }
+    Ok(sides.is_empty() || seen.contains("client"))
+}
+
+fn parse_processor_artifact(
+    coordinate: &str,
+) -> Result<BoundProcessorArtifact, ForgeInstallerError> {
+    if coordinate.is_empty() || coordinate.trim() != coordinate {
+        return Err(ForgeInstallerError::InvalidForgeProcessor);
+    }
+    let mut extension_parts = coordinate.split('@');
+    let base = extension_parts
+        .next()
+        .ok_or(ForgeInstallerError::InvalidForgeProcessor)?;
+    if extension_parts
+        .next()
+        .is_some_and(|extension| extension.is_empty())
+        || extension_parts.next().is_some()
+    {
+        return Err(ForgeInstallerError::InvalidForgeProcessor);
+    }
+    let parts = base.split(':').collect::<Vec<_>>();
+    if !matches!(parts.len(), 3 | 4) || parts.iter().any(|part| part.is_empty()) {
+        return Err(ForgeInstallerError::InvalidForgeProcessor);
+    }
+    let relative_path = ArtifactRelativePath::from_path(&maven_to_path(coordinate))
+        .map_err(|_| ForgeInstallerError::InvalidForgeProcessor)?;
+    Ok(BoundProcessorArtifact {
+        coordinate: coordinate.to_string(),
+        relative_path,
+    })
+}
+
+fn parse_processor_argument(
+    arg: &str,
+    data: &BTreeMap<String, BoundProcessorData>,
+    current_outputs: &BTreeMap<String, String>,
+    consumed: &mut BTreeMap<String, String>,
+) -> Result<BoundProcessorArgument, ForgeInstallerError> {
+    if arg.is_empty() || arg.chars().any(char::is_control) {
+        return Err(ForgeInstallerError::InvalidForgeProcessor);
+    }
+    if let Some(coordinate) = exact_delimited(arg, '[', ']') {
+        let artifact = parse_processor_artifact(coordinate)?;
+        let portable = portable_path_key(artifact.relative_path.as_str());
+        if let Some(expected) = current_outputs.get(&portable) {
+            if expected != artifact.relative_path.as_str() {
+                return Err(ForgeInstallerError::ForgeProcessorPortableAlias);
+            }
+            return Ok(BoundProcessorArgument::OutputArtifact(artifact));
+        }
+        record_processor_dependency(consumed, &artifact)?;
+        return Ok(BoundProcessorArgument::Artifact(artifact));
+    }
+
+    let mut chars = arg.chars().peekable();
+    let mut quoted = false;
+    let mut literal = String::new();
+    let mut parts = Vec::new();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => {
+                literal.push(
+                    chars
+                        .next()
+                        .ok_or(ForgeInstallerError::InvalidForgeProcessor)?,
+                );
+            }
+            '\'' => {
+                quoted = !quoted;
+            }
+            '{' if !quoted => {
+                push_processor_literal(&mut parts, &mut literal);
+                let mut token = String::new();
+                loop {
+                    match chars.next() {
+                        Some('}') => break,
+                        Some('{' | '[' | ']') | None => {
+                            return Err(ForgeInstallerError::InvalidForgeProcessor);
+                        }
+                        Some(value) => token.push(value),
+                    }
+                }
+                if !valid_processor_token(&token) {
+                    return Err(ForgeInstallerError::InvalidForgeProcessor);
+                }
+                if let Some(value) = data.get(&token) {
+                    if let BoundProcessorData::Artifact(artifact) = value {
+                        let portable = portable_path_key(artifact.relative_path.as_str());
+                        if let Some(expected) = current_outputs.get(&portable) {
+                            if expected != artifact.relative_path.as_str() {
+                                return Err(ForgeInstallerError::ForgeProcessorPortableAlias);
+                            }
+                            parts.push(BoundProcessorArgumentPart::OutputToken(token));
+                            continue;
+                        }
+                        record_processor_dependency(consumed, artifact)?;
+                    }
+                    parts.push(BoundProcessorArgumentPart::DataToken(token));
+                } else if let Some(token) = processor_builtin_token_kind(&token) {
+                    parts.push(BoundProcessorArgumentPart::BuiltinToken(token));
+                } else {
+                    return Err(ForgeInstallerError::InvalidForgeProcessor);
+                }
+            }
+            '}' | '[' | ']' if !quoted => {
+                return Err(ForgeInstallerError::InvalidForgeProcessor);
+            }
+            value => literal.push(value),
+        }
+    }
+    if quoted {
+        return Err(ForgeInstallerError::InvalidForgeProcessor);
+    }
+    push_processor_literal(&mut parts, &mut literal);
+    if parts.is_empty() {
+        return Err(ForgeInstallerError::InvalidForgeProcessor);
+    }
+    Ok(BoundProcessorArgument::Template(parts))
+}
+
+fn push_processor_literal(parts: &mut Vec<BoundProcessorArgumentPart>, literal: &mut String) {
+    if !literal.is_empty() {
+        parts.push(BoundProcessorArgumentPart::Literal(std::mem::take(literal)));
+    }
+}
+
+fn resolve_processor_output_artifact(
+    value: &str,
+    data: &BTreeMap<String, BoundProcessorData>,
+) -> Result<BoundProcessorArtifact, ForgeInstallerError> {
+    if let Some(coordinate) = exact_delimited(value, '[', ']') {
+        return parse_processor_artifact(coordinate)
+            .map_err(|_| ForgeInstallerError::InvalidForgeProcessorOutput);
+    }
+    let token = exact_delimited(value, '{', '}')
+        .filter(|token| valid_processor_token(token))
+        .ok_or(ForgeInstallerError::InvalidForgeProcessorOutput)?;
+    match data.get(token) {
+        Some(BoundProcessorData::Artifact(artifact)) => Ok(artifact.clone()),
+        Some(BoundProcessorData::InstallerData(_) | BoundProcessorData::Literal(_)) | None => {
+            Err(ForgeInstallerError::InvalidForgeProcessorOutput)
+        }
+    }
+}
+
+fn resolve_processor_output_sha1(
+    value: &str,
+    data: &BTreeMap<String, BoundProcessorData>,
+) -> Result<[u8; 20], ForgeInstallerError> {
+    let declared = if let Some(token) = exact_delimited(value, '{', '}') {
+        if !valid_processor_token(token) {
+            return Err(ForgeInstallerError::InvalidForgeProcessorOutput);
+        }
+        match data.get(token) {
+            Some(BoundProcessorData::Literal(value)) => value.as_str(),
+            Some(BoundProcessorData::Artifact(_) | BoundProcessorData::InstallerData(_)) | None => {
+                return Err(ForgeInstallerError::InvalidForgeProcessorOutput);
+            }
+        }
+    } else {
+        exact_delimited(value, '\'', '\'')
+            .ok_or(ForgeInstallerError::InvalidForgeProcessorOutput)?
+    };
+    if !valid_sha1(declared) {
+        return Err(ForgeInstallerError::InvalidForgeProcessorOutput);
+    }
+    let mut sha1 = [0_u8; 20];
+    for (index, pair) in declared.as_bytes().chunks_exact(2).enumerate() {
+        sha1[index] = hex_nibble(pair[0])
+            .checked_mul(16)
+            .and_then(|high| high.checked_add(hex_nibble(pair[1])))
+            .ok_or(ForgeInstallerError::InvalidForgeProcessorOutput)?;
+    }
+    Ok(sha1)
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => u8::MAX,
+    }
+}
+
+fn exact_delimited(value: &str, open: char, close: char) -> Option<&str> {
+    value
+        .strip_prefix(open)?
+        .strip_suffix(close)
+        .filter(|inner| !inner.is_empty() && !inner.contains(open) && !inner.contains(close))
+}
+
+fn validate_processor_dependency_order(
+    dependencies: &[BTreeMap<String, String>],
+    producers: &HashMap<String, (String, usize, [u8; 20])>,
+    declared: &HashMap<String, String>,
+) -> Result<(), ForgeInstallerError> {
+    let mut edges = vec![Vec::new(); dependencies.len()];
+    for (consumer, inputs) in dependencies.iter().enumerate() {
+        for input in inputs.keys() {
+            if let Some((_, producer, _)) = producers.get(input) {
+                edges[consumer].push(*producer);
+            }
+        }
+    }
+    let mut state = vec![0_u8; edges.len()];
+    for node in 0..edges.len() {
+        if processor_graph_has_cycle(node, &edges, &mut state) {
+            return Err(ForgeInstallerError::ForgeProcessorDependencyCycle);
+        }
+    }
+    for (consumer, inputs) in dependencies.iter().enumerate() {
+        for (input, exact) in inputs {
+            match producers.get(input) {
+                Some((produced, _, _)) if produced != exact => {
+                    return Err(ForgeInstallerError::ForgeProcessorPortableAlias);
+                }
+                Some((_, producer, _)) if *producer >= consumer => {
+                    return Err(ForgeInstallerError::InvalidForgeProcessor);
+                }
+                Some(_) => {}
+                None if declared.get(input).is_some_and(|path| path == exact) => {}
+                None if declared.contains_key(input) => {
+                    return Err(ForgeInstallerError::ForgeProcessorPortableAlias);
+                }
+                None => return Err(ForgeInstallerError::InvalidForgeProcessor),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_processor_dependency(
+    dependencies: &mut BTreeMap<String, String>,
+    artifact: &BoundProcessorArtifact,
+) -> Result<(), ForgeInstallerError> {
+    let portable = portable_path_key(artifact.relative_path.as_str());
+    match dependencies.get(&portable) {
+        Some(existing) if existing != artifact.relative_path.as_str() => {
+            Err(ForgeInstallerError::ForgeProcessorPortableAlias)
+        }
+        Some(_) => Ok(()),
+        None => {
+            dependencies.insert(portable, artifact.relative_path.as_str().to_string());
+            Ok(())
+        }
+    }
+}
+
+fn processor_graph_has_cycle(node: usize, edges: &[Vec<usize>], state: &mut [u8]) -> bool {
+    match state[node] {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    state[node] = 1;
+    if edges[node]
+        .iter()
+        .any(|dependency| processor_graph_has_cycle(*dependency, edges, state))
+    {
+        return true;
+    }
+    state[node] = 2;
+    false
+}
+
+fn extract_authenticated_processor_data(
+    installer: &[u8],
+    requested: &BTreeSet<ArtifactRelativePath>,
+) -> Result<BTreeMap<ArtifactRelativePath, Vec<u8>>, ForgeInstallerError> {
+    if requested.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let requested_portable = requested
+        .iter()
+        .map(|path| (portable_path_key(path.as_str()), path.as_str()))
+        .collect::<HashMap<_, _>>();
+    if requested_portable.len() != requested.len() {
+        return Err(ForgeInstallerError::ForgeProcessorPortableAlias);
+    }
+
+    let mut archive = ZipArchive::new(std::io::Cursor::new(installer))?;
+    let mut located = BTreeMap::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        let authored_name = entry.name();
+        let Ok(source_path) = ArtifactRelativePath::new(authored_name) else {
+            continue;
+        };
+        let portable = portable_path_key(source_path.as_str());
+        let Some(expected) = requested_portable.get(&portable) else {
+            continue;
+        };
+        if authored_name != *expected || entry.is_dir() || authored_name.ends_with('/') {
+            return Err(ForgeInstallerError::ForgeProcessorPortableAlias);
+        }
+        if located.insert(source_path, index).is_some() {
+            return Err(ForgeInstallerError::InvalidForgeProcessorData);
+        }
+    }
+    if located.len() != requested.len() {
+        return Err(ForgeInstallerError::MissingForgeProcessorData);
+    }
+
+    let mut extracted = BTreeMap::new();
+    let mut total = 0_u64;
+    for (path, index) in located {
+        let mut entry = archive.by_index(index)?;
+        if entry.size() > MAX_FORGE_PROCESSOR_DATA_ENTRY_BYTES {
+            return Err(ForgeInstallerError::ForgeProcessorDataEntryTooLarge);
+        }
+        if entry.size() > MAX_FORGE_PROCESSOR_DATA_TOTAL_BYTES.saturating_sub(total) {
+            return Err(ForgeInstallerError::ForgeProcessorDataTooLarge);
+        }
+        let bytes = read_bounded_entry(
+            &mut entry,
+            "processor data",
+            MAX_FORGE_PROCESSOR_DATA_ENTRY_BYTES,
+        )
+        .map_err(|error| match error {
+            ForgeInstallerError::EntryTooLarge { .. } => {
+                ForgeInstallerError::ForgeProcessorDataEntryTooLarge
+            }
+            other => other,
+        })?;
+        total = total
+            .checked_add(bytes.len() as u64)
+            .ok_or(ForgeInstallerError::ForgeProcessorDataTooLarge)?;
+        if total > MAX_FORGE_PROCESSOR_DATA_TOTAL_BYTES {
+            return Err(ForgeInstallerError::ForgeProcessorDataTooLarge);
+        }
+        extracted.insert(path, bytes);
+    }
+    Ok(extracted)
 }
 
 #[derive(Clone, Copy)]
@@ -1107,6 +2037,405 @@ mod tests {
     }
 
     #[test]
+    fn forge_binding_seals_client_outputs_and_ignores_server_only_processors() {
+        let record = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeModern,
+            "1.21.5",
+            "55.0.0",
+        );
+        let (version, mut install) = modern_binding_profiles(&record);
+        install["data"] = serde_json::json!({
+            "BINPATCH": {"client": "/data/client.lzma"},
+            "PATCHED": {"client": "[net.minecraftforge:forge:1.21.5-55.0.0:client]"},
+            "PATCHED_SHA": {"client": "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"},
+            "SERVER_ONLY": {"server": "/data/server.lzma"}
+        });
+        install["libraries"]
+            .as_array_mut()
+            .expect("installer libraries")
+            .extend([serde_json::json!({
+                "name": "net.minecraftforge:binarypatcher:1.1.1:fatjar",
+                "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            })]);
+        install["processors"] = serde_json::json!([
+            {
+                "jar": "net.minecraftforge:binarypatcher:1.1.1:fatjar",
+                "args": ["{BINPATCH}", "{PATCHED}"],
+                "sides": ["client"],
+                "outputs": {"{PATCHED}": "{PATCHED_SHA}"}
+            },
+            {
+                "args": ["{SERVER_ONLY}"],
+                "sides": ["server"]
+            },
+            {
+                "args": ["{SERVER_ONLY}"],
+                "sides": ["extract"]
+            }
+        ]);
+
+        let bound = bind_modern_fixture_with_entries(
+            &record,
+            &version,
+            &install,
+            &[("data/client.lzma", b"patches")],
+        )
+        .expect("authenticated Forge processor plan");
+        let processor_plan = bound.processor_plan.as_ref().expect("Forge authority");
+        assert_eq!(processor_plan.steps.len(), 1);
+        assert_eq!(processor_plan.steps[0].outputs.len(), 1);
+        assert_eq!(processor_plan.installer_data.len(), 1);
+    }
+
+    #[test]
+    fn forge_binding_rejects_runnable_processor_without_outputs() {
+        let record = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeModern,
+            "1.21.5",
+            "55.0.0",
+        );
+        let (version, mut install) = modern_binding_profiles(&record);
+        install["processors"] = serde_json::json!([{
+            "jar": "net.minecraftforge:binarypatcher:1.1.1:fatjar",
+            "sides": ["client"]
+        }]);
+
+        assert!(matches!(
+            bind_modern_fixture_with_entries(&record, &version, &install, &[]),
+            Err(ForgeInstallerError::MissingForgeProcessorOutputs)
+        ));
+    }
+
+    #[test]
+    fn spec_zero_forge_binds_outputs_while_neoforge_keeps_them_non_authoritative() {
+        let forge = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeLegacyInstaller,
+            "1.12.2",
+            "14.23.5.2859",
+        );
+        let (version, mut install) = later_legacy_binding_profiles(&forge);
+        install["libraries"]
+            .as_array_mut()
+            .expect("installer libraries")
+            .push(serde_json::json!({
+                "name": "example:processor:1.0",
+                "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }));
+        install["data"] = serde_json::json!({
+            "PATCHED": {"client": "[net.minecraftforge:forge:1.12.2-14.23.5.2859]"},
+            "PATCHED_SHA": {"client": "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"}
+        });
+        install["processors"] = serde_json::json!([{
+            "jar": "example:processor:1.0",
+            "args": ["{PATCHED}"],
+            "outputs": {"{PATCHED}": "{PATCHED_SHA}"}
+        }]);
+        let bound = bind_modern_fixture_with_entries(&forge, &version, &install, &[])
+            .expect("spec-zero Forge authority");
+        assert!(bound.processor_plan.is_some());
+
+        let neo = binding_record(
+            LoaderComponentId::NeoForge,
+            LoaderInstallStrategy::NeoForgeModern,
+            "1.21.5",
+            "21.5.74",
+        );
+        let (version, mut install) = modern_binding_profiles(&neo);
+        install["processors"] = serde_json::json!([{
+            "jar": "net.neoforged.installertools:installertools:2.1.3"
+        }]);
+        let bound = bind_modern_fixture_with_entries(&neo, &version, &install, &[])
+            .expect("NeoForge semantic binding");
+        assert!(bound.processor_plan.is_none());
+    }
+
+    #[test]
+    fn processor_maps_reject_duplicate_keys_without_echoing_them() {
+        for json in [
+            r#"{"data":{"PRIVATE":{"client":"'a'"},"PRIVATE":{"client":"'b'"}}}"#,
+            r#"{"processors":[{"outputs":{"{PRIVATE}":"a","{PRIVATE}":"b"}}]}"#,
+        ] {
+            let error = serde_json::from_str::<super::InstallProfileDeclarations>(json)
+                .expect_err("duplicate map key");
+            assert!(!error.to_string().contains("PRIVATE"));
+        }
+    }
+
+    #[test]
+    fn processor_binding_rejects_bad_outputs_sides_and_argument_tokens() {
+        let (record, version, install) = forge_processor_fixture();
+        let mut cases = Vec::new();
+
+        let mut bad_digest = install.clone();
+        bad_digest["processors"][0]["outputs"]["{PATCHED}"] = "not-a-sha1".into();
+        cases.push(bad_digest);
+        let mut unquoted_digest = install.clone();
+        unquoted_digest["processors"][0]["outputs"]["{PATCHED}"] =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        cases.push(unquoted_digest);
+        let mut unknown_side = install.clone();
+        unknown_side["processors"][0]["sides"] = serde_json::json!(["client", "unknown"]);
+        cases.push(unknown_side);
+        let mut unknown_token = install.clone();
+        unknown_token["processors"][0]["args"] = serde_json::json!(["{UNKNOWN}"]);
+        cases.push(unknown_token);
+        let mut embedded_artifact = install.clone();
+        embedded_artifact["processors"][0]["args"] = serde_json::json!(["prefix[g:a:1]"]);
+        cases.push(embedded_artifact);
+        let mut unquoted_data = install.clone();
+        unquoted_data["data"]["PATCHED_SHA"]["client"] = "raw-literal".into();
+        cases.push(unquoted_data);
+        let mut unsafe_target = install.clone();
+        unsafe_target["processors"][0]["outputs"] = serde_json::json!({
+            "[example:output:..]":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+        cases.push(unsafe_target);
+        let mut undeclared_input = install.clone();
+        undeclared_input["libraries"]
+            .as_array_mut()
+            .expect("installer libraries")
+            .retain(|library| library["name"] != "example:processor:1.0");
+        cases.push(undeclared_input);
+
+        for case in cases {
+            assert!(bind_modern_fixture_with_entries(&record, &version, &case, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn processor_binding_rejects_aliases_multiple_producers_and_dependency_cycles() {
+        let (record, version, install) = forge_processor_fixture();
+
+        let mut multiple = install.clone();
+        let duplicate = multiple["processors"][0].clone();
+        multiple["processors"]
+            .as_array_mut()
+            .expect("processors")
+            .push(duplicate);
+        assert!(matches!(
+            bind_modern_fixture_with_entries(&record, &version, &multiple, &[]),
+            Err(ForgeInstallerError::MultipleForgeProcessorProducers)
+        ));
+
+        let mut alias = install.clone();
+        alias["processors"][0]["outputs"] = serde_json::json!({
+            "[Example:Output:1.0]": "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+            "[example:output:1.0]": "'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'"
+        });
+        alias["processors"][0]["args"] = serde_json::json!([]);
+        assert!(matches!(
+            bind_modern_fixture_with_entries(&record, &version, &alias, &[]),
+            Err(ForgeInstallerError::ForgeProcessorPortableAlias)
+        ));
+
+        let cycle = cyclic_processor_fixture(&install, true);
+        assert!(matches!(
+            bind_modern_fixture_with_entries(&record, &version, &cycle, &[]),
+            Err(ForgeInstallerError::ForgeProcessorDependencyCycle)
+        ));
+        let forward = cyclic_processor_fixture(&install, false);
+        assert!(matches!(
+            bind_modern_fixture_with_entries(&record, &version, &forward, &[]),
+            Err(ForgeInstallerError::InvalidForgeProcessor)
+        ));
+
+        let mut self_dependency = install.clone();
+        self_dependency["processors"][0]["args"] = serde_json::json!([]);
+        self_dependency["processors"][0]["outputs"] = serde_json::json!({
+            "[example:processor:1.0]":"'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
+        });
+        assert!(matches!(
+            bind_modern_fixture_with_entries(&record, &version, &self_dependency, &[]),
+            Err(ForgeInstallerError::ForgeProcessorDependencyCycle)
+        ));
+
+        let mut prior = cyclic_processor_fixture(&install, true);
+        prior["processors"][0]["args"] = serde_json::json!(["{A}"]);
+        prior["processors"][1]["args"] = serde_json::json!(["{A}", "{B}"]);
+        bind_modern_fixture_with_entries(&record, &version, &prior, &[])
+            .expect("prior authenticated processor output");
+
+        let mut direct_digest = install.clone();
+        direct_digest["processors"][0]["outputs"]["{PATCHED}"] =
+            "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'".into();
+        bind_modern_fixture_with_entries(&record, &version, &direct_digest, &[])
+            .expect("quoted direct output digest");
+    }
+
+    #[test]
+    fn processor_binding_rejects_case_drifted_dependency_authority() {
+        let (record, version, install) = forge_processor_fixture();
+
+        let mut jar_alias = install.clone();
+        jar_alias["processors"][0]["jar"] = "Example:processor:1.0".into();
+        let Err(jar_alias_error) =
+            bind_modern_fixture_with_entries(&record, &version, &jar_alias, &[])
+        else {
+            panic!("case-drifted processor jar was accepted");
+        };
+        assert!(
+            matches!(
+                jar_alias_error,
+                ForgeInstallerError::PortablePathAlias
+                    | ForgeInstallerError::ForgeProcessorPortableAlias
+            ),
+            "unexpected static error variant: {jar_alias_error:?}"
+        );
+
+        let mut classpath_alias = install.clone();
+        classpath_alias["libraries"]
+            .as_array_mut()
+            .expect("installer libraries")
+            .push(serde_json::json!({
+                "name":"example:support:1.0",
+                "sha1":"cccccccccccccccccccccccccccccccccccccccc"
+            }));
+        classpath_alias["processors"][0]["classpath"] = serde_json::json!(["Example:support:1.0"]);
+        assert!(matches!(
+            bind_modern_fixture_with_entries(&record, &version, &classpath_alias, &[]),
+            Err(ForgeInstallerError::PortablePathAlias)
+                | Err(ForgeInstallerError::ForgeProcessorPortableAlias)
+        ));
+
+        let mut current_output_alias = install.clone();
+        current_output_alias["data"]["PATCHED_ALIAS"] = serde_json::json!({
+            "client":"[net.minecraftforge:Forge:1.21.5-55.0.0:client]"
+        });
+        current_output_alias["processors"][0]["args"] = serde_json::json!(["{PATCHED_ALIAS}"]);
+        assert!(matches!(
+            bind_modern_fixture_with_entries(&record, &version, &current_output_alias, &[]),
+            Err(ForgeInstallerError::PortablePathAlias)
+                | Err(ForgeInstallerError::ForgeProcessorPortableAlias)
+        ));
+
+        let mut prior_output_alias = cyclic_processor_fixture(&install, true);
+        prior_output_alias["data"]["A_ALIAS"] =
+            serde_json::json!({"client":"[Example:generated-a:1.0]"});
+        prior_output_alias["processors"][0]["args"] = serde_json::json!(["{A}"]);
+        prior_output_alias["processors"][1]["args"] = serde_json::json!(["{A_ALIAS}", "{B}"]);
+        assert!(matches!(
+            bind_modern_fixture_with_entries(&record, &version, &prior_output_alias, &[]),
+            Err(ForgeInstallerError::PortablePathAlias)
+                | Err(ForgeInstallerError::ForgeProcessorPortableAlias)
+        ));
+    }
+
+    #[test]
+    fn processor_binding_enforces_installer_data_source_and_size_bounds() {
+        let (record, version, mut install) = forge_processor_fixture();
+        install["data"]["BINPATCH"] = serde_json::json!({"client":"/data/client.lzma"});
+        install["processors"][0]["args"] = serde_json::json!(["{BINPATCH}", "{PATCHED}"]);
+
+        assert!(matches!(
+            bind_modern_fixture_with_entries(&record, &version, &install, &[]),
+            Err(ForgeInstallerError::MissingForgeProcessorData)
+        ));
+        assert!(matches!(
+            bind_modern_fixture_with_entries(
+                &record,
+                &version,
+                &install,
+                &[("Data/client.lzma", b"alias")],
+            ),
+            Err(ForgeInstallerError::ForgeProcessorPortableAlias)
+        ));
+        let oversized = vec![b'x'; (super::MAX_FORGE_PROCESSOR_DATA_ENTRY_BYTES + 1) as usize];
+        assert!(matches!(
+            bind_modern_fixture_with_entries(
+                &record,
+                &version,
+                &install,
+                &[("data/client.lzma", oversized.as_slice())],
+            ),
+            Err(ForgeInstallerError::ForgeProcessorDataEntryTooLarge)
+        ));
+    }
+
+    #[test]
+    fn processor_binding_enforces_declaration_count_and_aggregate_data_bounds() {
+        let (record, version, install) = forge_processor_fixture();
+        let mut too_many = install.clone();
+        too_many["processors"] = serde_json::Value::Array(
+            (0..=super::MAX_FORGE_PROCESSORS)
+                .map(|_| serde_json::json!({"sides":["server"]}))
+                .collect(),
+        );
+        assert!(matches!(
+            bind_modern_fixture_with_entries(&record, &version, &too_many, &[]),
+            Err(ForgeInstallerError::TooManyForgeProcessors)
+        ));
+        let too_many_data =
+            serde_json::from_value::<super::InstallProfileDeclarations>(serde_json::json!({
+                "data": (0..=super::MAX_FORGE_PROCESSOR_DATA)
+                    .map(|index| (format!("D{index}"), serde_json::json!({"client":"'x'"})))
+                    .collect::<serde_json::Map<_, _>>()
+            }))
+            .expect("processor data declarations");
+        assert!(matches!(
+            super::bind_forge_processor_plan(&[], &too_many_data, &[], &[]),
+            Err(ForgeInstallerError::TooManyForgeProcessorData)
+        ));
+        let too_many_outputs =
+            serde_json::from_value::<super::InstallProfileDeclarations>(serde_json::json!({
+                "processors":[{
+                    "sides":["server"],
+                    "outputs": (0..=super::MAX_FORGE_PROCESSOR_OUTPUTS)
+                        .map(|index| (
+                            format!("[g:a{index}:1]"),
+                            serde_json::Value::String(
+                                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()
+                            )
+                        ))
+                        .collect::<serde_json::Map<_, _>>()
+                }]
+            }))
+            .expect("processor output declarations");
+        assert!(matches!(
+            super::bind_forge_processor_plan(&[], &too_many_outputs, &[], &[]),
+            Err(ForgeInstallerError::TooManyForgeProcessorOutputs)
+        ));
+        let too_many_args =
+            serde_json::from_value::<super::InstallProfileDeclarations>(serde_json::json!({
+                "processors":[{
+                    "args": vec!["x"; super::MAX_FORGE_PROCESSOR_ARGS + 1],
+                    "sides":["server"]
+                }]
+            }))
+            .expect("processor argument declarations");
+        assert!(matches!(
+            super::bind_forge_processor_plan(&[], &too_many_args, &[], &[]),
+            Err(ForgeInstallerError::ForgeProcessorDeclarationsTooLarge)
+        ));
+
+        let mut aggregate = install.clone();
+        for index in 0..5 {
+            aggregate["data"][format!("FILE_{index}")] =
+                serde_json::json!({"client":format!("/data/{index}.bin")});
+        }
+        aggregate["processors"][0]["args"] = serde_json::Value::Array(
+            (0..5)
+                .map(|index| serde_json::Value::String(format!("{{FILE_{index}}}")))
+                .chain([serde_json::Value::String("{PATCHED}".to_string())])
+                .collect(),
+        );
+        let bytes = vec![b'x'; 900];
+        let entries = (0..5)
+            .map(|index| (format!("data/{index}.bin"), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let borrowed = entries
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), *bytes))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            bind_modern_fixture_with_entries(&record, &version, &aggregate, &borrowed),
+            Err(ForgeInstallerError::ForgeProcessorDataTooLarge)
+        ));
+    }
+
+    #[test]
     fn modern_binding_rejects_effective_identity_root_and_base_override_drift() {
         let record = binding_record(
             LoaderComponentId::Forge,
@@ -1724,6 +3053,57 @@ mod tests {
         (version, install)
     }
 
+    fn forge_processor_fixture() -> (LoaderBuildRecord, serde_json::Value, serde_json::Value) {
+        let record = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeModern,
+            "1.21.5",
+            "55.0.0",
+        );
+        let (version, mut install) = modern_binding_profiles(&record);
+        install["libraries"]
+            .as_array_mut()
+            .expect("installer libraries")
+            .push(serde_json::json!({
+                "name": "example:processor:1.0",
+                "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }));
+        install["data"] = serde_json::json!({
+            "PATCHED": {"client":"[net.minecraftforge:forge:1.21.5-55.0.0:client]"},
+            "PATCHED_SHA": {"client":"'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"}
+        });
+        install["processors"] = serde_json::json!([{
+            "jar": "example:processor:1.0",
+            "args": ["{PATCHED}"],
+            "sides": ["client"],
+            "outputs": {"{PATCHED}":"{PATCHED_SHA}"}
+        }]);
+        (record, version, install)
+    }
+
+    fn cyclic_processor_fixture(base: &serde_json::Value, close_cycle: bool) -> serde_json::Value {
+        let mut install = base.clone();
+        install["data"] = serde_json::json!({
+            "A": {"client":"[example:generated-a:1.0]"},
+            "B": {"client":"[example:generated-b:1.0]"},
+            "SHA_A": {"client":"'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"},
+            "SHA_B": {"client":"'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'"}
+        });
+        install["processors"] = serde_json::json!([
+            {
+                "jar":"example:processor:1.0",
+                "args":["{B}","{A}"],
+                "outputs":{"{A}":"{SHA_A}"}
+            },
+            {
+                "jar":"example:processor:1.0",
+                "args": if close_cycle {serde_json::json!(["{A}","{B}"])} else {serde_json::json!(["{B}"])},
+                "outputs":{"{B}":"{SHA_B}"}
+            }
+        ]);
+        install
+    }
+
     fn legacy_binding_profile(record: &LoaderBuildRecord) -> serde_json::Value {
         let version = format!("{}-{}", record.minecraft_version, record.loader_version);
         let assets = if record.minecraft_version == "1.8.9" {
@@ -1788,13 +3168,26 @@ mod tests {
         version: &serde_json::Value,
         install: &serde_json::Value,
     ) -> Result<(), ForgeInstallerError> {
+        bind_modern_fixture_with_entries(record, version, install, &[]).map(|_| ())
+    }
+
+    fn bind_modern_fixture_with_entries(
+        record: &LoaderBuildRecord,
+        version: &serde_json::Value,
+        install: &serde_json::Value,
+        extra_entries: &[(&str, &[u8])],
+    ) -> Result<super::BoundForgeInstallerPlan, ForgeInstallerError> {
         let version = serde_json::to_vec(version).expect("serialize version profile");
         let install = serde_json::to_vec(install).expect("serialize install profile");
-        let jar = zip_with_entries(&[
+        let mut entries = vec![
             ("version.json", version.as_slice()),
             ("install_profile.json", install.as_slice()),
-        ]);
-        bind_bytes(record, jar)
+        ];
+        entries.extend_from_slice(extra_entries);
+        let jar = zip_with_entries(&entries);
+        let authenticated =
+            plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(jar))?;
+        bind_authenticated_installer_plan(authenticated, record)
     }
 
     fn bind_legacy_fixture(
