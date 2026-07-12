@@ -24,6 +24,7 @@ let pendingCheckToken: symbol | null = null;
 let flowPollTimer: number | null = null;
 
 export const updateFlow = signal<UpdateFlowState>(idleUpdateFlow);
+export const updateRestartRequested = signal(false);
 
 function displayVersion(version: string): string {
   return version.startsWith('v') ? version : `v${version}`;
@@ -127,10 +128,11 @@ export async function restartDesktopApp(): Promise<void> {
     return;
   }
   try {
+    updateRestartRequested.value = true;
     const requested = await requestNativeAppRestart();
     if (!requested) throw new Error('desktop runtime unavailable');
-    toast('Restarting Axial');
   } catch (err: unknown) {
+    updateRestartRequested.value = false;
     toast(`Failed to restart: ${errMessage(err)}`, 'error');
   }
 }

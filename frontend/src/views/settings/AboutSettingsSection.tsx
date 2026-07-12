@@ -19,6 +19,7 @@ import {
   restartDesktopApp,
   startUpdateDownload,
   updateFlow,
+  updateRestartRequested,
 } from '../../updater';
 import { formatBytes } from '../../utils';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
@@ -68,7 +69,9 @@ export function AboutSettingsSection(): JSX.Element {
       : `Downloading ${displayReleaseVersion(latestVersion)}...`
     : flowStaged
       ? flowState.phase === 'restart-pending'
-        ? `Restart Axial to finish updating to ${displayReleaseVersion(latestVersion)}.`
+        ? updateRestartRequested.value
+          ? `Update installed. Axial is restarting into ${displayReleaseVersion(latestVersion)}.`
+          : `Update installed. Restart Axial when you are ready.`
         : `${displayReleaseVersion(latestVersion)} is downloaded and ready to install.`
       : checking
         ? 'Checking for updates...'
@@ -80,6 +83,7 @@ export function AboutSettingsSection(): JSX.Element {
   const visibleUpdate = hasVisibleUpdate() && !flowBusy && !flowStaged;
   const checkedAt = info ? formatUpdateCheckTime(info.checked_at) : 'Not checked yet';
   const restartBlocked = restartBlockedByActivity();
+  const restartRequested = updateRestartRequested.value;
 
   const dismiss = (): void => {
     dismissAvailableUpdate();
@@ -137,8 +141,13 @@ export function AboutSettingsSection(): JSX.Element {
                 Restart to update
               </Button>
             ) : (
-              <Button variant="primary" icon="refresh" onClick={() => void restartDesktopApp()}>
-                Restart now
+              <Button
+                variant="primary"
+                icon="refresh"
+                disabled={restartRequested}
+                onClick={() => void restartDesktopApp()}
+              >
+                {restartRequested ? 'Restarting…' : 'Restart now'}
               </Button>
             )}
             <Button variant="secondary" icon="tag" onClick={() => void openUpdateNotes()}>

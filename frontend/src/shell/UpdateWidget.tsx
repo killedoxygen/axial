@@ -15,6 +15,7 @@ import {
   restartBlockedByActivity,
   restartDesktopApp,
   updateFlow,
+  updateRestartRequested,
 } from '../updater';
 import { formatBytes } from '../utils';
 
@@ -30,6 +31,7 @@ function triggerIcon(phase: UpdateFlowState['phase']): string {
 }
 
 function triggerText(flow: UpdateFlowState): string {
+  if (updateRestartRequested.value) return 'Restarting';
   switch (flow.phase) {
     case 'downloading':
       return flow.percent != null ? `${flow.percent}%` : 'Updating';
@@ -44,6 +46,7 @@ function triggerText(flow: UpdateFlowState): string {
 }
 
 function triggerLabel(flow: UpdateFlowState, latest: string): string {
+  if (updateRestartRequested.value) return 'Update installed, restarting Axial';
   switch (flow.phase) {
     case 'downloading':
       return flow.percent != null ? `Downloading update, ${flow.percent}%` : 'Downloading update';
@@ -71,6 +74,7 @@ function UpdateCard({ latest, onClose }: { latest: string; onClose: () => void }
   const { phase } = flow;
   const inApp = canInstallUpdateInApp();
   const restartBlocked = restartBlockedByActivity();
+  const restartRequested = updateRestartRequested.value;
 
   const title =
     phase === 'downloading'
@@ -82,7 +86,9 @@ function UpdateCard({ latest, onClose }: { latest: string; onClose: () => void }
             ? 'Update ready'
             : 'Restart to install'
           : phase === 'restart-pending'
-            ? 'Restart to finish'
+            ? restartRequested
+              ? 'Restarting Axial'
+              : 'Restart to finish'
             : phase === 'failed'
               ? "Update didn't install"
               : `Update ${latest}`;
@@ -98,7 +104,9 @@ function UpdateCard({ latest, onClose }: { latest: string; onClose: () => void }
   } else if (phase === 'ready') {
     sub = restartBlocked ? 'Waiting for downloads and games to finish.' : `Axial will restart into ${latest}.`;
   } else if (phase === 'restart-pending') {
-    sub = 'Applied. Takes effect on next launch.';
+    sub = restartRequested
+      ? `Update installed. ${latest} will open shortly.`
+      : 'Installed. Restart when you are ready.';
   } else if (phase === 'failed') {
     sub = flow.message || 'Something went wrong while installing.';
     subTone = 'error';
@@ -206,10 +214,11 @@ function UpdateCard({ latest, onClose }: { latest: string; onClose: () => void }
             variant="primary"
             size="sm"
             icon="refresh"
+            disabled={restartRequested}
             style={{ width: '100%' }}
             onClick={() => void restartDesktopApp()}
           >
-            Restart now
+            {restartRequested ? 'Restarting…' : 'Restart now'}
           </Button>
         </div>
       )}

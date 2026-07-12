@@ -747,7 +747,15 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   }
   .cp-update-progress .cp-boot-bar-fill[data-indeterminate='true'],
   .cp-status-slot[data-busy='true'][data-indeterminate='true']::after {
-    left: 30%;
+    left: 0;
+    width: 100%;
+    box-shadow: none;
+  }
+  .cp-update-progress .cp-boot-bar-fill[data-indeterminate='true'] {
+    opacity: 0.45;
+  }
+  .cp-status-slot[data-busy='true'][data-indeterminate='true']::after {
+    opacity: 0.65;
   }
 }
 
