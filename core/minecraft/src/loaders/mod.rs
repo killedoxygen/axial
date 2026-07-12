@@ -34,17 +34,33 @@ pub use types::{
 
 use crate::artifact_path::MAX_ARTIFACT_PATH_SEGMENT_BYTES;
 use crate::download::DownloadProgress;
+use crate::known_good::KnownGoodInstallReceipt;
 use crate::paths::loader_work_dir;
 use std::fs;
 use std::path::{Component, Path};
 
 pub(crate) const MAX_VERSION_ID_BYTES: usize = MAX_ARTIFACT_PATH_SEGMENT_BYTES - ".json".len();
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum LoaderInstallOutcome {
+    KnownGood(Box<KnownGoodInstallReceipt>),
+    PendingAuthority { version_id: String },
+}
+
+impl LoaderInstallOutcome {
+    pub fn version_id(&self) -> &str {
+        match self {
+            Self::KnownGood(receipt) => receipt.version_id(),
+            Self::PendingAuthority { version_id } => version_id,
+        }
+    }
+}
+
 pub async fn install_build<F>(
     library_dir: &Path,
     record: LoaderBuildRecord,
     send: F,
-) -> Result<String, LoaderInstallError>
+) -> Result<LoaderInstallOutcome, LoaderInstallError>
 where
     F: FnMut(DownloadProgress),
 {

@@ -11,6 +11,8 @@ use crate::types::VersionSubjectKind;
 use crate::version_meta::MinecraftVersionMeta;
 use serde::Deserialize;
 
+use super::{ProfileInstallProof, ProfileLibraryProof};
+
 #[derive(Deserialize)]
 struct FabricGameEntry {
     version: String,
@@ -25,7 +27,35 @@ struct FabricLoaderEntry {
 #[derive(Deserialize)]
 struct FabricLoaderVersion {
     version: String,
+    #[serde(default)]
     stable: bool,
+    #[serde(default)]
+    maven: String,
+}
+
+#[derive(Deserialize)]
+struct FabricInstallEntry {
+    loader: FabricLoaderVersion,
+    intermediary: FabricIntermediaryVersion,
+    #[serde(rename = "launcherMeta")]
+    launcher_meta: FabricLauncherMeta,
+}
+
+#[derive(Deserialize)]
+struct FabricIntermediaryVersion {
+    version: String,
+    maven: String,
+}
+
+#[derive(Deserialize)]
+struct FabricLauncherMeta {
+    #[serde(rename = "mainClass")]
+    main_class: FabricMainClass,
+}
+
+#[derive(Deserialize)]
+struct FabricMainClass {
+    client: String,
 }
 
 pub async fn fetch_game_versions()
@@ -42,6 +72,49 @@ pub async fn fetch_game_versions()
             stable_hint: Some(entry.stable),
         })
         .collect())
+}
+
+pub(crate) async fn fetch_profile_install_proof(
+    record: &LoaderBuildRecord,
+) -> Result<ProfileInstallProof, crate::loaders::types::LoaderError> {
+    let entry = fetch_json::<FabricInstallEntry>(&format!(
+        "{FABRIC_META_BASE}/loader/{}/{}",
+        record.minecraft_version, record.loader_version
+    ))
+    .await?;
+    let loader_coordinate = format!("net.fabricmc:fabric-loader:{}", record.loader_version);
+    let intermediary_coordinate = format!("net.fabricmc:intermediary:{}", record.minecraft_version);
+    if entry.loader.version != record.loader_version
+        || entry.intermediary.version != record.minecraft_version
+        || entry.loader.maven != loader_coordinate
+        || entry.intermediary.maven != intermediary_coordinate
+        || entry.launcher_meta.main_class.client.trim().is_empty()
+    {
+        return Err(crate::loaders::types::LoaderError::ProviderDataInvalid {
+            kind: crate::loaders::types::LoaderProviderFailureKind::SchemaInvalid,
+            status: None,
+        });
+    }
+    Ok(ProfileInstallProof {
+        canonical_profile_id: format!(
+            "fabric-loader-{}-{}",
+            record.loader_version, record.minecraft_version
+        ),
+        inherits_from: record.minecraft_version.clone(),
+        client_main_class: entry.launcher_meta.main_class.client,
+        required_libraries: vec![
+            ProfileLibraryProof {
+                coordinate: entry.loader.maven,
+                sha1: None,
+                size: None,
+            },
+            ProfileLibraryProof {
+                coordinate: entry.intermediary.maven,
+                sha1: None,
+                size: None,
+            },
+        ],
+    })
 }
 
 pub async fn fetch_builds(

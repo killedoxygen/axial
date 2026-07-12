@@ -11,6 +11,8 @@ use crate::types::VersionSubjectKind;
 use crate::version_meta::MinecraftVersionMeta;
 use serde::Deserialize;
 
+use super::{ProfileInstallProof, ProfileLibraryProof};
+
 #[derive(Deserialize)]
 struct QuiltGameEntry {
     version: String,
@@ -25,6 +27,48 @@ struct QuiltLoaderEntry {
 #[derive(Deserialize)]
 struct QuiltLoaderVersion {
     version: String,
+    #[serde(default)]
+    maven: String,
+    #[serde(default)]
+    hashes: QuiltHashes,
+    #[serde(rename = "file_size", default)]
+    file_size: i64,
+}
+
+#[derive(Deserialize)]
+struct QuiltInstallEntry {
+    loader: QuiltLoaderVersion,
+    hashed: QuiltMappingVersion,
+    intermediary: QuiltMappingVersion,
+    #[serde(rename = "launcherMeta")]
+    launcher_meta: QuiltLauncherMeta,
+}
+
+#[derive(Deserialize)]
+struct QuiltMappingVersion {
+    version: String,
+    maven: String,
+    #[serde(default)]
+    hashes: QuiltHashes,
+    #[serde(rename = "file_size", default)]
+    file_size: i64,
+}
+
+#[derive(Default, Deserialize)]
+struct QuiltHashes {
+    #[serde(default)]
+    sha1: String,
+}
+
+#[derive(Deserialize)]
+struct QuiltLauncherMeta {
+    #[serde(rename = "mainClass")]
+    main_class: QuiltMainClass,
+}
+
+#[derive(Deserialize)]
+struct QuiltMainClass {
+    client: String,
 }
 
 pub async fn fetch_game_versions()
@@ -41,6 +85,81 @@ pub async fn fetch_game_versions()
             stable_hint: Some(entry.stable),
         })
         .collect())
+}
+
+pub(crate) async fn fetch_profile_install_proof(
+    record: &LoaderBuildRecord,
+) -> Result<ProfileInstallProof, crate::loaders::types::LoaderError> {
+    let entry = fetch_json::<QuiltInstallEntry>(&format!(
+        "{QUILT_META_BASE}/loader/{}/{}",
+        record.minecraft_version, record.loader_version
+    ))
+    .await?;
+    let loader_coordinate = format!("org.quiltmc:quilt-loader:{}", record.loader_version);
+    let hashed_coordinate = format!("org.quiltmc:hashed:{}", record.minecraft_version);
+    let intermediary_coordinate = format!("net.fabricmc:intermediary:{}", record.minecraft_version);
+    if entry.loader.version != record.loader_version
+        || entry.hashed.version != record.minecraft_version
+        || entry.intermediary.version != record.minecraft_version
+        || entry.loader.maven != loader_coordinate
+        || entry.hashed.maven != hashed_coordinate
+        || entry.intermediary.maven != intermediary_coordinate
+        || entry.launcher_meta.main_class.client.trim().is_empty()
+    {
+        return Err(crate::loaders::types::LoaderError::ProviderDataInvalid {
+            kind: crate::loaders::types::LoaderProviderFailureKind::SchemaInvalid,
+            status: None,
+        });
+    }
+    Ok(ProfileInstallProof {
+        canonical_profile_id: format!(
+            "quilt-loader-{}-{}",
+            record.loader_version, record.minecraft_version
+        ),
+        inherits_from: record.minecraft_version.clone(),
+        client_main_class: entry.launcher_meta.main_class.client,
+        required_libraries: vec![
+            profile_library_proof(
+                entry.loader.maven,
+                entry.loader.hashes.sha1,
+                entry.loader.file_size,
+            )?,
+            profile_library_proof(
+                entry.hashed.maven,
+                entry.hashed.hashes.sha1,
+                entry.hashed.file_size,
+            )?,
+            profile_library_proof(
+                entry.intermediary.maven,
+                entry.intermediary.hashes.sha1,
+                entry.intermediary.file_size,
+            )?,
+        ],
+    })
+}
+
+fn profile_library_proof(
+    coordinate: String,
+    sha1: String,
+    file_size: i64,
+) -> Result<ProfileLibraryProof, crate::loaders::types::LoaderError> {
+    let sha1 = (!sha1.is_empty()).then_some(sha1);
+    let size = u64::try_from(file_size).ok().filter(|size| *size > 0);
+    if sha1
+        .as_deref()
+        .is_some_and(|sha1| sha1.len() != 40 || !sha1.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        || sha1.is_some() != size.is_some()
+    {
+        return Err(crate::loaders::types::LoaderError::ProviderDataInvalid {
+            kind: crate::loaders::types::LoaderProviderFailureKind::SchemaInvalid,
+            status: None,
+        });
+    }
+    Ok(ProfileLibraryProof {
+        coordinate,
+        sha1: sha1.map(|sha1| sha1.to_ascii_lowercase()),
+        size,
+    })
 }
 
 pub async fn fetch_builds(
@@ -90,4 +209,34 @@ pub async fn fetch_builds(
             })
             .collect::<Result<Vec<_>, crate::loaders::types::LoaderError>>()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QuiltInstallEntry, profile_library_proof};
+
+    #[test]
+    fn install_metadata_reads_nested_hashes_as_exact_integrity() {
+        let entry: QuiltInstallEntry = serde_json::from_str(
+            r#"{
+                "loader":{"version":"0.29.2","maven":"org.quiltmc:quilt-loader:0.29.2","file_size":42,"hashes":{"sha1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}},
+                "hashed":{"version":"1.21.5","maven":"org.quiltmc:hashed:1.21.5","file_size":43,"hashes":{"sha1":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+                "intermediary":{"version":"1.21.5","maven":"net.fabricmc:intermediary:1.21.5"},
+                "launcherMeta":{"mainClass":{"client":"org.quiltmc.loader.impl.launch.knot.KnotClient"}}
+            }"#,
+        )
+        .expect("Quilt metadata");
+
+        let proof = profile_library_proof(
+            entry.loader.maven,
+            entry.loader.hashes.sha1,
+            entry.loader.file_size,
+        )
+        .expect("loader integrity");
+        assert_eq!(
+            proof.sha1.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(proof.size, Some(42));
+    }
 }

@@ -1,3 +1,6 @@
+use crate::download::{
+    ExpectedIntegrity, LauncherManagedArtifactReadiness, verify_existing_launcher_managed_artifact,
+};
 use crate::launch::{
     ArgumentsSection, AssetIndex, Downloads, JavaVersion, Library, LoggingConf, VersionJson,
     merge_libraries_prefer_first, resolve_version,
@@ -15,6 +18,8 @@ use super::validate_version_id;
 pub struct LoaderProfileFragment {
     #[serde(default)]
     pub id: String,
+    #[serde(rename = "inheritsFrom", default)]
+    pub inherits_from: String,
     #[serde(rename = "type", default)]
     pub kind: String,
     #[serde(rename = "mainClass", default)]
@@ -46,16 +51,18 @@ pub struct LoaderProfileFragment {
 }
 
 pub fn compose_loader_version(
-    mc_dir: &Path,
+    base: &VersionJson,
     base_version_id: &str,
     version_id: &str,
     fragment: &LoaderProfileFragment,
 ) -> Result<VersionJson, LoaderError> {
     validate_version_id(base_version_id, "base minecraft version id")?;
     validate_version_id(version_id, "installed loader version id")?;
-    let base = resolve_version(mc_dir, base_version_id).map_err(|error| {
-        LoaderError::InstallExecutionFailed(format!("resolve base version: {error}"))
-    })?;
+    if base.id != base_version_id || !base.inherits_from.is_empty() || base.materialized {
+        return Err(LoaderError::InvalidProfile(
+            "authenticated base identity does not match loader profile".to_string(),
+        ));
+    }
 
     let mut composed = VersionJson {
         id: version_id.to_string(),
@@ -125,15 +132,33 @@ pub fn compose_loader_version(
     Ok(composed)
 }
 
+pub fn compose_loader_version_from_installed_base(
+    mc_dir: &Path,
+    base_version_id: &str,
+    version_id: &str,
+    fragment: &LoaderProfileFragment,
+) -> Result<VersionJson, LoaderError> {
+    let base = resolve_version(mc_dir, base_version_id).map_err(|error| {
+        LoaderError::InstallExecutionFailed(format!("resolve base version: {error}"))
+    })?;
+    compose_loader_version(&base, base_version_id, version_id, fragment)
+}
+
 pub async fn write_composed_version(
     mc_dir: &Path,
     version_id: &str,
     version: &VersionJson,
+    version_bytes: &[u8],
     base_version_id: &str,
+    authenticated_client: &ExpectedIntegrity,
 ) -> Result<(), LoaderError> {
     validate_version_id(base_version_id, "base minecraft version id")?;
     validate_version_id(version_id, "installed loader version id")?;
-    if version.id != version_id || version.inherits_from != base_version_id || !version.materialized
+    if version.id != version_id
+        || version.inherits_from != base_version_id
+        || !version.materialized
+        || !serde_json::from_slice::<VersionJson>(version_bytes)
+            .is_ok_and(|written| written == *version)
     {
         return Err(LoaderError::InvalidProfile(
             "composed loader profile identity does not match its install target".to_string(),
@@ -145,10 +170,10 @@ pub async fn write_composed_version(
     async_fs::write(&marker, b"installing").await?;
     async_fs::write(
         version_dir.join(format!("{version_id}.json")),
-        serde_json::to_vec_pretty(version)?,
+        version_bytes,
     )
     .await?;
-    link_or_copy_base_jar(mc_dir, base_version_id, version_id).await?;
+    link_or_copy_base_jar(mc_dir, base_version_id, version_id, authenticated_client).await?;
     Ok(())
 }
 
@@ -200,39 +225,66 @@ async fn link_or_copy_base_jar(
     mc_dir: &Path,
     base_version_id: &str,
     version_id: &str,
+    authenticated_client: &ExpectedIntegrity,
 ) -> Result<(), LoaderError> {
     validate_version_id(base_version_id, "base minecraft version id")?;
     validate_version_id(version_id, "installed loader version id")?;
     let base_jar = versions_dir(mc_dir)
         .join(base_version_id)
         .join(format!("{base_version_id}.jar"));
-    if !matches!(async_fs::metadata(&base_jar).await, Ok(metadata) if metadata.is_file()) {
+    if verify_existing_launcher_managed_artifact(&base_jar, authenticated_client)
+        != LauncherManagedArtifactReadiness::Verified
+    {
         return Err(LoaderError::Verify(format!(
-            "base client jar is missing for {base_version_id}"
+            "base client jar is not authenticated for {base_version_id}"
         )));
     }
     let dst_jar = versions_dir(mc_dir)
         .join(version_id)
         .join(format!("{version_id}.jar"));
-    if async_fs::metadata(&dst_jar).await.is_ok() {
+    if verify_existing_launcher_managed_artifact(&dst_jar, authenticated_client)
+        == LauncherManagedArtifactReadiness::Verified
+    {
         return Ok(());
     }
-    match async_fs::hard_link(&base_jar, &dst_jar).await {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            async_fs::copy(base_jar, dst_jar).await?;
-            Ok(())
-        }
+    if async_fs::symlink_metadata(&dst_jar).await.is_ok() {
+        async_fs::remove_file(&dst_jar).await?;
     }
+    if async_fs::hard_link(&base_jar, &dst_jar).await.is_err() {
+        let temp_jar = dst_jar.with_extension("jar.axial-tmp");
+        if async_fs::symlink_metadata(&temp_jar).await.is_ok() {
+            async_fs::remove_file(&temp_jar).await?;
+        }
+        async_fs::copy(&base_jar, &temp_jar).await?;
+        if verify_existing_launcher_managed_artifact(&temp_jar, authenticated_client)
+            != LauncherManagedArtifactReadiness::Verified
+        {
+            let _ = async_fs::remove_file(&temp_jar).await;
+            return Err(LoaderError::Verify(format!(
+                "copied client jar is not authenticated for {version_id}"
+            )));
+        }
+        async_fs::rename(&temp_jar, &dst_jar).await?;
+    }
+    if verify_existing_launcher_managed_artifact(&dst_jar, authenticated_client)
+        != LauncherManagedArtifactReadiness::Verified
+    {
+        let _ = async_fs::remove_file(&dst_jar).await;
+        return Err(LoaderError::Verify(format!(
+            "installed client jar is not authenticated for {version_id}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
-        write_composed_version,
+        LoaderProfileFragment, cleanup_incomplete_version,
+        compose_loader_version_from_installed_base, write_composed_version,
     };
     use crate::LoaderError;
+    use crate::download::ExpectedIntegrity;
     use crate::launch::{AssetIndex, Downloads, JavaVersion, VersionJson, resolve_version};
     use crate::loaders::installed_metadata::INSTALLED_LOADER_METADATA_SCHEMA_VERSION;
     use crate::loaders::{LoaderComponentId, installed_version_id_for};
@@ -287,7 +339,8 @@ mod tests {
         let version_id = installed_version_id_for(LoaderComponentId::Fabric, "1.21.6", "0.16.10")
             .expect("canonical installed id");
         let composed =
-            compose_loader_version(&root, "1.21.6", &version_id, &fragment).expect("compose");
+            compose_loader_version_from_installed_base(&root, "1.21.6", &version_id, &fragment)
+                .expect("compose");
         assert_eq!(composed.asset_index.id, "1.21.6");
         assert_eq!(
             composed.main_class,
@@ -348,7 +401,8 @@ mod tests {
         let version_id = installed_version_id_for(LoaderComponentId::Fabric, "1.21.6", "0.16.10")
             .expect("canonical installed id");
         let composed =
-            compose_loader_version(&root, "1.21.6", &version_id, &fragment).expect("compose");
+            compose_loader_version_from_installed_base(&root, "1.21.6", &version_id, &fragment)
+                .expect("compose");
 
         let asm_libraries = composed
             .libraries
@@ -435,9 +489,16 @@ mod tests {
             logging: None,
         };
 
-        let error = write_composed_version(&root, "loader-test", &version, "../escape")
-            .await
-            .expect_err("traversal should fail");
+        let error = write_composed_version(
+            &root,
+            "loader-test",
+            &version,
+            &serde_json::to_vec_pretty(&version).expect("serialize version"),
+            "../escape",
+            &ExpectedIntegrity::default(),
+        )
+        .await
+        .expect_err("traversal should fail");
 
         assert!(matches!(
             error,
@@ -490,11 +551,19 @@ mod tests {
 
         let version_id = installed_version_id_for(LoaderComponentId::Fabric, "1.21.6", "0.16.10")
             .expect("canonical installed version id");
-        let composed = compose_loader_version(&root, "1.21.6", &version_id, &fragment)
-            .expect("compose loader version");
-        write_composed_version(&root, &version_id, &composed, "1.21.6")
-            .await
-            .expect("write composed version");
+        let composed =
+            compose_loader_version_from_installed_base(&root, "1.21.6", &version_id, &fragment)
+                .expect("compose loader version");
+        write_composed_version(
+            &root,
+            &version_id,
+            &composed,
+            &serde_json::to_vec_pretty(&composed).expect("serialize composed version"),
+            "1.21.6",
+            &expected_integrity(b"base jar"),
+        )
+        .await
+        .expect("write composed version");
         fs::write(
             root.join("versions")
                 .join(&version_id)
@@ -534,6 +603,15 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn expected_integrity(bytes: &[u8]) -> ExpectedIntegrity {
+        use sha1::{Digest as _, Sha1};
+
+        ExpectedIntegrity {
+            size: Some(bytes.len() as u64),
+            sha1: Some(format!("{:x}", Sha1::digest(bytes))),
+        }
     }
 
     fn count_arg_value(values: &[crate::launch::Argument], needle: &str) -> usize {

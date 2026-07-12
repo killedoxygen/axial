@@ -1,14 +1,14 @@
 #[cfg(test)]
 use crate::download::download_libraries_with_facts_and_descriptors;
 use crate::download::{
-    DownloadProgress, Downloader,
+    DownloadProgress, Downloader, ExpectedIntegrity,
     download_libraries_allowing_missing_checksums_with_facts_and_descriptors,
 };
 use crate::known_good::KnownGoodInstallReceipt;
-use crate::launch::{DownloadEntry, VersionJson, resolve_version};
+use crate::launch::{DownloadEntry, VersionJson, library_merge_key, resolve_version};
 use crate::loaders::compose::{
     LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
-    finalize_version_install, write_composed_version,
+    compose_loader_version_from_installed_base, finalize_version_install, write_composed_version,
 };
 use crate::loaders::forge_installer::{
     ExtractedForgeInstaller, extract_installer, extract_maven_entries,
@@ -18,6 +18,7 @@ use crate::loaders::http::fetch_bytes;
 #[cfg(test)]
 use crate::loaders::http::fetch_bytes_for_test as fetch_bytes;
 use crate::loaders::processors::run_processors;
+use crate::loaders::providers::{self, ProfileInstallProof};
 use crate::loaders::types::{LoaderBuildRecord, LoaderError, LoaderInstallPlan};
 use crate::loaders::{
     installed_loader_metadata_bytes, validate_provider_version_id, validate_version_id,
@@ -46,25 +47,36 @@ pub async fn install_from_profile_source<F>(
     plan: &LoaderInstallPlan,
     profile_url: &str,
     send: &mut F,
-) -> Result<String, LoaderError>
+) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
-    let _base_receipt = Box::pin(ensure_base_version(
+    let base_receipt = Box::pin(ensure_base_version(
         library_dir,
         &plan.record.minecraft_version,
         send,
     ))
     .await?;
-    install_profile_source_after_authenticated_base(library_dir, plan, profile_url, send).await
+    let source_proof = providers::fetch_profile_install_proof(&plan.record).await?;
+    Box::pin(install_profile_source_after_authenticated_base(
+        library_dir,
+        plan,
+        profile_url,
+        &base_receipt,
+        &source_proof,
+        send,
+    ))
+    .await
 }
 
 async fn install_profile_source_after_authenticated_base<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
     profile_url: &str,
+    base_receipt: &KnownGoodInstallReceipt,
+    source_proof: &ProfileInstallProof,
     send: &mut F,
-) -> Result<String, LoaderError>
+) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
@@ -75,10 +87,8 @@ where
         Some("Fetching loader profile...".to_string()),
     ));
     let profile_bytes = download_to_memory(profile_url).await?;
-    let fragment = parse_profile_json(&profile_bytes, &plan.record.component_name)?;
-    if !fragment.id.trim().is_empty() {
-        validate_provider_version_id(&fragment.id, "upstream loader profile version id")?;
-    }
+    let mut fragment = parse_profile_json(&profile_bytes, &plan.record.component_name)?;
+    validate_and_enrich_profile_source(&mut fragment, &plan.record, source_proof)?;
     let installed_version_id = plan.record.version_id.clone();
     validate_version_id(&installed_version_id, "installed loader version id")?;
 
@@ -92,7 +102,7 @@ where
     cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
     let version = cleanup_on_error(
         compose_loader_version(
-            library_dir,
+            base_receipt.effective_version(),
             &plan.record.minecraft_version,
             &installed_version_id,
             &fragment,
@@ -100,24 +110,45 @@ where
         library_dir,
         &installed_version_id,
     )?;
+    validate_required_profile_libraries(&version.libraries, source_proof)?;
+    let version_bytes = serde_json::to_vec_pretty(&version)?;
+    let loader_metadata_bytes = installed_loader_metadata_bytes(&plan.record)?;
+    let receipt = cleanup_on_error(
+        KnownGoodInstallReceipt::from_verified_profile_source(
+            base_receipt,
+            &plan.record,
+            version.clone(),
+            &version_bytes,
+            &fragment.libraries,
+            &loader_metadata_bytes,
+        )
+        .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}"))),
+        library_dir,
+        &installed_version_id,
+    )?;
+    let authenticated_client = base_receipt
+        .authenticated_client_integrity()
+        .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
     cleanup_on_error(
         write_composed_version(
             library_dir,
             &installed_version_id,
             &version,
+            &version_bytes,
             &plan.record.minecraft_version,
+            &authenticated_client,
         )
         .await,
         library_dir,
         &installed_version_id,
     )?;
     cleanup_on_error(
-        write_installed_loader_metadata(library_dir, &installed_version_id, &plan.record).await,
-        library_dir,
-        &installed_version_id,
-    )?;
-    cleanup_on_error(
-        verify_install(library_dir, &installed_version_id),
+        write_installed_loader_metadata_bytes(
+            library_dir,
+            &installed_version_id,
+            &loader_metadata_bytes,
+        )
+        .await,
         library_dir,
         &installed_version_id,
     )?;
@@ -132,7 +163,7 @@ where
         &installed_version_id,
     )?;
     send(done());
-    Ok(installed_version_id)
+    Ok(receipt)
 }
 
 // Installer-source loaders require extracting metadata and Maven entries from the installer jar.
@@ -145,19 +176,31 @@ pub async fn install_from_installer_source<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let _base_receipt = Box::pin(ensure_base_version(
+    let base_receipt = Box::pin(ensure_base_version(
         library_dir,
         &plan.record.minecraft_version,
         send,
     ))
     .await?;
-    install_installer_source_after_authenticated_base(library_dir, plan, installer_url, send).await
+    let authenticated_client = base_receipt
+        .authenticated_client_integrity()
+        .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
+    drop(base_receipt);
+    Box::pin(install_installer_source_after_authenticated_base(
+        library_dir,
+        plan,
+        installer_url,
+        &authenticated_client,
+        send,
+    ))
+    .await
 }
 
 async fn install_installer_source_after_authenticated_base<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
     installer_url: &str,
+    authenticated_client: &ExpectedIntegrity,
     send: &mut F,
 ) -> Result<String, LoaderError>
 where
@@ -190,18 +233,21 @@ where
     }
     let installed_version_id = plan.record.version_id.clone();
     validate_version_id(&installed_version_id, "installed loader version id")?;
-    let version = compose_loader_version(
+    let version = compose_loader_version_from_installed_base(
         library_dir,
         &plan.record.minecraft_version,
         &installed_version_id,
         &extracted.version_fragment,
     )?;
+    let version_bytes = serde_json::to_vec_pretty(&version)?;
     cleanup_on_error(
         write_composed_version(
             library_dir,
             &installed_version_id,
             &version,
+            &version_bytes,
             &plan.record.minecraft_version,
+            authenticated_client,
         )
         .await,
         library_dir,
@@ -320,19 +366,31 @@ pub async fn install_from_legacy_archive<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let _base_receipt = Box::pin(ensure_base_version(
+    let base_receipt = Box::pin(ensure_base_version(
         library_dir,
         &plan.record.minecraft_version,
         send,
     ))
     .await?;
-    install_legacy_archive_after_authenticated_base(library_dir, plan, archive_url, send).await
+    let authenticated_client = base_receipt
+        .authenticated_client_integrity()
+        .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
+    drop(base_receipt);
+    Box::pin(install_legacy_archive_after_authenticated_base(
+        library_dir,
+        plan,
+        archive_url,
+        &authenticated_client,
+        send,
+    ))
+    .await
 }
 
 async fn install_legacy_archive_after_authenticated_base<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
     archive_url: &str,
+    authenticated_client: &ExpectedIntegrity,
     send: &mut F,
 ) -> Result<String, LoaderError>
 where
@@ -358,18 +416,21 @@ where
         id: plan.record.version_id.clone(),
         ..LoaderProfileFragment::default()
     };
-    let version = compose_loader_version(
+    let version = compose_loader_version_from_installed_base(
         library_dir,
         &plan.record.minecraft_version,
         &plan.record.version_id,
         &fragment,
     )?;
+    let version_bytes = serde_json::to_vec_pretty(&version)?;
     cleanup_on_error(
         write_composed_version(
             library_dir,
             &plan.record.version_id,
             &version,
+            &version_bytes,
             &plan.record.minecraft_version,
+            authenticated_client,
         )
         .await,
         library_dir,
@@ -553,8 +614,16 @@ async fn write_installed_loader_metadata(
     version_id: &str,
     record: &LoaderBuildRecord,
 ) -> Result<(), LoaderError> {
-    validate_version_id(version_id, "installed loader version id")?;
     let metadata = installed_loader_metadata_bytes(record)?;
+    write_installed_loader_metadata_bytes(library_dir, version_id, &metadata).await
+}
+
+async fn write_installed_loader_metadata_bytes(
+    library_dir: &Path,
+    version_id: &str,
+    metadata: &[u8],
+) -> Result<(), LoaderError> {
+    validate_version_id(version_id, "installed loader version id")?;
     let path = versions_dir(library_dir)
         .join(version_id)
         .join(LOADER_METADATA_FILE);
@@ -572,6 +641,109 @@ fn parse_profile_json(
 ) -> Result<LoaderProfileFragment, LoaderError> {
     serde_json::from_slice::<LoaderProfileFragment>(bytes)
         .map_err(|error| LoaderError::InvalidProfile(format!("{component_name} profile: {error}")))
+}
+
+fn validate_and_enrich_profile_source(
+    fragment: &mut LoaderProfileFragment,
+    record: &LoaderBuildRecord,
+    proof: &ProfileInstallProof,
+) -> Result<(), LoaderError> {
+    validate_provider_version_id(&fragment.id, "upstream loader profile version id")?;
+    if proof.canonical_profile_id != fragment.id
+        || proof.inherits_from != fragment.inherits_from
+        || fragment.inherits_from != record.minecraft_version
+        || proof.client_main_class != fragment.main_class
+        || fragment.main_class.trim().is_empty()
+    {
+        return Err(LoaderError::InvalidProfile(
+            "loader profile identity does not match its live provider proof".to_string(),
+        ));
+    }
+    if (!fragment.kind.is_empty() && fragment.kind != "release")
+        || fragment.asset_index.is_some()
+        || !fragment.assets.is_empty()
+        || fragment.downloads.is_some()
+        || fragment.java_version.is_some()
+        || fragment.logging.is_some()
+    {
+        return Err(LoaderError::InvalidProfile(
+            "loader profile overrides authenticated base-owned metadata".to_string(),
+        ));
+    }
+
+    if proof.required_libraries.is_empty() {
+        return Err(LoaderError::InvalidProfile(
+            "loader profile libraries do not match their live provider proof".to_string(),
+        ));
+    }
+    validate_required_profile_libraries(&fragment.libraries, proof)?;
+    for required in &proof.required_libraries {
+        let library = fragment
+            .libraries
+            .iter_mut()
+            .find(|library| library.name == required.coordinate)
+            .expect("validated required profile library");
+        enrich_library_integrity(library, required)?;
+    }
+    Ok(())
+}
+
+fn validate_required_profile_libraries(
+    libraries: &[crate::launch::Library],
+    proof: &ProfileInstallProof,
+) -> Result<(), LoaderError> {
+    for required in &proof.required_libraries {
+        let required_key = library_merge_key(&required.coordinate);
+        let matching_key = libraries
+            .iter()
+            .filter(|library| library_merge_key(&library.name) == required_key)
+            .collect::<Vec<_>>();
+        if matching_key.len() != 1 || matching_key[0].name != required.coordinate {
+            return Err(LoaderError::InvalidProfile(
+                "loader profile contains a missing, duplicate, or shadowed provider library"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn enrich_library_integrity(
+    library: &mut crate::launch::Library,
+    proof: &crate::loaders::providers::ProfileLibraryProof,
+) -> Result<(), LoaderError> {
+    let (Some(expected_sha1), Some(expected_size)) = (proof.sha1.as_deref(), proof.size) else {
+        return Ok(());
+    };
+    let expected_size = i64::try_from(expected_size).map_err(|_| {
+        LoaderError::InvalidProfile("provider library size is out of range".to_string())
+    })?;
+    if (!library.sha1.is_empty() && !library.sha1.eq_ignore_ascii_case(expected_sha1))
+        || (library.size > 0 && library.size != expected_size)
+    {
+        return Err(LoaderError::InvalidProfile(
+            "loader profile library integrity conflicts with its live provider proof".to_string(),
+        ));
+    }
+    library.sha1 = expected_sha1.to_string();
+    library.size = expected_size;
+    if let Some(artifact) = library
+        .downloads
+        .as_mut()
+        .and_then(|downloads| downloads.artifact.as_mut())
+    {
+        if (!artifact.sha1.is_empty() && !artifact.sha1.eq_ignore_ascii_case(expected_sha1))
+            || (artifact.size > 0 && artifact.size != expected_size)
+        {
+            return Err(LoaderError::InvalidProfile(
+                "loader profile artifact integrity conflicts with its live provider proof"
+                    .to_string(),
+            ));
+        }
+        artifact.sha1 = expected_sha1.to_string();
+        artifact.size = expected_size;
+    }
+    Ok(())
 }
 
 fn validate_legacy_archive(bytes: &[u8]) -> Result<(), ZipError> {
@@ -850,14 +1022,18 @@ mod tests {
         download_loader_libraries_with_evidence, download_profile_loader_libraries_with_evidence,
         ensure_base_version, install_from_installer_source, install_from_legacy_archive,
         install_from_profile_source, install_installer_source_after_authenticated_base,
-        install_legacy_archive_after_authenticated_base,
-        install_profile_source_after_authenticated_base, strip_child_client_jar_meta,
-        write_patched_client_jar_integrity,
+        install_legacy_archive_after_authenticated_base, strip_child_client_jar_meta,
+        validate_and_enrich_profile_source, write_patched_client_jar_integrity,
     };
     use crate::download::{
-        DownloadProgress, ExecutionDownloadFactKind, SelectedDownloadArtifactKind,
+        DownloadProgress, ExecutionDownloadFactKind, ExpectedIntegrity,
+        SelectedDownloadArtifactKind,
     };
-    use crate::launch::{Library, LibraryArtifact, LibraryDownload};
+    use crate::launch::{
+        AssetIndex, Downloads, JavaVersion, Library, LibraryArtifact, LibraryDownload, LoggingConf,
+    };
+    use crate::loaders::compose::LoaderProfileFragment;
+    use crate::loaders::providers::{ProfileInstallProof, ProfileLibraryProof};
     use crate::loaders::types::LoaderError;
     use crate::loaders::types::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
@@ -896,6 +1072,71 @@ mod tests {
         assert!(!version_dir.exists());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn profile_source_requires_exact_live_identity_and_unique_coordinates() {
+        let record = profile_record();
+        let proof = fabric_profile_proof(&record);
+        let mut fragment = fabric_profile_fragment(&record);
+
+        validate_and_enrich_profile_source(&mut fragment, &record, &proof)
+            .expect("exact live profile proof");
+        let loader = fragment
+            .libraries
+            .iter()
+            .find(|library| library.name.starts_with("net.fabricmc:fabric-loader:"))
+            .expect("loader library");
+        assert_eq!(loader.sha1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(loader.size, 42);
+
+        fragment.libraries.push(Library {
+            name: "net.fabricmc:fabric-loader:competing".to_string(),
+            ..Library::default()
+        });
+        assert!(validate_and_enrich_profile_source(&mut fragment, &record, &proof).is_err());
+    }
+
+    #[test]
+    fn profile_source_rejects_identity_drift_and_base_owned_overrides() {
+        let record = profile_record();
+        let proof = fabric_profile_proof(&record);
+
+        let mut variants = Vec::new();
+        let mut fragment = fabric_profile_fragment(&record);
+        fragment.id.push_str("-wrong");
+        variants.push(fragment);
+        let mut fragment = fabric_profile_fragment(&record);
+        fragment.inherits_from = "1.21.4".to_string();
+        variants.push(fragment);
+        let mut fragment = fabric_profile_fragment(&record);
+        fragment.main_class = "wrong.Main".to_string();
+        variants.push(fragment);
+        let mut fragment = fabric_profile_fragment(&record);
+        fragment.kind = "snapshot".to_string();
+        variants.push(fragment);
+        let mut fragment = fabric_profile_fragment(&record);
+        fragment.asset_index = Some(AssetIndex::default());
+        variants.push(fragment);
+        let mut fragment = fabric_profile_fragment(&record);
+        fragment.assets = "legacy".to_string();
+        variants.push(fragment);
+        let mut fragment = fabric_profile_fragment(&record);
+        fragment.downloads = Some(Downloads::default());
+        variants.push(fragment);
+        let mut fragment = fabric_profile_fragment(&record);
+        fragment.java_version = Some(JavaVersion::default());
+        variants.push(fragment);
+        let mut fragment = fabric_profile_fragment(&record);
+        fragment.logging = Some(LoggingConf::default());
+        variants.push(fragment);
+
+        for mut fragment in variants {
+            assert!(
+                validate_and_enrich_profile_source(&mut fragment, &record, &proof).is_err(),
+                "identity drift or base-owned override must fail"
+            );
+        }
     }
 
     #[test]
@@ -1171,84 +1412,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_source_installs_to_backend_version_id_when_upstream_id_differs() {
-        let root = temp_dir("profile-upstream-id-mismatch");
-        write_base_version(&root, "1.21.5");
-        let record = profile_record();
-        let stale_profile_path = root.join("cache/loaders/artifacts/fabric/1.21.5/profile.json");
-        fs::create_dir_all(stale_profile_path.parent().expect("profile parent"))
-            .expect("create stale artifact parent");
-        fs::write(&stale_profile_path, profile_json("stale-profile-id")).expect("stale artifact");
-        let profile_server = TestByteServer::start(profile_json("upstream-profile-id"));
-        let plan = LoaderInstallPlan {
-            record: record.clone(),
-            stage_dir: root.join("stage"),
-        };
-        let mut progress = |_progress: DownloadProgress| {};
-
-        let installed_version_id = install_profile_source_after_authenticated_base(
-            &root,
-            &plan,
-            &profile_server.url,
-            &mut progress,
-        )
-        .await
-        .expect("install profile-backed loader");
-
-        assert_eq!(installed_version_id, record.version_id);
-        assert_backend_version_was_written(&root, &record.version_id, "upstream-profile-id");
-        assert_eq!(profile_server.request_count(), 1);
-        profile_server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn profile_source_does_not_persist_checksumless_authority() {
-        let root = temp_dir("profile-marks-checksumless-libraries");
-        write_base_version(&root, "1.21.5");
-        let library_body = zip_entries(&[("org/quiltmc/loader/impl/QuiltLoader.class", b"loader")]);
-        let library_server = TestByteServer::start(library_body);
-        let record = profile_record();
-        let profile_server = TestByteServer::start(profile_json_with_checksumless_library(
-            "upstream-profile-id",
-            &library_server.url,
-        ));
-        let plan = LoaderInstallPlan {
-            record: record.clone(),
-            stage_dir: root.join("stage"),
-        };
-        let mut progress = |_progress: DownloadProgress| {};
-
-        install_profile_source_after_authenticated_base(
-            &root,
-            &plan,
-            &profile_server.url,
-            &mut progress,
-        )
-        .await
-        .expect("install profile-backed loader");
-
-        let version_json = fs::read(
-            versions_dir(&root)
-                .join(&record.version_id)
-                .join(format!("{}.json", record.version_id)),
-        )
-        .expect("read composed profile");
-        let version: serde_json::Value =
-            serde_json::from_slice(&version_json).expect("parse composed profile");
-        let libraries = version["libraries"].as_array().expect("libraries");
-        assert!(libraries.iter().any(|library| {
-            library["name"] == "org.quiltmc:quilt-loader:0.29.2"
-                && library.get("axialChecksumlessAllowed").is_none()
-        }));
-
-        assert_eq!(profile_server.request_count(), 1);
-        profile_server.stop();
-        library_server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
     async fn installer_source_installs_to_backend_version_id_when_upstream_id_differs() {
         let root = temp_dir("installer-upstream-id-mismatch");
         write_base_version(&root, "1.21.5");
@@ -1264,6 +1427,7 @@ mod tests {
             &root,
             &plan,
             &installer_server.url,
+            &test_client_integrity(&root, &record.minecraft_version),
             &mut progress,
         )
         .await
@@ -1312,6 +1476,7 @@ mod tests {
             &root,
             &plan,
             &installer_server.url,
+            &test_client_integrity(&root, &record.minecraft_version),
             &mut |_| {},
         )
         .await
@@ -1505,6 +1670,7 @@ mod tests {
             &root,
             &plan,
             &installer_server.url,
+            &test_client_integrity(&root, &record.minecraft_version),
             &mut |_| {},
         )
         .await
@@ -1607,6 +1773,7 @@ mod tests {
             &root,
             &plan,
             &server.url,
+            &test_client_integrity(&root, &record.minecraft_version),
             &mut |_progress| {},
         )
         .await
@@ -1723,20 +1890,6 @@ mod tests {
             .into_bytes()
     }
 
-    fn profile_json_with_checksumless_library(id: &str, library_url: &str) -> Vec<u8> {
-        format!(
-            r#"{{
-                "id":"{id}",
-                "mainClass":"org.quiltmc.loader.impl.launch.knot.KnotClient",
-                "libraries":[{{
-                    "name":"org.quiltmc:quilt-loader:0.29.2",
-                    "url":"{library_url}"
-                }}]
-            }}"#
-        )
-        .into_bytes()
-    }
-
     fn write_base_version(root: &std::path::Path, version_id: &str) {
         let version_dir = versions_dir(root).join(version_id);
         fs::create_dir_all(&version_dir).expect("create base version dir");
@@ -1755,6 +1908,19 @@ mod tests {
         .expect("write base version json");
         fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
             .expect("write base jar");
+    }
+
+    fn test_client_integrity(root: &std::path::Path, version_id: &str) -> ExpectedIntegrity {
+        let client = fs::read(
+            versions_dir(root)
+                .join(version_id)
+                .join(format!("{version_id}.jar")),
+        )
+        .expect("read test base client");
+        ExpectedIntegrity {
+            size: Some(client.len() as u64),
+            sha1: Some(sha1_hex(&client)),
+        }
     }
 
     fn assert_backend_version_was_written(
@@ -1802,6 +1968,52 @@ mod tests {
             install_source: LoaderInstallSource::ProfileJson {
                 url: "https://meta.fabricmc.net/profile/json".to_string(),
             },
+        }
+    }
+
+    fn fabric_profile_proof(record: &LoaderBuildRecord) -> ProfileInstallProof {
+        ProfileInstallProof {
+            canonical_profile_id: format!(
+                "fabric-loader-{}-{}",
+                record.loader_version, record.minecraft_version
+            ),
+            inherits_from: record.minecraft_version.clone(),
+            client_main_class: "net.fabricmc.loader.impl.launch.knot.KnotClient".to_string(),
+            required_libraries: vec![
+                ProfileLibraryProof {
+                    coordinate: format!("net.fabricmc:fabric-loader:{}", record.loader_version),
+                    sha1: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                    size: Some(42),
+                },
+                ProfileLibraryProof {
+                    coordinate: format!("net.fabricmc:intermediary:{}", record.minecraft_version),
+                    sha1: None,
+                    size: None,
+                },
+            ],
+        }
+    }
+
+    fn fabric_profile_fragment(record: &LoaderBuildRecord) -> LoaderProfileFragment {
+        LoaderProfileFragment {
+            id: format!(
+                "fabric-loader-{}-{}",
+                record.loader_version, record.minecraft_version
+            ),
+            inherits_from: record.minecraft_version.clone(),
+            kind: "release".to_string(),
+            main_class: "net.fabricmc.loader.impl.launch.knot.KnotClient".to_string(),
+            libraries: vec![
+                Library {
+                    name: format!("net.fabricmc:fabric-loader:{}", record.loader_version),
+                    ..Library::default()
+                },
+                Library {
+                    name: format!("net.fabricmc:intermediary:{}", record.minecraft_version),
+                    ..Library::default()
+                },
+            ],
+            ..LoaderProfileFragment::default()
         }
     }
 

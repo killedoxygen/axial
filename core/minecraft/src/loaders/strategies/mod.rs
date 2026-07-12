@@ -7,6 +7,7 @@ mod neoforge_modern;
 mod quilt_profile;
 
 use crate::download::DownloadProgress;
+use crate::loaders::LoaderInstallOutcome;
 use crate::loaders::types::{LoaderError, LoaderInstallPlan, LoaderInstallStrategy};
 use std::path::Path;
 
@@ -14,7 +15,7 @@ pub async fn install_build<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
     mut send: F,
-) -> Result<String, LoaderError>
+) -> Result<LoaderInstallOutcome, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
@@ -26,21 +27,26 @@ where
             Box::pin(quilt_profile::install(library_dir, plan, &mut send)).await
         }
         LoaderInstallStrategy::ForgeModern => {
-            Box::pin(forge_modern::install(library_dir, plan, &mut send)).await
+            Box::pin(forge_modern::install(library_dir, plan, &mut send))
+                .await
+                .map(|version_id| LoaderInstallOutcome::PendingAuthority { version_id })
         }
-        LoaderInstallStrategy::ForgeLegacyInstaller => {
-            Box::pin(forge_legacy_installer::install(
-                library_dir,
-                plan,
-                &mut send,
-            ))
-            .await
-        }
+        LoaderInstallStrategy::ForgeLegacyInstaller => Box::pin(forge_legacy_installer::install(
+            library_dir,
+            plan,
+            &mut send,
+        ))
+        .await
+        .map(|version_id| LoaderInstallOutcome::PendingAuthority { version_id }),
         LoaderInstallStrategy::ForgeEarliestLegacy => {
-            Box::pin(forge_earliest_legacy::install(library_dir, plan, &mut send)).await
+            Box::pin(forge_earliest_legacy::install(library_dir, plan, &mut send))
+                .await
+                .map(|version_id| LoaderInstallOutcome::PendingAuthority { version_id })
         }
         LoaderInstallStrategy::NeoForgeModern => {
-            Box::pin(neoforge_modern::install(library_dir, plan, &mut send)).await
+            Box::pin(neoforge_modern::install(library_dir, plan, &mut send))
+                .await
+                .map(|version_id| LoaderInstallOutcome::PendingAuthority { version_id })
         }
     }
 }

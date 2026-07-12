@@ -29,7 +29,7 @@ pub use loaders::{
     InstalledLoaderProvenance, LOADER_CATALOG_SCHEMA_VERSION, LoaderArtifactKind,
     LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState,
     LoaderComponentId, LoaderComponentRecord, LoaderError, LoaderGameVersion, LoaderInstallError,
-    LoaderInstallFailureKind, LoaderInstallStrategy, LoaderInstallability,
+    LoaderInstallFailureKind, LoaderInstallOutcome, LoaderInstallStrategy, LoaderInstallability,
     LoaderPreOperationFailureKind, LoaderProviderFailureKind, LoaderSelectionMeta,
     LoaderSelectionReason, LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
     LoaderVersionIndex, build_id_for, fetch_builds, fetch_cached_builds, fetch_components,

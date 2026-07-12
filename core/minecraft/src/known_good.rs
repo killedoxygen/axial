@@ -192,10 +192,12 @@ impl KnownGoodInventory {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct KnownGoodInstallReceipt {
     version_id: KnownGoodId,
     inventory: KnownGoodInventory,
+    effective_version: VersionJson,
+    environment: Environment,
 }
 
 impl KnownGoodInstallReceipt {
@@ -205,6 +207,138 @@ impl KnownGoodInstallReceipt {
 
     pub fn into_inventory(self) -> KnownGoodInventory {
         self.inventory
+    }
+
+    pub(crate) fn effective_version(&self) -> &VersionJson {
+        &self.effective_version
+    }
+
+    pub(crate) fn authenticated_client_integrity(
+        &self,
+    ) -> Result<ExpectedIntegrity, KnownGoodInventoryError> {
+        let client = self
+            .effective_version
+            .downloads
+            .client
+            .as_ref()
+            .ok_or(KnownGoodInventoryError::MissingClient)?;
+        let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
+        expected_integrity(&expected, false, "authenticated client")?;
+        Ok(expected)
+    }
+
+    pub(crate) fn from_verified_profile_source(
+        base: &Self,
+        record: &LoaderBuildRecord,
+        resolved_version: VersionJson,
+        version_bytes: &[u8],
+        profile_libraries: &[Library],
+        loader_metadata_bytes: &[u8],
+    ) -> Result<Self, KnownGoodInventoryError> {
+        if base.version_id.as_str() != record.minecraft_version
+            || base.effective_version.id != record.minecraft_version
+            || resolved_version.id != record.version_id
+            || resolved_version.inherits_from != record.minecraft_version
+            || !resolved_version.materialized
+            || resolved_version.asset_index != base.effective_version.asset_index
+            || resolved_version.assets != base.effective_version.assets
+            || resolved_version.downloads != base.effective_version.downloads
+            || resolved_version.java_version != base.effective_version.java_version
+            || resolved_version.logging != base.effective_version.logging
+            || !serde_json::from_slice::<VersionJson>(version_bytes)
+                .is_ok_and(|version| version == resolved_version)
+        {
+            return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
+        }
+        let component_matches = matches!(
+            (record.component_id, record.strategy),
+            (
+                LoaderComponentId::Fabric,
+                LoaderInstallStrategy::FabricProfile
+            ) | (
+                LoaderComponentId::Quilt,
+                LoaderInstallStrategy::QuiltProfile
+            )
+        );
+        if !component_matches
+            || crate::loaders::api::validate_loader_build_record_identity(record).is_err()
+        {
+            return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
+        }
+
+        let version_id = KnownGoodId::new(&resolved_version.id)?;
+        let mut builder = InventoryBuilder::default();
+        for entry in base.inventory.entries.iter().filter(|entry| {
+            matches!(
+                &entry.root,
+                KnownGoodRoot::Assets | KnownGoodRoot::ManagedRuntime { .. }
+            )
+        }) {
+            builder.insert(entry.clone())?;
+        }
+
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Versions,
+            path: KnownGoodRelativePath::new(&format!("{0}/{0}.json", version_id.as_str()))?,
+            kind: KnownGoodArtifactKind::VersionMetadata,
+            integrity: exact_bytes_integrity(version_bytes),
+        })?;
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Versions,
+            path: KnownGoodRelativePath::new(&format!("{0}/{0}.jar", version_id.as_str()))?,
+            kind: KnownGoodArtifactKind::ClientJar,
+            integrity: expected_integrity(
+                &base.authenticated_client_integrity()?,
+                false,
+                "authenticated client",
+            )?,
+        })?;
+
+        if resolved_version
+            .libraries
+            .len()
+            .saturating_add(profile_libraries.len())
+            > MAX_KNOWN_GOOD_ENTRIES
+        {
+            return Err(KnownGoodInventoryError::InputTooLarge);
+        }
+        let structural_proofs = structural_library_proofs(
+            library_artifact_plans_for(
+                profile_libraries,
+                &base.environment,
+                LibraryChecksumPolicy::AllowMissing,
+            )
+            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?,
+        )?;
+        let libraries = library_artifact_plans_for(
+            &resolved_version.libraries,
+            &base.environment,
+            LibraryChecksumPolicy::Strict,
+        )
+        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+        add_library_plans(&mut builder, libraries, &structural_proofs)?;
+
+        let expected_metadata = installed_loader_metadata_bytes(record)
+            .map_err(|_| KnownGoodInventoryError::MetadataSerialization)?;
+        if expected_metadata != loader_metadata_bytes {
+            return Err(KnownGoodInventoryError::MetadataSerialization);
+        }
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Versions,
+            path: KnownGoodRelativePath::new(&format!(
+                "{}/.axial-loader.json",
+                version_id.as_str()
+            ))?,
+            kind: KnownGoodArtifactKind::LoaderMetadata,
+            integrity: exact_bytes_integrity(loader_metadata_bytes),
+        })?;
+
+        Ok(Self {
+            version_id,
+            inventory: builder.finish(),
+            effective_version: resolved_version,
+            environment: base.environment.clone(),
+        })
     }
 
     pub(crate) fn from_verified_vanilla_source(
@@ -220,10 +354,14 @@ impl KnownGoodInstallReceipt {
         )
         .map_err(|_| KnownGoodInventoryError::VersionMetadataIntegrity)?;
         let version_id = KnownGoodId::new(&input.resolved_version.id)?;
+        let effective_version = input.resolved_version.clone();
+        let environment = input.environment.clone();
         let inventory = derive_known_good_inventory(input)?;
         Ok(Self {
             version_id,
             inventory,
+            effective_version,
+            environment,
         })
     }
 }
@@ -1117,6 +1255,65 @@ mod tests {
             LibraryVerificationIntegrity::MissingChecksum
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn profile_receipt_inventory_keeps_only_the_final_shadowing_library() {
+        let fixture = fixture(FixtureShape::Fabric, false);
+        let record = fixture.loader_record.as_ref().expect("loader record");
+        let profile_library = Library {
+            name: "org.ow2.asm:asm:9.9".to_string(),
+            url: "https://example.invalid/maven/".to_string(),
+            size: 12,
+            ..Library::default()
+        };
+        let mut child = fixture.version.clone();
+        child.inherits_from = record.minecraft_version.clone();
+        child.materialized = true;
+        child.libraries = vec![profile_library.clone()];
+        let mut base_version = child.clone();
+        base_version.id = record.minecraft_version.clone();
+        base_version.inherits_from.clear();
+        base_version.materialized = false;
+        base_version.libraries = vec![checksum_library(
+            "org.ow2.asm:asm:9.6",
+            "org/ow2/asm/asm/9.6/asm-9.6.jar",
+            SHA_A,
+            10,
+        )];
+        let base = KnownGoodInstallReceipt {
+            version_id: KnownGoodId::new(&record.minecraft_version).expect("base id"),
+            inventory: InventoryBuilder::default().finish(),
+            effective_version: base_version,
+            environment: fixture.environment.clone(),
+        };
+        let version_bytes = serde_json::to_vec_pretty(&child).expect("version bytes");
+        let metadata = installed_loader_metadata_bytes(record).expect("loader metadata");
+
+        let receipt = KnownGoodInstallReceipt::from_verified_profile_source(
+            &base,
+            record,
+            child,
+            &version_bytes,
+            &[profile_library],
+            &metadata,
+        )
+        .expect("profile receipt");
+        let inventory = receipt.into_inventory();
+
+        assert!(inventory.entries().iter().any(|entry| {
+            entry.path().as_str() == "org/ow2/asm/asm/9.9/asm-9.9.jar"
+                && matches!(
+                    entry.integrity(),
+                    KnownGoodIntegrity::StructuralJar { size: Some(12) }
+                )
+        }));
+        assert!(
+            !inventory
+                .entries()
+                .iter()
+                .any(|entry| entry.path().as_str().contains("/asm/9.6/"))
+        );
     }
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
