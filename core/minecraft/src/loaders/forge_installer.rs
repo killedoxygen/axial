@@ -6,9 +6,11 @@ use super::types::{
     LoaderInstallStrategy,
 };
 use crate::artifact_path::ArtifactRelativePath;
-use crate::download::DownloadError;
+use crate::download::{DownloadError, LibraryChecksumPolicy, library_artifact_plans_for};
 use crate::launch::{Library, maven_to_path};
+use crate::rules::default_environment;
 use serde::{Deserialize, Deserializer, de};
+use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Write};
@@ -130,6 +132,10 @@ pub enum ForgeInstallerError {
     ForgeProcessorPortableAlias,
     #[error("Forge processor declarations contain a dependency cycle")]
     ForgeProcessorDependencyCycle,
+    #[error("Forge processor input does not have an authenticated artifact contract")]
+    InvalidForgeProcessorArtifactContract,
+    #[error("Forge processor terminal output does not match the final library inventory")]
+    InvalidForgeProcessorFinalOutput,
     #[error("download failed: {0}")]
     Download(#[from] DownloadError),
 }
@@ -153,6 +159,7 @@ struct BoundProcessorPlan {
     steps: Vec<BoundProcessorStep>,
     data: BTreeMap<String, BoundProcessorData>,
     installer_data: BTreeMap<ArtifactRelativePath, Vec<u8>>,
+    input_artifacts: BTreeMap<ArtifactRelativePath, BoundProcessorInputContract>,
 }
 
 struct BoundProcessorStep {
@@ -200,6 +207,26 @@ enum BoundProcessorData {
 struct BoundProcessorOutput {
     artifact: BoundProcessorArtifact,
     sha1: [u8; 20],
+    role: BoundProcessorOutputRole,
+}
+
+#[derive(Clone)]
+struct BoundProcessorInputContract {
+    sha1: [u8; 20],
+    size: Option<u64>,
+    source: BoundProcessorInputSource,
+}
+
+#[derive(Clone, Copy)]
+enum BoundProcessorInputSource {
+    Download,
+    Embedded,
+}
+
+#[derive(Clone, Copy)]
+enum BoundProcessorOutputRole {
+    Intermediate,
+    Terminal { expected_size: Option<u64> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -657,10 +684,15 @@ impl BoundProcessorPlan {
                     }
                 })
                 && !step.outputs.is_empty()
-                && step
-                    .outputs
-                    .iter()
-                    .all(|output| processor_artifact_is_valid(&output.artifact))
+                && step.outputs.iter().all(|output| {
+                    processor_artifact_is_valid(&output.artifact)
+                        && match output.role {
+                            BoundProcessorOutputRole::Intermediate => true,
+                            BoundProcessorOutputRole::Terminal { expected_size } => {
+                                expected_size.is_none_or(|size| size > 0)
+                            }
+                        }
+                })
         }) && self.data.iter().all(|(key, value)| {
             valid_processor_token(key)
                 && match value {
@@ -672,6 +704,13 @@ impl BoundProcessorPlan {
                 }
         }) && self.installer_data.iter().all(|(path, bytes)| {
             !path.as_str().is_empty() && bytes.len() as u64 <= MAX_FORGE_PROCESSOR_DATA_ENTRY_BYTES
+        }) && self.input_artifacts.iter().all(|(path, contract)| {
+            !path.as_str().is_empty()
+                && contract.size.is_none_or(|size| size > 0)
+                && matches!(
+                    contract.source,
+                    BoundProcessorInputSource::Download | BoundProcessorInputSource::Embedded
+                )
         })
     }
 }
@@ -703,7 +742,7 @@ fn bind_forge_processor_plan(
         return Err(ForgeInstallerError::TooManyForgeProcessorOutputs);
     }
     validate_processor_declaration_bounds(profile)?;
-    let declared_artifacts = declared_processor_artifacts(libraries, embedded)?;
+    let artifact_contracts = resolved_processor_artifact_contracts(libraries, embedded)?;
 
     validate_processor_data_keys(&profile.data)?;
     let referenced_data = referenced_client_processor_data(profile)?;
@@ -727,7 +766,7 @@ fn bind_forge_processor_plan(
     let installer_data = extract_authenticated_processor_data(installer, &requested_data)?;
 
     let mut steps = Vec::new();
-    let mut producers = HashMap::<String, (String, usize, [u8; 20])>::new();
+    let mut producers = HashMap::<String, (String, usize)>::new();
     let mut dependencies = Vec::<BTreeMap<String, String>>::new();
     for declaration in &profile.processors {
         let is_client = validate_processor_sides(&declaration.sides)?;
@@ -751,10 +790,13 @@ fn bind_forge_processor_plan(
             let artifact = resolve_processor_output_artifact(target, &data)?;
             let sha1 = resolve_processor_output_sha1(sha1, &data)?;
             let portable = portable_path_key(artifact.relative_path.as_str());
-            let output = BoundProcessorOutput { artifact, sha1 };
-            let output_sha1 = output.sha1;
+            let output = BoundProcessorOutput {
+                artifact,
+                sha1,
+                role: BoundProcessorOutputRole::Intermediate,
+            };
             match producers.get(&portable) {
-                Some((existing, _, _)) if existing == output.artifact.relative_path.as_str() => {
+                Some((existing, _)) if existing == output.artifact.relative_path.as_str() => {
                     return Err(ForgeInstallerError::MultipleForgeProcessorProducers);
                 }
                 Some(_) => return Err(ForgeInstallerError::ForgeProcessorPortableAlias),
@@ -764,7 +806,6 @@ fn bind_forge_processor_plan(
                         (
                             output.artifact.relative_path.as_str().to_string(),
                             step_index,
-                            output_sha1,
                         ),
                     );
                 }
@@ -792,11 +833,21 @@ fn bind_forge_processor_plan(
         });
     }
 
-    validate_processor_dependency_order(&dependencies, &producers, &declared_artifacts)?;
+    let (input_artifacts, consumed_outputs) = bind_processor_dependency_contracts(
+        &dependencies,
+        &producers,
+        &artifact_contracts.external_inputs,
+    )?;
+    classify_processor_outputs(
+        &mut steps,
+        &consumed_outputs,
+        &artifact_contracts.final_inventory,
+    )?;
     let plan = BoundProcessorPlan {
         steps,
         data,
         installer_data,
+        input_artifacts,
     };
     if !plan.is_structurally_complete() {
         return Err(ForgeInstallerError::InvalidForgeProcessor);
@@ -848,57 +899,147 @@ fn validate_processor_declaration_bounds(
     Ok(())
 }
 
-fn declared_processor_artifacts(
+struct ResolvedProcessorArtifactContracts {
+    external_inputs: HashMap<String, ExactProcessorInputContract>,
+    final_inventory: HashMap<String, ExactProcessorFinalContract>,
+}
+
+#[derive(Clone)]
+struct ExactProcessorInputContract {
+    path: ArtifactRelativePath,
+    contract: BoundProcessorInputContract,
+}
+
+struct ExactProcessorFinalContract {
+    path: ArtifactRelativePath,
+    sha1: Option<[u8; 20]>,
+    size: Option<u64>,
+}
+
+fn resolved_processor_artifact_contracts(
     libraries: &[Library],
     embedded: &[AuthenticatedEmbeddedMavenArtifact],
-) -> Result<HashMap<String, String>, ForgeInstallerError> {
-    let mut declared = HashMap::new();
-    for artifact in embedded {
-        insert_unique_processor_artifact(&mut declared, artifact.relative_path())?;
+) -> Result<ResolvedProcessorArtifactContracts, ForgeInstallerError> {
+    let plans = library_artifact_plans_for(
+        libraries,
+        &default_environment(),
+        LibraryChecksumPolicy::Strict,
+    )
+    .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?;
+    let mut external_inputs = HashMap::new();
+    let mut final_inventory = HashMap::new();
+    for plan in plans {
+        let sha1 = match plan.expected.sha1.as_deref() {
+            Some(value) => Some(
+                decode_sha1(value)
+                    .ok_or(ForgeInstallerError::InvalidForgeProcessorArtifactContract)?,
+            ),
+            None => None,
+        };
+        if let Some(sha1) = sha1
+            && plan.source_url.is_some()
+        {
+            let input = ExactProcessorInputContract {
+                path: plan.relative_path.clone(),
+                contract: BoundProcessorInputContract {
+                    sha1,
+                    size: plan.expected.size,
+                    source: BoundProcessorInputSource::Download,
+                },
+            };
+            insert_exact_input_contract(&mut external_inputs, input)?;
+        }
+        insert_exact_final_contract(
+            &mut final_inventory,
+            ExactProcessorFinalContract {
+                path: plan.relative_path,
+                sha1,
+                size: plan.expected.size,
+            },
+        )?;
     }
-    for library in libraries {
-        let artifact = parse_processor_artifact(&library.name)?;
-        if library_declares_integrity(library, &artifact.relative_path) {
-            insert_unique_processor_artifact(&mut declared, &artifact.relative_path)?;
+    for artifact in embedded {
+        let mut sha1 = [0_u8; 20];
+        sha1.copy_from_slice(&Sha1::digest(artifact.bytes()));
+        let embedded_contract = ExactProcessorInputContract {
+            path: artifact.relative_path().clone(),
+            contract: BoundProcessorInputContract {
+                sha1,
+                size: Some(artifact.bytes().len() as u64),
+                source: BoundProcessorInputSource::Embedded,
+            },
+        };
+        let portable = portable_path_key(embedded_contract.path.as_str());
+        if let Some(final_contract) = final_inventory.get(&portable)
+            && (final_contract.path != embedded_contract.path
+                || final_contract
+                    .sha1
+                    .is_some_and(|sha1| sha1 != embedded_contract.contract.sha1)
+                || final_contract
+                    .size
+                    .is_some_and(|size| Some(size) != embedded_contract.contract.size))
+        {
+            return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
+        }
+        if let Some(existing) = external_inputs.get(&portable) {
+            if existing.path != embedded_contract.path
+                || existing.contract.sha1 != embedded_contract.contract.sha1
+                || existing
+                    .contract
+                    .size
+                    .is_some_and(|size| Some(size) != embedded_contract.contract.size)
+            {
+                return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
+            }
+            external_inputs.insert(portable, embedded_contract);
+        } else {
+            insert_exact_input_contract(&mut external_inputs, embedded_contract)?;
         }
     }
-    Ok(declared)
+    Ok(ResolvedProcessorArtifactContracts {
+        external_inputs,
+        final_inventory,
+    })
 }
 
-fn library_declares_integrity(library: &Library, path: &ArtifactRelativePath) -> bool {
-    valid_sha1(&library.sha1)
-        || (library.sha256.len() == 64
-            && library.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        || library
-            .checksums
-            .iter()
-            .any(|checksum| valid_sha1(checksum))
-        || library.downloads.as_ref().is_some_and(|downloads| {
-            downloads.artifact.as_ref().is_some_and(|artifact| {
-                artifact.path == path.as_str() && valid_sha1(&artifact.sha1)
-            }) || downloads
-                .classifiers
-                .values()
-                .any(|artifact| artifact.path == path.as_str() && valid_sha1(&artifact.sha1))
-        })
-}
-
-fn valid_sha1(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn insert_unique_processor_artifact(
-    declared: &mut HashMap<String, String>,
-    path: &ArtifactRelativePath,
+fn insert_exact_input_contract(
+    contracts: &mut HashMap<String, ExactProcessorInputContract>,
+    contract: ExactProcessorInputContract,
 ) -> Result<(), ForgeInstallerError> {
-    let portable = portable_path_key(path.as_str());
-    match declared.get(&portable) {
-        Some(existing) if existing != path.as_str() => {
+    let portable = portable_path_key(contract.path.as_str());
+    match contracts.get(&portable) {
+        Some(existing) if existing.path != contract.path => {
             Err(ForgeInstallerError::ForgeProcessorPortableAlias)
+        }
+        Some(existing)
+            if existing.contract.sha1 != contract.contract.sha1
+                || existing.contract.size != contract.contract.size =>
+        {
+            Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract)
         }
         Some(_) => Ok(()),
         None => {
-            declared.insert(portable, path.as_str().to_string());
+            contracts.insert(portable, contract);
+            Ok(())
+        }
+    }
+}
+
+fn insert_exact_final_contract(
+    contracts: &mut HashMap<String, ExactProcessorFinalContract>,
+    contract: ExactProcessorFinalContract,
+) -> Result<(), ForgeInstallerError> {
+    let portable = portable_path_key(contract.path.as_str());
+    match contracts.get(&portable) {
+        Some(existing) if existing.path != contract.path => {
+            Err(ForgeInstallerError::ForgeProcessorPortableAlias)
+        }
+        Some(existing) if existing.sha1 != contract.sha1 || existing.size != contract.size => {
+            Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract)
+        }
+        Some(_) => Ok(()),
+        None => {
+            contracts.insert(portable, contract);
             Ok(())
         }
     }
@@ -1202,17 +1343,20 @@ fn resolve_processor_output_sha1(
         exact_delimited(value, '\'', '\'')
             .ok_or(ForgeInstallerError::InvalidForgeProcessorOutput)?
     };
-    if !valid_sha1(declared) {
-        return Err(ForgeInstallerError::InvalidForgeProcessorOutput);
+    decode_sha1(declared).ok_or(ForgeInstallerError::InvalidForgeProcessorOutput)
+}
+
+fn decode_sha1(value: &str) -> Option<[u8; 20]> {
+    if value.len() != 40 {
+        return None;
     }
     let mut sha1 = [0_u8; 20];
-    for (index, pair) in declared.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
         sha1[index] = hex_nibble(pair[0])
-            .checked_mul(16)
-            .and_then(|high| high.checked_add(hex_nibble(pair[1])))
-            .ok_or(ForgeInstallerError::InvalidForgeProcessorOutput)?;
+            .checked_mul(16)?
+            .checked_add(hex_nibble(pair[1]))?;
     }
-    Ok(sha1)
+    Some(sha1)
 }
 
 fn hex_nibble(byte: u8) -> u8 {
@@ -1231,15 +1375,21 @@ fn exact_delimited(value: &str, open: char, close: char) -> Option<&str> {
         .filter(|inner| !inner.is_empty() && !inner.contains(open) && !inner.contains(close))
 }
 
-fn validate_processor_dependency_order(
+fn bind_processor_dependency_contracts(
     dependencies: &[BTreeMap<String, String>],
-    producers: &HashMap<String, (String, usize, [u8; 20])>,
-    declared: &HashMap<String, String>,
-) -> Result<(), ForgeInstallerError> {
+    producers: &HashMap<String, (String, usize)>,
+    external: &HashMap<String, ExactProcessorInputContract>,
+) -> Result<
+    (
+        BTreeMap<ArtifactRelativePath, BoundProcessorInputContract>,
+        HashSet<String>,
+    ),
+    ForgeInstallerError,
+> {
     let mut edges = vec![Vec::new(); dependencies.len()];
     for (consumer, inputs) in dependencies.iter().enumerate() {
         for input in inputs.keys() {
-            if let Some((_, producer, _)) = producers.get(input) {
+            if let Some((_, producer)) = producers.get(input) {
                 edges[consumer].push(*producer);
             }
         }
@@ -1250,22 +1400,62 @@ fn validate_processor_dependency_order(
             return Err(ForgeInstallerError::ForgeProcessorDependencyCycle);
         }
     }
+    let mut input_contracts = BTreeMap::new();
+    let mut consumed_outputs = HashSet::new();
     for (consumer, inputs) in dependencies.iter().enumerate() {
         for (input, exact) in inputs {
             match producers.get(input) {
-                Some((produced, _, _)) if produced != exact => {
+                Some((produced, _)) if produced != exact => {
                     return Err(ForgeInstallerError::ForgeProcessorPortableAlias);
                 }
-                Some((_, producer, _)) if *producer >= consumer => {
+                Some((_, producer)) if *producer >= consumer => {
                     return Err(ForgeInstallerError::InvalidForgeProcessor);
                 }
-                Some(_) => {}
-                None if declared.get(input).is_some_and(|path| path == exact) => {}
-                None if declared.contains_key(input) => {
+                Some(_) => {
+                    consumed_outputs.insert(input.clone());
+                }
+                None if external
+                    .get(input)
+                    .is_some_and(|contract| contract.path.as_str() == exact) =>
+                {
+                    let contract = external
+                        .get(input)
+                        .ok_or(ForgeInstallerError::InvalidForgeProcessorArtifactContract)?;
+                    input_contracts.insert(contract.path.clone(), contract.contract.clone());
+                }
+                None if external.contains_key(input) => {
                     return Err(ForgeInstallerError::ForgeProcessorPortableAlias);
                 }
-                None => return Err(ForgeInstallerError::InvalidForgeProcessor),
+                None => {
+                    return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
+                }
             }
+        }
+    }
+    Ok((input_contracts, consumed_outputs))
+}
+
+fn classify_processor_outputs(
+    steps: &mut [BoundProcessorStep],
+    consumed_outputs: &HashSet<String>,
+    final_inventory: &HashMap<String, ExactProcessorFinalContract>,
+) -> Result<(), ForgeInstallerError> {
+    for output in steps.iter_mut().flat_map(|step| &mut step.outputs) {
+        let portable = portable_path_key(output.artifact.relative_path.as_str());
+        let consumed_by_later_step = consumed_outputs.contains(&portable);
+        if let Some(contract) = final_inventory.get(&portable) {
+            if contract.path != output.artifact.relative_path
+                || contract.sha1.is_some_and(|sha1| sha1 != output.sha1)
+            {
+                return Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput);
+            }
+            output.role = BoundProcessorOutputRole::Terminal {
+                expected_size: contract.size,
+            };
+        } else if consumed_by_later_step {
+            output.role = BoundProcessorOutputRole::Intermediate;
+        } else {
+            return Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput);
         }
     }
     Ok(())
@@ -2056,7 +2246,7 @@ mod tests {
             .expect("installer libraries")
             .extend([serde_json::json!({
                 "name": "net.minecraftforge:binarypatcher:1.1.1:fatjar",
-                "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                "sha1":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             })]);
         install["processors"] = serde_json::json!([
             {
@@ -2122,7 +2312,7 @@ mod tests {
             .expect("installer libraries")
             .push(serde_json::json!({
                 "name": "example:processor:1.0",
-                "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                "sha1":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             }));
         install["data"] = serde_json::json!({
             "PATCHED": {"client": "[net.minecraftforge:forge:1.12.2-14.23.5.2859]"},
@@ -2202,6 +2392,228 @@ mod tests {
 
         for case in cases {
             assert!(bind_modern_fixture_with_entries(&record, &version, &case, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn processor_binding_requires_selected_current_environment_input_contracts() {
+        let (record, version, install) = forge_processor_fixture();
+
+        let mut rule_excluded = install.clone();
+        rule_excluded["libraries"]
+            .as_array_mut()
+            .expect("installer libraries")
+            .last_mut()
+            .expect("processor library")["rules"] = serde_json::json!([{"action":"disallow"}]);
+
+        let mut divergent_path = install.clone();
+        *divergent_path["libraries"]
+            .as_array_mut()
+            .expect("installer libraries")
+            .last_mut()
+            .expect("processor library") = serde_json::json!({
+            "name":"example:processor:1.0",
+            "downloads":{"artifact":{
+                "path":"example/other/1.0/other-1.0.jar",
+                "sha1":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "url":"https://example.test/other.jar"
+            }}
+        });
+
+        let mut sha256_only = install.clone();
+        *sha256_only["libraries"]
+            .as_array_mut()
+            .expect("installer libraries")
+            .last_mut()
+            .expect("processor library") = serde_json::json!({
+            "name":"example:processor:1.0",
+            "sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        });
+
+        for invalid in [rule_excluded, divergent_path, sha256_only] {
+            assert!(matches!(
+                bind_modern_fixture_with_entries(&record, &version, &invalid, &[]),
+                Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract)
+            ));
+        }
+    }
+
+    #[test]
+    fn processor_binding_accepts_downloader_verified_legacy_maven_sha1() {
+        let (record, version, mut install) = forge_processor_fixture();
+        *install["libraries"]
+            .as_array_mut()
+            .expect("installer libraries")
+            .last_mut()
+            .expect("processor library") = serde_json::json!({
+            "name":"example:processor:1.0",
+            "sha1":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        });
+
+        bind_modern_fixture_with_entries(&record, &version, &install, &[])
+            .expect("legacy Maven SHA-1 is part of the downloader contract");
+    }
+
+    #[test]
+    fn processor_binding_accepts_retained_authenticated_embedded_input() {
+        let (record, version, mut install) = forge_processor_fixture();
+        *install["libraries"]
+            .as_array_mut()
+            .expect("installer libraries")
+            .last_mut()
+            .expect("processor library") = serde_json::json!({"name":"example:processor:1.0"});
+
+        let bound = bind_modern_fixture_with_entries(
+            &record,
+            &version,
+            &install,
+            &[(
+                "maven/example/processor/1.0/processor-1.0.jar",
+                b"processor",
+            )],
+        )
+        .expect("embedded processor input contract");
+        let plan = bound.processor_plan.as_ref().expect("processor plan");
+        let contract = plan
+            .input_artifacts
+            .values()
+            .next()
+            .expect("bound input contract");
+        assert!(matches!(
+            contract.source,
+            super::BoundProcessorInputSource::Embedded
+        ));
+        assert_eq!(contract.size, Some(9));
+    }
+
+    #[test]
+    fn processor_binding_rejects_non_inventory_and_conflicting_terminal_outputs() {
+        let (record, version, install) = forge_processor_fixture();
+
+        let mut non_inventory = install.clone();
+        non_inventory["data"]["PATCHED"]["client"] = "[example:unmanaged:1.0]".into();
+        assert!(matches!(
+            bind_modern_fixture_with_entries(&record, &version, &non_inventory, &[]),
+            Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput)
+        ));
+
+        let mut conflicting_version = version;
+        conflicting_version["libraries"][1]["sha1"] =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        let mut conflicting_digest = install;
+        conflicting_digest["data"]["PATCHED_SHA"]["client"] =
+            "'cccccccccccccccccccccccccccccccccccccccc'".into();
+        assert!(matches!(
+            bind_modern_fixture_with_entries(
+                &record,
+                &conflicting_version,
+                &conflicting_digest,
+                &[],
+            ),
+            Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput)
+        ));
+    }
+
+    #[test]
+    fn processor_output_digest_authenticates_checksumless_selected_final_library() {
+        let (record, version, install) = forge_processor_fixture();
+
+        let bound = bind_modern_fixture_with_entries(&record, &version, &install, &[])
+            .expect("processor output supplies final SHA-1 authority");
+        let plan = bound.processor_plan.as_ref().expect("processor plan");
+        assert!(matches!(
+            plan.steps[0].outputs[0].role,
+            super::BoundProcessorOutputRole::Terminal {
+                expected_size: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn processor_binding_classifies_consumed_outputs_as_intermediate_only() {
+        let (record, version, mut install) = forge_processor_fixture();
+        install["data"]["INTERMEDIATE"] =
+            serde_json::json!({"client":"[example:intermediate:1.0]"});
+        install["data"]["INTERMEDIATE_SHA"] = serde_json::json!({
+            "client":"'cccccccccccccccccccccccccccccccccccccccc'"
+        });
+        install["processors"] = serde_json::json!([
+            {
+                "jar":"example:processor:1.0",
+                "args":["{INTERMEDIATE}"],
+                "outputs":{"{INTERMEDIATE}":"{INTERMEDIATE_SHA}"}
+            },
+            {
+                "jar":"example:processor:1.0",
+                "args":["{INTERMEDIATE}","{PATCHED}"],
+                "outputs":{"{PATCHED}":"{PATCHED_SHA}"}
+            }
+        ]);
+
+        let bound = bind_modern_fixture_with_entries(&record, &version, &install, &[])
+            .expect("bound processor chain");
+        let plan = bound.processor_plan.as_ref().expect("processor plan");
+        assert!(matches!(
+            plan.steps[0].outputs[0].role,
+            super::BoundProcessorOutputRole::Intermediate
+        ));
+        assert!(matches!(
+            plan.steps[1].outputs[0].role,
+            super::BoundProcessorOutputRole::Terminal {
+                expected_size: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn processor_output_can_be_both_final_inventory_and_a_later_input() {
+        let (record, version, mut install) = forge_processor_fixture();
+        install["data"]["FIRST"] = serde_json::json!({"client":"[example:first:1.0]"});
+        install["data"]["FIRST_SHA"] = serde_json::json!({
+            "client":"'cccccccccccccccccccccccccccccccccccccccc'"
+        });
+        install["libraries"]
+            .as_array_mut()
+            .expect("installer libraries")
+            .push(serde_json::json!({
+                "name":"example:first:1.0",
+                "sha1":"cccccccccccccccccccccccccccccccccccccccc",
+                "size":2
+            }));
+        install["processors"] = serde_json::json!([
+            {
+                "jar":"example:processor:1.0",
+                "args":["{FIRST}"],
+                "outputs":{"{FIRST}":"{FIRST_SHA}"}
+            },
+            {
+                "jar":"example:processor:1.0",
+                "args":["{FIRST}","{PATCHED}"],
+                "outputs":{"{PATCHED}":"{PATCHED_SHA}"}
+            }
+        ]);
+
+        let bound = bind_modern_fixture_with_entries(&record, &version, &install, &[])
+            .expect("output with final and dependency roles");
+        let plan = bound.processor_plan.as_ref().expect("processor plan");
+        assert!(matches!(
+            plan.steps[0].outputs[0].role,
+            super::BoundProcessorOutputRole::Terminal {
+                expected_size: Some(2),
+            }
+        ));
+    }
+
+    #[test]
+    fn processor_contract_errors_do_not_echo_authored_values() {
+        for error in [
+            ForgeInstallerError::InvalidForgeProcessorArtifactContract,
+            ForgeInstallerError::InvalidForgeProcessorFinalOutput,
+        ] {
+            let rendered = error.to_string();
+            assert!(!rendered.contains("PRIVATE"));
+            assert!(!rendered.contains('/'));
+            assert!(!rendered.contains('['));
         }
     }
 
@@ -3066,7 +3478,7 @@ mod tests {
             .expect("installer libraries")
             .push(serde_json::json!({
                 "name": "example:processor:1.0",
-                "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                "sha1":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             }));
         install["data"] = serde_json::json!({
             "PATCHED": {"client":"[net.minecraftforge:forge:1.21.5-55.0.0:client]"},
@@ -3083,6 +3495,13 @@ mod tests {
 
     fn cyclic_processor_fixture(base: &serde_json::Value, close_cycle: bool) -> serde_json::Value {
         let mut install = base.clone();
+        install["libraries"]
+            .as_array_mut()
+            .expect("installer libraries")
+            .push(serde_json::json!({
+                "name":"example:generated-b:1.0",
+                "sha1":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }));
         install["data"] = serde_json::json!({
             "A": {"client":"[example:generated-a:1.0]"},
             "B": {"client":"[example:generated-b:1.0]"},
