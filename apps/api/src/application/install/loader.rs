@@ -23,7 +23,7 @@ use axial_minecraft::loaders::LoaderActiveInstallFailure;
 use axial_minecraft::{
     DownloadProgress, LoaderComponentId, LoaderError, LoaderInstallError, LoaderInstallFailureKind,
     LoaderPreOperationFailureKind, LoaderProviderFailureKind, fetch_builds, fetch_components,
-    fetch_supported_versions, install_build, resolve_build_record,
+    fetch_supported_versions, install_build, resolve_build_record_for_install,
 };
 use axum::{Json, http::StatusCode};
 use std::path::PathBuf;
@@ -49,9 +49,7 @@ pub(super) async fn start_loader_install_owned(
             Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
-    let library_dir_path = PathBuf::from(&library_dir);
-
-    let build = resolve_build_record(library_dir_path.as_path(), request.component_id, &build_id)
+    let build = resolve_build_record_for_install(request.component_id, &build_id)
         .await
         .map_err(loader_pre_operation_error_response)?;
 

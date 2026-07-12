@@ -107,11 +107,25 @@ fn validate_build_index_identity(
     }
 }
 
-pub async fn resolve_build_record(
-    library_dir: &Path,
+pub async fn resolve_build_record_for_install(
     component_id: LoaderComponentId,
     build_id: &str,
 ) -> Result<LoaderBuildRecord, LoaderError> {
+    resolve_build_record_for_install_with(component_id, build_id, |minecraft_version| async move {
+        providers::fetch_build_index(component_id, &minecraft_version).await
+    })
+    .await
+}
+
+async fn resolve_build_record_for_install_with<F, Fut>(
+    component_id: LoaderComponentId,
+    build_id: &str,
+    fetch_live: F,
+) -> Result<LoaderBuildRecord, LoaderError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<LoaderVersionIndex, LoaderError>>,
+{
     let Some((parsed_component_id, minecraft_version, _loader_version)) = parse_build_id(build_id)
     else {
         return Err(LoaderError::InvalidBuildId);
@@ -119,21 +133,18 @@ pub async fn resolve_build_record(
     if parsed_component_id != component_id {
         return Err(LoaderError::InvalidBuildId);
     }
+    let minecraft_version = sanitize_segment(&minecraft_version)?;
 
-    let (builds, catalog) = fetch_builds(library_dir, component_id, &minecraft_version).await?;
-    resolve_build_record_from_catalog(component_id, build_id, builds, &catalog)
+    let normalized = normalize_build_index(fetch_live(minecraft_version.clone()).await?);
+    validate_build_index_identity(&normalized, component_id, &minecraft_version)?;
+    resolve_live_build_record(component_id, build_id, normalized.builds)
 }
 
-fn resolve_build_record_from_catalog(
+fn resolve_live_build_record(
     component_id: LoaderComponentId,
     build_id: &str,
     builds: Vec<LoaderBuildRecord>,
-    catalog: &LoaderCatalogState,
 ) -> Result<LoaderBuildRecord, LoaderError> {
-    if catalog.availability.stale || !catalog.availability.fresh {
-        return Err(LoaderError::CatalogStale);
-    }
-
     builds
         .into_iter()
         .find(|build| build.component_id == component_id && build.build_id == build_id)
@@ -184,46 +195,15 @@ fn catalog_version_order(entries: &[crate::manifest::ManifestEntry]) -> HashMap<
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_build_record_from_catalog, validate_build_index_identity};
+    use super::{resolve_build_record_for_install_with, validate_build_index_identity};
     use crate::loaders::installed_version_id_for;
     use crate::loaders::types::{
-        LoaderArtifactKind, LoaderAvailability, LoaderBuildMetadata, LoaderBuildRecord,
-        LoaderBuildSubjectKind, LoaderCatalogState, LoaderComponentId, LoaderError,
-        LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
-        LoaderProviderFailureKind, LoaderVersionIndex,
+        LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
+        LoaderComponentId, LoaderError, LoaderInstallSource, LoaderInstallStrategy,
+        LoaderInstallability, LoaderProviderFailureKind, LoaderVersionIndex,
     };
-
-    #[test]
-    fn exact_build_resolver_rejects_stale_catalogs() {
-        let component_id = LoaderComponentId::Fabric;
-        let build_id = "fabric:1.21.5:0.16.14";
-
-        let error = resolve_build_record_from_catalog(
-            component_id,
-            build_id,
-            vec![build_record(component_id, build_id)],
-            &catalog_state(false, true),
-        )
-        .expect_err("stale catalog should be gated");
-
-        assert!(matches!(error, LoaderError::CatalogStale));
-    }
-
-    #[test]
-    fn exact_build_resolver_returns_matching_fresh_build() {
-        let component_id = LoaderComponentId::Fabric;
-        let build_id = "fabric:1.21.5:0.16.14";
-
-        let build = resolve_build_record_from_catalog(
-            component_id,
-            build_id,
-            vec![build_record(component_id, build_id)],
-            &catalog_state(true, false),
-        )
-        .expect("fresh matching catalog");
-
-        assert_eq!(build.build_id, build_id);
-    }
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn catalog_rejects_noncanonical_installed_version_id() {
@@ -250,18 +230,53 @@ mod tests {
         ));
     }
 
-    fn catalog_state(fresh: bool, stale: bool) -> LoaderCatalogState {
-        LoaderCatalogState {
-            availability: LoaderAvailability {
-                fresh,
-                stale,
-                cache_hit: stale,
-                checked_at_ms: 1,
-                last_success_at_ms: Some(1),
-                last_error: None,
-                last_failure_kind: None,
+    #[tokio::test]
+    async fn install_resolution_always_fetches_the_live_provider_index() {
+        let component_id = LoaderComponentId::Fabric;
+        let build_id = "fabric:1.21.5:0.16.14";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch_calls = Arc::clone(&calls);
+
+        let resolved = resolve_build_record_for_install_with(
+            component_id,
+            build_id,
+            move |minecraft_version| {
+                assert_eq!(minecraft_version, "1.21.5");
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(LoaderVersionIndex {
+                    component_id,
+                    builds: vec![build_record(component_id, build_id)],
+                }))
             },
-        }
+        )
+        .await
+        .expect("live build");
+
+        assert_eq!(resolved.build_id, build_id);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn install_resolution_rejects_unsafe_version_before_provider_fetch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch_calls = Arc::clone(&calls);
+
+        let error = resolve_build_record_for_install_with(
+            LoaderComponentId::Fabric,
+            "fabric:..:0.16.14",
+            move |_| {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(LoaderVersionIndex {
+                    component_id: LoaderComponentId::Fabric,
+                    builds: Vec::new(),
+                }))
+            },
+        )
+        .await
+        .expect_err("unsafe version segment");
+
+        assert!(matches!(error, LoaderError::InvalidMinecraftVersion));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     fn build_record(component_id: LoaderComponentId, build_id: &str) -> LoaderBuildRecord {

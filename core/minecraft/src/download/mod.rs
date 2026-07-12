@@ -17,17 +17,19 @@ pub use assets::{
     asset_object_hash_prefix, repair_virtual_assets_from_index, virtual_asset_destination,
 };
 pub use install::Downloader;
-pub use integrity::{LauncherManagedArtifactReadiness, verify_existing_launcher_managed_artifact};
 pub use integrity::{
-    jar_contains_signed_metadata,
-    verify_existing_launcher_managed_artifact_allowing_missing_checksum,
+    LauncherManagedArtifactReadiness, jar_contains_signed_metadata,
+    verify_existing_launcher_managed_artifact, verify_existing_structural_library,
+    verify_existing_structural_library_metadata,
 };
 #[cfg(test)]
 pub(crate) use libraries::DownloadJob;
-pub(crate) use libraries::{LibraryArtifactPlan, library_artifact_plans_for};
+pub(crate) use libraries::{
+    LibraryArtifactPlan, LibraryChecksumPolicy, library_artifact_plans_for,
+};
 pub use libraries::{
-    LibraryChecksumPolicy, LibraryVerificationPlan, download_libraries,
-    download_libraries_allowing_missing_checksums_with_facts_and_descriptors,
+    LibraryVerificationIntegrity, LibraryVerificationPlan, StructuralLibraryVerification,
+    download_libraries, download_libraries_allowing_missing_checksums_with_facts_and_descriptors,
     download_libraries_with_facts_and_descriptors, library_verification_plans_for,
 };
 pub use model::{

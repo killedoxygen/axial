@@ -1,9 +1,8 @@
 #[cfg(test)]
 use crate::download::download_libraries_with_facts_and_descriptors;
 use crate::download::{
-    DownloadError, DownloadProgress, Downloader, ExecutionDownloadError, ExecutionDownloadReport,
+    DownloadProgress, Downloader,
     download_libraries_allowing_missing_checksums_with_facts_and_descriptors,
-    write_launcher_managed_artifact_bytes_to_temp,
 };
 use crate::known_good::KnownGoodInstallReceipt;
 use crate::launch::{DownloadEntry, VersionJson, resolve_version};
@@ -14,13 +13,16 @@ use crate::loaders::compose::{
 use crate::loaders::forge_installer::{
     ExtractedForgeInstaller, extract_installer, extract_maven_entries,
 };
+#[cfg(not(test))]
 use crate::loaders::http::fetch_bytes;
+#[cfg(test)]
+use crate::loaders::http::fetch_bytes_for_test as fetch_bytes;
 use crate::loaders::processors::run_processors;
 use crate::loaders::types::{LoaderBuildRecord, LoaderError, LoaderInstallPlan};
 use crate::loaders::{
     installed_loader_metadata_bytes, validate_provider_version_id, validate_version_id,
 };
-use crate::paths::{loader_artifacts_dir, versions_dir};
+use crate::paths::versions_dir;
 use crate::profiles::ensure_launcher_profiles;
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
@@ -37,12 +39,6 @@ use zip::write::SimpleFileOptions;
 
 const MAX_INSTALLER_DOWNLOAD_SIZE: u64 = 50 << 20;
 const LOADER_METADATA_FILE: &str = ".axial-loader.json";
-
-#[derive(Debug)]
-struct CachedProfile {
-    bytes: Vec<u8>,
-    fragment: LoaderProfileFragment,
-}
 
 // Profile-source loaders ship a ready version JSON and then download its libraries.
 pub async fn install_from_profile_source<F>(
@@ -78,26 +74,14 @@ where
         1,
         Some("Fetching loader profile...".to_string()),
     ));
-    let profile_cache_path = cached_profile_path(library_dir, &plan.record);
-    let cached_profile = read_valid_profile_json(
-        &profile_cache_path,
-        profile_url,
-        &plan.record.component_name,
-    )
-    .await?;
-    let profile_bytes = cached_profile.bytes;
-    let fragment = cached_profile.fragment;
+    let profile_bytes = download_to_memory(profile_url).await?;
+    let fragment = parse_profile_json(&profile_bytes, &plan.record.component_name)?;
     if !fragment.id.trim().is_empty() {
         validate_provider_version_id(&fragment.id, "upstream loader profile version id")?;
     }
     let installed_version_id = plan.record.version_id.clone();
     validate_version_id(&installed_version_id, "installed loader version id")?;
 
-    cleanup_on_error(
-        write_raw_profile_version(library_dir, &installed_version_id, &profile_bytes).await,
-        library_dir,
-        &installed_version_id,
-    )?;
     let library_download_result = Box::pin(download_profile_loader_libraries_with_evidence(
         library_dir,
         &fragment.libraries,
@@ -179,8 +163,6 @@ async fn install_installer_source_after_authenticated_base<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let installer_path = cached_installer_path(library_dir, &plan.record);
-
     send(progress(
         "artifacts",
         0,
@@ -190,8 +172,9 @@ where
             plan.record.component_name
         )),
     ));
+    let installer_data = download_to_memory(installer_url).await?;
     let (installer_data, extracted) =
-        read_valid_installer(&installer_path, installer_url, &plan.record.component_name).await?;
+        extract_installer_blocking(installer_data, plan.record.component_name.clone()).await?;
 
     send(progress(
         "profile",
@@ -244,6 +227,9 @@ where
     cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
 
     if let Some(install_profile_json) = extracted.install_profile_json.as_deref() {
+        let installer_path = plan.stage_dir.join("source-installer.jar");
+        async_fs::create_dir_all(&plan.stage_dir).await?;
+        async_fs::write(&installer_path, &installer_data).await?;
         send(progress(
             "processors",
             0,
@@ -354,7 +340,6 @@ where
 {
     validate_version_id(&plan.record.version_id, "installed loader version id")?;
 
-    let archive_path = cached_legacy_archive_path(library_dir, &plan.record);
     send(progress(
         "artifacts",
         0,
@@ -364,8 +349,10 @@ where
             plan.record.component_name
         )),
     ));
-    let archive_data =
-        read_valid_legacy_archive(&archive_path, archive_url, &plan.record.component_name).await?;
+    let archive_data = download_to_memory(archive_url).await?;
+    if let Err(error) = validate_legacy_archive(&archive_data) {
+        return Err(legacy_archive_error(&plan.record.component_name, error));
+    }
 
     let fragment = LoaderProfileFragment {
         id: plan.record.version_id.clone(),
@@ -575,70 +562,8 @@ async fn write_installed_loader_metadata(
     Ok(())
 }
 
-async fn write_raw_profile_version(
-    library_dir: &Path,
-    version_id: &str,
-    profile_bytes: &[u8],
-) -> Result<(), LoaderError> {
-    validate_version_id(version_id, "installed loader version id")?;
-    let version_dir = versions_dir(library_dir).join(version_id);
-    async_fs::create_dir_all(&version_dir).await?;
-    async_fs::write(version_dir.join(".incomplete"), b"installing").await?;
-    async_fs::write(
-        version_dir.join(format!("{version_id}.json")),
-        profile_bytes,
-    )
-    .await?;
-    Ok(())
-}
-
 async fn download_to_memory(url: &str) -> Result<Vec<u8>, LoaderError> {
     fetch_bytes(url, MAX_INSTALLER_DOWNLOAD_SIZE).await
-}
-
-async fn read_valid_installer(
-    path: &Path,
-    url: &str,
-    component_name: &str,
-) -> Result<(Vec<u8>, ExtractedForgeInstaller), LoaderError> {
-    if path_is_file(path).await
-        && let Some(bytes) = read_cached_artifact(path).await?
-    {
-        return extract_installer_blocking(bytes, component_name.to_string()).await;
-    }
-
-    let bytes = download_to_memory(url).await?;
-    let (installer_data, extracted) =
-        extract_installer_blocking(bytes, component_name.to_string()).await?;
-    Box::pin(write_cached_artifact(path, &installer_data)).await?;
-    Ok((installer_data, extracted))
-}
-
-async fn read_valid_profile_json(
-    path: &Path,
-    url: &str,
-    component_name: &str,
-) -> Result<CachedProfile, LoaderError> {
-    if path_is_file(path).await {
-        let bytes = match read_cached_artifact(path).await? {
-            Some(bytes) => bytes,
-            None => {
-                let bytes = download_to_memory(url).await?;
-                let fragment = parse_profile_json(&bytes, component_name)?;
-                let _ = Box::pin(write_cached_artifact(path, &bytes)).await;
-                return Ok(CachedProfile { bytes, fragment });
-            }
-        };
-        match parse_profile_json(&bytes, component_name) {
-            Ok(fragment) => return Ok(CachedProfile { bytes, fragment }),
-            Err(error) => return Err(error),
-        }
-    }
-
-    let bytes = download_to_memory(url).await?;
-    let fragment = parse_profile_json(&bytes, component_name)?;
-    let _ = Box::pin(write_cached_artifact(path, &bytes)).await;
-    Ok(CachedProfile { bytes, fragment })
 }
 
 fn parse_profile_json(
@@ -647,38 +572,6 @@ fn parse_profile_json(
 ) -> Result<LoaderProfileFragment, LoaderError> {
     serde_json::from_slice::<LoaderProfileFragment>(bytes)
         .map_err(|error| LoaderError::InvalidProfile(format!("{component_name} profile: {error}")))
-}
-
-async fn read_valid_legacy_archive(
-    path: &Path,
-    url: &str,
-    component_name: &str,
-) -> Result<Vec<u8>, LoaderError> {
-    if path_is_file(path).await
-        && let Some(bytes) = read_cached_artifact(path).await?
-    {
-        match validate_legacy_archive(&bytes) {
-            Ok(()) => return Ok(bytes),
-            Err(error) => return Err(legacy_archive_error(component_name, error)),
-        }
-    }
-
-    let bytes = download_to_memory(url).await?;
-    if let Err(error) = validate_legacy_archive(&bytes) {
-        return Err(legacy_archive_error(component_name, error));
-    }
-    Box::pin(write_cached_artifact(path, &bytes)).await?;
-    Ok(bytes)
-}
-
-async fn read_cached_artifact(path: &Path) -> Result<Option<Vec<u8>>, LoaderError> {
-    let metadata = async_fs::metadata(path).await?;
-    if metadata.len() > MAX_INSTALLER_DOWNLOAD_SIZE {
-        return Err(LoaderError::Verify(
-            "cached loader artifact exceeded the bounded size limit".to_string(),
-        ));
-    }
-    Ok(Some(async_fs::read(path).await?))
 }
 
 fn validate_legacy_archive(bytes: &[u8]) -> Result<(), ZipError> {
@@ -906,38 +799,6 @@ fn legacy_archive_entry_is_skipped(name: &str) -> bool {
         || upper.ends_with(".DSA")
 }
 
-#[cfg(test)]
-async fn promote_cached_artifact_tmp(tmp_path: &Path, path: &Path) -> Result<(), LoaderError> {
-    crate::download::promote_launcher_managed_artifact_temp_once(tmp_path, path)
-        .await
-        .map_err(LoaderError::Io)
-}
-
-async fn write_cached_artifact(
-    path: &Path,
-    bytes: &[u8],
-) -> Result<ExecutionDownloadReport, LoaderError> {
-    let tmp_path = artifact_tmp_path(path);
-    write_launcher_managed_artifact_bytes_to_temp(path, &tmp_path, bytes)
-        .await
-        .map_err(loader_execution_download_error)
-}
-
-fn loader_execution_download_error(error: ExecutionDownloadError) -> LoaderError {
-    loader_download_error(error.into_download_error())
-}
-
-fn loader_download_error(error: DownloadError) -> LoaderError {
-    match error {
-        DownloadError::FileOperation(error) => LoaderError::Io(error),
-        error => LoaderError::InstallExecutionFailed(error.to_string()),
-    }
-}
-
-async fn path_is_file(path: &Path) -> bool {
-    matches!(async_fs::metadata(path).await, Ok(metadata) if metadata.is_file())
-}
-
 fn artifact_tmp_path(path: &Path) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -954,42 +815,6 @@ fn legacy_archive_error(component_name: &str, error: impl std::fmt::Display) -> 
     LoaderError::InvalidProfile(format!(
         "validating {component_name} legacy archive: {error}"
     ))
-}
-
-fn cached_installer_path(library_dir: &Path, record: &LoaderBuildRecord) -> PathBuf {
-    loader_artifacts_dir(library_dir)
-        .join(record.component_id.short_key())
-        .join(&record.minecraft_version)
-        .join(format!("{}-installer.jar", record.loader_version))
-}
-
-fn cached_profile_path(library_dir: &Path, record: &LoaderBuildRecord) -> PathBuf {
-    loader_artifacts_dir(library_dir)
-        .join(record.component_id.short_key())
-        .join(&record.minecraft_version)
-        .join(format!("{}-profile.json", record.loader_version))
-}
-
-fn cached_legacy_archive_path(library_dir: &Path, record: &LoaderBuildRecord) -> PathBuf {
-    let suffix = legacy_archive_cache_suffix(record);
-    loader_artifacts_dir(library_dir)
-        .join(record.component_id.short_key())
-        .join(&record.minecraft_version)
-        .join(format!("{}-{suffix}", record.loader_version))
-}
-
-fn legacy_archive_cache_suffix(record: &LoaderBuildRecord) -> &'static str {
-    match &record.install_source {
-        crate::loaders::types::LoaderInstallSource::LegacyArchive { url }
-            if url
-                .rsplit('/')
-                .next()
-                .is_some_and(|name| name.ends_with("-universal.zip")) =>
-        {
-            "universal.zip"
-        }
-        _ => "client.zip",
-    }
 }
 
 fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> DownloadProgress {
@@ -1026,9 +851,7 @@ mod tests {
         ensure_base_version, install_from_installer_source, install_from_legacy_archive,
         install_from_profile_source, install_installer_source_after_authenticated_base,
         install_legacy_archive_after_authenticated_base,
-        install_profile_source_after_authenticated_base, promote_cached_artifact_tmp,
-        read_cached_artifact, read_valid_installer, read_valid_legacy_archive,
-        read_valid_profile_json, strip_child_client_jar_meta, write_cached_artifact,
+        install_profile_source_after_authenticated_base, strip_child_client_jar_meta,
         write_patched_client_jar_integrity,
     };
     use crate::download::{
@@ -1198,49 +1021,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_artifact_write_uses_temp_file_then_rename() {
-        let root = temp_dir("cached-artifact-write");
-        fs::create_dir_all(&root).expect("root");
-        let path = root.join("installer.jar");
-
-        let report = write_cached_artifact(&path, b"installer bytes")
-            .await
-            .expect("write cached artifact");
-
-        assert_eq!(report.bytes_written, b"installer bytes".len() as u64);
-        assert_eq!(report.target, "installer.jar");
-        assert!(report.facts.iter().any(|fact| {
-            fact.kind == ExecutionDownloadFactKind::MetadataMissing
-                && fact
-                    .fields
-                    .iter()
-                    .any(|(key, value)| key == "field" && value == "sha1")
-        }));
-        assert!(
-            report
-                .facts
-                .iter()
-                .any(|fact| fact.kind == ExecutionDownloadFactKind::WrittenToTemp)
-        );
-        assert!(
-            report
-                .facts
-                .iter()
-                .any(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
-        );
-        assert_eq!(fs::read(&path).expect("read artifact"), b"installer bytes");
-        assert!(fs::read_dir(&root).expect("read root").all(|entry| {
-            !entry
-                .expect("entry")
-                .file_name()
-                .to_string_lossy()
-                .contains(".tmp-")
-        }));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
     async fn loader_library_download_failure_carries_artifact_evidence() {
         let root = temp_dir("loader-library-evidence");
         let server = TestByteServer::start(b"wrong".to_vec());
@@ -1369,363 +1149,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[tokio::test]
-    async fn cached_artifact_write_replaces_existing_file() {
-        let root = temp_dir("cached-artifact-replace");
-        fs::create_dir_all(&root).expect("root");
-        let path = root.join("installer.jar");
-        fs::write(&path, b"stale bytes").expect("stale artifact");
-
-        write_cached_artifact(&path, b"fresh bytes")
-            .await
-            .expect("replace cached artifact");
-
-        assert_eq!(fs::read(&path).expect("read artifact"), b"fresh bytes");
-        assert!(fs::read_dir(&root).expect("read root").all(|entry| {
-            !entry
-                .expect("entry")
-                .file_name()
-                .to_string_lossy()
-                .contains(".tmp-")
-        }));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn cached_artifact_promotion_preserves_destination_when_temp_missing() {
-        let root = temp_dir("cached-artifact-missing-temp");
-        fs::create_dir_all(&root).expect("root");
-        let path = root.join("installer.jar");
-        let tmp_path = root.join("installer.tmp");
-        fs::write(&path, b"existing bytes").expect("existing artifact");
-
-        let result = promote_cached_artifact_tmp(&tmp_path, &path).await;
-
-        assert!(result.is_err());
-        assert_eq!(fs::read(&path).expect("read artifact"), b"existing bytes");
-        assert!(!tmp_path.exists());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn cached_artifact_write_cleans_temp_file_on_rename_failure() {
-        let root = temp_dir("cached-artifact-write-failure");
-        fs::create_dir_all(&root).expect("root");
-        let path = root.join("installer.jar");
-        fs::create_dir_all(&path).expect("directory at destination");
-
-        let result = write_cached_artifact(&path, b"installer bytes").await;
-
-        assert!(result.is_err());
-        assert!(path.is_dir());
-        assert!(fs::read_dir(&root).expect("read root").all(|entry| {
-            !entry
-                .expect("entry")
-                .file_name()
-                .to_string_lossy()
-                .contains(".tmp-")
-        }));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn oversized_cached_artifact_blocks_without_mutation() {
-        let root = temp_dir("cached-artifact-oversized");
-        fs::create_dir_all(&root).expect("root");
-        let path = root.join("installer.jar");
-        write_oversized_cached_file(&path);
-
-        let error = read_cached_artifact(&path)
-            .await
-            .expect_err("oversized cached artifact should block");
-
-        assert!(matches!(error, LoaderError::Verify(_)));
-        assert!(path.exists());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn corrupt_cached_installer_blocks_without_provider_or_mutation() {
-        let root = temp_dir("installer-cache-corrupt");
-        let path = root.join("artifacts/forge/1.21.5/55.0.0-installer.jar");
-        fs::create_dir_all(path.parent().expect("installer parent")).expect("installer parent");
-        fs::write(&path, b"corrupt installer").expect("corrupt cached installer");
-        let fresh_installer = installer_jar("fresh-installer");
-        let server = TestByteServer::start(fresh_installer.clone());
-
-        let error = read_valid_installer(&path, &server.url, "Forge")
-            .await
-            .expect_err("corrupt cached installer should block");
-
-        assert!(matches!(error, LoaderError::InvalidProfile(_)));
-        assert_eq!(
-            fs::read(&path).expect("cached corrupt installer"),
-            b"corrupt installer"
-        );
-        assert_eq!(server.request_count(), 0);
-
-        server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn fresh_invalid_installer_is_not_cached() {
-        let root = temp_dir("installer-cache-invalid-fresh");
-        let path = root.join("artifacts/forge/1.21.5/55.0.0-installer.jar");
-        let server = TestByteServer::start(b"not a zip".to_vec());
-
-        let error = read_valid_installer(&path, &server.url, "Forge")
-            .await
-            .expect_err("invalid provider installer");
-
-        match error {
-            LoaderError::InvalidProfile(message) => {
-                assert!(
-                    message.starts_with("extracting Forge installer: "),
-                    "{message}"
-                );
-                assert!(!message.contains(&server.url), "{message}");
-            }
-            error => panic!("expected invalid profile error, got {error:?}"),
-        }
-        assert_eq!(server.request_count(), 1);
-        assert!(!path.exists());
-
-        server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn cached_valid_profile_is_used_when_provider_is_unavailable() {
-        let root = temp_dir("profile-cache-offline");
-        let path = root.join("artifacts/fabric/1.21.5/0.16.14-profile.json");
-        fs::create_dir_all(path.parent().expect("profile parent")).expect("profile parent");
-        fs::write(&path, profile_json("cached-profile")).expect("cached profile");
-
-        let profile = read_valid_profile_json(&path, "http://127.0.0.1:9/profile/json", "Fabric")
-            .await
-            .expect("cached profile");
-
-        assert_eq!(profile.fragment.id, "cached-profile");
-        assert_eq!(profile.bytes, profile_json("cached-profile"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn oversized_cached_profile_blocks_without_provider_or_mutation() {
-        let root = temp_dir("profile-cache-oversized");
-        let path = root.join("artifacts/fabric/1.21.5/0.16.14-profile.json");
-        fs::create_dir_all(path.parent().expect("profile parent")).expect("profile parent");
-        write_oversized_cached_file(&path);
-        let fresh = profile_json("fresh-profile");
-        let server = TestByteServer::start(fresh.clone());
-
-        let error = read_valid_profile_json(&path, &server.url, "Fabric")
-            .await
-            .expect_err("oversized cached profile should block");
-
-        assert!(matches!(error, LoaderError::Verify(_)));
-        assert!(path.exists());
-        assert_eq!(server.request_count(), 0);
-
-        server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn corrupt_cached_profile_blocks_without_provider_or_mutation() {
-        let root = temp_dir("profile-cache-corrupt");
-        let path = root.join("artifacts/fabric/1.21.5/0.16.14-profile.json");
-        fs::create_dir_all(path.parent().expect("profile parent")).expect("profile parent");
-        fs::write(&path, b"{not-json").expect("corrupt cached profile");
-        let fresh = profile_json("fresh-profile");
-        let server = TestByteServer::start(fresh.clone());
-
-        let error = read_valid_profile_json(&path, &server.url, "Fabric")
-            .await
-            .expect_err("corrupt cached profile should block");
-
-        assert!(matches!(error, LoaderError::InvalidProfile(_)));
-        assert_eq!(
-            fs::read(&path).expect("cached corrupt profile"),
-            b"{not-json"
-        );
-        assert_eq!(server.request_count(), 0);
-
-        server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn fresh_invalid_profile_is_not_cached() {
-        let root = temp_dir("profile-cache-invalid-fresh");
-        let path = root.join("artifacts/fabric/1.21.5/0.16.14-profile.json");
-        let server = TestByteServer::start(b"{not-json".to_vec());
-
-        let error = read_valid_profile_json(&path, &server.url, "Fabric")
-            .await
-            .expect_err("invalid provider profile");
-
-        match error {
-            LoaderError::InvalidProfile(message) => {
-                assert!(message.starts_with("Fabric profile: "), "{message}");
-                assert!(!message.contains(&server.url), "{message}");
-            }
-            error => panic!("expected invalid profile error, got {error:?}"),
-        }
-        assert_eq!(server.request_count(), 1);
-        assert!(!path.exists());
-
-        server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn fresh_valid_profile_survives_cache_write_failure() {
-        let root = temp_dir("profile-cache-write-failure");
-        let path = root.join("artifacts/fabric/1.21.5/0.16.14-profile.json");
-        fs::create_dir_all(&path).expect("blocking profile cache directory");
-        let fresh = profile_json("fresh-profile");
-        let server = TestByteServer::start(fresh.clone());
-
-        let profile = read_valid_profile_json(&path, &server.url, "Fabric")
-            .await
-            .expect("fresh profile should win over cache persistence failure");
-
-        assert_eq!(profile.fragment.id, "fresh-profile");
-        assert_eq!(profile.bytes, fresh);
-        assert!(path.is_dir());
-        assert_eq!(server.request_count(), 1);
-
-        server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn cached_profile_path_is_component_and_version_scoped() {
-        let root = PathBuf::from("/library");
-        let path = super::cached_profile_path(&root, &profile_record());
-
-        assert_eq!(
-            path,
-            root.join("cache")
-                .join("loaders")
-                .join("artifacts")
-                .join("fabric")
-                .join("1.21.5")
-                .join("0.16.14-profile.json")
-        );
-    }
-
-    #[test]
-    fn cached_legacy_archive_path_tracks_archive_flavor() {
-        let root = PathBuf::from("/library");
-        let mut record = legacy_archive_record();
-
-        assert_eq!(
-            super::cached_legacy_archive_path(&root, &record),
-            root.join("cache")
-                .join("loaders")
-                .join("artifacts")
-                .join("forge")
-                .join("1.2.5")
-                .join("3.4.9.171-client.zip")
-        );
-
-        record.minecraft_version = "1.4.7".to_string();
-        record.loader_version = "6.6.2.534".to_string();
-        record.install_source = LoaderInstallSource::LegacyArchive {
-            url: "https://maven.minecraftforge.net/net/minecraftforge/forge/1.4.7-6.6.2.534/forge-1.4.7-6.6.2.534-universal.zip".to_string(),
-        };
-
-        assert_eq!(
-            super::cached_legacy_archive_path(&root, &record),
-            root.join("cache")
-                .join("loaders")
-                .join("artifacts")
-                .join("forge")
-                .join("1.4.7")
-                .join("6.6.2.534-universal.zip")
-        );
-    }
-
-    #[tokio::test]
-    async fn corrupt_cached_legacy_archive_blocks_without_provider_or_mutation() {
-        let root = temp_dir("legacy-archive-corrupt-cache");
-        let path = root.join("artifacts/forge/1.2.4/2.0.0.68-client.zip");
-        fs::create_dir_all(path.parent().expect("parent")).expect("artifact parent");
-        fs::write(&path, b"corrupt cached archive").expect("cached archive");
-        let fresh_archive = empty_zip();
-        let server = TestByteServer::start(fresh_archive.clone());
-
-        let error = read_valid_legacy_archive(&path, &server.url, "Forge")
-            .await
-            .expect_err("corrupt cached legacy archive should block");
-
-        assert!(matches!(error, LoaderError::InvalidProfile(_)));
-        assert_eq!(
-            fs::read(&path).expect("cached corrupt archive"),
-            b"corrupt cached archive"
-        );
-        assert_eq!(server.request_count(), 0);
-
-        server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn oversized_cached_legacy_archive_blocks_without_provider_or_mutation() {
-        let root = temp_dir("legacy-archive-oversized-cache");
-        let path = root.join("artifacts/forge/1.2.4/2.0.0.68-client.zip");
-        fs::create_dir_all(path.parent().expect("parent")).expect("artifact parent");
-        write_oversized_cached_file(&path);
-        let fresh_archive = empty_zip();
-        let server = TestByteServer::start(fresh_archive.clone());
-
-        let error = read_valid_legacy_archive(&path, &server.url, "Forge")
-            .await
-            .expect_err("oversized cached legacy archive should block");
-
-        assert!(matches!(error, LoaderError::Verify(_)));
-        assert!(path.exists());
-        assert_eq!(server.request_count(), 0);
-
-        server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn fresh_invalid_legacy_archive_returns_bounded_error() {
-        let root = temp_dir("legacy-archive-invalid-fresh");
-        let path = root.join("artifacts/forge/1.2.4/2.0.0.68-client.zip");
-        let server = TestByteServer::start(b"invalid provider archive".to_vec());
-
-        let error = read_valid_legacy_archive(&path, &server.url, "Forge")
-            .await
-            .expect_err("invalid archive");
-
-        match error {
-            LoaderError::InvalidProfile(message) => {
-                assert!(
-                    message.starts_with("validating Forge legacy archive: "),
-                    "{message}"
-                );
-                assert!(!message.contains(&server.url), "{message}");
-            }
-            error => panic!("expected invalid profile error, got {error:?}"),
-        }
-        assert_eq!(server.request_count(), 1);
-        assert!(!path.exists());
-
-        server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
     #[test]
     fn rejects_whitespace_only_installed_version_id() {
         let error = validate_version_id(" \n ", "installed loader version id").expect_err("error");
@@ -1752,10 +1175,11 @@ mod tests {
         let root = temp_dir("profile-upstream-id-mismatch");
         write_base_version(&root, "1.21.5");
         let record = profile_record();
-        let profile_path = super::cached_profile_path(&root, &record);
-        fs::create_dir_all(profile_path.parent().expect("profile parent"))
-            .expect("create profile cache parent");
-        fs::write(&profile_path, profile_json("upstream-profile-id")).expect("cached profile");
+        let stale_profile_path = root.join("cache/loaders/artifacts/fabric/1.21.5/profile.json");
+        fs::create_dir_all(stale_profile_path.parent().expect("profile parent"))
+            .expect("create stale artifact parent");
+        fs::write(&stale_profile_path, profile_json("stale-profile-id")).expect("stale artifact");
+        let profile_server = TestByteServer::start(profile_json("upstream-profile-id"));
         let plan = LoaderInstallPlan {
             record: record.clone(),
             stage_dir: root.join("stage"),
@@ -1765,7 +1189,7 @@ mod tests {
         let installed_version_id = install_profile_source_after_authenticated_base(
             &root,
             &plan,
-            "http://127.0.0.1:9/profile/json",
+            &profile_server.url,
             &mut progress,
         )
         .await
@@ -1773,6 +1197,8 @@ mod tests {
 
         assert_eq!(installed_version_id, record.version_id);
         assert_backend_version_was_written(&root, &record.version_id, "upstream-profile-id");
+        assert_eq!(profile_server.request_count(), 1);
+        profile_server.stop();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1781,16 +1207,12 @@ mod tests {
         let root = temp_dir("profile-marks-checksumless-libraries");
         write_base_version(&root, "1.21.5");
         let library_body = zip_entries(&[("org/quiltmc/loader/impl/QuiltLoader.class", b"loader")]);
-        let server = TestByteServer::start(library_body);
+        let library_server = TestByteServer::start(library_body);
         let record = profile_record();
-        let profile_path = super::cached_profile_path(&root, &record);
-        fs::create_dir_all(profile_path.parent().expect("profile parent"))
-            .expect("create profile cache parent");
-        fs::write(
-            &profile_path,
-            profile_json_with_checksumless_library("upstream-profile-id", &server.url),
-        )
-        .expect("cached profile");
+        let profile_server = TestByteServer::start(profile_json_with_checksumless_library(
+            "upstream-profile-id",
+            &library_server.url,
+        ));
         let plan = LoaderInstallPlan {
             record: record.clone(),
             stage_dir: root.join("stage"),
@@ -1800,7 +1222,7 @@ mod tests {
         install_profile_source_after_authenticated_base(
             &root,
             &plan,
-            "http://127.0.0.1:9/profile/json",
+            &profile_server.url,
             &mut progress,
         )
         .await
@@ -1820,7 +1242,9 @@ mod tests {
                 && library.get("axialChecksumlessAllowed").is_none()
         }));
 
-        server.stop();
+        assert_eq!(profile_server.request_count(), 1);
+        profile_server.stop();
+        library_server.stop();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1829,11 +1253,7 @@ mod tests {
         let root = temp_dir("installer-upstream-id-mismatch");
         write_base_version(&root, "1.21.5");
         let record = installer_record();
-        let installer_path = super::cached_installer_path(&root, &record);
-        fs::create_dir_all(installer_path.parent().expect("installer parent"))
-            .expect("create installer cache parent");
-        fs::write(&installer_path, installer_jar("upstream-installer-id"))
-            .expect("cached installer");
+        let installer_server = TestByteServer::start(installer_jar("upstream-installer-id"));
         let plan = LoaderInstallPlan {
             record: record.clone(),
             stage_dir: root.join("stage"),
@@ -1843,7 +1263,7 @@ mod tests {
         let installed_version_id = install_installer_source_after_authenticated_base(
             &root,
             &plan,
-            "http://127.0.0.1:9/installer.jar",
+            &installer_server.url,
             &mut progress,
         )
         .await
@@ -1851,6 +1271,8 @@ mod tests {
 
         assert_eq!(installed_version_id, record.version_id);
         assert_backend_version_was_written(&root, &record.version_id, "upstream-installer-id");
+        assert_eq!(installer_server.request_count(), 1);
+        installer_server.stop();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1860,17 +1282,12 @@ mod tests {
         let minecraft_version = "1.7.10";
         write_base_version(&root, minecraft_version);
         let library_body = zip_entries(&[("net/minecraftforge/Forge.class", b"forge")]);
-        let server = TestByteServer::start(library_body);
+        let library_server = TestByteServer::start(library_body);
         let mut record = installer_record();
         record.minecraft_version = minecraft_version.to_string();
         record.loader_version = "10.13.4.1614-1.7.10".to_string();
         canonicalize_record_identity(&mut record);
-        let installer_path = super::cached_installer_path(&root, &record);
-        fs::create_dir_all(installer_path.parent().expect("installer parent"))
-            .expect("create installer cache parent");
-        fs::write(
-            &installer_path,
-            installer_jar_with_profile_json(
+        let installer_server = TestByteServer::start(installer_jar_with_profile_json(
                 format!(
                     r#"{{
                         "id":"upstream-forge-1.7.10",
@@ -1882,12 +1299,10 @@ mod tests {
                             "url":"{}"
                         }}]
                     }}"#,
-                    server.url
+                    library_server.url
                 )
                 .as_bytes(),
-            ),
-        )
-        .expect("cached installer");
+            ));
         let plan = LoaderInstallPlan {
             record: record.clone(),
             stage_dir: root.join("stage"),
@@ -1896,14 +1311,15 @@ mod tests {
         let installed_version_id = install_installer_source_after_authenticated_base(
             &root,
             &plan,
-            "http://127.0.0.1:9/installer.jar",
+            &installer_server.url,
             &mut |_| {},
         )
         .await
         .expect("install legacy installer-backed loader");
 
         assert_eq!(installed_version_id, record.version_id);
-        assert_eq!(server.request_count(), 1);
+        assert_eq!(installer_server.request_count(), 1);
+        assert_eq!(library_server.request_count(), 1);
         let library_path = root.join("libraries").join(
             "net/minecraftforge/forge/1.7.10-10.13.4.1614-1.7.10/forge-1.7.10-10.13.4.1614-1.7.10.jar",
         );
@@ -1925,7 +1341,8 @@ mod tests {
                 && library.get("axialChecksumlessAllowed").is_none()
         }));
 
-        server.stop();
+        installer_server.stop();
+        library_server.stop();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2078,10 +1495,7 @@ mod tests {
         canonicalize_record_identity(&mut record);
         assert_eq!(record.version_id, version_id);
         record.strategy = LoaderInstallStrategy::ForgeLegacyInstaller;
-        let installer_path = super::cached_installer_path(&root, &record);
-        fs::create_dir_all(installer_path.parent().expect("installer parent"))
-            .expect("create installer cache parent");
-        fs::write(&installer_path, installer).expect("write cached installer");
+        let installer_server = TestByteServer::start(installer);
         let plan = LoaderInstallPlan {
             record: record.clone(),
             stage_dir: root.join("stage"),
@@ -2090,7 +1504,7 @@ mod tests {
         install_installer_source_after_authenticated_base(
             &root,
             &plan,
-            "http://127.0.0.1:9/installer.jar",
+            &installer_server.url,
             &mut |_| {},
         )
         .await
@@ -2143,6 +1557,8 @@ mod tests {
         );
         assert_eq!(version["downloads"]["client"]["url"], "");
 
+        assert_eq!(installer_server.request_count(), 1);
+        installer_server.stop();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2253,17 +1669,6 @@ mod tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         std::env::temp_dir().join(format!("axial-{prefix}-{nanos:x}"))
-    }
-
-    fn write_oversized_cached_file(path: &std::path::Path) {
-        fs::File::create(path)
-            .expect("oversized cached file")
-            .set_len(super::MAX_INSTALLER_DOWNLOAD_SIZE + 1)
-            .expect("size oversized cached file");
-    }
-
-    fn empty_zip() -> Vec<u8> {
-        zip_entries(&[])
     }
 
     fn installer_jar(version_id: &str) -> Vec<u8> {

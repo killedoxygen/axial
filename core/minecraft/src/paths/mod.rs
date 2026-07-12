@@ -28,10 +28,6 @@ pub fn loader_catalog_dir(mc_dir: &Path) -> PathBuf {
     loader_cache_dir(mc_dir).join("catalog")
 }
 
-pub fn loader_artifacts_dir(mc_dir: &Path) -> PathBuf {
-    loader_cache_dir(mc_dir).join("artifacts")
-}
-
 pub fn loader_work_dir(mc_dir: &Path) -> PathBuf {
     loader_cache_dir(mc_dir).join("work")
 }
@@ -83,7 +79,6 @@ pub fn create_minecraft_dir(dir: &Path) -> std::io::Result<()> {
         "libraries",
         "assets",
         "cache/loaders/catalog",
-        "cache/loaders/artifacts",
         "cache/loaders/work",
     ] {
         std::fs::create_dir_all(dir.join(subdir))?;

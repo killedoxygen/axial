@@ -1,8 +1,9 @@
+use super::StructuralLibraryVerification;
 use super::model::{ActualIntegrity, DownloadError, DownloadIntegrityError, ExpectedIntegrity};
 use super::path_safety::{bounded_download_file_label, filesystem_path};
 use sha1::{Digest as _, Sha1};
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tokio::fs as async_fs;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,23 +135,17 @@ pub fn verify_existing_launcher_managed_artifact(
     }
 }
 
-pub fn verify_existing_launcher_managed_artifact_allowing_missing_checksum(
-    path: &Path,
-    expected: &ExpectedIntegrity,
+pub fn verify_existing_structural_library(
+    verification: &StructuralLibraryVerification,
 ) -> LauncherManagedArtifactReadiness {
-    if expected.sha1.is_some() {
-        return verify_existing_launcher_managed_artifact(path, expected);
-    }
-    let Ok(metadata) = std::fs::symlink_metadata(filesystem_path(path).as_ref()) else {
-        return LauncherManagedArtifactReadiness::Missing;
+    let (path, metadata) = match structural_library_file(verification) {
+        Ok(value) => value,
+        Err(readiness) => return readiness,
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return LauncherManagedArtifactReadiness::UnsupportedExisting;
-    }
     if metadata.len() == 0 {
         return LauncherManagedArtifactReadiness::Corrupt;
     }
-    if let Some(expected_size) = expected.size
+    if let Some(expected_size) = verification.expected_size
         && metadata.len() != expected_size
     {
         return LauncherManagedArtifactReadiness::Corrupt;
@@ -159,11 +154,114 @@ pub fn verify_existing_launcher_managed_artifact_allowing_missing_checksum(
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
-        && !checksumless_jar_is_readable(path)
+        && !checksumless_jar_is_readable(&path)
     {
         return LauncherManagedArtifactReadiness::Corrupt;
     }
     LauncherManagedArtifactReadiness::Verified
+}
+
+pub fn verify_existing_structural_library_metadata(
+    verification: &StructuralLibraryVerification,
+) -> LauncherManagedArtifactReadiness {
+    let (_, metadata) = match structural_library_file(verification) {
+        Ok(value) => value,
+        Err(readiness) => return readiness,
+    };
+    if metadata.len() == 0 {
+        return LauncherManagedArtifactReadiness::Corrupt;
+    }
+    if let Some(expected_size) = verification.expected_size
+        && metadata.len() != expected_size
+    {
+        return LauncherManagedArtifactReadiness::Corrupt;
+    }
+    LauncherManagedArtifactReadiness::Verified
+}
+
+fn structural_library_file(
+    verification: &StructuralLibraryVerification,
+) -> Result<(PathBuf, std::fs::Metadata), LauncherManagedArtifactReadiness> {
+    let root = absolute_lexical_path(&verification.minecraft_root)
+        .ok_or(LauncherManagedArtifactReadiness::UnsupportedExisting)?;
+    verify_directory(&root)?;
+
+    let mut current = root;
+    current.push("libraries");
+    verify_directory(&current)?;
+    for (index, component) in verification.relative_path.as_str().split('/').enumerate() {
+        current.push(component);
+        let is_final = index + 1 == verification.relative_path.as_str().split('/').count();
+        if is_final {
+            let metadata = checked_metadata(&current)?;
+            if !metadata.is_file() {
+                return Err(LauncherManagedArtifactReadiness::UnsupportedExisting);
+            }
+            return Ok((current, metadata));
+        }
+        verify_directory(&current)?;
+    }
+    Err(LauncherManagedArtifactReadiness::UnsupportedExisting)
+}
+
+fn absolute_lexical_path(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Some(normalized)
+}
+
+fn verify_directory(path: &Path) -> Result<(), LauncherManagedArtifactReadiness> {
+    let metadata = checked_metadata(path)?;
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(LauncherManagedArtifactReadiness::UnsupportedExisting)
+    }
+}
+
+fn checked_metadata(path: &Path) -> Result<std::fs::Metadata, LauncherManagedArtifactReadiness> {
+    let metadata = std::fs::symlink_metadata(filesystem_path(path).as_ref()).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            LauncherManagedArtifactReadiness::Missing
+        } else {
+            LauncherManagedArtifactReadiness::UnsupportedExisting
+        }
+    })?;
+    if metadata_is_link(&metadata) {
+        return Err(LauncherManagedArtifactReadiness::UnsupportedExisting);
+    }
+    Ok(metadata)
+}
+
+fn metadata_is_link(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 pub fn jar_contains_signed_metadata(path: &Path) -> bool {

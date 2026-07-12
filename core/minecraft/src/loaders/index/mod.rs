@@ -4,5 +4,5 @@ mod query;
 
 pub use query::{
     fetch_builds, fetch_cached_builds, fetch_components, fetch_supported_versions,
-    resolve_build_record,
+    resolve_build_record_for_install,
 };

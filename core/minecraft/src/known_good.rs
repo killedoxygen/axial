@@ -16,8 +16,10 @@ use crate::runtime::{
     plan_runtime_manifest_files, preferred_runtime_component,
 };
 use sha1::{Digest as _, Sha1};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path};
+use std::collections::BTreeMap;
+use std::io;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 pub const MAX_KNOWN_GOOD_RELATIVE_PATH_BYTES: usize = MAX_ARTIFACT_RELATIVE_PATH_BYTES;
 pub const MAX_KNOWN_GOOD_PATH_SEGMENT_BYTES: usize = MAX_ARTIFACT_PATH_SEGMENT_BYTES;
@@ -118,9 +120,75 @@ pub struct KnownGoodInventory {
     entries: Vec<KnownGoodEntry>,
 }
 
+#[derive(Clone, Debug)]
+pub struct KnownGoodInventoryAuthority {
+    inventory: Arc<KnownGoodInventory>,
+    library_root: PathBuf,
+}
+
+impl KnownGoodInventoryAuthority {
+    pub fn bind(inventory: Arc<KnownGoodInventory>, library_root: &Path) -> io::Result<Self> {
+        let library_root = std::fs::canonicalize(library_root)?;
+        let metadata = std::fs::symlink_metadata(&library_root)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "known-good library authority requires an existing directory",
+            ));
+        }
+        Ok(Self {
+            inventory,
+            library_root,
+        })
+    }
+
+    pub(crate) fn authorizes_structural_library(
+        &self,
+        requested_library_root: &Path,
+        path: &ArtifactRelativePath,
+        is_native: bool,
+        size: Option<u64>,
+    ) -> Option<PathBuf> {
+        let requested_library_root = std::fs::canonicalize(requested_library_root).ok()?;
+        (requested_library_root == self.library_root
+            && self
+                .inventory
+                .authorizes_structural_library(path, is_native, size))
+        .then(|| self.library_root.clone())
+    }
+}
+
 impl KnownGoodInventory {
     pub fn entries(&self) -> &[KnownGoodEntry] {
         &self.entries
+    }
+
+    pub(crate) fn authorizes_structural_library(
+        &self,
+        path: &ArtifactRelativePath,
+        is_native: bool,
+        size: Option<u64>,
+    ) -> bool {
+        let key = ("libraries", "", path.as_str());
+        let Ok(index) = self.entries.binary_search_by(|entry| {
+            (
+                entry.root.stable_id(),
+                entry.root.scope_id(),
+                entry.path.as_str(),
+            )
+                .cmp(&key)
+        }) else {
+            return false;
+        };
+        let entry = &self.entries[index];
+        entry.root == KnownGoodRoot::Libraries
+            && entry.kind
+                == if is_native {
+                    KnownGoodArtifactKind::NativeLibrary
+                } else {
+                    KnownGoodArtifactKind::Library
+                }
+            && entry.integrity == (KnownGoodIntegrity::StructuralJar { size })
     }
 }
 
@@ -334,6 +402,7 @@ pub enum KnownGoodInventoryError {
     MissingClient,
     InputTooLarge,
     InvalidLibraryPlan,
+    StructuralLibraryMismatch,
     ConflictingEntry,
     ConflictingRuntimePath,
     TooManyEntries,
@@ -380,30 +449,28 @@ pub fn derive_known_good_inventory(
     {
         return Err(KnownGoodInventoryError::InputTooLarge);
     }
-    let structural_paths = library_artifact_plans_for(
-        input.shape.structural_libraries(),
-        input.environment,
-        LibraryChecksumPolicy::AllowMissing,
-    )
-    .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?
-    .into_iter()
-    .filter(|plan| plan.expected.sha1.is_none())
-    .map(|plan| plan.relative_path.as_str().to_string())
-    .collect::<BTreeSet<_>>();
+    let structural_proofs = structural_library_proofs(
+        library_artifact_plans_for(
+            input.shape.structural_libraries(),
+            input.environment,
+            LibraryChecksumPolicy::AllowMissing,
+        )
+        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?,
+    )?;
     let libraries = library_artifact_plans_for(
         &input.resolved_version.libraries,
         input.environment,
         LibraryChecksumPolicy::Strict,
     )
     .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-    add_library_plans(&mut builder, libraries, &structural_paths)?;
+    add_library_plans(&mut builder, libraries, &structural_proofs)?;
     let installer_libraries = library_artifact_plans_for(
         input.shape.installer_libraries(),
         input.environment,
         LibraryChecksumPolicy::Strict,
     )
     .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-    add_library_plans(&mut builder, installer_libraries, &structural_paths)?;
+    add_library_plans(&mut builder, installer_libraries, &structural_proofs)?;
 
     if let Some(logging) = input
         .resolved_version
@@ -520,15 +587,20 @@ fn loader_strategy_matches(component: LoaderComponentId, strategy: LoaderInstall
 fn add_library_plans(
     builder: &mut InventoryBuilder,
     plans: Vec<LibraryArtifactPlan>,
-    structural_paths: &BTreeSet<String>,
+    structural_proofs: &BTreeMap<ArtifactRelativePath, StructuralLibraryProof>,
 ) -> Result<(), KnownGoodInventoryError> {
     for plan in plans {
         let path = KnownGoodRelativePath::new(plan.relative_path.as_str())?;
-        let integrity = expected_integrity(
-            &plan.expected,
-            structural_paths.contains(path.as_str()),
-            path.as_str(),
-        )?;
+        let allow_structural = if plan.expected.sha1.is_none() {
+            match structural_proofs.get(&plan.relative_path) {
+                Some(proof) if proof.matches(&plan) => true,
+                Some(_) => return Err(KnownGoodInventoryError::StructuralLibraryMismatch),
+                None => false,
+            }
+        } else {
+            false
+        };
+        let integrity = expected_integrity(&plan.expected, allow_structural, path.as_str())?;
         builder.insert(KnownGoodEntry {
             root: KnownGoodRoot::Libraries,
             path,
@@ -541,6 +613,43 @@ fn add_library_plans(
         })?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StructuralLibraryProof {
+    is_native: bool,
+    size: Option<u64>,
+}
+
+impl StructuralLibraryProof {
+    fn from_plan(plan: &LibraryArtifactPlan) -> Self {
+        Self {
+            is_native: plan.is_native,
+            size: plan.expected.size,
+        }
+    }
+
+    fn matches(self, plan: &LibraryArtifactPlan) -> bool {
+        self.is_native == plan.is_native && self.size == plan.expected.size
+    }
+}
+
+fn structural_library_proofs(
+    plans: Vec<LibraryArtifactPlan>,
+) -> Result<BTreeMap<ArtifactRelativePath, StructuralLibraryProof>, KnownGoodInventoryError> {
+    let mut proofs = BTreeMap::new();
+    for plan in plans
+        .into_iter()
+        .filter(|plan| plan.expected.sha1.is_none())
+    {
+        let proof = StructuralLibraryProof::from_plan(&plan);
+        if let Some(existing) = proofs.insert(plan.relative_path, proof)
+            && existing != proof
+        {
+            return Err(KnownGoodInventoryError::StructuralLibraryMismatch);
+        }
+    }
+    Ok(proofs)
 }
 
 fn add_asset_index(
@@ -853,6 +962,7 @@ impl InventoryBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::download::{LibraryVerificationIntegrity, library_verification_plans_for};
     use crate::launch::{
         ArgumentsSection, AssetIndex, Downloads, JavaVersion, LibraryArtifact, LibraryDownload,
         LoggingConf, LoggingEntry, LoggingFile,
@@ -863,6 +973,151 @@ mod tests {
         build_id_for, installed_version_id_for,
     };
     use std::collections::HashMap;
+
+    fn structural_inventory(
+        root: KnownGoodRoot,
+        path: &str,
+        kind: KnownGoodArtifactKind,
+        integrity: KnownGoodIntegrity,
+    ) -> KnownGoodInventory {
+        let mut builder = InventoryBuilder::default();
+        builder
+            .insert(KnownGoodEntry {
+                root,
+                path: KnownGoodRelativePath::new(path).expect("safe inventory path"),
+                kind,
+                integrity,
+            })
+            .expect("unique inventory entry");
+        builder.finish()
+    }
+
+    #[test]
+    fn structural_library_authority_matches_exact_root_path_kind_size_and_integrity() {
+        let path = ArtifactRelativePath::new("org/example/exact/1.0/exact-1.0.jar")
+            .expect("safe artifact path");
+        let library = structural_inventory(
+            KnownGoodRoot::Libraries,
+            path.as_str(),
+            KnownGoodArtifactKind::Library,
+            KnownGoodIntegrity::StructuralJar { size: Some(42) },
+        );
+        assert!(library.authorizes_structural_library(&path, false, Some(42)));
+        assert!(!library.authorizes_structural_library(&path, true, Some(42)));
+        assert!(!library.authorizes_structural_library(&path, false, None));
+        assert!(!library.authorizes_structural_library(&path, false, Some(41)));
+
+        let other_path = ArtifactRelativePath::new("org/example/exact/1.0/other.jar")
+            .expect("safe artifact path");
+        assert!(!library.authorizes_structural_library(&other_path, false, Some(42)));
+
+        let native = structural_inventory(
+            KnownGoodRoot::Libraries,
+            path.as_str(),
+            KnownGoodArtifactKind::NativeLibrary,
+            KnownGoodIntegrity::StructuralJar { size: None },
+        );
+        assert!(native.authorizes_structural_library(&path, true, None));
+        assert!(!native.authorizes_structural_library(&path, false, None));
+        assert!(!native.authorizes_structural_library(&path, true, Some(42)));
+
+        for inventory in [
+            structural_inventory(
+                KnownGoodRoot::Assets,
+                path.as_str(),
+                KnownGoodArtifactKind::Library,
+                KnownGoodIntegrity::StructuralJar { size: Some(42) },
+            ),
+            structural_inventory(
+                KnownGoodRoot::Libraries,
+                path.as_str(),
+                KnownGoodArtifactKind::Library,
+                KnownGoodIntegrity::Sha1 {
+                    digest: Sha1Digest::from_metadata("0123456789abcdef0123456789abcdef01234567")
+                        .expect("digest"),
+                    size: Some(42),
+                },
+            ),
+            structural_inventory(
+                KnownGoodRoot::Libraries,
+                path.as_str(),
+                KnownGoodArtifactKind::Library,
+                KnownGoodIntegrity::ExactBytes {
+                    digest: Sha1Digest::from_metadata("0123456789abcdef0123456789abcdef01234567")
+                        .expect("digest"),
+                    size: 42,
+                },
+            ),
+        ] {
+            assert!(!inventory.authorizes_structural_library(&path, false, Some(42)));
+        }
+    }
+
+    #[test]
+    fn verification_planner_requires_exact_inventory_for_checksumless_library() {
+        let relative_path = "org/example/exact/1.0/exact-1.0.jar";
+        let library = Library {
+            name: "org.example:exact:1.0".to_string(),
+            downloads: Some(LibraryDownload {
+                artifact: Some(LibraryArtifact {
+                    path: relative_path.to_string(),
+                    size: 42,
+                    ..LibraryArtifact::default()
+                }),
+                ..LibraryDownload::default()
+            }),
+            ..Library::default()
+        };
+        let inventory = structural_inventory(
+            KnownGoodRoot::Libraries,
+            relative_path,
+            KnownGoodArtifactKind::Library,
+            KnownGoodIntegrity::StructuralJar { size: Some(42) },
+        );
+        let root =
+            std::env::temp_dir().join(format!("axial-known-good-authority-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("authority root");
+        let authority =
+            KnownGoodInventoryAuthority::bind(Arc::new(inventory), &root).expect("bound authority");
+
+        let strict = library_verification_plans_for(
+            &root,
+            std::slice::from_ref(&library),
+            &crate::rules::default_environment(),
+            None,
+        )
+        .expect("strict plan");
+        assert_eq!(
+            strict[0].integrity,
+            LibraryVerificationIntegrity::MissingChecksum
+        );
+
+        let authorized = library_verification_plans_for(
+            &root,
+            std::slice::from_ref(&library),
+            &crate::rules::default_environment(),
+            Some(&authority),
+        )
+        .expect("authorized plan");
+        assert!(matches!(
+            &authorized[0].integrity,
+            LibraryVerificationIntegrity::StructuralJar(verification)
+                if verification.expected_size == Some(42)
+        ));
+
+        let wrong_root = library_verification_plans_for(
+            &root.join("other"),
+            &[library],
+            &crate::rules::default_environment(),
+            Some(&authority),
+        )
+        .expect("wrong-root plan");
+        assert_eq!(
+            wrong_root[0].integrity,
+            LibraryVerificationIntegrity::MissingChecksum
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1161,6 +1416,56 @@ mod tests {
         let error = derive_known_good_inventory(fixture.input())
             .expect_err("checksumless base library must remain strict");
         assert_eq!(error, KnownGoodInventoryError::MissingChecksum);
+    }
+
+    #[test]
+    fn structural_library_source_size_must_match_resolved_library() {
+        let mut fixture = fixture(FixtureShape::Fabric, false);
+        fixture
+            .version
+            .libraries
+            .iter_mut()
+            .find(|library| library.name == "net.loader:loader-unverified:1.0")
+            .expect("checksumless resolved library")
+            .size = 13;
+
+        let error = derive_known_good_inventory(fixture.input())
+            .expect_err("source size mismatch must not mint structural authority");
+
+        assert_eq!(error, KnownGoodInventoryError::StructuralLibraryMismatch);
+    }
+
+    #[test]
+    fn structural_library_source_kind_must_match_resolved_library() {
+        let path = ArtifactRelativePath::new("net/loader/exact/1.0/exact-1.0.jar")
+            .expect("canonical library path");
+        let proofs =
+            structural_library_proofs(vec![structural_plan(path.clone(), false, Some(12))])
+                .expect("source proof");
+        let mut builder = InventoryBuilder::default();
+
+        let error = add_library_plans(
+            &mut builder,
+            vec![structural_plan(path, true, Some(12))],
+            &proofs,
+        )
+        .expect_err("source kind mismatch must not mint structural authority");
+
+        assert_eq!(error, KnownGoodInventoryError::StructuralLibraryMismatch);
+    }
+
+    #[test]
+    fn conflicting_structural_library_source_proofs_fail_closed() {
+        let path = ArtifactRelativePath::new("net/loader/exact/1.0/exact-1.0.jar")
+            .expect("canonical library path");
+
+        let error = structural_library_proofs(vec![
+            structural_plan(path.clone(), false, Some(12)),
+            structural_plan(path, false, None),
+        ])
+        .expect_err("conflicting source proofs");
+
+        assert_eq!(error, KnownGoodInventoryError::StructuralLibraryMismatch);
     }
 
     #[test]
@@ -1630,6 +1935,21 @@ mod tests {
             url: "https://example.invalid/maven/".to_string(),
             size: 12,
             ..Library::default()
+        }
+    }
+
+    fn structural_plan(
+        relative_path: ArtifactRelativePath,
+        is_native: bool,
+        size: Option<u64>,
+    ) -> LibraryArtifactPlan {
+        LibraryArtifactPlan {
+            name: "exact structural library".to_string(),
+            source_url: Some("https://example.invalid/library".to_string()),
+            relative_path,
+            expected: ExpectedIntegrity { size, sha1: None },
+            allow_missing_checksum: true,
+            is_native,
         }
     }
 

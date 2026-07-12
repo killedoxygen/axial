@@ -17,7 +17,7 @@ pub mod version_meta;
 
 pub use asset_index::{AssetIndexFlagsError, asset_index_requires_virtual_repair};
 pub use download::{DownloadError, DownloadProgress, Downloader};
-pub use known_good::{KnownGoodInstallReceipt, KnownGoodInventory};
+pub use known_good::{KnownGoodInstallReceipt, KnownGoodInventory, KnownGoodInventoryAuthority};
 pub use launch::{
     JavaVersion, LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath,
     client_jar_path, effective_java_version_for, java_component_for_major,
@@ -34,14 +34,14 @@ pub use loaders::{
     LoaderSelectionReason, LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
     LoaderVersionIndex, build_id_for, fetch_builds, fetch_cached_builds, fetch_components,
     fetch_supported_versions, install_build, installed_version_id_for, loader_components,
-    parse_build_id, resolve_build_record, validated_installed_loader_provenance,
+    parse_build_id, resolve_build_record_for_install, validated_installed_loader_provenance,
 };
 pub use manifest::{
     ManifestEntry, VersionManifest, fetch_version_manifest, fetch_version_manifest_cached,
 };
 pub use paths::{
-    cache_dir, create_minecraft_dir, default_minecraft_dir, libraries_dir, loader_artifacts_dir,
-    loader_cache_dir, loader_catalog_dir, loader_work_dir, runtime_dirs, validate_installation,
+    cache_dir, create_minecraft_dir, default_minecraft_dir, libraries_dir, loader_cache_dir,
+    loader_catalog_dir, loader_work_dir, runtime_dirs, validate_installation,
     version_manifest_cache_path, versions_dir,
 };
 pub use profiles::ensure_launcher_profiles;

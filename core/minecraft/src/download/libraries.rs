@@ -30,12 +30,25 @@ pub(crate) struct DownloadJob {
 pub struct LibraryVerificationPlan {
     pub path: PathBuf,
     pub name: String,
-    pub expected: ExpectedIntegrity,
-    pub allow_missing_checksum: bool,
+    pub integrity: LibraryVerificationIntegrity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralLibraryVerification {
+    pub(crate) minecraft_root: PathBuf,
+    pub(crate) relative_path: ArtifactRelativePath,
+    pub(crate) expected_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LibraryVerificationIntegrity {
+    Sha1(ExpectedIntegrity),
+    StructuralJar(StructuralLibraryVerification),
+    MissingChecksum,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LibraryChecksumPolicy {
+pub(crate) enum LibraryChecksumPolicy {
     Strict,
     AllowMissing,
 }
@@ -57,12 +70,33 @@ pub(crate) struct LibraryArtifactPlan {
 }
 
 impl LibraryArtifactPlan {
-    fn into_verification_plan(self, mc_dir: &Path) -> LibraryVerificationPlan {
+    fn into_verification_plan(
+        self,
+        mc_dir: &Path,
+        known_good: Option<&crate::known_good::KnownGoodInventoryAuthority>,
+    ) -> LibraryVerificationPlan {
+        let integrity = if self.expected.sha1.is_some() {
+            LibraryVerificationIntegrity::Sha1(self.expected.clone())
+        } else if let Some(managed_root) = known_good.and_then(|inventory| {
+            inventory.authorizes_structural_library(
+                mc_dir,
+                &self.relative_path,
+                self.is_native,
+                self.expected.size,
+            )
+        }) {
+            LibraryVerificationIntegrity::StructuralJar(StructuralLibraryVerification {
+                minecraft_root: managed_root,
+                relative_path: self.relative_path.clone(),
+                expected_size: self.expected.size,
+            })
+        } else {
+            LibraryVerificationIntegrity::MissingChecksum
+        };
         LibraryVerificationPlan {
             path: self.relative_path.join_under(&libraries_dir(mc_dir)),
             name: self.name,
-            expected: self.expected,
-            allow_missing_checksum: self.allow_missing_checksum,
+            integrity,
         }
     }
 
@@ -407,12 +441,14 @@ pub fn library_verification_plans_for(
     mc_dir: &Path,
     libraries: &[Library],
     env: &Environment,
-    checksum_policy: LibraryChecksumPolicy,
+    known_good: Option<&crate::known_good::KnownGoodInventoryAuthority>,
 ) -> Result<Vec<LibraryVerificationPlan>, LibraryPlanError> {
-    Ok(library_artifact_plans_for(libraries, env, checksum_policy)?
-        .into_iter()
-        .map(|plan| plan.into_verification_plan(mc_dir))
-        .collect())
+    Ok(
+        library_artifact_plans_for(libraries, env, LibraryChecksumPolicy::Strict)?
+            .into_iter()
+            .map(|plan| plan.into_verification_plan(mc_dir, known_good))
+            .collect(),
+    )
 }
 
 pub(crate) fn library_artifact_plans_for(

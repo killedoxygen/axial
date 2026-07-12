@@ -236,6 +236,11 @@ pub(super) fn enrich_instance_for_scan(
         requested_java: selected_java_override(&instance, &config),
         version_id: instance.version_id.clone(),
         guardian_mode: GuardianMode::from_config(&config.guardian_mode),
+        known_good_inventory: state.active_known_good_inventory(
+            &instance.id,
+            &instance.version_id,
+            library_dir,
+        ),
     });
     let readiness_elapsed = readiness_started_at.elapsed();
     if readiness_elapsed >= INSTANCE_READINESS_SLOW_SPAN {

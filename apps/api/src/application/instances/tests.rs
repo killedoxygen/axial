@@ -2478,7 +2478,53 @@ async fn create_instance_loader_reuses_one_request_snapshot_without_warm_walks()
 }
 
 #[tokio::test]
-async fn create_instance_loader_selection_resolves_cached_build_and_queues_backend_install() {
+async fn create_instance_checksumless_loader_probe_stays_strict_without_instance_authority() {
+    let fixture = TestFixture::new("create-checksumless-loader-strict");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    write_installed_checksumless_loader_version(
+        &library_dir,
+        axial_minecraft::LoaderComponentId::Fabric,
+        "1.21.1",
+        "0.16.14",
+    );
+    let build_id = write_fabric_loader_build_cache(&library_dir, "1.21.1", "0.16.14");
+    fixture
+        .state
+        .installs()
+        .enqueue_queued_install(
+            "busy-checksumless-probe".to_string(),
+            crate::state::InstallQueueSpec::vanilla("busy".to_string()),
+            crate::state::InstallQueuePlacement::Back,
+        )
+        .await;
+    fixture
+        .state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .expect("reserve active queue slot");
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Strict checksumless loader".to_string(),
+            selection_id: format!(
+                "loader_build|{}|{build_id}",
+                axial_minecraft::LoaderComponentId::Fabric.as_str()
+            ),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create checksumless loader instance");
+
+    assert!(!created.instance.launchable);
+    assert!(created.queued_install.is_some());
+}
+
+#[tokio::test]
+async fn cached_loader_build_cannot_authorize_backend_install() {
     let fixture = TestFixture::new("create-loader-queue");
     let library_dir = fixture.root.join("library");
     fixture
@@ -2501,7 +2547,7 @@ async fn create_instance_loader_selection_resolves_cached_build_and_queues_backe
         .expect("reserve active queue slot");
     let build_id = write_fabric_loader_build_cache(&library_dir, "1.21.99", "0.16.14");
 
-    let created = handle_create_instance(
+    let (status, Json(body)) = handle_create_instance(
         &fixture.state,
         CreateInstanceRequest {
             name: "Fabric queued".to_string(),
@@ -2510,23 +2556,22 @@ async fn create_instance_loader_selection_resolves_cached_build_and_queues_backe
         },
     )
     .await
-    .expect("create and queue loader install");
+    .expect_err("cached build must not authorize a loader install");
 
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["failure_kind"], "catalog_unavailable");
     assert_eq!(
-        created.instance.version_id,
-        axial_minecraft::installed_version_id_for(
-            axial_minecraft::LoaderComponentId::Fabric,
-            "1.21.99",
-            "0.16.14",
-        )
-        .expect("valid Fabric identity")
+        body["error"],
+        "Loader catalog is unavailable. Check your connection and try again."
     );
-    let queued = created.queued_install.expect("queued install summary");
-    assert_eq!(queued.state_id, "install_queued");
-    assert_eq!(queued.kind, "loader");
-    assert_eq!(queued.label, "Fabric 0.16.14 for Minecraft 1.21.99");
-    assert!(queued.queue_id.is_some());
     assert_eq!(build_id, "fabric:1.21.99:0.16.14");
+    assert!(fixture.state.instances().list().is_empty());
+    let queue = fixture.state.installs().queue_snapshot().await;
+    assert_eq!(
+        queue.active.as_ref().map(|entry| entry.queue_id.as_str()),
+        Some("busy-loader-queue")
+    );
+    assert!(queue.pending.is_empty());
 }
 
 #[tokio::test]
@@ -3277,6 +3322,40 @@ fn write_installed_loader_version(
         .expect("serialize loader metadata"),
     )
     .expect("write loader metadata");
+}
+
+fn write_installed_checksumless_loader_version(
+    library_dir: &FsPath,
+    component_id: axial_minecraft::LoaderComponentId,
+    minecraft_version: &str,
+    loader_version: &str,
+) {
+    write_installed_loader_version(library_dir, component_id, minecraft_version, loader_version);
+    let version_id =
+        axial_minecraft::installed_version_id_for(component_id, minecraft_version, loader_version)
+            .expect("valid loader identity");
+    let version_path = library_dir
+        .join("versions")
+        .join(&version_id)
+        .join(format!("{version_id}.json"));
+    let mut version: serde_json::Value =
+        serde_json::from_slice(&fs::read(&version_path).expect("read installed loader version"))
+            .expect("parse installed loader version");
+    version["libraries"] = serde_json::json!([{
+        "name": "com.example:checksumless:1.0.0",
+        "url": "https://example.invalid/"
+    }]);
+    fs::write(
+        version_path,
+        serde_json::to_vec_pretty(&version).expect("serialize checksumless loader version"),
+    )
+    .expect("write checksumless loader version");
+    let library_path = library_dir
+        .join("libraries")
+        .join("com/example/checksumless/1.0.0/checksumless-1.0.0.jar");
+    fs::create_dir_all(library_path.parent().expect("library parent"))
+        .expect("create library directory");
+    fs::write(library_path, b"present but unauthoritative").expect("write checksumless library");
 }
 
 impl TestFixture {

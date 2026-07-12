@@ -474,13 +474,12 @@ impl AppState {
         Ok(accepted)
     }
 
-    #[allow(dead_code, reason = "consumed by the next R1 readiness slice")]
     pub(crate) fn active_known_good_inventory(
         &self,
         instance_id: &str,
         version_id: &str,
         library_root: &Path,
-    ) -> Option<Arc<axial_minecraft::known_good::KnownGoodInventory>> {
+    ) -> Option<Arc<axial_minecraft::KnownGoodInventoryAuthority>> {
         let configured_library_root = self.library_dir().map(PathBuf::from)?;
         if !known_good::KnownGoodInventoryStore::library_roots_match(
             &configured_library_root,
@@ -492,8 +491,12 @@ impl AppState {
         ) {
             return None;
         }
-        self.known_good
-            .active_inventory(instance_id, version_id, library_root)
+        let inventory = self
+            .known_good
+            .active_inventory(instance_id, version_id, library_root)?;
+        axial_minecraft::KnownGoodInventoryAuthority::bind(inventory, library_root)
+            .ok()
+            .map(Arc::new)
     }
 
     pub fn performance(&self) -> &Arc<AppPerformanceStore> {

@@ -37,7 +37,7 @@ use crate::state::{AppState, ProducerLease, RequestProducerHandoff};
 use axial_minecraft::{
     DownloadError, DownloadProgress, Downloader,
     download::{ExecutionDownloadFact, SelectedDownloadArtifactDescriptor},
-    resolve_build_record,
+    resolve_build_record_for_install,
 };
 use axum::{Json, http::StatusCode};
 use std::path::PathBuf;
@@ -936,19 +936,15 @@ async fn install_queue_spec_from_request(
                     Json(serde_json::json!({ "error": "build_id is required" })),
                 ));
             }
-            let library_dir = state.library_dir().ok_or_else(|| {
+            state.library_dir().ok_or_else(|| {
                 (
                     StatusCode::PRECONDITION_FAILED,
                     Json(serde_json::json!({ "error": "Axial library is not configured" })),
                 )
             })?;
-            let build = resolve_build_record(
-                PathBuf::from(library_dir).as_path(),
-                component_id,
-                &build_id,
-            )
-            .await
-            .map_err(loader_pre_operation_error_response)?;
+            let build = resolve_build_record_for_install(component_id, &build_id)
+                .await
+                .map_err(loader_pre_operation_error_response)?;
             Ok(InstallQueueSpec::loader(
                 build.component_id,
                 build.build_id,

@@ -9,14 +9,62 @@ const MAX_LOADER_JSON_BYTES: usize = 8 * 1024 * 1024;
 const LOADER_HTTP_CLIENT_MAX_IDLE_PER_HOST: usize = 8;
 const LOADER_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECS: u64 = 120;
 const LOADER_HTTP_CLIENT_TCP_KEEPALIVE_SECS: u64 = 60;
+const LOADER_SOURCE_REDIRECT_LIMIT: usize = 10;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderSourceRedirectDecision {
+    Follow,
+    RejectInsecure,
+    RejectLimit,
+}
+
+#[derive(Clone, Copy)]
+enum LoaderSourceTransportPolicy {
+    HttpsOnly,
+    #[cfg(test)]
+    AllowHttpForTest,
+}
+
+impl LoaderSourceTransportPolicy {
+    fn requires_https(self) -> bool {
+        match self {
+            Self::HttpsOnly => true,
+            #[cfg(test)]
+            Self::AllowHttpForTest => false,
+        }
+    }
+}
 
 pub async fn fetch_json<T>(url: &str) -> Result<T, LoaderError>
 where
     T: DeserializeOwned + Send + 'static,
 {
+    fetch_json_with_policy(url, LoaderSourceTransportPolicy::HttpsOnly).await
+}
+
+#[cfg(test)]
+async fn fetch_json_for_test<T>(url: &str) -> Result<T, LoaderError>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    fetch_json_with_policy(url, LoaderSourceTransportPolicy::AllowHttpForTest).await
+}
+
+async fn fetch_json_with_policy<T>(
+    url: &str,
+    policy: LoaderSourceTransportPolicy,
+) -> Result<T, LoaderError>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    if policy.requires_https() && !loader_source_url_is_secure(url) {
+        return Err(insecure_loader_source_error(
+            "loader provider source must use HTTPS",
+        ));
+    }
     let mut last_error: Option<LoaderError> = None;
     for attempt in 0..3 {
-        match fetch_json_once::<T>(url).await {
+        match fetch_json_once::<T>(url, policy).await {
             Ok(value) => return Ok(value),
             Err(error) if !loader_error_allows_primitive_retry(&error) => return Err(error),
             Err(error) => {
@@ -31,9 +79,25 @@ where
 }
 
 pub async fn fetch_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderError> {
+    fetch_bytes_with_policy(url, max_size, LoaderSourceTransportPolicy::HttpsOnly).await
+}
+
+#[cfg(test)]
+pub(crate) async fn fetch_bytes_for_test(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderError> {
+    fetch_bytes_with_policy(url, max_size, LoaderSourceTransportPolicy::AllowHttpForTest).await
+}
+
+async fn fetch_bytes_with_policy(
+    url: &str,
+    max_size: u64,
+    policy: LoaderSourceTransportPolicy,
+) -> Result<Vec<u8>, LoaderError> {
+    if policy.requires_https() && !loader_source_url_is_secure(url) {
+        return Err(insecure_loader_source_error("loader source must use HTTPS"));
+    }
     let mut last_error: Option<LoaderError> = None;
     for attempt in 0..3 {
-        match fetch_bytes_once(url, max_size).await {
+        match fetch_bytes_once(url, max_size, policy).await {
             Ok(value) => return Ok(value),
             Err(LoaderError::ArtifactMissing(message)) => {
                 return Err(LoaderError::ArtifactMissing(message));
@@ -50,15 +114,23 @@ pub async fn fetch_bytes(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderErro
     Err(last_error.unwrap_or_else(|| provider_network_error(None)))
 }
 
-async fn fetch_json_once<T>(url: &str) -> Result<T, LoaderError>
+async fn fetch_json_once<T>(
+    url: &str,
+    policy: LoaderSourceTransportPolicy,
+) -> Result<T, LoaderError>
 where
     T: DeserializeOwned,
 {
-    let response = client()
+    let response = source_client(policy)
         .get(url)
         .send()
         .await
         .map_err(|error| provider_network_error(Some(error)))?;
+    if policy.requires_https() && response.url().scheme() != "https" {
+        return Err(insecure_loader_source_error(
+            "loader provider source redirected to an insecure URL",
+        ));
+    }
     if !response.status().is_success() {
         return Err(provider_status_error(response.status()));
     }
@@ -91,12 +163,21 @@ fn loader_response_too_large() -> LoaderError {
     }
 }
 
-async fn fetch_bytes_once(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderError> {
-    let response = client()
+async fn fetch_bytes_once(
+    url: &str,
+    max_size: u64,
+    policy: LoaderSourceTransportPolicy,
+) -> Result<Vec<u8>, LoaderError> {
+    let response = source_client(policy)
         .get(url)
         .send()
         .await
         .map_err(|error| provider_network_error(Some(error)))?;
+    if policy.requires_https() && response.url().scheme() != "https" {
+        return Err(insecure_loader_source_error(
+            "loader source redirected to an insecure URL",
+        ));
+    }
 
     let mut bytes = Vec::new();
     let status = response.status();
@@ -124,6 +205,27 @@ async fn fetch_bytes_once(url: &str, max_size: u64) -> Result<Vec<u8>, LoaderErr
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+fn loader_source_url_is_secure(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| url.scheme() == "https" && url.host_str().is_some())
+}
+
+fn loader_source_redirect_decision(
+    destination: &reqwest::Url,
+    previous_count: usize,
+) -> LoaderSourceRedirectDecision {
+    if previous_count >= LOADER_SOURCE_REDIRECT_LIMIT {
+        LoaderSourceRedirectDecision::RejectLimit
+    } else if destination.scheme() == "https" {
+        LoaderSourceRedirectDecision::Follow
+    } else {
+        LoaderSourceRedirectDecision::RejectInsecure
+    }
+}
+
+fn insecure_loader_source_error(message: &str) -> LoaderError {
+    LoaderError::InstallExecutionFailed(message.to_string())
 }
 
 fn provider_network_error(error: Option<reqwest::Error>) -> LoaderError {
@@ -184,9 +286,44 @@ fn client() -> &'static reqwest::Client {
     })
 }
 
+fn source_client(policy: LoaderSourceTransportPolicy) -> &'static reqwest::Client {
+    if !policy.requires_https() {
+        return client();
+    }
+    static SOURCE_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    SOURCE_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .read_timeout(Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                match loader_source_redirect_decision(attempt.url(), attempt.previous().len()) {
+                    LoaderSourceRedirectDecision::Follow => attempt.follow(),
+                    LoaderSourceRedirectDecision::RejectInsecure => {
+                        attempt.error("loader source redirect must use HTTPS")
+                    }
+                    LoaderSourceRedirectDecision::RejectLimit => {
+                        attempt.error("loader source redirect limit exceeded")
+                    }
+                }
+            }))
+            .user_agent(USER_AGENT)
+            .pool_max_idle_per_host(LOADER_HTTP_CLIENT_MAX_IDLE_PER_HOST)
+            .pool_idle_timeout(Duration::from_secs(
+                LOADER_HTTP_CLIENT_POOL_IDLE_TIMEOUT_SECS,
+            ))
+            .tcp_keepalive(Duration::from_secs(LOADER_HTTP_CLIENT_TCP_KEEPALIVE_SECS))
+            .build()
+            .expect("loader source HTTP client configuration should be valid")
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MAX_LOADER_JSON_BYTES, fetch_bytes, fetch_json, fetch_json_once};
+    use super::{
+        LOADER_SOURCE_REDIRECT_LIMIT, LoaderSourceRedirectDecision, LoaderSourceTransportPolicy,
+        MAX_LOADER_JSON_BYTES, fetch_bytes, fetch_bytes_for_test, fetch_json, fetch_json_for_test,
+        fetch_json_once, loader_source_redirect_decision,
+    };
     use crate::loaders::types::{LoaderError, LoaderProviderFailureKind};
     use serde::Deserialize;
     use serde_json::Value;
@@ -197,6 +334,32 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn production_redirect_policy_rejects_https_to_http_downgrade() {
+        let destination = reqwest::Url::parse("http://provider.example.test/artifact")
+            .expect("valid redirect destination");
+
+        assert_eq!(
+            loader_source_redirect_decision(&destination, 0),
+            LoaderSourceRedirectDecision::RejectInsecure
+        );
+    }
+
+    #[test]
+    fn production_redirect_policy_enforces_redirect_limit() {
+        let destination = reqwest::Url::parse("https://provider.example.test/artifact")
+            .expect("valid redirect destination");
+
+        assert_eq!(
+            loader_source_redirect_decision(&destination, LOADER_SOURCE_REDIRECT_LIMIT - 1),
+            LoaderSourceRedirectDecision::Follow
+        );
+        assert_eq!(
+            loader_source_redirect_decision(&destination, LOADER_SOURCE_REDIRECT_LIMIT),
+            LoaderSourceRedirectDecision::RejectLimit
+        );
+    }
 
     #[tokio::test]
     async fn fetch_bytes_maps_http_404_to_artifact_missing() {
@@ -229,7 +392,9 @@ mod tests {
             }
         });
 
-        let error = fetch_bytes(&url, 1024).await.expect_err("404 error");
+        let error = fetch_bytes_for_test(&url, 1024)
+            .await
+            .expect_err("404 error");
 
         match error {
             LoaderError::ArtifactMissing(message) => {
@@ -253,7 +418,7 @@ mod tests {
             );
         });
 
-        let error = fetch_bytes(&server.url("/installer.jar"), 4)
+        let error = fetch_bytes_for_test(&server.url("/installer.jar"), 4)
             .await
             .expect_err("oversized response");
 
@@ -265,6 +430,27 @@ mod tests {
             error => panic!("expected ProviderDataInvalid, got {error:?}"),
         }
         assert_eq!(server.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn production_loader_source_rejects_http_before_request() {
+        let server = TestServer::spawn(|stream| {
+            respond(
+                stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            );
+        });
+
+        let error = fetch_bytes(&server.url("/installer.jar"), 16)
+            .await
+            .expect_err("production loader source must reject HTTP");
+
+        assert!(matches!(
+            error,
+            LoaderError::InstallExecutionFailed(message)
+                if message == "loader source must use HTTPS"
+        ));
+        assert_eq!(server.request_count(), 0);
     }
 
     #[derive(Debug, Deserialize)]
@@ -281,7 +467,7 @@ mod tests {
             );
         });
 
-        let payload: TestPayload = fetch_json(&server.url("/metadata.json"))
+        let payload: TestPayload = fetch_json_for_test(&server.url("/metadata.json"))
             .await
             .expect("json response");
 
@@ -294,9 +480,12 @@ mod tests {
             respond_oversized_json_content_length(stream);
         });
 
-        let error = fetch_json_once::<Value>(&server.url("/metadata.json"))
-            .await
-            .expect_err("oversized response");
+        let error = fetch_json_once::<Value>(
+            &server.url("/metadata.json"),
+            LoaderSourceTransportPolicy::AllowHttpForTest,
+        )
+        .await
+        .expect_err("oversized response");
 
         assert_loader_json_too_large(error);
         assert_eq!(server.request_count(), 1);
@@ -308,9 +497,12 @@ mod tests {
             respond_oversized_chunked_json(stream);
         });
 
-        let error = fetch_json_once::<Value>(&server.url("/metadata.json"))
-            .await
-            .expect_err("oversized response");
+        let error = fetch_json_once::<Value>(
+            &server.url("/metadata.json"),
+            LoaderSourceTransportPolicy::AllowHttpForTest,
+        )
+        .await
+        .expect_err("oversized response");
 
         assert_loader_json_too_large(error);
         assert_eq!(server.request_count(), 1);
@@ -325,9 +517,12 @@ mod tests {
             );
         });
 
-        let error = fetch_json_once::<Value>(&server.url("/metadata.json"))
-            .await
-            .expect_err("http status should fail");
+        let error = fetch_json_once::<Value>(
+            &server.url("/metadata.json"),
+            LoaderSourceTransportPolicy::AllowHttpForTest,
+        )
+        .await
+        .expect_err("http status should fail");
 
         match error {
             LoaderError::ProviderUnavailable { kind, status } => {
@@ -348,9 +543,12 @@ mod tests {
             );
         });
 
-        let error = fetch_json_once::<Value>(&server.url("/metadata.json"))
-            .await
-            .expect_err("invalid json should fail");
+        let error = fetch_json_once::<Value>(
+            &server.url("/metadata.json"),
+            LoaderSourceTransportPolicy::AllowHttpForTest,
+        )
+        .await
+        .expect_err("invalid json should fail");
         let encoded = error.to_string().to_ascii_lowercase();
 
         match &error {
@@ -363,6 +561,27 @@ mod tests {
         assert!(!encoded.contains("not-json"));
         assert!(!encoded.contains("metadata.json"));
         assert_eq!(server.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn production_loader_provider_rejects_http_before_request() {
+        let server = TestServer::spawn(|stream| {
+            respond(
+                stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            );
+        });
+
+        let error = fetch_json::<Value>(&server.url("/metadata.json"))
+            .await
+            .expect_err("production loader provider must reject HTTP");
+
+        assert!(matches!(
+            error,
+            LoaderError::InstallExecutionFailed(message)
+                if message == "loader provider source must use HTTPS"
+        ));
+        assert_eq!(server.request_count(), 0);
     }
 
     fn respond_404(stream: TcpStream) {

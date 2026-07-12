@@ -12,9 +12,7 @@ use axial_minecraft::known_good::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-#[cfg(test)]
-use std::fs;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -999,7 +997,15 @@ fn normalize_library_root(path: &Path) -> io::Result<PathBuf> {
             Component::Normal(value) => normalized.push(value),
         }
     }
-    Ok(normalized)
+    let canonical = fs::canonicalize(normalized)?;
+    let metadata = fs::symlink_metadata(&canonical)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "known-good library root must resolve to an existing directory",
+        ));
+    }
+    Ok(canonical)
 }
 
 fn invalid_snapshot(message: impl Into<String>) -> io::Error {
@@ -1033,6 +1039,36 @@ mod tests {
     struct BlockState {
         entered: bool,
         released: bool,
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalized_library_root_changes_when_a_root_symlink_is_retargeted() {
+        use std::os::unix::fs::symlink;
+
+        let (root, _) = paths("root-symlink-retarget");
+        let first = root.join("first");
+        let second = root.join("second");
+        let linked = root.join("library-link");
+        fs::create_dir_all(&first).expect("first root");
+        fs::create_dir_all(&second).expect("second root");
+        symlink(&first, &linked).expect("first symlink");
+        let first_identity = normalize_library_root(&linked).expect("first identity");
+
+        fs::remove_file(&linked).expect("remove first symlink");
+        symlink(&second, &linked).expect("second symlink");
+        let second_identity = normalize_library_root(&linked).expect("second identity");
+
+        assert_eq!(
+            first_identity,
+            fs::canonicalize(&first).expect("canonical first")
+        );
+        assert_eq!(
+            second_identity,
+            fs::canonicalize(&second).expect("canonical second")
+        );
+        assert_ne!(first_identity, second_identity);
+        let _ = fs::remove_dir_all(root);
     }
 
     impl FileBackend {
