@@ -12,6 +12,7 @@ mod instance_lifecycle;
 mod instance_registry;
 mod java_probe_failures;
 mod journals;
+mod known_good;
 pub(crate) mod launch_reports;
 mod lifecycle;
 pub mod ownership;
@@ -103,6 +104,7 @@ pub struct AppState {
     failure_memory: Arc<GuardianFailureMemoryStore>,
     journals: Arc<OperationJournalStore>,
     installed_versions: Arc<installed_versions::InstalledVersionsIndex>,
+    known_good: Arc<known_good::KnownGoodInventoryStore>,
     java_probe_failures: Arc<JavaProbeFailureCache>,
     sessions: Arc<SessionStore>,
     skins: Arc<skins::SavedSkinStore>,
@@ -286,6 +288,7 @@ impl AppState {
         let accounts = Arc::new(LauncherAccountStore::load_from_paths(config.paths()));
         let failure_memory = Arc::new(GuardianFailureMemoryStore::load_from_paths(config.paths()));
         let journals = Arc::new(OperationJournalStore::load_from_paths(config.paths()));
+        let known_good = Arc::new(known_good::KnownGoodInventoryStore::claim(config.paths()));
         let (config_changes, _) = broadcast::channel(32);
 
         Self {
@@ -299,6 +302,7 @@ impl AppState {
             failure_memory,
             journals,
             installed_versions: Arc::new(installed_versions::InstalledVersionsIndex::default()),
+            known_good,
             java_probe_failures: Arc::new(JavaProbeFailureCache::default()),
             sessions: init.sessions,
             skins,
@@ -399,6 +403,42 @@ impl AppState {
 
     pub(crate) fn java_probe_failures(&self) -> &Arc<JavaProbeFailureCache> {
         &self.java_probe_failures
+    }
+
+    pub async fn reconcile_known_good_inventory(
+        &self,
+        instance_id: &str,
+        version_id: &str,
+        inventory: axial_minecraft::known_good::KnownGoodInventory,
+    ) -> std::io::Result<axial_minecraft::known_good::KnownGoodInventory> {
+        if !is_canonical_instance_id(instance_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid instance identity",
+            ));
+        }
+        let _lifecycle = self.acquire_instance_lifecycle(instance_id).await;
+        let instance = self.instances.get(instance_id).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "instance not found")
+        })?;
+        if !matches_known_good_identity(Some(&instance), instance_id, version_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "instance version identity changed",
+            ));
+        }
+        let inventory = self
+            .known_good
+            .reconcile(instance_id, version_id, inventory)
+            .await?;
+        let current = self.instances.get(instance_id);
+        if !matches_known_good_identity(current.as_ref(), instance_id, version_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "instance identity changed during known-good reconciliation",
+            ));
+        }
+        Ok(inventory)
     }
 
     pub fn performance(&self) -> &Arc<AppPerformanceStore> {
@@ -616,6 +656,10 @@ impl AppState {
             .map_err(|error| {
                 InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
             })?;
+        self.known_good
+            .retire(&instance_id)
+            .await
+            .map_err(InstanceStoreError::Persistence)?;
         let instances = self.instances.clone();
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -728,6 +772,10 @@ impl AppState {
         self.instances.close().await
     }
 
+    pub(crate) async fn close_known_good_inventories(&self) -> std::io::Result<()> {
+        self.known_good.close().await
+    }
+
     fn config_commit_observer(&self) -> Arc<dyn Fn(AppConfig, AppConfig) + Send + Sync> {
         let telemetry = self.telemetry.clone();
         let changes = self.config_changes.clone();
@@ -797,4 +845,53 @@ fn bound_startup_warnings(warnings: Vec<String>) -> Vec<String> {
         .take(STARTUP_WARNING_LIMIT)
         .map(|warning| warning.chars().take(STARTUP_WARNING_MAX_CHARS).collect())
         .collect()
+}
+
+fn matches_known_good_identity(
+    instance: Option<&axial_config::Instance>,
+    instance_id: &str,
+    version_id: &str,
+) -> bool {
+    instance.is_some_and(|instance| {
+        instance.id == instance_id
+            && instance.version_id == version_id
+            && is_canonical_instance_id(&instance.id)
+    })
+}
+
+#[cfg(test)]
+mod known_good_identity_tests {
+    use super::*;
+
+    #[test]
+    fn unrelated_instance_changes_preserve_known_good_identity() {
+        let mut instance = new_instance(
+            "0000000000000042".to_string(),
+            "Before".to_string(),
+            "1.21.5".to_string(),
+            String::new(),
+            String::new(),
+        );
+        assert!(matches_known_good_identity(
+            Some(&instance),
+            &instance.id,
+            "1.21.5"
+        ));
+
+        instance.name = "After".to_string();
+        instance.max_memory_mb = 8_192;
+        instance.icon = "grass".to_string();
+        assert!(matches_known_good_identity(
+            Some(&instance),
+            &instance.id,
+            "1.21.5"
+        ));
+
+        instance.version_id = "1.21.6".to_string();
+        assert!(!matches_known_good_identity(
+            Some(&instance),
+            &instance.id,
+            "1.21.5"
+        ));
+    }
 }

@@ -2641,12 +2641,16 @@ async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
         .expect("add remove-files instance");
     let remove_game_dir = fixture.state.instances().game_dir(&remove_files.id);
     fs::write(remove_game_dir.join("mods").join("example.jar"), "mod").expect("write mod");
+    let known_good_dir = fixture.root.join("config").join("state").join("known-good");
+    let remove_known_good = known_good_dir.join(format!("{}.json", remove_files.id));
+    fs::write(&remove_known_good, "known-good").expect("write remove-files known-good cache");
 
     let body = handle_delete_instance(&fixture.state, &remove_files.id, HashMap::new())
         .await
         .expect("delete with default file removal");
     assert_eq!(body, serde_json::json!({ "status": "ok" }));
     assert!(!remove_game_dir.exists());
+    assert!(!remove_known_good.exists());
 
     let keep_files = fixture
         .state
@@ -2657,6 +2661,8 @@ async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
     let keep_marker = keep_game_dir.join("saves").join("world").join("level.dat");
     fs::create_dir_all(keep_marker.parent().expect("marker parent")).expect("create world");
     fs::write(&keep_marker, "level").expect("write level");
+    let keep_known_good = known_good_dir.join(format!("{}.json", keep_files.id));
+    fs::write(&keep_known_good, "known-good").expect("write keep-files known-good cache");
 
     let body = handle_delete_instance(
         &fixture.state,
@@ -2669,6 +2675,7 @@ async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
 
     assert!(fixture.state.instances().get(&keep_files.id).is_none());
     assert!(keep_marker.exists());
+    assert!(!keep_known_good.exists());
 }
 
 #[tokio::test]

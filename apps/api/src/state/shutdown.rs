@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 const SHUTDOWN_LOCK_INVARIANT: &str =
     "application shutdown lock poisoned; completion state may be inconsistent";
-const SHUTDOWN_STEP_COUNT: usize = 18;
+const SHUTDOWN_STEP_COUNT: usize = 19;
 type ShutdownAttemptChannel = Arc<watch::Sender<Option<Result<(), AppShutdownError>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +25,7 @@ pub enum AppShutdownStep {
     Accounts,
     SecureAuth,
     RemoteFlags,
+    KnownGoodInventories,
     InstanceRegistry,
     Config,
 }
@@ -48,8 +49,9 @@ impl AppShutdownStep {
             Self::Accounts => 13,
             Self::SecureAuth => 14,
             Self::RemoteFlags => 15,
-            Self::InstanceRegistry => 16,
-            Self::Config => 17,
+            Self::KnownGoodInventories => 16,
+            Self::InstanceRegistry => 17,
+            Self::Config => 18,
         }
     }
 
@@ -71,6 +73,7 @@ impl AppShutdownStep {
             Self::Accounts => "accounts",
             Self::SecureAuth => "secure_auth",
             Self::RemoteFlags => "remote_flags",
+            Self::KnownGoodInventories => "known_good_inventories",
             Self::InstanceRegistry => "instance_registry",
             Self::Config => "config",
         }
@@ -185,6 +188,7 @@ impl AppShutdownCoordinator {
             &mut first_error,
             self.close_managed_compositions(state).await,
         );
+        let known_good_result = self.close_known_good_inventories(state).await;
 
         let skin_result = self.flush_skin(state).await;
         let (
@@ -211,6 +215,7 @@ impl AppShutdownCoordinator {
         retain_first_error(&mut first_error, auth_result);
         retain_first_error(&mut first_error, remote_result);
         retain_first_error(&mut first_error, rules_result);
+        retain_first_error(&mut first_error, known_good_result);
         retain_first_error(&mut first_error, instance_result);
         retain_first_error(&mut first_error, config_result);
         first_error.map_or(Ok(()), Err)
@@ -490,6 +495,9 @@ impl AppShutdownCoordinator {
         if !self.completed(AppShutdownStep::ManagedCompositions) {
             return Err(AppShutdownError::at(AppShutdownStep::ManagedCompositions));
         }
+        if !self.completed(AppShutdownStep::KnownGoodInventories) {
+            return Err(AppShutdownError::at(AppShutdownStep::KnownGoodInventories));
+        }
         if self.completed(AppShutdownStep::InstanceRegistry) {
             return Ok(());
         }
@@ -498,6 +506,18 @@ impl AppShutdownCoordinator {
             .await
             .map_err(|_| AppShutdownError::at(AppShutdownStep::InstanceRegistry))?;
         self.mark_completed(AppShutdownStep::InstanceRegistry);
+        Ok(())
+    }
+
+    async fn close_known_good_inventories(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if self.completed(AppShutdownStep::KnownGoodInventories) {
+            return Ok(());
+        }
+        state
+            .close_known_good_inventories()
+            .await
+            .map_err(|_| AppShutdownError::at(AppShutdownStep::KnownGoodInventories))?;
+        self.mark_completed(AppShutdownStep::KnownGoodInventories);
         Ok(())
     }
 
