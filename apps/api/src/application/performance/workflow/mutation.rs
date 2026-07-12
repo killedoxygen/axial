@@ -17,8 +17,7 @@ use crate::guardian::{
     GuardianCopyRequest, GuardianFact, GuardianPerformanceOperationKind,
     GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection,
     GuardianPerformanceSupervisionRequest, GuardianPolicyContext, author_guardian_copy,
-    performance_failure_memory_guardian_fact, performance_plan_guardian_facts,
-    plan_performance_supervision,
+    performance_plan_guardian_facts, plan_performance_supervision,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{OperationId, OperationPhase, RollbackState};
@@ -556,8 +555,7 @@ async fn execute_performance_install(
             ),
         )
     })?;
-    let guardian_facts =
-        performance_install_guardian_facts(state, &plan, OperationPhase::Installing);
+    let guardian_facts = performance_plan_guardian_facts(&plan, OperationPhase::Installing);
     let supervision = match supervise_performance_operation(
         state,
         GuardianPerformanceOperationKind::ApplyManagedComposition,
@@ -699,23 +697,6 @@ fn supervise_performance_operation(
         rollback_state,
         context: GuardianPolicyContext::current_operation(),
     })
-}
-
-fn performance_install_guardian_facts(
-    state: &AppState,
-    plan: &axial_performance::CompositionPlan,
-    phase: OperationPhase,
-) -> Vec<GuardianFact> {
-    let mut facts = performance_plan_guardian_facts(plan, phase);
-    facts.extend(
-        state
-            .failure_memory()
-            .list()
-            .into_iter()
-            .filter(|entry| entry.target.id == plan.composition_id)
-            .filter_map(|entry| performance_failure_memory_guardian_fact(&entry, phase)),
-    );
-    facts
 }
 
 async fn preflight_current_performance_state(

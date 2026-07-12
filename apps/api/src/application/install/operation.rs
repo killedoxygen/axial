@@ -1414,7 +1414,6 @@ fn record_provider_failure_memory_if_needed(
     let action_outcome = match outcome.decision {
         GuardianActionKind::Retry => FailureMemoryActionOutcome::Retried,
         GuardianActionKind::Block => FailureMemoryActionOutcome::Blocked,
-        GuardianActionKind::AskUser => FailureMemoryActionOutcome::Failed,
         _ => return,
     };
     let entry = GuardianFailureMemoryEntry::observed(

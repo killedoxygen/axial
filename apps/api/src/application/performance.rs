@@ -9,9 +9,7 @@ mod qualification;
 mod workflow;
 
 use super::{ApplicationCommand, PerformancePlanSummaryViewModel, ViewModelAction, ViewModelTone};
-use crate::guardian::{
-    GuardianFact, performance_failure_memory_guardian_fact, performance_rules_guardian_facts,
-};
+use crate::guardian::{GuardianFact, performance_rules_guardian_facts};
 use crate::observability::{
     RedactionAudience, bounded_descriptor_token, evidence_text_looks_sensitive,
     sanitize_evidence_token,
@@ -23,7 +21,6 @@ use crate::state::{
         OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
         RollbackState, StabilizationSystem, TargetDescriptor,
     },
-    failure_memory::GuardianFailureMemoryEntry,
     operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
     ownership::{CurrentArtifact, classify_current_artifact},
 };
@@ -412,7 +409,7 @@ fn first_nonempty<'a>(values: impl IntoIterator<Item = &'a str>) -> &'a str {
 }
 
 pub fn performance_rules_status(state: &AppState) -> PerformanceRulesStatusResponse {
-    performance_rules_status_response(state, state.performance().rules_status())
+    performance_rules_status_response(state.performance().rules_status())
 }
 
 pub(crate) async fn refresh_performance_rules(
@@ -594,7 +591,7 @@ async fn handle_refresh_performance_rules(
             {
                 return Err(error.into());
             }
-            Ok(performance_rules_status_response(state, status))
+            Ok(performance_rules_status_response(status))
         }
         Err(error) => {
             if let Some(journal_error) = record_rules_terminal_reconciled(
@@ -763,20 +760,10 @@ fn rules_terminal_transition_matches(
 }
 
 fn performance_rules_status_response(
-    state: &AppState,
-    status: PerformanceRulesStatus,
-) -> PerformanceRulesStatusResponse {
-    let failure_memory = state.failure_memory().list();
-    performance_rules_status_response_from_memory(status, failure_memory.iter())
-}
-
-fn performance_rules_status_response_from_memory<'a>(
     mut status: PerformanceRulesStatus,
-    failure_memory: impl IntoIterator<Item = &'a GuardianFailureMemoryEntry>,
 ) -> PerformanceRulesStatusResponse {
     sanitize_performance_rules_status(&mut status);
-    let mut guardian_facts = performance_rules_guardian_facts(&status, OperationPhase::Validating);
-    guardian_facts.extend(performance_rules_failure_memory_facts(failure_memory));
+    let guardian_facts = performance_rules_guardian_facts(&status, OperationPhase::Validating);
     let view_model = performance_rules_status_view_model(&status);
     PerformanceRulesStatusResponse {
         status,
@@ -948,17 +935,6 @@ fn performance_rules_ownership_label(ownership: axial_performance::OwnershipClas
     }
 }
 
-fn performance_rules_failure_memory_facts<'a>(
-    failure_memory: impl IntoIterator<Item = &'a GuardianFailureMemoryEntry>,
-) -> Vec<GuardianFact> {
-    failure_memory
-        .into_iter()
-        .filter_map(|entry| {
-            performance_failure_memory_guardian_fact(entry, OperationPhase::Validating)
-        })
-        .collect()
-}
-
 fn new_refresh_rules_operation_id() -> OperationId {
     OperationId::new(format!(
         "performance-rules-refresh-{}",
@@ -1039,20 +1015,13 @@ impl From<RulesRefreshError> for RefreshPerformanceRulesError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ViewModelTone, performance_plan_summary_view_model,
-        performance_rules_status_response_from_memory,
+        ViewModelTone, performance_plan_summary_view_model, performance_rules_status_response,
     };
-    use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
-    use crate::state::{
-        contracts::{
-            OwnershipClass, RollbackState, StabilizationSystem, TargetDescriptor, TargetKind,
-        },
-        failure_memory::GuardianFailureMemoryEntry,
-    };
+    use crate::state::contracts::RollbackState;
     use axial_performance::{
         BundleHealth, CompositionPlan, CompositionTier, ModCondition, PerformanceMode, RuleChannel,
         RuleSource, RulesCacheState, RulesCacheStatus, RulesValidation, builtin_manifest,
-        rules_status, rules_status_for,
+        rules_status_for,
         types::{ManagedMod, VersionFamily},
     };
 
@@ -1208,7 +1177,7 @@ mod tests {
             RulesValidation::Invalid,
         );
 
-        let response = performance_rules_status_response_from_memory(status, std::iter::empty());
+        let response = performance_rules_status_response(status);
 
         assert_eq!(response.status.validation, RulesValidation::Invalid);
         assert_eq!(response.view_model.validation_label, "Invalid");
@@ -1246,7 +1215,7 @@ mod tests {
             RulesValidation::Invalid,
         );
 
-        let response = performance_rules_status_response_from_memory(status, std::iter::empty());
+        let response = performance_rules_status_response(status);
         let encoded = serde_json::to_string(&response).expect("serialize status");
 
         assert_eq!(
@@ -1271,44 +1240,6 @@ mod tests {
         for forbidden in ["Alice", ".minecraft", "api_token", "secret"] {
             assert!(!encoded.contains(forbidden), "{forbidden}");
         }
-    }
-
-    #[test]
-    fn performance_rules_status_response_includes_repeated_failure_memory_fact() {
-        let manifest = builtin_manifest().expect("builtin manifest");
-        let status = rules_status(&manifest);
-        let mut entry = GuardianFailureMemoryEntry::observed(
-            DiagnosisId::PerformanceFallbackSelected,
-            GuardianDomain::Performance,
-            TargetDescriptor::new(
-                StabilizationSystem::Performance,
-                TargetKind::PerformanceComposition,
-                "family-f-fabric-core",
-                OwnershipClass::CompositionManaged,
-            ),
-            GuardianMode::Managed,
-            Some("intent"),
-            "2026-06-15T12:00:00Z",
-        );
-        entry.occurrence_count = 3;
-
-        let response =
-            performance_rules_status_response_from_memory(status, std::iter::once(&entry));
-
-        let fact = response
-            .guardian_facts
-            .iter()
-            .find(|fact| fact.id.as_str() == "performance_repeated_failure_memory")
-            .expect("repeated failure memory Guardian fact");
-        assert_eq!(
-            fact.target.as_ref().map(|target| target.id.as_str()),
-            Some("family-f-fabric-core")
-        );
-        assert!(
-            fact.fields
-                .iter()
-                .any(|field| field.key == "occurrence_count" && field.value == "3")
-        );
     }
 
     fn test_plan(

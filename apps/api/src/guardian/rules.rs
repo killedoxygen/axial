@@ -395,9 +395,9 @@ const fn priority_profile(id: DiagnosisId) -> PriorityProfile {
         DiagnosisId::CustomJavaOverridePresent
         | DiagnosisId::CustomJvmPresetPresent
         | DiagnosisId::CustomJvmArgsPresent => PriorityProfile::CustomIntent,
-        DiagnosisId::PerformanceRulesInvalid
-        | DiagnosisId::PerformanceHealthDegraded
-        | DiagnosisId::PerformanceRepeatedFailureMemory => PriorityProfile::Degraded,
+        DiagnosisId::PerformanceRulesInvalid | DiagnosisId::PerformanceHealthDegraded => {
+            PriorityProfile::Degraded
+        }
         DiagnosisId::PerformanceFallbackSelected => PriorityProfile::PerformanceFallback,
         DiagnosisId::PersistedStateSchemaInvalid => PriorityProfile::PersistedState,
         DiagnosisId::ArtifactOwnershipUnsafe => PriorityProfile::OwnershipBoundary,
@@ -1068,15 +1068,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
         [RecordOnly, Warn],
         "performance_fallback_selected"
-    ),
-    rule!(
-        PerformanceRepeatedFailureMemory,
-        [PerformanceRepeatedFailureMemory],
-        RuleDomain::Fixed(GuardianDomain::Performance),
-        RuleSeverity::SupportingFactOr(GuardianSeverity::Degraded),
-        RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        [RecordOnly, Warn],
-        "performance_repeated_failure_memory"
     ),
     rule!(
         PerformanceUserOwnedConflict,

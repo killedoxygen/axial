@@ -1,7 +1,4 @@
 use super::launch_decision::failure_class_matrix_decision;
-use super::launch_failure_memory::{
-    launch_failure_class_for_diagnosis, launch_failure_diagnosis_id,
-};
 use super::repair_authorization::repair_hand_coverage;
 use super::rules::DIAGNOSIS_RULES;
 use super::{
@@ -60,7 +57,6 @@ struct InvariantCoverage {
     facts: Vec<FactCoverage>,
     preflight_senses: Vec<PreflightSenseCoverage>,
     adapters: AdapterCoverage,
-    memory_feedback: Vec<MemoryFeedbackCoverage>,
     repair_hands: Vec<RepairHandCoverage>,
     deferred_demonstrations: Vec<DeferredDemonstration>,
 }
@@ -159,14 +155,6 @@ struct LoaderBoundaryAdapterCell {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MemoryFeedbackCoverage {
-    failure_class: String,
-    diagnosis: String,
-    round_trip: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RepairHandCoverage {
     kind: String,
     diagnosis: String,
@@ -223,7 +211,7 @@ fn generate_coverage() -> InvariantCoverage {
             invariant("I3", "public_launch_failure_guidance_complete"),
             invariant("I4", "current_hand_attempt_bounds_registered"),
             invariant("I5", "launch_failure_surfaces_bounded_and_redacted"),
-            invariant("I6", "launch_failure_mapping_round_trip_only"),
+            invariant("I6", "implemented_memory_trigger_rules_registered"),
             invariant("I7", "pending_typed_install_error_and_delegation_proof"),
             invariant("I8", "preflight_costs_declared_measurement_pending_phase_4"),
             invariant("I9", "reserved_facts_unused_agent_demo_pending_phase_5"),
@@ -248,7 +236,6 @@ fn generate_coverage() -> InvariantCoverage {
             loader_delegated: loader_delegated_adapter_coverage(),
             readiness: readiness_adapter_coverage(),
         },
-        memory_feedback: memory_feedback_coverage(),
         repair_hands: repair_hand_coverage()
             .into_iter()
             .map(|(kind, diagnosis, max_attempts)| RepairHandCoverage {
@@ -493,7 +480,6 @@ fn rule_coverage() -> Vec<RuleCoverage> {
                     GuardianFactId::RecentStartupFailure
                         | GuardianFactId::RecentRepairFailed
                         | GuardianFactId::RepairSuppressedUntil
-                        | GuardianFactId::PerformanceRepeatedFailureMemory
                 )
             }),
         })
@@ -691,20 +677,6 @@ fn readiness_adapter_coverage() -> Vec<AdapterCell> {
         .collect()
 }
 
-fn memory_feedback_coverage() -> Vec<MemoryFeedbackCoverage> {
-    LaunchFailureClass::ALL
-        .iter()
-        .map(|class| {
-            let diagnosis = launch_failure_diagnosis_id(*class);
-            MemoryFeedbackCoverage {
-                failure_class: class.as_str().to_string(),
-                diagnosis: diagnosis.as_str().to_string(),
-                round_trip: launch_failure_class_for_diagnosis(diagnosis) == Some(*class),
-            }
-        })
-        .collect()
-}
-
 fn guardian_fact_is_registered(fact: &GuardianFactId) -> bool {
     GuardianFactId::ALL.contains(fact)
 }
@@ -753,11 +725,6 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
         + snapshot.adapters.loader_pre_operation.len()
         + snapshot.adapters.loader_delegated.len()
         + snapshot.adapters.readiness.len();
-    let launch_class_mappings = snapshot
-        .memory_feedback
-        .iter()
-        .filter(|coverage| coverage.round_trip)
-        .count();
     document.push_str("\n## Coverage Summary\n");
     markdown_table(
         &mut document,
@@ -772,7 +739,6 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
             ("Registered facts", snapshot.facts.len()),
             ("Preflight senses", snapshot.preflight_senses.len()),
             ("Adapter sources", adapter_sources),
-            ("Launch class mappings", launch_class_mappings),
             ("Repair hands", snapshot.repair_hands.len()),
         ]
         .map(|(surface, count)| vec![surface.to_string(), count.to_string()]),

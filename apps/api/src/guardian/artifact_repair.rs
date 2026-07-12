@@ -393,7 +393,7 @@ async fn finish_artifact_repair(
         match terminal {
             ArtifactTerminal::Blocked(summary) => (
                 ArtifactTerminalJournal::Create(OperationOutcome::Blocked),
-                FailureMemoryActionOutcome::Blocked,
+                None,
                 GuardianArtifactRepairStatus::Blocked,
                 Vec::new(),
                 summary,
@@ -402,7 +402,7 @@ async fn finish_artifact_repair(
             ),
             ArtifactTerminal::Suppressed(suppression_until) => (
                 ArtifactTerminalJournal::Create(OperationOutcome::Suppressed),
-                FailureMemoryActionOutcome::Suppressed,
+                None,
                 GuardianArtifactRepairStatus::Suppressed,
                 Vec::new(),
                 "guardian_artifact_repair_suppressed",
@@ -415,7 +415,7 @@ async fn finish_artifact_repair(
                 quarantined_target,
             } => (
                 ArtifactTerminalJournal::Record(step_id, RollbackState::Available, None),
-                FailureMemoryActionOutcome::Repaired,
+                Some(FailureMemoryActionOutcome::Repaired),
                 GuardianArtifactRepairStatus::Repaired,
                 facts,
                 "guardian_artifact_repaired",
@@ -429,7 +429,7 @@ async fn finish_artifact_repair(
                 summary,
             } => (
                 ArtifactTerminalJournal::Record(step_id, rollback, Some(step_id)),
-                FailureMemoryActionOutcome::Failed,
+                Some(FailureMemoryActionOutcome::Failed),
                 GuardianArtifactRepairStatus::Failed,
                 facts,
                 summary,
@@ -478,20 +478,19 @@ async fn finish_artifact_repair(
     super::repair_terminal::complete_repair_terminal(
         complete_journal,
         || {
-            record_artifact_repair_memory(
-                context.failure_memory,
-                &context.authorization.diagnosis_id,
-                context.authorization.mode,
-                &context.authorization.target,
-                memory_outcome,
-                context.observed_at,
-                suppression_until.as_deref(),
-                matches!(
-                    status,
-                    GuardianArtifactRepairStatus::Repaired | GuardianArtifactRepairStatus::Failed
-                ) && context.authorization.max_attempts > 0,
-                quarantined,
-            );
+            if let Some(memory_outcome) = memory_outcome {
+                record_artifact_repair_memory(
+                    context.failure_memory,
+                    &context.authorization.diagnosis_id,
+                    context.authorization.mode,
+                    &context.authorization.target,
+                    memory_outcome,
+                    context.observed_at,
+                    suppression_until.as_deref(),
+                    context.authorization.max_attempts > 0,
+                    quarantined,
+                );
+            }
         },
         || {
             artifact_repair_outcome(
@@ -1426,8 +1425,10 @@ mod tests {
         let memory = stores.failure_memory.get(&key).expect("memory");
         assert_eq!(
             memory.last_action_outcome,
-            Some(FailureMemoryActionOutcome::Suppressed)
+            Some(FailureMemoryActionOutcome::Failed)
         );
+        assert_eq!(memory.occurrence_count, 1);
+        assert_eq!(memory.repair_attempt_count, 1);
 
         server.stop();
         cleanup(&root);

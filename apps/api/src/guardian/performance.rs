@@ -10,7 +10,6 @@ use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass, RollbackState, StabilizationSystem,
     TargetDescriptor, TargetKind,
 };
-use crate::state::failure_memory::GuardianFailureMemoryEntry;
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
 use axial_performance::{
     BundleHealth, CompositionPlan, PerformanceRulesStatus, RuleSource, RulesCacheState,
@@ -235,31 +234,6 @@ pub fn performance_state_error_guardian_fact(
     ))
 }
 
-pub fn performance_failure_memory_guardian_fact(
-    entry: &GuardianFailureMemoryEntry,
-    phase: OperationPhase,
-) -> Option<GuardianFact> {
-    if entry.domain != GuardianDomain::Performance || entry.occurrence_count < 2 {
-        return None;
-    }
-
-    Some(performance_fact(
-        GuardianFactId::PerformanceRepeatedFailureMemory,
-        phase,
-        GuardianSeverity::Degraded,
-        GuardianConfidence::High,
-        entry.target.clone(),
-        vec![
-            token_field("diagnosis_id", entry.diagnosis_id.as_str()),
-            token_field("occurrence_count", entry.occurrence_count.to_string()),
-            token_field(
-                "repair_attempt_count",
-                entry.repair_attempt_count.to_string(),
-            ),
-        ],
-    ))
-}
-
 fn performance_fact(
     id: GuardianFactId,
     phase: OperationPhase,
@@ -354,10 +328,9 @@ fn token_field(key: impl Into<String>, value: impl AsRef<str>) -> EvidenceField 
 mod tests {
     use super::{
         GuardianPerformanceOperationKind, GuardianPerformanceSupervisionRejection,
-        GuardianPerformanceSupervisionRequest, performance_failure_memory_guardian_fact,
-        performance_health_guardian_facts, performance_plan_guardian_facts,
-        performance_rules_guardian_facts, performance_state_error_guardian_fact,
-        plan_performance_supervision,
+        GuardianPerformanceSupervisionRequest, performance_health_guardian_facts,
+        performance_plan_guardian_facts, performance_rules_guardian_facts,
+        performance_state_error_guardian_fact, plan_performance_supervision,
     };
     use crate::guardian::{
         GuardianActionKind, GuardianConfidence, GuardianDomain, GuardianFactId, GuardianMode,
@@ -367,7 +340,6 @@ mod tests {
         OperationPhase, OwnershipClass, RollbackState, StabilizationSystem, TargetDescriptor,
         TargetKind,
     };
-    use crate::state::failure_memory::GuardianFailureMemoryEntry;
     use axial_performance::types::VersionFamily;
     use axial_performance::{
         BundleHealth, CompositionPlan, CompositionTier, PerformanceMode, RuleChannel, RuleSource,
@@ -490,33 +462,6 @@ mod tests {
             "performance_user_owned_conflict"
         );
         assert_eq!(diagnoses[0].ownership(), OwnershipClass::UserOwned);
-    }
-
-    #[test]
-    fn repeated_performance_failure_memory_maps_to_guardian_fact() {
-        let target = TargetDescriptor::new(
-            StabilizationSystem::Performance,
-            TargetKind::PerformanceComposition,
-            "family-f-fabric-core",
-            OwnershipClass::CompositionManaged,
-        );
-        let mut entry = GuardianFailureMemoryEntry::observed(
-            crate::guardian::DiagnosisId::PerformanceFallbackSelected,
-            GuardianDomain::Performance,
-            target,
-            GuardianMode::Managed,
-            Some("intent"),
-            "2026-06-15T12:00:00Z",
-        );
-        entry.occurrence_count = 3;
-
-        let fact = performance_failure_memory_guardian_fact(&entry, OperationPhase::Planning)
-            .expect("repeated performance fact");
-
-        assert_eq!(fact.id.as_str(), "performance_repeated_failure_memory");
-        assert_eq!(fact.severity, Some(GuardianSeverity::Degraded));
-        assert_eq!(fact.confidence, Some(GuardianConfidence::High));
-        assert_eq!(fact.ownership, OwnershipClass::CompositionManaged);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use super::{optional_value, required_value};
 use crate::guardian::{
-    GuardianFact, performance_failure_memory_guardian_fact, performance_health_guardian_facts,
-    performance_plan_guardian_facts, performance_state_error_guardian_fact,
+    GuardianFact, performance_health_guardian_facts, performance_plan_guardian_facts,
+    performance_state_error_guardian_fact,
 };
 use crate::observability::{PerformanceProofRecord, performance_health_proof_record};
 use crate::state::contracts::{
@@ -21,7 +21,6 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 
 const PERFORMANCE_MANAGED_ARTIFACT_SUMMARY_LIMIT: usize = 50;
-const PERFORMANCE_GUARDIAN_FACT_LIMIT: usize = 16;
 pub(super) const PERFORMANCE_DATA_INTERNAL_ERROR: &str =
     "Could not load performance data. Check app data permissions and try again.";
 
@@ -128,15 +127,7 @@ pub async fn performance_plan(
         None => state.performance().get_plan(request),
     };
 
-    let mut guardian_facts = performance_plan_guardian_facts(&plan, OperationPhase::Planning);
-    append_performance_guardian_facts(
-        &mut guardian_facts,
-        performance_failure_memory_facts(
-            state,
-            OperationPhase::Planning,
-            Some(&plan.composition_id),
-        ),
-    );
+    let guardian_facts = performance_plan_guardian_facts(&plan, OperationPhase::Planning);
 
     Ok(PerformancePlanResponse {
         active: matches!(mode, PerformanceMode::Managed),
@@ -221,11 +212,6 @@ pub(crate) async fn performance_health(
         &warnings,
         OperationPhase::Validating,
     );
-    let mut guardian_facts = guardian_facts;
-    append_performance_guardian_facts(
-        &mut guardian_facts,
-        performance_failure_memory_facts(state, OperationPhase::Validating, Some(&composition_id)),
-    );
     let rollback = if inspection.rollback_snapshots.is_empty() {
         RollbackState::Unavailable
     } else {
@@ -288,31 +274,6 @@ pub(super) fn managed_artifact_summary(
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn performance_failure_memory_facts(
-    state: &AppState,
-    phase: OperationPhase,
-    target_id: Option<&str>,
-) -> Vec<GuardianFact> {
-    let target_id = target_id.map(str::trim).filter(|value| !value.is_empty());
-    state
-        .failure_memory()
-        .list()
-        .into_iter()
-        .filter(|entry| match target_id {
-            Some(target_id) => entry.target.id == target_id,
-            None => true,
-        })
-        .filter_map(|entry| performance_failure_memory_guardian_fact(&entry, phase))
-        .take(PERFORMANCE_GUARDIAN_FACT_LIMIT)
-        .collect()
-}
-
-fn append_performance_guardian_facts(facts: &mut Vec<GuardianFact>, more: Vec<GuardianFact>) {
-    let remaining = PERFORMANCE_GUARDIAN_FACT_LIMIT.saturating_sub(facts.len());
-    facts.extend(more.into_iter().take(remaining));
-    facts.truncate(PERFORMANCE_GUARDIAN_FACT_LIMIT);
 }
 
 fn performance_health_proof(

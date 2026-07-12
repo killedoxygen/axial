@@ -124,9 +124,9 @@ pub use model::{
 pub use performance::{
     GuardianPerformanceOperationKind, GuardianPerformanceSupervisionPlan,
     GuardianPerformanceSupervisionRejection, GuardianPerformanceSupervisionRequest,
-    performance_failure_memory_guardian_fact, performance_health_guardian_facts,
-    performance_plan_guardian_facts, performance_rules_guardian_facts,
-    performance_state_error_guardian_fact, plan_performance_supervision,
+    performance_health_guardian_facts, performance_plan_guardian_facts,
+    performance_rules_guardian_facts, performance_state_error_guardian_fact,
+    plan_performance_supervision,
 };
 pub(super) use policy::PreflightAdmission;
 pub use policy::{GuardianDecision, GuardianPolicyContext, decide_guardian_policy};

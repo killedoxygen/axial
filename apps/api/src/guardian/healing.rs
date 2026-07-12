@@ -316,22 +316,23 @@ async fn finish_runtime_repair(
         complete_journal,
         || {
             let memory_outcome = match status {
-                GuardianRepairStatus::Repaired => FailureMemoryActionOutcome::Repaired,
-                GuardianRepairStatus::Blocked => FailureMemoryActionOutcome::Blocked,
-                GuardianRepairStatus::Failed => FailureMemoryActionOutcome::Failed,
-                GuardianRepairStatus::Suppressed => FailureMemoryActionOutcome::Suppressed,
+                GuardianRepairStatus::Repaired => Some(FailureMemoryActionOutcome::Repaired),
+                GuardianRepairStatus::Failed => Some(FailureMemoryActionOutcome::Failed),
+                GuardianRepairStatus::Blocked | GuardianRepairStatus::Suppressed => None,
             };
-            record_repair_memory(
-                context.failure_memory,
-                context.diagnosis_id,
-                context.mode,
-                context.target,
-                action,
-                memory_outcome,
-                context.observed_at,
-                suppression_until.as_deref(),
-                repair_attempt,
-            );
+            if let Some(memory_outcome) = memory_outcome {
+                record_repair_memory(
+                    context.failure_memory,
+                    context.diagnosis_id,
+                    context.mode,
+                    context.target,
+                    action,
+                    memory_outcome,
+                    context.observed_at,
+                    suppression_until.as_deref(),
+                    repair_attempt,
+                );
+            }
         },
         || {
             repair_outcome(
@@ -1104,7 +1105,7 @@ mod tests {
             .expect("memory entry");
         assert_eq!(
             memory.last_action_outcome,
-            Some(FailureMemoryActionOutcome::Suppressed)
+            Some(FailureMemoryActionOutcome::Failed)
         );
         assert_eq!(
             memory.suppression_until.as_deref(),
@@ -1177,6 +1178,7 @@ mod tests {
 
         assert_eq!(outcome.status, GuardianRepairStatus::Blocked);
         assert!(!runtime_root.join(".axial-ready").exists());
+        assert!(stores.failure_memory.list().is_empty());
 
         cleanup(&root);
     }
@@ -1539,6 +1541,8 @@ mod tests {
             memory.last_action_outcome,
             Some(FailureMemoryActionOutcome::Failed)
         );
+        assert_eq!(memory.occurrence_count, 1);
+        assert_eq!(memory.repair_attempt_count, 1);
         assert_eq!(
             memory.suppression_until.as_deref(),
             Some("2026-06-15T10:15:00Z")

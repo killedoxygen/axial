@@ -100,7 +100,6 @@
   "performance_health_degraded",
   "performance_health_fallback",
   "performance_health_invalid",
-  "performance_repeated_failure_memory",
   "performance_rules_invalid",
   "performance_user_owned_conflict",
   "persisted_state_schema_invalid",

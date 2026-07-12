@@ -48,7 +48,6 @@
         "managed_runtime_rosetta_required",
         "managed_runtime_unavailable_for_platform",
         "performance_fallback_selected",
-        "performance_repeated_failure_memory",
         "performance_rules_invalid",
         "performance_user_owned_conflict"
       ],

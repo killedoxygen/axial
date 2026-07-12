@@ -210,7 +210,6 @@ pub enum FailureMemoryActionOutcome {
     Retried,
     Blocked,
     Failed,
-    Suppressed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -787,25 +786,16 @@ mod tests {
             .iter()
             .filter_map(|entry| entry.last_action_kind)
             .collect::<Vec<_>>();
-        let expected_action_kinds = [
-            GuardianActionKind::Allow,
-            GuardianActionKind::Warn,
+        let expected_action_kinds = vec![
             GuardianActionKind::Repair,
             GuardianActionKind::Retry,
             GuardianActionKind::Strip,
             GuardianActionKind::Downgrade,
             GuardianActionKind::Fallback,
-            GuardianActionKind::Quarantine,
-            GuardianActionKind::AskUser,
+            GuardianActionKind::Repair,
             GuardianActionKind::Block,
-            GuardianActionKind::RecordOnly,
         ];
-        assert_eq!(action_kinds.len(), expected_action_kinds.len());
-        assert!(
-            expected_action_kinds
-                .iter()
-                .all(|expected| action_kinds.contains(expected))
-        );
+        assert_eq!(action_kinds, expected_action_kinds);
         let action_outcomes = snapshot
             .entries
             .iter()
@@ -821,7 +811,6 @@ mod tests {
                 FailureMemoryActionOutcome::Retried,
                 FailureMemoryActionOutcome::Blocked,
                 FailureMemoryActionOutcome::Failed,
-                FailureMemoryActionOutcome::Suppressed,
             ])
         );
 
@@ -841,8 +830,7 @@ mod tests {
             FailureMemoryActionOutcome::Repaired
             | FailureMemoryActionOutcome::Retried
             | FailureMemoryActionOutcome::Blocked
-            | FailureMemoryActionOutcome::Failed
-            | FailureMemoryActionOutcome::Suppressed => {}
+            | FailureMemoryActionOutcome::Failed => {}
         }
     }
 
@@ -1053,7 +1041,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_remote_rules_suppression_shape_uses_external_provider_target() {
+    fn invalid_remote_rules_failure_cooldown_uses_external_provider_target() {
         let target = classify_current_artifact(
             CurrentArtifact::ExternalPerformanceRules,
             "performance_rules_remote_source",
@@ -1069,7 +1057,7 @@ mod tests {
         )
         .with_action(
             GuardianActionKind::RecordOnly,
-            FailureMemoryActionOutcome::Suppressed,
+            FailureMemoryActionOutcome::Failed,
         )
         .with_suppression_until("2026-06-15T13:05:00Z");
 

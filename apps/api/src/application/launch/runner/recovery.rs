@@ -908,7 +908,7 @@ mod tests {
         assert_eq!(memory.len(), 1);
         assert_eq!(
             memory[0].last_action_outcome,
-            Some(FailureMemoryActionOutcome::Suppressed)
+            Some(FailureMemoryActionOutcome::Failed)
         );
 
         let _ = fs::remove_dir_all(root);
@@ -988,7 +988,7 @@ mod tests {
         assert_eq!(memory.len(), 1);
         assert_eq!(
             memory[0].last_action_outcome,
-            Some(FailureMemoryActionOutcome::Suppressed)
+            Some(FailureMemoryActionOutcome::Failed)
         );
         assert_eq!(memory[0].repair_attempt_count, 1);
         assert!(memory[0].suppression_until.is_some());
@@ -1139,7 +1139,7 @@ mod tests {
         assert_eq!(memory.len(), 1);
         assert_eq!(
             memory[0].last_action_outcome,
-            Some(FailureMemoryActionOutcome::Suppressed)
+            Some(FailureMemoryActionOutcome::Failed)
         );
         assert_eq!(memory[0].repair_attempt_count, 1);
         assert!(memory[0].suppression_until.is_some());

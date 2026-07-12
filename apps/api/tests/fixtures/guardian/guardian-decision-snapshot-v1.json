@@ -2969,60 +2969,6 @@
       ]
     },
     {
-      "id": "performance_repeated_failure_memory--performance_repeated_failure_memory",
-      "input": {
-        "kind": "fact",
-        "fact_id": "performance_repeated_failure_memory",
-        "domain": "Performance",
-        "reliability": "DirectStructured",
-        "severity": "Degraded",
-        "confidence": "High"
-      },
-      "allowed_phases": [
-        "Planning",
-        "Validating",
-        "Preparing",
-        "Running",
-        "Repairing"
-      ],
-      "diagnosis": {
-        "id": "performance_repeated_failure_memory",
-        "domain": "Performance",
-        "severity": "Degraded",
-        "confidence": "High",
-        "fact_ids": [
-          "performance_repeated_failure_memory"
-        ],
-        "candidate_actions": [
-          "RecordOnly",
-          "Warn"
-        ],
-        "public_reason_template": "performance_repeated_failure_memory"
-      },
-      "ownership_profiles": [
-        {
-          "ownership": "LauncherManaged",
-          "policy_profile": "profile-d9cc3248e2b8e439"
-        },
-        {
-          "ownership": "CompositionManaged",
-          "policy_profile": "profile-d9cc3248e2b8e439"
-        },
-        {
-          "ownership": "UserOwned",
-          "policy_profile": "profile-d9cc3248e2b8e439"
-        },
-        {
-          "ownership": "ExternalProviderDerived",
-          "policy_profile": "profile-d9cc3248e2b8e439"
-        },
-        {
-          "ownership": "Unknown",
-          "policy_profile": "profile-d9cc3248e2b8e439"
-        }
-      ]
-    },
-    {
       "id": "performance_rules_invalid--performance_rules_invalid",
       "input": {
         "kind": "fact",

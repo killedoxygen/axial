@@ -23,7 +23,7 @@
     },
     {
       "id": "I6",
-      "status": "launch_failure_mapping_round_trip_only"
+      "status": "implemented_memory_trigger_rules_registered"
     },
     {
       "id": "I7",
@@ -5077,21 +5077,6 @@
       "memory_feedback": false
     },
     {
-      "diagnosis": "performance_repeated_failure_memory",
-      "triggers": [
-        "performance_repeated_failure_memory"
-      ],
-      "evidence": [
-        "performance_repeated_failure_memory"
-      ],
-      "phases": [],
-      "actions": [
-        "RecordOnly",
-        "Warn"
-      ],
-      "memory_feedback": true
-    },
-    {
       "diagnosis": "performance_user_owned_conflict",
       "triggers": [
         "performance_user_owned_conflict"
@@ -5886,11 +5871,6 @@
       "referenced_by_rule": true
     },
     {
-      "fact": "performance_repeated_failure_memory",
-      "availability": "registered_current",
-      "referenced_by_rule": true
-    },
-    {
       "fact": "performance_rules_invalid",
       "availability": "registered_current",
       "referenced_by_rule": true
@@ -6534,83 +6514,6 @@
       }
     ]
   },
-  "memory_feedback": [
-    {
-      "failure_class": "unknown",
-      "diagnosis": "unknown",
-      "round_trip": true
-    },
-    {
-      "failure_class": "jvm_unsupported_option",
-      "diagnosis": "jvm_unsupported_option",
-      "round_trip": true
-    },
-    {
-      "failure_class": "jvm_experimental_unlock",
-      "diagnosis": "jvm_experimental_unlock",
-      "round_trip": true
-    },
-    {
-      "failure_class": "jvm_option_ordering",
-      "diagnosis": "jvm_option_ordering",
-      "round_trip": true
-    },
-    {
-      "failure_class": "java_runtime_mismatch",
-      "diagnosis": "java_runtime_mismatch",
-      "round_trip": true
-    },
-    {
-      "failure_class": "out_of_memory",
-      "diagnosis": "out_of_memory",
-      "round_trip": true
-    },
-    {
-      "failure_class": "graphics_driver_crash",
-      "diagnosis": "graphics_driver_crash",
-      "round_trip": true
-    },
-    {
-      "failure_class": "missing_dependency",
-      "diagnosis": "missing_dependency",
-      "round_trip": true
-    },
-    {
-      "failure_class": "mod_transformation_failure",
-      "diagnosis": "mod_transformation_failure",
-      "round_trip": true
-    },
-    {
-      "failure_class": "mod_attributed_crash",
-      "diagnosis": "mod_attributed_crash",
-      "round_trip": true
-    },
-    {
-      "failure_class": "classpath_module_conflict",
-      "diagnosis": "classpath_module_conflict",
-      "round_trip": true
-    },
-    {
-      "failure_class": "launcher_managed_artifact_signature",
-      "diagnosis": "launcher_managed_artifact_signature",
-      "round_trip": true
-    },
-    {
-      "failure_class": "auth_mode_incompatible",
-      "diagnosis": "auth_mode_incompatible",
-      "round_trip": true
-    },
-    {
-      "failure_class": "loader_bootstrap_failure",
-      "diagnosis": "loader_bootstrap_failure",
-      "round_trip": true
-    },
-    {
-      "failure_class": "startup_stalled",
-      "diagnosis": "startup_stalled",
-      "round_trip": true
-    }
-  ],
   "repair_hands": [
     {
       "kind": "quarantine_redownload",

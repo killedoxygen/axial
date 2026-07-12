@@ -194,7 +194,7 @@ async fn launch_preflight_surfaces_only_active_suppression_for_the_exact_current
                 )
                 .with_action(
                     GuardianActionKind::Downgrade,
-                    FailureMemoryActionOutcome::Suppressed,
+                    FailureMemoryActionOutcome::Failed,
                 )
                 .with_repair_attempt()
                 .with_suppression_until(relative_timestamp(suppression_offset)),
@@ -981,7 +981,7 @@ async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
     let memory = fixture.state.failure_memory().list();
     assert_eq!(
         memory[0].last_action_outcome,
-        Some(FailureMemoryActionOutcome::Suppressed)
+        Some(FailureMemoryActionOutcome::Repaired)
     );
 }
 

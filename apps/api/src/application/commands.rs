@@ -278,8 +278,6 @@ pub struct RepairInstanceCommand {
     pub instance_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<TargetDescriptor>,
-    #[serde(default)]
-    pub user_confirmed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

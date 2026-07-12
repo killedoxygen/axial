@@ -15,9 +15,9 @@ const SNAPSHOT_FIXTURE: &str = include_str!(concat!(
     "/tests/fixtures/guardian/guardian-decision-snapshot-v1.json"
 ));
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_DECISION_SNAPSHOT";
-const FACT_SOURCE_COUNT: usize = 69;
-const DIAGNOSIS_COUNT: usize = 46;
-const FACT_SOURCE_PHASE_COUNT: usize = 272;
+const FACT_SOURCE_COUNT: usize = 68;
+const DIAGNOSIS_COUNT: usize = 45;
+const FACT_SOURCE_PHASE_COUNT: usize = 267;
 const UNKNOWN_SOURCE_COUNT: usize = 12;
 const CONTEXT_COUNT: usize = 16;
 const FACT_SOURCE_OWNERSHIP_COUNT: usize = 5;
@@ -466,9 +466,9 @@ fn assert_snapshot_coverage(snapshot: &GuardianDecisionSnapshot) {
         snapshot.source_cases.len(),
         FACT_SOURCE_COUNT + UNKNOWN_SOURCE_COUNT
     );
-    assert_eq!(RAW_DIAGNOSIS_CASE_COUNT, 1_372);
-    assert_eq!(RAW_POLICY_EVALUATION_COUNT, 65_856);
-    assert_eq!(COMPRESSED_POLICY_CELL_COUNT, 17_136);
+    assert_eq!(RAW_DIAGNOSIS_CASE_COUNT, 1_347);
+    assert_eq!(RAW_POLICY_EVALUATION_COUNT, 64_656);
+    assert_eq!(COMPRESSED_POLICY_CELL_COUNT, 16_896);
     assert!(
         snapshot
             .source_cases

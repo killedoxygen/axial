@@ -112,7 +112,6 @@ pub enum GuardianFactId {
     PerformanceHealthDegraded,
     PerformanceHealthFallback,
     PerformanceHealthInvalid,
-    PerformanceRepeatedFailureMemory,
     PerformanceRulesInvalid,
     PerformanceUserOwnedConflict,
     PersistedStateSchemaInvalid,
@@ -135,7 +134,7 @@ pub enum GuardianFactId {
 }
 
 impl GuardianFactId {
-    pub const ALL: [Self; 121] = [
+    pub const ALL: [Self; 120] = [
         Self::AgentHookFailed,
         Self::AgentUnavailable,
         Self::ArtifactChecksumMismatch,
@@ -237,7 +236,6 @@ impl GuardianFactId {
         Self::PerformanceHealthDegraded,
         Self::PerformanceHealthFallback,
         Self::PerformanceHealthInvalid,
-        Self::PerformanceRepeatedFailureMemory,
         Self::PerformanceRulesInvalid,
         Self::PerformanceUserOwnedConflict,
         Self::PersistedStateSchemaInvalid,
@@ -368,7 +366,6 @@ impl GuardianFactId {
             Self::PerformanceHealthDegraded => "performance_health_degraded",
             Self::PerformanceHealthFallback => "performance_health_fallback",
             Self::PerformanceHealthInvalid => "performance_health_invalid",
-            Self::PerformanceRepeatedFailureMemory => "performance_repeated_failure_memory",
             Self::PerformanceRulesInvalid => "performance_rules_invalid",
             Self::PerformanceUserOwnedConflict => "performance_user_owned_conflict",
             Self::PersistedStateSchemaInvalid => "persisted_state_schema_invalid",
@@ -469,7 +466,6 @@ pub enum DiagnosisId {
     ManagedRuntimeRosettaRequired,
     ManagedRuntimeUnavailableForPlatform,
     PerformanceFallbackSelected,
-    PerformanceRepeatedFailureMemory,
     PerformanceRulesInvalid,
     PerformanceUserOwnedConflict,
     PersistedStateSchemaInvalid,
@@ -516,7 +512,7 @@ pub enum DiagnosisId {
 }
 
 impl DiagnosisId {
-    pub const ALL: [Self; 80] = [
+    pub const ALL: [Self; 79] = [
         Self::ArtifactOwnershipUnsafe,
         Self::AtomicPromotionFailed,
         Self::DownloadUnavailable,
@@ -542,7 +538,6 @@ impl DiagnosisId {
         Self::ManagedRuntimeRosettaRequired,
         Self::ManagedRuntimeUnavailableForPlatform,
         Self::PerformanceFallbackSelected,
-        Self::PerformanceRepeatedFailureMemory,
         Self::PerformanceRulesInvalid,
         Self::PerformanceUserOwnedConflict,
         Self::PersistedStateSchemaInvalid,
@@ -630,7 +625,6 @@ impl DiagnosisId {
                 "managed_runtime_unavailable_for_platform"
             }
             Self::PerformanceFallbackSelected => "performance_fallback_selected",
-            Self::PerformanceRepeatedFailureMemory => "performance_repeated_failure_memory",
             Self::PerformanceRulesInvalid => "performance_rules_invalid",
             Self::PerformanceUserOwnedConflict => "performance_user_owned_conflict",
             Self::PersistedStateSchemaInvalid => "persisted_state_schema_invalid",

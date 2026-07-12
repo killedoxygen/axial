@@ -588,28 +588,6 @@ fn replace_operation_backends(
     state.with_operation_stores(journals, performance_operations)
 }
 
-fn seed_repeated_performance_memory(state: &AppState, composition_id: &str, count: u32) {
-    let target = crate::state::contracts::TargetDescriptor::new(
-        crate::state::contracts::StabilizationSystem::Performance,
-        crate::state::contracts::TargetKind::PerformanceComposition,
-        composition_id,
-        crate::state::contracts::OwnershipClass::CompositionManaged,
-    );
-    let mut entry = crate::state::failure_memory::GuardianFailureMemoryEntry::observed(
-        crate::guardian::DiagnosisId::PerformanceFallbackSelected,
-        crate::guardian::GuardianDomain::Performance,
-        target,
-        crate::guardian::GuardianMode::Managed,
-        Some("intent"),
-        "2026-06-15T12:00:00Z",
-    );
-    entry.occurrence_count = count;
-    state
-        .failure_memory()
-        .record(entry)
-        .expect("record performance failure memory");
-}
-
 fn test_operation_payload() -> PerformanceOperationPayload {
     PerformanceOperationPayload {
         game_version: None,

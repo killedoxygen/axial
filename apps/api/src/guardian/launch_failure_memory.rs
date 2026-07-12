@@ -155,10 +155,7 @@ fn active_repair_suppression_entry(
     context: &IntakeContext,
 ) -> bool {
     accepted_repair_entry(entry, request, context)
-        && matches!(
-            entry.last_action_outcome,
-            Some(FailureMemoryActionOutcome::Failed | FailureMemoryActionOutcome::Suppressed)
-        )
+        && entry.last_action_outcome == Some(FailureMemoryActionOutcome::Failed)
         && entry
             .suppression_until
             .as_deref()
@@ -553,13 +550,13 @@ mod tests {
     }
 
     #[test]
-    fn intake_requires_exact_repair_intent_and_active_suppression() {
+    fn intake_requires_exact_repair_intent_and_separates_failure_from_suppression() {
         let active = repair_entry(
             "instance-a",
             GuardianMode::Managed,
             DiagnosisId::JvmArgUnsupported,
             GuardianActionKind::Strip,
-            FailureMemoryActionOutcome::Suppressed,
+            FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:30:00Z",
             Some("2026-07-11T11:00:00Z"),
             &intent_fingerprint(RecoveryCase::StripRawJvmArgs),
@@ -569,7 +566,7 @@ mod tests {
             GuardianMode::Managed,
             DiagnosisId::JvmArgUnsupported,
             GuardianActionKind::Strip,
-            FailureMemoryActionOutcome::Suppressed,
+            FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:40:00Z",
             Some("2026-07-11T09:59:00Z"),
             &intent_fingerprint(RecoveryCase::DisableCustomGc),
@@ -588,10 +585,12 @@ mod tests {
         let expired_facts =
             launch_failure_memory_guardian_facts(intake_request(std::slice::from_ref(&expired)));
 
-        assert_eq!(active_facts.len(), 1);
-        assert_eq!(active_facts[0].id, REPAIR_SUPPRESSED_UNTIL_FACT_ID);
+        assert_eq!(active_facts.len(), 2);
+        assert_eq!(active_facts[0].id, RECENT_REPAIR_FAILED_FACT_ID);
+        assert_eq!(active_facts[1].id, REPAIR_SUPPRESSED_UNTIL_FACT_ID);
         assert!(wrong_intent_facts.is_empty());
-        assert!(expired_facts.is_empty());
+        assert_eq!(expired_facts.len(), 1);
+        assert_eq!(expired_facts[0].id, RECENT_REPAIR_FAILED_FACT_ID);
     }
 
     #[test]

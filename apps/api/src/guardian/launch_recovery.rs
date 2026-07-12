@@ -243,7 +243,6 @@ pub async fn record_launch_recovery_attempt(
     let plan = request.plan;
     let diagnosis_id = plan.diagnosis_id;
     let operation_id = plan.operation_id.clone();
-    let action = plan.directive.action_kind();
     let memory_key = FailureMemoryKey::for_observation(
         GuardianDomain::Launch,
         &diagnosis_id,
@@ -255,7 +254,6 @@ pub async fn record_launch_recovery_attempt(
     if let Some(entry) = request.failure_memory.get(&memory_key)
         && suppression_active(&entry, request.observed_at)
     {
-        let suppression_until = entry.suppression_until.as_deref();
         match request.journals.get(&operation_id) {
             Some(entry) if launch_recovery_suppressed_journal_matches(&entry, plan) => {}
             Some(_) => return Err(OperationJournalStoreError::AlreadyTerminal),
@@ -270,18 +268,6 @@ pub async fn record_launch_recovery_attempt(
                 .await?;
             }
         }
-        record_launch_recovery_memory(
-            request.failure_memory,
-            &diagnosis_id,
-            plan.mode,
-            &plan.target,
-            action,
-            FailureMemoryActionOutcome::Suppressed,
-            request.observed_at,
-            Some(plan.user_intent_hash.as_str()),
-            suppression_until,
-            false,
-        );
         return Ok(launch_recovery_outcome(
             operation_id,
             GuardianLaunchRecoveryStatus::Suppressed,
@@ -1191,7 +1177,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn later_session_for_same_instance_is_suppressed_and_merges_memory() {
+    async fn later_session_suppression_preserves_failed_memory() {
         let journals = OperationJournalStore::new();
         let failure_memory = GuardianFailureMemoryStore::new();
         let initial_plan = plan("instance-3", RecoveryCase::DowngradePreset);
@@ -1231,10 +1217,15 @@ mod tests {
         assert_eq!(memory.len(), 1);
         assert_eq!(memory[0].target.kind, TargetKind::Instance);
         assert_eq!(memory[0].target.id, "instance-3");
-        assert_eq!(memory[0].occurrence_count, 2);
+        assert_eq!(memory[0].occurrence_count, 1);
+        assert_eq!(memory[0].repair_attempt_count, 1);
         assert_eq!(
             memory[0].last_action_outcome,
-            Some(FailureMemoryActionOutcome::Suppressed)
+            Some(FailureMemoryActionOutcome::Failed)
+        );
+        assert_eq!(
+            memory[0].suppression_until.as_deref(),
+            Some("2026-06-15T10:30:00+00:00")
         );
     }
 
@@ -1329,10 +1320,11 @@ mod tests {
         assert_eq!(outcome.status, GuardianLaunchRecoveryStatus::Suppressed);
         let memory = reloaded_memory.list();
         assert_eq!(memory.len(), 1);
-        assert_eq!(memory[0].occurrence_count, 2);
+        assert_eq!(memory[0].occurrence_count, 1);
+        assert_eq!(memory[0].repair_attempt_count, 1);
         assert_eq!(
             memory[0].last_action_outcome,
-            Some(FailureMemoryActionOutcome::Suppressed)
+            Some(FailureMemoryActionOutcome::Failed)
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -1398,6 +1390,18 @@ mod tests {
             Some(FailureMemoryActionOutcome::Retried)
         );
         assert_eq!(memory[0].repair_attempt_count, 2);
+        assert!(memory[0].suppression_until.is_none());
+
+        let next_plan = plan("session-expired", RecoveryCase::SwitchManagedRuntime);
+        let next_attempt = record_launch_recovery_attempt(request(
+            &next_plan,
+            "2026-06-15T10:33:00Z",
+            &journals,
+            &reloaded_memory,
+        ))
+        .await
+        .expect("successful retry removes next recovery suppression");
+        assert_eq!(next_attempt.status, GuardianLaunchRecoveryStatus::Recorded);
 
         let _ = fs::remove_dir_all(&root);
     }

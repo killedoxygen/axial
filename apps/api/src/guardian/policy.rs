@@ -840,28 +840,6 @@ mod tests {
             Case {
                 facts: vec![
                     fact(
-                        GuardianFactId::PerformanceRepeatedFailureMemory,
-                        GuardianDomain::Performance,
-                        OperationPhase::Planning,
-                        OwnershipClass::CompositionManaged,
-                        None,
-                        None,
-                    ),
-                    fact(
-                        GuardianFactId::PerformanceHealthDegraded,
-                        GuardianDomain::Performance,
-                        OperationPhase::Planning,
-                        OwnershipClass::CompositionManaged,
-                        None,
-                        None,
-                    ),
-                ],
-                phase: OperationPhase::Planning,
-                expected: DiagnosisId::PerformanceHealthDegraded,
-            },
-            Case {
-                facts: vec![
-                    fact(
                         GuardianFactId::StartupWindowExpired,
                         GuardianDomain::Startup,
                         OperationPhase::Launching,

@@ -47,40 +47,6 @@ async fn status_reports_bundled_rules_without_remote_refresh() {
 }
 
 #[tokio::test]
-async fn status_exposes_repeated_performance_failure_memory_fact() {
-    let fixture = TestFixture::new("status-repeated-performance-memory");
-    seed_repeated_performance_memory(&fixture.state, "family-f-fabric-core", 3);
-
-    let Json(response) = handle_status(State(fixture.state.clone()))
-        .await
-        .expect("status should serialize");
-
-    assert_eq!(
-        response.status.rule_source,
-        axial_performance::RuleSource::BuiltIn
-    );
-    let fact = response
-        .guardian_facts
-        .iter()
-        .find(|fact| fact.id.as_str() == "performance_repeated_failure_memory")
-        .expect("repeated failure memory fact");
-    assert_eq!(fact.domain, crate::guardian::GuardianDomain::Performance);
-    assert_eq!(
-        fact.ownership,
-        crate::state::contracts::OwnershipClass::CompositionManaged
-    );
-    assert_eq!(
-        fact.target.as_ref().map(|target| target.id.as_str()),
-        Some("family-f-fabric-core")
-    );
-    assert!(
-        fact.fields
-            .iter()
-            .any(|field| field.key == "occurrence_count" && field.value == "3")
-    );
-}
-
-#[tokio::test]
 async fn status_reports_invalid_remote_rules_with_guardian_fact_and_safe_copy() {
     let root = test_root("status-invalid-remote-rules");
     let paths = test_paths(&root);
