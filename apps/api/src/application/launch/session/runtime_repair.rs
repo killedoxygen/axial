@@ -5,10 +5,10 @@ use crate::execution::runtime::{
     ManagedRuntimeRoot, ManagedRuntimeVerificationRequest, verify_managed_runtime,
 };
 use crate::guardian::{
-    GuardianManagedRuntimeRepairRequest, GuardianPreflightOutcomeRequest,
-    GuardianRepairPlanningContext, GuardianRepairStatus, GuardianRuntimeRepairCopy,
+    GuardianPreflightOutcomeRequest, GuardianRepairStatus, GuardianRuntimeRepairCopy,
+    RepairAuthorizationContext, authorize_managed_runtime_ready_marker_repair,
     execute_managed_runtime_ready_marker_repair, guardian_fact_from_execution,
-    guardian_preflight_outcome, plan_managed_runtime_ready_marker_repair,
+    guardian_preflight_outcome,
 };
 use crate::logging::timestamp_utc;
 use crate::observability::telemetry::{
@@ -110,9 +110,9 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
         api_guardian_mode(preflight.guardian.mode),
         &guardian_facts,
     ));
-    let Ok(repair_plan) = plan_managed_runtime_ready_marker_repair(
+    let Ok(repair_authorization) = authorize_managed_runtime_ready_marker_repair(
         &repair_outcome.guardian_decision,
-        GuardianRepairPlanningContext::current_operation(),
+        RepairAuthorizationContext::current_operation(),
     ) else {
         return Ok(preflight);
     };
@@ -121,7 +121,6 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
     let runtime_root_path = candidate.runtime_root.clone();
     let java_executable = candidate.java_executable.clone();
     let operation_id = repair_outcome.guardian_decision.operation_id.clone();
-    let mode = repair_outcome.guardian_decision.mode;
     let abandoned = Arc::new(AtomicBool::new(false));
     let request_guard = RuntimeRepairRequestGuard::new(abandoned.clone());
     let terminal_failure = Arc::new(tokio::sync::Notify::new());
@@ -136,19 +135,18 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
         ) {
             Ok(runtime_root) => {
                 let observed_at = timestamp_utc();
-                execute_managed_runtime_ready_marker_repair(GuardianManagedRuntimeRepairRequest {
+                execute_managed_runtime_ready_marker_repair(
+                    repair_authorization,
                     operation_id,
-                    mode,
-                    plan: &repair_plan,
                     runtime_root,
-                    journals: state_task.journals().as_ref(),
-                    failure_memory: state_task.failure_memory().as_ref(),
-                    observed_at: observed_at.as_str(),
-                    suppression_until_on_failure: None,
-                    abandoned: Some(abandoned.as_ref()),
-                    ready_for_effect: Some(ready_tx),
-                    terminal_failure: Some(terminal_failure_task.as_ref()),
-                })
+                    state_task.journals().as_ref(),
+                    state_task.failure_memory().as_ref(),
+                    observed_at.as_str(),
+                    None,
+                    Some(abandoned.as_ref()),
+                    Some(ready_tx),
+                    Some(terminal_failure_task.as_ref()),
+                )
                 .await
             }
             Err(_) => Err(OperationJournalStoreError::Persistence(

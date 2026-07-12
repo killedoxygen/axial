@@ -391,8 +391,11 @@ pub const ROUTE_BOUNDARY_PROBES: &[RouteBoundaryProbe] = &[
         responsibility: RouteForbiddenResponsibility::RepairPlanning,
         forbidden_markers: &[
             "GuardianRepairActionTemplate",
-            "plan_launcher_managed_artifact_repair",
-            "execute_guardian_artifact_repair",
+            "authorize_launcher_managed_artifact_repair",
+            "authorize_launcher_managed_missing_artifact_repair",
+            "authorize_managed_runtime_ready_marker_repair",
+            "execute_guardian_quarantine_redownload",
+            "execute_guardian_missing_download",
             "guardian_prepare_failure_outcome(",
             "guardian_startup_failure_outcome(",
             "GuardianCopyRequest::prepare_failure(",
@@ -1059,6 +1062,91 @@ mod tests {
         assert!(
             violations.is_empty(),
             "displaced Guardian copy authors:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn repair_authorizations_are_the_only_repair_effect_capability() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("api crate must live under apps/ in the repository");
+        let guardian_mod = fs::read_to_string(repo_root.join("apps/api/src/guardian/mod.rs"))
+            .expect("read Guardian module");
+        assert!(guardian_mod.contains("mod repair_authorization;"));
+        assert!(!guardian_mod.contains("pub mod repair_authorization;"));
+        assert!(guardian_mod.contains("mod artifact_descriptor;"));
+        assert!(guardian_mod.contains("mod artifact_repair;"));
+
+        let authorization =
+            fs::read_to_string(repo_root.join("apps/api/src/guardian/repair_authorization.rs"))
+                .expect("read repair authorization authority");
+        assert!(authorization.contains("pub(crate) struct RepairAuthorization<K>"));
+        assert!(!authorization.contains("impl<K> Clone for RepairAuthorization"));
+        assert!(!authorization.contains("impl<K> Copy for RepairAuthorization"));
+        assert!(!authorization.contains("Serialize for RepairAuthorization"));
+        assert!(!authorization.contains("Deserialize for RepairAuthorization"));
+        assert_eq!(authorization.matches("Ok(RepairAuthorization {").count(), 2);
+        assert!(authorization.contains("DescriptorTargetMismatch"));
+        assert!(authorization.contains("descriptor: GuardianMinecraftArtifactRepairDescriptor"));
+
+        let artifact =
+            fs::read_to_string(repo_root.join("apps/api/src/guardian/artifact_repair.rs"))
+                .expect("read artifact repair executor");
+        assert!(artifact.contains("authorization: RepairAuthorization<QuarantineRedownload>"));
+        assert!(artifact.contains("authorization: RepairAuthorization<MissingDownload>"));
+        assert!(!artifact.contains("authorization: &RepairAuthorization"));
+        assert!(!artifact.contains("destination: &Path"));
+        assert!(!artifact.contains("source: GuardianArtifactRepairSource"));
+        assert!(artifact.contains("let descriptor = authorization.kind.into_descriptor();"));
+
+        let runtime = fs::read_to_string(repo_root.join("apps/api/src/guardian/healing.rs"))
+            .expect("read runtime repair executor");
+        assert!(runtime.contains("authorization: RepairAuthorization<ReadyMarker>"));
+        assert!(!runtime.contains("authorization: &RepairAuthorization"));
+
+        let mut sources = Vec::new();
+        collect_rust_sources(&repo_root.join("apps/api/src"), &mut sources);
+        let mut violations = Vec::new();
+        for path in sources {
+            let relative = path
+                .strip_prefix(repo_root)
+                .expect("API source must be inside the repository")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative == "apps/api/src/application/authority.rs" {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("read API source");
+            for marker in [
+                "GuardianRepairPlan",
+                "GuardianRepairTask",
+                "GuardianRepairExecutor",
+                "GuardianRepairMutation",
+                "GuardianRepairReversibility",
+                "GuardianRepairPlanningContext",
+                "GuardianArtifactRepairRequest",
+                "GuardianArtifactRepairMutation",
+                "GuardianManagedRuntimeRepairRequest",
+                "plan_launcher_managed_artifact_repair",
+                "plan_launcher_managed_missing_artifact_repair",
+                "plan_managed_runtime_ready_marker_repair",
+                "execute_guardian_artifact_repair(",
+            ] {
+                if source.contains(marker) {
+                    violations.push(format!("{relative}: {marker}"));
+                }
+            }
+            if relative != "apps/api/src/guardian/repair_authorization.rs"
+                && source.contains("RepairAuthorization {")
+            {
+                violations.push(format!("{relative}: RepairAuthorization {{"));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "repair capability compatibility paths:\n{}",
             violations.join("\n")
         );
     }

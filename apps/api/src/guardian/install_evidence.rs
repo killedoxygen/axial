@@ -6,10 +6,11 @@
 
 use super::GuardianPolicyContext;
 use super::{
-    DiagnosisId, GuardianActionKind, GuardianCopyRequest, GuardianFact, GuardianMode,
-    GuardianRepairPlan, GuardianRepairPlanRejection, GuardianUserOutcome, SafetyCase,
-    author_guardian_copy, build_safety_case, decide_guardian_policy, guardian_fact_from_execution,
-    plan_launcher_managed_artifact_repair, plan_launcher_managed_missing_artifact_repair,
+    DiagnosisId, GuardianActionKind, GuardianCopyRequest, GuardianDecision, GuardianFact,
+    GuardianMode, GuardianUserOutcome, MissingDownload, QuarantineRedownload, RepairAuthorization,
+    RepairAuthorizationRejection, SafetyCase, author_guardian_copy,
+    authorize_launcher_managed_artifact_repair, authorize_launcher_managed_missing_artifact_repair,
+    build_safety_case, decide_guardian_policy, guardian_fact_from_execution,
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{
@@ -77,16 +78,10 @@ impl GuardianInstallArtifactFailureEvidence {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GuardianInstallArtifactRepairPlanKind {
-    ExistingArtifact,
-    MissingArtifact,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GuardianInstallArtifactRepairPlanRejection {
+pub(crate) enum GuardianInstallArtifactRepairAuthorizationRejection {
     NoFailureEvidence,
     PolicyDidNotSelectRepair,
-    RepairPlan(GuardianRepairPlanRejection),
+    Authorization(RepairAuthorizationRejection),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,32 +201,49 @@ pub fn install_artifact_failure_guardian_outcome_with_context(
     })
 }
 
-pub fn plan_install_artifact_failure_repair(
+pub(crate) fn authorize_install_existing_artifact_failure_repair(
     operation_id: Option<OperationId>,
     mode: GuardianMode,
     phase: OperationPhase,
     evidence: &[GuardianInstallArtifactFailureEvidence],
-    plan_kind: GuardianInstallArtifactRepairPlanKind,
-) -> Result<GuardianRepairPlan, GuardianInstallArtifactRepairPlanRejection> {
-    if evidence.is_empty() {
-        return Err(GuardianInstallArtifactRepairPlanRejection::NoFailureEvidence);
-    }
+    descriptor: super::GuardianMinecraftArtifactRepairDescriptor,
+) -> Result<
+    RepairAuthorization<QuarantineRedownload>,
+    GuardianInstallArtifactRepairAuthorizationRejection,
+> {
+    let decision = install_artifact_repair_decision(operation_id, mode, phase, evidence)?;
+    authorize_launcher_managed_artifact_repair(&decision, Default::default(), descriptor)
+        .map_err(GuardianInstallArtifactRepairAuthorizationRejection::Authorization)
+}
 
+pub(crate) fn authorize_install_missing_artifact_failure_repair(
+    operation_id: Option<OperationId>,
+    mode: GuardianMode,
+    phase: OperationPhase,
+    evidence: &[GuardianInstallArtifactFailureEvidence],
+    descriptor: super::GuardianMinecraftArtifactRepairDescriptor,
+) -> Result<RepairAuthorization<MissingDownload>, GuardianInstallArtifactRepairAuthorizationRejection>
+{
+    let decision = install_artifact_repair_decision(operation_id, mode, phase, evidence)?;
+    authorize_launcher_managed_missing_artifact_repair(&decision, Default::default(), descriptor)
+        .map_err(GuardianInstallArtifactRepairAuthorizationRejection::Authorization)
+}
+
+fn install_artifact_repair_decision(
+    operation_id: Option<OperationId>,
+    mode: GuardianMode,
+    phase: OperationPhase,
+    evidence: &[GuardianInstallArtifactFailureEvidence],
+) -> Result<GuardianDecision, GuardianInstallArtifactRepairAuthorizationRejection> {
+    if evidence.is_empty() {
+        return Err(GuardianInstallArtifactRepairAuthorizationRejection::NoFailureEvidence);
+    }
     let safety_case = install_artifact_failure_safety_case(operation_id, mode, phase, evidence);
     let decision = decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
     if decision.kind != GuardianActionKind::Repair {
-        return Err(GuardianInstallArtifactRepairPlanRejection::PolicyDidNotSelectRepair);
+        return Err(GuardianInstallArtifactRepairAuthorizationRejection::PolicyDidNotSelectRepair);
     }
-
-    match plan_kind {
-        GuardianInstallArtifactRepairPlanKind::ExistingArtifact => {
-            plan_launcher_managed_artifact_repair(&decision, Default::default())
-        }
-        GuardianInstallArtifactRepairPlanKind::MissingArtifact => {
-            plan_launcher_managed_missing_artifact_repair(&decision, Default::default())
-        }
-    }
-    .map_err(GuardianInstallArtifactRepairPlanRejection::RepairPlan)
+    Ok(decision)
 }
 
 fn install_failure_kind_for_minecraft_download_fact(
@@ -360,13 +372,18 @@ fn install_field_key_looks_sensitive(key: &str) -> bool {
 mod tests {
     use super::{
         GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-        GuardianInstallArtifactRepairPlanKind,
+        authorize_install_existing_artifact_failure_repair,
         install_artifact_failure_from_minecraft_download_fact,
         install_artifact_failure_guardian_fact, install_artifact_failure_guardian_outcome,
-        install_artifact_failure_safety_case, plan_install_artifact_failure_repair,
+        install_artifact_failure_safety_case,
     };
-    use crate::guardian::{GuardianActionKind, GuardianMode};
-    use crate::state::contracts::{OperationId, OperationPhase, OwnershipClass, TargetKind};
+    use crate::guardian::{
+        GuardianActionKind, GuardianMinecraftArtifactRepairDescriptor, GuardianMode,
+    };
+    use crate::state::contracts::{
+        OperationId, OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor,
+        TargetKind,
+    };
     use axial_minecraft::download::{
         ExecutionDownloadFact as MinecraftDownloadFact,
         ExecutionDownloadFactKind as MinecraftDownloadFactKind,
@@ -412,36 +429,39 @@ mod tests {
     }
 
     #[test]
-    fn install_artifact_repair_plan_is_selected_by_guardian_policy() {
+    fn install_artifact_repair_authorization_is_selected_by_guardian_policy() {
         let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
             Some(OperationId::new("install-operation-1")),
             "minecraft_client_1.21.5",
             GuardianInstallArtifactFailureKind::ChecksumMismatch,
         );
 
-        let plan = plan_install_artifact_failure_repair(
+        let _authorization = authorize_install_existing_artifact_failure_repair(
             Some(OperationId::new("install-operation-1")),
             GuardianMode::Managed,
             OperationPhase::Downloading,
             &[evidence],
-            GuardianInstallArtifactRepairPlanKind::ExistingArtifact,
+            test_descriptor("minecraft_client_1.21.5"),
         )
         .expect("Guardian policy selects managed artifact repair");
+    }
 
-        assert_eq!(
-            plan.diagnosis_id.as_str(),
-            "launcher_managed_artifact_corrupt"
-        );
-        assert_eq!(plan.target.id, "minecraft_client_1.21.5");
-        assert!(plan.tasks.iter().any(|task| {
-            task.id == "quarantine_launcher_managed_target"
-                && task.action == GuardianActionKind::Quarantine
-        }));
-        assert!(
-            plan.tasks
-                .iter()
-                .any(|task| task.id == "promote_verified_artifact")
-        );
+    fn test_descriptor(target_id: &str) -> GuardianMinecraftArtifactRepairDescriptor {
+        GuardianMinecraftArtifactRepairDescriptor::for_test(
+            TargetDescriptor::new(
+                StabilizationSystem::Execution,
+                TargetKind::Artifact,
+                target_id,
+                OwnershipClass::LauncherManaged,
+            ),
+            std::path::Path::new("/tmp/axial-test-artifact.jar"),
+            "https://example.invalid/artifact.jar",
+            "sha1",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Some(128),
+            1024,
+        )
+        .expect("test descriptor")
     }
 
     #[test]

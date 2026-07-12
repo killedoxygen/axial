@@ -4,7 +4,7 @@
 //! into the source/destination shape required by Guardian artifact repair, but
 //! they do not resolve providers, start downloads, or mutate files.
 
-use super::GuardianArtifactRepairSource;
+use super::artifact_repair::GuardianArtifactRepairSource;
 use crate::execution::download::{
     DownloadChecksum, DownloadChecksumAlgorithm, valid_download_checksum_metadata,
 };
@@ -19,11 +19,13 @@ use url::Url;
 const MAX_MINECRAFT_REPAIR_ARTIFACT_BYTES: u64 = 512 << 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GuardianArtifactDescriptorError {
+pub(crate) enum GuardianArtifactDescriptorError {
     MissingDestination,
     MissingProviderUrl,
     UnsupportedProviderUrl,
     MissingChecksum,
+    #[cfg(test)]
+    UnsupportedChecksumAlgorithm,
     InvalidChecksum,
     MissingTargetId,
     UnsafeTargetId,
@@ -33,14 +35,14 @@ pub enum GuardianArtifactDescriptorError {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub struct GuardianMinecraftArtifactRepairDescriptor {
+pub(crate) struct GuardianMinecraftArtifactRepairDescriptor {
     target: TargetDescriptor,
     destination: PathBuf,
     source: GuardianMinecraftArtifactRepairSource,
 }
 
 impl GuardianMinecraftArtifactRepairDescriptor {
-    pub fn from_core_selected_descriptor(
+    pub(crate) fn from_core_selected_descriptor(
         descriptor: &SelectedDownloadArtifactDescriptor,
     ) -> Result<Self, GuardianArtifactDescriptorError> {
         if descriptor.destination().as_os_str().is_empty() {
@@ -74,15 +76,15 @@ impl GuardianMinecraftArtifactRepairDescriptor {
         })
     }
 
-    pub fn target(&self) -> &TargetDescriptor {
+    pub(crate) fn target(&self) -> &TargetDescriptor {
         &self.target
     }
 
-    pub fn destination(&self) -> &Path {
+    pub(crate) fn destination(&self) -> &Path {
         &self.destination
     }
 
-    pub fn repair_source(&self) -> GuardianArtifactRepairSource<'_> {
+    pub(super) fn repair_source(&self) -> GuardianArtifactRepairSource<'_> {
         GuardianArtifactRepairSource {
             url: &self.source.url,
             checksum_algorithm: self.source.checksum_algorithm.as_str(),
@@ -90,6 +92,47 @@ impl GuardianMinecraftArtifactRepairDescriptor {
             expected_size: self.source.expected_size,
             max_bytes: Some(self.source.max_bytes),
         }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test(
+        target: TargetDescriptor,
+        destination: &Path,
+        provider_url: &str,
+        checksum_algorithm: &str,
+        checksum: &str,
+        expected_size: Option<u64>,
+        max_bytes: u64,
+    ) -> Result<Self, GuardianArtifactDescriptorError> {
+        if destination.as_os_str().is_empty() {
+            return Err(GuardianArtifactDescriptorError::MissingDestination);
+        }
+        let provider_url = safe_provider_url(provider_url)?;
+        let checksum_algorithm = DownloadChecksumAlgorithm::parse(checksum_algorithm)
+            .ok_or(GuardianArtifactDescriptorError::UnsupportedChecksumAlgorithm)?;
+        let checksum = checksum.trim();
+        if checksum.is_empty() {
+            return Err(GuardianArtifactDescriptorError::MissingChecksum);
+        }
+        if !valid_download_checksum_metadata(DownloadChecksum::new(checksum_algorithm, checksum)) {
+            return Err(GuardianArtifactDescriptorError::InvalidChecksum);
+        }
+        let max_bytes = bounded_max_bytes(max_bytes)?;
+        if expected_size.is_some_and(|expected_size| expected_size > max_bytes) {
+            return Err(GuardianArtifactDescriptorError::ExpectedSizeExceedsMaxBytes);
+        }
+        Ok(Self {
+            target,
+            destination: destination.to_path_buf(),
+            source: GuardianMinecraftArtifactRepairSource {
+                url: provider_url,
+                checksum_algorithm,
+                checksum: checksum.to_ascii_lowercase(),
+                expected_size,
+                max_bytes,
+            },
+        })
     }
 }
 
@@ -352,6 +395,30 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    #[test]
+    fn test_descriptor_constructor_rejects_unsupported_checksum_algorithm() {
+        let error = GuardianMinecraftArtifactRepairDescriptor::for_test(
+            crate::state::contracts::TargetDescriptor::new(
+                crate::state::contracts::StabilizationSystem::Execution,
+                crate::state::contracts::TargetKind::Artifact,
+                "artifact",
+                OwnershipClass::LauncherManaged,
+            ),
+            Path::new("/tmp/axial/artifact.jar"),
+            "https://example.invalid/artifact.jar",
+            "sha512",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Some(128),
+            ONE_MIB,
+        )
+        .expect_err("unsupported checksum algorithm");
+
+        assert_eq!(
+            error,
+            GuardianArtifactDescriptorError::UnsupportedChecksumAlgorithm
+        );
     }
 
     fn selected_descriptor(

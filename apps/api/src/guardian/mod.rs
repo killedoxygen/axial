@@ -4,12 +4,12 @@
 //! supervised recovery, user outcomes, and bounded failure memory across
 //! launch, install, runtime, and performance workflows.
 
-pub mod artifact_descriptor;
-pub mod artifact_repair;
+mod artifact_descriptor;
+mod artifact_repair;
 mod copy;
 mod directive;
-pub mod healing;
-pub mod install_evidence;
+mod healing;
+mod install_evidence;
 pub mod jvm_preset;
 pub mod launch_decision;
 pub mod launch_failure_memory;
@@ -17,7 +17,7 @@ pub mod launch_recovery;
 pub mod performance;
 pub mod policy;
 pub mod preflight;
-pub mod repair_plan;
+mod repair_authorization;
 pub mod state_evidence;
 pub(crate) mod summary;
 
@@ -46,10 +46,10 @@ mod rules;
 #[cfg(test)]
 mod tests;
 
-pub use artifact_descriptor::GuardianMinecraftArtifactRepairDescriptor;
-pub use artifact_repair::{
-    GuardianArtifactRepairMutation, GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest,
-    GuardianArtifactRepairSource, GuardianArtifactRepairStatus, execute_guardian_artifact_repair,
+pub(crate) use artifact_descriptor::GuardianMinecraftArtifactRepairDescriptor;
+pub use artifact_repair::{GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus};
+pub(crate) use artifact_repair::{
+    execute_guardian_missing_download, execute_guardian_quarantine_redownload,
 };
 pub(crate) use copy::{
     GuardianCopyRequest, GuardianLaunchAdmission, GuardianRuntimeRepairCopy, author_guardian_copy,
@@ -74,17 +74,17 @@ pub use directive::{
 };
 pub(crate) use directive::{GuardianRecoveryIntentAxis, GuardianRecoveryMetadata};
 pub use facts::guardian_fact_from_execution;
-pub use healing::{
-    GuardianManagedRuntimeRepairRequest, GuardianRepairOutcome, GuardianRepairStatus,
-    execute_managed_runtime_ready_marker_repair,
-};
+pub(crate) use healing::execute_managed_runtime_ready_marker_repair;
+pub use healing::{GuardianRepairOutcome, GuardianRepairStatus};
 pub use install_evidence::{
     GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-    GuardianInstallArtifactRepairPlanKind, GuardianInstallArtifactRepairPlanRejection,
     GuardianInstallFailureOutcome, install_artifact_failure_from_minecraft_download_fact,
     install_artifact_failure_guardian_fact, install_artifact_failure_guardian_outcome,
     install_artifact_failure_guardian_outcome_with_context, install_artifact_failure_safety_case,
-    plan_install_artifact_failure_repair,
+};
+pub(crate) use install_evidence::{
+    authorize_install_existing_artifact_failure_repair,
+    authorize_install_missing_artifact_failure_repair,
 };
 pub use jvm_preset::{
     GuardianJvmPresetId, GuardianJvmPresetResolution, normalize_create_jvm_preset,
@@ -128,11 +128,11 @@ pub use preflight::{
     GuardianPreflightOutcome, GuardianPreflightOutcomeRequest, GuardianPreflightOverrideSignals,
     GuardianPreflightReadiness, GuardianPreflightResourceSignals, guardian_preflight_outcome,
 };
-pub use repair_plan::{
-    GuardianRepairExecutor, GuardianRepairMutation, GuardianRepairPlan,
-    GuardianRepairPlanRejection, GuardianRepairPlanningContext, GuardianRepairReversibility,
-    GuardianRepairTask, GuardianRepairTaskKind, plan_launcher_managed_artifact_repair,
-    plan_launcher_managed_missing_artifact_repair, plan_managed_runtime_ready_marker_repair,
+pub(crate) use repair_authorization::{
+    ArtifactRepairKind, MissingDownload, QuarantineRedownload, ReadyMarker, RepairAuthorization,
+    RepairAuthorizationContext, RepairAuthorizationRejection,
+    authorize_launcher_managed_artifact_repair, authorize_launcher_managed_missing_artifact_repair,
+    authorize_managed_runtime_ready_marker_repair,
 };
 pub use state_evidence::{GuardianStateLoadOutcome, persisted_state_load_guardian_outcome};
 pub use summary::GuardianSummary;

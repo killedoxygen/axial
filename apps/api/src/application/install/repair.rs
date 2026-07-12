@@ -4,12 +4,11 @@ use super::{
     reconcile_install_journal_transition,
 };
 use crate::guardian::{
-    DiagnosisId, GuardianArtifactRepairMutation, GuardianArtifactRepairOutcome,
-    GuardianArtifactRepairRequest, GuardianArtifactRepairStatus, GuardianCopyRequest,
-    GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactRepairPlanKind,
-    GuardianMinecraftArtifactRepairDescriptor, GuardianMode, author_guardian_copy,
-    execute_guardian_artifact_repair, install_artifact_failure_from_minecraft_download_fact,
-    plan_install_artifact_failure_repair,
+    DiagnosisId, GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus, GuardianCopyRequest,
+    GuardianInstallArtifactFailureEvidence, GuardianMinecraftArtifactRepairDescriptor,
+    GuardianMode, author_guardian_copy, authorize_install_existing_artifact_failure_repair,
+    authorize_install_missing_artifact_failure_repair, execute_guardian_missing_download,
+    execute_guardian_quarantine_redownload, install_artifact_failure_from_minecraft_download_fact,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
@@ -139,42 +138,49 @@ pub async fn repair_install_artifact_corruption_with_guardian(
         .destination()
         .try_exists()
         .is_ok_and(|exists| !exists);
-    let plan_kind = if repair.evidence.kind
+    let missing_download = repair.evidence.kind
         == crate::guardian::GuardianInstallArtifactFailureKind::ArtifactMissing
-        || destination_missing
-    {
-        GuardianInstallArtifactRepairPlanKind::MissingArtifact
+        || destination_missing;
+    let outcome = if missing_download {
+        let Ok(authorization) = authorize_install_missing_artifact_failure_repair(
+            Some(operation_id.clone()),
+            GuardianMode::Managed,
+            OperationPhase::Downloading,
+            std::slice::from_ref(&repair.evidence),
+            repair.descriptor,
+        ) else {
+            return Ok(None);
+        };
+        execute_guardian_missing_download(
+            authorization,
+            None,
+            client,
+            journals,
+            failure_memory,
+            observed_at,
+        )
+        .await
     } else {
-        GuardianInstallArtifactRepairPlanKind::ExistingArtifact
+        let Ok(authorization) = authorize_install_existing_artifact_failure_repair(
+            Some(operation_id.clone()),
+            GuardianMode::Managed,
+            OperationPhase::Downloading,
+            std::slice::from_ref(&repair.evidence),
+            repair.descriptor,
+        ) else {
+            return Ok(None);
+        };
+        execute_guardian_quarantine_redownload(
+            authorization,
+            None,
+            client,
+            journals,
+            failure_memory,
+            observed_at,
+        )
+        .await
     };
-    let Ok(plan) = plan_install_artifact_failure_repair(
-        Some(operation_id.clone()),
-        GuardianMode::Managed,
-        OperationPhase::Downloading,
-        std::slice::from_ref(&repair.evidence),
-        plan_kind,
-    ) else {
-        return Ok(None);
-    };
-
-    let request = GuardianArtifactRepairRequest {
-        operation_id: None,
-        plan: &plan,
-        destination: repair.descriptor.destination(),
-        source: repair.descriptor.repair_source(),
-        client,
-        journals,
-        failure_memory,
-        mode: GuardianMode::Managed,
-        observed_at,
-        mutation: if destination_missing {
-            GuardianArtifactRepairMutation::DownloadMissing
-        } else {
-            GuardianArtifactRepairMutation::QuarantineExisting
-        },
-    };
-
-    execute_guardian_artifact_repair(request).await.map(Some)
+    outcome.map(Some)
 }
 
 struct RepairableInstallArtifact {
