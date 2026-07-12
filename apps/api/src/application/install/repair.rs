@@ -5,10 +5,10 @@ use super::{
 };
 use crate::guardian::{
     DiagnosisId, GuardianArtifactRepairMutation, GuardianArtifactRepairOutcome,
-    GuardianArtifactRepairRequest, GuardianArtifactRepairStatus,
+    GuardianArtifactRepairRequest, GuardianArtifactRepairStatus, GuardianCopyRequest,
     GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactRepairPlanKind,
-    GuardianMinecraftArtifactRepairDescriptor, GuardianMode, execute_guardian_artifact_repair,
-    install_artifact_failure_from_minecraft_download_fact, install_artifact_repair_user_outcome,
+    GuardianMinecraftArtifactRepairDescriptor, GuardianMode, author_guardian_copy,
+    execute_guardian_artifact_repair, install_artifact_failure_from_minecraft_download_fact,
     plan_install_artifact_failure_repair,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
@@ -45,7 +45,7 @@ pub async fn record_install_operation_guardian_repair_outcome(
         format!("{REPAIR_OPERATION_FACT_PREFIX}{repair_operation_id}"),
         format!(
             "{REPAIR_STATUS_FACT_PREFIX}{}",
-            guardian_artifact_repair_status_id(outcome.status)
+            outcome.status.as_persisted_id()
         ),
         format!("{REPAIR_SUMMARY_FACT_PREFIX}{summary}"),
     ];
@@ -85,19 +85,20 @@ pub fn install_guardian_repair_summary_from_journal(
     entry: &OperationJournalEntry,
 ) -> Option<InstallGuardianRepairSummary> {
     let repair_operation_id = latest_generated_fact_value(entry, REPAIR_OPERATION_FACT_PREFIX)?;
-    let status = latest_generated_fact_value(entry, REPAIR_STATUS_FACT_PREFIX)?;
+    let status_id = latest_generated_fact_value(entry, REPAIR_STATUS_FACT_PREFIX)?;
+    let status = GuardianArtifactRepairStatus::from_persisted_id(&status_id)?;
     let diagnosis_id = entry
         .guardian_diagnosis_ids
         .iter()
         .copied()
         .rev()
         .find(|diagnosis_id| *diagnosis_id == DiagnosisId::LauncherManagedArtifactCorrupt)?;
-    let outcome = install_artifact_repair_user_outcome(&status);
+    let outcome = author_guardian_copy(GuardianCopyRequest::artifact_repair(diagnosis_id, status))?;
 
     Some(InstallGuardianRepairSummary {
         repair_operation_id: OperationId::new(repair_operation_id),
         diagnosis_id,
-        status,
+        status: status.as_persisted_id().to_string(),
         label: outcome.summary,
         detail: outcome.details.first().cloned(),
     })
@@ -156,15 +157,6 @@ pub async fn repair_install_artifact_corruption_with_guardian(
     };
 
     execute_guardian_artifact_repair(request).await.map(Some)
-}
-
-fn guardian_artifact_repair_status_id(status: GuardianArtifactRepairStatus) -> &'static str {
-    match status {
-        GuardianArtifactRepairStatus::Repaired => "repaired",
-        GuardianArtifactRepairStatus::Blocked => "blocked",
-        GuardianArtifactRepairStatus::Failed => "failed",
-        GuardianArtifactRepairStatus::Suppressed => "suppressed",
-    }
 }
 
 struct RepairableInstallArtifact {
@@ -238,4 +230,40 @@ fn terminal_download_failure_fact_kind(kind: ExecutionDownloadFactKind) -> bool 
             | ExecutionDownloadFactKind::SizeMismatch
             | ExecutionDownloadFactKind::TempWriteFailed
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::install_guardian_repair_summary_from_journal;
+    use crate::guardian::DiagnosisId;
+    use crate::state::contracts::{
+        CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
+        OperationPhase, OperationStepResult, OwnershipClass, RollbackState, StabilizationSystem,
+    };
+
+    #[test]
+    fn malformed_persisted_artifact_repair_status_has_no_public_summary() {
+        let operation_id = OperationId::new("install-operation");
+        let mut entry = OperationJournalEntry::new(
+            JournalId::new("install-journal"),
+            operation_id,
+            CommandKind::InstallVersion,
+            StabilizationSystem::Application,
+            OwnershipClass::LauncherManaged,
+            RollbackState::NotApplicable,
+        );
+        let mut step = OperationJournalStep::new("guardian-repair", OperationPhase::Repairing);
+        step.result = OperationStepResult::Completed;
+        step.generated_facts = vec![
+            "guardian_repair_operation:repair-operation".to_string(),
+            "guardian_repair_status:legacy_repaired".to_string(),
+            "guardian_repair_summary:repair-summary".to_string(),
+        ];
+        entry.completed_steps.push(step);
+        entry
+            .guardian_diagnosis_ids
+            .push(DiagnosisId::LauncherManagedArtifactCorrupt);
+
+        assert!(install_guardian_repair_summary_from_journal(&entry).is_none());
+    }
 }

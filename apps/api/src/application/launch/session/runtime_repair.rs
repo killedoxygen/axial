@@ -5,11 +5,11 @@ use crate::execution::runtime::{
     ManagedRuntimeRoot, ManagedRuntimeVerificationRequest, verify_managed_runtime,
 };
 use crate::guardian::{
-    GuardianActionKind as ApiGuardianActionKind, GuardianManagedRuntimeRepairRequest,
-    GuardianPreflightOutcome, GuardianPreflightOutcomeRequest, GuardianRepairPlanningContext,
-    GuardianRepairStatus, GuardianUserOutcome, execute_managed_runtime_ready_marker_repair,
-    guardian_fact_from_execution, guardian_preflight_outcome,
-    plan_managed_runtime_ready_marker_repair, runtime_repair_user_outcome,
+    GuardianActionKind as ApiGuardianActionKind, GuardianCopyRequest,
+    GuardianManagedRuntimeRepairRequest, GuardianPreflightOutcome, GuardianPreflightOutcomeRequest,
+    GuardianRepairPlanningContext, GuardianRepairStatus, GuardianUserOutcome, author_guardian_copy,
+    execute_managed_runtime_ready_marker_repair, guardian_fact_from_execution,
+    guardian_preflight_outcome, plan_managed_runtime_ready_marker_repair,
 };
 use crate::logging::timestamp_utc;
 use crate::observability::telemetry::{
@@ -211,7 +211,15 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
             outcome.summary.as_str(),
         ));
     }
-    let repair_user_outcome = runtime_repair_user_outcome(&outcome);
+    let repair_user_outcome = author_guardian_copy(GuardianCopyRequest::runtime_repair(
+        outcome.diagnosis_id,
+        outcome.status,
+    ))
+    .ok_or_else(|| {
+        OperationJournalStoreError::Persistence(std::io::Error::other(
+            "managed-runtime repair outcome is missing its supported diagnosis",
+        ))
+    })?;
     match outcome.status {
         GuardianRepairStatus::Repaired => {
             let prior_java_probe_receipt = preflight.java_probe_receipt.take();

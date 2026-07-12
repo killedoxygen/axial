@@ -1,14 +1,12 @@
 use super::{
-    DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus,
+    DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianCopyRequest,
     GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
     GuardianLaunchRecoveryDirective, GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind,
     GuardianLaunchRecoveryPlanRequest, GuardianMode, GuardianPerformanceSupervisionRejection,
-    GuardianRepairOutcome, GuardianRepairStatus, GuardianUserOutcome,
-    install_artifact_repair_user_outcome, launch_recovery_suppressed_user_outcome,
-    performance_supervision_rejection_user_outcome, persisted_state_load_user_outcome,
-    plan_launch_recovery_directive, runtime_repair_user_outcome,
+    GuardianRepairStatus, GuardianUserOutcome, author_guardian_copy,
+    launch_recovery_suppressed_user_outcome, plan_launch_recovery_directive,
 };
-use crate::state::contracts::{OperationId, OperationPhase};
+use crate::state::contracts::OperationPhase;
 use axial_launcher::LaunchFailureClass;
 use serde::{Deserialize, Serialize};
 
@@ -179,40 +177,51 @@ fn replay_snapshot(snapshot: &GuardianOutcomeCopySnapshot) -> GuardianOutcomeCop
 
 fn render_outcome(input: &GuardianOutcomeCopyInput) -> GuardianUserOutcomeProjection {
     match input {
-        GuardianOutcomeCopyInput::RuntimeRepair { status } => {
-            runtime_repair_user_outcome(&GuardianRepairOutcome {
-                operation_id: OperationId::new("copy-snapshot-runtime-repair"),
-                diagnosis_id: Some(DiagnosisId::ManagedRuntimeCorrupt),
-                action: Some(GuardianActionKind::Repair),
-                status: *status,
-                facts: Vec::new(),
-                summary: "internal_runtime_repair_summary".to_string(),
-            })
-            .into()
-        }
+        GuardianOutcomeCopyInput::RuntimeRepair { status } => author_guardian_copy(
+            GuardianCopyRequest::runtime_repair(Some(DiagnosisId::ManagedRuntimeCorrupt), *status),
+        )
+        .expect("runtime repair copy rule")
+        .into(),
         GuardianOutcomeCopyInput::InstallArtifactRepair { status } => {
-            install_artifact_repair_user_outcome(artifact_status_id(*status)).into()
+            author_guardian_copy(GuardianCopyRequest::artifact_repair(
+                DiagnosisId::LauncherManagedArtifactCorrupt,
+                *status,
+            ))
+            .expect("artifact repair copy rule")
+            .into()
         }
         GuardianOutcomeCopyInput::InstallFailure {
             diagnosis,
             decision,
             component,
             platform,
-        } => super::install_evidence::install_failure_user_outcome_from_evidence(
-            *decision,
-            *diagnosis,
-            &install_failure_evidence(*diagnosis, component.as_deref(), platform.as_deref()),
-        )
-        .into(),
+        } => {
+            let evidence =
+                install_failure_evidence(*diagnosis, component.as_deref(), platform.as_deref());
+            author_guardian_copy(GuardianCopyRequest::install_failure(
+                *diagnosis, *decision, &evidence,
+            ))
+            .expect("install failure copy rule")
+            .into()
+        }
         GuardianOutcomeCopyInput::LaunchRecoverySuppressed { kind } => {
             launch_recovery_suppressed_user_outcome(&launch_recovery_plan(*kind)).into()
         }
         GuardianOutcomeCopyInput::PerformanceRejection { rejection, phase } => {
-            performance_supervision_rejection_user_outcome((*rejection).into(), *phase).into()
+            author_guardian_copy(GuardianCopyRequest::performance_rejection(
+                (*rejection).into(),
+                *phase,
+            ))
+            .expect("performance rejection copy rule")
+            .into()
         }
         GuardianOutcomeCopyInput::PersistedStateLoad { decision } => {
-            persisted_state_load_user_outcome(*decision, DiagnosisId::PersistedStateSchemaInvalid)
-                .into()
+            author_guardian_copy(GuardianCopyRequest::persisted_state_load(
+                DiagnosisId::PersistedStateSchemaInvalid,
+                *decision,
+            ))
+            .expect("persisted state copy rule")
+            .into()
         }
     }
 }
@@ -316,15 +325,6 @@ fn repair_status_id(status: GuardianRepairStatus) -> &'static str {
     }
 }
 
-fn artifact_status_id(status: GuardianArtifactRepairStatus) -> &'static str {
-    match status {
-        GuardianArtifactRepairStatus::Repaired => "repaired",
-        GuardianArtifactRepairStatus::Blocked => "blocked",
-        GuardianArtifactRepairStatus::Failed => "failed",
-        GuardianArtifactRepairStatus::Suppressed => "suppressed",
-    }
-}
-
 fn launch_recovery_kind_id(kind: GuardianLaunchRecoveryKind) -> &'static str {
     match kind {
         GuardianLaunchRecoveryKind::SwitchManagedRuntime => "managed_runtime",
@@ -366,7 +366,7 @@ fn canonical_case_id(input: &GuardianOutcomeCopyInput) -> String {
             format!("runtime_repair.{}", repair_status_id(*status))
         }
         GuardianOutcomeCopyInput::InstallArtifactRepair { status } => {
-            format!("install_artifact_repair.{}", artifact_status_id(*status))
+            format!("install_artifact_repair.{}", status.as_persisted_id())
         }
         GuardianOutcomeCopyInput::InstallFailure {
             diagnosis,

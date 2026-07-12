@@ -14,10 +14,10 @@ use super::{
 };
 use crate::application::guardian_conversion::api_guardian_mode_from_config;
 use crate::guardian::{
-    GuardianFact, GuardianPerformanceOperationKind, GuardianPerformanceSupervisionPlan,
-    GuardianPerformanceSupervisionRejection, GuardianPerformanceSupervisionRequest,
-    GuardianPolicyContext, performance_failure_memory_guardian_fact,
-    performance_plan_guardian_facts, performance_supervision_rejection_user_outcome,
+    GuardianCopyRequest, GuardianFact, GuardianPerformanceOperationKind,
+    GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection,
+    GuardianPerformanceSupervisionRequest, GuardianPolicyContext, author_guardian_copy,
+    performance_failure_memory_guardian_fact, performance_plan_guardian_facts,
     plan_performance_supervision,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
@@ -804,7 +804,11 @@ fn performance_supervision_error(
             StatusCode::INTERNAL_SERVER_ERROR
         }
     };
-    let outcome = performance_supervision_rejection_user_outcome(error, phase);
+    let Some(outcome) =
+        author_guardian_copy(GuardianCopyRequest::performance_rejection(error, phase))
+    else {
+        return internal_install_error("Guardian performance copy rule is missing");
+    };
     (
         status,
         Json(serde_json::json!({
@@ -885,5 +889,56 @@ fn managed_mutation_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": PERFORMANCE_INSTALL_INTERNAL_ERROR })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PERFORMANCE_INSTALL_INTERNAL_ERROR, performance_supervision_error};
+    use crate::guardian::GuardianPerformanceSupervisionRejection;
+    use crate::state::contracts::OperationPhase;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn performance_supervision_rejections_use_exact_bounded_copy() {
+        let cases = [
+            (
+                GuardianPerformanceSupervisionRejection::UnsafeOwnership,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                GuardianPerformanceSupervisionRejection::MissingJournal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                GuardianPerformanceSupervisionRejection::UnsafePublicBoundary,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                GuardianPerformanceSupervisionRejection::GuardianBlocked,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                GuardianPerformanceSupervisionRejection::FallbackUnavailable,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                GuardianPerformanceSupervisionRejection::RollbackUnavailable,
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+
+        for (rejection, expected_status) in cases {
+            let (status, body) =
+                performance_supervision_error(rejection, OperationPhase::RollingBack);
+            let message = body.0["error"].as_str().expect("bounded error string");
+
+            assert_eq!(status, expected_status);
+            assert_eq!(
+                message,
+                "performance update was blocked by Guardian safety supervision"
+            );
+            assert_ne!(message, PERFORMANCE_INSTALL_INTERNAL_ERROR);
+        }
     }
 }

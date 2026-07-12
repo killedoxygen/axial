@@ -122,6 +122,8 @@ Guardian decisions follow the same shape even when a domain has only partial wor
 8. Public outcome
    Guardian emits bounded message/details, intervention summaries, or non-intervention reasons. Raw paths, Java paths, JVM args, command lines, provider payloads, account ids, usernames, tokens, server addresses, and token-like strings do not cross public or exportable boundaries.
 
+Runtime repair, install artifact repair, non-repairable install failure, Performance supervision rejection, and persisted-state load outcomes use one iterable typed copy table. Its crate-private request constructors provide closed family shapes, derive repair decisions from terminal status where applicable, and preserve the caller's Performance phase; the copy authority returns no outcome for unsupported coordinates. Runtime install details extract the first matching structured evidence and first matching field once inside this authority, sanitize only those dynamic values for the user-visible audience, and enforce byte and collection bounds with stable deduplication. Launch preflight, launch failure, and launch recovery copy remain in their existing Guardian authors until those families are migrated.
+
 ## Core Data Model
 ### Inputs
 Guardian reasons from explicit facts:

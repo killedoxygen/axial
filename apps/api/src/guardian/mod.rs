@@ -6,6 +6,7 @@
 
 pub mod artifact_descriptor;
 pub mod artifact_repair;
+mod copy;
 pub mod healing;
 pub mod install_evidence;
 pub mod jvm_preset;
@@ -41,6 +42,7 @@ pub use artifact_repair::{
     GuardianArtifactRepairMutation, GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest,
     GuardianArtifactRepairSource, GuardianArtifactRepairStatus, execute_guardian_artifact_repair,
 };
+pub(crate) use copy::{GuardianCopyRequest, author_guardian_copy};
 pub use diagnosis::{Diagnosis, build_safety_case, diagnose};
 pub use facts::guardian_fact_from_execution;
 pub use healing::{
@@ -87,10 +89,8 @@ pub use model::{
     GuardianFactId, GuardianMode, GuardianSeverity, SafetyCase, SafetyOutcome,
 };
 pub use outcome::{
-    GuardianUserOutcome, install_artifact_repair_user_outcome, install_failure_user_outcome,
-    launch_recovery_public_action_label, launch_recovery_suppressed_user_outcome,
-    performance_supervision_rejection_user_outcome, persisted_state_load_user_outcome,
-    runtime_repair_user_outcome,
+    GuardianUserOutcome, launch_recovery_public_action_label,
+    launch_recovery_suppressed_user_outcome,
 };
 pub use performance::{
     GuardianPerformanceOperationKind, GuardianPerformanceSupervisionPlan,

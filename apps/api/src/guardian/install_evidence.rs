@@ -6,9 +6,9 @@
 
 use super::GuardianPolicyContext;
 use super::{
-    DiagnosisId, GuardianActionKind, GuardianFact, GuardianMode, GuardianRepairPlan,
-    GuardianRepairPlanRejection, GuardianUserOutcome, SafetyCase, build_safety_case,
-    decide_guardian_policy, guardian_fact_from_execution, install_failure_user_outcome,
+    DiagnosisId, GuardianActionKind, GuardianCopyRequest, GuardianFact, GuardianMode,
+    GuardianRepairPlan, GuardianRepairPlanRejection, GuardianUserOutcome, SafetyCase,
+    author_guardian_copy, build_safety_case, decide_guardian_policy, guardian_fact_from_execution,
     plan_launcher_managed_artifact_repair, plan_launcher_managed_missing_artifact_repair,
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind};
@@ -194,14 +194,15 @@ pub fn install_artifact_failure_guardian_outcome_with_context(
         return None;
     }
 
+    let user_outcome = author_guardian_copy(GuardianCopyRequest::install_failure(
+        diagnosis_id,
+        decision.kind,
+        evidence,
+    ))?;
     Some(GuardianInstallFailureOutcome {
         diagnosis_id,
         decision: decision.kind,
-        user_outcome: install_failure_user_outcome_from_evidence(
-            decision.kind,
-            diagnosis_id,
-            evidence,
-        ),
+        user_outcome,
     })
 }
 
@@ -320,72 +321,6 @@ fn target_kind_for_install_failure(kind: GuardianInstallArtifactFailureKind) -> 
         | GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform => TargetKind::Runtime,
         _ => TargetKind::Artifact,
     }
-}
-
-pub(super) fn install_failure_user_outcome_from_evidence(
-    decision: GuardianActionKind,
-    diagnosis_id: DiagnosisId,
-    evidence: &[GuardianInstallArtifactFailureEvidence],
-) -> GuardianUserOutcome {
-    let mut outcome = install_failure_user_outcome(decision, diagnosis_id);
-    match diagnosis_id {
-        DiagnosisId::ManagedRuntimeUnavailableForPlatform => {
-            outcome.details = vec![runtime_unavailable_detail(evidence)];
-            outcome.guidance = vec!["This version cannot be installed on this device.".to_string()];
-        }
-        DiagnosisId::ManagedRuntimeRosettaRequired => {
-            outcome.details = vec![runtime_rosetta_required_detail(evidence)];
-            outcome.guidance = vec![
-                "Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then retry.".to_string(),
-            ];
-        }
-        _ => {}
-    }
-
-    outcome
-}
-
-fn runtime_unavailable_detail(evidence: &[GuardianInstallArtifactFailureEvidence]) -> String {
-    let component = runtime_failure_field(
-        evidence,
-        GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform,
-        "component",
-    )
-    .unwrap_or_else(|| "the required runtime".to_string());
-    let platform = runtime_failure_field(
-        evidence,
-        GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform,
-        "platform",
-    )
-    .unwrap_or_else(|| "this device".to_string());
-    format!("Java runtime component {component} is not available for {platform}.")
-}
-
-fn runtime_rosetta_required_detail(evidence: &[GuardianInstallArtifactFailureEvidence]) -> String {
-    let component = runtime_failure_field(
-        evidence,
-        GuardianInstallArtifactFailureKind::RuntimeRosettaRequired,
-        "component",
-    )
-    .unwrap_or_else(|| "the required runtime".to_string());
-    format!("Java runtime component {component} needs Rosetta 2 on this Mac.")
-}
-
-fn runtime_failure_field(
-    evidence: &[GuardianInstallArtifactFailureEvidence],
-    kind: GuardianInstallArtifactFailureKind,
-    key: &str,
-) -> Option<String> {
-    evidence
-        .iter()
-        .find(|evidence| evidence.kind == kind)
-        .and_then(|evidence| {
-            evidence
-                .fields
-                .iter()
-                .find(|(field_key, _)| field_key == key)
-        })
-        .and_then(|(_, value)| sanitize_evidence_token(value, RedactionAudience::UserVisible, 64))
 }
 
 fn safe_artifact_target_id(value: &str) -> String {

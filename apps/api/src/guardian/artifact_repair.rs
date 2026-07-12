@@ -91,6 +91,27 @@ pub enum GuardianArtifactRepairStatus {
     Suppressed,
 }
 
+impl GuardianArtifactRepairStatus {
+    pub const fn as_persisted_id(self) -> &'static str {
+        match self {
+            Self::Repaired => "repaired",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+            Self::Suppressed => "suppressed",
+        }
+    }
+
+    pub fn from_persisted_id(value: &str) -> Option<Self> {
+        match value {
+            "repaired" => Some(Self::Repaired),
+            "blocked" => Some(Self::Blocked),
+            "failed" => Some(Self::Failed),
+            "suppressed" => Some(Self::Suppressed),
+            _ => None,
+        }
+    }
+}
+
 enum ArtifactTerminal {
     Blocked(&'static str),
     Suppressed(String),
@@ -998,6 +1019,29 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn artifact_repair_status_ids_round_trip_strictly() {
+        for status in [
+            GuardianArtifactRepairStatus::Repaired,
+            GuardianArtifactRepairStatus::Blocked,
+            GuardianArtifactRepairStatus::Failed,
+            GuardianArtifactRepairStatus::Suppressed,
+        ] {
+            assert_eq!(
+                GuardianArtifactRepairStatus::from_persisted_id(status.as_persisted_id()),
+                Some(status)
+            );
+        }
+        assert_eq!(
+            GuardianArtifactRepairStatus::from_persisted_id("Repaired"),
+            None
+        );
+        assert_eq!(
+            GuardianArtifactRepairStatus::from_persisted_id("legacy_repaired"),
+            None
+        );
+    }
 
     async fn execute_guardian_artifact_repair(
         request: GuardianArtifactRepairRequest<'_>,
