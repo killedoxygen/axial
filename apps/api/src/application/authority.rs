@@ -901,6 +901,8 @@ mod tests {
             "\"Guardian warned\"",
             "\"Guardian intervened\"",
             "\"Guardian note\"",
+            "Guardian adjusted launch settings for safety.",
+            "JVM preset changed from {} to {} for compatibility.",
         ] {
             assert!(
                 copy.contains(marker),
@@ -955,6 +957,8 @@ mod tests {
                 "GUARDIAN_OUTCOME_SUMMARY_PREFIX",
                 "GUARDIAN_OUTCOME_DETAIL_PREFIX",
                 "GUARDIAN_OUTCOME_GUIDANCE_PREFIX",
+                "launcher_guardian_decision",
+                "GuardianSummary {",
             ] {
                 if production.contains(marker) {
                     violations.push(format!("{relative}: {marker}"));
@@ -974,6 +978,31 @@ mod tests {
         ] {
             if preset_production.contains(marker) {
                 violations.push(format!("apps/api/src/guardian/jvm_preset.rs: {marker}"));
+            }
+        }
+        let core_guardian = fs::read_to_string(repo_root.join("core/launcher/src/guardian/mod.rs"))
+            .expect("read Core Launcher Guardian transport");
+        let core_guardian_production = without_trailing_test_module(&core_guardian);
+        for marker in [
+            "record_intervention",
+            "block_with_guidance",
+            "block_with_reason_and_guidance",
+            "warn_with_guidance",
+            "refresh_outcome",
+            "guardian_message",
+            "guardian_details",
+            "push_unique_detail",
+            "prepend_unique_detail",
+            "user_facing_intervention_detail",
+            "downgrade_preset_detail",
+            "format_preset_name",
+            "capitalize_ascii_word",
+            ".split('\"')",
+            "Guardian adjusted launch settings for safety.",
+            "JVM preset changed from",
+        ] {
+            if core_guardian_production.contains(marker) {
+                violations.push(format!("core/launcher/src/guardian/mod.rs: {marker}"));
             }
         }
         assert!(

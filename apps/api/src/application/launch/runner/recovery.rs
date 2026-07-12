@@ -14,7 +14,7 @@ use crate::guardian::{
 };
 use crate::logging::timestamp_utc;
 use crate::state::{AppState, OperationJournalReconciliation, OperationJournalStoreError};
-use axial_launcher::{GuardianInterventionKind, GuardianSummary, LaunchFailureClass};
+use axial_launcher::{GuardianSummary, LaunchFailureClass};
 use std::time::Duration;
 
 const JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
@@ -382,14 +382,7 @@ pub(super) fn record_prelaunch_preset_adjustment_directive(
         GuardianDirective::DowngradeJvmPreset {
             reason: GuardianPresetDowngradeReason::Compatibility { .. },
             ..
-        } => {
-            *guardian = guardian_summary_with_intervention(
-                guardian,
-                GuardianInterventionKind::DowngradePreset,
-                guardian_directive_description(directive),
-                false,
-            )
-        }
+        } => *guardian = guardian_summary_with_intervention(guardian, directive, false),
         _ => unreachable!("prelaunch preset adjustment emitted non-compatibility directive"),
     }
 }
@@ -408,23 +401,13 @@ pub(super) fn apply_prepare_recovery_directive(
         GuardianDirective::UseManagedJava {
             reason: GuardianManagedJavaReason::PrepareFailure,
         } => {
-            *guardian = guardian_summary_with_intervention(
-                guardian,
-                GuardianInterventionKind::SwitchManagedRuntime,
-                description.clone(),
-                false,
-            );
+            *guardian = guardian_summary_with_intervention(guardian, directive, false);
             attempt.record_runtime_intervention(description);
         }
         GuardianDirective::StripJvmArgs {
             reason: GuardianStripJvmArgsReason::PrepareFailure,
         } => {
-            *guardian = guardian_summary_with_intervention(
-                guardian,
-                GuardianInterventionKind::StripJvmArgs,
-                description.clone(),
-                false,
-            );
+            *guardian = guardian_summary_with_intervention(guardian, directive, false);
             attempt.record_raw_jvm_args_intervention(description);
         }
         _ => return false,
@@ -448,34 +431,19 @@ pub(super) fn apply_startup_recovery_directive(
             preset,
             reason: GuardianPresetDowngradeReason::StartupRecovery,
         } => {
-            *guardian = guardian_summary_with_intervention(
-                guardian,
-                GuardianInterventionKind::DowngradePreset,
-                description,
-                false,
-            );
+            *guardian = guardian_summary_with_intervention(guardian, directive, false);
             attempt.preset_override = Some(preset.as_str().to_string());
             attempt.disable_custom_gc = false;
         }
         GuardianDirective::DisableCustomGc => {
-            *guardian = guardian_summary_with_intervention(
-                guardian,
-                GuardianInterventionKind::DisableCustomGc,
-                description,
-                false,
-            );
+            *guardian = guardian_summary_with_intervention(guardian, directive, false);
             attempt.preset_override = None;
             attempt.disable_custom_gc = true;
         }
         GuardianDirective::UseManagedJava {
             reason: GuardianManagedJavaReason::StartupRecovery,
         } => {
-            *guardian = guardian_summary_with_intervention(
-                guardian,
-                GuardianInterventionKind::SwitchManagedRuntime,
-                description,
-                false,
-            );
+            *guardian = guardian_summary_with_intervention(guardian, directive, false);
             attempt.force_managed_runtime = true;
             attempt.preset_override = None;
             attempt.disable_custom_gc = false;
@@ -515,16 +483,27 @@ mod tests {
         DisableCustomGc,
     }
 
+    fn guardian_with_warning(mode: GuardianMode, warning: &str) -> GuardianSummary {
+        GuardianSummary {
+            mode,
+            decision: GuardianDecision::Warned,
+            message: Some("Guardian flagged launch settings for review.".to_string()),
+            details: vec![warning.to_string()],
+            guidance: vec![warning.to_string()],
+            interventions: Vec::new(),
+        }
+    }
+
     #[test]
     fn launch_guardian_intervention_preserves_existing_warning_guidance() {
         let warning = "Launch memory budget is tight.".to_string();
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
-        guardian.warn_with_guidance(vec![warning.clone()]);
+        let mut guardian = guardian_with_warning(GuardianMode::Managed, &warning);
 
         guardian = guardian_summary_with_intervention(
             &guardian,
-            GuardianInterventionKind::SwitchManagedRuntime,
-            "Guardian switched to managed Java before launch.".to_string(),
+            &GuardianDirective::UseManagedJava {
+                reason: GuardianManagedJavaReason::PrepareFailure,
+            },
             false,
         );
 
@@ -619,8 +598,7 @@ mod tests {
     #[test]
     fn startup_stalled_blocks_with_guardian_authored_status_payload() {
         let warning = "Launch memory budget is tight.".to_string();
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
-        guardian.warn_with_guidance(vec![warning.clone()]);
+        let mut guardian = guardian_with_warning(GuardianMode::Managed, &warning);
         let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
             mode: api_guardian_mode(GuardianMode::Managed),
             observation: GuardianStartupFailureObservation::Stalled,
@@ -765,8 +743,8 @@ mod tests {
     #[test]
     fn prelaunch_preset_adjustment_records_backend_authored_guardian_intervention() {
         let directive = GuardianDirective::compatibility_preset_downgrade("graalvm", "performance");
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
-        guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
+        let mut guardian =
+            guardian_with_warning(GuardianMode::Managed, "Keep existing launch guidance.");
 
         record_prelaunch_preset_adjustment_directive(&mut guardian, &directive);
         let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
@@ -810,8 +788,8 @@ mod tests {
         let mut intent = test_launch_intent(&root, session_id);
         intent.target_version_id = "/invalid/version".to_string();
         let mut recovery_attempts = 0;
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
-        guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
+        let mut guardian =
+            guardian_with_warning(GuardianMode::Managed, "Keep existing launch guidance.");
         let original_guardian = guardian.clone();
 
         let outcome = handle_recovery_directive(RecoveryDirectiveRequest {
@@ -877,8 +855,8 @@ mod tests {
         ))
         .expect("launch recovery suppression copy");
         let mut recovery_attempts = 0;
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
-        guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
+        let mut guardian =
+            guardian_with_warning(GuardianMode::Managed, "Keep existing launch guidance.");
 
         let outcome = handle_recovery_directive(RecoveryDirectiveRequest {
             state: &state,
@@ -982,8 +960,8 @@ mod tests {
             &suppressed_plan.directive,
         ))
         .expect("launch recovery suppression copy");
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
-        guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
+        let mut guardian =
+            guardian_with_warning(GuardianMode::Managed, "Keep existing launch guidance.");
         guardian = guardian_summary_with_suppressed_outcome(&guardian, &user_outcome);
         let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
 
@@ -1360,8 +1338,8 @@ mod tests {
         ))
         .expect("launch recovery suppression copy");
         let reason = outcome.summary().to_string();
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
-        guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
+        let mut guardian =
+            guardian_with_warning(GuardianMode::Managed, "Keep existing launch guidance.");
 
         guardian = guardian_summary_with_suppressed_outcome(&guardian, &outcome);
 

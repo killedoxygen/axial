@@ -4,8 +4,8 @@ use super::{
     GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
     GuardianManagedJavaReason, GuardianMode, GuardianObservedLaunchFailurePhase,
     GuardianPerformanceSupervisionRejection, GuardianPreflightOutcome,
-    GuardianPresetDowngradeReason, GuardianRepairStatus, GuardianStartupFailureObservation,
-    GuardianStripJvmArgsReason,
+    GuardianPresetDowngradeReason, GuardianPresetValue, GuardianRepairStatus,
+    GuardianStartupFailureObservation, GuardianStripJvmArgsReason,
 };
 use crate::observability::{
     RedactionAudience, sanitize_evidence_text, sanitize_evidence_token,
@@ -13,8 +13,9 @@ use crate::observability::{
 };
 use crate::state::contracts::OperationPhase;
 use axial_launcher::{
-    CrashEvidence, GuardianDecision as LauncherGuardianDecision, GuardianInterventionKind,
-    GuardianSummary, LaunchFailureClass, LaunchStageEvidence,
+    CrashEvidence, GuardianDecision as LauncherGuardianDecision, GuardianIntervention,
+    GuardianInterventionKind, GuardianMode as LauncherGuardianMode, GuardianSummary,
+    LaunchFailureClass, LaunchStageEvidence,
 };
 use chrono::{DateTime, Timelike, Utc};
 use serde::Serialize;
@@ -636,7 +637,7 @@ impl GuardianLaunchAdmission {
         }
     }
 
-    pub(crate) fn public_lines(&self) -> Vec<String> {
+    fn public_lines(&self) -> Vec<String> {
         let outcome = self.user_outcome();
         let mut lines = Vec::new();
         for value in outcome.details.iter().chain(outcome.guidance.iter()) {
@@ -846,25 +847,140 @@ pub(crate) fn guardian_summary_with_observed_outcome(
     projected
 }
 
+pub(crate) fn guardian_summary_from_admission(
+    mode: LauncherGuardianMode,
+    admission: &GuardianLaunchAdmission,
+) -> GuardianSummary {
+    let outcome = admission.user_outcome();
+    let public_lines = admission.public_lines();
+    let decision = match outcome.decision {
+        GuardianActionKind::Allow | GuardianActionKind::RecordOnly => {
+            LauncherGuardianDecision::Allowed
+        }
+        GuardianActionKind::Warn => LauncherGuardianDecision::Warned,
+        GuardianActionKind::Block => LauncherGuardianDecision::Blocked,
+        GuardianActionKind::AskUser => {
+            unreachable!("preflight boundary must resolve confirmation before launch conversion")
+        }
+        GuardianActionKind::Repair
+        | GuardianActionKind::Retry
+        | GuardianActionKind::Strip
+        | GuardianActionKind::Downgrade
+        | GuardianActionKind::Fallback
+        | GuardianActionKind::Quarantine => LauncherGuardianDecision::Intervened,
+    };
+    GuardianSummary {
+        mode,
+        decision,
+        message: Some(outcome.summary.clone()),
+        details: public_lines.clone(),
+        guidance: public_lines,
+        interventions: Vec::new(),
+    }
+}
+
 pub(crate) fn guardian_summary_with_intervention(
     current: &GuardianSummary,
-    kind: GuardianInterventionKind,
-    detail: String,
+    directive: &GuardianDirective,
     silent: bool,
 ) -> GuardianSummary {
-    let mut projected = current.clone();
-    let existing_guidance = projected.guidance.clone();
-    projected.record_intervention(kind, detail, silent);
-    let expanded_details = projected.details.clone();
-    projected.details.clear();
-    for detail in expanded_details.iter().chain(existing_guidance.iter()) {
-        push_unique_copy_line(&mut projected.details, detail);
+    let mut details = Vec::new();
+    for detail in &current.details {
+        if !current.guidance.iter().any(|guidance| guidance == detail) {
+            push_unique_copy_line(&mut details, detail);
+        }
     }
-    projected.guidance.clear();
-    for detail in existing_guidance {
-        push_unique_copy_line(&mut projected.guidance, &detail);
+    if !silent {
+        push_unique_copy_line(
+            &mut details,
+            &guardian_intervention_public_detail(directive),
+        );
     }
-    projected
+    for detail in &current.guidance {
+        push_unique_copy_line(&mut details, detail);
+    }
+
+    let mut guidance = Vec::new();
+    for detail in &current.guidance {
+        push_unique_copy_line(&mut guidance, detail);
+    }
+    let mut interventions = current.interventions.clone();
+    interventions.push(GuardianIntervention {
+        kind: guardian_intervention_kind(directive),
+        detail: Some(guardian_directive_description(directive)),
+        silent: Some(silent),
+    });
+    GuardianSummary {
+        mode: current.mode,
+        decision: LauncherGuardianDecision::Intervened,
+        message: Some("Guardian adjusted launch settings for safety.".to_string()),
+        details,
+        guidance,
+        interventions,
+    }
+}
+
+fn guardian_intervention_kind(directive: &GuardianDirective) -> GuardianInterventionKind {
+    match directive {
+        GuardianDirective::UseManagedJava { .. } => GuardianInterventionKind::SwitchManagedRuntime,
+        GuardianDirective::StripJvmArgs { .. } => GuardianInterventionKind::StripJvmArgs,
+        GuardianDirective::DowngradeJvmPreset { .. } => GuardianInterventionKind::DowngradePreset,
+        GuardianDirective::DisableCustomGc => GuardianInterventionKind::DisableCustomGc,
+    }
+}
+
+fn guardian_intervention_public_detail(directive: &GuardianDirective) -> String {
+    match directive {
+        GuardianDirective::UseManagedJava { .. } => {
+            "Guardian used the managed Java runtime for this launch.".to_string()
+        }
+        GuardianDirective::StripJvmArgs { .. } => {
+            "Explicit JVM args were removed before launch because they were incompatible."
+                .to_string()
+        }
+        GuardianDirective::DowngradeJvmPreset {
+            preset,
+            reason: GuardianPresetDowngradeReason::Compatibility { requested_preset },
+        } => format!(
+            "JVM preset changed from {} to {} for compatibility.",
+            guardian_preset_display_name(requested_preset),
+            guardian_preset_display_name(preset)
+        ),
+        GuardianDirective::DowngradeJvmPreset {
+            preset,
+            reason: GuardianPresetDowngradeReason::StartupRecovery,
+        } => format!(
+            "JVM preset changed to {} for compatibility.",
+            guardian_preset_display_name(preset)
+        ),
+        GuardianDirective::DisableCustomGc => {
+            "Custom GC flags were disabled for compatibility.".to_string()
+        }
+    }
+}
+
+fn guardian_preset_display_name(preset: &GuardianPresetValue) -> String {
+    match preset.as_str() {
+        "" | "none" => "Auto".to_string(),
+        "smooth" => "Smooth".to_string(),
+        "performance" => "Performance".to_string(),
+        "ultra_low_latency" => "Ultra Low Latency".to_string(),
+        "graalvm" => "GraalVM".to_string(),
+        "legacy" => "Legacy".to_string(),
+        "legacy_pvp" => "Legacy PvP".to_string(),
+        "legacy_heavy" => "Legacy Heavy".to_string(),
+        value => value
+            .split('_')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
 }
 
 #[cfg(test)]
@@ -3104,11 +3220,159 @@ mod tests {
     };
     use crate::guardian::{
         DiagnosisId, GuardianActionKind, GuardianInstallArtifactFailureEvidence,
-        GuardianInstallArtifactFailureKind, GuardianJvmPresetId,
-        GuardianPerformanceSupervisionRejection, GuardianRepairStatus,
+        GuardianInstallArtifactFailureKind, GuardianJvmPresetId, GuardianLaunchAdmission,
+        GuardianManagedJavaReason, GuardianPerformanceSupervisionRejection, GuardianRepairStatus,
+        GuardianStripJvmArgsReason, GuardianUserOutcome, SafetyOutcome,
     };
     use crate::state::contracts::OperationPhase;
-    use axial_launcher::{GuardianMode, GuardianSummary};
+    use axial_launcher::{
+        GuardianDecision, GuardianInterventionKind, GuardianMode, GuardianSummary,
+    };
+
+    fn warning_summary() -> GuardianSummary {
+        GuardianSummary {
+            mode: GuardianMode::Managed,
+            decision: GuardianDecision::Warned,
+            message: Some("Guardian flagged launch settings for review.".to_string()),
+            details: vec!["Keep existing launch guidance.".to_string()],
+            guidance: vec!["Keep existing launch guidance.".to_string()],
+            interventions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn admission_projection_is_central_and_preserves_public_lines() {
+        let user_outcome = GuardianUserOutcome::authored(
+            GuardianActionKind::Warn,
+            OperationPhase::Validating,
+            "Guardian flagged launch settings for review.".to_string(),
+            vec!["Review the selected Java runtime.".to_string()],
+            vec!["Keep the current JVM preset.".to_string()],
+        );
+        let admission = GuardianLaunchAdmission::Preflight {
+            safety: SafetyOutcome {
+                decision: GuardianActionKind::Warn,
+                summary: user_outcome.summary.clone(),
+                detail: user_outcome.details.first().cloned(),
+                diagnoses: Vec::new(),
+            },
+            user_outcome,
+        };
+
+        let summary = super::guardian_summary_from_admission(GuardianMode::Custom, &admission);
+
+        assert_eq!(summary.mode, GuardianMode::Custom);
+        assert_eq!(summary.decision, GuardianDecision::Warned);
+        assert_eq!(
+            summary.message.as_deref(),
+            Some("Guardian flagged launch settings for review.")
+        );
+        assert_eq!(
+            summary.details,
+            [
+                "Review the selected Java runtime.",
+                "Keep the current JVM preset."
+            ]
+        );
+        assert_eq!(summary.guidance, summary.details);
+        assert!(summary.interventions.is_empty());
+    }
+
+    #[test]
+    fn typed_directives_author_all_intervention_details_and_raw_evidence() {
+        let cases = [
+            (
+                crate::guardian::GuardianDirective::UseManagedJava {
+                    reason: GuardianManagedJavaReason::PrepareFailure,
+                },
+                GuardianInterventionKind::SwitchManagedRuntime,
+                "Guardian switched to managed Java before launch",
+                "Guardian used the managed Java runtime for this launch.",
+            ),
+            (
+                crate::guardian::GuardianDirective::StripJvmArgs {
+                    reason: GuardianStripJvmArgsReason::PrepareFailure,
+                },
+                GuardianInterventionKind::StripJvmArgs,
+                "Guardian removed incompatible explicit JVM args before launch",
+                "Explicit JVM args were removed before launch because they were incompatible.",
+            ),
+            (
+                crate::guardian::GuardianDirective::compatibility_preset_downgrade(
+                    "graalvm",
+                    "performance",
+                ),
+                GuardianInterventionKind::DowngradePreset,
+                "Guardian downgraded JVM preset from \"graalvm\" to \"performance\" before launch",
+                "JVM preset changed from GraalVM to Performance for compatibility.",
+            ),
+            (
+                crate::guardian::GuardianDirective::startup_preset_downgrade("performance"),
+                GuardianInterventionKind::DowngradePreset,
+                "Automatic retry: downgraded JVM preset to \"performance\" after startup failure",
+                "JVM preset changed to Performance for compatibility.",
+            ),
+            (
+                crate::guardian::GuardianDirective::DisableCustomGc,
+                GuardianInterventionKind::DisableCustomGc,
+                "Automatic retry: disabled custom GC flags after startup failure",
+                "Custom GC flags were disabled for compatibility.",
+            ),
+        ];
+
+        for (directive, kind, raw_detail, public_detail) in cases {
+            let summary =
+                super::guardian_summary_with_intervention(&warning_summary(), &directive, false);
+            assert_eq!(summary.decision, GuardianDecision::Intervened);
+            assert_eq!(
+                summary.message.as_deref(),
+                Some("Guardian adjusted launch settings for safety.")
+            );
+            assert_eq!(
+                summary.details,
+                [public_detail, "Keep existing launch guidance."]
+            );
+            assert_eq!(summary.guidance, ["Keep existing launch guidance."]);
+            assert_eq!(summary.interventions.len(), 1);
+            assert_eq!(summary.interventions[0].kind, kind);
+            assert_eq!(summary.interventions[0].detail.as_deref(), Some(raw_detail));
+            assert_eq!(summary.interventions[0].silent, Some(false));
+        }
+    }
+
+    #[test]
+    fn intervention_projection_preserves_order_dedup_and_silent_behavior() {
+        let managed = crate::guardian::GuardianDirective::UseManagedJava {
+            reason: GuardianManagedJavaReason::PrepareFailure,
+        };
+        let stripped = crate::guardian::GuardianDirective::StripJvmArgs {
+            reason: GuardianStripJvmArgsReason::PrepareFailure,
+        };
+        let once = super::guardian_summary_with_intervention(&warning_summary(), &managed, false);
+        let repeated = super::guardian_summary_with_intervention(&once, &managed, false);
+        let expanded = super::guardian_summary_with_intervention(&repeated, &stripped, false);
+
+        assert_eq!(
+            expanded.details,
+            [
+                "Guardian used the managed Java runtime for this launch.",
+                "Explicit JVM args were removed before launch because they were incompatible.",
+                "Keep existing launch guidance.",
+            ]
+        );
+        assert_eq!(expanded.guidance, ["Keep existing launch guidance."]);
+        assert_eq!(expanded.interventions.len(), 3);
+
+        let silent = super::guardian_summary_with_intervention(&warning_summary(), &managed, true);
+        assert_eq!(silent.details, ["Keep existing launch guidance."]);
+        assert_eq!(silent.guidance, ["Keep existing launch guidance."]);
+        assert_eq!(silent.interventions.len(), 1);
+        assert_eq!(silent.interventions[0].silent, Some(true));
+        assert_eq!(
+            silent.interventions[0].detail.as_deref(),
+            Some("Guardian switched to managed Java before launch")
+        );
+    }
 
     #[test]
     fn jvm_preset_copy_table_is_unique_complete_and_bounded() {
@@ -3494,10 +3758,12 @@ mod tests {
 
     #[test]
     fn suppressed_recovery_preserves_visible_intervention_detail_order() {
-        let mut current = GuardianSummary::new(GuardianMode::Managed);
-        current.record_intervention(
-            axial_launcher::GuardianInterventionKind::DowngradePreset,
-            "Existing visible preset intervention.",
+        let current = super::guardian_summary_with_intervention(
+            &GuardianSummary::new(GuardianMode::Managed),
+            &crate::guardian::GuardianDirective::compatibility_preset_downgrade(
+                "graalvm",
+                "performance",
+            ),
             false,
         );
         let outcome = super::author_launch_recovery_suppressed_copy(
@@ -3511,7 +3777,7 @@ mod tests {
         assert_eq!(projected.details[0], outcome.summary());
         assert_eq!(
             projected.details[1],
-            "JVM preset was changed for compatibility."
+            "JVM preset changed from GraalVM to Performance for compatibility."
         );
         assert_eq!(projected.details[2], outcome.guidance()[0]);
         assert_eq!(projected.interventions, current.interventions);

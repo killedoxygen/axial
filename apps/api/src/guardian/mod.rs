@@ -55,9 +55,9 @@ pub(crate) use copy::{
     guardian_directive_description, guardian_failed_launch_recovery_log,
     guardian_install_outcome_fact_group, guardian_install_outcome_from_persisted_group,
     guardian_install_outcome_persistence_facts, guardian_launch_stage_evidence,
-    guardian_proof_evidence, guardian_summary_with_blocked_outcome,
-    guardian_summary_with_intervention, guardian_summary_with_observed_outcome,
-    guardian_summary_with_suppressed_outcome,
+    guardian_proof_evidence, guardian_summary_from_admission,
+    guardian_summary_with_blocked_outcome, guardian_summary_with_intervention,
+    guardian_summary_with_observed_outcome, guardian_summary_with_suppressed_outcome,
 };
 pub use copy::{
     GuardianInstallOutcomeSummary, GuardianJvmPresetNotice, GuardianJvmPresetOption,

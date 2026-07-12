@@ -6,7 +6,7 @@ mod runtime_repair;
 
 use super::policy;
 use super::runner::trace_launch_event;
-use crate::application::guardian_conversion::{api_guardian_mode, launcher_guardian_decision};
+use crate::application::guardian_conversion::api_guardian_mode;
 use crate::application::timing::{
     LaunchPreflightFactTiming, LaunchPreflightResponseTiming, LaunchSessionTiming,
     trace_launch_preflight_facts, trace_launch_preflight_response, trace_launch_session,
@@ -21,7 +21,8 @@ use crate::guardian::{
     GuardianLaunchAdmission, GuardianLaunchFailureMemoryIntakeRequest,
     GuardianLaunchRecoveryCurrentIntent, GuardianManagedJavaReason, GuardianPreflightOutcome,
     GuardianPreflightOutcomeRequest, GuardianPreflightReadiness, GuardianStripJvmArgsReason,
-    guardian_fact_from_execution, guardian_preflight_outcome, launch_failure_memory_guardian_facts,
+    guardian_fact_from_execution, guardian_preflight_outcome, guardian_summary_from_admission,
+    launch_failure_memory_guardian_facts,
 };
 use crate::logging::timestamp_utc;
 use crate::state::contracts::OperationPhase;
@@ -769,15 +770,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
         &mut java_probe_receipt,
     );
     let guardian_admission = GuardianLaunchAdmission::preflight(&guardian_outcome);
-    let public_lines = guardian_admission.public_lines();
-    let guardian_summary = GuardianSummary {
-        mode: guardian.mode,
-        decision: launcher_guardian_decision(guardian_admission.user_outcome().decision()),
-        message: Some(guardian_admission.user_outcome().summary().to_string()),
-        details: public_lines.clone(),
-        guidance: public_lines,
-        interventions: Vec::new(),
-    };
+    let guardian_summary = guardian_summary_from_admission(guardian.mode, &guardian_admission);
     let guardian_elapsed = guardian_started_at.elapsed();
 
     trace_launch_preflight_facts(LaunchPreflightFactTiming {
