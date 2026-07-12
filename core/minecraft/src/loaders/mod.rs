@@ -67,6 +67,11 @@ where
     api::validate_loader_build_record_identity(&record).map_err(LoaderInstallError::from)?;
     validate_version_id(&record.version_id, "loader build version id")
         .map_err(LoaderInstallError::from)?;
+    let live_record = resolve_build_record_for_install(record.component_id, &record.build_id)
+        .await
+        .map_err(LoaderInstallError::from)?;
+    let record =
+        require_exact_live_build_record(&record, live_record).map_err(LoaderInstallError::from)?;
     let stage_dir = loader_work_dir(library_dir).join(&record.version_id);
     if stage_dir.exists() {
         let _ = fs::remove_dir_all(&stage_dir);
@@ -79,6 +84,18 @@ where
     let result = Box::pin(strategies::install_build(library_dir, &plan, send)).await;
     let _ = fs::remove_dir_all(&plan.stage_dir);
     result.map_err(LoaderInstallError::from)
+}
+
+fn require_exact_live_build_record(
+    requested: &LoaderBuildRecord,
+    live: LoaderBuildRecord,
+) -> Result<LoaderBuildRecord, LoaderError> {
+    if requested != &live {
+        return Err(LoaderError::InvalidProfile(
+            "requested loader build does not match live provider authority".to_string(),
+        ));
+    }
+    Ok(live)
 }
 
 pub(crate) fn validate_version_id(version_id: &str, context: &str) -> Result<(), LoaderError> {
@@ -121,7 +138,8 @@ mod tests {
     use super::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderComponentId, LoaderError,
         LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, MAX_VERSION_ID_BYTES,
-        install_build, installed_version_id_for, validate_version_id,
+        install_build, installed_version_id_for, require_exact_live_build_record,
+        validate_version_id,
     };
     use crate::loaders::types::LoaderBuildSubjectKind;
     use crate::paths::loader_work_dir;
@@ -201,6 +219,51 @@ mod tests {
 
         assert!(!loader_work_dir(&root).exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_build_gate_rejects_canonical_records_with_caller_mutations() {
+        let component_id = LoaderComponentId::Fabric;
+        let loader_version = "0.16.14";
+        let minecraft_version = "1.21.5";
+        let live = LoaderBuildRecord {
+            subject_kind: LoaderBuildSubjectKind::LoaderBuild,
+            component_id,
+            component_name: component_id.display_name().to_string(),
+            build_id: super::build_id_for(component_id, minecraft_version, loader_version),
+            minecraft_version: minecraft_version.to_string(),
+            loader_version: loader_version.to_string(),
+            version_id: installed_version_id_for(component_id, minecraft_version, loader_version)
+                .expect("canonical installed version id"),
+            build_meta: LoaderBuildMetadata::default(),
+            strategy: LoaderInstallStrategy::FabricProfile,
+            artifact_kind: LoaderArtifactKind::ProfileJson,
+            installability: LoaderInstallability::Installable,
+            install_source: LoaderInstallSource::ProfileJson {
+                url: "https://meta.fabricmc.net/official-profile.json".to_string(),
+            },
+        };
+
+        let mut attacker_source = live.clone();
+        attacker_source.install_source = LoaderInstallSource::ProfileJson {
+            url: "https://attacker.invalid/profile.json".to_string(),
+        };
+        assert!(
+            require_exact_live_build_record(&attacker_source, live.clone()).is_err(),
+            "caller-selected source must not mint install authority"
+        );
+
+        let mut mutated_metadata = live.clone();
+        mutated_metadata.component_name = "Caller Fabric".to_string();
+        assert!(
+            require_exact_live_build_record(&mutated_metadata, live.clone()).is_err(),
+            "all caller-supplied record fields must match live authority"
+        );
+
+        assert_eq!(
+            require_exact_live_build_record(&live, live.clone()).expect("exact live record"),
+            live
+        );
     }
 
     fn temp_library(name: &str) -> PathBuf {
