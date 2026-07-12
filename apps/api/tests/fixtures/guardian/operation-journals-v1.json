@@ -29,6 +29,8 @@
         "filesystem_permission_denied",
         "install_artifact_metadata_invalid",
         "install_dependency_failed",
+        "install_execution_failed",
+        "install_processor_failed",
         "java_override_unavailable",
         "java_probe_failed",
         "java_runtime_major_mismatch",

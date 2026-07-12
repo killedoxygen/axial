@@ -176,9 +176,7 @@ where
     let data = fs::read(path)?;
     let cached = serde_json::from_slice::<CachedCatalog<T>>(&data)?;
     if cached.schema_version != LOADER_CATALOG_SCHEMA_VERSION {
-        return Err(LoaderError::Other(
-            "catalog cache schema mismatch".to_string(),
-        ));
+        return Err(LoaderError::CatalogStale);
     }
     Ok(cached)
 }
@@ -204,7 +202,7 @@ fn loader_execution_download_error(error: ExecutionDownloadError) -> LoaderError
 fn loader_download_error(error: DownloadError) -> LoaderError {
     match error {
         DownloadError::FileOperation(error) => LoaderError::Io(error),
-        error => LoaderError::Download(error),
+        error => LoaderError::InstallExecutionFailed(error.to_string()),
     }
 }
 
@@ -325,7 +323,7 @@ mod tests {
 
         let (value, state) =
             resolve_cached(cache_path.clone(), Duration::from_secs(60), || async {
-                Err::<Vec<String>, _>(LoaderError::Other("live should not run".to_string()))
+                Err::<Vec<String>, _>(LoaderError::CatalogStale)
             })
             .await
             .expect("fresh disk cache should satisfy first lookup");
@@ -337,7 +335,7 @@ mod tests {
         fs::remove_file(&cache_path).expect("remove disk cache");
 
         let (value, state) = resolve_cached(cache_path, Duration::from_secs(60), || async {
-            Err::<Vec<String>, _>(LoaderError::Other("live should not run".to_string()))
+            Err::<Vec<String>, _>(LoaderError::CatalogStale)
         })
         .await
         .expect("memory cache should satisfy second lookup");

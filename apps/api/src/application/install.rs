@@ -12,6 +12,9 @@ mod operation;
 mod repair;
 mod stream;
 
+#[cfg(test)]
+pub(crate) use operation::{LoaderGuardianFailureDisposition, loader_install_failure_disposition};
+
 use super::InstallVersionCommand;
 use crate::guardian::{DiagnosisId, GuardianArtifactRepairOutcome, GuardianInstallOutcomeSummary};
 use crate::observability::{

@@ -102,6 +102,8 @@ execution_fact_kinds! {
     FileTempLeftover,
     FileWrittenToTemp,
     InstallDependencyFailed,
+    InstallExecutionFailed,
+    InstallProcessorFailed,
     RuntimeCorrupt,
     RuntimeJavaOverrideEmpty,
     RuntimeJavaOverrideUndefinedSentinel,

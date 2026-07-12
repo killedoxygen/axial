@@ -483,12 +483,11 @@ pub(crate) async fn wait_for_active_vanilla_base_install(
 
 pub fn loader_error_response(error: LoaderError) -> InstallApplicationError {
     let status = match error {
-        LoaderError::InvalidMinecraftVersion
-        | LoaderError::InvalidBuildId
-        | LoaderError::InvalidComponentId => StatusCode::BAD_REQUEST,
+        LoaderError::InvalidMinecraftVersion | LoaderError::InvalidBuildId => {
+            StatusCode::BAD_REQUEST
+        }
         LoaderError::BuildNotFound(_) => StatusCode::NOT_FOUND,
         LoaderError::CatalogStale => StatusCode::PRECONDITION_FAILED,
-        LoaderError::MissingLibraryDir => StatusCode::PRECONDITION_FAILED,
         LoaderError::CatalogUnavailable {
             provider_failure_kind: Some(LoaderProviderFailureKind::HttpNotFound),
             ..
@@ -581,8 +580,6 @@ fn public_loader_error_message(error: &LoaderError) -> &'static str {
     match error {
         LoaderError::InvalidMinecraftVersion => "Invalid Minecraft version.",
         LoaderError::InvalidBuildId => "Invalid loader build.",
-        LoaderError::InvalidComponentId => "Invalid loader component.",
-        LoaderError::MissingLibraryDir => "Axial library is not configured",
         LoaderError::CatalogUnavailable { .. } => {
             "Loader catalog is unavailable. Check your connection and try again."
         }
@@ -609,14 +606,16 @@ fn public_loader_error_message(error: &LoaderError) -> &'static str {
         LoaderError::ArtifactDownloadFailed { .. } => {
             "Loader download failed. Check your connection and try again."
         }
-        LoaderError::Request(_) => {
-            "Loader service request failed. Check your connection and try again."
-        }
-        LoaderError::Download(_) => "Loader download failed. Check your connection and try again.",
-        LoaderError::Parse(_) => "Loader service returned unreadable data. Try again later.",
-        LoaderError::Io(_) => {
+        LoaderError::Parse(_) => "Loader install data could not be read. Try again.",
+        LoaderError::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             "Could not write loader files. Check app data permissions and try again."
         }
-        LoaderError::Other(_) => "Loader operation failed. Try again.",
+        LoaderError::Io(_) => "Loader file operation failed. Restart Axial and try again.",
+        LoaderError::ProcessorFailed(_) => {
+            "Loader installer processor failed. Retry or choose another build."
+        }
+        LoaderError::InstallExecutionFailed(_) => {
+            "Loader installer could not complete. Restart Axial and try again."
+        }
     }
 }

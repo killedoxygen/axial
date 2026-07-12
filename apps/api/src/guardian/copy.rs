@@ -1858,6 +1858,36 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
     ),
     fixed_rule(
         key(
+            Some(DiagnosisId::InstallExecutionFailed),
+            GuardianActionKind::Block,
+            CopyContextKey::InstallFailure,
+        ),
+        OperationPhase::Installing,
+        "Guardian blocked loader install because installation could not complete.",
+        &[CopyLine::Static(
+            "A launcher-managed loader installation step failed before verification completed.",
+        )],
+        &[CopyLine::Static(
+            "Retry the loader install. If it repeats, restart Axial before trying again.",
+        )],
+    ),
+    fixed_rule(
+        key(
+            Some(DiagnosisId::InstallProcessorFailed),
+            GuardianActionKind::Block,
+            CopyContextKey::InstallFailure,
+        ),
+        OperationPhase::Installing,
+        "Guardian blocked loader install because an installer processor failed.",
+        &[CopyLine::Static(
+            "A loader-supplied processor did not complete successfully.",
+        )],
+        &[CopyLine::Static(
+            "Retry the loader install or choose another loader build.",
+        )],
+    ),
+    fixed_rule(
+        key(
             Some(DiagnosisId::ManagedRuntimeUnavailableForPlatform),
             GuardianActionKind::Block,
             CopyContextKey::InstallFailure,
@@ -3934,7 +3964,7 @@ mod tests {
 
     #[test]
     fn copy_rule_table_is_unique_and_covers_the_five_migrated_families() {
-        assert_eq!(GUARDIAN_COPY_RULES.len(), 25);
+        assert_eq!(GUARDIAN_COPY_RULES.len(), 27);
         for (index, rule) in GUARDIAN_COPY_RULES.iter().enumerate() {
             assert!(
                 GUARDIAN_COPY_RULES[index + 1..]
@@ -3969,7 +3999,7 @@ mod tests {
             assert!(rule.details.len() <= MAX_COLLECTION_LINES);
             assert!(rule.guidance.len() <= MAX_COLLECTION_LINES);
         }
-        assert_eq!(counts, [4, 4, 10, 6, 1]);
+        assert_eq!(counts, [4, 4, 12, 6, 1]);
     }
 
     #[test]

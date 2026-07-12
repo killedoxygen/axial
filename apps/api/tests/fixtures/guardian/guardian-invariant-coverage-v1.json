@@ -27,7 +27,7 @@
     },
     {
       "id": "I7",
-      "status": "pending_loader_error_classification"
+      "status": "pending_loader_delegation_proof"
     },
     {
       "id": "I8",
@@ -4911,6 +4911,34 @@
       "memory_feedback": false
     },
     {
+      "diagnosis": "install_execution_failed",
+      "triggers": [
+        "install_execution_failed"
+      ],
+      "evidence": [
+        "install_execution_failed"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
+      "diagnosis": "install_processor_failed",
+      "triggers": [
+        "install_processor_failed"
+      ],
+      "evidence": [
+        "install_processor_failed"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
       "diagnosis": "download_unavailable",
       "triggers": [
         "download_provider_unavailable",
@@ -5528,6 +5556,16 @@
       "referenced_by_rule": true
     },
     {
+      "fact": "install_execution_failed",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "install_processor_failed",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
       "fact": "installed_versions_degraded",
       "availability": "registered_current",
       "referenced_by_rule": false
@@ -6047,6 +6085,14 @@
         "fact": "install_dependency_failed"
       },
       {
+        "source": "InstallExecutionFailed",
+        "fact": "install_execution_failed"
+      },
+      {
+        "source": "InstallProcessorFailed",
+        "fact": "install_processor_failed"
+      },
+      {
         "source": "RuntimeCorrupt",
         "fact": "managed_runtime_corrupt"
       },
@@ -6221,6 +6267,14 @@
         "fact": "install_dependency_failed"
       },
       {
+        "source": "ExecutionFailed",
+        "fact": "install_execution_failed"
+      },
+      {
+        "source": "ProcessorFailed",
+        "fact": "install_processor_failed"
+      },
+      {
         "source": "OwnershipRefused",
         "fact": "primitive_refused"
       },
@@ -6231,6 +6285,170 @@
       {
         "source": "RuntimeUnavailableForPlatform",
         "fact": "managed_runtime_unavailable_for_platform"
+      }
+    ],
+    "loader": [
+      {
+        "source": "InvalidMinecraftVersion",
+        "disposition": "pre_operation",
+        "phase": null,
+        "evidence_kind": null,
+        "fact": null,
+        "diagnosis": null,
+        "target_kind": null
+      },
+      {
+        "source": "InvalidBuildId",
+        "disposition": "pre_operation",
+        "phase": null,
+        "evidence_kind": null,
+        "fact": null,
+        "diagnosis": null,
+        "target_kind": null
+      },
+      {
+        "source": "CatalogUnavailable",
+        "disposition": "pre_operation",
+        "phase": null,
+        "evidence_kind": null,
+        "fact": null,
+        "diagnosis": null,
+        "target_kind": null
+      },
+      {
+        "source": "CatalogStale",
+        "disposition": "pre_operation",
+        "phase": null,
+        "evidence_kind": null,
+        "fact": null,
+        "diagnosis": null,
+        "target_kind": null
+      },
+      {
+        "source": "BuildNotFound",
+        "disposition": "pre_operation",
+        "phase": null,
+        "evidence_kind": null,
+        "fact": null,
+        "diagnosis": null,
+        "target_kind": null
+      },
+      {
+        "source": "ArtifactMissing",
+        "disposition": "guardian_evidence",
+        "phase": "Downloading",
+        "evidence_kind": "ProviderFailure",
+        "fact": "download_provider_unavailable",
+        "diagnosis": "download_unavailable",
+        "target_kind": "Artifact"
+      },
+      {
+        "source": "InvalidProfile",
+        "disposition": "guardian_evidence",
+        "phase": "Downloading",
+        "evidence_kind": "MetadataInvalid",
+        "fact": "provider_data_invalid",
+        "diagnosis": "install_artifact_metadata_invalid",
+        "target_kind": "Artifact"
+      },
+      {
+        "source": "ProviderHttpFailure",
+        "disposition": "guardian_evidence",
+        "phase": "Downloading",
+        "evidence_kind": "ProviderFailure",
+        "fact": "download_provider_unavailable",
+        "diagnosis": "download_unavailable",
+        "target_kind": "Artifact"
+      },
+      {
+        "source": "ProviderNetworkFailure",
+        "disposition": "guardian_evidence",
+        "phase": "Downloading",
+        "evidence_kind": "NetworkFailure",
+        "fact": "download_interrupted",
+        "diagnosis": "download_unavailable",
+        "target_kind": "Artifact"
+      },
+      {
+        "source": "ProviderRateLimited",
+        "disposition": "guardian_evidence",
+        "phase": "Downloading",
+        "evidence_kind": "ProviderFailure",
+        "fact": "download_provider_unavailable",
+        "diagnosis": "download_unavailable",
+        "target_kind": "Artifact"
+      },
+      {
+        "source": "ProviderResponseTooLarge",
+        "disposition": "guardian_evidence",
+        "phase": "Downloading",
+        "evidence_kind": "MetadataInvalid",
+        "fact": "provider_data_invalid",
+        "diagnosis": "install_artifact_metadata_invalid",
+        "target_kind": "Artifact"
+      },
+      {
+        "source": "ProviderSchemaInvalid",
+        "disposition": "guardian_evidence",
+        "phase": "Downloading",
+        "evidence_kind": "MetadataInvalid",
+        "fact": "provider_data_invalid",
+        "diagnosis": "install_artifact_metadata_invalid",
+        "target_kind": "Artifact"
+      },
+      {
+        "source": "ProcessorFailed",
+        "disposition": "guardian_evidence",
+        "phase": "Installing",
+        "evidence_kind": "ProcessorFailed",
+        "fact": "install_processor_failed",
+        "diagnosis": "install_processor_failed",
+        "target_kind": "Version"
+      },
+      {
+        "source": "InstallExecutionFailed",
+        "disposition": "guardian_evidence",
+        "phase": "Installing",
+        "evidence_kind": "ExecutionFailed",
+        "fact": "install_execution_failed",
+        "diagnosis": "install_execution_failed",
+        "target_kind": "Version"
+      },
+      {
+        "source": "VerifyFailed",
+        "disposition": "guardian_evidence",
+        "phase": "Installing",
+        "evidence_kind": "ExecutionFailed",
+        "fact": "install_execution_failed",
+        "diagnosis": "install_execution_failed",
+        "target_kind": "Version"
+      },
+      {
+        "source": "BaseInstallFailed",
+        "disposition": "delegated_base_install",
+        "phase": null,
+        "evidence_kind": null,
+        "fact": null,
+        "diagnosis": null,
+        "target_kind": null
+      },
+      {
+        "source": "ArtifactDownloadFailed",
+        "disposition": "delegated_artifact_download",
+        "phase": null,
+        "evidence_kind": null,
+        "fact": null,
+        "diagnosis": null,
+        "target_kind": null
+      },
+      {
+        "source": "ParseFailed",
+        "disposition": "guardian_evidence",
+        "phase": "Installing",
+        "evidence_kind": "ExecutionFailed",
+        "fact": "install_execution_failed",
+        "diagnosis": "install_execution_failed",
+        "target_kind": "Version"
       }
     ],
     "readiness": [
@@ -6412,12 +6630,15 @@
     },
     {
       "invariant": "I7",
-      "boundary": "loader_install_failure_adapter",
+      "boundary": "loader_preoperation_and_delegated_failures",
       "missing_variants": [
-        "BaseInstallFailed",
+        "InvalidMinecraftVersion",
+        "InvalidBuildId",
+        "CatalogUnavailable",
+        "CatalogStale",
         "BuildNotFound",
-        "ProcessorFailed",
-        "Other"
+        "BaseInstallFailed",
+        "ArtifactDownloadFailed"
       ]
     }
   ]

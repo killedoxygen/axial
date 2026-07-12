@@ -90,6 +90,14 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
             GuardianFactId::InstallDependencyFailed,
             GuardianDomain::Install,
         ),
+        ExecutionFactKind::InstallExecutionFailed => (
+            GuardianFactId::InstallExecutionFailed,
+            GuardianDomain::Install,
+        ),
+        ExecutionFactKind::InstallProcessorFailed => (
+            GuardianFactId::InstallProcessorFailed,
+            GuardianDomain::Install,
+        ),
         ExecutionFactKind::RuntimeCorrupt => (
             GuardianFactId::ManagedRuntimeCorrupt,
             GuardianDomain::Runtime,

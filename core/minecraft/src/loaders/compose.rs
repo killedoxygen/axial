@@ -55,8 +55,9 @@ pub fn compose_loader_version(
 ) -> Result<VersionJson, LoaderError> {
     validate_version_id(base_version_id, "base minecraft version id")?;
     validate_version_id(version_id, "installed loader version id")?;
-    let base = resolve_version(mc_dir, base_version_id)
-        .map_err(|error| LoaderError::InvalidProfile(format!("resolve base version: {error}")))?;
+    let base = resolve_version(mc_dir, base_version_id).map_err(|error| {
+        LoaderError::InstallExecutionFailed(format!("resolve base version: {error}"))
+    })?;
 
     let mut composed = VersionJson {
         id: version_id.to_string(),
@@ -226,6 +227,7 @@ mod tests {
         LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
         write_composed_version,
     };
+    use crate::LoaderError;
     use crate::launch::{AssetIndex, Downloads, JavaVersion, VersionJson, resolve_version};
     use crate::paths::create_minecraft_dir;
     use std::fs;
@@ -428,10 +430,11 @@ mod tests {
             .await
             .expect_err("traversal should fail");
 
-        assert_eq!(
-            error.to_string(),
-            "base minecraft version id contains path separators"
-        );
+        assert!(matches!(
+            error,
+            LoaderError::InstallExecutionFailed(message)
+                if message == "base minecraft version id contains path separators"
+        ));
         assert!(!root.join("versions").join("loader-test").exists());
 
         let _ = fs::remove_dir_all(root);

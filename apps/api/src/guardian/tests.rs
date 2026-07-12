@@ -355,7 +355,7 @@ fn declarative_rules_have_unique_ids_and_keep_conditions_out_of_evidence() {
         GuardianFactId::LaunchJvmPresetDowngradeAvailable,
     ];
 
-    assert_eq!(DIAGNOSIS_RULES.len(), 58);
+    assert_eq!(DIAGNOSIS_RULES.len(), 60);
     for rule in DIAGNOSIS_RULES {
         assert!(diagnosis_ids.insert(rule.id), "duplicate rule {}", rule.id);
         assert!(!rule.trigger_fact_ids.is_empty(), "{}", rule.id);
@@ -832,6 +832,14 @@ fn execution_download_and_process_facts_map_to_guardian_fact_ids() {
         (
             ExecutionFactKind::InstallDependencyFailed,
             "install_dependency_failed",
+        ),
+        (
+            ExecutionFactKind::InstallExecutionFailed,
+            "install_execution_failed",
+        ),
+        (
+            ExecutionFactKind::InstallProcessorFailed,
+            "install_processor_failed",
         ),
         (
             ExecutionFactKind::RuntimeUnavailableForPlatform,

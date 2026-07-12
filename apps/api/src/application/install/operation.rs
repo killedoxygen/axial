@@ -223,6 +223,7 @@ pub async fn record_install_operation_interrupted(
         None,
         operation_id,
         &[evidence],
+        OperationPhase::Downloading,
         &chrono::Utc::now().to_rfc3339(),
     )
     .unwrap_or_default();
@@ -280,6 +281,7 @@ pub(super) async fn record_install_operation_initialization_cancelled(
         None,
         operation_id,
         &[evidence],
+        OperationPhase::Downloading,
         &chrono::Utc::now().to_rfc3339(),
     )
     .unwrap_or_default();
@@ -379,6 +381,7 @@ pub async fn record_install_operation_guardian_failure_outcome_with_memory(
         Some(failure_memory),
         operation_id,
         &evidence,
+        OperationPhase::Downloading,
         observed_at,
     )
     .await
@@ -399,6 +402,7 @@ pub async fn record_install_operation_guardian_failure_outcome_for_error_with_me
         Some(failure_memory),
         operation_id,
         &evidence,
+        OperationPhase::Downloading,
         observed_at,
     )
     .await
@@ -412,18 +416,33 @@ pub async fn record_loader_install_operation_guardian_failure_outcome(
     error: &LoaderError,
     observed_at: &str,
 ) -> Result<(), OperationJournalStoreError> {
-    let Some(evidence) = loader_error_guardian_failure_evidence(operation_id, target_id, error)
-    else {
-        return Ok(());
-    };
-    record_install_operation_guardian_failure_outcome_from_evidence_with_memory(
-        journals,
-        Some(failure_memory),
-        operation_id,
-        &[evidence],
-        observed_at,
-    )
-    .await
+    match loader_install_failure_disposition(error.failure_kind()) {
+        LoaderGuardianFailureDisposition::Evidence {
+            kind,
+            ownership,
+            phase,
+        } => {
+            let evidence = loader_error_guardian_failure_evidence(
+                operation_id,
+                target_id,
+                error,
+                kind,
+                ownership,
+            );
+            record_install_operation_guardian_failure_outcome_from_evidence_with_memory(
+                journals,
+                Some(failure_memory),
+                operation_id,
+                &[evidence],
+                phase,
+                observed_at,
+            )
+            .await
+        }
+        LoaderGuardianFailureDisposition::DelegatedBaseInstall
+        | LoaderGuardianFailureDisposition::DelegatedArtifactDownload
+        | LoaderGuardianFailureDisposition::PreOperation => Ok(()),
+    }
 }
 
 pub async fn record_loader_base_install_dependency_guardian_failure_outcome(
@@ -1086,6 +1105,7 @@ async fn record_install_operation_guardian_failure_outcome_from_evidence(
         None,
         operation_id,
         evidence,
+        OperationPhase::Downloading,
         &chrono::Utc::now().to_rfc3339(),
     )
     .await
@@ -1096,11 +1116,16 @@ async fn record_install_operation_guardian_failure_outcome_from_evidence_with_me
     failure_memory: Option<&GuardianFailureMemoryStore>,
     operation_id: &OperationId,
     evidence: &[GuardianInstallArtifactFailureEvidence],
+    phase: OperationPhase,
     observed_at: &str,
 ) -> Result<(), OperationJournalStoreError> {
-    let Some((facts, diagnosis_ids)) =
-        install_guardian_evidence_update(failure_memory, operation_id, evidence, observed_at)
-    else {
+    let Some((facts, diagnosis_ids)) = install_guardian_evidence_update(
+        failure_memory,
+        operation_id,
+        evidence,
+        phase,
+        observed_at,
+    ) else {
         return Ok(());
     };
     record_guardian_evidence_with_reconciliation(journals, operation_id, facts, diagnosis_ids).await
@@ -1211,10 +1236,10 @@ fn install_guardian_evidence_update(
     failure_memory: Option<&GuardianFailureMemoryStore>,
     operation_id: &OperationId,
     evidence: &[GuardianInstallArtifactFailureEvidence],
+    phase: OperationPhase,
     observed_at: &str,
 ) -> Option<(Vec<String>, Vec<DiagnosisId>)> {
     let mode = GuardianMode::Managed;
-    let phase = OperationPhase::Downloading;
     let context = failure_memory_suppression_context(
         failure_memory,
         Some(operation_id.clone()),
@@ -1246,44 +1271,74 @@ fn install_guardian_evidence_update(
     Some((facts, vec![outcome.diagnosis_id]))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LoaderGuardianFailureDisposition {
+    Evidence {
+        kind: GuardianInstallArtifactFailureKind,
+        ownership: OwnershipClass,
+        phase: OperationPhase,
+    },
+    DelegatedBaseInstall,
+    DelegatedArtifactDownload,
+    PreOperation,
+}
+
+pub(crate) const fn loader_install_failure_disposition(
+    failure_kind: LoaderInstallFailureKind,
+) -> LoaderGuardianFailureDisposition {
+    use LoaderGuardianFailureDisposition::{
+        DelegatedArtifactDownload, DelegatedBaseInstall, Evidence, PreOperation,
+    };
+
+    match failure_kind {
+        LoaderInstallFailureKind::InvalidMinecraftVersion
+        | LoaderInstallFailureKind::InvalidBuildId
+        | LoaderInstallFailureKind::CatalogUnavailable
+        | LoaderInstallFailureKind::CatalogStale
+        | LoaderInstallFailureKind::BuildNotFound => PreOperation,
+        LoaderInstallFailureKind::BaseInstallFailed => DelegatedBaseInstall,
+        LoaderInstallFailureKind::ArtifactDownloadFailed => DelegatedArtifactDownload,
+        LoaderInstallFailureKind::ProviderHttpFailure
+        | LoaderInstallFailureKind::ProviderRateLimited
+        | LoaderInstallFailureKind::ArtifactMissing => Evidence {
+            kind: GuardianInstallArtifactFailureKind::ProviderFailure,
+            ownership: OwnershipClass::ExternalProviderDerived,
+            phase: OperationPhase::Downloading,
+        },
+        LoaderInstallFailureKind::ProviderNetworkFailure => Evidence {
+            kind: GuardianInstallArtifactFailureKind::NetworkFailure,
+            ownership: OwnershipClass::ExternalProviderDerived,
+            phase: OperationPhase::Downloading,
+        },
+        LoaderInstallFailureKind::ProviderResponseTooLarge
+        | LoaderInstallFailureKind::ProviderSchemaInvalid
+        | LoaderInstallFailureKind::InvalidProfile => Evidence {
+            kind: GuardianInstallArtifactFailureKind::MetadataInvalid,
+            ownership: OwnershipClass::ExternalProviderDerived,
+            phase: OperationPhase::Downloading,
+        },
+        LoaderInstallFailureKind::ParseFailed
+        | LoaderInstallFailureKind::VerifyFailed
+        | LoaderInstallFailureKind::InstallExecutionFailed => Evidence {
+            kind: GuardianInstallArtifactFailureKind::ExecutionFailed,
+            ownership: OwnershipClass::LauncherManaged,
+            phase: OperationPhase::Installing,
+        },
+        LoaderInstallFailureKind::ProcessorFailed => Evidence {
+            kind: GuardianInstallArtifactFailureKind::ProcessorFailed,
+            ownership: OwnershipClass::LauncherManaged,
+            phase: OperationPhase::Installing,
+        },
+    }
+}
+
 fn loader_error_guardian_failure_evidence(
     operation_id: &OperationId,
     target_id: &str,
     error: &LoaderError,
-) -> Option<GuardianInstallArtifactFailureEvidence> {
-    let (kind, ownership) = match error.failure_kind() {
-        LoaderInstallFailureKind::CatalogUnavailable
-        | LoaderInstallFailureKind::CatalogStale
-        | LoaderInstallFailureKind::ProviderHttpFailure
-        | LoaderInstallFailureKind::ProviderRateLimited
-        | LoaderInstallFailureKind::ArtifactMissing => (
-            GuardianInstallArtifactFailureKind::ProviderFailure,
-            OwnershipClass::ExternalProviderDerived,
-        ),
-        LoaderInstallFailureKind::ProviderNetworkFailure
-        | LoaderInstallFailureKind::RequestFailed
-        | LoaderInstallFailureKind::DownloadFailed => (
-            GuardianInstallArtifactFailureKind::NetworkFailure,
-            OwnershipClass::ExternalProviderDerived,
-        ),
-        LoaderInstallFailureKind::ProviderResponseTooLarge
-        | LoaderInstallFailureKind::ProviderSchemaInvalid
-        | LoaderInstallFailureKind::InvalidProfile
-        | LoaderInstallFailureKind::ParseFailed
-        | LoaderInstallFailureKind::VerifyFailed => (
-            GuardianInstallArtifactFailureKind::MetadataInvalid,
-            OwnershipClass::ExternalProviderDerived,
-        ),
-        LoaderInstallFailureKind::IoFailed => (
-            GuardianInstallArtifactFailureKind::PermissionDenied,
-            OwnershipClass::LauncherManaged,
-        ),
-        LoaderInstallFailureKind::BaseInstallFailed
-        | LoaderInstallFailureKind::BuildNotFound
-        | LoaderInstallFailureKind::ProcessorFailed
-        | LoaderInstallFailureKind::Other => return None,
-    };
-
+    kind: GuardianInstallArtifactFailureKind,
+    ownership: OwnershipClass,
+) -> GuardianInstallArtifactFailureEvidence {
     let mut evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
         Some(operation_id.clone()),
         target_id,
@@ -1297,7 +1352,7 @@ fn loader_error_guardian_failure_evidence(
     if let Some(status) = error.provider_status() {
         evidence = evidence.with_field("status", status.to_string());
     }
-    Some(evidence)
+    evidence
 }
 
 fn failure_memory_suppression_context(

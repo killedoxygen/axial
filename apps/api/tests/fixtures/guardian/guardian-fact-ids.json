@@ -34,6 +34,8 @@
   "heap_pressure_critical",
   "incomplete_install",
   "install_dependency_failed",
+  "install_execution_failed",
+  "install_processor_failed",
   "installed_versions_degraded",
   "java_major_mismatch",
   "java_override_empty",

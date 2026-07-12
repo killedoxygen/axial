@@ -5,11 +5,14 @@ use super::launch_failure_memory::{
 use super::repair_authorization::repair_hand_coverage;
 use super::rules::DIAGNOSIS_RULES;
 use super::{
-    GuardianActionKind, GuardianFactId, GuardianInstallArtifactFailureEvidence,
+    DiagnosisId, GuardianActionKind, GuardianFactId, GuardianInstallArtifactFailureEvidence,
     GuardianInstallArtifactFailureKind, GuardianMode, GuardianPrepareFailureRequest,
     GuardianStartupFailureObservation, GuardianStartupFailureRequest, guardian_fact_from_execution,
     guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
-    install_artifact_failure_guardian_fact,
+    install_artifact_failure_guardian_fact, install_artifact_failure_guardian_outcome,
+};
+use crate::application::install::{
+    LoaderGuardianFailureDisposition, loader_install_failure_disposition,
 };
 use crate::application::launch::readiness_guardian_facts_for_coverage;
 use crate::execution::{ExecutionFact, ExecutionFactKind};
@@ -21,6 +24,7 @@ use axial_launcher::{
     LaunchFailureClass, LaunchReadiness, LaunchReadinessReason, LaunchReadinessReasonId,
     LaunchReadinessSeverity,
 };
+use axial_minecraft::LoaderInstallFailureKind;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -109,6 +113,7 @@ struct SenseCoverage {
 struct AdapterCoverage {
     execution: Vec<AdapterCell>,
     install: Vec<AdapterCell>,
+    loader: Vec<LoaderAdapterCell>,
     readiness: Vec<AdapterCell>,
 }
 
@@ -117,6 +122,18 @@ struct AdapterCoverage {
 struct AdapterCell {
     source: String,
     fact: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoaderAdapterCell {
+    source: String,
+    disposition: String,
+    phase: Option<String>,
+    evidence_kind: Option<String>,
+    fact: Option<String>,
+    diagnosis: Option<String>,
+    target_kind: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -184,7 +201,7 @@ fn generate_coverage() -> InvariantCoverage {
             invariant("I4", "current_hand_attempt_bounds_registered"),
             invariant("I5", "launch_failure_surfaces_bounded_and_redacted"),
             invariant("I6", "launch_failure_mapping_round_trip_only"),
-            invariant("I7", "pending_loader_error_classification"),
+            invariant("I7", "pending_loader_delegation_proof"),
             invariant("I8", "pending_phase_4_timing"),
             invariant("I9", "reserved_facts_unused_agent_demo_pending_phase_5"),
         ],
@@ -202,6 +219,7 @@ fn generate_coverage() -> InvariantCoverage {
         adapters: AdapterCoverage {
             execution: execution_adapter_coverage(),
             install: install_adapter_coverage(),
+            loader: loader_adapter_coverage(),
             readiness: readiness_adapter_coverage(),
         },
         memory_feedback: memory_feedback_coverage(),
@@ -243,12 +261,15 @@ fn generate_coverage() -> InvariantCoverage {
             },
             KnownGap {
                 invariant: "I7".to_string(),
-                boundary: "loader_install_failure_adapter".to_string(),
+                boundary: "loader_preoperation_and_delegated_failures".to_string(),
                 missing_variants: vec![
-                    "BaseInstallFailed".to_string(),
+                    "InvalidMinecraftVersion".to_string(),
+                    "InvalidBuildId".to_string(),
+                    "CatalogUnavailable".to_string(),
+                    "CatalogStale".to_string(),
                     "BuildNotFound".to_string(),
-                    "ProcessorFailed".to_string(),
-                    "Other".to_string(),
+                    "BaseInstallFailed".to_string(),
+                    "ArtifactDownloadFailed".to_string(),
                 ],
             },
         ],
@@ -549,6 +570,81 @@ fn install_adapter_coverage() -> Vec<AdapterCell> {
             AdapterCell {
                 source: debug_name(kind),
                 fact: fact_name(&fact.id),
+            }
+        })
+        .collect()
+}
+
+fn loader_adapter_coverage() -> Vec<LoaderAdapterCell> {
+    LoaderInstallFailureKind::ALL
+        .iter()
+        .map(|failure_kind| {
+            let source = debug_name(failure_kind);
+            match loader_install_failure_disposition(*failure_kind) {
+                LoaderGuardianFailureDisposition::PreOperation => LoaderAdapterCell {
+                    source,
+                    disposition: "pre_operation".to_string(),
+                    phase: None,
+                    evidence_kind: None,
+                    fact: None,
+                    diagnosis: None,
+                    target_kind: None,
+                },
+                LoaderGuardianFailureDisposition::DelegatedBaseInstall => LoaderAdapterCell {
+                    source,
+                    disposition: "delegated_base_install".to_string(),
+                    phase: None,
+                    evidence_kind: None,
+                    fact: None,
+                    diagnosis: None,
+                    target_kind: None,
+                },
+                LoaderGuardianFailureDisposition::DelegatedArtifactDownload => LoaderAdapterCell {
+                    source,
+                    disposition: "delegated_artifact_download".to_string(),
+                    phase: None,
+                    evidence_kind: None,
+                    fact: None,
+                    diagnosis: None,
+                    target_kind: None,
+                },
+                LoaderGuardianFailureDisposition::Evidence {
+                    kind,
+                    ownership,
+                    phase,
+                } => {
+                    let evidence = GuardianInstallArtifactFailureEvidence::launcher_managed(
+                        None,
+                        "coverage_loader_version",
+                        kind,
+                    )
+                    .with_ownership(ownership)
+                    .with_field("failure_kind", failure_kind.as_str());
+                    let fact = install_artifact_failure_guardian_fact(&evidence, phase);
+                    let outcome = install_artifact_failure_guardian_outcome(
+                        None,
+                        GuardianMode::Managed,
+                        phase,
+                        &[evidence],
+                    )
+                    .expect("loader evidence reaches a blocking Guardian outcome");
+                    assert_public_outcome(
+                        outcome.user_outcome.summary(),
+                        outcome.user_outcome.details(),
+                        outcome.user_outcome.guidance(),
+                    );
+                    assert!(guardian_fact_is_registered(&fact.id));
+                    assert!(DiagnosisId::ALL.contains(&outcome.diagnosis_id));
+                    LoaderAdapterCell {
+                        source,
+                        disposition: "guardian_evidence".to_string(),
+                        phase: Some(debug_name(&phase)),
+                        evidence_kind: Some(debug_name(&kind)),
+                        fact: Some(fact_name(&fact.id)),
+                        diagnosis: Some(outcome.diagnosis_id.as_str().to_string()),
+                        target_kind: fact.target.as_ref().map(|target| debug_name(&target.kind)),
+                    }
+                }
             }
         })
         .collect()

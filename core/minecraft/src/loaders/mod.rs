@@ -52,35 +52,46 @@ where
 }
 
 pub(crate) fn validate_version_id(version_id: &str, context: &str) -> Result<(), LoaderError> {
+    validate_version_id_shape(version_id, context).map_err(LoaderError::InstallExecutionFailed)
+}
+
+pub(crate) fn validate_provider_version_id(
+    version_id: &str,
+    context: &str,
+) -> Result<(), LoaderError> {
+    validate_version_id_shape(version_id, context).map_err(LoaderError::InvalidProfile)
+}
+
+fn validate_version_id_shape(version_id: &str, context: &str) -> Result<(), String> {
     let trimmed = version_id.trim();
     if trimmed.is_empty() {
-        return Err(LoaderError::Other(format!("{context} is empty")));
+        return Err(format!("{context} is empty"));
     }
     if version_id != trimmed {
-        return Err(LoaderError::Other(format!(
-            "{context} contains surrounding whitespace"
-        )));
+        return Err(format!("{context} contains surrounding whitespace"));
     }
     if trimmed.contains(['/', '\\']) {
-        return Err(LoaderError::Other(format!(
-            "{context} contains path separators"
-        )));
+        return Err(format!("{context} contains path separators"));
     }
     let mut components = Path::new(trimmed).components();
     if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-        return Err(LoaderError::Other(format!("{context} is invalid")));
+        return Err(format!("{context} is invalid"));
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_version_id;
+    use super::{LoaderError, validate_version_id};
 
     #[test]
     fn rejects_empty_version_ids() {
         let error = validate_version_id(" \t ", "loader build version id").expect_err("error");
-        assert_eq!(error.to_string(), "loader build version id is empty");
+        assert!(matches!(
+            error,
+            LoaderError::InstallExecutionFailed(message)
+                if message == "loader build version id is empty"
+        ));
     }
 
     #[test]
@@ -100,9 +111,10 @@ mod tests {
     fn rejects_whitespace_padded_version_ids() {
         let error =
             validate_version_id(" loader-id ", "loader build version id").expect_err("error");
-        assert_eq!(
-            error.to_string(),
-            "loader build version id contains surrounding whitespace"
-        );
+        assert!(matches!(
+            error,
+            LoaderError::InstallExecutionFailed(message)
+                if message == "loader build version id contains surrounding whitespace"
+        ));
     }
 }

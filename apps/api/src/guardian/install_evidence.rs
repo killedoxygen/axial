@@ -49,6 +49,8 @@ install_artifact_failure_kinds! {
     TempWriteFailed,
     PromotionFailed,
     DependencyFailed,
+    ExecutionFailed,
+    ProcessorFailed,
     OwnershipRefused,
     RuntimeRosettaRequired,
     RuntimeUnavailableForPlatform,
@@ -329,6 +331,12 @@ fn execution_kind_for_install_failure(
         GuardianInstallArtifactFailureKind::DependencyFailed => {
             ExecutionFactKind::InstallDependencyFailed
         }
+        GuardianInstallArtifactFailureKind::ExecutionFailed => {
+            ExecutionFactKind::InstallExecutionFailed
+        }
+        GuardianInstallArtifactFailureKind::ProcessorFailed => {
+            ExecutionFactKind::InstallProcessorFailed
+        }
         GuardianInstallArtifactFailureKind::OwnershipRefused => ExecutionFactKind::PrimitiveRefused,
         GuardianInstallArtifactFailureKind::RuntimeRosettaRequired => {
             ExecutionFactKind::RuntimeRosettaRequired
@@ -343,6 +351,8 @@ fn target_kind_for_install_failure(kind: GuardianInstallArtifactFailureKind) -> 
     match kind {
         GuardianInstallArtifactFailureKind::RuntimeRosettaRequired
         | GuardianInstallArtifactFailureKind::RuntimeUnavailableForPlatform => TargetKind::Runtime,
+        GuardianInstallArtifactFailureKind::ExecutionFailed
+        | GuardianInstallArtifactFailureKind::ProcessorFailed => TargetKind::Version,
         _ => TargetKind::Artifact,
     }
 }
@@ -514,6 +524,14 @@ mod tests {
             (
                 GuardianInstallArtifactFailureKind::DependencyFailed,
                 "install_dependency_failed",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::ExecutionFailed,
+                "install_execution_failed",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::ProcessorFailed,
+                "install_processor_failed",
             ),
             (
                 GuardianInstallArtifactFailureKind::OwnershipRefused,
@@ -737,6 +755,16 @@ mod tests {
                 GuardianInstallArtifactFailureKind::DependencyFailed,
                 "install_dependency_failed",
                 "required base install failed",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::ExecutionFailed,
+                "install_execution_failed",
+                "installation could not complete",
+            ),
+            (
+                GuardianInstallArtifactFailureKind::ProcessorFailed,
+                "install_processor_failed",
+                "installer processor failed",
             ),
             (
                 GuardianInstallArtifactFailureKind::OwnershipRefused,

@@ -17,8 +17,10 @@ pub const NEOFORGE_MAVEN_BASE: &str = "https://maven.neoforged.net/releases";
 
 pub async fn fetch_text(url: &str) -> Result<String, LoaderError> {
     let bytes = fetch_bytes(url, 2 << 20).await?;
-    String::from_utf8(bytes)
-        .map_err(|error| LoaderError::Other(format!("invalid text body for {url}: {error}")))
+    String::from_utf8(bytes).map_err(|_| LoaderError::ProviderDataInvalid {
+        kind: crate::loaders::types::LoaderProviderFailureKind::SchemaInvalid,
+        status: None,
+    })
 }
 
 pub fn parse_maven_versions(xml: &str) -> Vec<String> {

@@ -12,12 +12,12 @@ use crate::loaders::compose::{
     finalize_version_install, write_composed_version,
 };
 use crate::loaders::forge_installer::{
-    ExtractedForgeInstaller, ForgeInstallerError, extract_installer, extract_maven_entries,
+    ExtractedForgeInstaller, extract_installer, extract_maven_entries,
 };
 use crate::loaders::http::fetch_bytes;
 use crate::loaders::processors::run_processors;
 use crate::loaders::types::{LoaderBuildRecord, LoaderError, LoaderInstallPlan};
-use crate::loaders::validate_version_id;
+use crate::loaders::{validate_provider_version_id, validate_version_id};
 use crate::paths::{loader_artifacts_dir, versions_dir};
 use crate::profiles::ensure_launcher_profiles;
 use serde::Serialize;
@@ -54,21 +54,6 @@ struct InstalledLoaderMetadata<'a> {
     build_meta: &'a crate::loaders::types::LoaderBuildMetadata,
 }
 
-#[derive(Debug)]
-enum InstallerTaskError {
-    Extract(ForgeInstallerError),
-    Task(tokio::task::JoinError),
-}
-
-impl std::fmt::Display for InstallerTaskError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Extract(error) => write!(formatter, "{error}"),
-            Self::Task(error) => write!(formatter, "blocking task failed: {error}"),
-        }
-    }
-}
-
 // Profile-source loaders ship a ready version JSON and then download its libraries.
 pub async fn install_from_profile_source<F>(
     library_dir: &Path,
@@ -96,7 +81,7 @@ where
     let mut fragment = cached_profile.fragment;
     mark_loader_libraries_checksumless_allowed(&mut fragment.libraries);
     if !fragment.id.trim().is_empty() {
-        validate_version_id(&fragment.id, "upstream loader profile version id")?;
+        validate_provider_version_id(&fragment.id, "upstream loader profile version id")?;
     }
     let installed_version_id = plan.record.version_id.clone();
     validate_version_id(&installed_version_id, "installed loader version id")?;
@@ -112,11 +97,7 @@ where
         "loader_libraries",
         &mut *send,
     ))
-    .await
-    .map_err(|error| match error {
-        LoaderError::ArtifactDownloadFailed { .. } => error,
-        error => LoaderError::Other(format!("downloading loader libraries: {error}")),
-    });
+    .await;
     cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
     cleanup_on_error(
         Box::pin(ensure_base_version(
@@ -216,7 +197,7 @@ where
         )),
     ));
     if !extracted.version_id.trim().is_empty() {
-        validate_version_id(&extracted.version_id, "upstream installer version id")?;
+        validate_provider_version_id(&extracted.version_id, "upstream installer version id")?;
     }
     let installed_version_id = plan.record.version_id.clone();
     validate_version_id(&installed_version_id, "installed loader version id")?;
@@ -238,14 +219,12 @@ where
         &installed_version_id,
     )?;
     let installer_data = cleanup_on_error(
-        extract_maven_entries_blocking(installer_data, library_dir.to_path_buf())
-            .await
-            .map_err(|error| {
-                LoaderError::Other(format!(
-                    "extracting {} installer libraries: {error}",
-                    plan.record.component_name
-                ))
-            }),
+        extract_maven_entries_blocking(
+            installer_data,
+            library_dir.to_path_buf(),
+            plan.record.component_name.clone(),
+        )
+        .await,
         library_dir,
         &installed_version_id,
     )?;
@@ -255,14 +234,7 @@ where
         "loader_libraries",
         &mut *send,
     ))
-    .await
-    .map_err(|error| match error {
-        LoaderError::ArtifactDownloadFailed { .. } => error,
-        error => LoaderError::Other(format!(
-            "downloading {} libraries: {error}",
-            plan.record.component_name
-        )),
-    });
+    .await;
     cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
 
     if let Some(install_profile_json) = extracted.install_profile_json.as_deref() {
@@ -293,12 +265,7 @@ where
             },
         ))
         .await
-        .map_err(|error| {
-            LoaderError::Other(format!(
-                "running {} processors: {error}",
-                plan.record.component_name
-            ))
-        });
+        .map_err(|error| LoaderError::ProcessorFailed(error.to_string()));
         cleanup_on_error(processor_result, library_dir, &installed_version_id)?;
     }
 
@@ -678,19 +645,12 @@ async fn read_valid_installer(
     if path_is_file(path).await
         && let Some(bytes) = read_cached_artifact(path).await?
     {
-        match extract_installer_blocking(bytes).await {
-            Ok(extracted) => return Ok(extracted),
-            Err(InstallerTaskError::Extract(error)) => {
-                return Err(installer_extract_error(component_name, error));
-            }
-            Err(error) => return Err(installer_task_extract_error(component_name, error)),
-        }
+        return extract_installer_blocking(bytes, component_name.to_string()).await;
     }
 
     let bytes = download_to_memory(url).await?;
-    let (installer_data, extracted) = extract_installer_blocking(bytes)
-        .await
-        .map_err(|error| installer_task_extract_error(component_name, error))?;
+    let (installer_data, extracted) =
+        extract_installer_blocking(bytes, component_name.to_string()).await?;
     Box::pin(write_cached_artifact(path, &installer_data)).await?;
     Ok((installer_data, extracted))
 }
@@ -773,26 +733,29 @@ fn validate_legacy_archive(bytes: &[u8]) -> Result<(), ZipError> {
 
 async fn extract_installer_blocking(
     installer_data: Vec<u8>,
-) -> Result<(Vec<u8>, ExtractedForgeInstaller), InstallerTaskError> {
+    component_name: String,
+) -> Result<(Vec<u8>, ExtractedForgeInstaller), LoaderError> {
     tokio::task::spawn_blocking(move || {
-        let extracted = extract_installer(&installer_data).map_err(InstallerTaskError::Extract)?;
+        let extracted = extract_installer(&installer_data)
+            .map_err(|error| installer_extract_error(&component_name, error))?;
         Ok((installer_data, extracted))
     })
     .await
-    .map_err(InstallerTaskError::Task)?
+    .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
 }
 
 async fn extract_maven_entries_blocking(
     installer_data: Vec<u8>,
     library_dir: PathBuf,
-) -> Result<Vec<u8>, InstallerTaskError> {
+    component_name: String,
+) -> Result<Vec<u8>, LoaderError> {
     tokio::task::spawn_blocking(move || {
         extract_maven_entries(&installer_data, &library_dir)
-            .map_err(InstallerTaskError::Extract)?;
+            .map_err(|error| installer_extract_error(&component_name, error))?;
         Ok(installer_data)
     })
     .await
-    .map_err(InstallerTaskError::Task)?
+    .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
 }
 
 async fn overlay_legacy_archive_onto_base_client(
@@ -815,7 +778,7 @@ async fn overlay_legacy_archive_onto_base_client(
         overlay_legacy_archive_blocking(&base_jar, &blocking_temp_jar, &archive_data)
     })
     .await
-    .map_err(|error| LoaderError::Other(format!("overlaying legacy Forge archive: {error}")))??;
+    .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))??;
     async_fs::rename(&temp_jar, &output_jar).await?;
     Ok(())
 }
@@ -864,7 +827,7 @@ async fn strip_child_client_jar_meta(
         strip_zip_metadata_blocking(&source_jar, &blocking_temp_jar)
     })
     .await
-    .map_err(|error| LoaderError::Other(format!("stripping legacy client metadata: {error}")))??;
+    .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))??;
 
     match async_fs::remove_file(&jar_path).await {
         Ok(()) => {}
@@ -1008,7 +971,7 @@ fn loader_execution_download_error(error: ExecutionDownloadError) -> LoaderError
 fn loader_download_error(error: DownloadError) -> LoaderError {
     match error {
         DownloadError::FileOperation(error) => LoaderError::Io(error),
-        error => LoaderError::Download(error),
+        error => LoaderError::InstallExecutionFailed(error.to_string()),
     }
 }
 
@@ -1026,15 +989,6 @@ fn artifact_tmp_path(path: &Path) -> PathBuf {
 
 fn installer_extract_error(component_name: &str, error: impl std::fmt::Display) -> LoaderError {
     LoaderError::InvalidProfile(format!("extracting {component_name} installer: {error}"))
-}
-
-fn installer_task_extract_error(component_name: &str, error: InstallerTaskError) -> LoaderError {
-    match error {
-        InstallerTaskError::Extract(error) => installer_extract_error(component_name, error),
-        InstallerTaskError::Task(error) => LoaderError::Other(format!(
-            "extracting {component_name} installer: blocking task failed: {error}"
-        )),
-    }
 }
 
 fn legacy_archive_error(component_name: &str, error: impl std::fmt::Display) -> LoaderError {
@@ -1854,17 +1808,22 @@ mod tests {
     #[test]
     fn rejects_whitespace_only_installed_version_id() {
         let error = validate_version_id(" \n ", "installed loader version id").expect_err("error");
-        assert_eq!(error.to_string(), "installed loader version id is empty");
+        assert!(matches!(
+            error,
+            LoaderError::InstallExecutionFailed(message)
+                if message == "installed loader version id is empty"
+        ));
     }
 
     #[test]
     fn rejects_whitespace_padded_installed_version_id() {
         let error =
             validate_version_id(" loader-id ", "installed loader version id").expect_err("error");
-        assert_eq!(
-            error.to_string(),
-            "installed loader version id contains surrounding whitespace"
-        );
+        assert!(matches!(
+            error,
+            LoaderError::InstallExecutionFailed(message)
+                if message == "installed loader version id contains surrounding whitespace"
+        ));
     }
 
     #[tokio::test]

@@ -364,6 +364,8 @@ const fn priority_profile(id: DiagnosisId) -> PriorityProfile {
         | DiagnosisId::LauncherManagedArtifactSignatureCorrupt
         | DiagnosisId::InstallArtifactMetadataInvalid
         | DiagnosisId::InstallDependencyFailed
+        | DiagnosisId::InstallExecutionFailed
+        | DiagnosisId::InstallProcessorFailed
         | DiagnosisId::DownloadUnavailable
         | DiagnosisId::FilesystemPermissionDenied
         | DiagnosisId::TempFileLeftover
@@ -967,6 +969,24 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
         [Block],
         "install_dependency_failed"
+    ),
+    rule!(
+        InstallExecutionFailed,
+        [InstallExecutionFailed],
+        RuleDomain::Fixed(GuardianDomain::Install),
+        RuleSeverity::Fixed(GuardianSeverity::Blocking),
+        RuleConfidence::Fixed(GuardianConfidence::Confirmed),
+        [Block],
+        "install_execution_failed"
+    ),
+    rule!(
+        InstallProcessorFailed,
+        [InstallProcessorFailed],
+        RuleDomain::Fixed(GuardianDomain::Install),
+        RuleSeverity::Fixed(GuardianSeverity::Blocking),
+        RuleConfidence::Fixed(GuardianConfidence::Confirmed),
+        [Block],
+        "install_processor_failed"
     ),
     rule!(
         DownloadUnavailable,

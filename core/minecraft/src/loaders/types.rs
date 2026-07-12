@@ -278,53 +278,46 @@ pub struct LoaderInstallPlan {
     pub stage_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LoaderInstallFailureKind {
-    CatalogUnavailable,
-    CatalogStale,
-    BuildNotFound,
-    ArtifactMissing,
-    InvalidProfile,
-    ProviderHttpFailure,
-    ProviderNetworkFailure,
-    ProviderRateLimited,
-    ProviderResponseTooLarge,
-    ProviderSchemaInvalid,
-    ProcessorFailed,
-    VerifyFailed,
-    BaseInstallFailed,
-    RequestFailed,
-    DownloadFailed,
-    IoFailed,
-    ParseFailed,
-    Other,
+macro_rules! loader_install_failure_kinds {
+    ($($variant:ident => $name:literal),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum LoaderInstallFailureKind {
+            $($variant),+
+        }
+
+        impl LoaderInstallFailureKind {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name),+
+                }
+            }
+        }
+    };
 }
 
-impl LoaderInstallFailureKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::CatalogUnavailable => "catalog_unavailable",
-            Self::CatalogStale => "catalog_stale",
-            Self::BuildNotFound => "build_not_found",
-            Self::ArtifactMissing => "artifact_missing",
-            Self::InvalidProfile => "invalid_profile",
-            Self::ProviderHttpFailure => "provider_http_failure",
-            Self::ProviderNetworkFailure => "provider_network_failure",
-            Self::ProviderRateLimited => "provider_rate_limited",
-            Self::ProviderResponseTooLarge => "provider_response_too_large",
-            Self::ProviderSchemaInvalid => "provider_schema_invalid",
-            Self::ProcessorFailed => "processor_failed",
-            Self::VerifyFailed => "verify_failed",
-            Self::BaseInstallFailed => "base_install_failed",
-            Self::RequestFailed => "request_failed",
-            Self::DownloadFailed => "download_failed",
-            Self::IoFailed => "io_failed",
-            Self::ParseFailed => "parse_failed",
-            Self::Other => "other",
-        }
-    }
-}
+loader_install_failure_kinds!(
+    InvalidMinecraftVersion => "invalid_minecraft_version",
+    InvalidBuildId => "invalid_build_id",
+    CatalogUnavailable => "catalog_unavailable",
+    CatalogStale => "catalog_stale",
+    BuildNotFound => "build_not_found",
+    ArtifactMissing => "artifact_missing",
+    InvalidProfile => "invalid_profile",
+    ProviderHttpFailure => "provider_http_failure",
+    ProviderNetworkFailure => "provider_network_failure",
+    ProviderRateLimited => "provider_rate_limited",
+    ProviderResponseTooLarge => "provider_response_too_large",
+    ProviderSchemaInvalid => "provider_schema_invalid",
+    ProcessorFailed => "processor_failed",
+    InstallExecutionFailed => "install_execution_failed",
+    VerifyFailed => "verify_failed",
+    BaseInstallFailed => "base_install_failed",
+    ArtifactDownloadFailed => "artifact_download_failed",
+    ParseFailed => "parse_failed",
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoaderProviderFailureKind {
@@ -359,10 +352,6 @@ pub enum LoaderError {
     InvalidMinecraftVersion,
     #[error("invalid loader build id")]
     InvalidBuildId,
-    #[error("invalid loader component id")]
-    InvalidComponentId,
-    #[error("Axial library is not configured")]
-    MissingLibraryDir,
     #[error("loader catalog is unavailable: {message}")]
     CatalogUnavailable {
         message: String,
@@ -389,6 +378,10 @@ pub enum LoaderError {
     },
     #[error("loader install verification failed: {0}")]
     Verify(String),
+    #[error("loader processor failed: {0}")]
+    ProcessorFailed(String),
+    #[error("loader install execution failed: {0}")]
+    InstallExecutionFailed(String),
     #[error("base Minecraft install failed: {error}")]
     BaseInstallFailed {
         error: Box<DownloadError>,
@@ -400,16 +393,10 @@ pub enum LoaderError {
         facts: Vec<ExecutionDownloadFact>,
         descriptors: Vec<SelectedDownloadArtifactDescriptor>,
     },
-    #[error("request failed: {0}")]
-    Request(#[from] reqwest::Error),
-    #[error("download failed: {0}")]
-    Download(#[from] DownloadError),
     #[error("parse failed: {0}")]
     Parse(#[from] serde_json::Error),
     #[error("io failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("{0}")]
-    Other(String),
 }
 
 impl LoaderError {
@@ -463,17 +450,14 @@ impl LoaderError {
                 }
             },
             Self::Verify(_) => LoaderInstallFailureKind::VerifyFailed,
+            Self::ProcessorFailed(_) => LoaderInstallFailureKind::ProcessorFailed,
+            Self::InstallExecutionFailed(_) => LoaderInstallFailureKind::InstallExecutionFailed,
             Self::BaseInstallFailed { .. } => LoaderInstallFailureKind::BaseInstallFailed,
-            Self::ArtifactDownloadFailed { .. } => LoaderInstallFailureKind::DownloadFailed,
-            Self::Request(_) => LoaderInstallFailureKind::RequestFailed,
-            Self::Download(_) => LoaderInstallFailureKind::DownloadFailed,
+            Self::ArtifactDownloadFailed { .. } => LoaderInstallFailureKind::ArtifactDownloadFailed,
             Self::Parse(_) => LoaderInstallFailureKind::ParseFailed,
-            Self::Io(_) => LoaderInstallFailureKind::IoFailed,
-            Self::InvalidMinecraftVersion
-            | Self::InvalidBuildId
-            | Self::InvalidComponentId
-            | Self::MissingLibraryDir
-            | Self::Other(_) => LoaderInstallFailureKind::Other,
+            Self::Io(_) => LoaderInstallFailureKind::InstallExecutionFailed,
+            Self::InvalidMinecraftVersion => LoaderInstallFailureKind::InvalidMinecraftVersion,
+            Self::InvalidBuildId => LoaderInstallFailureKind::InvalidBuildId,
         }
     }
 
@@ -525,7 +509,31 @@ fn provider_install_failure_kind(kind: LoaderProviderFailureKind) -> LoaderInsta
 
 #[cfg(test)]
 mod tests {
-    use super::LoaderGameVersion;
+    use super::{LoaderError, LoaderGameVersion, LoaderInstallFailureKind};
+    use std::collections::HashSet;
+    use std::io;
+
+    #[test]
+    fn loader_failure_inventory_is_unique_and_covers_runtime_categories() {
+        let names = LoaderInstallFailureKind::ALL
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(names.len(), LoaderInstallFailureKind::ALL.len());
+        assert_eq!(
+            LoaderError::ProcessorFailed("processor exit".to_string()).failure_kind(),
+            LoaderInstallFailureKind::ProcessorFailed
+        );
+        assert_eq!(
+            LoaderError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+                .failure_kind(),
+            LoaderInstallFailureKind::InstallExecutionFailed
+        );
+        assert_eq!(
+            LoaderError::Io(io::Error::other("disk failure")).failure_kind(),
+            LoaderInstallFailureKind::InstallExecutionFailed
+        );
+    }
 
     #[test]
     fn loader_game_version_defaults_lifecycle_when_missing() {

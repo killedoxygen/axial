@@ -21,7 +21,8 @@ use axial_minecraft::download::{
     download_file_with_client_report,
 };
 use axial_minecraft::{
-    DownloadError, DownloadProgress, LoaderComponentId, LoaderError, LoaderProviderFailureKind,
+    DownloadError, DownloadProgress, LoaderComponentId, LoaderError, LoaderInstallFailureKind,
+    LoaderProviderFailureKind,
 };
 use axial_performance::PerformanceManager;
 use axum::{body::to_bytes, response::IntoResponse};
@@ -2139,7 +2140,7 @@ fn loader_error_response_keeps_status_and_failure_kind_without_raw_details() {
     )));
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body["failure_kind"], json!("io_failed"));
+    assert_eq!(body["failure_kind"], json!("install_execution_failed"));
     assert_eq!(
         body["error"],
         json!("Could not write loader files. Check app data permissions and try again.")
@@ -2154,7 +2155,7 @@ fn loader_error_response_keeps_status_and_failure_kind_without_raw_details() {
     assert_eq!(body["failure_kind"], json!("parse_failed"));
     assert_eq!(
         body["error"],
-        json!("Loader service returned unreadable data. Try again later.")
+        json!("Loader install data could not be read. Try again.")
     );
     assert_no_public_raw_fragments(body["error"].as_str().expect("error is a string"));
 
@@ -2199,14 +2200,40 @@ fn loader_error_response_preserves_safe_explicit_messages() {
     let (status, Json(body)) = loader_error_response(LoaderError::InvalidMinecraftVersion);
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["failure_kind"], json!("other"));
+    assert_eq!(body["failure_kind"], json!("invalid_minecraft_version"));
     assert_eq!(body["error"], json!("Invalid Minecraft version."));
+}
 
-    let (status, Json(body)) = loader_error_response(LoaderError::MissingLibraryDir);
-
-    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
-    assert_eq!(body["failure_kind"], json!("other"));
-    assert_eq!(body["error"], json!("Axial library is not configured"));
+#[test]
+fn loader_failure_disposition_preserves_operation_boundaries() {
+    assert!(matches!(
+        loader_install_failure_disposition(LoaderInstallFailureKind::CatalogUnavailable),
+        LoaderGuardianFailureDisposition::PreOperation
+    ));
+    assert!(matches!(
+        loader_install_failure_disposition(LoaderInstallFailureKind::BaseInstallFailed),
+        LoaderGuardianFailureDisposition::DelegatedBaseInstall
+    ));
+    assert!(matches!(
+        loader_install_failure_disposition(LoaderInstallFailureKind::ArtifactDownloadFailed),
+        LoaderGuardianFailureDisposition::DelegatedArtifactDownload
+    ));
+    assert!(matches!(
+        loader_install_failure_disposition(LoaderInstallFailureKind::ProcessorFailed),
+        LoaderGuardianFailureDisposition::Evidence {
+            kind: crate::guardian::GuardianInstallArtifactFailureKind::ProcessorFailed,
+            ownership: OwnershipClass::LauncherManaged,
+            phase: OperationPhase::Installing,
+        }
+    ));
+    assert!(matches!(
+        loader_install_failure_disposition(LoaderInstallFailureKind::InstallExecutionFailed),
+        LoaderGuardianFailureDisposition::Evidence {
+            kind: crate::guardian::GuardianInstallArtifactFailureKind::ExecutionFailed,
+            phase: OperationPhase::Installing,
+            ..
+        }
+    ));
 }
 
 #[test]

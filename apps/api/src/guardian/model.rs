@@ -57,6 +57,8 @@ pub enum GuardianFactId {
     HeapPressureCritical,
     IncompleteInstall,
     InstallDependencyFailed,
+    InstallExecutionFailed,
+    InstallProcessorFailed,
     InstalledVersionsDegraded,
     JavaMajorMismatch,
     JavaOverrideEmpty,
@@ -133,7 +135,7 @@ pub enum GuardianFactId {
 }
 
 impl GuardianFactId {
-    pub const ALL: [Self; 119] = [
+    pub const ALL: [Self; 121] = [
         Self::AgentHookFailed,
         Self::AgentUnavailable,
         Self::ArtifactChecksumMismatch,
@@ -169,6 +171,8 @@ impl GuardianFactId {
         Self::HeapPressureCritical,
         Self::IncompleteInstall,
         Self::InstallDependencyFailed,
+        Self::InstallExecutionFailed,
+        Self::InstallProcessorFailed,
         Self::InstalledVersionsDegraded,
         Self::JavaMajorMismatch,
         Self::JavaOverrideEmpty,
@@ -292,6 +296,8 @@ impl GuardianFactId {
             Self::HeapPressureCritical => "heap_pressure_critical",
             Self::IncompleteInstall => "incomplete_install",
             Self::InstallDependencyFailed => "install_dependency_failed",
+            Self::InstallExecutionFailed => "install_execution_failed",
+            Self::InstallProcessorFailed => "install_processor_failed",
             Self::InstalledVersionsDegraded => "installed_versions_degraded",
             Self::JavaMajorMismatch => "java_major_mismatch",
             Self::JavaOverrideEmpty => "java_override_empty",
@@ -444,6 +450,8 @@ pub enum DiagnosisId {
     FilesystemPermissionDenied,
     InstallArtifactMetadataInvalid,
     InstallDependencyFailed,
+    InstallExecutionFailed,
+    InstallProcessorFailed,
     JavaOverrideUnavailable,
     JavaProbeFailed,
     JavaRuntimeMajorMismatch,
@@ -508,13 +516,15 @@ pub enum DiagnosisId {
 }
 
 impl DiagnosisId {
-    pub const ALL: [Self; 78] = [
+    pub const ALL: [Self; 80] = [
         Self::ArtifactOwnershipUnsafe,
         Self::AtomicPromotionFailed,
         Self::DownloadUnavailable,
         Self::FilesystemPermissionDenied,
         Self::InstallArtifactMetadataInvalid,
         Self::InstallDependencyFailed,
+        Self::InstallExecutionFailed,
+        Self::InstallProcessorFailed,
         Self::JavaOverrideUnavailable,
         Self::JavaProbeFailed,
         Self::JavaRuntimeMajorMismatch,
@@ -597,6 +607,8 @@ impl DiagnosisId {
             Self::FilesystemPermissionDenied => "filesystem_permission_denied",
             Self::InstallArtifactMetadataInvalid => "install_artifact_metadata_invalid",
             Self::InstallDependencyFailed => "install_dependency_failed",
+            Self::InstallExecutionFailed => "install_execution_failed",
+            Self::InstallProcessorFailed => "install_processor_failed",
             Self::JavaOverrideUnavailable => "java_override_unavailable",
             Self::JavaProbeFailed => "java_probe_failed",
             Self::JavaRuntimeMajorMismatch => "java_runtime_major_mismatch",
