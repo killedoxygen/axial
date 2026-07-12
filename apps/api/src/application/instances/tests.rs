@@ -3378,3 +3378,4 @@ fn test_launch_record(session_id: &str, instance_id: &str) -> LaunchSessionRecor
         stages: Vec::new(),
     }
 }
+    fs::create_dir_all(&known_good_dir).expect("create known-good cache directory");

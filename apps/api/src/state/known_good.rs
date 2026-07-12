@@ -12,7 +12,9 @@ use axial_minecraft::known_good::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File};
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -159,7 +161,6 @@ impl KnownGoodInventoryStore {
         root: PathBuf,
         coordinator: PersistenceCoordinator,
     ) -> io::Result<Self> {
-        fs::create_dir_all(&root)?;
         let owner = coordinator.claim_owner(&root).map_err(io::Error::from)?;
         Ok(Self {
             root,
@@ -1241,7 +1242,7 @@ mod tests {
     }
 
     fn store(paths: &AppPaths, backend: Arc<FileBackend>) -> KnownGoodInventoryStore {
-        KnownGoodInventoryStore::claim_with_coordinator(
+        let store = KnownGoodInventoryStore::claim_with_coordinator(
             paths,
             PersistenceCoordinator::for_test(
                 backend,
@@ -1249,7 +1250,9 @@ mod tests {
                 Duration::from_millis(2),
             ),
         )
-        .expect("known-good store")
+        .expect("known-good store");
+        fs::create_dir_all(&store.root).expect("known-good test directory");
+        store
     }
 
     fn paths(name: &str) -> (PathBuf, AppPaths) {
