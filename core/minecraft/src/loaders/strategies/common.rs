@@ -12,7 +12,8 @@ use crate::loaders::compose::{
     prepare_managed_version_dir, write_composed_version, write_exact_managed_version_artifact,
 };
 use crate::loaders::forge_installer::{
-    ExtractedForgeInstaller, extract_installer, extract_maven_entries,
+    AuthenticatedEmbeddedMavenArtifact, AuthenticatedForgeInstallerPlan,
+    plan_authenticated_installer,
 };
 #[cfg(not(test))]
 use crate::loaders::http::fetch_bytes;
@@ -26,7 +27,7 @@ use crate::loaders::workspace::cleanup::{prepare_fresh_work_dir, remove_work_dir
 use crate::loaders::{
     installed_loader_metadata_bytes, validate_provider_version_id, validate_version_id,
 };
-use crate::paths::versions_dir;
+use crate::paths::{libraries_dir, versions_dir};
 use crate::profiles::ensure_launcher_profiles;
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
@@ -231,7 +232,7 @@ async fn install_installer_source_after_authenticated_base<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let (installer_source, extracted) =
+    let installer_plan =
         extract_installer_blocking(installer_source, plan.record.component_name.clone()).await?;
 
     send(progress(
@@ -243,8 +244,10 @@ where
             plan.record.component_name
         )),
     ));
-    if !extracted.version_id.trim().is_empty() {
-        validate_provider_version_id(&extracted.version_id, "upstream installer version id")?;
+    let installer_version =
+        serde_json::from_slice::<LoaderProfileFragment>(installer_plan.version_json())?;
+    if !installer_version.id.trim().is_empty() {
+        validate_provider_version_id(&installer_version.id, "upstream installer version id")?;
     }
     let installed_version_id = plan.record.version_id.clone();
     validate_version_id(&installed_version_id, "installed loader version id")?;
@@ -252,7 +255,7 @@ where
         library_dir,
         &plan.record.minecraft_version,
         &installed_version_id,
-        &extracted.version_fragment,
+        &installer_version,
     )?;
     let version_bytes = serde_json::to_vec_pretty(&version)?;
     cleanup_on_error(
@@ -268,11 +271,10 @@ where
         library_dir,
         &installed_version_id,
     )?;
-    let installer_source = cleanup_on_error(
-        extract_maven_entries_blocking(
-            installer_source,
-            library_dir.to_path_buf(),
-            plan.record.component_name.clone(),
+    cleanup_on_error(
+        materialize_embedded_maven_artifacts(
+            library_dir,
+            installer_plan.embedded_maven_artifacts(),
         )
         .await,
         library_dir,
@@ -280,14 +282,14 @@ where
     )?;
     let library_download_result = Box::pin(download_profile_loader_libraries_with_evidence(
         library_dir,
-        &extracted.libraries,
+        installer_plan.libraries(),
         "loader_libraries",
         &mut *send,
     ))
     .await;
     cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
 
-    if let Some(install_profile_json) = extracted.install_profile_json.as_deref() {
+    if let Some(install_profile_json) = installer_plan.install_profile_json() {
         let stage_dir = prepare_fresh_work_dir(library_dir, &installed_version_id)?;
         if stage_dir != plan.stage_dir {
             remove_work_dir(&stage_dir);
@@ -296,7 +298,7 @@ where
             ));
         }
         let installer_path = plan.stage_dir.join("source-installer.jar");
-        async_fs::write(&installer_path, installer_source.bytes()).await?;
+        async_fs::write(&installer_path, installer_plan.source_bytes()).await?;
         send(progress(
             "processors",
             0,
@@ -307,7 +309,7 @@ where
             library_dir,
             &plan.record.minecraft_version,
             install_profile_json,
-            installer_source.bytes(),
+            installer_plan.source_bytes(),
             &plan.stage_dir,
             &installer_path,
             |current, total, detail| {
@@ -328,7 +330,7 @@ where
         cleanup_on_error(processor_result, library_dir, &installed_version_id)?;
     }
 
-    if extracted.strip_client_meta {
+    if installer_plan.strip_client_meta() {
         send(progress(
             "client_jar",
             0,
@@ -765,28 +767,28 @@ fn enrich_library_integrity(
 async fn extract_installer_blocking(
     installer_source: VerifiedLoaderSource,
     component_name: String,
-) -> Result<(VerifiedLoaderSource, ExtractedForgeInstaller), LoaderError> {
+) -> Result<AuthenticatedForgeInstallerPlan, LoaderError> {
     tokio::task::spawn_blocking(move || {
-        let extracted = extract_installer(installer_source.bytes())
-            .map_err(|error| installer_extract_error(&component_name, error))?;
-        Ok((installer_source, extracted))
+        plan_authenticated_installer(installer_source)
+            .map_err(|error| installer_extract_error(&component_name, error))
     })
     .await
     .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
 }
 
-async fn extract_maven_entries_blocking(
-    installer_source: VerifiedLoaderSource,
-    library_dir: PathBuf,
-    component_name: String,
-) -> Result<VerifiedLoaderSource, LoaderError> {
-    tokio::task::spawn_blocking(move || {
-        extract_maven_entries(installer_source.bytes(), &library_dir)
-            .map_err(|error| installer_extract_error(&component_name, error))?;
-        Ok(installer_source)
-    })
-    .await
-    .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
+async fn materialize_embedded_maven_artifacts(
+    library_dir: &Path,
+    artifacts: &[AuthenticatedEmbeddedMavenArtifact],
+) -> Result<(), LoaderError> {
+    let root = libraries_dir(library_dir);
+    for artifact in artifacts {
+        let destination = artifact.relative_path().join_under(&root);
+        if let Some(parent) = destination.parent() {
+            async_fs::create_dir_all(parent).await?;
+        }
+        async_fs::write(destination, artifact.bytes()).await?;
+    }
+    Ok(())
 }
 
 async fn overlay_legacy_archive_bytes_blocking(

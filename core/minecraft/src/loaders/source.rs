@@ -7,6 +7,7 @@ use sha1::Digest as _;
 
 const MAX_SOURCE_SHA1_PROOF_BYTES: u64 = 128;
 
+#[derive(Debug)]
 pub(crate) struct VerifiedLoaderSource {
     bytes: Vec<u8>,
 }
@@ -18,6 +19,11 @@ impl VerifiedLoaderSource {
 
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         self.bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_bytes(bytes: Vec<u8>) -> Self {
+        Self { bytes }
     }
 }
 
