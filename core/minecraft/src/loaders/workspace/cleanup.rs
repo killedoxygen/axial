@@ -26,14 +26,14 @@ impl LoaderWorkspace {
 
     pub(crate) fn create_temp(&self, name: &str) -> Result<LoaderWorkspaceTemp, LoaderError> {
         if let Some(stale) = self.directory.open_child_if_exists(name)? {
-            stale.clear_and_remove()?;
+            stale.clear_owned_contents()?;
         }
         let directory = self.directory.open_or_create_child(name)?;
         Ok(LoaderWorkspaceTemp { directory })
     }
 
     pub(crate) fn cleanup(self) -> Result<(), LoaderError> {
-        self.directory.clear_and_remove()
+        self.directory.clear_owned_contents()
     }
 }
 
@@ -47,7 +47,7 @@ impl LoaderWorkspaceTemp {
     }
 
     pub(crate) fn cleanup(self) -> Result<(), LoaderError> {
-        self.directory.clear_and_remove()
+        self.directory.clear_owned_contents()
     }
 }
 
@@ -62,7 +62,7 @@ pub(crate) fn prepare_fresh_work_dir(
         .open_or_create_child("loaders")?
         .open_or_create_child("work")?;
     if let Some(stale) = work.open_child_if_exists(version_id)? {
-        stale.clear_and_remove()?;
+        stale.clear_owned_contents()?;
     }
     let directory = work.open_or_create_child(version_id)?;
     directory.revalidate()?;
@@ -95,6 +95,24 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn fresh_workspace_reuses_cleared_admitted_shell() {
+        let root = temp_dir("workspace-retained-shell");
+        fs::create_dir_all(&root).expect("root");
+        let workspace = prepare_fresh_work_dir(&root, "version").expect("fresh workspace");
+        fs::write(workspace.path().join("stale"), b"stale").expect("stale artifact");
+
+        workspace.cleanup().expect("clear workspace");
+
+        let stage = root.join("cache/loaders/work/version");
+        assert!(stage.is_dir());
+        assert_eq!(fs::read_dir(&stage).expect("cleared stage").count(), 0);
+        let reused = prepare_fresh_work_dir(&root, "version").expect("reused workspace");
+        assert_eq!(reused.path(), stage);
+        drop(reused);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {

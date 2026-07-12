@@ -229,7 +229,7 @@ pub fn cleanup_incomplete_version(mc_dir: &Path, version_id: &str) {
         .read_exact(".incomplete")
         .is_ok_and(|marker| marker == b"installing")
     {
-        let _ = version_dir.clear_and_remove();
+        let _ = version_dir.clear_owned_contents();
     }
 }
 
@@ -480,6 +480,27 @@ mod tests {
         assert!(version_dir.is_dir());
         assert!(version_dir.join("loader-complete.json").is_file());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_incomplete_version_retains_only_cleared_admitted_shell() {
+        let root = temp_dir("cleanup-incomplete-retained-shell");
+        create_minecraft_dir(&root).expect("library");
+        let version_dir = root.join("versions").join("loader-incomplete");
+        fs::create_dir_all(&version_dir).expect("version dir");
+        fs::write(version_dir.join(".incomplete"), b"installing").expect("marker");
+        fs::write(version_dir.join("loader-incomplete.json"), b"partial").expect("partial file");
+
+        cleanup_incomplete_version(&root, "loader-incomplete");
+
+        assert!(version_dir.is_dir());
+        assert_eq!(
+            fs::read_dir(&version_dir)
+                .expect("cleared version shell")
+                .count(),
+            0
+        );
         let _ = fs::remove_dir_all(root);
     }
 

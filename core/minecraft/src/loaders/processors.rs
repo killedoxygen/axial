@@ -9,8 +9,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::process::Command;
 use zip::ZipArchive;
@@ -19,7 +18,7 @@ use zip::ZipArchive;
 const MAX_INSTALLER_DATA_ENTRY_BYTES: u64 = 128 << 20;
 #[cfg(test)]
 const MAX_INSTALLER_DATA_ENTRY_BYTES: u64 = 1024;
-static PROCESSOR_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const PROCESSOR_DATA_DIR: &str = "processor-data";
 
 #[derive(Debug, Error)]
 pub enum ProcessorError {
@@ -89,7 +88,7 @@ where
     }
 
     let installer_path = workspace.path().join("source-installer.jar");
-    let (data_vars, temp_plan) = build_data_vars_blocking(
+    let (data_vars, data_plan) = build_data_vars_blocking(
         &profile.data,
         mc_dir,
         mc_version,
@@ -98,21 +97,21 @@ where
         &installer_path,
     )
     .await?;
-    let temp_dir = if let Some(plan) = temp_plan {
-        let temp = workspace
-            .create_temp(&plan.name)
+    let data_dir = if let Some(plan) = data_plan {
+        let directory = workspace
+            .create_temp(PROCESSOR_DATA_DIR)
             .map_err(|error| ProcessorError::Io(loader_io_error(error)))?;
         for file in plan.files {
-            if let Err(error) = temp
+            if let Err(error) = directory
                 .write_relative_exact(&file.relative_path, &file.bytes)
                 .await
             {
-                let cleanup = temp.cleanup().map_err(loader_io_error);
+                let cleanup = directory.cleanup().map_err(loader_io_error);
                 cleanup?;
                 return Err(ProcessorError::Io(loader_io_error(error)));
             }
         }
-        Some(temp)
+        Some(directory)
     } else {
         None
     };
@@ -140,8 +139,8 @@ where
         Ok::<(), ProcessorError>(())
     }
     .await;
-    let cleanup = temp_dir
-        .map(|temp| temp.cleanup().map_err(loader_io_error))
+    let cleanup = data_dir
+        .map(|directory| directory.cleanup().map_err(loader_io_error))
         .transpose();
     result?;
     cleanup.map_err(ProcessorError::Io)?;
@@ -227,9 +226,9 @@ fn build_data_vars(
     installer_data: &[u8],
     work_dir: &Path,
     installer_path: &Path,
-) -> Result<(HashMap<String, String>, Option<ProcessorTempPlan>), ProcessorError> {
+) -> Result<(HashMap<String, String>, Option<ProcessorDataPlan>), ProcessorError> {
     let mut vars = HashMap::new();
-    let mut temp_plan = None;
+    let mut data_plan = None;
 
     for (key, entry) in data {
         let value = entry.client.trim();
@@ -251,11 +250,8 @@ fn build_data_vars(
             let destination_path = safe_installer_entry_path(entry_path)?;
             let relative_path = ArtifactRelativePath::from_path(&destination_path)
                 .map_err(|_| unsafe_installer_entry_error(entry_path))?;
-            let plan = temp_plan.get_or_insert_with(|| ProcessorTempPlan {
-                name: processor_temp_name(),
-                files: Vec::new(),
-            });
-            let extracted = work_dir.join(&plan.name).join(&destination_path);
+            let plan = data_plan.get_or_insert_with(|| ProcessorDataPlan { files: Vec::new() });
+            let extracted = work_dir.join(PROCESSOR_DATA_DIR).join(&destination_path);
             let bytes = read_installer_entry(installer_data, entry_path)?;
             plan.files.push(PlannedWorkspaceFile {
                 relative_path,
@@ -288,7 +284,7 @@ fn build_data_vars(
         installer_path.to_string_lossy().to_string(),
     );
 
-    Ok((vars, temp_plan))
+    Ok((vars, data_plan))
 }
 
 async fn build_data_vars_blocking(
@@ -298,7 +294,7 @@ async fn build_data_vars_blocking(
     installer_data: &[u8],
     work_dir: &Path,
     installer_path: &Path,
-) -> Result<(HashMap<String, String>, Option<ProcessorTempPlan>), ProcessorError> {
+) -> Result<(HashMap<String, String>, Option<ProcessorDataPlan>), ProcessorError> {
     let data = data.clone();
     let mc_dir = mc_dir.to_path_buf();
     let mc_version = mc_version.to_string();
@@ -321,8 +317,7 @@ async fn build_data_vars_blocking(
 }
 
 #[derive(Debug)]
-struct ProcessorTempPlan {
-    name: String,
+struct ProcessorDataPlan {
     files: Vec<PlannedWorkspaceFile>,
 }
 
@@ -330,15 +325,6 @@ struct ProcessorTempPlan {
 struct PlannedWorkspaceFile {
     relative_path: ArtifactRelativePath,
     bytes: Vec<u8>,
-}
-
-fn processor_temp_name() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    let sequence = PROCESSOR_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("processors-{}-{nanos:x}-{sequence:x}", std::process::id())
 }
 
 fn read_installer_entry(jar_data: &[u8], entry_path: &str) -> Result<Vec<u8>, ProcessorError> {
@@ -558,6 +544,7 @@ fn substitute_arg(
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use zip::write::SimpleFileOptions;
 
     #[test]
@@ -647,6 +634,44 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn build_data_vars_reuses_canonical_processor_data_child() {
+        let root = test_root("canonical-processor-data");
+        let mut data = HashMap::new();
+        data.insert(
+            "EXTRACTED".to_string(),
+            DataEntry {
+                client: "/data/input.bin".to_string(),
+            },
+        );
+        let installer = zip_with_entry("data/input.bin", b"input".to_vec());
+
+        for _ in 0..2 {
+            let (vars, plan) = build_data_vars(
+                &data,
+                &root,
+                "1.20.1",
+                &installer,
+                &root,
+                &root.join("installer.jar"),
+            )
+            .expect("processor data plan");
+
+            let expected = root
+                .join(PROCESSOR_DATA_DIR)
+                .join("data/input.bin")
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(
+                vars.get("EXTRACTED").map(String::as_str),
+                Some(expected.as_str())
+            );
+            assert_eq!(plan.expect("extraction plan").files.len(), 1);
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn empty_zip() -> Vec<u8> {
         let mut cursor = std::io::Cursor::new(Vec::new());
         zip::ZipWriter::new(&mut cursor)
@@ -670,7 +695,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         let root = std::env::temp_dir().join(format!(

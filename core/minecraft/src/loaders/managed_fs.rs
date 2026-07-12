@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 const TEMP_PREFIX: &str = ".axial-loader-tmp-";
@@ -63,6 +64,37 @@ struct ActiveTempKey {
 
 struct ActiveTemp {
     key: ActiveTempKey,
+}
+
+struct CleanupPlan {
+    entries: Vec<CleanupPlanEntry>,
+}
+
+enum CleanupPlanEntry {
+    File {
+        name: OsString,
+        kind: EntryKind,
+    },
+    Directory {
+        name: OsString,
+        directory: ManagedDir,
+        children: CleanupPlan,
+    },
+}
+
+struct CleanupBudget {
+    remaining: usize,
+}
+
+impl CleanupBudget {
+    fn reserve(&mut self, count: usize) -> Result<(), LoaderError> {
+        self.remaining = self.remaining.checked_sub(count).ok_or_else(|| {
+            LoaderError::Verify(
+                "managed loader cleanup tree exceeds the aggregate entry budget".to_string(),
+            )
+        })?;
+        Ok(())
+    }
 }
 
 impl ActiveTemp {
@@ -328,41 +360,43 @@ impl ManagedDir {
         }
     }
 
-    pub(crate) fn clear_and_remove(self) -> Result<(), LoaderError> {
-        self.clear_contents(0)?;
-        let DirectoryBinding::Child { parent, name } = &self.inner.binding else {
+    pub(crate) fn clear_owned_contents(self) -> Result<(), LoaderError> {
+        if !matches!(&self.inner.binding, DirectoryBinding::Child { .. }) {
             return Err(LoaderError::Verify(
-                "managed root cannot be recursively removed".to_string(),
+                "managed root cannot be recursively cleared".to_string(),
             ));
+        }
+        self.clear_contents()
+    }
+
+    fn clear_contents(&self) -> Result<(), LoaderError> {
+        self.clear_contents_bounded(MAX_MANAGED_DIRECTORY_ENTRIES)
+    }
+
+    fn clear_contents_bounded(&self, entry_limit: usize) -> Result<(), LoaderError> {
+        let mut budget = CleanupBudget {
+            remaining: entry_limit,
         };
-        self.revalidate()?;
-        let parent = parent.clone();
-        let name = name.clone();
-        drop(self);
-        platform::remove_directory(&parent.handle, &parent.path, &name)?;
-        Ok(())
+        let plan = self.plan_cleanup(0, &mut budget)?;
+        self.execute_cleanup(&plan)?;
+        self.validate_cleanup_result(&plan)
     }
 
-    fn clear_contents(&self, depth: usize) -> Result<(), LoaderError> {
-        self.clear_contents_bounded(depth, MAX_MANAGED_DIRECTORY_ENTRIES)
-    }
-
-    fn clear_contents_bounded(&self, depth: usize, entry_limit: usize) -> Result<(), LoaderError> {
+    fn plan_cleanup(
+        &self,
+        depth: usize,
+        budget: &mut CleanupBudget,
+    ) -> Result<CleanupPlan, LoaderError> {
         if depth > 16 {
             return Err(LoaderError::Verify(
                 "managed loader cleanup tree is too deep".to_string(),
             ));
         }
-        let entries = platform::entry_names(
-            &self.inner.handle,
-            &self.inner.path,
-            entry_limit.saturating_add(1),
-        )?;
-        if entries.len() > entry_limit {
-            return Err(LoaderError::Verify(
-                "managed loader cleanup tree exceeds the bounded entry scan".to_string(),
-            ));
-        }
+        self.revalidate()?;
+        let scan_limit = budget.remaining.saturating_add(1);
+        let entries = platform::entry_names(&self.inner.handle, &self.inner.path, scan_limit)?;
+        budget.reserve(entries.len())?;
+        let mut planned = Vec::with_capacity(entries.len());
         for name in entries {
             let Some(name_text) = name.to_str() else {
                 return Err(LoaderError::Verify(
@@ -374,13 +408,15 @@ impl ManagedDir {
                 None => {}
                 Some(EntryKind::Directory) => {
                     let child = self.open_child(name_text)?;
-                    child.clear_contents_bounded(depth + 1, entry_limit)?;
-                    child.revalidate()?;
-                    drop(child);
-                    platform::remove_directory(&self.inner.handle, &self.inner.path, &name)?;
+                    let children = child.plan_cleanup(depth + 1, budget)?;
+                    planned.push(CleanupPlanEntry::Directory {
+                        name,
+                        directory: child,
+                        children,
+                    });
                 }
-                Some(EntryKind::File | EntryKind::Link) => {
-                    platform::remove_file(&self.inner.handle, &self.inner.path, &name)?;
+                Some(kind @ (EntryKind::File | EntryKind::Link)) => {
+                    planned.push(CleanupPlanEntry::File { name, kind });
                 }
                 #[cfg(unix)]
                 Some(EntryKind::Other) => {
@@ -388,6 +424,74 @@ impl ManagedDir {
                         "managed loader cleanup contains an unsupported entry".to_string(),
                     ));
                 }
+            }
+        }
+        self.revalidate()?;
+        Ok(CleanupPlan { entries: planned })
+    }
+
+    fn execute_cleanup(&self, plan: &CleanupPlan) -> Result<(), LoaderError> {
+        for entry in &plan.entries {
+            match entry {
+                CleanupPlanEntry::File { name, kind } => {
+                    match platform::entry_kind(&self.inner.handle, &self.inner.path, name)? {
+                        None => {}
+                        Some(actual) if actual == *kind => {
+                            platform::remove_file(&self.inner.handle, &self.inner.path, name)?;
+                        }
+                        Some(_) => {
+                            return Err(LoaderError::Verify(
+                                "managed loader cleanup entry changed after preflight".to_string(),
+                            ));
+                        }
+                    }
+                }
+                CleanupPlanEntry::Directory {
+                    name: _,
+                    directory,
+                    children,
+                } => {
+                    directory.execute_cleanup(children)?;
+                }
+            }
+        }
+        self.revalidate()
+    }
+
+    fn validate_cleanup_result(&self, plan: &CleanupPlan) -> Result<(), LoaderError> {
+        self.revalidate()?;
+        let mut expected_directories = plan
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                CleanupPlanEntry::Directory { name, .. } => Some(name.clone()),
+                CleanupPlanEntry::File { .. } => None,
+            })
+            .collect::<HashSet<_>>();
+        let entries = platform::entry_names(
+            &self.inner.handle,
+            &self.inner.path,
+            expected_directories.len().saturating_add(1),
+        )?;
+        if entries.len() != expected_directories.len()
+            || entries
+                .iter()
+                .any(|name| !expected_directories.remove(name))
+            || !expected_directories.is_empty()
+        {
+            return Err(LoaderError::Verify(
+                "managed loader cleanup result contains unplanned entries".to_string(),
+            ));
+        }
+        for entry in &plan.entries {
+            if let CleanupPlanEntry::Directory {
+                directory,
+                children,
+                ..
+            } = entry
+            {
+                directory.revalidate()?;
+                directory.validate_cleanup_result(children)?;
             }
         }
         self.revalidate()
@@ -415,6 +519,14 @@ impl ManagedDir {
     }
 
     fn sweep_orphan_temps(&self) -> Result<(), LoaderError> {
+        let mut system = System::new();
+        self.sweep_orphan_temps_with(|pid| temp_owner_is_live(&mut system, pid))
+    }
+
+    fn sweep_orphan_temps_with<F>(&self, mut owner_is_live: F) -> Result<(), LoaderError>
+    where
+        F: FnMut(u32) -> bool,
+    {
         let entries = platform::entry_names(
             &self.inner.handle,
             &self.inner.path,
@@ -425,18 +537,25 @@ impl ManagedDir {
                 "managed loader directory exceeds the bounded entry scan".to_string(),
             ));
         }
-        let mut temp_count = 0;
+        let mut reserved = Vec::new();
         for name in entries {
             let Some(text) = name.to_str() else { continue };
             if !text.starts_with(TEMP_PREFIX) {
                 continue;
             }
-            temp_count += 1;
-            if temp_count > MAX_TEMP_SWEEP_ENTRIES {
-                return Err(LoaderError::Verify(
-                    "managed loader directory exceeds the bounded temp sweep".to_string(),
-                ));
-            }
+            let owner_pid = temp_owner_pid(text).ok_or_else(|| {
+                LoaderError::Verify(
+                    "managed loader temp namespace contains a malformed entry".to_string(),
+                )
+            })?;
+            reserved.push((name, owner_pid));
+        }
+        if reserved.len() > MAX_TEMP_SWEEP_ENTRIES {
+            return Err(LoaderError::Verify(
+                "managed loader directory exceeds the bounded temp sweep".to_string(),
+            ));
+        }
+        for (name, owner_pid) in reserved {
             let key = ActiveTempKey {
                 directory: self.inner.identity,
                 name: name.clone(),
@@ -446,6 +565,9 @@ impl ManagedDir {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(&key)
             {
+                continue;
+            }
+            if owner_is_live(owner_pid) {
                 continue;
             }
             match platform::entry_kind(&self.inner.handle, &self.inner.path, &name)? {
@@ -483,6 +605,33 @@ fn temp_name() -> String {
         .unwrap_or_default();
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("{TEMP_PREFIX}{}-{nanos:x}-{sequence:x}", std::process::id())
+}
+
+fn temp_owner_pid(name: &str) -> Option<u32> {
+    let mut parts = name.strip_prefix(TEMP_PREFIX)?.split('-');
+    let pid_text = parts.next()?;
+    let nanos_text = parts.next()?;
+    let sequence_text = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let pid = pid_text.parse::<u32>().ok()?;
+    let nanos = u128::from_str_radix(nanos_text, 16).ok()?;
+    let sequence = u64::from_str_radix(sequence_text, 16).ok()?;
+    (pid.to_string() == pid_text
+        && format!("{nanos:x}") == nanos_text
+        && format!("{sequence:x}") == sequence_text)
+        .then_some(pid)
+}
+
+fn temp_owner_is_live(system: &mut System, pid: u32) -> bool {
+    let pid = Pid::from_u32(pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().without_tasks(),
+    );
+    system.process(pid).is_some()
 }
 
 #[cfg(unix)]
@@ -588,14 +737,6 @@ mod platform {
         Ok(rfs::unlinkat(parent, name, AtFlags::empty())?)
     }
 
-    pub(super) fn remove_directory(
-        parent: &DirectoryHandle,
-        _parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<()> {
-        Ok(rfs::unlinkat(parent, name, AtFlags::REMOVEDIR)?)
-    }
-
     pub(super) fn entry_kind(
         parent: &DirectoryHandle,
         _parent_path: &Path,
@@ -685,7 +826,9 @@ mod tests {
         assert!(root.join(&name).is_file());
 
         drop(active);
-        directory.sweep_orphan_temps().expect("sweep orphan");
+        directory
+            .sweep_orphan_temps_with(|_| false)
+            .expect("sweep dead-owner orphan");
         assert!(!root.join(&name).exists());
         let _ = fs::remove_dir_all(root);
     }
@@ -742,7 +885,7 @@ mod tests {
         }
 
         let error = child
-            .clear_contents_bounded(0, 8)
+            .clear_contents_bounded(8)
             .expect_err("overflow must fail before cleanup");
 
         assert!(matches!(error, LoaderError::Verify(_)));
@@ -753,6 +896,182 @@ mod tests {
                 b"retained"
             );
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_cleanup_overflow_has_no_partial_effects() {
+        let root = test_root("nested-cleanup-entry-overflow");
+        fs::create_dir_all(&root).expect("root");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let child = directory.open_or_create_child("stage").expect("stage");
+        fs::write(child.path().join("top-level"), b"retained").expect("top-level artifact");
+        let nested = child.open_or_create_child("nested").expect("nested");
+        for index in 0..7 {
+            fs::write(nested.path().join(format!("artifact-{index}")), b"retained")
+                .expect("nested artifact");
+        }
+
+        let error = child
+            .clear_contents_bounded(8)
+            .expect_err("aggregate overflow must fail before cleanup");
+
+        assert!(matches!(error, LoaderError::Verify(_)));
+        assert_eq!(
+            fs::read(child.path().join("top-level")).expect("retained top-level artifact"),
+            b"retained"
+        );
+        for index in 0..7 {
+            assert_eq!(
+                fs::read(nested.path().join(format!("artifact-{index}")))
+                    .expect("retained nested artifact"),
+                b"retained"
+            );
+        }
+        drop(nested);
+        drop(child);
+        drop(directory);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_retains_only_admitted_directory_shells() {
+        let root = test_root("cleanup-retained-shells");
+        fs::create_dir_all(&root).expect("root");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let child = directory.open_or_create_child("stage").expect("stage");
+        let nested = child.open_or_create_child("nested").expect("nested");
+        fs::write(child.path().join("top-level"), b"owned").expect("top-level artifact");
+        fs::write(nested.path().join("nested-artifact"), b"owned").expect("nested artifact");
+
+        child.clear_owned_contents().expect("clear owned tree");
+
+        assert!(root.join("stage").is_dir());
+        assert!(root.join("stage/nested").is_dir());
+        assert!(!root.join("stage/top-level").exists());
+        assert!(!root.join("stage/nested/nested-artifact").exists());
+        drop(nested);
+        drop(directory);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_rescan_rejects_raced_entries_in_retained_shells() {
+        let root = test_root("cleanup-rescan-race");
+        fs::create_dir_all(&root).expect("root");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let child = directory.open_or_create_child("stage").expect("stage");
+        let nested = child.open_or_create_child("nested").expect("nested");
+        fs::write(child.path().join("owned"), b"owned").expect("owned file");
+        let mut budget = CleanupBudget { remaining: 8 };
+        let plan = child.plan_cleanup(0, &mut budget).expect("cleanup plan");
+
+        child.execute_cleanup(&plan).expect("execute cleanup plan");
+        fs::write(child.path().join("raced-file"), b"raced").expect("raced file");
+        let raced_file = child
+            .validate_cleanup_result(&plan)
+            .expect_err("raced file must prevent cleanup success");
+        assert!(matches!(raced_file, LoaderError::Verify(_)));
+
+        fs::remove_file(child.path().join("raced-file")).expect("remove raced file");
+        fs::create_dir(nested.path().join("raced-directory")).expect("raced directory");
+        let raced_directory = child
+            .validate_cleanup_result(&plan)
+            .expect_err("raced directory must prevent cleanup success");
+        assert!(matches!(raced_directory, LoaderError::Verify(_)));
+
+        drop(plan);
+        drop(nested);
+        drop(child);
+        drop(directory);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reserved_temp_overflow_has_no_partial_sweep() {
+        let root = test_root("reserved-temp-overflow");
+        fs::create_dir_all(&root).expect("root");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let foreign_pid = std::process::id().wrapping_add(1);
+        let names = (0..=MAX_TEMP_SWEEP_ENTRIES)
+            .map(|index| format!("{TEMP_PREFIX}{foreign_pid}-{:x}-0", index + 1))
+            .collect::<Vec<_>>();
+        for name in &names {
+            fs::write(root.join(name), b"foreign-active").expect("foreign temp");
+        }
+
+        let error = directory
+            .sweep_orphan_temps_with(|_| false)
+            .expect_err("reserved temp overflow must fail before sweeping");
+
+        assert!(matches!(error, LoaderError::Verify(_)));
+        for name in names {
+            assert_eq!(
+                fs::read(root.join(name)).expect("retained overflow temp"),
+                b"foreign-active"
+            );
+        }
+        drop(directory);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_or_reused_pid_temp_is_preserved() {
+        let root = test_root("live-owner-temp");
+        fs::create_dir_all(&root).expect("root");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let owner_pid = std::process::id().wrapping_add(1);
+        let name = format!("{TEMP_PREFIX}{owner_pid}-1-0");
+        fs::write(root.join(&name), b"potentially-live").expect("live-owner temp");
+
+        directory
+            .sweep_orphan_temps_with(|pid| pid == owner_pid)
+            .expect("live or reused PID must be retained");
+
+        assert_eq!(
+            fs::read(root.join(name)).expect("retained live-owner temp"),
+            b"potentially-live"
+        );
+        drop(directory);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dead_owner_temp_is_swept() {
+        let root = test_root("dead-owner-temp");
+        fs::create_dir_all(&root).expect("root");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let owner_pid = std::process::id().wrapping_add(1);
+        let name = format!("{TEMP_PREFIX}{owner_pid}-1-0");
+        fs::write(root.join(&name), b"dead-owner").expect("dead-owner temp");
+
+        directory
+            .sweep_orphan_temps_with(|_| false)
+            .expect("dead-owner temp sweep");
+
+        assert!(!root.join(name).exists());
+        drop(directory);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_reserved_temp_name_fails_closed() {
+        let root = test_root("malformed-temp");
+        fs::create_dir_all(&root).expect("root");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let name = format!("{TEMP_PREFIX}malformed");
+        fs::write(root.join(&name), b"unknown").expect("unknown temp");
+
+        let error = directory
+            .sweep_orphan_temps()
+            .expect_err("malformed reserved temp must fail closed");
+
+        assert!(matches!(error, LoaderError::Verify(_)));
+        assert_eq!(
+            fs::read(root.join(name)).expect("retained unknown temp"),
+            b"unknown"
+        );
+        drop(directory);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -805,10 +1124,12 @@ mod tests {
         let sentinel = outside.join("sentinel");
         fs::write(&sentinel, b"untouched").expect("sentinel");
         let directory = ManagedDir::open_root(&root).expect("managed root");
-        let temp = format!("{TEMP_PREFIX}999-orphan");
+        let temp = temp_name();
         symlink(&sentinel, root.join(&temp)).expect("temp symlink");
 
-        directory.sweep_orphan_temps().expect("sweep temp link");
+        directory
+            .sweep_orphan_temps_with(|_| false)
+            .expect("sweep dead-owner temp link");
 
         assert!(!root.join(temp).exists());
         assert_eq!(fs::read(&sentinel).expect("sentinel"), b"untouched");
@@ -835,15 +1156,43 @@ mod tests {
         symlink(&outside, child.path()).expect("replacement link");
 
         let error = child
-            .clear_and_remove()
+            .clear_owned_contents()
             .expect_err("replacement must fail revalidation");
 
         assert!(matches!(error, LoaderError::Io(_) | LoaderError::Verify(_)));
         assert_eq!(fs::read(&sentinel).expect("sentinel"), b"untouched");
-        assert!(!parked.join("owned").exists());
+        assert_eq!(
+            fs::read(parked.join("owned")).expect("retained admitted file"),
+            b"owned"
+        );
         let _ = fs::remove_file(root.join("stage"));
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_never_removes_replacement_empty_directory() {
+        let root = test_root("cleanup-directory-replacement");
+        fs::create_dir_all(&root).expect("root");
+        let parent = ManagedDir::open_root(&root).expect("managed root");
+        let child = parent.open_or_create_child("stage").expect("stage");
+        fs::write(child.path().join("owned"), b"owned").expect("owned file");
+        let parked = root.join("parked");
+        fs::rename(child.path(), &parked).expect("park stage");
+        fs::create_dir(child.path()).expect("replacement directory");
+
+        let error = child
+            .clear_owned_contents()
+            .expect_err("replacement must fail revalidation");
+
+        assert!(matches!(error, LoaderError::Io(_) | LoaderError::Verify(_)));
+        assert!(root.join("stage").is_dir());
+        assert_eq!(
+            fs::read(parked.join("owned")).expect("retained admitted file"),
+            b"owned"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]
@@ -857,6 +1206,36 @@ mod tests {
         drop(held);
         fs::rename(&root, &moved).expect("rename after release");
         fs::rename(&moved, &root).expect("restore");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_entry_kind_classifies_files_and_directories_without_following() {
+        let root = test_root("windows-entry-kind");
+        fs::create_dir_all(root.join("child")).expect("child directory");
+        fs::write(root.join("artifact"), b"artifact").expect("artifact");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+
+        assert_eq!(
+            platform::entry_kind(
+                &directory.inner.handle,
+                &directory.inner.path,
+                OsStr::new("child")
+            )
+            .expect("directory kind"),
+            Some(EntryKind::Directory)
+        );
+        assert_eq!(
+            platform::entry_kind(
+                &directory.inner.handle,
+                &directory.inner.path,
+                OsStr::new("artifact")
+            )
+            .expect("file kind"),
+            Some(EntryKind::File)
+        );
+        drop(directory);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -901,7 +1280,7 @@ mod platform {
     pub(super) fn open_exact_directory(
         path: &Path,
     ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
-        let file = open_no_follow(path, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, false)?;
+        let file = open_no_follow(path, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, true)?;
         let basic: FILE_BASIC_INFO = query(&file, FileBasicInfo)?;
         let standard: FILE_STANDARD_INFO = query(&file, FileStandardInfo)?;
         if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -956,7 +1335,7 @@ mod platform {
         let file = open_no_follow(
             &parent_path.join(name),
             windows_sys::Win32::Foundation::GENERIC_READ,
-            true,
+            false,
         )?;
         let basic: FILE_BASIC_INFO = query(&file, FileBasicInfo)?;
         let standard: FILE_STANDARD_INFO = query(&file, FileStandardInfo)?;
@@ -988,14 +1367,6 @@ mod platform {
         name: &OsStr,
     ) -> io::Result<()> {
         fs::remove_file(parent_path.join(name))
-    }
-
-    pub(super) fn remove_directory(
-        _parent: &DirectoryHandle,
-        parent_path: &Path,
-        name: &OsStr,
-    ) -> io::Result<()> {
-        fs::remove_dir(parent_path.join(name))
     }
 
     pub(super) fn entry_kind(
@@ -1044,7 +1415,7 @@ mod platform {
         open_exact_directory(&parent_path.join(name)).map(|(_, identity)| identity)
     }
 
-    fn open_no_follow(path: &Path, access: u32, allow_file: bool) -> io::Result<fs::File> {
+    fn open_no_follow(path: &Path, access: u32, include_directories: bool) -> io::Result<fs::File> {
         let mut options = fs::OpenOptions::new();
         options
             .read(true)
@@ -1052,10 +1423,10 @@ mod platform {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(
                 FILE_FLAG_OPEN_REPARSE_POINT
-                    | if allow_file {
-                        0
-                    } else {
+                    | if include_directories {
                         FILE_FLAG_BACKUP_SEMANTICS
+                    } else {
+                        0
                     },
             );
         options.open(path)
