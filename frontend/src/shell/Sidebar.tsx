@@ -380,6 +380,7 @@ export function Sidebar(): JSX.Element {
       </button>
       <RailButton icon="home" label="Home" target={{ name: 'home' }} tooltip={tooltip} />
       <RailButton icon="stack" label="Instances" target={{ name: 'instances' }} tooltip={tooltip} />
+      <RailButton icon="compass" label="Discover" target={{ name: 'discover' }} tooltip={tooltip} />
       <button
         class="cp-rail-btn"
         data-accent="true"

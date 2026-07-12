@@ -4,6 +4,7 @@ export type Route =
   | { name: 'home' }
   | { name: 'instances' }
   | { name: 'instance'; id: string }
+  | { name: 'discover' }
   | { name: 'dev-lab' }
   | { name: 'downloads' }
   | { name: 'accounts' }
@@ -58,6 +59,7 @@ function isRoute(value: unknown): value is Route {
   switch (candidate.name) {
     case 'home':
     case 'instances':
+    case 'discover':
     case 'dev-lab':
     case 'downloads':
     case 'accounts':

@@ -23,6 +23,8 @@ function crumbsFor(): { label: string; onClick?: () => void }[] {
       return [{ label: 'Home' }];
     case 'instances':
       return [{ label: 'Instances' }];
+    case 'discover':
+      return [{ label: 'Discover' }];
     case 'instance': {
       const inst = instances.value.find((i) => i.id === r.id);
       return [

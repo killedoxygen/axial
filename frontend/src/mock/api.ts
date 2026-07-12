@@ -4,6 +4,16 @@ import type { InstallQueueStateResponse } from '../types-install';
 import type { FeatureFlagViewModel, FlagsResponse } from '../types-flags';
 import type { UpdateFlowState, UpdateInfo } from '../types-update';
 import type { Version } from '../types-version';
+import type {
+  CanonicalContent,
+  ContentDetail,
+  ContentKind,
+  ContentPage,
+  ContentSelection,
+  InstanceContentEntry,
+  InstanceContentResponse,
+  ResolutionPlan,
+} from '../types-content';
 
 type Handler = (body?: unknown, path?: string, request?: MockRequest) => unknown | Promise<unknown>;
 
@@ -201,6 +211,246 @@ const scanState: ScanState = {
   degraded: false,
 };
 
+function mockContent(
+  id: string,
+  kind: ContentKind,
+  title: string,
+  author: string,
+  summary: string,
+  downloads: number,
+  categories: string[],
+): CanonicalContent {
+  return {
+    canonical_id: id,
+    kind,
+    provider: 'modrinth',
+    project_id: id.replace('modrinth:', ''),
+    title,
+    author,
+    summary,
+    downloads,
+    follows: Math.round(downloads / 100),
+    categories,
+    game_versions: ['1.21.6', '1.21.5'],
+    loaders: kind === 'mod' || kind === 'modpack' ? ['fabric'] : [],
+    sources: [{ provider: 'modrinth', project_id: id.replace('modrinth:', '') }],
+  };
+}
+
+const mockContentCatalog: Record<ContentKind, CanonicalContent[]> = {
+  mod: [
+    mockContent(
+      'modrinth:AANobbMI',
+      'mod',
+      'Sodium',
+      'jellysquid3',
+      'A modern rendering engine that dramatically improves frame rates.',
+      182_000_000,
+      ['optimization', 'fabric'],
+    ),
+    mockContent(
+      'modrinth:P7dR8mSH',
+      'mod',
+      'Fabric API',
+      'modmuss50',
+      'Core hooks and interoperability utilities most Fabric mods depend on.',
+      210_000_000,
+      ['library', 'fabric'],
+    ),
+    mockContent(
+      'modrinth:gvQqBUqZ',
+      'mod',
+      'Lithium',
+      'jellysquid3',
+      'General-purpose optimization mod that improves server tick performance.',
+      90_000_000,
+      ['optimization'],
+    ),
+  ],
+  modpack: [
+    mockContent(
+      'modrinth:1KVo5zza',
+      'modpack',
+      'Fabulously Optimized',
+      'robotkoer',
+      'A modpack focused on performance and vanilla-plus visuals.',
+      12_000_000,
+      ['optimization'],
+    ),
+  ],
+  resource_pack: [
+    mockContent(
+      'modrinth:faithful32',
+      'resource_pack',
+      'Faithful 32x',
+      'Faithful Team',
+      'A higher-resolution take on the vanilla textures.',
+      40_000_000,
+      ['32x', 'realistic'],
+    ),
+  ],
+  shader_pack: [
+    mockContent(
+      'modrinth:complementary',
+      'shader_pack',
+      'Complementary Shaders',
+      'EminGT',
+      'A well-balanced shader pack with strong performance.',
+      25_000_000,
+      ['fantasy'],
+    ),
+  ],
+};
+
+const mockDependencies: Record<string, string[]> = {
+  'modrinth:AANobbMI': ['modrinth:P7dR8mSH'],
+  'modrinth:gvQqBUqZ': ['modrinth:P7dR8mSH'],
+};
+
+const mockInstanceContent: Record<string, InstanceContentEntry[]> = {
+  'mock-fabric-lab': [
+    {
+      canonical_id: 'modrinth:P7dR8mSH',
+      title: 'Fabric API',
+      kind: 'mod',
+      provider: 'modrinth',
+      project_id: 'P7dR8mSH',
+      version_id: 'fabric-api-mock-1',
+      filename: 'fabric-api.jar',
+      enabled: true,
+      source: 'managed',
+    },
+  ],
+};
+
+function mockCatalogItem(canonicalId: string): CanonicalContent | undefined {
+  return Object.values(mockContentCatalog)
+    .flat()
+    .find((item) => item.canonical_id === canonicalId);
+}
+
+function mockContentSearch(request: MockRequest | undefined): ContentPage {
+  const kind = (request?.searchParams.get('kind') as ContentKind | null) ?? 'mod';
+  const query = (request?.searchParams.get('query') ?? '').toLowerCase();
+  const items = (mockContentCatalog[kind] ?? []).filter(
+    (item) => !query || item.title.toLowerCase().includes(query) || item.summary.toLowerCase().includes(query),
+  );
+  return { items, offset: 0, limit: items.length, total: items.length };
+}
+
+function mockContentDetail(request: MockRequest | undefined): ContentDetail {
+  const id = request?.searchParams.get('id') ?? '';
+  const item = mockCatalogItem(id);
+  if (!item) throw apiError(404, 'Not Found', { error: 'content not found' });
+  return {
+    ...item,
+    body: item.summary,
+    gallery: [],
+    versions: [
+      {
+        id: `${item.project_id}-v1`,
+        name: `${item.title} 1.0`,
+        version_number: '1.0.0',
+        game_versions: ['1.21.6'],
+        loaders: item.loaders,
+        channel: 'release',
+        downloads: item.downloads,
+        files: [
+          {
+            url: 'https://example.invalid/file.jar',
+            filename: `${item.project_id}.jar`,
+            primary: true,
+            size: 512_000,
+          },
+        ],
+        dependencies: (mockDependencies[item.canonical_id] ?? []).map((projectId) => ({
+          project_id: projectId.replace('modrinth:', ''),
+          kind: 'required' as const,
+        })),
+      },
+    ],
+  };
+}
+
+function mockResolvePlan(instanceId: string, selections: ContentSelection[]): ResolutionPlan {
+  const installed = mockInstanceContent[instanceId] ?? [];
+  const seen = new Set<string>();
+  const queue = [...selections.map((selection) => ({ id: selection.canonical_id, dependency: false }))];
+  for (const selection of selections) {
+    for (const dep of mockDependencies[selection.canonical_id] ?? []) {
+      queue.push({ id: dep, dependency: true });
+    }
+  }
+  const items = queue
+    .filter((entry) => {
+      if (seen.has(entry.id)) return false;
+      seen.add(entry.id);
+      return true;
+    })
+    .map((entry) => {
+      const item = mockCatalogItem(entry.id);
+      const already = installed.some((installedEntry) => installedEntry.canonical_id === entry.id);
+      return {
+        canonical_id: entry.id,
+        title: item?.title ?? entry.id,
+        kind: 'mod' as ContentKind,
+        project_id: entry.id.replace('modrinth:', ''),
+        version_id: `${entry.id.replace('modrinth:', '')}-v1`,
+        version_number: '1.0.0',
+        filename: `${entry.id.replace('modrinth:', '')}.jar`,
+        size: 512_000,
+        reason: entry.dependency ? ('dependency' as const) : ('selected' as const),
+        already_installed: already,
+        update: false,
+      };
+    });
+  const totalBytes = items
+    .filter((item) => !item.already_installed || item.update)
+    .reduce((sum, item) => sum + (item.size ?? 0), 0);
+  return {
+    instance_id: instanceId,
+    loader: 'fabric',
+    game_version: '1.21.6',
+    items,
+    conflicts: [],
+    total_download_bytes: totalBytes,
+  };
+}
+
+function mockContentInstall(body: unknown): InstanceContentResponse {
+  if (!isRecord(body) || typeof body.instance_id !== 'string' || !Array.isArray(body.selections)) {
+    throw apiError(400, 'Bad Request', { error: 'invalid install request' });
+  }
+  const instanceId = body.instance_id;
+  const plan = mockResolvePlan(instanceId, body.selections as ContentSelection[]);
+  const current = mockInstanceContent[instanceId] ?? (mockInstanceContent[instanceId] = []);
+  for (const item of plan.items) {
+    if (current.some((entry) => entry.canonical_id === item.canonical_id)) continue;
+    current.push({
+      canonical_id: item.canonical_id,
+      title: item.title,
+      kind: item.kind,
+      provider: 'modrinth',
+      project_id: item.project_id,
+      version_id: item.version_id,
+      filename: item.filename,
+      enabled: true,
+      source: 'managed',
+    });
+  }
+  return { entries: current };
+}
+
+function mockInstanceContentList(instanceId: string): InstanceContentResponse {
+  return { entries: mockInstanceContent[instanceId] ?? [] };
+}
+
+function mockContentUninstall(instanceId: string, canonicalId: string): InstanceContentResponse {
+  const current = mockInstanceContent[instanceId] ?? [];
+  mockInstanceContent[instanceId] = current.filter((entry) => entry.canonical_id !== canonicalId);
+  return { entries: mockInstanceContent[instanceId] };
+}
+
 const flagRegistry: FlagDefinition[] = [
   {
     key: 'dev.state-inspector',
@@ -289,6 +539,18 @@ const handlers: Record<string, Handler> = {
   'GET /update/flow': () => mockUpdateFlow(),
   'POST /update/download': () => startMockUpdateDownload(),
   'POST /update/apply': () => applyMockUpdate(),
+  'GET /content/search': (_body, _path, request) => mockContentSearch(request),
+  'GET /content/item': (_body, _path, request) => mockContentDetail(request),
+  'POST /content/plan': (body) => {
+    if (!isRecord(body) || typeof body.instance_id !== 'string' || !Array.isArray(body.selections)) {
+      throw apiError(400, 'Bad Request', { error: 'invalid plan request' });
+    }
+    return mockResolvePlan(body.instance_id, body.selections as ContentSelection[]);
+  },
+  'POST /content/install': (body) => mockContentInstall(body),
+  'GET /instances/{id}/content': (_body, path) => mockInstanceContentList(instanceIdFromContentPath(path)),
+  'DELETE /instances/{id}/content': (_body, path, request) =>
+    mockContentUninstall(instanceIdFromContentPath(path), request?.searchParams.get('id') ?? ''),
 };
 
 const MOCK_UPDATE_VERSION = '9.9.9';
@@ -450,12 +712,18 @@ export async function mockApi<T>(method: string, path: string, body?: unknown): 
 
 function handlerKey(method: string, path: string): string {
   if (method === 'PUT' && path.startsWith('/flags/')) return 'PUT /flags/{key}';
+  if (/^\/instances\/[^/]+\/content$/.test(path)) return `${method} /instances/{id}/content`;
   if (/^\/instances\/[^/]+$/.test(path) && path !== '/instances/create-view') return `${method} /instances/{id}`;
   return `${method} ${path}`;
 }
 
 function instanceIdFromPath(path: string | undefined): string {
   return decodeURIComponent((path ?? '').slice('/instances/'.length));
+}
+
+function instanceIdFromContentPath(path: string | undefined): string {
+  const match = /^\/instances\/([^/]+)\/content$/.exec(path ?? '');
+  return match ? decodeURIComponent(match[1]) : '';
 }
 
 function findInstance(id: string): EnrichedInstance {

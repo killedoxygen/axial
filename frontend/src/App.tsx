@@ -33,6 +33,8 @@ const InstanceDetailRoute = createRouteLoader<{ id: string }>(
 
 const InstancesRoute = createRouteLoader(async () => (await import('./views/instances/InstancesView')).InstancesView);
 
+const DiscoverRoute = createRouteLoader(async () => (await import('./views/discover/DiscoverView')).DiscoverView);
+
 const CreateOverlay = createRouteLoader(async () => (await import('./views/create/CreateView')).CreateView);
 
 const AccountsRoute = createRouteLoader(async () => (await import('./views/accounts/AccountsView')).AccountsView);
@@ -153,6 +155,8 @@ function CurrentView(): JSX.Element {
       return <InstancesRoute />;
     case 'instance':
       return <InstanceDetailRoute id={r.id} />;
+    case 'discover':
+      return <DiscoverRoute />;
     case 'dev-lab':
       return <DevLabRoute />;
     case 'downloads':
