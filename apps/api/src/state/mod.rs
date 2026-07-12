@@ -158,9 +158,12 @@ impl AppState {
             Arc::new(AuthLoginStore::new()),
             Arc::new(RemoteFlagStore::default()),
         )
+        .unwrap_or_else(|error| {
+            panic!("failed to initialize known-good inventory persistence: {error}")
+        })
     }
 
-    pub async fn load(mut init: AppStateInit) -> Self {
+    pub async fn load(mut init: AppStateInit) -> std::io::Result<Self> {
         let config =
             Arc::new(AppConfigStore::claim(&init.config).unwrap_or_else(|error| {
                 panic!("failed to initialize config persistence: {error}")
@@ -195,7 +198,7 @@ impl AppState {
             )
         })
         .await
-        .unwrap_or_else(|_| panic!("persisted state startup task stopped"))
+        .map_err(|_| std::io::Error::other("persisted state startup task stopped"))?
     }
 
     #[cfg(test)]
@@ -212,6 +215,9 @@ impl AppState {
             Arc::new(AuthLoginStore::new()),
             Arc::new(RemoteFlagStore::default()),
         )
+        .unwrap_or_else(|error| {
+            panic!("failed to initialize known-good inventory persistence: {error}")
+        })
     }
 
     #[cfg(test)]
@@ -248,7 +254,7 @@ impl AppState {
         telemetry: Arc<TelemetryHub>,
         auth_logins: Arc<AuthLoginStore>,
         remote_flags: Arc<RemoteFlagStore>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let instances = Arc::new(AppInstanceStore::claim(&init.instances).unwrap_or_else(
             |error| panic!("failed to initialize instance registry persistence: {error}"),
         ));
@@ -288,10 +294,10 @@ impl AppState {
         let accounts = Arc::new(LauncherAccountStore::load_from_paths(config.paths()));
         let failure_memory = Arc::new(GuardianFailureMemoryStore::load_from_paths(config.paths()));
         let journals = Arc::new(OperationJournalStore::load_from_paths(config.paths()));
-        let known_good = Arc::new(known_good::KnownGoodInventoryStore::claim(config.paths()));
+        let known_good = Arc::new(known_good::KnownGoodInventoryStore::claim(config.paths())?);
         let (config_changes, _) = broadcast::channel(32);
 
-        Self {
+        Ok(Self {
             app_name: init.app_name,
             version: init.version,
             config,
@@ -321,7 +327,7 @@ impl AppState {
             #[cfg(test)]
             auth_chain_client_override: Arc::new(RwLock::new(None)),
             frontend_dir: Arc::new(init.frontend_dir),
-        }
+        })
     }
 
     pub fn app_name(&self) -> &str {
@@ -409,16 +415,8 @@ impl AppState {
         &self,
         installed_library_root: &Path,
         receipt: axial_minecraft::known_good::KnownGoodInstallReceipt,
-    ) -> std::io::Result<usize> {
-        let Some(configured_library_root) = self.library_dir().map(PathBuf::from) else {
-            return Ok(0);
-        };
-        if !known_good::KnownGoodInventoryStore::library_roots_match(
-            &configured_library_root,
-            installed_library_root,
-        ) {
-            return Ok(0);
-        }
+    ) -> std::io::Result<()> {
+        require_matching_known_good_library_root(self.library_dir(), installed_library_root)?;
 
         let version_id = receipt.version_id().to_string();
         let inventory = Arc::new(receipt.into_inventory());
@@ -431,21 +429,13 @@ impl AppState {
             })
             .map(|instance| instance.id)
             .collect::<Vec<_>>();
-        let mut accepted = 0;
         for instance_id in candidates {
             let _lifecycle = self.acquire_instance_lifecycle(&instance_id).await;
             let current = self.instances.get(&instance_id);
-            let current_root = self.library_dir().map(PathBuf::from);
-            if !matches_known_good_identity(current.as_ref(), &instance_id, &version_id)
-                || current_root.as_ref().is_none_or(|current_root| {
-                    !known_good::KnownGoodInventoryStore::library_roots_match(
-                        current_root,
-                        installed_library_root,
-                    )
-                })
-            {
+            if !matches_known_good_identity(current.as_ref(), &instance_id, &version_id) {
                 continue;
             }
+            require_matching_known_good_library_root(self.library_dir(), installed_library_root)?;
 
             self.known_good
                 .reconcile(
@@ -461,11 +451,13 @@ impl AppState {
             {
                 self.known_good
                     .deactivate_exact(&instance_id, &version_id, installed_library_root);
-                continue;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "known-good live authority was not activated",
+                ));
             }
-            accepted += 1;
         }
-        Ok(accepted)
+        Ok(())
     }
 
     pub(crate) fn active_known_good_inventory(
@@ -933,9 +925,32 @@ fn matches_known_good_identity(
     })
 }
 
+fn require_matching_known_good_library_root(
+    configured_library_root: Option<String>,
+    installed_library_root: &Path,
+) -> std::io::Result<()> {
+    let configured_library_root = configured_library_root.map(PathBuf::from).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "known-good library root is not configured",
+        )
+    })?;
+    if !known_good::KnownGoodInventoryStore::library_roots_match(
+        &configured_library_root,
+        installed_library_root,
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "known-good library root changed during installation",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod known_good_identity_tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn unrelated_instance_changes_preserve_known_good_identity() {
@@ -967,5 +982,44 @@ mod known_good_identity_tests {
             &instance.id,
             "1.21.5"
         ));
+    }
+
+    #[test]
+    fn receipt_acceptance_requires_the_exact_current_library_root() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-known-good-root-contract-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let configured = root.join("configured");
+        let changed = root.join("changed");
+        std::fs::create_dir_all(&configured).expect("configured root");
+        std::fs::create_dir_all(&changed).expect("changed root");
+
+        assert_eq!(
+            require_matching_known_good_library_root(None, &configured)
+                .expect_err("missing root must fail")
+                .kind(),
+            std::io::ErrorKind::NotConnected
+        );
+        assert_eq!(
+            require_matching_known_good_library_root(
+                Some(configured.to_string_lossy().into_owned()),
+                &changed,
+            )
+            .expect_err("changed root must fail")
+            .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        require_matching_known_good_library_root(
+            Some(configured.to_string_lossy().into_owned()),
+            &configured,
+        )
+        .expect("exact root");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

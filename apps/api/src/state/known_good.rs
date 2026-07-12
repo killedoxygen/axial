@@ -82,7 +82,7 @@ enum KnownGoodIntegritySnapshot {
 
 #[derive(Clone)]
 struct PendingSnapshot {
-    revision: Option<u64>,
+    revision: u64,
     snapshot: KnownGoodSnapshot,
     failed: bool,
 }
@@ -200,7 +200,7 @@ impl Drop for CloseTransition {
 
 pub(super) struct KnownGoodInventoryStore {
     root: PathBuf,
-    owner: Option<PersistenceOwnerLease>,
+    owner: PersistenceOwnerLease,
     state: Arc<Mutex<StoreState>>,
     active: Mutex<ActiveInventories<KnownGoodInventory>>,
     gates: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
@@ -210,12 +210,9 @@ pub(super) struct KnownGoodInventoryStore {
 }
 
 impl KnownGoodInventoryStore {
-    pub(super) fn claim(paths: &AppPaths) -> Self {
+    pub(super) fn claim(paths: &AppPaths) -> io::Result<Self> {
         let root = paths.config_dir.join("state").join(KNOWN_GOOD_DIR);
-        match Self::claim_root_with_coordinator(root.clone(), PersistenceCoordinator::global()) {
-            Ok(store) => store,
-            Err(_) => Self::volatile(root),
-        }
+        Self::claim_root_with_coordinator(root, PersistenceCoordinator::global())
     }
 
     #[cfg(test)]
@@ -234,7 +231,7 @@ impl KnownGoodInventoryStore {
         let owner = coordinator.claim_owner(&root).map_err(io::Error::from)?;
         Ok(Self {
             root,
-            owner: Some(owner),
+            owner,
             state: Arc::new(Mutex::new(StoreState::default())),
             active: Mutex::new(ActiveInventories::default()),
             gates: Mutex::new(HashMap::new()),
@@ -242,19 +239,6 @@ impl KnownGoodInventoryStore {
             close_gate: AsyncMutex::new(()),
             phase: Arc::new(AtomicU8::new(StorePhase::Running as u8)),
         })
-    }
-
-    fn volatile(root: PathBuf) -> Self {
-        Self {
-            root,
-            owner: None,
-            state: Arc::new(Mutex::new(StoreState::default())),
-            active: Mutex::new(ActiveInventories::default()),
-            gates: Mutex::new(HashMap::new()),
-            lifecycle: Arc::new(AsyncRwLock::new(())),
-            close_gate: AsyncMutex::new(()),
-            phase: Arc::new(AtomicU8::new(StorePhase::Running as u8)),
-        }
     }
 
     pub(super) async fn reconcile(
@@ -276,16 +260,7 @@ impl KnownGoodInventoryStore {
         }
 
         let snapshot = snapshot_from_inventory(instance_id, version_id, &inventory);
-        self.active
-            .lock()
-            .expect(STORE_LOCK_INVARIANT)
-            .activate_validated(
-                &snapshot,
-                instance_id,
-                version_id,
-                library_root,
-                inventory.clone(),
-            )?;
+        snapshot.validate()?;
         let path = self.snapshot_path(instance_id);
         let read_path = path.clone();
         let persisted = tokio::task::spawn_blocking(move || read_snapshot(&read_path))
@@ -293,7 +268,11 @@ impl KnownGoodInventoryStore {
             .unwrap_or(Ok(None))
             .unwrap_or(None);
 
-        self.reconcile_persistence(instance_id, path, persisted.as_ref(), snapshot);
+        self.reconcile_persistence(instance_id, path, persisted.as_ref(), snapshot.clone())?;
+        self.active
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .activate_validated(&snapshot, instance_id, version_id, library_root, inventory)?;
         Ok(())
     }
 
@@ -394,9 +373,6 @@ impl KnownGoodInventoryStore {
             state.writers.remove(instance_id);
         }
 
-        if self.owner.is_none() {
-            return Ok(());
-        }
         let path = self.snapshot_path(instance_id);
         let target = known_good_target(instance_id);
         tokio::task::spawn_blocking(move || {
@@ -419,10 +395,7 @@ impl KnownGoodInventoryStore {
         self.clear_active();
         let transition = CloseTransition::new(self.phase.clone());
         let result = match self.settle_writers().await {
-            Ok(()) => match &self.owner {
-                Some(owner) => owner.close().await.map_err(io::Error::from),
-                None => Ok(()),
-            },
+            Ok(()) => self.owner.close().await.map_err(io::Error::from),
             Err(error) => Err(error),
         };
         if result.is_ok() {
@@ -431,58 +404,38 @@ impl KnownGoodInventoryStore {
         result
     }
 
-    fn accept_snapshot(&self, instance_id: &str, path: PathBuf, snapshot: KnownGoodSnapshot) {
-        let writer = {
-            let mut state = self.state.lock().expect(STORE_LOCK_INVARIANT);
+    fn accept_snapshot(
+        &self,
+        instance_id: &str,
+        path: PathBuf,
+        snapshot: KnownGoodSnapshot,
+    ) -> io::Result<()> {
+        let (writer, is_new) = {
+            let state = self.state.lock().expect(STORE_LOCK_INVARIANT);
             match state.writers.get(instance_id) {
-                Some(writer) => writer.clone(),
-                None => match self
-                    .owner
-                    .as_ref()
-                    .ok_or_else(closed_error)
-                    .and_then(|owner| {
-                        owner
-                            .writer(&path, known_good_target(instance_id))
-                            .map_err(io::Error::from)
-                    }) {
-                    Ok(writer) => {
-                        state
-                            .writers
-                            .insert(instance_id.to_string(), writer.clone());
-                        writer
-                    }
-                    Err(_) => {
-                        state.pending.insert(
-                            instance_id.to_string(),
-                            PendingSnapshot {
-                                revision: None,
-                                snapshot,
-                                failed: true,
-                            },
-                        );
-                        return;
-                    }
-                },
+                Some(writer) => (writer.clone(), false),
+                None => {
+                    let writer = self
+                        .owner
+                        .writer(&path, known_good_target(instance_id))
+                        .map_err(io::Error::from)?;
+                    (writer, true)
+                }
             }
         };
 
-        match writer.accept(snapshot.clone(), WriteUrgency::Immediate, encode_snapshot) {
-            Ok(ticket) => self.track_ticket(instance_id, snapshot, ticket),
-            Err(_) => {
-                self.state
-                    .lock()
-                    .expect(STORE_LOCK_INVARIANT)
-                    .pending
-                    .insert(
-                        instance_id.to_string(),
-                        PendingSnapshot {
-                            revision: None,
-                            snapshot,
-                            failed: true,
-                        },
-                    );
-            }
+        let ticket = writer
+            .accept(snapshot.clone(), WriteUrgency::Immediate, encode_snapshot)
+            .map_err(io::Error::from)?;
+        if is_new {
+            self.state
+                .lock()
+                .expect(STORE_LOCK_INVARIANT)
+                .writers
+                .insert(instance_id.to_string(), writer);
         }
+        self.track_ticket(instance_id, snapshot, ticket);
+        Ok(())
     }
 
     async fn settle_writers(&self) -> io::Result<()> {
@@ -506,7 +459,7 @@ impl KnownGoodInventoryStore {
                         .get(&instance_id)
                         .map(|pending| pending.snapshot.clone())
                         .ok_or_else(|| io::Error::from(PersistenceError::RetryUnavailable))?;
-                    self.accept_snapshot(&instance_id, self.snapshot_path(&instance_id), snapshot);
+                    self.accept_snapshot(&instance_id, self.snapshot_path(&instance_id), snapshot)?;
                     let writer = self
                         .state
                         .lock()
@@ -529,8 +482,7 @@ impl KnownGoodInventoryStore {
         if state
             .pending
             .get(instance_id)
-            .and_then(|pending| pending.revision)
-            .is_some_and(|revision| revision <= committed_revision)
+            .is_some_and(|pending| pending.revision <= committed_revision)
         {
             state.pending.remove(instance_id);
         }
@@ -542,7 +494,7 @@ impl KnownGoodInventoryStore {
         path: PathBuf,
         persisted: Option<&KnownGoodSnapshot>,
         snapshot: KnownGoodSnapshot,
-    ) {
+    ) -> io::Result<()> {
         let pending = self
             .state
             .lock()
@@ -552,41 +504,40 @@ impl KnownGoodInventoryStore {
             .cloned();
         if let Some(pending) = pending {
             if pending.snapshot == snapshot {
-                if pending.failed && !self.retry_snapshot(instance_id, &snapshot) {
-                    self.accept_snapshot(instance_id, path, snapshot);
+                if pending.failed && !self.retry_snapshot(instance_id, &snapshot)? {
+                    self.accept_snapshot(instance_id, path, snapshot)?;
                 }
-                return;
+                return Ok(());
             }
-            self.accept_snapshot(instance_id, path, snapshot);
-            return;
+            return self.accept_snapshot(instance_id, path, snapshot);
         }
         if persisted == Some(&snapshot) {
-            return;
+            return Ok(());
         }
-        self.accept_snapshot(instance_id, path, snapshot);
+        self.accept_snapshot(instance_id, path, snapshot)
     }
 
-    fn retry_snapshot(&self, instance_id: &str, snapshot: &KnownGoodSnapshot) -> bool {
+    fn retry_snapshot(&self, instance_id: &str, snapshot: &KnownGoodSnapshot) -> io::Result<bool> {
         let retry = {
             let state = self.state.lock().expect(STORE_LOCK_INVARIANT);
             let Some(pending) = state.pending.get(instance_id) else {
-                return false;
+                return Ok(false);
             };
             if !pending.failed || pending.snapshot != *snapshot {
-                return false;
+                return Ok(false);
             }
-            let (Some(revision), Some(writer)) =
-                (pending.revision, state.writers.get(instance_id).cloned())
-            else {
-                return false;
-            };
-            (revision, writer)
+            let writer = state
+                .writers
+                .get(instance_id)
+                .cloned()
+                .ok_or_else(closed_error)?;
+            (pending.revision, writer)
         };
 
         let ticket = match retry.1.retry() {
             Ok(ticket) => ticket,
-            Err(PersistenceError::RetryUnavailable) => return false,
-            Err(_) => return true,
+            Err(PersistenceError::RetryUnavailable) => return Ok(false),
+            Err(error) => return Err(io::Error::from(error)),
         };
         assert_eq!(
             ticket.revision().get(),
@@ -594,7 +545,7 @@ impl KnownGoodInventoryStore {
             "known-good retry revision diverged from retained candidate"
         );
         self.track_ticket(instance_id, snapshot.clone(), ticket);
-        true
+        Ok(true)
     }
 
     fn track_ticket(&self, instance_id: &str, snapshot: KnownGoodSnapshot, ticket: AcceptedWrite) {
@@ -606,7 +557,7 @@ impl KnownGoodInventoryStore {
             .insert(
                 instance_id.to_string(),
                 PendingSnapshot {
-                    revision: Some(revision),
+                    revision,
                     snapshot: snapshot.clone(),
                     failed: false,
                 },
@@ -618,7 +569,7 @@ impl KnownGoodInventoryStore {
             let Some(pending) = state.pending.get_mut(&instance_id) else {
                 return;
             };
-            if pending.revision != Some(revision) || pending.snapshot != snapshot {
+            if pending.revision != revision || pending.snapshot != snapshot {
                 return;
             }
             if result.is_ok() {
@@ -669,16 +620,12 @@ impl KnownGoodInventoryStore {
             .await
             .unwrap_or(Ok(None))?;
         let instance_id = snapshot.instance_id.clone();
-        self.reconcile_persistence(&instance_id, path, persisted.as_ref(), snapshot);
-        Ok(())
+        self.reconcile_persistence(&instance_id, path, persisted.as_ref(), snapshot)
     }
 
     #[cfg(test)]
     async fn flush_for_test(&self) -> io::Result<()> {
-        match &self.owner {
-            Some(owner) => owner.flush().await.map_err(io::Error::from),
-            None => Ok(()),
-        }?;
+        self.owner.flush().await.map_err(io::Error::from)?;
 
         // Persistence can finish before ticket observers clear the store's pending marker.
         let writers = self
@@ -1084,6 +1031,106 @@ mod tests {
             fs::canonicalize(&second).expect("canonical second")
         );
         assert_ne!(first_identity, second_identity);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn duplicate_claim_fails_until_the_owned_store_closes() {
+        let (root, paths) = paths("duplicate-owner");
+        let backend = FileBackend::new(0);
+        let coordinator = PersistenceCoordinator::for_test(
+            backend,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        );
+        let first = KnownGoodInventoryStore::claim_with_coordinator(&paths, coordinator.clone())
+            .expect("first owner");
+
+        let duplicate =
+            KnownGoodInventoryStore::claim_with_coordinator(&paths, coordinator.clone())
+                .err()
+                .expect("duplicate owner must fail");
+        assert_eq!(duplicate.kind(), io::ErrorKind::AlreadyExists);
+
+        first.close().await.expect("close first owner");
+        KnownGoodInventoryStore::claim_with_coordinator(&paths, coordinator)
+            .expect("closed owner root is reclaimable");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn conflicting_snapshot_lane_rejects_reconciliation_without_pending_state() {
+        let (root, paths) = paths("snapshot-lane-conflict");
+        let backend = FileBackend::new(0);
+        let coordinator = PersistenceCoordinator::for_test(
+            backend,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        );
+        let store = KnownGoodInventoryStore::claim_with_coordinator(&paths, coordinator.clone())
+            .expect("known-good owner");
+        fs::create_dir_all(&store.root).expect("known-good directory");
+        let current = snapshot("0000000000000010", "1.21.5");
+        let path = store.snapshot_path(&current.instance_id);
+        let conflicting_owner = coordinator.claim_owner(&path).expect("conflicting owner");
+        let conflicting_writer = conflicting_owner
+            .writer(&path, known_good_target(&current.instance_id))
+            .expect("conflicting writer");
+
+        let error = store
+            .reconcile_snapshot(current)
+            .await
+            .expect_err("physical lane collision must fail reconciliation");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        {
+            let state = store.state.lock().expect(STORE_LOCK_INVARIANT);
+            assert!(state.pending.is_empty());
+            assert!(state.writers.is_empty());
+        }
+
+        drop(conflicting_writer);
+        conflicting_owner
+            .close()
+            .await
+            .expect("close conflicting owner");
+        store.close().await.expect("close known-good owner");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failed_new_writer_admission_leaves_no_store_or_live_state() {
+        let (root, paths) = paths("writer-admission-failure");
+        let backend = FileBackend::new(0);
+        let store = store(&paths, backend);
+        let current = snapshot("0000000000000011", "1.21.5");
+        let path = store.snapshot_path(&current.instance_id);
+        let exhausted_writer = store
+            .owner
+            .writer(&path, known_good_target(&current.instance_id))
+            .expect("unpublished writer");
+        exhausted_writer.exhaust_revisions_for_test();
+
+        let error = store
+            .reconcile_snapshot(current)
+            .await
+            .expect_err("revision exhaustion must reject persistence admission");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        {
+            let state = store.state.lock().expect(STORE_LOCK_INVARIANT);
+            assert!(state.pending.is_empty());
+            assert!(state.writers.is_empty());
+        }
+        assert!(
+            store
+                .active
+                .lock()
+                .expect(STORE_LOCK_INVARIANT)
+                .by_instance
+                .is_empty()
+        );
+
+        drop(exhausted_writer);
+        store.close().await.expect("close known-good owner");
         let _ = fs::remove_dir_all(root);
     }
 

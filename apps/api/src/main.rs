@@ -60,7 +60,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         startup_warnings,
         frontend_dir: default_frontend_dir(),
     })
-    .await;
+    .await?;
     spawn_performance_operations_resume(&state);
     spawn_benchmark_suite_drivers_resume(&state);
     spawn_performance_rules_refresh(&state);

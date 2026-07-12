@@ -63,7 +63,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         startup_warnings,
         frontend_dir: axial_api::app::default_frontend_dir(),
     })
-    .await;
+    .await?;
     let telemetry = state.telemetry().clone();
     let discord_presence = discord_presence::spawn(state.clone());
     spawn_performance_operations_resume(&state);

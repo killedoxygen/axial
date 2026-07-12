@@ -464,7 +464,7 @@ pub(crate) async fn start_install_version_owned(
                             .accept_known_good_install_receipt(&installed_library_root, receipt)
                             .await
                         {
-                            Ok(_) => break (true, attempt_terminal_progress),
+                            Ok(()) => break (true, attempt_terminal_progress),
                             Err(error) => {
                                 tracing::warn!(
                                     operation_id = worker_operation_id.as_str(),

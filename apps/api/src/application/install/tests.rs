@@ -2177,7 +2177,7 @@ async fn loader_receipt_acceptance_completes_before_terminal_success_is_publishe
                 .lock()
                 .expect("events lock")
                 .push("accepted");
-            Ok(1)
+            Ok(())
         },
         Some(done_progress()),
         move |progress| {
@@ -2249,7 +2249,7 @@ async fn loader_receipt_identity_mismatch_cannot_publish_success() {
                 "loader-v2-expected",
                 "loader-v2-authenticated-base",
             )?;
-            Ok(1)
+            Ok(())
         },
         Some(done_progress()),
         move |progress| {

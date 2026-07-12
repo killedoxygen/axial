@@ -598,6 +598,15 @@ impl AcceptedWrite {
 }
 
 impl AtomicSnapshotWriter {
+    #[cfg(test)]
+    pub(crate) fn exhaust_revisions_for_test(&self) {
+        self.lane
+            .state
+            .lock()
+            .expect("persistence lane state lock poisoned")
+            .next_revision = u64::MAX;
+    }
+
     pub(crate) fn accept<T, Encode>(
         &self,
         value: T,

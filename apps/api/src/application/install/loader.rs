@@ -373,11 +373,11 @@ pub(super) async fn publish_known_good_loader_terminal<F, P>(
     publish: P,
 ) -> LoaderTerminalPublication
 where
-    F: Future<Output = std::io::Result<usize>>,
+    F: Future<Output = std::io::Result<()>>,
     P: FnOnce(DownloadProgress),
 {
     match acceptance.await {
-        Ok(_) => {
+        Ok(()) => {
             publish(captured_terminal.unwrap_or_else(loader_install_done_progress));
             LoaderTerminalPublication::success()
         }
