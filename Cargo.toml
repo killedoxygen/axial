@@ -3,6 +3,7 @@ members = [
   "apps/api",
   "apps/desktop",
   "core/config",
+  "core/content",
   "core/launcher",
   "core/minecraft",
   "core/performance",
