@@ -981,11 +981,11 @@ async fn install_status_exposes_interrupted_install_as_redacted_terminal_state()
         Some(INSTALL_FAILURE_MESSAGE)
     );
     let guardian = response.guardian.as_ref().expect("guardian outcome");
-    assert_eq!(guardian.diagnosis_id, DiagnosisId::DownloadUnavailable);
-    assert_eq!(guardian.decision, "retry");
+    assert_eq!(guardian.diagnosis_id(), DiagnosisId::DownloadUnavailable);
+    assert_eq!(guardian.decision(), "retry");
     assert!(
         guardian
-            .label
+            .label()
             .contains("install download failure as retryable")
     );
     assert!(response.guardian_repair.is_none());
@@ -1066,8 +1066,8 @@ async fn restart_interrupted_install_retry_discards_stale_temp_without_promoting
         Some("install_worker_interrupted")
     );
     let guardian = response.guardian.as_ref().expect("guardian outcome");
-    assert_eq!(guardian.diagnosis_id, DiagnosisId::DownloadUnavailable);
-    assert_eq!(guardian.decision, "retry");
+    assert_eq!(guardian.diagnosis_id(), DiagnosisId::DownloadUnavailable);
+    assert_eq!(guardian.decision(), "retry");
     let failure_view_model = response
         .failure_view_model
         .as_ref()
@@ -1181,7 +1181,7 @@ async fn install_status_reconstructs_journal_progress_when_snapshot_is_missing()
         Some(INSTALL_FAILURE_MESSAGE)
     );
     let guardian = response.guardian.as_ref().expect("guardian outcome");
-    assert_eq!(guardian.diagnosis_id, DiagnosisId::DownloadUnavailable);
+    assert_eq!(guardian.diagnosis_id(), DiagnosisId::DownloadUnavailable);
     assert_no_public_raw_fragments(&serde_json::to_string(&response).expect("status json"));
 
     let _ = fs::remove_dir_all(root);
@@ -1412,11 +1412,11 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
     assert!(response.done);
     assert!(response.guardian_repair.is_none());
     let guardian = response.guardian.as_ref().expect("guardian outcome");
-    assert_eq!(guardian.diagnosis_id, DiagnosisId::DownloadUnavailable);
-    assert_eq!(guardian.decision, "retry");
+    assert_eq!(guardian.diagnosis_id(), DiagnosisId::DownloadUnavailable);
+    assert_eq!(guardian.decision(), "retry");
     assert!(
         guardian
-            .label
+            .label()
             .contains("install download failure as retryable")
     );
     let failure_view_model = response
@@ -1424,7 +1424,7 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
         .as_ref()
         .expect("failure view model");
     assert_eq!(failure_view_model.state_id, "failed_retryable");
-    assert_eq!(failure_view_model.summary, guardian.label);
+    assert_eq!(failure_view_model.summary, guardian.label());
     assert!(failure_view_model.retry_action.enabled);
     assert!(!failure_view_model.repair_action.enabled);
     assert!(
@@ -1436,11 +1436,10 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
     );
     assert!(
         guardian
-            .detail
-            .as_deref()
+            .detail()
             .is_some_and(|detail| detail.contains("provider or network download"))
     );
-    assert!(!guardian.guidance.is_empty());
+    assert!(!guardian.guidance().is_empty());
     assert_no_public_raw_fragments(&serde_json::to_string(&guardian).expect("guardian json"));
     assert_no_public_raw_fragments(
         &serde_json::to_string(&failure_view_model).expect("failure view model json"),
@@ -1524,18 +1523,17 @@ async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
     );
     let guardian = response.guardian.as_ref().expect("guardian outcome");
     assert_eq!(
-        guardian.diagnosis_id,
+        guardian.diagnosis_id(),
         DiagnosisId::ManagedRuntimeUnavailableForPlatform
     );
-    assert_eq!(guardian.decision, "block");
+    assert_eq!(guardian.decision(), "block");
     assert_eq!(
-        guardian.label,
+        guardian.label(),
         "This Minecraft version needs a Java runtime that is not available for this device."
     );
     assert!(
         guardian
-            .detail
-            .as_deref()
+            .detail()
             .is_some_and(|detail| detail.contains("jre-legacy") && detail.contains("mac-os-arm64"))
     );
     let failure_view_model = response
@@ -1628,21 +1626,20 @@ async fn install_status_exposes_rosetta_required_failure_with_retry() {
     );
     let guardian = response.guardian.as_ref().expect("guardian outcome");
     assert_eq!(
-        guardian.diagnosis_id,
+        guardian.diagnosis_id(),
         DiagnosisId::ManagedRuntimeRosettaRequired
     );
-    assert_eq!(guardian.decision, "block");
+    assert_eq!(guardian.decision(), "block");
     assert_eq!(
-        guardian.label,
+        guardian.label(),
         "This Minecraft version needs Rosetta 2 on Apple Silicon Macs."
     );
     assert!(
         guardian
-            .detail
-            .as_deref()
+            .detail()
             .is_some_and(|detail| detail.contains("jre-legacy") && detail.contains("Rosetta 2"))
     );
-    assert!(guardian.guidance.iter().any(|guidance| {
+    assert!(guardian.guidance().iter().any(|guidance| {
         guidance.contains("softwareupdate --install-rosetta --agree-to-license")
     }));
     let failure_view_model = response
@@ -1723,12 +1720,11 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
         .expect("install status");
 
     let guardian = response.guardian.as_ref().expect("guardian outcome");
-    assert_eq!(guardian.diagnosis_id, DiagnosisId::DownloadUnavailable);
-    assert_eq!(guardian.decision, "retry");
+    assert_eq!(guardian.diagnosis_id(), DiagnosisId::DownloadUnavailable);
+    assert_eq!(guardian.decision(), "retry");
     assert!(
         guardian
-            .detail
-            .as_deref()
+            .detail()
             .is_some_and(|detail| detail.contains("provider or network download"))
     );
     let failure_view_model = response
@@ -1961,14 +1957,14 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
         assert!(response.done);
         assert!(response.guardian_repair.is_none());
         let guardian = response.guardian.as_ref().expect("guardian outcome");
-        assert_eq!(guardian.diagnosis_id, diagnosis_id);
-        assert_eq!(guardian.decision, decision);
+        assert_eq!(guardian.diagnosis_id(), diagnosis_id);
+        assert_eq!(guardian.decision(), decision);
         let failure_view_model = response
             .failure_view_model
             .as_ref()
             .expect("failure view model");
         assert_eq!(failure_view_model.state_id, "failed_blocked");
-        assert_eq!(failure_view_model.summary, guardian.label);
+        assert_eq!(failure_view_model.summary, guardian.label());
         assert!(!failure_view_model.retry_action.enabled);
         assert!(
             failure_view_model
@@ -1981,19 +1977,18 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
             "{diagnosis_id} disabled reason did not contain backend guidance: {failure_view_model:?}"
         );
         assert!(
-            guardian.label.contains(label_fragment),
+            guardian.label().contains(label_fragment),
             "{diagnosis_id} label did not contain expected fragment: {guardian:?}"
         );
         assert!(
             guardian
-                .detail
-                .as_deref()
+                .detail()
                 .is_some_and(|detail| detail.contains(detail_fragment)),
             "{diagnosis_id} detail did not contain expected fragment: {guardian:?}"
         );
         assert!(
             guardian
-                .guidance
+                .guidance()
                 .iter()
                 .any(|guidance| guidance.contains(guidance_fragment)),
             "{diagnosis_id} guidance did not contain expected fragment: {guardian:?}"
@@ -3282,17 +3277,16 @@ async fn install_journal_records_guardian_download_failure_outcome_without_raw_d
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
-    assert_eq!(summary.diagnosis_id, DiagnosisId::DownloadUnavailable);
-    assert_eq!(summary.decision, "retry");
+    assert_eq!(summary.diagnosis_id(), DiagnosisId::DownloadUnavailable);
+    assert_eq!(summary.decision(), "retry");
     assert!(
         summary
-            .label
+            .label()
             .contains("install download failure as retryable")
     );
     assert!(
         summary
-            .detail
-            .as_deref()
+            .detail()
             .is_some_and(|detail| detail.contains("provider or network download"))
     );
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
@@ -3334,11 +3328,11 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
-    assert_eq!(summary.diagnosis_id, DiagnosisId::DownloadUnavailable);
-    assert_eq!(summary.decision, "retry");
+    assert_eq!(summary.diagnosis_id(), DiagnosisId::DownloadUnavailable);
+    assert_eq!(summary.decision(), "retry");
     assert!(
         summary
-            .label
+            .label()
             .contains("install download failure as retryable")
     );
     assert_eq!(failure_memory.list().len(), 1);
@@ -3370,16 +3364,16 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     let suppressed_entry = journals.get(&suppressed_operation_id).expect("journal");
     let suppressed =
         install_guardian_outcome_summary_from_journal(&suppressed_entry).expect("guardian outcome");
-    assert_eq!(suppressed.diagnosis_id, DiagnosisId::DownloadUnavailable);
-    assert_eq!(suppressed.decision, "block");
+    assert_eq!(suppressed.diagnosis_id(), DiagnosisId::DownloadUnavailable);
+    assert_eq!(suppressed.decision(), "block");
     assert!(
         suppressed
-            .label
+            .label()
             .contains("paused install retry after repeated provider failure")
     );
     assert!(
         suppressed
-            .guidance
+            .guidance()
             .iter()
             .any(|guidance| guidance.contains("Wait a few minutes"))
     );
@@ -3423,11 +3417,11 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
-    assert_eq!(summary.diagnosis_id, DiagnosisId::DownloadUnavailable);
-    assert_eq!(summary.decision, "retry");
+    assert_eq!(summary.diagnosis_id(), DiagnosisId::DownloadUnavailable);
+    assert_eq!(summary.decision(), "retry");
     assert!(
         summary
-            .label
+            .label()
             .contains("install download failure as retryable")
     );
     assert_eq!(failure_memory.list().len(), 1);
@@ -3460,16 +3454,16 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
     let suppressed_entry = journals.get(&suppressed_operation_id).expect("journal");
     let suppressed =
         install_guardian_outcome_summary_from_journal(&suppressed_entry).expect("guardian outcome");
-    assert_eq!(suppressed.diagnosis_id, DiagnosisId::DownloadUnavailable);
-    assert_eq!(suppressed.decision, "block");
+    assert_eq!(suppressed.diagnosis_id(), DiagnosisId::DownloadUnavailable);
+    assert_eq!(suppressed.decision(), "block");
     assert!(
         suppressed
-            .label
+            .label()
             .contains("paused install retry after repeated provider failure")
     );
     assert!(
         suppressed
-            .guidance
+            .guidance()
             .iter()
             .any(|guidance| guidance.contains("Wait a few minutes"))
     );
@@ -3507,22 +3501,21 @@ async fn loader_base_install_dependency_failure_records_guardian_block_without_r
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
     assert_eq!(entry.status, OperationStatus::Failed);
-    assert_eq!(summary.diagnosis_id, DiagnosisId::InstallDependencyFailed);
-    assert_eq!(summary.decision, "block");
+    assert_eq!(summary.diagnosis_id(), DiagnosisId::InstallDependencyFailed);
+    assert_eq!(summary.decision(), "block");
     assert!(
-        summary.label.contains("required base install failed"),
+        summary.label().contains("required base install failed"),
         "{summary:?}"
     );
     assert!(
         summary
-            .detail
-            .as_deref()
+            .detail()
             .is_some_and(|detail| detail.contains("base Minecraft install failed")),
         "{summary:?}"
     );
     assert!(
         summary
-            .guidance
+            .guidance()
             .iter()
             .any(|guidance| guidance.contains("Retry the base version install")),
         "{summary:?}"

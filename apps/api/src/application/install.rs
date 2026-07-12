@@ -13,7 +13,10 @@ mod repair;
 mod stream;
 
 use super::InstallVersionCommand;
-use crate::guardian::{DiagnosisId, GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus};
+use crate::guardian::{
+    DiagnosisId, GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus,
+    GuardianInstallOutcomeSummary,
+};
 use crate::observability::{
     operation_journal_proof_record,
     telemetry::{
@@ -236,13 +239,12 @@ use loader::{
 };
 pub use loader::{loader_builds, loader_components, loader_error_response, loader_game_versions};
 pub use model::{
-    InstallActionViewModel, InstallFailureViewModel, InstallGuardianOutcomeSummary,
-    InstallGuardianRepairSummary, InstallProgressStepViewModel, InstallProgressViewModel,
-    InstallQueueActiveViewModel, InstallQueueInstallItemViewModel, InstallQueueLoaderItemViewModel,
-    InstallQueueNoticeViewModel, InstallQueueRequest, InstallQueueStateResponse,
-    InstallQueueViewModel, InstallQueuedItemViewModel, InstallStartResponse, InstallStatusResponse,
-    InstallVersionStaging, InstallVersionStartRequest, LoaderBuildsRequest,
-    LoaderInstallStartRequest,
+    InstallActionViewModel, InstallFailureViewModel, InstallGuardianRepairSummary,
+    InstallProgressStepViewModel, InstallProgressViewModel, InstallQueueActiveViewModel,
+    InstallQueueInstallItemViewModel, InstallQueueLoaderItemViewModel, InstallQueueNoticeViewModel,
+    InstallQueueRequest, InstallQueueStateResponse, InstallQueueViewModel,
+    InstallQueuedItemViewModel, InstallStartResponse, InstallStatusResponse, InstallVersionStaging,
+    InstallVersionStartRequest, LoaderBuildsRequest, LoaderInstallStartRequest,
 };
 use operation::{
     InstallProgressCoalescer, install_failure_point_from_journal, install_journal_is_terminal,
@@ -1440,7 +1442,7 @@ pub(crate) fn effective_install_fields(request: &InstallVersionStartRequest) -> 
 
 fn install_failure_view_model(
     progress: &InstallProgressViewModel,
-    guardian: Option<&InstallGuardianOutcomeSummary>,
+    guardian: Option<&GuardianInstallOutcomeSummary>,
     repair: Option<&InstallGuardianRepairSummary>,
 ) -> Option<InstallFailureViewModel> {
     if !progress.failed {
@@ -1448,16 +1450,16 @@ fn install_failure_view_model(
     }
 
     let summary = guardian
-        .map(|guardian| guardian.label.clone())
+        .map(|guardian| guardian.label().to_string())
         .or_else(|| repair.map(|repair| repair.label.clone()))
         .unwrap_or_else(|| progress.label.clone());
     let mut details = Vec::new();
     push_install_failure_detail(
         &mut details,
-        guardian.and_then(|guardian| guardian.detail.clone()),
+        guardian.and_then(|guardian| guardian.detail().map(str::to_string)),
     );
     if let Some(guardian) = guardian {
-        for guidance in &guardian.guidance {
+        for guidance in guardian.guidance() {
             push_install_failure_detail(&mut details, Some(guidance.clone()));
         }
     }
@@ -1496,7 +1498,7 @@ fn push_install_failure_detail(details: &mut Vec<String>, detail: Option<String>
 }
 
 fn failure_state_id(
-    guardian: Option<&InstallGuardianOutcomeSummary>,
+    guardian: Option<&GuardianInstallOutcomeSummary>,
     repair: Option<&InstallGuardianRepairSummary>,
 ) -> &'static str {
     if let Some(repair) = repair {
@@ -1508,7 +1510,7 @@ fn failure_state_id(
             _ => "failed_repair_recorded",
         };
     }
-    match guardian.map(|guardian| guardian.decision.as_str()) {
+    match guardian.map(GuardianInstallOutcomeSummary::decision) {
         Some("retry") => "failed_retryable",
         Some("block") => "failed_blocked",
         Some("suppress") => "failed_suppressed",
@@ -1518,7 +1520,7 @@ fn failure_state_id(
 }
 
 fn install_retry_action(
-    guardian: Option<&InstallGuardianOutcomeSummary>,
+    guardian: Option<&GuardianInstallOutcomeSummary>,
     repair: Option<&InstallGuardianRepairSummary>,
 ) -> InstallActionViewModel {
     if repair.is_some_and(|repair| repair.status == "repaired") {
@@ -1530,15 +1532,14 @@ fn install_retry_action(
         };
     }
 
-    if guardian.is_some_and(|guardian| {
-        guardian.decision == "block" && !blocking_guardian_allows_retry(guardian)
+    if let Some(guardian) = guardian.filter(|guardian| {
+        guardian.decision() == "block" && !blocking_guardian_allows_retry(guardian)
     }) {
-        let disabled_reason = guardian_retry_disabled_reason(guardian);
         return InstallActionViewModel {
             action: "retry".to_string(),
             label: "Retry install".to_string(),
             enabled: false,
-            disabled_reason: Some(disabled_reason),
+            disabled_reason: Some(guardian.retry_disabled_reason().to_string()),
         };
     }
 
@@ -1550,21 +1551,8 @@ fn install_retry_action(
     }
 }
 
-fn blocking_guardian_allows_retry(guardian: &InstallGuardianOutcomeSummary) -> bool {
-    guardian.diagnosis_id == DiagnosisId::ManagedRuntimeRosettaRequired
-}
-
-fn guardian_retry_disabled_reason(guardian: Option<&InstallGuardianOutcomeSummary>) -> String {
-    guardian
-        .and_then(|guardian| {
-            guardian
-                .guidance
-                .first()
-                .cloned()
-                .or_else(|| guardian.detail.clone())
-                .or_else(|| Some(guardian.label.clone()))
-        })
-        .unwrap_or_else(|| "Guardian blocked immediate retry for this install.".to_string())
+fn blocking_guardian_allows_retry(guardian: &GuardianInstallOutcomeSummary) -> bool {
+    guardian.diagnosis_id() == DiagnosisId::ManagedRuntimeRosettaRequired
 }
 
 fn install_repair_action(repair: Option<&InstallGuardianRepairSummary>) -> InstallActionViewModel {

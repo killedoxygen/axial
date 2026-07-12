@@ -1,5 +1,5 @@
 use super::super::{ApplicationCommand, CommandResult, InstallVersionPayload};
-use crate::guardian::DiagnosisId;
+use crate::guardian::{DiagnosisId, GuardianInstallOutcomeSummary};
 use crate::observability::OperationProofRecord;
 use crate::state::contracts::OperationId;
 use axial_minecraft::{DownloadProgress, LoaderComponentId};
@@ -19,17 +19,6 @@ pub struct InstallGuardianRepairSummary {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InstallGuardianOutcomeSummary {
-    pub diagnosis_id: DiagnosisId,
-    pub decision: String,
-    pub label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub guidance: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -91,7 +80,7 @@ impl InstallProgressViewModel {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InstallStatusResponse {
     pub install_id: String,
     pub operation_id: OperationId,
@@ -103,7 +92,7 @@ pub struct InstallStatusResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_point: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guardian: Option<InstallGuardianOutcomeSummary>,
+    pub guardian: Option<GuardianInstallOutcomeSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardian_repair: Option<InstallGuardianRepairSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

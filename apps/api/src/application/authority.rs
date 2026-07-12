@@ -886,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn guardian_preset_and_launch_stage_copy_have_one_production_author() {
+    fn guardian_surface_copy_has_one_production_author() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
@@ -897,6 +897,10 @@ mod tests {
             "Guardian adjusted the JVM preset",
             "Guardian reset an unknown JVM preset to Automatic",
             "Guardian recorded the launch safety decision.",
+            "\"Guardian blocked\"",
+            "\"Guardian warned\"",
+            "\"Guardian intervened\"",
+            "\"Guardian note\"",
         ] {
             assert!(
                 copy.contains(marker),
@@ -934,6 +938,23 @@ mod tests {
                 "Guardian reset an unknown JVM preset to Automatic",
                 "Guardian recorded the launch safety decision.",
                 "guardian_launch_safety_decision",
+                "\"Guardian blocked\"",
+                "\"Guardian warned\"",
+                "\"Guardian intervened\"",
+                "\"Guardian note\"",
+                "Guardian blocked immediate retry for this install.",
+                "Guardian recorded an install safety outcome.",
+                "Guardian recorded bounded install failure details.",
+                "guardian_decision_label",
+                "guardian_decision_tone",
+                "guardian_retry_disabled_reason",
+                "prefixed_guardian_guidance_fact",
+                "expand_guardian_guidance_fact",
+                "rosetta_required_install_guidance",
+                "GUARDIAN_OUTCOME_DECISION_PREFIX",
+                "GUARDIAN_OUTCOME_SUMMARY_PREFIX",
+                "GUARDIAN_OUTCOME_DETAIL_PREFIX",
+                "GUARDIAN_OUTCOME_GUIDANCE_PREFIX",
             ] {
                 if production.contains(marker) {
                     violations.push(format!("{relative}: {marker}"));

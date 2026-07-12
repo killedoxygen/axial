@@ -37,6 +37,8 @@ mod preflight_copy_snapshot;
 mod preflight_decision_snapshot;
 #[cfg(test)]
 mod preset_stage_copy_snapshot;
+#[cfg(test)]
+mod projection_copy_snapshot;
 mod repair_terminal;
 mod rules;
 
@@ -51,13 +53,14 @@ pub use artifact_repair::{
 pub(crate) use copy::{
     GuardianCopyRequest, GuardianLaunchAdmission, GuardianRuntimeRepairCopy, author_guardian_copy,
     guardian_directive_description, guardian_failed_launch_recovery_log,
-    guardian_launch_stage_evidence, guardian_summary_with_blocked_outcome,
+    guardian_install_outcome_from_persisted_facts, guardian_install_outcome_persistence_facts,
+    guardian_launch_stage_evidence, guardian_proof_evidence, guardian_summary_with_blocked_outcome,
     guardian_summary_with_intervention, guardian_summary_with_observed_outcome,
     guardian_summary_with_suppressed_outcome,
 };
 pub use copy::{
-    GuardianJvmPresetNotice, GuardianJvmPresetOption, GuardianUserOutcome,
-    guardian_jvm_preset_notice, guardian_jvm_preset_options,
+    GuardianInstallOutcomeSummary, GuardianJvmPresetNotice, GuardianJvmPresetOption,
+    GuardianUserOutcome, guardian_jvm_preset_notice, guardian_jvm_preset_options,
 };
 #[cfg(test)]
 pub(crate) use copy::{guardian_launch_stage_evidence_for_test, guardian_user_outcome_for_test};

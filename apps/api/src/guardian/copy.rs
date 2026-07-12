@@ -7,7 +7,10 @@ use super::{
     GuardianPresetDowngradeReason, GuardianRepairStatus, GuardianStartupFailureObservation,
     GuardianStripJvmArgsReason,
 };
-use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
+use crate::observability::{
+    RedactionAudience, sanitize_evidence_text, sanitize_evidence_token,
+    sanitize_public_diagnostic_text,
+};
 use crate::state::contracts::OperationPhase;
 use axial_launcher::{
     CrashEvidence, GuardianDecision as LauncherGuardianDecision, GuardianInterventionKind,
@@ -22,6 +25,10 @@ const MAX_COLLECTION_LINES: usize = 6;
 const MAX_DYNAMIC_TOKEN_BYTES: usize = 64;
 const MAX_STAGE_SUMMARY_BYTES: usize = 160;
 const MAX_STAGE_DETAIL_BYTES: usize = 120;
+const MAX_PROOF_DETAIL_BYTES: usize = 150;
+const GUARDIAN_OUTCOME_DECISION_PREFIX: &str = "guardian_outcome_decision:";
+const GUARDIAN_OUTCOME_SUMMARY_PREFIX: &str = "guardian_outcome_summary:";
+const GUARDIAN_OUTCOME_DETAIL_PREFIX: &str = "guardian_outcome_detail:";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct GuardianJvmPresetOption {
@@ -221,6 +228,245 @@ fn checked_stage_detail(value: String) -> String {
     )
     .filter(|value| !value.is_empty() && value.len() <= MAX_STAGE_DETAIL_BYTES)
     .expect("typed Guardian stage detail must stay public and bounded")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct GuardianProofEvidenceProjection {
+    tone: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+pub(crate) fn guardian_proof_evidence(
+    guardian: &GuardianSummary,
+) -> Option<GuardianProofEvidenceProjection> {
+    let detail = first_bounded_proof_detail(
+        guardian
+            .message
+            .iter()
+            .cloned()
+            .chain(guardian.details.iter().cloned())
+            .chain(guardian.guidance.iter().cloned())
+            .chain(
+                guardian
+                    .interventions
+                    .iter()
+                    .filter_map(|intervention| intervention.detail.clone()),
+            ),
+    );
+    let actionable = matches!(
+        guardian.decision,
+        LauncherGuardianDecision::Blocked
+            | LauncherGuardianDecision::Warned
+            | LauncherGuardianDecision::Intervened
+    );
+    if !actionable && detail.is_none() {
+        return None;
+    }
+
+    let (tone, label) = match guardian.decision {
+        LauncherGuardianDecision::Blocked => ("err", "Guardian blocked"),
+        LauncherGuardianDecision::Warned => ("warn", "Guardian warned"),
+        LauncherGuardianDecision::Intervened => ("info", "Guardian intervened"),
+        LauncherGuardianDecision::Allowed => ("info", "Guardian note"),
+    };
+    Some(GuardianProofEvidenceProjection {
+        tone: trusted_line(tone, MAX_SUMMARY_BYTES),
+        label: trusted_line(label, MAX_SUMMARY_BYTES),
+        detail,
+    })
+}
+
+fn first_bounded_proof_detail(values: impl IntoIterator<Item = String>) -> Option<String> {
+    values.into_iter().find_map(|value| {
+        let detail = sanitize_public_diagnostic_text(
+            &value,
+            RedactionAudience::UserVisible,
+            MAX_PROOF_DETAIL_BYTES,
+            "",
+        );
+        (!detail.is_empty()).then_some(detail)
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GuardianInstallOutcomeSummary {
+    diagnosis_id: DiagnosisId,
+    decision: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    guidance: Vec<String>,
+}
+
+impl GuardianInstallOutcomeSummary {
+    pub fn diagnosis_id(&self) -> DiagnosisId {
+        self.diagnosis_id
+    }
+
+    pub fn decision(&self) -> &str {
+        &self.decision
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+
+    pub fn guidance(&self) -> &[String] {
+        &self.guidance
+    }
+
+    pub(crate) fn retry_disabled_reason(&self) -> &str {
+        self.guidance
+            .first()
+            .map(String::as_str)
+            .or(self.detail.as_deref())
+            .unwrap_or(&self.label)
+    }
+}
+
+pub(crate) fn guardian_install_outcome_persistence_facts(
+    outcome: &GuardianUserOutcome,
+) -> Vec<String> {
+    let mut facts = vec![
+        format!(
+            "{GUARDIAN_OUTCOME_DECISION_PREFIX}{}",
+            guardian_action_persisted_id(outcome.decision)
+        ),
+        format!("{GUARDIAN_OUTCOME_SUMMARY_PREFIX}{}", outcome.summary),
+    ];
+    if let Some(detail) = outcome.details.first() {
+        facts.push(format!("{GUARDIAN_OUTCOME_DETAIL_PREFIX}{detail}"));
+    }
+    facts
+}
+
+pub(crate) fn guardian_install_outcome_from_persisted_facts<'a>(
+    diagnosis_id: DiagnosisId,
+    facts: impl IntoIterator<Item = &'a str>,
+) -> Option<GuardianInstallOutcomeSummary> {
+    let facts = facts.into_iter().collect::<Vec<_>>();
+    let decision = latest_prefixed_fact(&facts, GUARDIAN_OUTCOME_DECISION_PREFIX)
+        .and_then(guardian_action_from_persisted_id)?;
+    let persisted_summary = latest_prefixed_fact(&facts, GUARDIAN_OUTCOME_SUMMARY_PREFIX)?;
+    let persisted_detail = latest_prefixed_fact(&facts, GUARDIAN_OUTCOME_DETAIL_PREFIX);
+    let canonical = author_guardian_copy(GuardianCopyRequest::install_failure_replay(
+        diagnosis_id,
+        decision,
+    ))?;
+    if persisted_summary != canonical.summary {
+        return None;
+    }
+
+    let detail = match (persisted_detail, canonical.details.first()) {
+        (Some(detail), Some(canonical_detail)) => Some(validated_install_detail(
+            diagnosis_id,
+            detail,
+            canonical_detail,
+        )?),
+        (None, None) => None,
+        _ => return None,
+    };
+    Some(GuardianInstallOutcomeSummary {
+        diagnosis_id,
+        decision: guardian_action_persisted_id(decision).to_string(),
+        label: canonical.summary,
+        detail,
+        guidance: canonical.guidance,
+    })
+}
+
+fn latest_prefixed_fact<'a>(facts: &[&'a str], prefix: &str) -> Option<&'a str> {
+    facts
+        .iter()
+        .rev()
+        .find_map(|fact| fact.strip_prefix(prefix))
+}
+
+fn validated_persisted_copy_line(value: &str) -> Option<String> {
+    sanitize_evidence_text(value, RedactionAudience::UserVisible, MAX_LINE_BYTES)
+        .filter(|sanitized| sanitized == value && sanitized.len() <= MAX_LINE_BYTES)
+}
+
+fn validated_install_detail(
+    diagnosis_id: DiagnosisId,
+    value: &str,
+    canonical: &str,
+) -> Option<String> {
+    let value = validated_persisted_copy_line(value)?;
+    if value == canonical {
+        return Some(value);
+    }
+    match diagnosis_id {
+        DiagnosisId::ManagedRuntimeUnavailableForPlatform => {
+            let body = value
+                .strip_prefix("Java runtime component ")?
+                .strip_suffix('.')?;
+            let (component, platform) = body.split_once(" is not available for ")?;
+            validate_dynamic_install_token(component)?;
+            validate_dynamic_install_token(platform)?;
+        }
+        DiagnosisId::ManagedRuntimeRosettaRequired => {
+            let component = value
+                .strip_prefix("Java runtime component ")?
+                .strip_suffix(" needs Rosetta 2 on this Mac.")?;
+            validate_dynamic_install_token(component)?;
+        }
+        _ => return None,
+    }
+    Some(value)
+}
+
+fn validate_dynamic_install_token(value: &str) -> Option<()> {
+    if matches!(value, "the required runtime" | "this device") {
+        return Some(());
+    }
+    sanitize_evidence_token(
+        value,
+        RedactionAudience::UserVisible,
+        MAX_DYNAMIC_TOKEN_BYTES,
+    )
+    .filter(|sanitized| sanitized == value)
+    .map(|_| ())
+}
+
+const fn guardian_action_persisted_id(action: GuardianActionKind) -> &'static str {
+    match action {
+        GuardianActionKind::Allow => "allow",
+        GuardianActionKind::Warn => "warn",
+        GuardianActionKind::Repair => "repair",
+        GuardianActionKind::Retry => "retry",
+        GuardianActionKind::Strip => "strip",
+        GuardianActionKind::Downgrade => "downgrade",
+        GuardianActionKind::Fallback => "fallback",
+        GuardianActionKind::Quarantine => "quarantine",
+        GuardianActionKind::AskUser => "ask_user",
+        GuardianActionKind::Block => "block",
+        GuardianActionKind::RecordOnly => "record_only",
+    }
+}
+
+fn guardian_action_from_persisted_id(value: &str) -> Option<GuardianActionKind> {
+    match value {
+        "allow" => Some(GuardianActionKind::Allow),
+        "warn" => Some(GuardianActionKind::Warn),
+        "repair" => Some(GuardianActionKind::Repair),
+        "retry" => Some(GuardianActionKind::Retry),
+        "strip" => Some(GuardianActionKind::Strip),
+        "downgrade" => Some(GuardianActionKind::Downgrade),
+        "fallback" => Some(GuardianActionKind::Fallback),
+        "quarantine" => Some(GuardianActionKind::Quarantine),
+        "ask_user" => Some(GuardianActionKind::AskUser),
+        "block" => Some(GuardianActionKind::Block),
+        "record_only" => Some(GuardianActionKind::RecordOnly),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -725,6 +971,16 @@ impl<'a> GuardianCopyRequest<'a> {
             context: GuardianCopyContext::InstallFailure {
                 decision,
                 dynamics: install_copy_dynamics(diagnosis_id, evidence),
+            },
+        }
+    }
+
+    fn install_failure_replay(diagnosis_id: DiagnosisId, decision: GuardianActionKind) -> Self {
+        Self {
+            diagnosis_id: Some(diagnosis_id),
+            context: GuardianCopyContext::InstallFailure {
+                decision,
+                dynamics: InstallCopyDynamics::None,
             },
         }
     }
@@ -2814,7 +3070,7 @@ mod tests {
         CopyContextKey, GUARDIAN_COPY_RULES, GUARDIAN_JVM_PRESET_COPY_RULES, GuardianCopyRequest,
         GuardianRuntimeRepairCopy, MAX_COLLECTION_LINES, MAX_LINE_BYTES, MAX_SUMMARY_BYTES,
         PREFLIGHT_DIAGNOSIS_RULES, PREFLIGHT_INVARIANT_DIAGNOSIS_RULES, PREFLIGHT_SUMMARY_RULES,
-        author_guardian_copy, finalize_lines,
+        author_guardian_copy, finalize_lines, guardian_install_outcome_persistence_facts,
     };
     use crate::guardian::{
         DiagnosisId, GuardianActionKind, GuardianInstallArtifactFailureEvidence,
@@ -2840,6 +3096,26 @@ mod tests {
             assert!(!rule.label.is_empty() && rule.label.len() <= MAX_SUMMARY_BYTES);
             assert!(!rule.detail.is_empty() && rule.detail.len() <= MAX_LINE_BYTES);
         }
+    }
+
+    #[test]
+    fn install_persistence_projects_only_sealed_decision_summary_and_detail() {
+        let outcome = author_guardian_copy(GuardianCopyRequest::install_failure_replay(
+            DiagnosisId::ManagedRuntimeRosettaRequired,
+            GuardianActionKind::Block,
+        ))
+        .expect("Rosetta install copy rule");
+
+        assert_eq!(
+            guardian_install_outcome_persistence_facts(&outcome),
+            vec![
+                "guardian_outcome_decision:block".to_string(),
+                "guardian_outcome_summary:This Minecraft version needs Rosetta 2 on Apple Silicon Macs."
+                    .to_string(),
+                "guardian_outcome_detail:Java runtime component the required runtime needs Rosetta 2 on this Mac."
+                    .to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -1,7 +1,6 @@
 use super::{
-    INSTALL_FAILURE_MESSAGE, InstallGuardianOutcomeSummary, InstallJournalReconciliation,
-    InstallProgressStepViewModel, InstallProgressViewModel, InstallVersionStaging,
-    reconcile_install_journal_transition,
+    INSTALL_FAILURE_MESSAGE, InstallJournalReconciliation, InstallProgressStepViewModel,
+    InstallProgressViewModel, InstallVersionStaging, reconcile_install_journal_transition,
 };
 use crate::application::{
     ApplicationCommandRequest, CommandResult, CommandResultCarriers, InstallVersionCommand,
@@ -10,12 +9,12 @@ use crate::application::{
 use crate::guardian::{
     DiagnosisId, GuardianActionKind, GuardianInstallArtifactFailureEvidence,
     GuardianInstallArtifactFailureKind, GuardianMode, GuardianPolicyContext, diagnose,
+    guardian_install_outcome_from_persisted_facts, guardian_install_outcome_persistence_facts,
     install_artifact_failure_from_minecraft_download_fact, install_artifact_failure_guardian_fact,
     install_artifact_failure_guardian_outcome_with_context, install_artifact_failure_safety_case,
 };
 use crate::observability::{
-    RedactionAudience, sanitize_evidence_text, sanitize_evidence_token,
-    sanitize_public_diagnostic_text,
+    RedactionAudience, sanitize_evidence_token, sanitize_public_diagnostic_text,
 };
 use crate::state::contracts::{
     CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
@@ -41,12 +40,6 @@ const PROVIDER_FAILURE_MEMORY_SOURCE: &str = "install_provider";
 const COALESCED_PROGRESS_EVENT_INTERVAL: usize = 25;
 const ROSETTA_INSTALL_COMMAND: &str = "softwareupdate --install-rosetta --agree-to-license";
 const ROSETTA_REQUIRED_INSTALL_GUIDANCE: &str = "Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then retry.";
-const ROSETTA_REQUIRED_INSTALL_GUIDANCE_TOKEN: &str = "rosetta_required_install_guidance";
-
-const GUARDIAN_OUTCOME_DECISION_PREFIX: &str = "guardian_outcome_decision:";
-const GUARDIAN_OUTCOME_SUMMARY_PREFIX: &str = "guardian_outcome_summary:";
-const GUARDIAN_OUTCOME_DETAIL_PREFIX: &str = "guardian_outcome_detail:";
-const GUARDIAN_OUTCOME_GUIDANCE_PREFIX: &str = "guardian_outcome_guidance:";
 const RUNTIME_UNAVAILABLE_INSTALL_FAILURE_MESSAGE_PREFIX: &str =
     "This Minecraft version needs a Java runtime that is not available for this device.";
 const RUNTIME_ROSETTA_REQUIRED_INSTALL_FAILURE_MESSAGE_PREFIX: &str =
@@ -455,28 +448,20 @@ pub async fn record_loader_base_install_dependency_guardian_failure_outcome(
 
 pub fn install_guardian_outcome_summary_from_journal(
     entry: &OperationJournalEntry,
-) -> Option<InstallGuardianOutcomeSummary> {
-    let decision = latest_generated_fact_value(entry, GUARDIAN_OUTCOME_DECISION_PREFIX)?;
-    let label = latest_generated_fact_value(entry, GUARDIAN_OUTCOME_SUMMARY_PREFIX)?;
+) -> Option<crate::guardian::GuardianInstallOutcomeSummary> {
     let diagnosis_id = entry
         .guardian_diagnosis_ids
         .iter()
         .copied()
         .rev()
         .find(|id| *id != DiagnosisId::LauncherManagedArtifactCorrupt)?;
-    let detail = latest_generated_fact_value(entry, GUARDIAN_OUTCOME_DETAIL_PREFIX);
-    let guidance = latest_generated_fact_value(entry, GUARDIAN_OUTCOME_GUIDANCE_PREFIX)
-        .map(expand_guardian_guidance_fact)
-        .into_iter()
-        .collect();
-
-    Some(InstallGuardianOutcomeSummary {
+    guardian_install_outcome_from_persisted_facts(
         diagnosis_id,
-        decision,
-        label,
-        detail,
-        guidance,
-    })
+        entry
+            .completed_steps
+            .iter()
+            .flat_map(|step| step.generated_facts.iter().map(String::as_str)),
+    )
 }
 
 pub fn sanitize_install_progress(mut progress: DownloadProgress) -> DownloadProgress {
@@ -1258,31 +1243,7 @@ fn install_guardian_evidence_update(
         observed_at,
     );
 
-    let mut facts = vec![
-        prefixed_token_fact(
-            GUARDIAN_OUTCOME_DECISION_PREFIX,
-            guardian_action_kind_id(outcome.decision),
-            "guardian_decision",
-            48,
-        ),
-        prefixed_text_fact(
-            GUARDIAN_OUTCOME_SUMMARY_PREFIX,
-            outcome.user_outcome.summary(),
-            "Guardian recorded an install safety outcome.",
-            220,
-        ),
-    ];
-    if let Some(detail) = outcome.user_outcome.details().first() {
-        facts.push(prefixed_text_fact(
-            GUARDIAN_OUTCOME_DETAIL_PREFIX,
-            detail,
-            "Guardian recorded bounded install failure details.",
-            240,
-        ));
-    }
-    if let Some(guidance) = outcome.user_outcome.guidance().first() {
-        facts.push(prefixed_guardian_guidance_fact(guidance));
-    }
+    let facts = guardian_install_outcome_persistence_facts(&outcome.user_outcome);
 
     Some((facts, vec![outcome.diagnosis_id]))
 }
@@ -1468,57 +1429,6 @@ fn suppression_active(entry: &GuardianFailureMemoryEntry, observed_at: &str) -> 
     let observed_at = chrono::DateTime::parse_from_rfc3339(observed_at)
         .unwrap_or_else(|_| chrono::Utc::now().fixed_offset());
     suppression_until > observed_at
-}
-
-fn prefixed_token_fact(prefix: &str, value: &str, fallback: &str, max_len: usize) -> String {
-    let value = sanitize_evidence_token(value, RedactionAudience::UserVisible, max_len)
-        .unwrap_or_else(|| fallback.to_string());
-    format!("{prefix}{value}")
-}
-
-fn prefixed_text_fact(prefix: &str, value: &str, fallback: &str, max_len: usize) -> String {
-    let value = sanitize_evidence_text(value, RedactionAudience::UserVisible, max_len)
-        .unwrap_or_else(|| fallback.to_string());
-    format!("{prefix}{value}")
-}
-
-fn prefixed_guardian_guidance_fact(value: &str) -> String {
-    if value == ROSETTA_REQUIRED_INSTALL_GUIDANCE {
-        return format!(
-            "{GUARDIAN_OUTCOME_GUIDANCE_PREFIX}{ROSETTA_REQUIRED_INSTALL_GUIDANCE_TOKEN}"
-        );
-    }
-
-    prefixed_text_fact(
-        GUARDIAN_OUTCOME_GUIDANCE_PREFIX,
-        value,
-        "Retry the install after checking connection and storage availability.",
-        240,
-    )
-}
-
-fn expand_guardian_guidance_fact(value: String) -> String {
-    if value == ROSETTA_REQUIRED_INSTALL_GUIDANCE_TOKEN {
-        ROSETTA_REQUIRED_INSTALL_GUIDANCE.to_string()
-    } else {
-        value
-    }
-}
-
-fn guardian_action_kind_id(decision: GuardianActionKind) -> &'static str {
-    match decision {
-        GuardianActionKind::Allow => "allow",
-        GuardianActionKind::Warn => "warn",
-        GuardianActionKind::Repair => "repair",
-        GuardianActionKind::Retry => "retry",
-        GuardianActionKind::Strip => "strip",
-        GuardianActionKind::Downgrade => "downgrade",
-        GuardianActionKind::Fallback => "fallback",
-        GuardianActionKind::Quarantine => "quarantine",
-        GuardianActionKind::Block => "block",
-        GuardianActionKind::AskUser => "ask_user",
-        GuardianActionKind::RecordOnly => "record_only",
-    }
 }
 
 pub(super) fn public_install_id(id: &str) -> String {

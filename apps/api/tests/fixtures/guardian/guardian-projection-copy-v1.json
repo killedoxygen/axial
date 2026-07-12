@@ -1,0 +1,414 @@
+{
+  "schema": "axial.guardian.projection_copy.v1",
+  "cases": [
+    {
+      "id": "proof.blocked",
+      "input": {
+        "surface": "proof",
+        "decision": "blocked",
+        "message": "Guardian blocked an unsafe launch setup.",
+        "details": [],
+        "guidance": [],
+        "intervention_details": []
+      },
+      "output": {
+        "surface": "proof",
+        "evidence": {
+          "tone": "err",
+          "label": "Guardian blocked",
+          "detail": "Guardian blocked an unsafe launch setup."
+        }
+      }
+    },
+    {
+      "id": "proof.warned",
+      "input": {
+        "surface": "proof",
+        "decision": "warned",
+        "message": null,
+        "details": [
+          "Review custom JVM arguments."
+        ],
+        "guidance": [],
+        "intervention_details": []
+      },
+      "output": {
+        "surface": "proof",
+        "evidence": {
+          "tone": "warn",
+          "label": "Guardian warned"
+        }
+      }
+    },
+    {
+      "id": "proof.intervened",
+      "input": {
+        "surface": "proof",
+        "decision": "intervened",
+        "message": "Guardian adjusted launch settings for safety.",
+        "details": [],
+        "guidance": [],
+        "intervention_details": []
+      },
+      "output": {
+        "surface": "proof",
+        "evidence": {
+          "tone": "info",
+          "label": "Guardian intervened",
+          "detail": "Guardian adjusted launch settings for safety."
+        }
+      }
+    },
+    {
+      "id": "proof.allowed_note",
+      "input": {
+        "surface": "proof",
+        "decision": "allowed",
+        "message": "Internal diagnostic summary.",
+        "details": [],
+        "guidance": [],
+        "intervention_details": []
+      },
+      "output": {
+        "surface": "proof",
+        "evidence": {
+          "tone": "info",
+          "label": "Guardian note",
+          "detail": "Internal diagnostic summary."
+        }
+      }
+    },
+    {
+      "id": "proof.allowed_empty",
+      "input": {
+        "surface": "proof",
+        "decision": "allowed",
+        "message": null,
+        "details": [],
+        "guidance": [],
+        "intervention_details": []
+      },
+      "output": {
+        "surface": "proof",
+        "evidence": null
+      }
+    },
+    {
+      "id": "proof.hostile_lead",
+      "input": {
+        "surface": "proof",
+        "decision": "warned",
+        "message": "/home/alice/java --accessToken raw-secret-token",
+        "details": [
+          "Safe bounded detail."
+        ],
+        "guidance": [],
+        "intervention_details": []
+      },
+      "output": {
+        "surface": "proof",
+        "evidence": {
+          "tone": "warn",
+          "label": "Guardian warned",
+          "detail": "Safe bounded detail."
+        }
+      }
+    },
+    {
+      "id": "install.retry",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "download_unavailable",
+        "facts": [
+          "guardian_outcome_decision:retry",
+          "guardian_outcome_summary:Guardian classified the install download failure as retryable.",
+          "guardian_outcome_detail:The install stopped because a provider or network download was unavailable or interrupted."
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": {
+          "diagnosis_id": "download_unavailable",
+          "decision": "retry",
+          "label": "Guardian classified the install download failure as retryable.",
+          "detail": "The install stopped because a provider or network download was unavailable or interrupted.",
+          "guidance": [
+            "Retry the install after checking connection and storage availability."
+          ]
+        }
+      }
+    },
+    {
+      "id": "install.suppressed",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "download_unavailable",
+        "facts": [
+          "guardian_outcome_decision:block",
+          "guardian_outcome_summary:Guardian paused install retry after repeated provider failure.",
+          "guardian_outcome_detail:The install stopped because the same provider or network download failure repeated within the retry cooldown."
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": {
+          "diagnosis_id": "download_unavailable",
+          "decision": "block",
+          "label": "Guardian paused install retry after repeated provider failure.",
+          "detail": "The install stopped because the same provider or network download failure repeated within the retry cooldown.",
+          "guidance": [
+            "Wait a few minutes, then retry after checking connection and storage availability."
+          ]
+        },
+        "retry_disabled_reason": "Wait a few minutes, then retry after checking connection and storage availability."
+      }
+    },
+    {
+      "id": "install.metadata_invalid",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "install_artifact_metadata_invalid",
+        "facts": [
+          "guardian_outcome_decision:block",
+          "guardian_outcome_summary:Guardian blocked install because provider metadata could not be trusted.",
+          "guardian_outcome_detail:The install did not continue with invalid provider metadata."
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": {
+          "diagnosis_id": "install_artifact_metadata_invalid",
+          "decision": "block",
+          "label": "Guardian blocked install because provider metadata could not be trusted.",
+          "detail": "The install did not continue with invalid provider metadata.",
+          "guidance": [
+            "Retry later or choose another version source."
+          ]
+        },
+        "retry_disabled_reason": "Retry later or choose another version source."
+      }
+    },
+    {
+      "id": "install.dependency_failed",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "install_dependency_failed",
+        "facts": [
+          "guardian_outcome_decision:block",
+          "guardian_outcome_summary:Guardian blocked loader install because the required base install failed.",
+          "guardian_outcome_detail:The loader install did not continue after the base Minecraft install failed."
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": {
+          "diagnosis_id": "install_dependency_failed",
+          "decision": "block",
+          "label": "Guardian blocked loader install because the required base install failed.",
+          "detail": "The loader install did not continue after the base Minecraft install failed.",
+          "guidance": [
+            "Retry the base version install, then retry the loader install."
+          ]
+        },
+        "retry_disabled_reason": "Retry the base version install, then retry the loader install."
+      }
+    },
+    {
+      "id": "install.runtime_unavailable",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "managed_runtime_unavailable_for_platform",
+        "facts": [
+          "guardian_outcome_decision:block",
+          "guardian_outcome_summary:This Minecraft version needs a Java runtime that is not available for this device.",
+          "guardian_outcome_detail:Java runtime component jre-legacy is not available for linux_64."
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": {
+          "diagnosis_id": "managed_runtime_unavailable_for_platform",
+          "decision": "block",
+          "label": "This Minecraft version needs a Java runtime that is not available for this device.",
+          "detail": "Java runtime component jre-legacy is not available for linux_64.",
+          "guidance": [
+            "This version cannot be installed on this device."
+          ]
+        },
+        "retry_disabled_reason": "This version cannot be installed on this device."
+      }
+    },
+    {
+      "id": "install.rosetta",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "managed_runtime_rosetta_required",
+        "facts": [
+          "guardian_outcome_decision:block",
+          "guardian_outcome_summary:This Minecraft version needs Rosetta 2 on Apple Silicon Macs.",
+          "guardian_outcome_detail:Java runtime component jre-legacy needs Rosetta 2 on this Mac."
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": {
+          "diagnosis_id": "managed_runtime_rosetta_required",
+          "decision": "block",
+          "label": "This Minecraft version needs Rosetta 2 on Apple Silicon Macs.",
+          "detail": "Java runtime component jre-legacy needs Rosetta 2 on this Mac.",
+          "guidance": [
+            "Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then retry."
+          ]
+        },
+        "retry_disabled_reason": "Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then retry."
+      }
+    },
+    {
+      "id": "install.filesystem_permission",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "filesystem_permission_denied",
+        "facts": [
+          "guardian_outcome_decision:block",
+          "guardian_outcome_summary:Guardian blocked install because Axial could not write launcher-managed files safely.",
+          "guardian_outcome_detail:The install did not mutate files after the filesystem refused the operation."
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": {
+          "diagnosis_id": "filesystem_permission_denied",
+          "decision": "block",
+          "label": "Guardian blocked install because Axial could not write launcher-managed files safely.",
+          "detail": "The install did not mutate files after the filesystem refused the operation.",
+          "guidance": [
+            "Check app data permissions and retry the install."
+          ]
+        },
+        "retry_disabled_reason": "Check app data permissions and retry the install."
+      }
+    },
+    {
+      "id": "install.temp_leftover",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "temp_file_leftover",
+        "facts": [
+          "guardian_outcome_decision:block",
+          "guardian_outcome_summary:Guardian blocked install because temporary download state could not be written safely.",
+          "guardian_outcome_detail:The install did not continue after temporary download state could not be written or cleaned safely."
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": {
+          "diagnosis_id": "temp_file_leftover",
+          "decision": "block",
+          "label": "Guardian blocked install because temporary download state could not be written safely.",
+          "detail": "The install did not continue after temporary download state could not be written or cleaned safely.",
+          "guidance": [
+            "Check app data permissions and disk availability before retrying the install."
+          ]
+        },
+        "retry_disabled_reason": "Check app data permissions and disk availability before retrying the install."
+      }
+    },
+    {
+      "id": "install.atomic_promotion",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "atomic_promotion_failed",
+        "facts": [
+          "guardian_outcome_decision:block",
+          "guardian_outcome_summary:Guardian blocked install because verified download data could not be promoted safely.",
+          "guardian_outcome_detail:The install did not replace launcher-managed files after atomic promotion failed."
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": {
+          "diagnosis_id": "atomic_promotion_failed",
+          "decision": "block",
+          "label": "Guardian blocked install because verified download data could not be promoted safely.",
+          "detail": "The install did not replace launcher-managed files after atomic promotion failed.",
+          "guidance": [
+            "Check app data permissions and retry the install."
+          ]
+        },
+        "retry_disabled_reason": "Check app data permissions and retry the install."
+      }
+    },
+    {
+      "id": "install.ownership_unsafe",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "artifact_ownership_unsafe",
+        "facts": [
+          "guardian_outcome_decision:block",
+          "guardian_outcome_summary:Guardian blocked install to protect user-owned or unknown files.",
+          "guardian_outcome_detail:The install did not automatically mutate a target whose ownership was unsafe."
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": {
+          "diagnosis_id": "artifact_ownership_unsafe",
+          "decision": "block",
+          "label": "Guardian blocked install to protect user-owned or unknown files.",
+          "detail": "The install did not automatically mutate a target whose ownership was unsafe.",
+          "guidance": [
+            "Move the affected files or choose a launcher-managed library location before retrying."
+          ]
+        },
+        "retry_disabled_reason": "Move the affected files or choose a launcher-managed library location before retrying."
+      }
+    },
+    {
+      "id": "install.malformed_summary",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "download_unavailable",
+        "facts": [
+          "guardian_outcome_decision:retry",
+          "guardian_outcome_summary:Unexpected fallback copy.",
+          "guardian_outcome_detail:The install stopped because a provider or network download was unavailable or interrupted."
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": null
+      }
+    },
+    {
+      "id": "install.missing_detail",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "download_unavailable",
+        "facts": [
+          "guardian_outcome_decision:retry",
+          "guardian_outcome_summary:Guardian classified the install download failure as retryable."
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": null
+      }
+    },
+    {
+      "id": "install.unsafe_detail",
+      "input": {
+        "surface": "install_persistence",
+        "diagnosis_id": "download_unavailable",
+        "facts": [
+          "guardian_outcome_decision:retry",
+          "guardian_outcome_summary:Guardian classified the install download failure as retryable.",
+          "guardian_outcome_detail:/home/alice/java --accessToken raw-secret-token"
+        ]
+      },
+      "output": {
+        "surface": "install_persistence",
+        "outcome": null
+      }
+    }
+  ]
+}

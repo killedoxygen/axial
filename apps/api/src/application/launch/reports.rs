@@ -1,12 +1,11 @@
 use super::runner::persist_launch_proof_owned;
 use super::trace_launch_event;
+use crate::guardian::guardian_proof_evidence;
 use crate::observability::{
     RedactionAudience, sanitize_public_diagnostic_text, sanitize_public_json_value,
 };
 use crate::state::{AppState, LaunchStatusEvent, SessionStopError};
-use axial_launcher::{
-    GuardianDecision, GuardianSummary, LaunchHealingSummary, LaunchSessionRecord, snapshot_status,
-};
+use axial_launcher::{GuardianSummary, LaunchHealingSummary, LaunchSessionRecord, snapshot_status};
 use axum::Json;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -116,50 +115,7 @@ fn launch_proof_evidence_view_model(
 }
 
 fn guardian_proof_evidence_view_model(guardian: &GuardianSummary) -> Option<Value> {
-    let detail = first_bounded_public_detail(
-        guardian
-            .message
-            .iter()
-            .cloned()
-            .chain(guardian.details.iter().cloned())
-            .chain(guardian.guidance.iter().cloned())
-            .chain(
-                guardian
-                    .interventions
-                    .iter()
-                    .filter_map(|intervention| intervention.detail.clone()),
-            ),
-    );
-    let has_guardian_action = matches!(
-        guardian.decision,
-        GuardianDecision::Blocked | GuardianDecision::Warned | GuardianDecision::Intervened
-    );
-    if !has_guardian_action && detail.is_none() {
-        return None;
-    }
-
-    Some(json!({
-        "tone": guardian_decision_tone(guardian.decision),
-        "label": guardian_decision_label(guardian.decision),
-        "detail": detail,
-    }))
-}
-
-fn guardian_decision_label(decision: GuardianDecision) -> &'static str {
-    match decision {
-        GuardianDecision::Blocked => "Guardian blocked",
-        GuardianDecision::Warned => "Guardian warned",
-        GuardianDecision::Intervened => "Guardian intervened",
-        GuardianDecision::Allowed => "Guardian note",
-    }
-}
-
-fn guardian_decision_tone(decision: GuardianDecision) -> &'static str {
-    match decision {
-        GuardianDecision::Blocked => "err",
-        GuardianDecision::Warned => "warn",
-        GuardianDecision::Intervened | GuardianDecision::Allowed => "info",
-    }
+    guardian_proof_evidence(guardian).map(|evidence| json!(evidence))
 }
 
 fn healing_proof_evidence_view_model(healing: &LaunchHealingSummary) -> Option<Value> {
