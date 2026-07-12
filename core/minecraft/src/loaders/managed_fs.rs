@@ -104,10 +104,6 @@ pub(crate) struct ManagedFileFact {
     sha1: [u8; 20],
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the typed processor executor cutover")
-)]
 impl ManagedFileFact {
     pub(crate) fn size(&self) -> u64 {
         self.size
@@ -124,10 +120,6 @@ pub(crate) struct ManagedTreeSnapshot {
     directories: BTreeSet<ArtifactRelativePath>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the typed processor executor cutover")
-)]
 impl ManagedTreeSnapshot {
     pub(crate) fn files(&self) -> &BTreeMap<ArtifactRelativePath, ManagedFileFact> {
         &self.files
@@ -188,11 +180,8 @@ pub(crate) struct ManagedTreeDiff {
     removed_directories: BTreeSet<ArtifactRelativePath>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the typed processor executor cutover")
-)]
 impl ManagedTreeDiff {
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.added_files.is_empty()
             && self.removed_files.is_empty()

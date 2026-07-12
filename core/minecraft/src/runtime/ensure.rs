@@ -1,6 +1,7 @@
 use super::discovery::{
-    parse_runtime_override, resolve_component_runtime, resolve_managed_runtime,
-    resolve_override_runtime, runtime_requirement,
+    is_known_runtime_component, parse_runtime_override, resolve_axial_cached_runtime,
+    resolve_component_runtime, resolve_managed_runtime, resolve_override_runtime,
+    runtime_requirement,
 };
 use super::file_download::runtime_filesystem_path;
 use super::install::install_managed_runtime;
@@ -14,12 +15,91 @@ use super::model::{
     RuntimeEnsureResult, RuntimeOverride, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement,
     RuntimeSource,
 };
-use super::probe::JavaRuntimeProbeReceipt;
+use super::probe::{JavaRuntimeProbeReceipt, probe_java_runtime_receipt};
 use crate::launch::JavaVersion;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
+
+pub(crate) struct ProcessorRuntime {
+    probe_receipt: JavaRuntimeProbeReceipt,
+    _source_receipt: RuntimeSourceReceipt,
+}
+
+impl ProcessorRuntime {
+    pub(crate) fn revalidate_cli_executable(&self) -> Result<PathBuf, JavaRuntimeLookupError> {
+        self.probe_receipt.revalidate_cli_executable()
+    }
+}
+
+pub(crate) async fn ensure_axial_managed_processor_runtime(
+    java_version: &JavaVersion,
+) -> Result<ProcessorRuntime, JavaRuntimeLookupError> {
+    let requirement = runtime_requirement(java_version);
+    let component = requirement.preferred_component;
+    if !is_known_runtime_component(component.as_str()) {
+        return Err(JavaRuntimeLookupError::Probe(
+            "processor runtime component is not in the closed managed-runtime vocabulary"
+                .to_string(),
+        ));
+    }
+    let source_receipt = acquire_runtime_source(&component, &runtime_os_arch()).await?;
+    let install_root = runtime_cache_dir().join(component.as_str());
+    let install_lock = runtime_install_lock(component.as_str());
+    let _guard = install_lock.lock().await;
+    let _file_lock = acquire_runtime_install_file_lock(&install_root).await?;
+    let mut runtime = match resolve_axial_cached_runtime(&component, java_version.major_version) {
+        Ok(runtime) => Some(runtime),
+        Err(JavaRuntimeLookupError::NotFound { .. }) => None,
+        Err(error) => return Err(error),
+    };
+    let matches_source = match runtime.as_ref() {
+        Some(runtime) => runtime_record_matches_source(runtime, &source_receipt).await,
+        None => false,
+    };
+    if !matches_source {
+        let mut observer = |_| {};
+        install_managed_runtime(&component, &install_root, &source_receipt, &mut observer).await?;
+        runtime = Some(resolve_axial_cached_runtime(
+            &component,
+            java_version.major_version,
+        )?);
+    }
+    let runtime = runtime.ok_or_else(|| JavaRuntimeLookupError::NotFound {
+        component: component.as_str().to_string(),
+        major: java_version.major_version,
+    })?;
+    if runtime.source != RuntimeSource::Managed
+        || !runtime_record_matches_source(&runtime, &source_receipt).await
+    {
+        return Err(JavaRuntimeLookupError::Probe(
+            "processor runtime failed authenticated Axial-cache verification".to_string(),
+        ));
+    }
+    let java_path = PathBuf::from(runtime.java_path);
+    let probe_receipt = tokio::task::spawn_blocking(move || {
+        probe_java_runtime_receipt(&java_path, Some("managed-processor-runtime"))
+    })
+    .await
+    .map_err(|_| {
+        JavaRuntimeLookupError::Probe(
+            "processor runtime probe task stopped unexpectedly".to_string(),
+        )
+    })??;
+    if probe_receipt.validation().into_info().major
+        != u32::try_from(java_version.major_version).unwrap_or(u32::MAX)
+    {
+        return Err(JavaRuntimeLookupError::Probe(
+            "processor runtime Java major does not match the authenticated base requirement"
+                .to_string(),
+        ));
+    }
+    Ok(ProcessorRuntime {
+        probe_receipt,
+        _source_receipt: source_receipt,
+    })
+}
 
 pub async fn ensure_java_runtime(
     library_dir: &Path,

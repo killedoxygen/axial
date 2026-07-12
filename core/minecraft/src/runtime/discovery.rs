@@ -232,6 +232,61 @@ pub(super) fn resolve_managed_runtime(
     resolve_component_runtime(library_dir, component, 0)
 }
 
+pub(super) fn resolve_axial_cached_runtime(
+    component: &RuntimeId,
+    required_major: i32,
+) -> Result<RuntimeRecord, JavaRuntimeLookupError> {
+    resolve_component_runtime_from_roots(
+        vec![runtime_cache_dir()],
+        component,
+        required_major,
+        |dir| inspect_axial_cached_runtime(dir, component.as_str()),
+    )
+}
+
+fn inspect_axial_cached_runtime(
+    base_dir: &Path,
+    component: &str,
+) -> Result<Option<RuntimeRecord>, JavaRuntimeLookupError> {
+    if !runtime_filesystem_path(base_dir).as_ref().exists() {
+        return Ok(None);
+    }
+    let os_arch = runtime_os_arch();
+    for candidate in [
+        base_dir.join(component).join(&os_arch).join(component),
+        base_dir.join(component),
+    ] {
+        let state = detect_runtime_state(&candidate, true);
+        if state == RuntimeInstallState::Missing {
+            continue;
+        }
+        let java_exe = java_executable(&candidate);
+        if state == RuntimeInstallState::Ready
+            && rosetta_required_error_for_current_host(&java_exe, component).is_some()
+        {
+            return Err(JavaRuntimeLookupError::RosettaRequired {
+                component: component.to_string(),
+            });
+        }
+        let java_path = java_exe.to_string_lossy().to_string();
+        return Ok(Some(RuntimeRecord {
+            id: RuntimeId(component.to_string()),
+            java_path: java_path.clone(),
+            info: JavaRuntimeInfo {
+                id: component.to_string(),
+                major: 0,
+                update: 0,
+                distribution: "unknown".to_string(),
+                path: java_path,
+            },
+            source: RuntimeSource::Managed,
+            install_state: state,
+            root_dir: candidate.to_string_lossy().to_string(),
+        }));
+    }
+    Ok(None)
+}
+
 pub(super) struct ResolvedOverrideRuntime {
     pub(super) record: RuntimeRecord,
     pub(super) probe_usage: super::model::RuntimeProbeUsage,
@@ -491,6 +546,32 @@ fn persisted_runtime_manifest_verified(runtime_root: &Path) -> bool {
     }
 
     saw_file && verify_runtime_jobs(file_jobs) && link_jobs.into_iter().all(verify_runtime_link_job)
+}
+
+#[cfg(test)]
+mod processor_runtime_tests {
+    use super::inspect_axial_cached_runtime;
+    use crate::runtime::{RuntimeInstallState, RuntimeSource};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn exact_axial_inspection_stamps_managed_even_under_packages_parent() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("Packages-parent-{nonce}"));
+        let component = "java-runtime-delta";
+        fs::create_dir_all(root.join(component)).expect("runtime shell");
+        let record = inspect_axial_cached_runtime(&root, component)
+            .expect("exact inspection")
+            .expect("broken runtime record");
+        assert_eq!(record.source, RuntimeSource::Managed);
+        assert_eq!(record.install_state, RuntimeInstallState::Broken);
+        assert_eq!(record.id.as_str(), component);
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[derive(Clone)]

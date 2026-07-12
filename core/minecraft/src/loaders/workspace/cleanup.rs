@@ -5,7 +5,9 @@ use crate::loaders::validate_version_id;
 use std::path::Path;
 
 pub(crate) struct LoaderWorkspace {
+    root: ManagedDir,
     directory: ManagedDir,
+    target_version_id: String,
 }
 
 pub(crate) struct LoaderWorkspaceTemp {
@@ -23,6 +25,9 @@ pub(crate) struct ProcessorWorkspace {
 }
 
 impl LoaderWorkspace {
+    pub(crate) fn target_version_id(&self) -> &str {
+        &self.target_version_id
+    }
     pub(crate) fn path(&self) -> &Path {
         self.directory.path()
     }
@@ -32,7 +37,32 @@ impl LoaderWorkspace {
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), LoaderError> {
+        self.root.revalidate()?;
         self.directory.revalidate()
+    }
+
+    pub(crate) fn read_live_library_authenticated(
+        &self,
+        relative: &ArtifactRelativePath,
+        expected_size: Option<u64>,
+        expected_sha1: &[u8; 20],
+    ) -> Result<Vec<u8>, LoaderError> {
+        self.root
+            .open_child("libraries")?
+            .read_relative_authenticated(relative, expected_size, expected_sha1)
+    }
+
+    pub(crate) fn read_base_client_authenticated(
+        &self,
+        version_id: &str,
+        expected_size: Option<u64>,
+        expected_sha1: Option<&str>,
+    ) -> Result<Vec<u8>, LoaderError> {
+        validate_version_id(version_id, "processor base version id")?;
+        self.root
+            .open_child("versions")?
+            .open_child(version_id)?
+            .read_authenticated(&format!("{version_id}.jar"), expected_size, expected_sha1)
     }
 
     pub(crate) fn create_temp(&self, name: &str) -> Result<LoaderWorkspaceTemp, LoaderError> {
@@ -43,10 +73,6 @@ impl LoaderWorkspace {
         Ok(LoaderWorkspaceTemp { directory })
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the typed processor executor cutover")
-    )]
     pub(crate) fn prepare_processor_stage(
         &self,
         minecraft_version: &str,
@@ -96,10 +122,6 @@ impl LoaderWorkspaceTemp {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the typed processor executor cutover")
-)]
 impl ProcessorWorkspace {
     fn validate_fresh_layout(&self, minecraft_version: &str) -> Result<(), LoaderError> {
         let snapshot = self.snapshot_stage()?;
@@ -177,6 +199,14 @@ impl ProcessorWorkspace {
         self.libraries.write_relative_exact(relative, bytes).await
     }
 
+    pub(crate) fn ensure_library_parent(
+        &self,
+        relative: &ArtifactRelativePath,
+    ) -> Result<(), LoaderError> {
+        let _ = self.libraries.open_or_create_relative_parent(relative)?;
+        self.libraries.revalidate()
+    }
+
     pub(crate) async fn write_version_exact(
         &self,
         relative: &ArtifactRelativePath,
@@ -217,6 +247,30 @@ impl ProcessorWorkspace {
     ) -> Result<Vec<u8>, LoaderError> {
         self.version
             .read_relative_authenticated(relative, expected_size, expected_sha1)
+    }
+
+    pub(crate) fn read_processor_data_authenticated(
+        &self,
+        relative: &ArtifactRelativePath,
+        expected_size: Option<u64>,
+        expected_sha1: &[u8; 20],
+    ) -> Result<Vec<u8>, LoaderError> {
+        self.processor_data
+            .read_relative_authenticated(relative, expected_size, expected_sha1)
+    }
+
+    pub(crate) fn read_installer_authenticated(
+        &self,
+        expected_size: Option<u64>,
+        expected_sha1: &[u8; 20],
+    ) -> Result<Vec<u8>, LoaderError> {
+        self.root.read_relative_authenticated(
+            &ArtifactRelativePath::new("installer.jar").map_err(|_| {
+                LoaderError::Verify("processor installer path is invalid".to_string())
+            })?,
+            expected_size,
+            expected_sha1,
+        )
     }
 
     pub(crate) fn snapshot_root(&self) -> Result<ManagedTreeSnapshot, LoaderError> {
@@ -266,7 +320,11 @@ pub(crate) fn prepare_fresh_work_dir(
     }
     let directory = work.open_or_create_child(version_id)?;
     directory.revalidate()?;
-    Ok(LoaderWorkspace { directory })
+    Ok(LoaderWorkspace {
+        root,
+        directory,
+        target_version_id: version_id.to_string(),
+    })
 }
 
 #[cfg(test)]

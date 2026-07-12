@@ -1,5 +1,10 @@
 pub mod api;
 pub mod artifacts;
+#[expect(
+    dead_code,
+    reason = "disconnected bound Forge processor capability; wired by the receipt cutover next"
+)]
+mod bound_processors;
 mod compose;
 mod forge_installer;
 mod http;

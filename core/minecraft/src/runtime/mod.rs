@@ -21,6 +21,7 @@ pub use discovery::{
     runtime_component_ready_without_probe, runtime_executable_ready_without_probe,
     runtime_requirement,
 };
+pub(crate) use ensure::{ProcessorRuntime, ensure_axial_managed_processor_runtime};
 pub use ensure::{ensure_java_runtime, ensure_runtime_with_events};
 pub use model::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureAction,

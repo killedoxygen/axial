@@ -152,30 +152,55 @@ pub(crate) struct AuthenticatedForgeInstallerPlan {
 
 pub(crate) struct BoundForgeInstallerPlan {
     authenticated: AuthenticatedForgeInstallerPlan,
-    processor_plan: Option<BoundProcessorPlan>,
+    processor_disposition: BoundProcessorDisposition,
 }
 
-struct BoundProcessorPlan {
-    steps: Vec<BoundProcessorStep>,
-    data: BTreeMap<String, BoundProcessorData>,
-    installer_data: BTreeMap<ArtifactRelativePath, Vec<u8>>,
-    input_artifacts: BTreeMap<ArtifactRelativePath, BoundProcessorInputContract>,
+pub(crate) struct BoundForgeProcessorExecution {
+    plan: BoundProcessorPlan,
+    continuation: BoundForgeInstallerContinuation,
 }
 
-struct BoundProcessorStep {
-    jar: BoundProcessorArtifact,
-    classpath: Vec<BoundProcessorArtifact>,
-    args: Vec<BoundProcessorArgument>,
-    outputs: Vec<BoundProcessorOutput>,
+#[expect(
+    dead_code,
+    reason = "non-runnable continuation is consumed by the receipt cutover next"
+)]
+pub(crate) enum BoundForgeProcessorExtraction {
+    Runnable(Box<BoundForgeProcessorExecution>),
+    NonRunnable(Box<BoundForgeInstallerPlan>),
 }
 
-enum BoundProcessorArgument {
+pub(crate) struct BoundForgeInstallerContinuation {
+    authenticated: AuthenticatedForgeInstallerPlan,
+}
+
+pub(crate) enum BoundProcessorDisposition {
+    TypedRunnable(BoundProcessorPlan),
+    LegacyNoClientWork,
+    EmptyClientWork,
+    UnsupportedMissingOutputs,
+}
+
+pub(crate) struct BoundProcessorPlan {
+    pub(super) steps: Vec<BoundProcessorStep>,
+    pub(super) data: BTreeMap<String, BoundProcessorData>,
+    pub(super) installer_data: BTreeMap<ArtifactRelativePath, Vec<u8>>,
+    pub(super) input_artifacts: BTreeMap<ArtifactRelativePath, BoundProcessorInputContract>,
+}
+
+pub(super) struct BoundProcessorStep {
+    pub(super) jar: BoundProcessorArtifact,
+    pub(super) classpath: Vec<BoundProcessorArtifact>,
+    pub(super) args: Vec<BoundProcessorArgument>,
+    pub(super) outputs: Vec<BoundProcessorOutput>,
+}
+
+pub(super) enum BoundProcessorArgument {
     Artifact(BoundProcessorArtifact),
     OutputArtifact(BoundProcessorArtifact),
     Template(Vec<BoundProcessorArgumentPart>),
 }
 
-enum BoundProcessorArgumentPart {
+pub(super) enum BoundProcessorArgumentPart {
     Literal(String),
     DataToken(String),
     OutputToken(String),
@@ -183,7 +208,7 @@ enum BoundProcessorArgumentPart {
 }
 
 #[derive(Clone, Copy)]
-enum ProcessorBuiltinToken {
+pub(super) enum ProcessorBuiltinToken {
     MinecraftJar,
     Side,
     MinecraftVersion,
@@ -193,38 +218,38 @@ enum ProcessorBuiltinToken {
 }
 
 #[derive(Clone)]
-struct BoundProcessorArtifact {
-    coordinate: String,
-    relative_path: ArtifactRelativePath,
+pub(super) struct BoundProcessorArtifact {
+    pub(super) coordinate: String,
+    pub(super) relative_path: ArtifactRelativePath,
 }
 
-enum BoundProcessorData {
+pub(super) enum BoundProcessorData {
     Artifact(BoundProcessorArtifact),
     InstallerData(ArtifactRelativePath),
     Literal(String),
 }
 
-struct BoundProcessorOutput {
-    artifact: BoundProcessorArtifact,
-    sha1: [u8; 20],
-    role: BoundProcessorOutputRole,
+pub(super) struct BoundProcessorOutput {
+    pub(super) artifact: BoundProcessorArtifact,
+    pub(super) sha1: [u8; 20],
+    pub(super) role: BoundProcessorOutputRole,
 }
 
 #[derive(Clone)]
-struct BoundProcessorInputContract {
-    sha1: [u8; 20],
-    size: Option<u64>,
-    source: BoundProcessorInputSource,
+pub(super) struct BoundProcessorInputContract {
+    pub(super) sha1: [u8; 20],
+    pub(super) size: Option<u64>,
+    pub(super) source: BoundProcessorInputSource,
 }
 
 #[derive(Clone, Copy)]
-enum BoundProcessorInputSource {
+pub(super) enum BoundProcessorInputSource {
     Download,
     Embedded,
 }
 
 #[derive(Clone, Copy)]
-enum BoundProcessorOutputRole {
+pub(super) enum BoundProcessorOutputRole {
     Intermediate,
     Terminal { expected_size: Option<u64> },
 }
@@ -268,11 +293,11 @@ impl BoundForgeInstallerPlan {
     }
 
     pub(crate) fn install_profile_json(&self) -> Option<&[u8]> {
-        debug_assert!(
-            self.processor_plan
-                .as_ref()
-                .is_none_or(BoundProcessorPlan::is_structurally_complete)
-        );
+        debug_assert!(!matches!(
+            &self.processor_disposition,
+            BoundProcessorDisposition::TypedRunnable(plan)
+                if !plan.is_structurally_complete()
+        ));
         self.authenticated.install_profile_json.as_deref()
     }
 
@@ -284,6 +309,73 @@ impl BoundForgeInstallerPlan {
         &self.authenticated.embedded_maven_artifacts
     }
 
+    pub(crate) fn strip_client_meta(&self) -> bool {
+        self.authenticated.strip_client_meta
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the receipt-producing Forge install cutover consumes this capability next"
+        )
+    )]
+    pub(crate) fn processor_disposition(&self) -> &BoundProcessorDisposition {
+        &self.processor_disposition
+    }
+
+    #[expect(
+        dead_code,
+        reason = "disconnected executor entry is wired by the receipt cutover next"
+    )]
+    pub(crate) fn into_processor_execution(self) -> BoundForgeProcessorExtraction {
+        match self {
+            Self {
+                mut authenticated,
+                processor_disposition: BoundProcessorDisposition::TypedRunnable(plan),
+            } => {
+                authenticated.install_profile_json = None;
+                BoundForgeProcessorExtraction::Runnable(Box::new(BoundForgeProcessorExecution {
+                    plan,
+                    continuation: BoundForgeInstallerContinuation { authenticated },
+                }))
+            }
+            other => BoundForgeProcessorExtraction::NonRunnable(Box::new(other)),
+        }
+    }
+}
+
+impl BoundForgeProcessorExecution {
+    pub(super) fn into_parts(self) -> (BoundForgeInstallerContinuation, BoundProcessorPlan) {
+        (self.continuation, self.plan)
+    }
+}
+
+impl BoundForgeInstallerContinuation {
+    pub(super) fn source_bytes(&self) -> &[u8] {
+        self.authenticated.source.bytes()
+    }
+
+    pub(super) fn embedded_maven_artifacts(&self) -> &[AuthenticatedEmbeddedMavenArtifact] {
+        &self.authenticated.embedded_maven_artifacts
+    }
+
+    pub(crate) fn version(&self) -> &LoaderProfileFragment {
+        &self.authenticated.version
+    }
+
+    #[expect(
+        dead_code,
+        reason = "continuation is consumed by the receipt cutover next"
+    )]
+    pub(crate) fn libraries(&self) -> &[Library] {
+        &self.authenticated.libraries
+    }
+
+    #[expect(
+        dead_code,
+        reason = "continuation is consumed by the receipt cutover next"
+    )]
     pub(crate) fn strip_client_meta(&self) -> bool {
         self.authenticated.strip_client_meta
     }
@@ -547,8 +639,15 @@ pub(crate) fn bind_authenticated_installer_plan(
         .install_profile_json
         .as_deref()
         .and_then(|profile| serde_json::from_slice::<LegacyInstallProfile>(profile).ok());
+    if legacy_profile.is_some()
+        && install_profile
+            .as_ref()
+            .is_some_and(|profile| !profile.processors.is_empty() || !profile.data.is_empty())
+    {
+        return Err(ForgeInstallerError::InvalidForgeProcessor);
+    }
 
-    let (root_artifact, bind_processors) = match (record.component_id, record.strategy) {
+    let root_artifact = match (record.component_id, record.strategy) {
         (LoaderComponentId::Forge, LoaderInstallStrategy::ForgeModern) => {
             if legacy_profile.is_some() {
                 return Err(ForgeInstallerError::IdentityMismatch);
@@ -574,7 +673,7 @@ pub(crate) fn bind_authenticated_installer_plan(
                 &expected_version,
                 Some(&expected_path),
             )?;
-            (RootArtifact::Universal, true)
+            RootArtifact::Universal
         }
         (LoaderComponentId::NeoForge, LoaderInstallStrategy::NeoForgeModern) => {
             if legacy_profile.is_some() {
@@ -593,7 +692,7 @@ pub(crate) fn bind_authenticated_installer_plan(
                 &format!("neoforge-{}", record.loader_version),
                 None,
             )?;
-            (RootArtifact::Universal, false)
+            RootArtifact::Universal
         }
         (LoaderComponentId::Forge, LoaderInstallStrategy::ForgeLegacyInstaller) => {
             if let Some(legacy_profile) = legacy_profile.as_ref() {
@@ -603,7 +702,7 @@ pub(crate) fn bind_authenticated_installer_plan(
                     EffectiveProfileShape::LegacyVersionInfo,
                 )?;
                 validate_legacy_install_profile(legacy_profile, record, &authenticated.version)?;
-                (RootArtifact::Universal, false)
+                RootArtifact::Universal
             } else {
                 validate_effective_version_identity(
                     &mut authenticated.version,
@@ -626,28 +725,44 @@ pub(crate) fn bind_authenticated_installer_plan(
                     &expected_version,
                     Some(&expected_path),
                 )?;
-                (RootArtifact::Plain, true)
+                RootArtifact::Plain
             }
         }
         _ => return Err(ForgeInstallerError::IdentityMismatch),
     };
     validate_component_root_libraries(&authenticated.libraries, record, root_artifact)?;
-    let processor_plan = if bind_processors {
-        Some(bind_forge_processor_plan(
-            authenticated.source.bytes(),
-            install_profile
-                .as_ref()
-                .ok_or(ForgeInstallerError::IdentityMismatch)?,
-            &authenticated.libraries,
-            &authenticated.embedded_maven_artifacts,
-        )?)
+    let processor_disposition = if legacy_profile.is_some() {
+        BoundProcessorDisposition::LegacyNoClientWork
     } else {
-        None
+        let profile = install_profile
+            .as_ref()
+            .ok_or(ForgeInstallerError::IdentityMismatch)?;
+        validate_processor_disposition_bounds(profile)?;
+        let mut has_client_work = false;
+        let mut has_missing_client_outputs = false;
+        for processor in &profile.processors {
+            if validate_processor_sides(&processor.sides)? {
+                has_client_work = true;
+                has_missing_client_outputs |= processor.outputs.is_empty();
+            }
+        }
+        if !has_client_work {
+            BoundProcessorDisposition::EmptyClientWork
+        } else if record.component_id == LoaderComponentId::NeoForge && has_missing_client_outputs {
+            BoundProcessorDisposition::UnsupportedMissingOutputs
+        } else {
+            BoundProcessorDisposition::TypedRunnable(bind_forge_processor_plan(
+                authenticated.source.bytes(),
+                profile,
+                &authenticated.libraries,
+                &authenticated.embedded_maven_artifacts,
+            )?)
+        }
     };
 
     Ok(BoundForgeInstallerPlan {
         authenticated,
-        processor_plan,
+        processor_disposition,
     })
 }
 
@@ -853,6 +968,28 @@ fn bind_forge_processor_plan(
         return Err(ForgeInstallerError::InvalidForgeProcessor);
     }
     Ok(plan)
+}
+
+fn validate_processor_disposition_bounds(
+    profile: &InstallProfileDeclarations,
+) -> Result<(), ForgeInstallerError> {
+    if profile.processors.len() > MAX_FORGE_PROCESSORS {
+        return Err(ForgeInstallerError::TooManyForgeProcessors);
+    }
+    if profile.data.len() > MAX_FORGE_PROCESSOR_DATA {
+        return Err(ForgeInstallerError::TooManyForgeProcessorData);
+    }
+    let output_count = profile
+        .processors
+        .iter()
+        .try_fold(0_usize, |count, processor| {
+            count.checked_add(processor.outputs.len())
+        })
+        .ok_or(ForgeInstallerError::TooManyForgeProcessorOutputs)?;
+    if output_count > MAX_FORGE_PROCESSOR_OUTPUTS {
+        return Err(ForgeInstallerError::TooManyForgeProcessorOutputs);
+    }
+    validate_processor_declaration_bounds(profile)
 }
 
 fn validate_processor_declaration_bounds(
@@ -2122,7 +2259,8 @@ fn normalize_legacy_forge_version_id(path: &str, minecraft: &str) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthenticatedForgeInstallerPlan, ForgeInstallerError, MAX_INSTALLER_EMBEDDED_ENTRY_BYTES,
+        AuthenticatedForgeInstallerPlan, BoundForgeInstallerPlan, BoundProcessorDisposition,
+        BoundProcessorPlan, ForgeInstallerError, MAX_INSTALLER_EMBEDDED_ENTRY_BYTES,
         MAX_INSTALLER_PROFILE_ENTRY_BYTES, bind_authenticated_installer_plan,
         merge_libraries_by_name, normalize_legacy_forge_library, normalize_legacy_forge_version_id,
         plan_authenticated_installer,
@@ -2137,6 +2275,13 @@ mod tests {
     use std::io::{Cursor, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
     use zip::write::SimpleFileOptions;
+
+    fn typed_plan(bound: &BoundForgeInstallerPlan) -> &BoundProcessorPlan {
+        match bound.processor_disposition() {
+            BoundProcessorDisposition::TypedRunnable(plan) => plan,
+            _ => panic!("typed processor plan"),
+        }
+    }
 
     #[test]
     fn normalizes_legacy_forge_version_id() {
@@ -2227,6 +2372,56 @@ mod tests {
     }
 
     #[test]
+    fn classifies_empty_server_only_and_true_legacy_processor_work() {
+        let forge = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeModern,
+            "1.21.5",
+            "55.0.0",
+        );
+        let (version, install) = modern_binding_profiles(&forge);
+        let empty = bind_modern_fixture_with_entries(&forge, &version, &install, &[])
+            .expect("empty Forge profile");
+        assert!(matches!(
+            empty.processor_disposition(),
+            BoundProcessorDisposition::EmptyClientWork
+        ));
+
+        let mut server_only = install;
+        server_only["processors"] = serde_json::json!([
+            {"sides":["server"]},
+            {"sides":["extract"]}
+        ]);
+        let server_only = bind_modern_fixture_with_entries(&forge, &version, &server_only, &[])
+            .expect("server-only Forge profile");
+        assert!(matches!(
+            server_only.processor_disposition(),
+            BoundProcessorDisposition::EmptyClientWork
+        ));
+
+        let legacy = binding_record(
+            LoaderComponentId::Forge,
+            LoaderInstallStrategy::ForgeLegacyInstaller,
+            "1.7.10",
+            "10.13.4.1614-1.7.10",
+        );
+        let legacy_profile = legacy_binding_profile(&legacy);
+        let legacy_bound =
+            bind_legacy_fixture_plan(&legacy, &legacy_profile).expect("true legacy profile");
+        assert!(matches!(
+            legacy_bound.processor_disposition(),
+            BoundProcessorDisposition::LegacyNoClientWork
+        ));
+
+        let mut hybrid = legacy_profile;
+        hybrid["processors"] = serde_json::json!([{"sides":["client"]}]);
+        assert!(matches!(
+            bind_legacy_fixture(&legacy, &hybrid),
+            Err(ForgeInstallerError::InvalidForgeProcessor)
+        ));
+    }
+
+    #[test]
     fn forge_binding_seals_client_outputs_and_ignores_server_only_processors() {
         let record = binding_record(
             LoaderComponentId::Forge,
@@ -2272,7 +2467,7 @@ mod tests {
             &[("data/client.lzma", b"patches")],
         )
         .expect("authenticated Forge processor plan");
-        let processor_plan = bound.processor_plan.as_ref().expect("Forge authority");
+        let processor_plan = typed_plan(&bound);
         assert_eq!(processor_plan.steps.len(), 1);
         assert_eq!(processor_plan.steps[0].outputs.len(), 1);
         assert_eq!(processor_plan.installer_data.len(), 1);
@@ -2299,7 +2494,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_zero_forge_binds_outputs_while_neoforge_keeps_them_non_authoritative() {
+    fn spec_zero_forge_binds_outputs_while_outputless_neoforge_is_unsupported() {
         let forge = binding_record(
             LoaderComponentId::Forge,
             LoaderInstallStrategy::ForgeLegacyInstaller,
@@ -2325,7 +2520,10 @@ mod tests {
         }]);
         let bound = bind_modern_fixture_with_entries(&forge, &version, &install, &[])
             .expect("spec-zero Forge authority");
-        assert!(bound.processor_plan.is_some());
+        assert!(matches!(
+            bound.processor_disposition(),
+            BoundProcessorDisposition::TypedRunnable(_)
+        ));
 
         let neo = binding_record(
             LoaderComponentId::NeoForge,
@@ -2339,7 +2537,10 @@ mod tests {
         }]);
         let bound = bind_modern_fixture_with_entries(&neo, &version, &install, &[])
             .expect("NeoForge semantic binding");
-        assert!(bound.processor_plan.is_none());
+        assert!(matches!(
+            bound.processor_disposition(),
+            BoundProcessorDisposition::UnsupportedMissingOutputs
+        ));
     }
 
     #[test]
@@ -2473,7 +2674,7 @@ mod tests {
             )],
         )
         .expect("embedded processor input contract");
-        let plan = bound.processor_plan.as_ref().expect("processor plan");
+        let plan = typed_plan(&bound);
         let contract = plan
             .input_artifacts
             .values()
@@ -2520,7 +2721,7 @@ mod tests {
 
         let bound = bind_modern_fixture_with_entries(&record, &version, &install, &[])
             .expect("processor output supplies final SHA-1 authority");
-        let plan = bound.processor_plan.as_ref().expect("processor plan");
+        let plan = typed_plan(&bound);
         assert!(matches!(
             plan.steps[0].outputs[0].role,
             super::BoundProcessorOutputRole::Terminal {
@@ -2552,7 +2753,7 @@ mod tests {
 
         let bound = bind_modern_fixture_with_entries(&record, &version, &install, &[])
             .expect("bound processor chain");
-        let plan = bound.processor_plan.as_ref().expect("processor plan");
+        let plan = typed_plan(&bound);
         assert!(matches!(
             plan.steps[0].outputs[0].role,
             super::BoundProcessorOutputRole::Intermediate
@@ -2595,7 +2796,7 @@ mod tests {
 
         let bound = bind_modern_fixture_with_entries(&record, &version, &install, &[])
             .expect("output with final and dependency roles");
-        let plan = bound.processor_plan.as_ref().expect("processor plan");
+        let plan = typed_plan(&bound);
         assert!(matches!(
             plan.steps[0].outputs[0].role,
             super::BoundProcessorOutputRole::Terminal {
@@ -3613,6 +3814,13 @@ mod tests {
         record: &LoaderBuildRecord,
         install: &serde_json::Value,
     ) -> Result<(), ForgeInstallerError> {
+        bind_legacy_fixture_plan(record, install).map(|_| ())
+    }
+
+    fn bind_legacy_fixture_plan(
+        record: &LoaderBuildRecord,
+        install: &serde_json::Value,
+    ) -> Result<super::BoundForgeInstallerPlan, ForgeInstallerError> {
         let install_bytes = serde_json::to_vec(install).expect("serialize legacy install profile");
         let file_path = install["install"]["filePath"]
             .as_str()
@@ -3621,13 +3829,9 @@ mod tests {
             ("install_profile.json", install_bytes.as_slice()),
             (file_path, b"legacy root"),
         ]);
-        bind_bytes(record, jar)
-    }
-
-    fn bind_bytes(record: &LoaderBuildRecord, bytes: Vec<u8>) -> Result<(), ForgeInstallerError> {
         let authenticated =
-            plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(bytes))?;
-        bind_authenticated_installer_plan(authenticated, record).map(|_| ())
+            plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(jar))?;
+        bind_authenticated_installer_plan(authenticated, record)
     }
 
     fn zip_with_entry(name: &str, bytes: Vec<u8>) -> Vec<u8> {

@@ -61,10 +61,6 @@ pub struct JavaRuntimeProbeResolutionError {
 }
 
 impl JavaRuntimeProbeReceipt {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the typed processor executor cutover")
-    )]
     pub(crate) fn revalidate_cli_executable(&self) -> Result<PathBuf, JavaRuntimeLookupError> {
         let current = fingerprint_java_targets(&self.fingerprint.requested_path)?;
         if current != self.fingerprint {
