@@ -14,7 +14,6 @@ pub mod jvm_preset;
 pub mod launch_decision;
 pub mod launch_failure_memory;
 pub mod launch_recovery;
-pub mod outcome;
 pub mod performance;
 pub mod policy;
 pub mod preflight;
@@ -47,10 +46,14 @@ pub use artifact_repair::{
     GuardianArtifactRepairMutation, GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest,
     GuardianArtifactRepairSource, GuardianArtifactRepairStatus, execute_guardian_artifact_repair,
 };
-pub use copy::launch_recovery_suppressed_user_outcome;
+pub use copy::GuardianUserOutcome;
+#[cfg(test)]
+pub(crate) use copy::guardian_user_outcome_for_test;
 pub(crate) use copy::{
-    GuardianCopyRequest, author_guardian_copy, guardian_directive_description,
-    guardian_directive_recovery_label,
+    GuardianCopyRequest, GuardianLaunchAdmission, GuardianRuntimeRepairCopy, author_guardian_copy,
+    guardian_directive_description, guardian_failed_launch_recovery_log,
+    guardian_summary_with_blocked_outcome, guardian_summary_with_intervention,
+    guardian_summary_with_observed_outcome, guardian_summary_with_suppressed_outcome,
 };
 pub use diagnosis::{Diagnosis, build_safety_case, diagnose};
 pub use directive::{
@@ -79,9 +82,9 @@ pub use launch_decision::{
     GuardianLaunchFailureOutcome, GuardianObservedLaunchFailurePhase,
     GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
     GuardianStartupFailureObservation, GuardianStartupFailureRequest,
-    conservative_launch_recovery_preset, guardian_observed_launch_failure_outcome,
-    guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
-    guardian_startup_failure_outcome, is_guardian_launch_crash_class,
+    conservative_launch_recovery_preset, guardian_prelaunch_preset_adjustment_directive,
+    guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
+    is_guardian_launch_crash_class,
 };
 pub use launch_failure_memory::{
     GuardianLaunchFailureMemoryIntakeRequest, launch_failure_memory_guardian_facts,
@@ -101,7 +104,6 @@ pub use model::{
     GuardianActionPlan, GuardianConfidence, GuardianDecision, GuardianDomain, GuardianFact,
     GuardianFactId, GuardianMode, GuardianSeverity, SafetyCase, SafetyOutcome,
 };
-pub use outcome::GuardianUserOutcome;
 pub use performance::{
     GuardianPerformanceOperationKind, GuardianPerformanceSupervisionPlan,
     GuardianPerformanceSupervisionRejection, GuardianPerformanceSupervisionRequest,

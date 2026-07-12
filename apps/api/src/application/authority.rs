@@ -813,6 +813,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn guardian_copy_is_the_only_production_user_outcome_authority() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("api crate must live under apps/ in the repository");
+        let api_root = repo_root.join("apps/api/src");
+        let copy_path = "apps/api/src/guardian/copy.rs";
+        let mut sources = Vec::new();
+        collect_rust_sources(&api_root, &mut sources);
+        sources.sort();
+
+        let mut violations = Vec::new();
+        for path in sources {
+            if is_test_source(&path) {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(repo_root)
+                .expect("API source must be inside the repository")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source = fs::read_to_string(&path).expect("read API source");
+            let production = without_trailing_test_module(&source);
+            let compact = production
+                .chars()
+                .filter(|value| !value.is_whitespace())
+                .collect::<String>();
+
+            if relative != copy_path && compact.contains(concat!("GuardianUser", "Outcome{")) {
+                violations.push(format!("{relative}: GuardianUserOutcome literal"));
+            }
+            for marker in [
+                concat!(".user_outcome.", "decision="),
+                concat!(".user_outcome.", "phase="),
+                concat!(".user_outcome.", "summary="),
+                concat!(".user_outcome.", "details="),
+                concat!(".user_outcome.", "guidance="),
+            ] {
+                if compact.contains(marker) {
+                    violations.push(format!("{relative}: {marker}"));
+                }
+            }
+            for marker in [
+                concat!("launcher_guardian_", "public_lines"),
+                concat!("block_preflight_outcome_", "for_runtime_repair"),
+                concat!("block_guardian_with_", "user_outcome"),
+                concat!("block_guardian_for_", "suppressed_launch_recovery"),
+                concat!("guardian_observed_launch_", "failure_outcome"),
+                concat!("launch_recovery_suppressed_", "user_outcome"),
+            ] {
+                if production.contains(marker) {
+                    violations.push(format!("{relative}: {marker}"));
+                }
+            }
+            if relative != copy_path
+                && production.contains(concat!(
+                    "Guardian recorded failed launch ",
+                    "self-healing for"
+                ))
+            {
+                violations.push(format!("{relative}: failed-healing public copy"));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "Guardian user-outcome authority regressions:\n{}",
+            violations.join("\n")
+        );
+    }
+
     fn collect_rust_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
         for entry in fs::read_dir(directory).expect("read API source directory") {
             let entry = entry.expect("read API source entry");

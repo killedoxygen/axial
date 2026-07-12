@@ -570,7 +570,7 @@ fn boundary_case(id: impl Into<String>, family: BoundaryFamily, spec: CaseSpec) 
         overrides,
         explicit_user_intent: spec.explicit_user_intent,
     });
-    assert_eq!(outcome.safety.decision, outcome.user_outcome.decision);
+    assert_eq!(outcome.safety.decision, outcome.user_outcome.decision());
     let plan = outcome
         .guardian_decision
         .action_plan
@@ -596,7 +596,7 @@ fn boundary_case(id: impl Into<String>, family: BoundaryFamily, spec: CaseSpec) 
             &outcome.guardian_decision,
             &outcome.safety_case,
         ),
-        effective_decision: outcome.user_outcome.decision,
+        effective_decision: outcome.user_outcome.decision(),
         directives: outcome
             .directives
             .iter()

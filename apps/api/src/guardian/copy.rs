@@ -1,19 +1,71 @@
 use super::{
     DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianDirective, GuardianFact,
     GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-    GuardianLaunchRecoveryPlan, GuardianManagedJavaReason, GuardianObservedLaunchFailurePhase,
-    GuardianPerformanceSupervisionRejection, GuardianPresetDowngradeReason, GuardianRepairStatus,
-    GuardianStartupFailureObservation, GuardianStripJvmArgsReason, GuardianUserOutcome,
+    GuardianManagedJavaReason, GuardianObservedLaunchFailurePhase,
+    GuardianPerformanceSupervisionRejection, GuardianPreflightOutcome,
+    GuardianPresetDowngradeReason, GuardianRepairStatus, GuardianStartupFailureObservation,
+    GuardianStripJvmArgsReason,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
 use crate::state::contracts::OperationPhase;
-use axial_launcher::{CrashEvidence, LaunchFailureClass};
+use axial_launcher::{
+    CrashEvidence, GuardianDecision as LauncherGuardianDecision, GuardianInterventionKind,
+    GuardianSummary, LaunchFailureClass,
+};
 use chrono::{DateTime, Timelike, Utc};
+use serde::Serialize;
 
 const MAX_SUMMARY_BYTES: usize = 180;
 const MAX_LINE_BYTES: usize = 240;
 const MAX_COLLECTION_LINES: usize = 6;
 const MAX_DYNAMIC_TOKEN_BYTES: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GuardianUserOutcome {
+    decision: GuardianActionKind,
+    phase: OperationPhase,
+    summary: String,
+    details: Vec<String>,
+    guidance: Vec<String>,
+}
+
+impl GuardianUserOutcome {
+    fn authored(
+        decision: GuardianActionKind,
+        phase: OperationPhase,
+        summary: String,
+        details: Vec<String>,
+        guidance: Vec<String>,
+    ) -> Self {
+        Self {
+            decision,
+            phase,
+            summary,
+            details,
+            guidance,
+        }
+    }
+
+    pub fn decision(&self) -> GuardianActionKind {
+        self.decision
+    }
+
+    pub fn phase(&self) -> OperationPhase {
+        self.phase
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub fn details(&self) -> &[String] {
+        &self.details
+    }
+
+    pub fn guidance(&self) -> &[String] {
+        &self.guidance
+    }
+}
 
 pub(crate) fn guardian_directive_description(directive: &GuardianDirective) -> String {
     let rendered = match directive {
@@ -51,7 +103,7 @@ pub(crate) fn guardian_directive_description(directive: &GuardianDirective) -> S
     checked_rendered_line(rendered)
 }
 
-pub(crate) fn guardian_directive_recovery_label(directive: &GuardianDirective) -> &'static str {
+fn guardian_directive_recovery_label(directive: &GuardianDirective) -> &'static str {
     match directive {
         GuardianDirective::UseManagedJava { .. } => "managed Java recovery",
         GuardianDirective::StripJvmArgs { .. } => "explicit JVM argument recovery",
@@ -60,13 +112,311 @@ pub(crate) fn guardian_directive_recovery_label(directive: &GuardianDirective) -
     }
 }
 
-pub fn launch_recovery_suppressed_user_outcome(
-    plan: &GuardianLaunchRecoveryPlan,
-) -> GuardianUserOutcome {
-    author_guardian_copy(GuardianCopyRequest::launch_recovery_suppressed(
-        &plan.directive,
+pub(crate) fn guardian_failed_launch_recovery_log(directive: &GuardianDirective) -> String {
+    checked_rendered_line(format!(
+        "Guardian recorded failed launch self-healing for {}.",
+        guardian_directive_recovery_label(directive)
     ))
-    .expect("launch recovery suppression copy request is closed")
+}
+
+pub(crate) struct GuardianRuntimeRepairCopy {
+    status: GuardianRepairStatus,
+    user_outcome: GuardianUserOutcome,
+}
+
+#[derive(Clone)]
+pub(crate) enum GuardianLaunchAdmission {
+    Preflight {
+        user_outcome: GuardianUserOutcome,
+        safety: super::SafetyOutcome,
+    },
+    RuntimeRepairBlock {
+        user_outcome: GuardianUserOutcome,
+        safety: super::SafetyOutcome,
+    },
+}
+
+impl GuardianLaunchAdmission {
+    pub(crate) fn preflight(current: &GuardianPreflightOutcome) -> Self {
+        Self::Preflight {
+            user_outcome: current.user_outcome.clone(),
+            safety: current.safety.clone(),
+        }
+    }
+
+    pub(crate) fn user_outcome(&self) -> &GuardianUserOutcome {
+        match self {
+            Self::Preflight { user_outcome, .. }
+            | Self::RuntimeRepairBlock { user_outcome, .. } => user_outcome,
+        }
+    }
+
+    pub(crate) fn safety(&self) -> &super::SafetyOutcome {
+        match self {
+            Self::Preflight { safety, .. } | Self::RuntimeRepairBlock { safety, .. } => safety,
+        }
+    }
+
+    pub(crate) fn public_lines(&self) -> Vec<String> {
+        let outcome = self.user_outcome();
+        let mut lines = Vec::new();
+        for value in outcome.details.iter().chain(outcome.guidance.iter()) {
+            push_unique_copy_line(&mut lines, value);
+        }
+        lines
+    }
+}
+
+impl GuardianRuntimeRepairCopy {
+    pub(crate) fn author(
+        diagnosis_id: Option<DiagnosisId>,
+        status: GuardianRepairStatus,
+    ) -> Option<Self> {
+        let user_outcome =
+            author_guardian_copy(GuardianCopyRequest::runtime_repair(diagnosis_id, status))?;
+        Some(Self {
+            status,
+            user_outcome,
+        })
+    }
+
+    pub(crate) fn guardian_summary(&self, current: &GuardianSummary) -> GuardianSummary {
+        match self.status {
+            GuardianRepairStatus::Repaired => {
+                repaired_runtime_guardian_summary(current, &self.user_outcome)
+            }
+            GuardianRepairStatus::Blocked
+            | GuardianRepairStatus::Failed
+            | GuardianRepairStatus::Suppressed => {
+                blocked_runtime_guardian_summary(current, &self.user_outcome)
+            }
+        }
+    }
+
+    pub(crate) fn blocked_admission(
+        &self,
+        current: &GuardianPreflightOutcome,
+    ) -> Option<GuardianLaunchAdmission> {
+        if self.status == GuardianRepairStatus::Repaired {
+            return None;
+        }
+        let user_outcome = GuardianUserOutcome::authored(
+            GuardianActionKind::Block,
+            current.user_outcome.phase,
+            self.user_outcome.summary.clone(),
+            self.user_outcome.details.clone(),
+            self.user_outcome.guidance.clone(),
+        );
+        Some(GuardianLaunchAdmission::RuntimeRepairBlock {
+            safety: super::SafetyOutcome {
+                decision: GuardianActionKind::Block,
+                summary: user_outcome.summary.clone(),
+                detail: user_outcome.details.first().cloned(),
+                diagnoses: current.safety.diagnoses.clone(),
+            },
+            user_outcome,
+        })
+    }
+}
+
+fn repaired_runtime_guardian_summary(
+    current: &GuardianSummary,
+    outcome: &GuardianUserOutcome,
+) -> GuardianSummary {
+    let mut summary = current.clone();
+    let previous_details = summary.details.clone();
+    let previous_guidance = summary.guidance.clone();
+    summary.decision = LauncherGuardianDecision::Intervened;
+    summary.message = Some(outcome.summary.clone());
+    summary.details.clear();
+    for detail in &outcome.details {
+        push_unique_copy_line(&mut summary.details, detail);
+    }
+    for detail in previous_details {
+        push_unique_copy_line(&mut summary.details, &detail);
+    }
+    for detail in &previous_guidance {
+        push_unique_copy_line(&mut summary.details, detail);
+    }
+    summary.guidance.clear();
+    for detail in previous_guidance {
+        push_unique_copy_line(&mut summary.guidance, &detail);
+    }
+    summary
+}
+
+fn blocked_runtime_guardian_summary(
+    current: &GuardianSummary,
+    outcome: &GuardianUserOutcome,
+) -> GuardianSummary {
+    let mut details = Vec::new();
+    for detail in outcome
+        .details
+        .iter()
+        .chain(current.details.iter())
+        .chain(current.guidance.iter())
+        .chain(outcome.guidance.iter())
+    {
+        push_unique_copy_line(&mut details, detail);
+    }
+    let mut guidance = Vec::new();
+    for detail in current.guidance.iter().chain(outcome.guidance.iter()) {
+        push_unique_copy_line(&mut guidance, detail);
+    }
+    GuardianSummary {
+        mode: current.mode,
+        decision: LauncherGuardianDecision::Blocked,
+        message: Some(outcome.summary.clone()),
+        details,
+        guidance,
+        interventions: current.interventions.clone(),
+    }
+}
+
+fn push_unique_copy_line(lines: &mut Vec<String>, value: &str) {
+    if lines.len() >= MAX_COLLECTION_LINES {
+        return;
+    }
+    let Some(value) = sanitize_evidence_text(value, RedactionAudience::UserVisible, MAX_LINE_BYTES)
+        .filter(|value| value.len() <= MAX_LINE_BYTES)
+    else {
+        return;
+    };
+    if !lines.iter().any(|line| line == &value) {
+        lines.push(value);
+    }
+}
+
+pub(crate) fn guardian_summary_with_blocked_outcome(
+    current: &GuardianSummary,
+    outcome: &GuardianUserOutcome,
+) -> GuardianSummary {
+    let mut projected = current.clone();
+    let existing_guidance = projected.guidance.clone();
+    let mut guidance = Vec::new();
+    for detail in existing_guidance.iter().chain(outcome.guidance.iter()) {
+        push_unique_copy_line(&mut guidance, detail);
+    }
+    let mut details = Vec::new();
+    for detail in outcome
+        .details
+        .iter()
+        .chain(existing_guidance.iter())
+        .chain(outcome.guidance.iter())
+    {
+        push_unique_copy_line(&mut details, detail);
+    }
+    projected.decision = LauncherGuardianDecision::Blocked;
+    projected.message = Some(outcome.summary.clone());
+    projected.details = details;
+    projected.guidance = guidance;
+    projected
+}
+
+pub(crate) fn guardian_summary_with_suppressed_outcome(
+    current: &GuardianSummary,
+    outcome: &GuardianUserOutcome,
+) -> GuardianSummary {
+    let mut guidance = Vec::new();
+    for detail in current.guidance.iter().chain(outcome.guidance.iter()) {
+        push_unique_copy_line(&mut guidance, detail);
+    }
+    let reason = outcome
+        .details
+        .first()
+        .cloned()
+        .unwrap_or_else(|| outcome.summary.clone());
+    let mut details = Vec::new();
+    push_unique_copy_line(&mut details, &reason);
+    for detail in &current.details {
+        push_unique_copy_line(&mut details, detail);
+    }
+    for detail in &guidance {
+        push_unique_copy_line(&mut details, detail);
+    }
+    GuardianSummary {
+        mode: current.mode,
+        decision: LauncherGuardianDecision::Blocked,
+        message: Some("Guardian blocked an unsafe launch setup.".to_string()),
+        details,
+        guidance,
+        interventions: current.interventions.clone(),
+    }
+}
+
+pub(crate) fn guardian_summary_with_observed_outcome(
+    current: &GuardianSummary,
+    outcome: &GuardianUserOutcome,
+) -> GuardianSummary {
+    if outcome.decision == GuardianActionKind::Block {
+        return guardian_summary_with_blocked_outcome(current, outcome);
+    }
+    let mut projected = current.clone();
+    projected.decision = LauncherGuardianDecision::Warned;
+    projected.message = Some(outcome.summary.clone());
+    let mut details = Vec::new();
+    for detail in current.details.iter().chain(outcome.details.iter()) {
+        push_unique_copy_line(&mut details, detail);
+    }
+    let mut guidance = Vec::new();
+    for detail in current.guidance.iter().chain(outcome.guidance.iter()) {
+        push_unique_copy_line(&mut guidance, detail);
+    }
+    projected.details = details;
+    projected.guidance = guidance;
+    projected
+}
+
+pub(crate) fn guardian_summary_with_intervention(
+    current: &GuardianSummary,
+    kind: GuardianInterventionKind,
+    detail: String,
+    silent: bool,
+) -> GuardianSummary {
+    let mut projected = current.clone();
+    let existing_guidance = projected.guidance.clone();
+    projected.record_intervention(kind, detail, silent);
+    let expanded_details = projected.details.clone();
+    projected.details.clear();
+    for detail in expanded_details.iter().chain(existing_guidance.iter()) {
+        push_unique_copy_line(&mut projected.details, detail);
+    }
+    projected.guidance.clear();
+    for detail in existing_guidance {
+        push_unique_copy_line(&mut projected.guidance, &detail);
+    }
+    projected
+}
+
+#[cfg(test)]
+pub(crate) fn guardian_user_outcome_for_test(
+    decision: GuardianActionKind,
+    phase: OperationPhase,
+    summary: &str,
+    details: &[&str],
+    guidance: &[&str],
+) -> GuardianUserOutcome {
+    let mut bounded_details = Vec::new();
+    for detail in details {
+        push_unique_copy_line(&mut bounded_details, detail);
+    }
+    let mut bounded_guidance = Vec::new();
+    for detail in guidance {
+        push_unique_copy_line(&mut bounded_guidance, detail);
+    }
+    GuardianUserOutcome::authored(
+        decision,
+        phase,
+        trusted_line_for_test(summary, MAX_SUMMARY_BYTES),
+        bounded_details,
+        bounded_guidance,
+    )
+}
+
+#[cfg(test)]
+fn trusted_line_for_test(value: &str, max_bytes: usize) -> String {
+    assert!(!value.is_empty() && value.len() <= max_bytes);
+    value.to_string()
 }
 
 #[derive(Clone, Debug)]
@@ -1349,13 +1699,9 @@ pub(crate) fn author_guardian_copy(
             .map(|line| render_line(*line, &context)),
     );
 
-    Some(GuardianUserOutcome {
-        decision,
-        phase,
-        summary,
-        details,
-        guidance,
-    })
+    Some(GuardianUserOutcome::authored(
+        decision, phase, summary, details, guidance,
+    ))
 }
 
 impl GuardianCopyContext<'_> {
@@ -1655,13 +2001,13 @@ fn author_prepare_failure_copy(
         GuardianActionKind::Block => "Guardian blocked launch preparation.",
         _ => "Guardian recorded launch preparation failure.",
     };
-    GuardianUserOutcome {
-        decision: launch_public_decision(decision),
-        phase: OperationPhase::Preparing,
-        summary: trusted_line(summary, MAX_SUMMARY_BYTES),
-        details: finalize_launch_lines([detail]),
-        guidance: prepare_failure_guidance(failure_class, explicit_java, explicit_jvm_args, false),
-    }
+    GuardianUserOutcome::authored(
+        launch_public_decision(decision),
+        OperationPhase::Preparing,
+        trusted_line(summary, MAX_SUMMARY_BYTES),
+        finalize_launch_lines([detail]),
+        prepare_failure_guidance(failure_class, explicit_java, explicit_jvm_args, false),
+    )
 }
 
 fn startup_failure_reason(
@@ -1753,15 +2099,15 @@ fn author_startup_failure_copy(input: StartupFailureCopyInput<'_>) -> GuardianUs
         GuardianActionKind::Block => "Guardian blocked launch startup.",
         _ => "Guardian recorded launch startup failure.",
     };
-    GuardianUserOutcome {
-        decision: launch_public_decision(decision),
-        phase: OperationPhase::Launching,
-        summary: trusted_line(summary, MAX_SUMMARY_BYTES),
-        details: finalize_launch_lines([directive
+    GuardianUserOutcome::authored(
+        launch_public_decision(decision),
+        OperationPhase::Launching,
+        trusted_line(summary, MAX_SUMMARY_BYTES),
+        finalize_launch_lines([directive
             .map(guardian_directive_description)
             .unwrap_or_else(|| startup_failure_reason(failure_class, stalled, suspected_mod))]),
-        guidance: finalize_launch_lines(guidance),
-    }
+        finalize_launch_lines(guidance),
+    )
 }
 
 fn author_observed_launch_failure_copy(
@@ -1784,13 +2130,13 @@ fn author_observed_launch_failure_copy(
             copy.running_detail,
         ),
     };
-    Some(GuardianUserOutcome {
+    Some(GuardianUserOutcome::authored(
         decision,
         phase,
-        summary: launch_summary(&summary),
-        details: finalize_launch_lines([detail]),
-        guidance: finalize_launch_lines([copy.guidance]),
-    })
+        launch_summary(&summary),
+        finalize_launch_lines([detail]),
+        finalize_launch_lines([copy.guidance]),
+    ))
 }
 
 fn author_launch_recovery_suppressed_copy(directive: &GuardianDirective) -> GuardianUserOutcome {
@@ -1798,16 +2144,16 @@ fn author_launch_recovery_suppressed_copy(directive: &GuardianDirective) -> Guar
     let detail = checked_rendered_line(format!(
         "Guardian suppressed a repeated launch self-healing retry for {label} because the same recovery failed recently."
     ));
-    GuardianUserOutcome {
-        decision: GuardianActionKind::Block,
-        phase: OperationPhase::Repairing,
-        summary: detail.clone(),
-        details: vec![detail],
-        guidance: vec![
+    GuardianUserOutcome::authored(
+        GuardianActionKind::Block,
+        OperationPhase::Repairing,
+        detail.clone(),
+        vec![detail],
+        vec![
             "Review the latest game log or change the affected launch setting before retrying."
                 .to_string(),
         ],
-    }
+    )
 }
 
 fn launch_public_decision(decision: GuardianActionKind) -> GuardianActionKind {
@@ -1857,13 +2203,13 @@ fn author_preflight_copy(
     let details = finalize_lines(ordered.clone().filter_map(|lines| lines.0.clone()));
     let guidance = finalize_lines(ordered.filter_map(|lines| lines.1.clone()));
 
-    Some(GuardianUserOutcome {
-        decision: effective_decision,
+    Some(GuardianUserOutcome::authored(
+        effective_decision,
         phase,
         summary,
         details,
         guidance,
-    })
+    ))
 }
 
 fn preflight_diagnosis_copy(
@@ -2262,8 +2608,8 @@ fn finalize_launch_lines(lines: impl IntoIterator<Item = String>) -> Vec<String>
 #[cfg(test)]
 mod tests {
     use super::{
-        CopyContextKey, GUARDIAN_COPY_RULES, GuardianCopyRequest, MAX_COLLECTION_LINES,
-        MAX_LINE_BYTES, MAX_SUMMARY_BYTES, PREFLIGHT_DIAGNOSIS_RULES,
+        CopyContextKey, GUARDIAN_COPY_RULES, GuardianCopyRequest, GuardianRuntimeRepairCopy,
+        MAX_COLLECTION_LINES, MAX_LINE_BYTES, MAX_SUMMARY_BYTES, PREFLIGHT_DIAGNOSIS_RULES,
         PREFLIGHT_INVARIANT_DIAGNOSIS_RULES, PREFLIGHT_SUMMARY_RULES, author_guardian_copy,
         finalize_lines,
     };
@@ -2273,6 +2619,7 @@ mod tests {
         GuardianRepairStatus,
     };
     use crate::state::contracts::OperationPhase;
+    use axial_launcher::{GuardianMode, GuardianSummary};
 
     #[test]
     fn copy_rule_table_is_unique_and_covers_the_five_migrated_families() {
@@ -2574,5 +2921,72 @@ mod tests {
             values,
             ["first", "second", "third", "fourth", "fifth", "sixth"]
         );
+    }
+
+    #[test]
+    fn runtime_repair_composition_bounds_and_redacts_prior_copy() {
+        let mut prior = GuardianSummary::new(GuardianMode::Managed);
+        prior.details = vec![
+            "/home/alice/private/runtime".to_string(),
+            "é".repeat(121),
+            "existing detail".to_string(),
+            "existing detail".to_string(),
+            "second detail".to_string(),
+            "third detail".to_string(),
+            "fourth detail".to_string(),
+            "fifth detail".to_string(),
+            "sixth detail".to_string(),
+        ];
+        prior.guidance = prior.details.clone();
+
+        for status in [GuardianRepairStatus::Repaired, GuardianRepairStatus::Failed] {
+            let copy =
+                GuardianRuntimeRepairCopy::author(Some(DiagnosisId::ManagedRuntimeCorrupt), status)
+                    .expect("runtime repair copy");
+            let summary = copy.guardian_summary(&prior);
+            assert!(summary.details.len() <= MAX_COLLECTION_LINES);
+            assert!(summary.guidance.len() <= MAX_COLLECTION_LINES);
+            let encoded = serde_json::to_string(&summary).expect("summary JSON");
+            assert!(!encoded.contains("/home"));
+            assert!(!encoded.contains("alice"));
+            assert!(!encoded.contains(&"é".repeat(121)));
+            assert!(
+                summary
+                    .details
+                    .iter()
+                    .all(|line| line.len() <= MAX_LINE_BYTES)
+            );
+            assert!(
+                summary
+                    .guidance
+                    .iter()
+                    .all(|line| line.len() <= MAX_LINE_BYTES)
+            );
+        }
+    }
+
+    #[test]
+    fn suppressed_recovery_preserves_visible_intervention_detail_order() {
+        let mut current = GuardianSummary::new(GuardianMode::Managed);
+        current.record_intervention(
+            axial_launcher::GuardianInterventionKind::DowngradePreset,
+            "Existing visible preset intervention.",
+            false,
+        );
+        let outcome = super::author_launch_recovery_suppressed_copy(
+            &crate::guardian::GuardianDirective::StripJvmArgs {
+                reason: crate::guardian::GuardianStripJvmArgsReason::PrepareFailure,
+            },
+        );
+
+        let projected = super::guardian_summary_with_suppressed_outcome(&current, &outcome);
+
+        assert_eq!(projected.details[0], outcome.summary());
+        assert_eq!(
+            projected.details[1],
+            "JVM preset was changed for compatibility."
+        );
+        assert_eq!(projected.details[2], outcome.guidance()[0]);
+        assert_eq!(projected.interventions, current.interventions);
     }
 }

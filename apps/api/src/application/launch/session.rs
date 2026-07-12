@@ -18,10 +18,10 @@ use crate::application::{
 };
 use crate::guardian::{
     GuardianActionKind as ApiGuardianActionKind, GuardianDirective, GuardianFact,
-    GuardianLaunchFailureMemoryIntakeRequest, GuardianLaunchRecoveryCurrentIntent,
-    GuardianManagedJavaReason, GuardianPreflightOutcome, GuardianPreflightOutcomeRequest,
-    GuardianPreflightReadiness, GuardianStripJvmArgsReason, guardian_fact_from_execution,
-    guardian_preflight_outcome, launch_failure_memory_guardian_facts,
+    GuardianLaunchAdmission, GuardianLaunchFailureMemoryIntakeRequest,
+    GuardianLaunchRecoveryCurrentIntent, GuardianManagedJavaReason, GuardianPreflightOutcome,
+    GuardianPreflightOutcomeRequest, GuardianPreflightReadiness, GuardianStripJvmArgsReason,
+    guardian_fact_from_execution, guardian_preflight_outcome, launch_failure_memory_guardian_facts,
 };
 use crate::logging::timestamp_utc;
 use crate::state::contracts::OperationPhase;
@@ -99,6 +99,7 @@ struct LaunchPreflightFacts {
     guardian: LaunchGuardianContext,
     guardian_summary: GuardianSummary,
     guardian_outcome: GuardianPreflightOutcome,
+    guardian_admission: GuardianLaunchAdmission,
     guardian_facts: Vec<GuardianFact>,
     preflight_stage_evidence: Vec<LaunchStageEvidence>,
     readiness: LaunchReadiness,
@@ -252,7 +253,7 @@ async fn prepare_launch_session_with_auth_refresh(
     .await
     .map_err(launch_journal_error_response)?;
     let repair_elapsed = repair_started_at.elapsed();
-    if preflight.guardian_outcome.user_outcome.decision == ApiGuardianActionKind::Block {
+    if preflight.guardian_admission.user_outcome().decision() == ApiGuardianActionKind::Block {
         trace_launch_session(
             LaunchSessionTiming {
                 route: "/api/v1/launch",
@@ -266,14 +267,14 @@ async fn prepare_launch_session_with_auth_refresh(
                 runtime_repair: repair_elapsed,
                 insert: None,
                 readiness_launchable: preflight.readiness.launchable,
-                guardian_decision: preflight.guardian_outcome.user_outcome.decision,
+                guardian_decision: preflight.guardian_admission.user_outcome().decision(),
             },
             "launch session blocked by preflight timing",
         );
         return Err(launch_preflight_guardian_error_response(
             preflight.readiness,
             preflight.guardian_summary,
-            &preflight.guardian_outcome,
+            preflight.guardian_admission,
         ));
     }
 
@@ -363,7 +364,7 @@ async fn prepare_launch_session_with_auth_refresh(
             runtime_repair: repair_elapsed,
             insert: Some(insert_elapsed),
             readiness_launchable: preflight.readiness.launchable,
-            guardian_decision: preflight.guardian_outcome.user_outcome.decision,
+            guardian_decision: preflight.guardian_admission.user_outcome().decision(),
         },
         "launch session preparation timing",
     );
@@ -419,7 +420,7 @@ fn launch_session_admission_error_response(
 fn launch_preflight_guardian_error_response(
     readiness: LaunchReadiness,
     guardian: GuardianSummary,
-    outcome: &GuardianPreflightOutcome,
+    admission: GuardianLaunchAdmission,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let status = if readiness.launchable {
         StatusCode::UNPROCESSABLE_ENTITY
@@ -429,11 +430,11 @@ fn launch_preflight_guardian_error_response(
     (
         status,
         Json(json!({
-            "error": outcome.user_outcome.summary,
+            "error": admission.user_outcome().summary(),
             "readiness": readiness,
             "notice": launch_notice(Some(&guardian), None, None, None, None),
             "guardian": guardian,
-            "safety": outcome.safety,
+            "safety": admission.safety(),
         })),
     )
 }
@@ -525,7 +526,7 @@ async fn prepare_launch_preflight_with_memory_capture(
         version_id: &instance.version_id,
         total: started_at.elapsed(),
         readiness_launchable: facts.readiness.launchable,
-        guardian_decision: facts.guardian_outcome.user_outcome.decision,
+        guardian_decision: facts.guardian_admission.user_outcome().decision(),
         reason_count: facts.readiness.reasons.len(),
         fact_count: facts.guardian_facts.len(),
     });
@@ -767,8 +768,16 @@ async fn build_launch_preflight_facts_with_memory_capture(
         &mut extra_jvm_args,
         &mut java_probe_receipt,
     );
-    let guardian_summary =
-        guardian_summary_from_preflight_outcome(guardian.mode, &guardian_outcome);
+    let guardian_admission = GuardianLaunchAdmission::preflight(&guardian_outcome);
+    let public_lines = guardian_admission.public_lines();
+    let guardian_summary = GuardianSummary {
+        mode: guardian.mode,
+        decision: launcher_guardian_decision(guardian_admission.user_outcome().decision()),
+        message: Some(guardian_admission.user_outcome().summary().to_string()),
+        details: public_lines.clone(),
+        guidance: public_lines,
+        interventions: Vec::new(),
+    };
     let guardian_elapsed = guardian_started_at.elapsed();
 
     trace_launch_preflight_facts(LaunchPreflightFactTiming {
@@ -785,7 +794,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
         readiness_launchable: readiness.launchable,
         reason_count: readiness.reasons.len(),
         fact_count: guardian_facts.len(),
-        guardian_decision: guardian_outcome.user_outcome.decision,
+        guardian_decision: guardian_admission.user_outcome().decision(),
         java_probe_count,
         java_probe_source: java_probe_source.as_str(),
         installed_versions_source: scan_source,
@@ -806,6 +815,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
         guardian,
         guardian_summary,
         guardian_outcome,
+        guardian_admission,
         guardian_facts,
         preflight_stage_evidence,
         readiness,
@@ -845,36 +855,6 @@ fn apply_guardian_preflight_interventions(
             }
         }
     }
-}
-
-fn guardian_summary_from_preflight_outcome(
-    mode: GuardianMode,
-    outcome: &GuardianPreflightOutcome,
-) -> GuardianSummary {
-    let public_details = launcher_guardian_public_lines(outcome);
-    GuardianSummary {
-        mode,
-        decision: launcher_guardian_decision(outcome.user_outcome.decision),
-        message: Some(outcome.user_outcome.summary.clone()),
-        details: public_details.clone(),
-        guidance: public_details,
-        interventions: Vec::new(),
-    }
-}
-
-fn launcher_guardian_public_lines(outcome: &GuardianPreflightOutcome) -> Vec<String> {
-    let mut lines = Vec::new();
-    for value in outcome
-        .user_outcome
-        .details
-        .iter()
-        .chain(outcome.user_outcome.guidance.iter())
-    {
-        if !value.trim().is_empty() && !lines.iter().any(|existing| existing == value) {
-            lines.push(value.clone());
-        }
-    }
-    lines
 }
 
 impl LaunchPreflightFacts {

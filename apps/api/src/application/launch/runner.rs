@@ -12,11 +12,12 @@ use crate::execution::launch::{
     LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
 };
 use crate::guardian::{
-    GuardianLaunchRecoveryPlan, GuardianObservedLaunchFailurePhase, GuardianPrepareFailureRequest,
-    GuardianPresetAdjustmentRequest, GuardianStartupFailureObservation,
-    GuardianStartupFailureRequest, guardian_observed_launch_failure_outcome,
+    GuardianCopyRequest, GuardianLaunchRecoveryPlan, GuardianObservedLaunchFailurePhase,
+    GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
+    GuardianStartupFailureObservation, GuardianStartupFailureRequest, author_guardian_copy,
     guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
-    guardian_startup_failure_outcome, is_guardian_launch_crash_class,
+    guardian_startup_failure_outcome, guardian_summary_with_blocked_outcome,
+    guardian_summary_with_observed_outcome, is_guardian_launch_crash_class,
     record_launch_failure_observation,
 };
 use crate::logging::{append_trace, timestamp_utc};
@@ -42,9 +43,9 @@ use prewarm::{format_prewarm_run_summary, prewarm_launch_plan};
 use proof::persist_launch_proof_with_context_owned as persist_launch_proof_with_context;
 use recovery::{
     RecoveryDirectiveOutcome, RecoveryDirectiveRequest, RecoveryDirectiveStage,
-    apply_prepare_recovery_directive, apply_startup_recovery_directive,
-    block_guardian_with_user_outcome, handle_recovery_directive, record_failed_self_healing_if_any,
-    record_prelaunch_preset_adjustment_directive, record_successful_self_healing_if_any,
+    apply_prepare_recovery_directive, apply_startup_recovery_directive, handle_recovery_directive,
+    record_failed_self_healing_if_any, record_prelaunch_preset_adjustment_directive,
+    record_successful_self_healing_if_any,
 };
 use spawn::{
     launch_command_target, launch_spawn_failed_stage_evidence, launch_spawn_stage_evidence,
@@ -306,28 +307,21 @@ async fn settle_observed_launch_failure(
     record: crate::state::LaunchSessionRecord,
     mut guardian: GuardianSummary,
 ) {
-    let Some(user_outcome) = guardian_observed_launch_failure_outcome(
+    let Some(user_outcome) = author_guardian_copy(GuardianCopyRequest::observed_launch_failure(
         failure_class,
         record.crash_evidence.as_ref(),
         observed_phase,
-    ) else {
+    )) else {
         persist_terminal_proof(state, session_id, launched_at, proof_context, record).await;
         return;
     };
     let terminal_state = match observed_phase {
         GuardianObservedLaunchFailurePhase::BeforeBoot => {
-            block_guardian_with_user_outcome(&mut guardian, &user_outcome);
+            guardian = guardian_summary_with_observed_outcome(&guardian, &user_outcome);
             "failed"
         }
         GuardianObservedLaunchFailurePhase::AfterBoot => {
-            guardian.decision = axial_launcher::GuardianDecision::Warned;
-            guardian.message = Some(user_outcome.summary.clone());
-            for detail in &user_outcome.details {
-                push_unique_guardian_detail(&mut guardian.details, detail);
-            }
-            for guidance in &user_outcome.guidance {
-                push_unique_guardian_detail(&mut guardian.guidance, guidance);
-            }
+            guardian = guardian_summary_with_observed_outcome(&guardian, &user_outcome);
             "exited"
         }
     };
@@ -342,7 +336,7 @@ async fn settle_observed_launch_failure(
                 pid: None,
                 exit_code: record.exit_code,
                 failure_class: Some(failure_class.as_str().to_string()),
-                failure_detail: Some(user_outcome.summary.clone()),
+                failure_detail: Some(user_outcome.summary().to_string()),
                 crash_evidence: record.crash_evidence.clone(),
                 healing: record.healing.clone(),
                 guardian: serialize_guardian(Some(guardian)),
@@ -387,12 +381,6 @@ async fn settle_observed_launch_failure(
             failure_class = failure_class.as_str(),
             "failed to persist observed launch failure proof"
         );
-    }
-}
-
-fn push_unique_guardian_detail(target: &mut Vec<String>, value: &str) {
-    if !target.iter().any(|existing| existing == value) {
-        target.push(value.to_string());
     }
 }
 
@@ -656,21 +644,21 @@ async fn launch_session_inner_with_control(
                             }
                             RecoveryDirectiveOutcome::Exhausted => {
                                 control.record_capped_prepare_failure(&error);
-                                block_guardian_with_user_outcome(
-                                    &mut guardian,
+                                guardian = guardian_summary_with_blocked_outcome(
+                                    &guardian,
                                     &prepare_outcome.user_outcome,
                                 );
-                                prepare_outcome.user_outcome.summary.clone()
+                                prepare_outcome.user_outcome.summary().to_string()
                             }
                             RecoveryDirectiveOutcome::Rejected => {
-                                block_guardian_with_user_outcome(
-                                    &mut guardian,
+                                guardian = guardian_summary_with_blocked_outcome(
+                                    &guardian,
                                     &prepare_outcome.user_outcome,
                                 );
-                                prepare_outcome.user_outcome.summary.clone()
+                                prepare_outcome.user_outcome.summary().to_string()
                             }
                             RecoveryDirectiveOutcome::Suppressed(recovery_user_outcome) => {
-                                recovery_user_outcome.summary
+                                recovery_user_outcome.summary().to_string()
                             }
                         };
                     return Err(finish_launch_failure(
@@ -689,7 +677,8 @@ async fn launch_session_inner_with_control(
                     )
                     .await);
                 }
-                block_guardian_with_user_outcome(&mut guardian, &prepare_outcome.user_outcome);
+                guardian =
+                    guardian_summary_with_blocked_outcome(&guardian, &prepare_outcome.user_outcome);
                 return Err(finish_launch_failure(
                     &state,
                     producer,
@@ -1149,29 +1138,29 @@ async fn launch_session_inner_with_control(
                                     last_recovery_plan = Some(recovery_plan);
                                     continue;
                                 } else {
-                                    block_guardian_with_user_outcome(
-                                        &mut guardian,
+                                    guardian = guardian_summary_with_blocked_outcome(
+                                        &guardian,
                                         &startup_outcome.user_outcome,
                                     );
-                                    startup_outcome.user_outcome.summary.clone()
+                                    startup_outcome.user_outcome.summary().to_string()
                                 }
                             }
                             RecoveryDirectiveOutcome::Exhausted => {
-                                block_guardian_with_user_outcome(
-                                    &mut guardian,
+                                guardian = guardian_summary_with_blocked_outcome(
+                                    &guardian,
                                     &startup_outcome.user_outcome,
                                 );
-                                startup_outcome.user_outcome.summary.clone()
+                                startup_outcome.user_outcome.summary().to_string()
                             }
                             RecoveryDirectiveOutcome::Rejected => {
-                                block_guardian_with_user_outcome(
-                                    &mut guardian,
+                                guardian = guardian_summary_with_blocked_outcome(
+                                    &guardian,
                                     &startup_outcome.user_outcome,
                                 );
-                                startup_outcome.user_outcome.summary.clone()
+                                startup_outcome.user_outcome.summary().to_string()
                             }
                             RecoveryDirectiveOutcome::Suppressed(recovery_user_outcome) => {
-                                recovery_user_outcome.summary
+                                recovery_user_outcome.summary().to_string()
                             }
                         };
                     let healing =
@@ -1194,7 +1183,8 @@ async fn launch_session_inner_with_control(
                 }
 
                 let healing = startup_failure_healing(&intent, &prepared, &attempt, failure_class);
-                block_guardian_with_user_outcome(&mut guardian, &startup_outcome.user_outcome);
+                guardian =
+                    guardian_summary_with_blocked_outcome(&guardian, &startup_outcome.user_outcome);
                 return Err(finish_launch_failure(
                     &state,
                     producer,
@@ -1203,7 +1193,7 @@ async fn launch_session_inner_with_control(
                     LaunchFailure {
                         proof_context: Some(&proof_context),
                         class: failure_class,
-                        message: &startup_outcome.user_outcome.summary,
+                        message: startup_outcome.user_outcome.summary(),
                         healing,
                         guardian: Some(guardian.clone()),
                         outcome: None,
@@ -1410,7 +1400,9 @@ pub fn trace_launch_event(session_id: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guardian::{GuardianActionKind, GuardianDomain, GuardianMode, GuardianUserOutcome};
+    use crate::guardian::{
+        GuardianActionKind, GuardianDomain, GuardianMode, guardian_user_outcome_for_test,
+    };
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
     use crate::state::contracts::{
         OperationPhase, OwnershipClass, StabilizationSystem, TargetKind,
@@ -1500,7 +1492,7 @@ mod tests {
             runtime_intervention_applied: false,
             raw_jvm_args_intervention_applied: false,
         });
-        assert_eq!(error.message, final_outcome.user_outcome.summary);
+        assert_eq!(error.message, final_outcome.user_outcome.summary());
         let record = state
             .sessions()
             .get(session_id)
@@ -2408,15 +2400,15 @@ mod tests {
             .await
             .expect("insert session");
         let mut guardian = GuardianSummary::new(axial_launcher::GuardianMode::Managed);
-        let user_outcome = GuardianUserOutcome {
-            decision: GuardianActionKind::Block,
-            phase: OperationPhase::Preparing,
-            summary: "Guardian blocked launch recovery planning.".to_string(),
-            details: vec!["The recovery directive could not be planned safely.".to_string()],
-            guidance: Vec::new(),
-        };
+        let user_outcome = guardian_user_outcome_for_test(
+            GuardianActionKind::Block,
+            OperationPhase::Preparing,
+            "Guardian blocked launch recovery planning.",
+            &["The recovery directive could not be planned safely."],
+            &[],
+        );
 
-        block_guardian_with_user_outcome(&mut guardian, &user_outcome);
+        guardian = guardian_summary_with_blocked_outcome(&guardian, &user_outcome);
         let mut launch_completion_pending = true;
         let error = finish_launch_failure(
             &state,
@@ -2426,7 +2418,7 @@ mod tests {
             LaunchFailure {
                 proof_context: None,
                 class: LaunchFailureClass::Unknown,
-                message: &user_outcome.summary,
+                message: user_outcome.summary(),
                 healing: None,
                 guardian: Some(guardian.clone()),
                 outcome: None,
@@ -2434,7 +2426,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(error.message, user_outcome.summary);
+        assert_eq!(error.message, user_outcome.summary());
         assert_eq!(guardian.decision, axial_launcher::GuardianDecision::Blocked);
         let record = state
             .sessions()

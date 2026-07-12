@@ -3,8 +3,7 @@ use super::{
     GuardianDirective, GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
     GuardianLaunchRecoveryPlanRequest, GuardianManagedJavaReason, GuardianMode,
     GuardianPerformanceSupervisionRejection, GuardianRepairStatus, GuardianStripJvmArgsReason,
-    GuardianUserOutcome, author_guardian_copy, launch_recovery_suppressed_user_outcome,
-    plan_launch_recovery_directive,
+    GuardianUserOutcome, author_guardian_copy, plan_launch_recovery_directive,
 };
 use crate::state::contracts::OperationPhase;
 use axial_launcher::LaunchFailureClass;
@@ -128,11 +127,11 @@ struct GuardianUserOutcomeProjection {
 impl From<GuardianUserOutcome> for GuardianUserOutcomeProjection {
     fn from(outcome: GuardianUserOutcome) -> Self {
         Self {
-            decision: outcome.decision,
-            phase: outcome.phase,
-            summary: outcome.summary,
-            details: outcome.details,
-            guidance: outcome.guidance,
+            decision: outcome.decision(),
+            phase: outcome.phase(),
+            summary: outcome.summary().to_string(),
+            details: outcome.details().to_vec(),
+            guidance: outcome.guidance().to_vec(),
         }
     }
 }
@@ -213,7 +212,12 @@ fn render_outcome(input: &GuardianOutcomeCopyInput) -> GuardianUserOutcomeProjec
             .into()
         }
         GuardianOutcomeCopyInput::LaunchRecoverySuppressed { kind } => {
-            launch_recovery_suppressed_user_outcome(&launch_recovery_plan(*kind)).into()
+            let plan = launch_recovery_plan(*kind);
+            author_guardian_copy(GuardianCopyRequest::launch_recovery_suppressed(
+                &plan.directive,
+            ))
+            .expect("launch recovery suppression copy")
+            .into()
         }
         GuardianOutcomeCopyInput::PerformanceRejection { rejection, phase } => {
             author_guardian_copy(GuardianCopyRequest::performance_rejection(

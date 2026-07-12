@@ -3,13 +3,13 @@ use super::launch_decision_snapshot::{
     LaunchBoundaryCopySource, committed_launch_boundary_case_ids, launch_boundary_copy_sources,
 };
 use super::{
-    GuardianActionKind, GuardianDirective, GuardianLaunchRecoveryPlanRequest,
+    GuardianActionKind, GuardianCopyRequest, GuardianDirective, GuardianLaunchRecoveryPlanRequest,
     GuardianManagedJavaReason, GuardianMode, GuardianObservedLaunchFailurePhase,
     GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
     GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianStripJvmArgsReason,
-    GuardianUserOutcome, guardian_directive_description, guardian_observed_launch_failure_outcome,
+    GuardianUserOutcome, author_guardian_copy, guardian_directive_description,
     guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
-    launch_recovery_suppressed_user_outcome, plan_launch_recovery_directive,
+    plan_launch_recovery_directive,
 };
 use crate::state::contracts::OperationPhase;
 use axial_launcher::{CrashEvidence, LaunchFailureClass};
@@ -182,11 +182,11 @@ struct GuardianUserOutcomeProjection {
 impl From<GuardianUserOutcome> for GuardianUserOutcomeProjection {
     fn from(outcome: GuardianUserOutcome) -> Self {
         Self {
-            decision: outcome.decision,
-            phase: outcome.phase,
-            summary: outcome.summary,
-            details: outcome.details,
-            guidance: outcome.guidance,
+            decision: outcome.decision(),
+            phase: outcome.phase(),
+            summary: outcome.summary().to_string(),
+            details: outcome.details().to_vec(),
+            guidance: outcome.guidance().to_vec(),
         }
     }
 }
@@ -346,11 +346,11 @@ fn render_output(
             let crash_evidence = crash_evidence(suspected_mods);
             project_output(
                 None,
-                guardian_observed_launch_failure_outcome(
+                author_guardian_copy(GuardianCopyRequest::observed_launch_failure(
                     *failure_class,
                     crash_evidence.as_ref(),
                     (*phase).into(),
-                ),
+                )),
                 None,
             )
         }
@@ -427,9 +427,12 @@ fn render_output(
         }
         GuardianLaunchCopyInput::RecoverySuppressed { kind } => project_output(
             None,
-            Some(launch_recovery_suppressed_user_outcome(
-                &launch_recovery_plan(*kind),
-            )),
+            Some(
+                author_guardian_copy(GuardianCopyRequest::launch_recovery_suppressed(
+                    &launch_recovery_plan(*kind).directive,
+                ))
+                .expect("launch recovery suppression copy"),
+            ),
             None,
         ),
     }

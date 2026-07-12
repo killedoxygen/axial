@@ -812,7 +812,7 @@ fn performance_supervision_error(
     (
         status,
         Json(serde_json::json!({
-            "error": outcome.summary
+            "error": outcome.summary()
         })),
     )
 }

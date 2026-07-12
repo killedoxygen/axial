@@ -1,21 +1,20 @@
 use super::trace_launch_event;
 use crate::guardian::{
-    GuardianDirective, GuardianLaunchRecoveryCurrentIntent,
+    GuardianCopyRequest, GuardianDirective, GuardianLaunchRecoveryCurrentIntent,
     GuardianLaunchRecoveryJournalTransition, GuardianLaunchRecoveryOutcome,
     GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
     GuardianLaunchRecoveryPlanRequest, GuardianLaunchRecoveryRecordRequest,
     GuardianManagedJavaReason, GuardianPresetDowngradeReason, GuardianStripJvmArgsReason,
-    GuardianUserOutcome, guardian_directive_description, guardian_directive_recovery_label,
-    launch_recovery_journal_transition_conflicts, launch_recovery_journal_transition_matches,
-    launch_recovery_suppressed_user_outcome, launch_recovery_user_intent_fingerprint,
+    GuardianUserOutcome, author_guardian_copy, guardian_directive_description,
+    guardian_failed_launch_recovery_log, guardian_summary_with_intervention,
+    guardian_summary_with_suppressed_outcome, launch_recovery_journal_transition_conflicts,
+    launch_recovery_journal_transition_matches, launch_recovery_user_intent_fingerprint,
     plan_launch_recovery_directive, record_launch_recovery_attempt, record_launch_recovery_failure,
     record_launch_recovery_success,
 };
 use crate::logging::timestamp_utc;
 use crate::state::{AppState, OperationJournalReconciliation, OperationJournalStoreError};
-use axial_launcher::{
-    GuardianDecision, GuardianInterventionKind, GuardianSummary, LaunchFailureClass,
-};
+use axial_launcher::{GuardianInterventionKind, GuardianSummary, LaunchFailureClass};
 use std::time::Duration;
 
 const JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
@@ -78,13 +77,21 @@ pub(super) async fn handle_recovery_directive(
     let outcome =
         record_guardian_launch_recovery_attempt(request.state, request.session_id, &plan).await?;
     if outcome.status == crate::guardian::GuardianLaunchRecoveryStatus::Suppressed {
-        let user_outcome = launch_recovery_suppressed_user_outcome(&plan);
+        let user_outcome = author_guardian_copy(GuardianCopyRequest::launch_recovery_suppressed(
+            &plan.directive,
+        ))
+        .expect("launch recovery suppression copy request is closed");
         request
             .state
             .sessions()
-            .emit_log(request.session_id, "system", user_outcome.summary.clone())
+            .emit_log(
+                request.session_id,
+                "system",
+                user_outcome.summary().to_string(),
+            )
             .await;
-        block_guardian_for_suppressed_launch_recovery(request.guardian, &user_outcome);
+        *request.guardian =
+            guardian_summary_with_suppressed_outcome(request.guardian, &user_outcome);
         return Ok(RecoveryDirectiveOutcome::Suppressed(user_outcome));
     }
 
@@ -298,10 +305,7 @@ pub(super) async fn record_failed_self_healing_if_any(
         .emit_log(
             session_id,
             "system",
-            format!(
-                "Guardian recorded failed launch self-healing for {}.",
-                guardian_directive_recovery_label(&plan.directive)
-            ),
+            guardian_failed_launch_recovery_log(&plan.directive),
         )
         .await;
     Ok(())
@@ -370,29 +374,6 @@ fn reject_mismatched_launch_recovery_transition(
     Ok(())
 }
 
-fn block_guardian_for_suppressed_launch_recovery(
-    guardian: &mut GuardianSummary,
-    outcome: &GuardianUserOutcome,
-) {
-    let reason = outcome
-        .details
-        .first()
-        .cloned()
-        .unwrap_or_else(|| outcome.summary.clone());
-    block_guardian_with_reason_and_guidance(guardian, Some(reason), outcome.guidance.clone());
-}
-
-fn record_guardian_intervention(
-    guardian: &mut GuardianSummary,
-    kind: GuardianInterventionKind,
-    detail: impl Into<String>,
-    silent: bool,
-) {
-    let existing_guidance = guardian.guidance.clone();
-    guardian.record_intervention(kind, detail, silent);
-    append_guardian_guidance_details(guardian, &existing_guidance);
-}
-
 pub(super) fn record_prelaunch_preset_adjustment_directive(
     guardian: &mut GuardianSummary,
     directive: &GuardianDirective,
@@ -401,29 +382,15 @@ pub(super) fn record_prelaunch_preset_adjustment_directive(
         GuardianDirective::DowngradeJvmPreset {
             reason: GuardianPresetDowngradeReason::Compatibility { .. },
             ..
-        } => record_guardian_intervention(
-            guardian,
-            GuardianInterventionKind::DowngradePreset,
-            guardian_directive_description(directive),
-            false,
-        ),
+        } => {
+            *guardian = guardian_summary_with_intervention(
+                guardian,
+                GuardianInterventionKind::DowngradePreset,
+                guardian_directive_description(directive),
+                false,
+            )
+        }
         _ => unreachable!("prelaunch preset adjustment emitted non-compatibility directive"),
-    }
-}
-
-fn block_guardian_with_reason_and_guidance(
-    guardian: &mut GuardianSummary,
-    reason: Option<String>,
-    guidance: Vec<String>,
-) {
-    let mut merged = guardian.guidance.clone();
-    for detail in guidance {
-        push_unique_detail(&mut merged, detail);
-    }
-    if let Some(reason) = reason {
-        guardian.block_with_reason_and_guidance(reason, merged);
-    } else {
-        guardian.block_with_guidance(merged);
     }
 }
 
@@ -441,7 +408,7 @@ pub(super) fn apply_prepare_recovery_directive(
         GuardianDirective::UseManagedJava {
             reason: GuardianManagedJavaReason::PrepareFailure,
         } => {
-            record_guardian_intervention(
+            *guardian = guardian_summary_with_intervention(
                 guardian,
                 GuardianInterventionKind::SwitchManagedRuntime,
                 description.clone(),
@@ -452,7 +419,7 @@ pub(super) fn apply_prepare_recovery_directive(
         GuardianDirective::StripJvmArgs {
             reason: GuardianStripJvmArgsReason::PrepareFailure,
         } => {
-            record_guardian_intervention(
+            *guardian = guardian_summary_with_intervention(
                 guardian,
                 GuardianInterventionKind::StripJvmArgs,
                 description.clone(),
@@ -481,7 +448,7 @@ pub(super) fn apply_startup_recovery_directive(
             preset,
             reason: GuardianPresetDowngradeReason::StartupRecovery,
         } => {
-            record_guardian_intervention(
+            *guardian = guardian_summary_with_intervention(
                 guardian,
                 GuardianInterventionKind::DowngradePreset,
                 description,
@@ -491,7 +458,7 @@ pub(super) fn apply_startup_recovery_directive(
             attempt.disable_custom_gc = false;
         }
         GuardianDirective::DisableCustomGc => {
-            record_guardian_intervention(
+            *guardian = guardian_summary_with_intervention(
                 guardian,
                 GuardianInterventionKind::DisableCustomGc,
                 description,
@@ -503,7 +470,7 @@ pub(super) fn apply_startup_recovery_directive(
         GuardianDirective::UseManagedJava {
             reason: GuardianManagedJavaReason::StartupRecovery,
         } => {
-            record_guardian_intervention(
+            *guardian = guardian_summary_with_intervention(
                 guardian,
                 GuardianInterventionKind::SwitchManagedRuntime,
                 description,
@@ -518,44 +485,6 @@ pub(super) fn apply_startup_recovery_directive(
     true
 }
 
-pub(super) fn block_guardian_with_user_outcome(
-    guardian: &mut GuardianSummary,
-    outcome: &GuardianUserOutcome,
-) {
-    let existing_guidance = guardian.guidance.clone();
-    let mut guidance = existing_guidance.clone();
-    for detail in &outcome.guidance {
-        push_unique_detail(&mut guidance, detail.clone());
-    }
-
-    let mut details = outcome.details.clone();
-    for detail in &existing_guidance {
-        push_unique_detail(&mut details, detail.clone());
-    }
-    for detail in &outcome.guidance {
-        push_unique_detail(&mut details, detail.clone());
-    }
-
-    guardian.decision = GuardianDecision::Blocked;
-    guardian.message = Some(outcome.summary.clone());
-    guardian.details = details;
-    guardian.guidance = guidance;
-}
-
-fn append_guardian_guidance_details(guardian: &mut GuardianSummary, guidance: &[String]) {
-    for detail in guidance {
-        push_unique_detail(&mut guardian.details, detail.clone());
-    }
-}
-
-fn push_unique_detail(details: &mut Vec<String>, detail: String) {
-    let detail = detail.trim();
-    if detail.is_empty() || details.iter().any(|existing| existing == detail) {
-        return;
-    }
-    details.push(detail.to_string());
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::status::serialize_guardian;
@@ -563,7 +492,7 @@ mod tests {
     use crate::application::guardian_conversion::api_guardian_mode;
     use crate::guardian::{
         GuardianStartupFailureObservation, GuardianStartupFailureRequest,
-        guardian_startup_failure_outcome,
+        guardian_startup_failure_outcome, guardian_summary_with_blocked_outcome,
     };
     use crate::state::contracts::{OperationOutcome, OperationStatus, TargetKind};
     use crate::state::failure_memory::FailureMemoryActionOutcome;
@@ -592,10 +521,10 @@ mod tests {
         let mut guardian = GuardianSummary::new(GuardianMode::Managed);
         guardian.warn_with_guidance(vec![warning.clone()]);
 
-        record_guardian_intervention(
-            &mut guardian,
+        guardian = guardian_summary_with_intervention(
+            &guardian,
             GuardianInterventionKind::SwitchManagedRuntime,
-            "Guardian switched to managed Java before launch.",
+            "Guardian switched to managed Java before launch.".to_string(),
             false,
         );
 
@@ -688,26 +617,6 @@ mod tests {
     }
 
     #[test]
-    fn launch_guardian_block_preserves_reason_before_warning_guidance() {
-        let warning = "Launch memory budget is tight.".to_string();
-        let guidance = "Remove the Java override or switch Guardian Mode back to Managed.";
-        let reason = "explicit Java override targets Java 8 but this version requires Java 17";
-        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
-        guardian.warn_with_guidance(vec![warning.clone()]);
-
-        block_guardian_with_reason_and_guidance(
-            &mut guardian,
-            Some(format!(" {reason} ")),
-            vec![guidance.to_string(), warning.clone()],
-        );
-
-        assert_eq!(
-            guardian.details,
-            vec![reason.to_string(), warning, guidance.to_string()]
-        );
-    }
-
-    #[test]
     fn startup_stalled_blocks_with_guardian_authored_status_payload() {
         let warning = "Launch memory budget is tight.".to_string();
         let mut guardian = GuardianSummary::new(GuardianMode::Managed);
@@ -726,18 +635,18 @@ mod tests {
             disable_custom_gc: false,
             effective_preset: "performance",
         });
-        block_guardian_with_user_outcome(&mut guardian, &outcome.user_outcome);
+        guardian = guardian_summary_with_blocked_outcome(&guardian, &outcome.user_outcome);
         let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
 
         assert_eq!(outcome.failure_class, LaunchFailureClass::StartupStalled);
         assert_eq!(guardian.decision, GuardianDecision::Blocked);
         assert_eq!(
             guardian.message.as_deref(),
-            Some(outcome.user_outcome.summary.as_str())
+            Some(outcome.user_outcome.summary())
         );
         assert_eq!(
             guardian.details.first(),
-            outcome.user_outcome.details.first()
+            outcome.user_outcome.details().first()
         );
         assert!(guardian.details.iter().any(|detail| detail == &warning));
         assert!(
@@ -749,11 +658,11 @@ mod tests {
         assert_eq!(payload["decision"], serde_json::json!("blocked"));
         assert_eq!(
             payload["message"],
-            serde_json::json!(outcome.user_outcome.summary)
+            serde_json::json!(outcome.user_outcome.summary())
         );
         assert_eq!(
             payload["details"][0],
-            serde_json::json!(outcome.user_outcome.details[0])
+            serde_json::json!(outcome.user_outcome.details()[0])
         );
     }
 
@@ -776,7 +685,7 @@ mod tests {
             disable_custom_gc: false,
             effective_preset: "performance",
         });
-        block_guardian_with_user_outcome(&mut guardian, &outcome.user_outcome);
+        guardian = guardian_summary_with_blocked_outcome(&guardian, &outcome.user_outcome);
         let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
 
         assert_eq!(
@@ -799,7 +708,7 @@ mod tests {
         assert_eq!(payload["decision"], serde_json::json!("blocked"));
         assert_eq!(
             payload["details"][0],
-            serde_json::json!(outcome.user_outcome.details[0])
+            serde_json::json!(outcome.user_outcome.details()[0])
         );
     }
 
@@ -822,7 +731,7 @@ mod tests {
             disable_custom_gc: false,
             effective_preset: "ultra_low_latency",
         });
-        block_guardian_with_user_outcome(&mut guardian, &outcome.user_outcome);
+        guardian = guardian_summary_with_blocked_outcome(&guardian, &outcome.user_outcome);
         let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
 
         assert_eq!(
@@ -830,7 +739,7 @@ mod tests {
             crate::guardian::GuardianActionKind::Block
         );
         assert_eq!(
-            outcome.user_outcome.decision,
+            outcome.user_outcome.decision(),
             crate::guardian::GuardianActionKind::Block
         );
         assert!(outcome.directive.is_none());
@@ -963,7 +872,10 @@ mod tests {
             .subscribe(session_id)
             .await
             .expect("subscribe to session events");
-        let expected = launch_recovery_suppressed_user_outcome(&failed_plan);
+        let expected = author_guardian_copy(GuardianCopyRequest::launch_recovery_suppressed(
+            &failed_plan.directive,
+        ))
+        .expect("launch recovery suppression copy");
         let mut recovery_attempts = 0;
         let mut guardian = GuardianSummary::new(GuardianMode::Managed);
         guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
@@ -997,7 +909,7 @@ mod tests {
             guardian
                 .details
                 .iter()
-                .any(|detail| detail == &expected.details[0])
+                .any(|detail| detail == &expected.details()[0])
         );
         assert!(guardian.guidance.iter().any(|detail| {
             detail == "Review the latest game log or change the affected launch setting before retrying."
@@ -1007,7 +919,7 @@ mod tests {
             event => panic!("expected suppression recovery log, got {event:?}"),
         };
         assert_eq!(log.source, "system");
-        assert_eq!(log.text, expected.summary);
+        assert_eq!(log.text, expected.summary());
         assert_eq!(state.journals().list().len(), 2);
         assert!(state.journals().list().iter().any(|journal| {
             journal.status == OperationStatus::Blocked
@@ -1066,10 +978,13 @@ mod tests {
             suppressed.status,
             crate::guardian::GuardianLaunchRecoveryStatus::Suppressed
         );
-        let user_outcome = launch_recovery_suppressed_user_outcome(&suppressed_plan);
+        let user_outcome = author_guardian_copy(GuardianCopyRequest::launch_recovery_suppressed(
+            &suppressed_plan.directive,
+        ))
+        .expect("launch recovery suppression copy");
         let mut guardian = GuardianSummary::new(GuardianMode::Managed);
         guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
-        block_guardian_for_suppressed_launch_recovery(&mut guardian, &user_outcome);
+        guardian = guardian_summary_with_suppressed_outcome(&guardian, &user_outcome);
         let payload = serialize_guardian(Some(guardian.clone())).expect("guardian payload");
 
         assert_eq!(guardian.decision, GuardianDecision::Blocked);
@@ -1440,12 +1355,15 @@ mod tests {
     fn suppressed_launch_recovery_block_uses_existing_guardian_block_copy() {
         let intent = test_launch_intent(Path::new("/tmp/axial-test"), "session");
         let plan = test_recovery_plan(&intent, RecoveryCase::StripRawJvmArgs);
-        let outcome = launch_recovery_suppressed_user_outcome(&plan);
-        let reason = outcome.summary.clone();
+        let outcome = author_guardian_copy(GuardianCopyRequest::launch_recovery_suppressed(
+            &plan.directive,
+        ))
+        .expect("launch recovery suppression copy");
+        let reason = outcome.summary().to_string();
         let mut guardian = GuardianSummary::new(GuardianMode::Managed);
         guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
 
-        block_guardian_for_suppressed_launch_recovery(&mut guardian, &outcome);
+        guardian = guardian_summary_with_suppressed_outcome(&guardian, &outcome);
 
         assert_eq!(guardian.decision, GuardianDecision::Blocked);
         assert_eq!(

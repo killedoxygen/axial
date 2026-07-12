@@ -79,14 +79,14 @@ mod tests {
         let outcome = persisted_state_load_guardian_outcome(2).expect("guardian outcome");
 
         assert_eq!(outcome.decision, GuardianActionKind::Warn);
-        assert_eq!(outcome.user_outcome.decision, outcome.decision);
+        assert_eq!(outcome.user_outcome.decision(), outcome.decision);
         assert_eq!(
             outcome.diagnosis_id.as_str(),
             "persisted_state_schema_invalid"
         );
-        assert_eq!(outcome.user_outcome.phase, OperationPhase::Startup);
+        assert_eq!(outcome.user_outcome.phase(), OperationPhase::Startup);
         assert_eq!(
-            outcome.user_outcome.summary,
+            outcome.user_outcome.summary(),
             "Guardian kept Axial running after persisted operation state could not be trusted."
         );
     }

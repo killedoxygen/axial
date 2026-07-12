@@ -196,18 +196,6 @@ pub enum GuardianObservedLaunchFailurePhase {
     AfterBoot,
 }
 
-pub fn guardian_observed_launch_failure_outcome(
-    failure_class: LaunchFailureClass,
-    crash_evidence: Option<&CrashEvidence>,
-    observed_phase: GuardianObservedLaunchFailurePhase,
-) -> Option<GuardianUserOutcome> {
-    author_guardian_copy(GuardianCopyRequest::observed_launch_failure(
-        failure_class,
-        crash_evidence,
-        observed_phase,
-    ))
-}
-
 pub fn conservative_launch_recovery_preset(version_id: &str, runtime_major: u32) -> String {
     if runtime_major <= 8 || is_legacy_version_family(version_id) {
         "legacy".to_string()
@@ -606,12 +594,12 @@ mod tests {
     use super::{
         GuardianObservedLaunchFailurePhase, GuardianPrepareFailureRequest,
         GuardianStartupFailureObservation, GuardianStartupFailureRequest,
-        guardian_observed_launch_failure_outcome, guardian_prelaunch_preset_adjustment_directive,
-        guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
+        guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
+        guardian_startup_failure_outcome,
     };
     use crate::guardian::{
-        GuardianActionKind, GuardianDirective, GuardianFactId, GuardianMode,
-        GuardianPresetDowngradeReason, conservative_launch_recovery_preset,
+        GuardianActionKind, GuardianCopyRequest, GuardianDirective, GuardianFactId, GuardianMode,
+        GuardianPresetDowngradeReason, author_guardian_copy, conservative_launch_recovery_preset,
         guardian_directive_description,
     };
     use crate::state::contracts::{OperationPhase, OwnershipClass};
@@ -669,10 +657,10 @@ mod tests {
             "launcher_managed_artifact_signature_corrupt"
         );
         assert!(outcome.directive.is_none());
-        assert!(outcome.user_outcome.details.contains(
+        assert!(outcome.user_outcome.details().contains(
             &"Minecraft exited before startup completed with detected launcher-managed jar signature corruption.".to_string()
         ));
-        assert!(outcome.user_outcome.guidance.contains(
+        assert!(outcome.user_outcome.guidance().contains(
             &"Repair the installed version so Axial can replace the affected launcher-managed jars.".to_string()
         ));
     }
@@ -698,7 +686,7 @@ mod tests {
 
         assert_eq!(outcome.failure_class, LaunchFailureClass::OutOfMemory);
         assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Block);
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
+        assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Block);
         assert_eq!(
             outcome.safety_case.diagnoses[0].id().as_str(),
             "out_of_memory"
@@ -710,24 +698,24 @@ mod tests {
         );
         assert!(outcome.directive.is_none());
         assert_eq!(
-            outcome.user_outcome.summary,
+            outcome.user_outcome.summary(),
             "Guardian blocked launch startup."
         );
         assert_eq!(
-            outcome.user_outcome.details,
+            outcome.user_outcome.details(),
             ["Minecraft exited before startup completed after running out of memory."]
         );
         assert_eq!(
-            outcome.user_outcome.guidance,
+            outcome.user_outcome.guidance(),
             ["Review the instance memory allocation and close memory-heavy apps before retrying."]
         );
-        assert!(outcome.user_outcome.summary.chars().count() <= 180);
+        assert!(outcome.user_outcome.summary().chars().count() <= 180);
         assert!(
             outcome
                 .user_outcome
-                .details
+                .details()
                 .iter()
-                .chain(&outcome.user_outcome.guidance)
+                .chain(outcome.user_outcome.guidance())
                 .all(|line| line.chars().count() <= 240)
         );
 
@@ -736,24 +724,24 @@ mod tests {
             OwnershipClass::UserOwned
         );
 
-        let post_boot = guardian_observed_launch_failure_outcome(
+        let post_boot = author_guardian_copy(GuardianCopyRequest::observed_launch_failure(
             LaunchFailureClass::OutOfMemory,
             None,
             GuardianObservedLaunchFailurePhase::AfterBoot,
-        )
+        ))
         .expect("OOM is an accepted launch crash");
-        assert_eq!(post_boot.decision, GuardianActionKind::Warn);
-        assert_eq!(post_boot.phase, OperationPhase::Running);
+        assert_eq!(post_boot.decision(), GuardianActionKind::Warn);
+        assert_eq!(post_boot.phase(), OperationPhase::Running);
         assert_eq!(
-            post_boot.summary,
+            post_boot.summary(),
             "Minecraft stopped after running out of memory."
         );
-        assert!(post_boot.summary.chars().count() <= 180);
+        assert!(post_boot.summary().chars().count() <= 180);
         assert!(
             post_boot
-                .details
+                .details()
                 .iter()
-                .chain(&post_boot.guidance)
+                .chain(post_boot.guidance())
                 .all(|line| line.chars().count() <= 240)
         );
     }
@@ -790,37 +778,37 @@ mod tests {
                 OwnershipClass::UserOwned
             );
             assert!(outcome.directive.is_none());
-            assert!(!outcome.user_outcome.details.is_empty());
-            assert!(!outcome.user_outcome.guidance.is_empty());
+            assert!(!outcome.user_outcome.details().is_empty());
+            assert!(!outcome.user_outcome.guidance().is_empty());
             assert!(
                 outcome
                     .user_outcome
-                    .details
+                    .details()
                     .iter()
-                    .chain(&outcome.user_outcome.guidance)
+                    .chain(outcome.user_outcome.guidance())
                     .all(|line| line.chars().count() <= 240)
             );
 
-            let before_boot = guardian_observed_launch_failure_outcome(
+            let before_boot = author_guardian_copy(GuardianCopyRequest::observed_launch_failure(
                 failure_class,
                 None,
                 GuardianObservedLaunchFailurePhase::BeforeBoot,
-            )
+            ))
             .expect("accepted before-boot crash outcome");
-            assert_eq!(before_boot.decision, GuardianActionKind::Block);
-            assert_eq!(before_boot.phase, OperationPhase::Launching);
-            assert_eq!(before_boot.details, outcome.user_outcome.details);
-            assert_eq!(before_boot.guidance, outcome.user_outcome.guidance);
+            assert_eq!(before_boot.decision(), GuardianActionKind::Block);
+            assert_eq!(before_boot.phase(), OperationPhase::Launching);
+            assert_eq!(before_boot.details(), outcome.user_outcome.details());
+            assert_eq!(before_boot.guidance(), outcome.user_outcome.guidance());
 
-            let post_boot = guardian_observed_launch_failure_outcome(
+            let post_boot = author_guardian_copy(GuardianCopyRequest::observed_launch_failure(
                 failure_class,
                 None,
                 GuardianObservedLaunchFailurePhase::AfterBoot,
-            )
+            ))
             .expect("accepted post-boot crash outcome");
-            assert_eq!(post_boot.phase, OperationPhase::Running);
-            assert!(!post_boot.details.is_empty());
-            assert!(!post_boot.guidance.is_empty());
+            assert_eq!(post_boot.phase(), OperationPhase::Running);
+            assert!(!post_boot.details().is_empty());
+            assert!(!post_boot.guidance().is_empty());
         }
     }
 
@@ -849,24 +837,24 @@ mod tests {
             disable_custom_gc: false,
             effective_preset: "performance",
         });
-        let post_boot = guardian_observed_launch_failure_outcome(
+        let post_boot = author_guardian_copy(GuardianCopyRequest::observed_launch_failure(
             LaunchFailureClass::ModAttributedCrash,
             Some(&crash_evidence),
             GuardianObservedLaunchFailurePhase::AfterBoot,
-        )
+        ))
         .expect("mod-attributed post-boot outcome");
 
-        assert!(startup.user_outcome.details[0].contains("Example Machines"));
-        assert!(startup.user_outcome.guidance[0].contains("Example Machines"));
-        assert!(post_boot.summary.contains("Example Machines"));
-        assert!(post_boot.details[0].contains("Example Machines"));
-        assert!(post_boot.guidance[0].contains("Example Machines"));
+        assert!(startup.user_outcome.details()[0].contains("Example Machines"));
+        assert!(startup.user_outcome.guidance()[0].contains("Example Machines"));
+        assert!(post_boot.summary().contains("Example Machines"));
+        assert!(post_boot.details()[0].contains("Example Machines"));
+        assert!(post_boot.guidance()[0].contains("Example Machines"));
         assert!(
-            guardian_observed_launch_failure_outcome(
+            author_guardian_copy(GuardianCopyRequest::observed_launch_failure(
                 LaunchFailureClass::Unknown,
                 None,
                 GuardianObservedLaunchFailurePhase::AfterBoot,
-            )
+            ))
             .is_none()
         );
     }
@@ -889,13 +877,13 @@ mod tests {
         });
 
         assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Block);
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
+        assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Block);
         assert_eq!(
-            outcome.user_outcome.summary,
+            outcome.user_outcome.summary(),
             "Guardian blocked launch startup."
         );
         assert!(outcome.directive.is_none());
-        assert!(outcome.user_outcome.details.contains(
+        assert!(outcome.user_outcome.details().contains(
             &"No startup activity was observed before the startup window ended.".to_string()
         ));
     }
@@ -916,7 +904,7 @@ mod tests {
         let lower = encoded.to_ascii_lowercase();
 
         assert_eq!(
-            outcome.user_outcome.summary,
+            outcome.user_outcome.summary(),
             "Guardian blocked launch preparation."
         );
         assert!(!lower.contains("/home"));
@@ -942,7 +930,7 @@ mod tests {
         });
 
         assert_eq!(
-            outcome.user_outcome.details,
+            outcome.user_outcome.details(),
             ["Launch preparation failed before Minecraft could start."]
         );
     }

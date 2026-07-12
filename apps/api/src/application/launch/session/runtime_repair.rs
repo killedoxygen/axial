@@ -5,9 +5,8 @@ use crate::execution::runtime::{
     ManagedRuntimeRoot, ManagedRuntimeVerificationRequest, verify_managed_runtime,
 };
 use crate::guardian::{
-    GuardianActionKind as ApiGuardianActionKind, GuardianCopyRequest,
-    GuardianManagedRuntimeRepairRequest, GuardianPreflightOutcome, GuardianPreflightOutcomeRequest,
-    GuardianRepairPlanningContext, GuardianRepairStatus, GuardianUserOutcome, author_guardian_copy,
+    GuardianManagedRuntimeRepairRequest, GuardianPreflightOutcomeRequest,
+    GuardianRepairPlanningContext, GuardianRepairStatus, GuardianRuntimeRepairCopy,
     execute_managed_runtime_ready_marker_repair, guardian_fact_from_execution,
     guardian_preflight_outcome, plan_managed_runtime_ready_marker_repair,
 };
@@ -18,7 +17,7 @@ use crate::observability::telemetry::{
 use crate::state::contracts::OperationPhase;
 use crate::state::{AppState, OperationJournalStoreError};
 use axial_config::{AppPaths, Instance};
-use axial_launcher::{GuardianDecision, GuardianMode, GuardianSummary};
+use axial_launcher::GuardianMode;
 use axial_minecraft::{
     managed_runtime_contents_verified_without_probe, preferred_runtime_component, resolve_version,
 };
@@ -211,15 +210,12 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
             outcome.summary.as_str(),
         ));
     }
-    let repair_user_outcome = author_guardian_copy(GuardianCopyRequest::runtime_repair(
-        outcome.diagnosis_id,
-        outcome.status,
-    ))
-    .ok_or_else(|| {
-        OperationJournalStoreError::Persistence(std::io::Error::other(
-            "managed-runtime repair outcome is missing its supported diagnosis",
-        ))
-    })?;
+    let repair_copy = GuardianRuntimeRepairCopy::author(outcome.diagnosis_id, outcome.status)
+        .ok_or_else(|| {
+            OperationJournalStoreError::Persistence(std::io::Error::other(
+                "managed-runtime repair outcome is missing its supported diagnosis",
+            ))
+        })?;
     match outcome.status {
         GuardianRepairStatus::Repaired => {
             let prior_java_probe_receipt = preflight.java_probe_receipt.take();
@@ -237,23 +233,16 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
                 prior_java_probe_receipt,
             )
             .await;
-            mark_guardian_runtime_repair_success(
-                &mut repaired.guardian_summary,
-                &repair_user_outcome,
-            );
+            repaired.guardian_summary = repair_copy.guardian_summary(&repaired.guardian_summary);
             Ok(repaired)
         }
         GuardianRepairStatus::Blocked
         | GuardianRepairStatus::Failed
         | GuardianRepairStatus::Suppressed => {
-            block_guardian_for_runtime_repair_outcome(
-                &mut preflight.guardian_summary,
-                &repair_user_outcome,
-            );
-            block_preflight_outcome_for_runtime_repair(
-                &mut preflight.guardian_outcome,
-                &repair_user_outcome,
-            );
+            preflight.guardian_summary = repair_copy.guardian_summary(&preflight.guardian_summary);
+            preflight.guardian_admission = repair_copy
+                .blocked_admission(&preflight.guardian_outcome)
+                .expect("non-repaired runtime copy authors a blocked admission");
             Ok(preflight)
         }
     }
@@ -304,68 +293,4 @@ fn managed_runtime_java_executable(runtime_root: &Path) -> PathBuf {
         } else {
             "java"
         })
-}
-
-fn mark_guardian_runtime_repair_success(
-    summary: &mut GuardianSummary,
-    outcome: &GuardianUserOutcome,
-) {
-    let previous_details = summary.details.clone();
-    let previous_guidance = summary.guidance.clone();
-    summary.decision = GuardianDecision::Intervened;
-    summary.message = Some(outcome.summary.clone());
-    summary.details.clear();
-    for detail in &outcome.details {
-        push_unique_summary_detail(&mut summary.details, detail);
-    }
-    for detail in previous_details {
-        push_unique_summary_detail(&mut summary.details, &detail);
-    }
-    for detail in &previous_guidance {
-        push_unique_summary_detail(&mut summary.details, detail);
-    }
-    summary.guidance = previous_guidance;
-}
-
-fn block_guardian_for_runtime_repair_outcome(
-    summary: &mut GuardianSummary,
-    outcome: &GuardianUserOutcome,
-) {
-    let mut guidance = summary.guidance.clone();
-    for detail in &outcome.guidance {
-        push_unique_guidance(&mut guidance, detail);
-    }
-    let reason = outcome
-        .details
-        .first()
-        .map(String::as_str)
-        .unwrap_or(outcome.summary.as_str());
-    summary.block_with_reason_and_guidance(reason, guidance);
-}
-
-fn block_preflight_outcome_for_runtime_repair(
-    preflight: &mut GuardianPreflightOutcome,
-    outcome: &GuardianUserOutcome,
-) {
-    preflight.guardian_decision.kind = ApiGuardianActionKind::Block;
-    preflight.safety.decision = ApiGuardianActionKind::Block;
-    preflight.safety.summary = outcome.summary.clone();
-    preflight.safety.detail = outcome.details.first().cloned();
-    preflight.user_outcome.decision = ApiGuardianActionKind::Block;
-    preflight.user_outcome.summary = outcome.summary.clone();
-    preflight.user_outcome.details = outcome.details.clone();
-    preflight.user_outcome.guidance = outcome.guidance.clone();
-}
-
-fn push_unique_summary_detail(details: &mut Vec<String>, value: &str) {
-    let value = value.trim();
-    if !value.is_empty() && !details.iter().any(|detail| detail == value) {
-        details.push(value.to_string());
-    }
-}
-
-fn push_unique_guidance(guidance: &mut Vec<String>, value: &str) {
-    if !guidance.iter().any(|existing| existing == value) {
-        guidance.push(value.to_string());
-    }
 }

@@ -111,8 +111,8 @@ pub fn guardian_preflight_outcome(
     .expect("preflight copy summary table covers every preflight verdict");
     let safety = SafetyOutcome {
         decision: preflight_decision,
-        summary: user_outcome.summary.clone(),
-        detail: user_outcome.details.first().cloned(),
+        summary: user_outcome.summary().to_string(),
+        detail: user_outcome.details().first().cloned(),
         diagnoses: guardian_decision.diagnoses.clone(),
     };
 
@@ -419,9 +419,9 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Custom, &[])
         });
 
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
+        assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Block);
         assert_eq!(outcome.safety.decision, GuardianActionKind::Block);
-        assert!(outcome.user_outcome.details.iter().any(|detail| detail
+        assert!(outcome.user_outcome.details().iter().any(|detail| detail
             == "Guardian blocked launch because the selected Java override is unavailable."));
     }
 
@@ -442,12 +442,12 @@ mod tests {
         });
 
         assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::AskUser);
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
+        assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Block);
         assert_eq!(
-            outcome.user_outcome.summary,
+            outcome.user_outcome.summary(),
             "Guardian needs confirmation before launch."
         );
-        assert!(outcome.user_outcome.guidance.contains(
+        assert!(outcome.user_outcome.guidance().contains(
             &"Confirm managed Java for this launch or choose a valid Java runtime.".to_string()
         ));
         assert!(outcome.directives.is_empty());
@@ -480,23 +480,26 @@ mod tests {
         ));
 
         assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Fallback);
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Fallback);
         assert_eq!(
-            &outcome.user_outcome.details[..2],
+            outcome.user_outcome.decision(),
+            GuardianActionKind::Fallback
+        );
+        assert_eq!(
+            &outcome.user_outcome.details()[..2],
             [
                 "Guardian will ignore the unavailable Java override and use managed Java for this launch.",
                 "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
             ]
         );
         assert_eq!(
-            &outcome.user_outcome.guidance[..2],
+            &outcome.user_outcome.guidance()[..2],
             [
                 "Update or remove the bad Java override after launch if you want to use Custom Java again.",
                 "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
             ]
         );
-        assert!(outcome.user_outcome.details.len() <= 6);
-        assert!(outcome.user_outcome.guidance.len() <= 6);
+        assert!(outcome.user_outcome.details().len() <= 6);
+        assert!(outcome.user_outcome.guidance().len() <= 6);
     }
 
     #[test]
@@ -526,23 +529,23 @@ mod tests {
         });
 
         assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::AskUser);
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
+        assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Block);
         assert_eq!(
-            &outcome.user_outcome.details[..2],
+            &outcome.user_outcome.details()[..2],
             [
                 "Guardian needs confirmation before changing the selected Java override.",
                 "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
             ]
         );
         assert_eq!(
-            &outcome.user_outcome.guidance[..2],
+            &outcome.user_outcome.guidance()[..2],
             [
                 "Confirm managed Java for this launch or choose a valid Java runtime.",
                 "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
             ]
         );
-        assert!(outcome.user_outcome.details.len() <= 6);
-        assert!(outcome.user_outcome.guidance.len() <= 6);
+        assert!(outcome.user_outcome.details().len() <= 6);
+        assert!(outcome.user_outcome.guidance().len() <= 6);
     }
 
     #[test]
@@ -572,16 +575,16 @@ mod tests {
         ));
 
         assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Strip);
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Strip);
+        assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Strip);
         assert_eq!(
-            &outcome.user_outcome.details[..2],
+            &outcome.user_outcome.details()[..2],
             [
                 "Guardian could not verify the selected Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
                 "Guardian removed malformed explicit JVM args for this launch.",
             ]
         );
         assert_eq!(
-            &outcome.user_outcome.guidance[..2],
+            &outcome.user_outcome.guidance()[..2],
             [
                 "Use a Java runtime that can run `java -version`, or switch back to Managed Java.",
                 "Fix the saved JVM args before re-enabling them.",
@@ -616,16 +619,16 @@ mod tests {
         ));
 
         assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Warn);
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Warn);
+        assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Warn);
         assert_eq!(
-            &outcome.user_outcome.details[..2],
+            &outcome.user_outcome.details()[..2],
             [
                 "Guardian could not verify the selected Java override. Use a valid Java runtime or switch back to Managed Java before relying on this launch.",
                 "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
             ]
         );
         assert_eq!(
-            &outcome.user_outcome.guidance[..2],
+            &outcome.user_outcome.guidance()[..2],
             [
                 "Use a Java runtime that can run `java -version`, or switch back to Managed Java.",
                 "Guardian detected malformed JVM arguments. Fix or remove the explicit JVM args before relying on this launch.",
@@ -649,9 +652,9 @@ mod tests {
         });
 
         assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Block);
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
+        assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Block);
         assert_eq!(
-            outcome.user_outcome.details,
+            outcome.user_outcome.details(),
             ["Guardian blocked launch because preflight readiness failed."]
         );
         assert_eq!(
@@ -678,7 +681,7 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[])
         });
         assert_eq!(blocked.guardian_decision.kind, GuardianActionKind::Block);
-        assert_eq!(blocked.user_outcome.decision, GuardianActionKind::Block);
+        assert_eq!(blocked.user_outcome.decision(), GuardianActionKind::Block);
 
         readiness_fact.severity = Some(GuardianSeverity::Warning);
         let ready = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
@@ -686,7 +689,10 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[])
         });
         assert_eq!(ready.guardian_decision.kind, GuardianActionKind::RecordOnly);
-        assert_eq!(ready.user_outcome.decision, GuardianActionKind::RecordOnly);
+        assert_eq!(
+            ready.user_outcome.decision(),
+            GuardianActionKind::RecordOnly
+        );
     }
 
     #[test]
@@ -708,14 +714,14 @@ mod tests {
             )
         });
         assert_eq!(managed.guardian_decision.kind, GuardianActionKind::Strip);
-        assert_eq!(managed.user_outcome.decision, GuardianActionKind::Strip);
+        assert_eq!(managed.user_outcome.decision(), GuardianActionKind::Strip);
         assert_eq!(
             managed.directives,
             vec![GuardianDirective::StripJvmArgs {
                 reason: GuardianStripJvmArgsReason::Preflight,
             }]
         );
-        assert!(managed.user_outcome.details.iter().any(|detail| {
+        assert!(managed.user_outcome.details().iter().any(|detail| {
             detail == "Guardian removed malformed explicit JVM args for this launch."
         }));
 
@@ -723,7 +729,7 @@ mod tests {
             explicit_user_intent: true,
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Disabled, &[fact])
         });
-        assert_eq!(disabled.user_outcome.decision, GuardianActionKind::Block);
+        assert_eq!(disabled.user_outcome.decision(), GuardianActionKind::Block);
         assert!(disabled.directives.is_empty());
     }
 
@@ -743,11 +749,11 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[])
         });
 
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
-        assert!(outcome.user_outcome.details.contains(
+        assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Block);
+        assert!(outcome.user_outcome.details().contains(
             &"Guardian blocked launch because client game files are missing.".to_string()
         ));
-        assert!(outcome.user_outcome.guidance.contains(
+        assert!(outcome.user_outcome.guidance().contains(
             &"Install or repair the affected version before launching again.".to_string()
         ));
     }
@@ -768,12 +774,12 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &[])
         });
 
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Block);
-        assert!(outcome.user_outcome.details.contains(
+        assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Block);
+        assert!(outcome.user_outcome.details().contains(
             &"Guardian blocked launch because launcher-managed jar signatures are inconsistent."
                 .to_string()
         ));
-        assert!(outcome.user_outcome.guidance.contains(
+        assert!(outcome.user_outcome.guidance().contains(
             &"Install or repair the affected version before launching again.".to_string()
         ));
     }
@@ -863,7 +869,7 @@ mod tests {
                     ..GuardianPreflightOutcomeRequest::new(mode, &[historical_fact])
                 });
 
-                assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Warn);
+                assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Warn);
                 assert!(outcome.directives.is_empty());
             }
         }
@@ -896,8 +902,8 @@ mod tests {
 
         assert_eq!(outcome.safety_case.diagnoses.len(), 1);
         assert_eq!(outcome.guardian_decision.kind, GuardianActionKind::Warn);
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Warn);
-        assert!(outcome.user_outcome.details.iter().any(|detail| {
+        assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Warn);
+        assert!(outcome.user_outcome.details().iter().any(|detail| {
             detail == "This instance has recorded one out-of-memory crash; the latest was today."
         }));
     }
@@ -974,16 +980,16 @@ mod tests {
         assert!(
             outcome
                 .user_outcome
-                .details
+                .details()
                 .contains(&"This instance had 3 mod-attributed crashes today.".to_string())
         );
         assert!(
-            outcome.user_outcome.details.contains(
+            outcome.user_outcome.details().contains(
                 &"This instance has recorded 4 missing-dependency crashes; the latest was today."
                     .to_string()
             )
         );
-        assert!(outcome.user_outcome.details.contains(
+        assert!(outcome.user_outcome.details().contains(
             &"This instance has recorded one graphics driver crash; the latest was within the past 24 hours."
                 .to_string()
         ));
@@ -1018,11 +1024,11 @@ mod tests {
             &[suggested, unverified_headroom],
         ));
 
-        assert!(outcome.user_outcome.guidance.contains(
+        assert!(outcome.user_outcome.guidance().contains(
             &"Increase this instance's maximum memory from 4096 MB to 6144 MB before relaunching."
                 .to_string()
         ));
-        assert!(outcome.user_outcome.guidance.contains(
+        assert!(outcome.user_outcome.guidance().contains(
             &"Guardian could not verify safe headroom for a larger memory allocation. Close another session or free memory before relaunching."
                 .to_string()
         ));
@@ -1052,16 +1058,16 @@ mod tests {
         assert!(
             outcome
                 .user_outcome
-                .details
+                .details()
                 .contains(&"The previous JVM preset recovery attempt failed.".to_string())
         );
         assert!(
             outcome
                 .user_outcome
-                .guidance
+                .guidance()
                 .contains(&"Review the JVM preset before relaunching.".to_string())
         );
-        assert!(outcome.user_outcome.details.contains(
+        assert!(outcome.user_outcome.details().contains(
             &"Guardian will not auto-repair this launch again until 11:45 UTC.".to_string()
         ));
     }
@@ -1101,30 +1107,30 @@ mod tests {
             ..GuardianPreflightOutcomeRequest::new(GuardianMode::Managed, &historical_facts)
         });
 
-        assert_eq!(outcome.user_outcome.decision, GuardianActionKind::Warn);
-        assert_eq!(outcome.user_outcome.details.len(), 6);
-        assert_eq!(outcome.user_outcome.guidance.len(), 6);
+        assert_eq!(outcome.user_outcome.decision(), GuardianActionKind::Warn);
+        assert_eq!(outcome.user_outcome.details().len(), 6);
+        assert_eq!(outcome.user_outcome.guidance().len(), 6);
         assert!(
             outcome
                 .user_outcome
-                .details
+                .details()
                 .contains(&"This instance had 2 out-of-memory crashes today.".to_string())
         );
-        assert!(outcome.user_outcome.details.contains(
+        assert!(outcome.user_outcome.details().contains(
             &"Guardian will not auto-repair this launch again until 11:45 UTC.".to_string()
         ));
-        assert!(outcome.user_outcome.guidance.contains(
+        assert!(outcome.user_outcome.guidance().contains(
             &"Increase this instance's maximum memory from 4096 MB to 6144 MB before relaunching."
                 .to_string()
         ));
-        assert!(outcome.user_outcome.guidance.contains(
+        assert!(outcome.user_outcome.guidance().contains(
             &"Review the launch settings before retrying; unchanged settings will not trigger another automatic repair before 11:45 UTC."
                 .to_string()
         ));
         assert!(
             !outcome
                 .user_outcome
-                .details
+                .details()
                 .contains(&"Launch-relevant storage has low free space.".to_string())
         );
     }
@@ -1175,14 +1181,14 @@ mod tests {
         let encoded = serde_json::to_string(&outcome).expect("historical outcome json");
         let lower = encoded.to_ascii_lowercase();
 
-        assert!(outcome.user_outcome.details.len() <= 6);
-        assert!(outcome.user_outcome.guidance.len() <= 6);
+        assert!(outcome.user_outcome.details().len() <= 6);
+        assert!(outcome.user_outcome.guidance().len() <= 6);
         assert!(
             outcome
                 .user_outcome
-                .details
+                .details()
                 .iter()
-                .chain(&outcome.user_outcome.guidance)
+                .chain(outcome.user_outcome.guidance())
                 .all(|line| line.chars().count() <= 240)
         );
         for sensitive in ["/home", "alice", "-xmx", "accesstoken", "secret"] {

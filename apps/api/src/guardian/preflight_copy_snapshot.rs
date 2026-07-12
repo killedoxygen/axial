@@ -558,20 +558,20 @@ fn replay_historical_composition(
 fn output_projection(outcome: GuardianPreflightOutcome) -> PreflightCopyOutput {
     PreflightCopyOutput {
         kernel_decision: outcome.guardian_decision.kind,
-        effective_decision: outcome.user_outcome.decision,
-        phase: outcome.user_outcome.phase,
-        summary: outcome.user_outcome.summary,
-        details: outcome.user_outcome.details,
-        guidance: outcome.user_outcome.guidance,
+        effective_decision: outcome.user_outcome.decision(),
+        phase: outcome.user_outcome.phase(),
+        summary: outcome.user_outcome.summary().to_string(),
+        details: outcome.user_outcome.details().to_vec(),
+        guidance: outcome.user_outcome.guidance().to_vec(),
     }
 }
 
 fn assert_safety_relation(outcome: &GuardianPreflightOutcome) {
-    assert_eq!(outcome.safety.decision, outcome.user_outcome.decision);
-    assert_eq!(outcome.safety.summary, outcome.user_outcome.summary);
+    assert_eq!(outcome.safety.decision, outcome.user_outcome.decision());
+    assert_eq!(outcome.safety.summary, outcome.user_outcome.summary());
     assert_eq!(
         outcome.safety.detail,
-        outcome.user_outcome.details.first().cloned()
+        outcome.user_outcome.details().first().cloned()
     );
 }
 

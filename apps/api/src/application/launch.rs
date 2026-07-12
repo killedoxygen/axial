@@ -131,7 +131,7 @@ pub(crate) fn launch_preflight_stage_evidence(
             "Guardian recorded the launch safety decision.",
             vec![
                 format!("mode:{:?}", outcome.guardian_decision.mode),
-                format!("decision:{:?}", outcome.user_outcome.decision),
+                format!("decision:{:?}", outcome.user_outcome.decision()),
                 format!("diagnoses:{}", outcome.safety_case.diagnoses.len()),
             ],
         ),
@@ -388,7 +388,7 @@ mod tests {
             crate::guardian::GuardianActionKind::Warn
         );
         assert_eq!(
-            outcome.user_outcome.decision,
+            outcome.user_outcome.decision(),
             crate::guardian::GuardianActionKind::Warn
         );
         assert_eq!(

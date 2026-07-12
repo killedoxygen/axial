@@ -99,8 +99,8 @@ pub fn install_guardian_repair_summary_from_journal(
         repair_operation_id: OperationId::new(repair_operation_id),
         diagnosis_id,
         status: status.as_persisted_id().to_string(),
-        label: outcome.summary,
-        detail: outcome.details.first().cloned(),
+        label: outcome.summary().to_string(),
+        detail: outcome.details().first().cloned(),
     })
 }
 

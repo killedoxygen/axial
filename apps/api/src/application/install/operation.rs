@@ -1267,12 +1267,12 @@ fn install_guardian_evidence_update(
         ),
         prefixed_text_fact(
             GUARDIAN_OUTCOME_SUMMARY_PREFIX,
-            &outcome.user_outcome.summary,
+            outcome.user_outcome.summary(),
             "Guardian recorded an install safety outcome.",
             220,
         ),
     ];
-    if let Some(detail) = outcome.user_outcome.details.first() {
+    if let Some(detail) = outcome.user_outcome.details().first() {
         facts.push(prefixed_text_fact(
             GUARDIAN_OUTCOME_DETAIL_PREFIX,
             detail,
@@ -1280,7 +1280,7 @@ fn install_guardian_evidence_update(
             240,
         ));
     }
-    if let Some(guidance) = outcome.user_outcome.guidance.first() {
+    if let Some(guidance) = outcome.user_outcome.guidance().first() {
         facts.push(prefixed_guardian_guidance_fact(guidance));
     }
 

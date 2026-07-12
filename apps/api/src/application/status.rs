@@ -19,7 +19,7 @@ pub fn launcher_status(state: &AppState) -> StatusResponse {
     let library_dir = state.library_dir().unwrap_or_default();
     let mut warnings = state.startup_warnings();
     if let Some(outcome) = persisted_state_load_guardian_outcome(state_load_issue_count(state)) {
-        warnings.push(outcome.user_outcome.summary);
+        warnings.push(outcome.user_outcome.summary().to_string());
     }
 
     StatusResponse {

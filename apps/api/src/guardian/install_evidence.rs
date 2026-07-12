@@ -547,7 +547,7 @@ mod tests {
             assert!(
                 outcome
                     .user_outcome
-                    .summary
+                    .summary()
                     .contains("download failure as retryable")
             );
             let encoded = serde_json::to_string(&outcome.user_outcome)
@@ -585,17 +585,17 @@ mod tests {
         );
         assert_eq!(outcome.decision, crate::guardian::GuardianActionKind::Block);
         assert_eq!(
-            outcome.user_outcome.summary,
+            outcome.user_outcome.summary(),
             "This Minecraft version needs a Java runtime that is not available for this device."
         );
         assert_eq!(
-            outcome.user_outcome.details,
+            outcome.user_outcome.details(),
             vec![
                 "Java runtime component jre-legacy is not available for mac-os-arm64.".to_string()
             ]
         );
         assert_eq!(
-            outcome.user_outcome.guidance,
+            outcome.user_outcome.guidance(),
             vec!["This version cannot be installed on this device.".to_string()]
         );
 
@@ -647,15 +647,15 @@ mod tests {
         );
         assert_eq!(outcome.decision, crate::guardian::GuardianActionKind::Block);
         assert_eq!(
-            outcome.user_outcome.summary,
+            outcome.user_outcome.summary(),
             "This Minecraft version needs Rosetta 2 on Apple Silicon Macs."
         );
         assert_eq!(
-            outcome.user_outcome.details,
+            outcome.user_outcome.details(),
             vec!["Java runtime component jre-legacy needs Rosetta 2 on this Mac.".to_string()]
         );
         assert_eq!(
-            outcome.user_outcome.guidance,
+            outcome.user_outcome.guidance(),
             vec![
                 "Install Rosetta 2 by running `softwareupdate --install-rosetta --agree-to-license` in Terminal, then retry.".to_string()
             ]
@@ -744,7 +744,7 @@ mod tests {
             assert_eq!(outcome.diagnosis_id.as_str(), diagnosis_id);
             assert_eq!(outcome.decision, crate::guardian::GuardianActionKind::Block);
             assert!(
-                outcome.user_outcome.summary.contains(summary_fragment),
+                outcome.user_outcome.summary().contains(summary_fragment),
                 "{diagnosis_id} summary did not contain expected fragment: {:?}",
                 outcome.user_outcome
             );
