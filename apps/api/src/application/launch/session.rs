@@ -21,8 +21,8 @@ use crate::guardian::{
     GuardianLaunchAdmission, GuardianLaunchFailureMemoryIntakeRequest,
     GuardianLaunchRecoveryCurrentIntent, GuardianManagedJavaReason, GuardianPreflightOutcome,
     GuardianPreflightOutcomeRequest, GuardianPreflightReadiness, GuardianStripJvmArgsReason,
-    guardian_fact_from_execution, guardian_preflight_outcome, guardian_summary_from_admission,
-    launch_failure_memory_guardian_facts,
+    GuardianSummary, guardian_fact_from_execution, guardian_preflight_outcome,
+    guardian_summary_from_admission, launch_failure_memory_guardian_facts, launch_notice,
 };
 use crate::logging::timestamp_utc;
 use crate::state::contracts::OperationPhase;
@@ -31,10 +31,9 @@ use crate::state::{AppState, LaunchSessionRecord, ensure_instance_layout};
 use auth::{LaunchAuthRefreshOptions, resolve_launch_auth_context};
 use axial_config::{AppConfig, Instance};
 use axial_launcher::{
-    GuardianMode, GuardianSummary, LaunchGuardianContext, LaunchIntent, LaunchReadiness,
-    LaunchReadinessReason, LaunchReadinessReasonId, LaunchReadinessRequest,
-    LaunchReadinessSeverity, LaunchStageEvidence, LaunchState, inspect_launch_readiness,
-    launch_notice,
+    GuardianMode, LaunchGuardianContext, LaunchIntent, LaunchReadiness, LaunchReadinessReason,
+    LaunchReadinessReasonId, LaunchReadinessRequest, LaunchReadinessSeverity, LaunchStageEvidence,
+    LaunchState, inspect_launch_readiness,
 };
 use axial_minecraft::{JavaRuntimeProbeReceipt, VersionScanState};
 use axum::{Json, http::StatusCode};

@@ -14,11 +14,11 @@ use crate::execution::launch::{
 use crate::guardian::{
     GuardianCopyRequest, GuardianLaunchRecoveryPlan, GuardianObservedLaunchFailurePhase,
     GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
-    GuardianStartupFailureObservation, GuardianStartupFailureRequest, author_guardian_copy,
-    guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
-    guardian_startup_failure_outcome, guardian_summary_with_blocked_outcome,
-    guardian_summary_with_observed_outcome, is_guardian_launch_crash_class,
-    record_launch_failure_observation,
+    GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianSummary,
+    author_guardian_copy, guardian_prelaunch_preset_adjustment_directive,
+    guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
+    guardian_summary_with_blocked_outcome, guardian_summary_with_observed_outcome,
+    is_guardian_launch_crash_class, record_launch_failure_observation,
 };
 use crate::logging::{append_trace, timestamp_utc};
 use crate::observability::telemetry::{
@@ -31,9 +31,8 @@ use crate::state::{
     LaunchStatusEvent, OperationJournalStoreError, StartupOutcome,
 };
 use axial_launcher::{
-    GuardianSummary, LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome,
-    LaunchSessionOutcomeKind, LaunchState, PreparedLaunchAttempt, build_healing_summary,
-    prepare_launch_attempt_with_events,
+    LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome, LaunchSessionOutcomeKind,
+    LaunchState, PreparedLaunchAttempt, build_healing_summary, prepare_launch_attempt_with_events,
 };
 use axial_minecraft::download::repair_virtual_assets_from_index;
 use axial_minecraft::paths::assets_dir;
@@ -1559,7 +1558,10 @@ mod tests {
         assert_eq!(error.message, "Guardian blocked launch startup.");
         assert!(error.message.chars().count() <= 180);
         let guardian = error.guardian.as_ref().expect("OOM Guardian summary");
-        assert_eq!(guardian.decision, axial_launcher::GuardianDecision::Blocked);
+        assert_eq!(
+            guardian.decision,
+            crate::guardian::summary::GuardianDecision::Blocked
+        );
         assert_eq!(guardian.message.as_deref(), Some(error.message.as_str()));
         assert!(guardian.details.iter().any(|detail| {
             detail == "Minecraft exited before startup completed after running out of memory."
@@ -1667,7 +1669,7 @@ mod tests {
         );
         assert_eq!(
             preflight.guardian.decision,
-            axial_launcher::GuardianDecision::Warned
+            crate::guardian::summary::GuardianDecision::Warned
         );
         let recent_failure = preflight
             .guardian_facts
@@ -1702,7 +1704,7 @@ mod tests {
         assert!(low_end_preflight.readiness.launchable);
         assert_eq!(
             low_end_preflight.guardian.decision,
-            axial_launcher::GuardianDecision::Warned
+            crate::guardian::summary::GuardianDecision::Warned
         );
         assert_eq!(low_end_preflight.memory.max_memory_mb, 1024);
         assert_eq!(
@@ -2098,7 +2100,7 @@ mod tests {
         assert!(preflight.readiness.launchable);
         assert_eq!(
             preflight.guardian.decision,
-            axial_launcher::GuardianDecision::Warned
+            crate::guardian::summary::GuardianDecision::Warned
         );
         let recent_failure = preflight
             .guardian_facts
@@ -2133,7 +2135,7 @@ mod tests {
         assert!(normal_preflight.readiness.launchable);
         assert_eq!(
             normal_preflight.guardian.decision,
-            axial_launcher::GuardianDecision::Warned
+            crate::guardian::summary::GuardianDecision::Warned
         );
         assert_eq!(normal_preflight.memory.max_memory_mb, 4096);
         assert_eq!(
@@ -2427,7 +2429,10 @@ mod tests {
         .await;
 
         assert_eq!(error.message, user_outcome.summary());
-        assert_eq!(guardian.decision, axial_launcher::GuardianDecision::Blocked);
+        assert_eq!(
+            guardian.decision,
+            crate::guardian::summary::GuardianDecision::Blocked
+        );
         let record = state
             .sessions()
             .get(session_id)

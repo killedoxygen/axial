@@ -8,10 +8,13 @@ use super::{
     ApplicationCommand, ApplicationCommandRequest, CommandResult, CommandResultCarriers,
     LaunchInstanceCommand, LaunchInstancePayload, SessionCommandCarrier,
 };
-use crate::guardian::{GuardianPreflightOutcome, guardian_launch_stage_evidence};
+use crate::guardian::{
+    GuardianPreflightOutcome, guardian_launch_stage_evidence,
+    summary::GuardianDecision as GuardianSummaryDecision,
+};
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
 use crate::state::contracts::{CommandKind, OperationStatus};
-use axial_launcher::{LaunchStageEvidence, launch_notice};
+use axial_launcher::LaunchStageEvidence;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,6 +24,8 @@ mod policy;
 mod reports;
 mod runner;
 mod session;
+
+pub(crate) use crate::guardian::{launch_notice, launch_notice_from_values};
 
 pub(crate) use super::performance::BenchmarkMatrix;
 pub(crate) use benchmark::*;
@@ -38,6 +43,12 @@ pub(crate) use runner::launch_session;
 pub use runner::{
     LaunchRequestError, LaunchSuccess, sanitize_live_launch_failure_message, trace_launch_event,
 };
+
+pub fn snapshot_status(
+    record: &axial_launcher::LaunchSessionRecord,
+) -> axial_launcher::LaunchStatusEvent {
+    crate::guardian::launch_status_snapshot(record)
+}
 #[cfg(test)]
 use session::prepare_launch_session;
 pub use session::{
@@ -217,7 +228,7 @@ pub fn launch_request_error_status(error: &LaunchRequestError) -> StatusCode {
     if error
         .guardian
         .as_ref()
-        .is_some_and(|guardian| guardian.decision == axial_launcher::GuardianDecision::Blocked)
+        .is_some_and(|guardian| guardian.decision == GuardianSummaryDecision::Blocked)
     {
         StatusCode::UNPROCESSABLE_ENTITY
     } else {

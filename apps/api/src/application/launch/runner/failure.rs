@@ -1,14 +1,13 @@
 use super::LaunchRequestError;
 use super::proof::persist_launch_proof_with_context_owned as persist_launch_proof_with_context;
 use super::status::{serialize_guardian, serialize_healing};
+use crate::guardian::GuardianSummary;
 use crate::observability::{
     RedactionAudience, sanitize_evidence_token, sanitize_public_diagnostic_text,
 };
 use crate::state::launch_reports::LaunchProofContext;
 use crate::state::{AppState, LaunchStatusEvent};
-use axial_launcher::{
-    GuardianSummary, LaunchFailureClass, LaunchSessionOutcome, failure_class_name,
-};
+use axial_launcher::{LaunchFailureClass, LaunchSessionOutcome, failure_class_name};
 
 const LIVE_LAUNCH_FAILURE_MAX_CHARS: usize = 180;
 const LIVE_LAUNCH_FAILURE_SAFE_FALLBACK: &str = "Launch failed before Minecraft could start. Detailed diagnostics were hidden because they may contain local paths or private data.";

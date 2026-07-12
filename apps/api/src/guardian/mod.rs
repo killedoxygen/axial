@@ -19,6 +19,7 @@ pub mod policy;
 pub mod preflight;
 pub mod repair_plan;
 pub mod state_evidence;
+pub(crate) mod summary;
 
 #[cfg(test)]
 mod decision_snapshot;
@@ -58,6 +59,7 @@ pub(crate) use copy::{
     guardian_proof_evidence, guardian_summary_from_admission,
     guardian_summary_with_blocked_outcome, guardian_summary_with_intervention,
     guardian_summary_with_observed_outcome, guardian_summary_with_suppressed_outcome,
+    launch_notice, launch_notice_from_values, launch_session_outcome, launch_status_snapshot,
 };
 pub use copy::{
     GuardianInstallOutcomeSummary, GuardianJvmPresetNotice, GuardianJvmPresetOption,
@@ -133,3 +135,5 @@ pub use repair_plan::{
     plan_launcher_managed_missing_artifact_repair, plan_managed_runtime_ready_marker_repair,
 };
 pub use state_evidence::{GuardianStateLoadOutcome, persisted_state_load_guardian_outcome};
+pub use summary::GuardianSummary;
+pub(crate) use summary::{GuardianIntervention, GuardianInterventionKind};

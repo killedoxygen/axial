@@ -3,12 +3,12 @@ use crate::state::{
     ApiRuntimeState, DesktopState, TerminalAttemptOwner, TerminalFailure, TerminalIntent,
     TerminalResult,
 };
-use axial_api::application::launch::public_launch_status_json;
+use axial_api::application::launch::{public_launch_status_json, snapshot_status};
 use axial_api::application::{
     public_loader_install_progress_json, public_vanilla_install_progress_json,
 };
 use axial_api::state::{AppState, LaunchEvent};
-use axial_launcher::{is_terminal_state, snapshot_status};
+use axial_launcher::is_terminal_state;
 use serde::Serialize;
 use std::fs;
 use std::future::Future;

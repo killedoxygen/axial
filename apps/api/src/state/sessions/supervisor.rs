@@ -3,6 +3,7 @@ use super::{
     process_kill_stage_evidence, process_observation_stage_evidence,
 };
 use crate::execution::crash::{CrashArtifactCollectionRequest, collect_crash_evidence};
+use crate::guardian::launch_session_outcome;
 use axial_launcher::{
     LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome, LaunchState,
     LaunchStatusEvent, classify_launch_failure,
@@ -918,7 +919,7 @@ async fn settle_watchdog_exit(
                 crash_evidence: None,
                 healing: exit_context.record.healing.clone(),
                 guardian: exit_context.record.guardian.clone(),
-                outcome: Some(LaunchSessionOutcome::from_reason(
+                outcome: Some(launch_session_outcome(
                     LaunchSessionExitReason::WatchdogKilled,
                 )),
                 notice: None,

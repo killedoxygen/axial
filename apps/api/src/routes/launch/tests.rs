@@ -7,12 +7,13 @@ use crate::application::performance::{
 };
 use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
+use crate::guardian::{GuardianSummary, summary::GuardianDecision};
 use crate::state::contracts::TargetDescriptor;
 use crate::state::{AppStateInit, InstallStore, SessionStopError, SessionStore};
 use axial_config::{AppPaths, ConfigStore, Instance, InstanceStore};
 use axial_launcher::{
-    GuardianDecision, GuardianMode, GuardianSummary, LaunchAuthContext, LaunchGuardianContext,
-    LaunchIntent, LaunchSessionRecord, LaunchStageRecord, LaunchState, SessionId,
+    GuardianMode, LaunchAuthContext, LaunchGuardianContext, LaunchIntent, LaunchSessionRecord,
+    LaunchStageRecord, LaunchState, SessionId,
 };
 use axial_performance::PerformanceManager;
 use axum::{
@@ -4126,7 +4127,7 @@ fn launch_request_error(decision: Option<GuardianDecision>) -> launch_app::Launc
     launch_app::LaunchRequestError {
         message: "launch rejected".to_string(),
         healing: None,
-        guardian: decision.map(|decision| axial_launcher::GuardianSummary {
+        guardian: decision.map(|decision| GuardianSummary {
             mode: axial_launcher::GuardianMode::Managed,
             decision,
             message: None,

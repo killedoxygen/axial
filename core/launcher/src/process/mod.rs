@@ -79,7 +79,7 @@ impl LaunchSessionExitReason {
             Self::SpawnFailed => "The game process could not be started.",
             Self::StartupFailed => "Minecraft failed during startup.",
             Self::StartupStalled => "Minecraft did not finish startup in time.",
-            Self::WatchdogKilled => "Guardian stopped a stalled startup.",
+            Self::WatchdogKilled => "Minecraft did not finish startup in time.",
             Self::CrashedBeforeBoot => "Minecraft exited before startup completed.",
             Self::CrashedAfterBoot => "Minecraft crashed after startup.",
             Self::UnknownExit => "Minecraft exited and the launcher could not classify the reason.",

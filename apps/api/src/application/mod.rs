@@ -80,7 +80,6 @@ pub use install::{
 };
 pub(crate) use install::{enqueue_install_owned, install_queue_status_owned, retry_install_owned};
 pub use java::{JavaRuntimesResponse, java_runtimes};
-pub(crate) use launch::launch_preflight_stage_evidence;
 pub use launch::{
     LaunchInstanceStaging, LaunchPreflightMemory, LaunchPreflightOverride,
     LaunchPreflightOverrides, LaunchPreflightResourceBudget, LaunchPreflightResponse,
@@ -89,6 +88,7 @@ pub use launch::{
     prepare_launch_preflight, sanitize_live_launch_failure_message, stage_launch_instance_command,
     trace_launch_event,
 };
+pub(crate) use launch::{launch_notice_from_values, launch_preflight_stage_evidence};
 pub use music::{
     MusicStatusResponse, MusicTrackBytes, MusicTrackError, MusicTrackRequest, music_status,
     music_track,

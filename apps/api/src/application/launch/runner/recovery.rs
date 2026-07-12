@@ -5,7 +5,7 @@ use crate::guardian::{
     GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
     GuardianLaunchRecoveryPlanRequest, GuardianLaunchRecoveryRecordRequest,
     GuardianManagedJavaReason, GuardianPresetDowngradeReason, GuardianStripJvmArgsReason,
-    GuardianUserOutcome, author_guardian_copy, guardian_directive_description,
+    GuardianSummary, GuardianUserOutcome, author_guardian_copy, guardian_directive_description,
     guardian_failed_launch_recovery_log, guardian_summary_with_intervention,
     guardian_summary_with_suppressed_outcome, launch_recovery_journal_transition_conflicts,
     launch_recovery_journal_transition_matches, launch_recovery_user_intent_fingerprint,
@@ -14,7 +14,7 @@ use crate::guardian::{
 };
 use crate::logging::timestamp_utc;
 use crate::state::{AppState, OperationJournalReconciliation, OperationJournalStoreError};
-use axial_launcher::{GuardianSummary, LaunchFailureClass};
+use axial_launcher::LaunchFailureClass;
 use std::time::Duration;
 
 const JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
@@ -461,14 +461,13 @@ mod tests {
     use crate::guardian::{
         GuardianStartupFailureObservation, GuardianStartupFailureRequest,
         guardian_startup_failure_outcome, guardian_summary_with_blocked_outcome,
+        summary::GuardianDecision,
     };
     use crate::state::contracts::{OperationOutcome, OperationStatus, TargetKind};
     use crate::state::failure_memory::FailureMemoryActionOutcome;
     use crate::state::{AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
-    use axial_launcher::{
-        GuardianDecision, GuardianMode, LaunchSessionRecord, LaunchState, SessionId,
-    };
+    use axial_launcher::{GuardianMode, LaunchSessionRecord, LaunchState, SessionId};
     use axial_performance::PerformanceManager;
     use std::fs;
     use std::path::{Path, PathBuf};

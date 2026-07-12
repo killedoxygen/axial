@@ -3,6 +3,7 @@ use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
 };
+use crate::guardian::{GuardianSummary, launch_session_outcome};
 use crate::logging::timestamp_utc;
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
 use crate::state::benchmark_suites::{
@@ -11,7 +12,7 @@ use crate::state::benchmark_suites::{
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use axial_config::AppPaths;
 use axial_launcher::{
-    CrashEvidence, GuardianSummary, LaunchHealingSummary, LaunchIntent, LaunchPriorityEvidence,
+    CrashEvidence, LaunchHealingSummary, LaunchIntent, LaunchPriorityEvidence,
     LaunchSessionOutcome, LaunchSessionOutcomeKind, LaunchSessionRecord, LaunchStageEvidence,
     LaunchStageRecord, launch_state_name,
 };
@@ -762,7 +763,7 @@ impl LaunchProofExport {
             session_outcome: record
                 .session_outcome
                 .as_ref()
-                .map(|outcome| LaunchSessionOutcome::from_reason(outcome.reason)),
+                .map(|outcome| launch_session_outcome(outcome.reason)),
             scenario: sanitized_export_scenario(&record.scenario),
             device: sanitized_export_device(&record.device),
             resource_budget: record.resource_budget.clone(),
@@ -2034,7 +2035,7 @@ fn optional_bounded_text_is_canonical(value: Option<&str>) -> bool {
 }
 
 fn optional_session_outcome_is_canonical(outcome: Option<&LaunchSessionOutcome>) -> bool {
-    outcome.is_none_or(|outcome| LaunchSessionOutcome::from_reason(outcome.reason) == *outcome)
+    outcome.is_none_or(|outcome| launch_session_outcome(outcome.reason) == *outcome)
 }
 
 fn session_outcome_matches_report_outcome(

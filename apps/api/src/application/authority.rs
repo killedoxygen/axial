@@ -773,6 +773,7 @@ mod tests {
 
         let marker = concat!("Guardian", "Decision{");
         let declaration = concat!("pubstructGuardian", "Decision{");
+        let summary_declaration = concat!("pub(crate)enumGuardian", "Decision{");
         let mut violations = Vec::new();
         for path in sources {
             if is_test_source(&path) {
@@ -798,6 +799,14 @@ mod tests {
                     .expect("GuardianDecision model declaration");
                 compact.replace_range(
                     declaration_offset..declaration_offset + declaration.len(),
+                    "",
+                );
+            } else if relative == "apps/api/src/guardian/summary.rs" {
+                let declaration_offset = compact
+                    .find(summary_declaration)
+                    .expect("Guardian summary decision declaration");
+                compact.replace_range(
+                    declaration_offset..declaration_offset + summary_declaration.len(),
                     "",
                 );
             }
@@ -903,6 +912,8 @@ mod tests {
             "\"Guardian note\"",
             "Guardian adjusted launch settings for safety.",
             "JVM preset changed from {} to {} for compatibility.",
+            "Guardian stopped a stalled startup.",
+            "Launch stopped before startup because the required Java runtime was not available.",
         ] {
             assert!(
                 copy.contains(marker),
@@ -959,7 +970,12 @@ mod tests {
                 "GUARDIAN_OUTCOME_GUIDANCE_PREFIX",
                 "launcher_guardian_decision",
                 "GuardianSummary {",
+                "Guardian stopped a stalled startup.",
+                "Guardian found launch settings to review.",
             ] {
+                if relative == "apps/api/src/guardian/summary.rs" && marker == "GuardianSummary {" {
+                    continue;
+                }
                 if production.contains(marker) {
                     violations.push(format!("{relative}: {marker}"));
                 }
@@ -1003,6 +1019,41 @@ mod tests {
         ] {
             if core_guardian_production.contains(marker) {
                 violations.push(format!("core/launcher/src/guardian/mod.rs: {marker}"));
+            }
+        }
+        let core_root = repo_root.join("core/launcher/src");
+        let mut core_sources = Vec::new();
+        collect_rust_sources(&core_root, &mut core_sources);
+        for path in core_sources {
+            let relative = path
+                .strip_prefix(repo_root)
+                .expect("Core source must be inside the repository")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source = fs::read_to_string(&path).expect("read Core Launcher source");
+            let production = without_trailing_test_module(&source);
+            for marker in [
+                "GuardianSummary",
+                "GuardianDecision",
+                "GuardianIntervention",
+                "launch_notice(",
+                "launch_notice_from_values(",
+                "Guardian stopped a stalled startup.",
+                "Guardian found launch settings to review.",
+                "Guardian blocked an unsafe launch setup.",
+                "Guardian adjusted launch settings for safety.",
+            ] {
+                if production.contains(marker) {
+                    violations.push(format!("{relative}: {marker}"));
+                }
+            }
+        }
+        let frontend_guardian =
+            fs::read_to_string(repo_root.join("frontend/src/types-guardian.ts"))
+                .expect("read frontend Guardian types");
+        for marker in ["GuardianIntervention", "interventions?:"] {
+            if frontend_guardian.contains(marker) {
+                violations.push(format!("frontend/src/types-guardian.ts: {marker}"));
             }
         }
         assert!(

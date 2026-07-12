@@ -1,11 +1,12 @@
 use super::runner::persist_launch_proof_owned;
+use super::snapshot_status;
 use super::trace_launch_event;
-use crate::guardian::guardian_proof_evidence;
+use crate::guardian::{GuardianSummary, guardian_proof_evidence};
 use crate::observability::{
     RedactionAudience, sanitize_public_diagnostic_text, sanitize_public_json_value,
 };
 use crate::state::{AppState, LaunchStatusEvent, SessionStopError};
-use axial_launcher::{GuardianSummary, LaunchHealingSummary, LaunchSessionRecord, snapshot_status};
+use axial_launcher::{LaunchHealingSummary, LaunchSessionRecord};
 use axum::Json;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};

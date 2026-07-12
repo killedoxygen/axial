@@ -24,8 +24,7 @@ pub use crash::{
 };
 pub use failure::{classify_launch_failure, classify_startup_failure_text};
 pub use guardian::{
-    GuardianDecision, GuardianIntervention, GuardianInterventionKind, GuardianMode,
-    GuardianSummary, LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB, LaunchGuardianContext,
+    GuardianMode, LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB, LaunchGuardianContext,
     OverrideOrigin,
 };
 pub use healing::{HealingEvent, HealingEventKind};
@@ -47,8 +46,7 @@ pub use runtime::RuntimeSelection;
 pub use service::{
     LaunchHealingSummary, LaunchIntent, LaunchPreparationError, LaunchPreparationEvent,
     PreparedLaunchAttempt, build_healing_summary, failure_class_name, format_failure_class,
-    is_terminal_state, is_terminal_status, launch_notice, launch_notice_from_values,
-    launch_stage_label, launch_state_name, prepare_launch_attempt_with_events,
-    sanitize_effective_runtime_major, snapshot_status,
+    is_terminal_state, is_terminal_status, launch_stage_label, launch_state_name,
+    prepare_launch_attempt_with_events, sanitize_effective_runtime_major, snapshot_status,
 };
 pub use types::{InstanceId, LaunchFailure, LaunchFailureClass, LaunchState, SessionId, VersionId};

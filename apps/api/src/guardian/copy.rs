@@ -1,11 +1,13 @@
 use super::jvm_preset::{GuardianJvmPresetId, GuardianJvmPresetResolution};
+use super::summary::GuardianDecision as LauncherGuardianDecision;
 use super::{
     DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianDirective, GuardianFact,
     GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-    GuardianManagedJavaReason, GuardianMode, GuardianObservedLaunchFailurePhase,
-    GuardianPerformanceSupervisionRejection, GuardianPreflightOutcome,
-    GuardianPresetDowngradeReason, GuardianPresetValue, GuardianRepairStatus,
-    GuardianStartupFailureObservation, GuardianStripJvmArgsReason,
+    GuardianIntervention, GuardianInterventionKind, GuardianManagedJavaReason, GuardianMode,
+    GuardianObservedLaunchFailurePhase, GuardianPerformanceSupervisionRejection,
+    GuardianPreflightOutcome, GuardianPresetDowngradeReason, GuardianPresetValue,
+    GuardianRepairStatus, GuardianStartupFailureObservation, GuardianStripJvmArgsReason,
+    GuardianSummary,
 };
 use crate::observability::{
     RedactionAudience, sanitize_evidence_text, sanitize_evidence_token,
@@ -13,12 +15,14 @@ use crate::observability::{
 };
 use crate::state::contracts::OperationPhase;
 use axial_launcher::{
-    CrashEvidence, GuardianDecision as LauncherGuardianDecision, GuardianIntervention,
-    GuardianInterventionKind, GuardianMode as LauncherGuardianMode, GuardianSummary,
-    LaunchFailureClass, LaunchStageEvidence,
+    CrashEvidence, GuardianMode as LauncherGuardianMode, HealingEventKind, LaunchFailureClass,
+    LaunchHealingSummary, LaunchNotice, LaunchNoticeTone, LaunchSessionExitReason,
+    LaunchSessionOutcome, LaunchSessionOutcomeKind, LaunchSessionRecord, LaunchStageEvidence,
+    LaunchStatusEvent,
 };
 use chrono::{DateTime, Timelike, Utc};
 use serde::Serialize;
+use serde_json::Value;
 
 const MAX_SUMMARY_BYTES: usize = 180;
 const MAX_LINE_BYTES: usize = 240;
@@ -27,6 +31,10 @@ const MAX_DYNAMIC_TOKEN_BYTES: usize = 64;
 const MAX_STAGE_SUMMARY_BYTES: usize = 160;
 const MAX_STAGE_DETAIL_BYTES: usize = 120;
 const MAX_PROOF_DETAIL_BYTES: usize = 150;
+const MAX_NOTICE_MESSAGE_BYTES: usize = 180;
+const MAX_NOTICE_DETAIL_BYTES: usize = 240;
+const MAX_NOTICE_DETAILS: usize = 8;
+const PRIVATE_NOTICE_FALLBACK: &str = "Launch status details were hidden for privacy.";
 const GUARDIAN_OUTCOME_DECISION_PREFIX: &str = "guardian_outcome_decision:";
 const GUARDIAN_OUTCOME_SUMMARY_PREFIX: &str = "guardian_outcome_summary:";
 const GUARDIAN_OUTCOME_DETAIL_PREFIX: &str = "guardian_outcome_detail:";
@@ -253,7 +261,8 @@ pub(crate) fn guardian_proof_evidence(
                 guardian
                     .interventions
                     .iter()
-                    .filter_map(|intervention| intervention.detail.clone()),
+                    .filter(|intervention| !intervention.silent.unwrap_or(false))
+                    .filter_map(|intervention| intervention.public_detail.clone()),
             ),
     );
     let actionable = matches!(
@@ -289,6 +298,306 @@ fn first_bounded_proof_detail(values: impl IntoIterator<Item = String>) -> Optio
         );
         (!detail.is_empty()).then_some(detail)
     })
+}
+
+pub(crate) fn launch_notice_from_values(
+    guardian: Option<&Value>,
+    healing: Option<&Value>,
+    outcome: Option<&LaunchSessionOutcome>,
+    lead_detail: Option<&str>,
+    fallback_message: Option<&str>,
+) -> Option<LaunchNotice> {
+    let guardian = guardian.and_then(|value| serde_json::from_value(value.clone()).ok());
+    let healing = healing.and_then(|value| serde_json::from_value(value.clone()).ok());
+    launch_notice(
+        guardian.as_ref(),
+        healing.as_ref(),
+        outcome,
+        lead_detail,
+        fallback_message,
+    )
+}
+
+pub(crate) fn launch_notice(
+    guardian: Option<&GuardianSummary>,
+    healing: Option<&LaunchHealingSummary>,
+    outcome: Option<&LaunchSessionOutcome>,
+    lead_detail: Option<&str>,
+    fallback_message: Option<&str>,
+) -> Option<LaunchNotice> {
+    let guardian_details = guardian_notice_details(guardian);
+    let guardian_actionable = guardian.is_some_and(|guardian| {
+        matches!(
+            guardian.decision,
+            LauncherGuardianDecision::Blocked
+                | LauncherGuardianDecision::Warned
+                | LauncherGuardianDecision::Intervened
+        ) && (guardian
+            .message
+            .as_deref()
+            .is_some_and(|message| !message.trim().is_empty())
+            || !guardian_details.is_empty())
+    });
+
+    let mut details = Vec::new();
+    if guardian_details.is_empty() {
+        push_notice_detail(&mut details, lead_detail);
+    }
+    for detail in &guardian_details {
+        push_notice_detail(&mut details, Some(detail));
+    }
+    if !guardian_actionable {
+        for detail in healing_notice_details(healing) {
+            push_notice_detail(&mut details, Some(&detail));
+        }
+    }
+    if details.is_empty()
+        && outcome.is_some_and(|outcome| {
+            matches!(
+                outcome.kind,
+                LaunchSessionOutcomeKind::Failed | LaunchSessionOutcomeKind::Unknown
+            )
+        })
+    {
+        push_notice_detail(
+            &mut details,
+            outcome.map(|outcome| outcome.summary.as_str()),
+        );
+    }
+
+    let message = guardian_notice_message(guardian)
+        .or_else(|| healing_notice_message(healing))
+        .or_else(|| {
+            outcome.and_then(|outcome| match outcome.kind {
+                LaunchSessionOutcomeKind::Failed | LaunchSessionOutcomeKind::Unknown => {
+                    Some(outcome.summary.clone())
+                }
+                LaunchSessionOutcomeKind::Clean | LaunchSessionOutcomeKind::Stopped => None,
+            })
+        })
+        .or_else(|| {
+            fallback_message
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(str::to_string)
+        })?;
+
+    let message = sanitize_evidence_text(
+        &message,
+        RedactionAudience::UserVisible,
+        MAX_NOTICE_MESSAGE_BYTES,
+    )
+    .unwrap_or_else(|| PRIVATE_NOTICE_FALLBACK.to_string());
+    let details = details
+        .into_iter()
+        .filter_map(|detail| {
+            sanitize_evidence_text(
+                &detail,
+                RedactionAudience::UserVisible,
+                MAX_NOTICE_DETAIL_BYTES,
+            )
+        })
+        .take(MAX_NOTICE_DETAILS)
+        .collect::<Vec<_>>();
+    Some(LaunchNotice {
+        message,
+        detail: details.first().cloned(),
+        details,
+        tone: launch_notice_tone(guardian, healing, outcome),
+    })
+}
+
+pub(crate) fn launch_status_snapshot(record: &LaunchSessionRecord) -> LaunchStatusEvent {
+    let mut status = axial_launcher::snapshot_status(record);
+    status.notice = launch_notice_from_values(
+        status.guardian.as_ref(),
+        status.healing.as_ref(),
+        status.outcome.as_ref(),
+        status.failure_detail.as_deref(),
+        None,
+    );
+    status
+}
+
+pub(crate) fn launch_session_outcome(reason: LaunchSessionExitReason) -> LaunchSessionOutcome {
+    let mut outcome = LaunchSessionOutcome::from_reason(reason);
+    if reason == LaunchSessionExitReason::WatchdogKilled {
+        outcome.summary = "Guardian stopped a stalled startup.".to_string();
+    }
+    outcome
+}
+
+fn guardian_notice_details(guardian: Option<&GuardianSummary>) -> Vec<String> {
+    let Some(guardian) = guardian else {
+        return Vec::new();
+    };
+    if !guardian.details.is_empty() {
+        return guardian.details.clone();
+    }
+    let mut details = Vec::new();
+    for intervention in &guardian.interventions {
+        if !intervention.silent.unwrap_or(false) {
+            push_notice_detail(&mut details, intervention.public_detail.as_deref());
+        }
+    }
+    for guidance in &guardian.guidance {
+        push_notice_detail(&mut details, Some(guidance));
+    }
+    details
+}
+
+fn guardian_notice_message(guardian: Option<&GuardianSummary>) -> Option<String> {
+    let guardian = guardian?;
+    if guardian.decision == LauncherGuardianDecision::Allowed {
+        return None;
+    }
+    if let Some(message) = guardian
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    {
+        return Some(message.to_string());
+    }
+    match guardian.decision {
+        LauncherGuardianDecision::Blocked => {
+            Some("Guardian blocked an unsafe launch setup.".to_string())
+        }
+        LauncherGuardianDecision::Warned => {
+            Some("Guardian found launch settings to review.".to_string())
+        }
+        LauncherGuardianDecision::Intervened => {
+            Some("Guardian adjusted launch settings for safety.".to_string())
+        }
+        LauncherGuardianDecision::Allowed => None,
+    }
+}
+
+fn healing_notice_message(healing: Option<&LaunchHealingSummary>) -> Option<String> {
+    let healing = healing?;
+    if healing.failure_class.is_some()
+        && healing.retry_count.unwrap_or_default() == 0
+        && healing.fallback_applied.is_none()
+    {
+        if healing.failure_class.as_deref() == Some("java_runtime_mismatch") {
+            return Some(
+                "Launch stopped before startup because the required Java runtime was not available."
+                    .to_string(),
+            );
+        }
+        return Some(
+            "Launch stopped before startup because the selected setup was not compatible."
+                .to_string(),
+        );
+    }
+    if healing.retry_count.is_some_and(|count| count > 0) {
+        return Some("Launch recovered automatically with safer settings.".to_string());
+    }
+    if healing.fallback_applied.is_some() || !healing.warnings.is_empty() {
+        return Some("Launch settings were adjusted for compatibility.".to_string());
+    }
+    None
+}
+
+fn healing_notice_details(healing: Option<&LaunchHealingSummary>) -> Vec<String> {
+    let Some(healing) = healing else {
+        return Vec::new();
+    };
+    let mut details = Vec::new();
+    for event in &healing.events {
+        push_notice_detail(&mut details, Some(healing_event_detail(event)));
+    }
+    for warning in &healing.warnings {
+        push_notice_detail(&mut details, Some(warning));
+    }
+    push_notice_detail(&mut details, healing.fallback_applied.as_deref());
+    if let Some(retry_count) = healing.retry_count.filter(|count| *count > 0) {
+        push_notice_detail(
+            &mut details,
+            Some(&format!(
+                "Recovered automatically after {retry_count} {}.",
+                if retry_count == 1 { "retry" } else { "retries" }
+            )),
+        );
+    }
+    if let Some(failure_class) = healing.failure_class.as_deref() {
+        push_notice_detail(
+            &mut details,
+            Some(&format!(
+                "Reason: {}",
+                LaunchFailureClass::from_name(failure_class)
+                    .map(axial_launcher::format_failure_class)
+                    .unwrap_or("startup failure")
+            )),
+        );
+    }
+    details
+}
+
+fn healing_event_detail(event: &axial_launcher::HealingEvent) -> &str {
+    match event.kind {
+        HealingEventKind::RuntimeBypassed => {
+            "Java override was skipped and the managed runtime was used instead."
+        }
+        HealingEventKind::PresetDowngraded => event
+            .detail
+            .as_deref()
+            .unwrap_or("GC preset was adjusted for compatibility."),
+        HealingEventKind::FallbackApplied => event
+            .detail
+            .as_deref()
+            .unwrap_or("Axial retried startup with safer settings."),
+    }
+}
+
+fn launch_notice_tone(
+    guardian: Option<&GuardianSummary>,
+    healing: Option<&LaunchHealingSummary>,
+    outcome: Option<&LaunchSessionOutcome>,
+) -> LaunchNoticeTone {
+    match guardian.map(|guardian| guardian.decision) {
+        Some(LauncherGuardianDecision::Blocked) => return LaunchNoticeTone::Error,
+        Some(LauncherGuardianDecision::Warned) => return LaunchNoticeTone::Warned,
+        Some(LauncherGuardianDecision::Intervened) => return LaunchNoticeTone::Intervened,
+        Some(LauncherGuardianDecision::Allowed) | None => {}
+    }
+    if outcome.is_some_and(|outcome| {
+        matches!(
+            outcome.kind,
+            LaunchSessionOutcomeKind::Failed | LaunchSessionOutcomeKind::Unknown
+        )
+    }) || healing.is_some_and(|healing| healing.failure_class.is_some())
+    {
+        return LaunchNoticeTone::Error;
+    }
+    if healing.is_some_and(|healing| healing.retry_count.is_some_and(|count| count > 0)) {
+        return LaunchNoticeTone::Success;
+    }
+    LaunchNoticeTone::Info
+}
+
+fn push_notice_detail(details: &mut Vec<String>, detail: Option<&str>) {
+    let Some(detail) = detail
+        .map(ensure_sentence)
+        .filter(|detail| !detail.is_empty())
+    else {
+        return;
+    };
+    if !details.iter().any(|existing| existing == &detail) {
+        details.push(detail);
+    }
+}
+
+fn ensure_sentence(detail: &str) -> String {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return String::new();
+    }
+    if detail.ends_with(['.', '!', '?']) {
+        detail.to_string()
+    } else {
+        format!("{detail}.")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -3213,6 +3522,8 @@ fn finalize_launch_lines(lines: impl IntoIterator<Item = String>) -> Vec<String>
 
 #[cfg(test)]
 mod tests {
+    use super::super::summary::GuardianDecision;
+    use super::super::{GuardianInterventionKind, GuardianSummary};
     use super::{
         CopyContextKey, GUARDIAN_COPY_RULES, GUARDIAN_JVM_PRESET_COPY_RULES, GuardianCopyRequest,
         GuardianRuntimeRepairCopy, MAX_COLLECTION_LINES, MAX_LINE_BYTES, MAX_SUMMARY_BYTES,
@@ -3227,7 +3538,8 @@ mod tests {
     };
     use crate::state::contracts::OperationPhase;
     use axial_launcher::{
-        GuardianDecision, GuardianInterventionKind, GuardianMode, GuardianSummary,
+        GuardianMode, LaunchHealingSummary, LaunchNoticeTone, LaunchSessionExitReason,
+        LaunchSessionOutcome, LaunchSessionRecord, LaunchState, SessionId,
     };
 
     fn warning_summary() -> GuardianSummary {
@@ -3239,6 +3551,173 @@ mod tests {
             guidance: vec!["Keep existing launch guidance.".to_string()],
             interventions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn launch_notice_preserves_guardian_precedence_and_healing_fallback() {
+        let guardian = GuardianSummary {
+            mode: GuardianMode::Managed,
+            decision: GuardianDecision::Blocked,
+            message: Some("Guardian blocked an unsafe launch setup.".to_string()),
+            details: vec!["Custom Java path is unavailable.".to_string()],
+            guidance: Vec::new(),
+            interventions: Vec::new(),
+        };
+        let healing = LaunchHealingSummary {
+            failure_class: Some("java_runtime_mismatch".to_string()),
+            ..Default::default()
+        };
+
+        let notice = super::launch_notice(
+            Some(&guardian),
+            Some(&healing),
+            None,
+            Some("Fallback detail"),
+            Some("Fallback message"),
+        )
+        .expect("Guardian notice");
+        assert_eq!(notice.message, "Guardian blocked an unsafe launch setup.");
+        assert_eq!(notice.details, ["Custom Java path is unavailable."]);
+        assert_eq!(notice.tone, LaunchNoticeTone::Error);
+
+        let healing_notice = super::launch_notice(
+            None,
+            Some(&healing),
+            None,
+            Some("Java check failed"),
+            Some("Fallback message"),
+        )
+        .expect("Healing notice");
+        assert_eq!(
+            healing_notice.message,
+            "Launch stopped before startup because the required Java runtime was not available."
+        );
+        assert_eq!(healing_notice.detail.as_deref(), Some("Java check failed."));
+        assert_eq!(healing_notice.tone, LaunchNoticeTone::Error);
+    }
+
+    #[test]
+    fn launch_notice_rejects_malformed_values_and_uses_only_visible_intervention_copy() {
+        let malformed = serde_json::json!({
+            "mode": "managed",
+            "decision": "not_a_decision"
+        });
+        assert!(
+            super::launch_notice_from_values(Some(&malformed), None, None, None, None).is_none()
+        );
+
+        let directive = crate::guardian::GuardianDirective::UseManagedJava {
+            reason: GuardianManagedJavaReason::PrepareFailure,
+        };
+        let visible = super::guardian_summary_with_intervention(
+            &GuardianSummary::new(GuardianMode::Managed),
+            &directive,
+            false,
+        );
+        let visible_notice = super::launch_notice(Some(&visible), None, None, None, None)
+            .expect("visible intervention notice");
+        assert_eq!(
+            visible_notice.details,
+            ["Guardian used the managed Java runtime for this launch."]
+        );
+        assert!(
+            !visible_notice
+                .details
+                .iter()
+                .any(|detail| detail.contains("switched to managed Java before launch"))
+        );
+
+        let silent = super::guardian_summary_with_intervention(
+            &GuardianSummary::new(GuardianMode::Managed),
+            &directive,
+            true,
+        );
+        let silent_notice = super::launch_notice(Some(&silent), None, None, None, None)
+            .expect("silent intervention summary still has a message");
+        assert!(silent_notice.details.is_empty());
+    }
+
+    #[test]
+    fn launch_notice_enforces_privacy_and_bounds_at_the_authority() {
+        let guardian = GuardianSummary {
+            mode: GuardianMode::Managed,
+            decision: GuardianDecision::Warned,
+            message: Some(
+                "Leaked /home/alice/.minecraft --accessToken raw-secret-token".to_string(),
+            ),
+            details: ["/Users/Alice/private/java -Xmx8192M raw-secret-token".to_string()]
+                .into_iter()
+                .chain((0..10).map(|index| format!("Safe bounded detail {index}.")))
+                .collect(),
+            guidance: Vec::new(),
+            interventions: Vec::new(),
+        };
+
+        let notice = super::launch_notice(Some(&guardian), None, None, None, None)
+            .expect("bounded Guardian notice");
+        assert_eq!(notice.message, super::PRIVATE_NOTICE_FALLBACK);
+        assert_eq!(notice.details.len(), super::MAX_NOTICE_DETAILS);
+        assert!(
+            notice
+                .details
+                .iter()
+                .all(|detail| detail.len() <= super::MAX_NOTICE_DETAIL_BYTES)
+        );
+        let encoded = serde_json::to_string(&notice).expect("notice JSON");
+        assert!(!encoded.contains("alice"));
+        assert!(!encoded.contains("Alice"));
+        assert!(!encoded.contains("accessToken"));
+        assert!(!encoded.contains("/Users"));
+        assert!(!encoded.contains("-Xmx"));
+        assert!(!encoded.contains("raw-secret"));
+    }
+
+    #[test]
+    fn watchdog_outcome_and_snapshot_notice_are_application_authored() {
+        let watchdog = super::launch_session_outcome(LaunchSessionExitReason::WatchdogKilled);
+        assert_eq!(watchdog.summary, "Guardian stopped a stalled startup.");
+        assert_ne!(
+            watchdog,
+            LaunchSessionOutcome::from_reason(LaunchSessionExitReason::WatchdogKilled)
+        );
+
+        let guardian = warning_summary();
+        let record = LaunchSessionRecord {
+            session_id: SessionId("notice-parity".to_string()),
+            instance_id: "instance".to_string(),
+            version_id: "1.21.5".to_string(),
+            launched_at: None,
+            benchmark: None,
+            state: LaunchState::Exited,
+            pid: None,
+            process_started_at_ms: None,
+            boot_completed_at_ms: None,
+            boot_duration_ms: None,
+            priority: None,
+            exit_code: Some(-1),
+            command: Vec::new(),
+            java_path: None,
+            natives_dir: None,
+            failure: None,
+            crash_evidence: None,
+            healing: None,
+            guardian: Some(serde_json::to_value(&guardian).expect("Guardian JSON")),
+            outcome: Some(watchdog),
+            stages: Vec::new(),
+        };
+        let factual = axial_launcher::snapshot_status(&record);
+        assert!(factual.notice.is_none());
+        let enriched = super::launch_status_snapshot(&record);
+        assert_eq!(
+            enriched.notice,
+            super::launch_notice_from_values(
+                record.guardian.as_ref(),
+                record.healing.as_ref(),
+                record.outcome.as_ref(),
+                None,
+                None,
+            )
+        );
     }
 
     #[test]

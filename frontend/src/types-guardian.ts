@@ -2,25 +2,12 @@ export type GuardianMode = 'managed' | 'custom';
 
 export type GuardianDecision = 'allowed' | 'warned' | 'blocked' | 'intervened';
 
-export type GuardianInterventionKind =
-  | 'switch_managed_runtime'
-  | 'strip_jvm_args'
-  | 'downgrade_preset'
-  | 'disable_custom_gc';
-
-export interface GuardianIntervention {
-  kind: GuardianInterventionKind;
-  detail?: string;
-  silent?: boolean;
-}
-
 export interface GuardianSummary {
   mode: GuardianMode;
   decision: GuardianDecision;
   message?: string;
   details?: string[];
   guidance?: string[];
-  interventions?: GuardianIntervention[];
 }
 
 export interface GuardianEvidenceField {

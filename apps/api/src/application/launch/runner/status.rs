@@ -1,7 +1,7 @@
+use crate::guardian::GuardianSummary;
 use crate::state::{AppState, LaunchStatusEvent};
 use axial_launcher::{
-    GuardianSummary, LaunchFailureClass, LaunchPreparationEvent, LaunchState, failure_class_name,
-    launch_state_name,
+    LaunchFailureClass, LaunchPreparationEvent, LaunchState, failure_class_name, launch_state_name,
 };
 use serde_json::Value;
 

@@ -2,6 +2,7 @@ mod classify;
 mod priority;
 mod supervisor;
 
+use crate::application::launch_notice_from_values;
 use crate::execution::process::{
     ProcessKillReason, ProcessKillRequest, ProcessObservation, ProcessObservationRequest,
     ProcessStopIntent, ProcessStopRequest, observe_process, process_killed, process_session_target,
@@ -11,7 +12,7 @@ use axial_launcher::{
     LaunchEvent, LaunchFailure, LaunchFailureClass, LaunchLogEvent, LaunchNotice,
     LaunchPriorityEvidence, LaunchSessionOutcomeKind, LaunchSessionRecord, LaunchStageEvidence,
     LaunchStageRecord, LaunchState, LaunchStatusEvent, classify_startup_failure_text,
-    launch_notice_from_values, launch_stage_label, launch_state_name,
+    launch_stage_label, launch_state_name,
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -2215,7 +2216,7 @@ fn test_record(session_id: &str) -> LaunchSessionRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axial_launcher::{LaunchSessionExitReason, LaunchStageEvidence};
+    use axial_launcher::{LaunchSessionExitReason, LaunchSessionOutcome, LaunchStageEvidence};
     use serde_json::json;
     use std::sync::Arc;
     use tokio::process::Command;
@@ -2275,9 +2276,28 @@ mod tests {
                 retained_receiver = store.subscribe(&session_id).await;
             }
             store.release_terminal_retention_hold(&session_id).await;
-            store
-                .emit_status(&session_id, terminal_status(Some(index as i32), None, None))
-                .await;
+            let mut status = terminal_status(Some(index as i32), None, None);
+            if session_id == retained_session_id {
+                status.failure_detail = Some("Java validation failed".to_string());
+                status.guardian = Some(json!({
+                    "mode": "managed",
+                    "decision": "warned",
+                    "message": "Guardian found launch settings to review.",
+                    "details": ["Use the managed Java runtime."]
+                }));
+                status.healing = Some(json!({
+                    "warnings": ["The selected runtime was not compatible."],
+                    "retry_count": 1,
+                    "failure_class": "java_runtime_mismatch",
+                    "events": [{
+                        "kind": "runtime_bypassed"
+                    }]
+                }));
+                status.outcome = Some(LaunchSessionOutcome::from_reason(
+                    LaunchSessionExitReason::UnknownExit,
+                ));
+            }
+            store.emit_status(&session_id, status).await;
         }
 
         assert!(store.get("terminal-0").await.is_none());
@@ -2286,12 +2306,19 @@ mod tests {
             .get(&retained_session_id)
             .await
             .expect("retained terminal record");
-        let replay = axial_launcher::snapshot_status(&retained);
+        let replay = crate::application::launch::snapshot_status(&retained);
 
         assert_eq!(replay.state, emitted.state);
         assert_eq!(replay.exit_code, emitted.exit_code);
         assert_eq!(replay.outcome, emitted.outcome);
         assert_eq!(replay.notice, emitted.notice);
+        let notice = replay.notice.as_ref().expect("enriched replay notice");
+        assert_eq!(notice.message, "Guardian found launch settings to review.");
+        assert_eq!(notice.details, ["Use the managed Java runtime."]);
+        assert_eq!(
+            replay.outcome.as_ref().map(|outcome| outcome.kind),
+            Some(axial_launcher::LaunchSessionOutcomeKind::Unknown)
+        );
         assert_eq!(replay.stages, emitted.stages);
         assert!(store.subscribe(&retained_session_id).await.is_some());
     }

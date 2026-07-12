@@ -1,5 +1,5 @@
 use super::*;
-use crate::guardian::GuardianSeverity;
+use crate::guardian::{GuardianSeverity, summary::GuardianDecision};
 use crate::state::contracts::{CommandKind, OperationOutcome, OperationStatus, OwnershipClass};
 use crate::state::{
     AppStateInit, AuthLoginMinecraftProfile, InstallStore, NewAuthLoginMinecraftAccount,
@@ -7,7 +7,7 @@ use crate::state::{
 };
 use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_launcher::{
-    GuardianDecision, LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB, LaunchReadinessReason,
+    LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB, LaunchReadinessReason,
     LaunchReadinessReasonId, LaunchReadinessSeverity, OverrideOrigin, SessionId,
 };
 use axial_performance::PerformanceManager;

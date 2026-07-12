@@ -63,66 +63,9 @@ impl LaunchGuardianContext {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GuardianDecision {
-    Allowed,
-    Warned,
-    Blocked,
-    Intervened,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GuardianInterventionKind {
-    SwitchManagedRuntime,
-    StripJvmArgs,
-    DowngradePreset,
-    DisableCustomGc,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GuardianIntervention {
-    pub kind: GuardianInterventionKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub public_detail: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub silent: Option<bool>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GuardianSummary {
-    pub mode: GuardianMode,
-    pub decision: GuardianDecision,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub details: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub guidance: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub interventions: Vec<GuardianIntervention>,
-}
-
-impl GuardianSummary {
-    pub fn new(mode: GuardianMode) -> Self {
-        Self {
-            mode,
-            decision: GuardianDecision::Allowed,
-            message: None,
-            details: Vec::new(),
-            guidance: Vec::new(),
-            interventions: Vec::new(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{GuardianMode, GuardianSummary, LaunchGuardianContext, OverrideOrigin};
-    use serde_json::json;
+    use super::{GuardianMode, LaunchGuardianContext, OverrideOrigin};
 
     #[test]
     fn named_preset_counts_as_risky_override_for_warning_policy() {
@@ -134,15 +77,5 @@ mod tests {
         };
 
         assert!(context.has_risky_overrides());
-    }
-
-    #[test]
-    fn allowed_guardian_summary_has_no_user_facing_outcome() {
-        let summary = GuardianSummary::new(GuardianMode::Managed);
-        let serialized = serde_json::to_value(summary).expect("serialized summary");
-
-        assert_eq!(serialized["decision"], json!("allowed"));
-        assert!(serialized.get("message").is_none());
-        assert!(serialized.get("details").is_none());
     }
 }
