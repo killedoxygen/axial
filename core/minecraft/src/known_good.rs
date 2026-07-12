@@ -267,7 +267,8 @@ impl KnownGoodInstallReceipt {
 
         let child_size = i64::try_from(child_client_bytes.len())
             .map_err(|_| KnownGoodInventoryError::InputTooLarge)?;
-        let child_sha1 = sha1_digest(child_client_bytes).as_str().to_string();
+        let child_digest = sha1_digest(child_client_bytes);
+        let child_sha1 = child_digest.as_str().to_string();
         let mut expected_version = base.effective_version.clone();
         expected_version.id = record.version_id.clone();
         expected_version.inherits_from = record.minecraft_version.clone();
@@ -307,7 +308,10 @@ impl KnownGoodInstallReceipt {
             root: KnownGoodRoot::Versions,
             path: KnownGoodRelativePath::new(&format!("{0}/{0}.jar", version_id.as_str()))?,
             kind: KnownGoodArtifactKind::ClientJar,
-            integrity: exact_bytes_integrity(child_client_bytes),
+            integrity: KnownGoodIntegrity::Sha1 {
+                digest: child_digest,
+                size: Some(child_client_bytes.len() as u64),
+            },
         })?;
 
         let libraries = library_artifact_plans_for(
@@ -1495,7 +1499,10 @@ mod tests {
             &KnownGoodRoot::Versions,
             &format!("{0}/{0}.jar", record.version_id),
             KnownGoodArtifactKind::ClientJar,
-            &exact_bytes_integrity(child_client_bytes),
+            &KnownGoodIntegrity::Sha1 {
+                digest: sha1_digest(child_client_bytes),
+                size: Some(child_client_bytes.len() as u64),
+            },
         );
         assert_entry(
             &inventory,

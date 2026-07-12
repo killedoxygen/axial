@@ -113,6 +113,19 @@ impl<T> Default for ActiveInventories<T> {
 }
 
 impl<T> ActiveInventories<T> {
+    fn activate_validated(
+        &mut self,
+        snapshot: &KnownGoodSnapshot,
+        instance_id: &str,
+        version_id: &str,
+        library_root: PathBuf,
+        inventory: Arc<T>,
+    ) -> io::Result<()> {
+        snapshot.validate()?;
+        self.activate(instance_id, version_id, library_root, inventory);
+        Ok(())
+    }
+
     fn activate(
         &mut self,
         instance_id: &str,
@@ -263,16 +276,17 @@ impl KnownGoodInventoryStore {
             return Err(closed_error());
         }
 
-        self.active.lock().expect(STORE_LOCK_INVARIANT).activate(
-            instance_id,
-            version_id,
-            library_root,
-            inventory.clone(),
-        );
         let snapshot = snapshot_from_inventory(instance_id, version_id, &inventory);
-        if snapshot.validate().is_err() {
-            return Ok(());
-        }
+        self.active
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .activate_validated(
+                &snapshot,
+                instance_id,
+                version_id,
+                library_root,
+                inventory.clone(),
+            )?;
         let path = self.snapshot_path(instance_id);
         let read_path = path.clone();
         let persisted = tokio::task::spawn_blocking(move || read_snapshot(&read_path))
@@ -1210,6 +1224,32 @@ mod tests {
                 .expect("unrelated authority"),
             &unrelated
         ));
+    }
+
+    #[test]
+    fn incompatible_snapshot_is_rejected_before_authority_activation() {
+        let instance_id = "0000000000000001";
+        let version_id = "1.21.5";
+        let root = PathBuf::from("/library");
+        let mut incompatible = snapshot(instance_id, version_id);
+        incompatible.entries[0].integrity = KnownGoodIntegritySnapshot::ExactBytes {
+            digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            size: 42,
+        };
+        let mut active = ActiveInventories::default();
+
+        let error = active
+            .activate_validated(
+                &incompatible,
+                instance_id,
+                version_id,
+                root.clone(),
+                Arc::new(1_u8),
+            )
+            .expect_err("incompatible producer contract must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(active.get(instance_id, version_id, &root).is_none());
     }
 
     #[test]
