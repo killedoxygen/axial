@@ -428,7 +428,7 @@ impl Downloader {
                         manifest_expected: expected,
                     },
                 ),
-                shape: KnownGoodInstallShape::Vanilla {
+                shape: KnownGoodInstallShape {
                     version_manifest: &version_manifest_entry,
                 },
                 environment: &default_environment(),

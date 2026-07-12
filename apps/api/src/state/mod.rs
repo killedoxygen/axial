@@ -455,15 +455,9 @@ impl AppState {
                     inventory.clone(),
                 )
                 .await?;
-            let current = self.instances.get(&instance_id);
-            let current_root = self.library_dir().map(PathBuf::from);
-            if !matches_known_good_identity(current.as_ref(), &instance_id, &version_id)
-                || current_root.as_ref().is_none_or(|current_root| {
-                    !known_good::KnownGoodInventoryStore::library_roots_match(
-                        current_root,
-                        installed_library_root,
-                    )
-                })
+            if self
+                .active_known_good_inventory(&instance_id, &version_id, installed_library_root)
+                .is_none()
             {
                 self.known_good
                     .deactivate_exact(&instance_id, &version_id, installed_library_root);
@@ -479,7 +473,7 @@ impl AppState {
         instance_id: &str,
         version_id: &str,
         library_root: &Path,
-    ) -> Option<Arc<axial_minecraft::KnownGoodInventoryAuthority>> {
+    ) -> Option<Arc<axial_minecraft::KnownGoodInventory>> {
         let configured_library_root = self.library_dir().map(PathBuf::from)?;
         if !known_good::KnownGoodInventoryStore::library_roots_match(
             &configured_library_root,
@@ -491,12 +485,8 @@ impl AppState {
         ) {
             return None;
         }
-        let inventory = self
-            .known_good
-            .active_inventory(instance_id, version_id, library_root)?;
-        axial_minecraft::KnownGoodInventoryAuthority::bind(inventory, library_root)
-            .ok()
-            .map(Arc::new)
+        self.known_good
+            .active_inventory(instance_id, version_id, library_root)
     }
 
     pub fn performance(&self) -> &Arc<AppPerformanceStore> {

@@ -845,7 +845,6 @@ fn version_is_launch_ready_or_user_blocked(
         requested_java: config.java_path_override.trim().to_string(),
         version_id: version_id.to_string(),
         guardian_mode: GuardianMode::from_config(&config.guardian_mode),
-        known_good_inventory: None,
     });
     if readiness.launchable {
         return Ok(true);

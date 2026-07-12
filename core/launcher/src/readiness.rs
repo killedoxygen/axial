@@ -3,8 +3,7 @@ use crate::build::find_client_jar;
 use axial_minecraft::download::{
     ExpectedIntegrity, LauncherManagedArtifactReadiness, LibraryVerificationIntegrity,
     asset_object_hash_prefix, jar_contains_signed_metadata, library_verification_plans_for,
-    verify_existing_launcher_managed_artifact, verify_existing_structural_library,
-    verify_existing_structural_library_metadata,
+    verify_existing_launcher_managed_artifact,
 };
 use axial_minecraft::paths::assets_dir;
 use axial_minecraft::{
@@ -18,7 +17,6 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct LaunchReadinessRequest {
@@ -26,7 +24,6 @@ pub struct LaunchReadinessRequest {
     pub version_id: String,
     pub requested_java: String,
     pub guardian_mode: GuardianMode,
-    pub known_good_inventory: Option<Arc<axial_minecraft::KnownGoodInventoryAuthority>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -106,7 +103,6 @@ fn inspect_launch_readiness_with_depth(
                 &request.library_dir,
                 &request.version_id,
                 &version,
-                request.known_good_inventory.as_deref(),
                 inspection,
                 &mut reasons,
             );
@@ -160,7 +156,6 @@ fn inspect_version_files(
     library_dir: &Path,
     version_id: &str,
     version: &VersionJson,
-    known_good_inventory: Option<&axial_minecraft::KnownGoodInventoryAuthority>,
     inspection: LaunchReadinessInspection,
     reasons: &mut Vec<LaunchReadinessReason>,
 ) {
@@ -212,12 +207,8 @@ fn inspect_version_files(
         }
     }
 
-    let planned_libraries = library_verification_plans_for(
-        library_dir,
-        &version.libraries,
-        &default_environment(),
-        known_good_inventory,
-    );
+    let planned_libraries =
+        library_verification_plans_for(library_dir, &version.libraries, &default_environment());
     let library_planning_failed = planned_libraries.is_err();
     let library_jobs: Vec<ArtifactVerificationJob> = planned_libraries
         .unwrap_or_default()
@@ -370,9 +361,6 @@ fn verify_artifact_job(job: ArtifactVerificationJob) -> LauncherManagedArtifactR
         LibraryVerificationIntegrity::Sha1(expected) => {
             verify_existing_launcher_managed_artifact(&job.path, &expected)
         }
-        LibraryVerificationIntegrity::StructuralJar(verification) => {
-            verify_existing_structural_library(&verification)
-        }
         LibraryVerificationIntegrity::MissingChecksum => {
             LauncherManagedArtifactReadiness::MetadataMissing
         }
@@ -396,9 +384,6 @@ fn verify_artifact_job_metadata(job: ArtifactVerificationJob) -> LauncherManaged
                 return LauncherManagedArtifactReadiness::MetadataInvalid;
             }
             expected.size
-        }
-        LibraryVerificationIntegrity::StructuralJar(verification) => {
-            return verify_existing_structural_library_metadata(verification);
         }
         LibraryVerificationIntegrity::MissingChecksum => {
             return LauncherManagedArtifactReadiness::MetadataMissing;
@@ -802,7 +787,6 @@ mod tests {
             version_id: "1.21.1".to_string(),
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(readiness.launchable, "{:?}", readiness.reasons);
@@ -847,7 +831,6 @@ mod tests {
             version_id: "1.21.1".to_string(),
             requested_java: "axial-test-runtime-missing".to_string(),
             guardian_mode: GuardianMode::Custom,
-            known_good_inventory: None,
         });
 
         assert!(!readiness.launchable);
@@ -900,7 +883,6 @@ mod tests {
             version_id: "1.21.1".to_string(),
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(!readiness.launchable);
@@ -912,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_library_blocks_launch_readiness() {
+    fn exact_library_hash_and_size_drift_block_readiness() {
         let library_dir = temp_library("corrupt-library");
         let client = b"client";
         let expected_library = b"fresh";
@@ -969,11 +951,23 @@ mod tests {
             version_id: "1.21.1".to_string(),
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(!readiness.launchable);
         assert!(readiness.reasons.iter().any(|reason| {
+            reason.id == LaunchReadinessReasonId::LibrariesCorrupt
+                && reason.severity == LaunchReadinessSeverity::Blocking
+        }));
+
+        fs::write(&library_path, b"wrong-size").expect("write size-drifted library");
+        let summary = inspect_launch_readiness_summary(&LaunchReadinessRequest {
+            library_dir: library_dir.clone(),
+            version_id: "1.21.1".to_string(),
+            requested_java: String::new(),
+            guardian_mode: GuardianMode::Managed,
+        });
+        assert!(!summary.launchable);
+        assert!(summary.reasons.iter().any(|reason| {
             reason.id == LaunchReadinessReasonId::LibrariesCorrupt
                 && reason.severity == LaunchReadinessSeverity::Blocking
         }));
@@ -1038,7 +1032,6 @@ mod tests {
             version_id: "1.21.1".to_string(),
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(readiness.launchable, "{:?}", readiness.reasons);
@@ -1101,7 +1094,6 @@ mod tests {
             version_id: "1.21.1".to_string(),
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(!readiness.launchable);
@@ -1167,7 +1159,6 @@ mod tests {
             version_id,
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(!readiness.launchable);
@@ -1179,8 +1170,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_checksum_never_reaches_structural_verification_without_typed_authority() {
-        let library_dir = temp_library("typed-structural-library-authority");
+    fn missing_checksum_is_always_fail_closed() {
+        let library_dir = temp_library("missing-checksum-library");
         let path = library_dir.join("libraries/example.jar");
         fs::create_dir_all(path.parent().expect("library parent")).expect("library directory");
         let bytes = zip_bytes(&[("example/Entry.class", b"entry")]);
@@ -1257,7 +1248,6 @@ mod tests {
             version_id,
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(!readiness.launchable);
@@ -1310,7 +1300,6 @@ mod tests {
             version_id,
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(!readiness.launchable);
@@ -1370,7 +1359,6 @@ mod tests {
             version_id,
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(!readiness.launchable);
@@ -1449,7 +1437,6 @@ mod tests {
             version_id,
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(!readiness.launchable);
@@ -1529,7 +1516,6 @@ mod tests {
             version_id,
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(!readiness.launchable);
@@ -1592,7 +1578,6 @@ mod tests {
             version_id: "1.5.2".to_string(),
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(!readiness.launchable);
@@ -1657,7 +1642,6 @@ mod tests {
             version_id: "1.21.1".to_string(),
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(!readiness.launchable);
@@ -1678,7 +1662,6 @@ mod tests {
             version_id: "asset-version".to_string(),
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         };
 
         let summary = inspect_launch_readiness_summary(&request);
@@ -1716,7 +1699,6 @@ mod tests {
             version_id: "asset-version".to_string(),
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(!readiness.launchable);
@@ -1746,7 +1728,6 @@ mod tests {
             version_id: "asset-version".to_string(),
             requested_java: String::new(),
             guardian_mode: GuardianMode::Managed,
-            known_good_inventory: None,
         });
 
         assert!(readiness.launchable, "{:?}", readiness.reasons);

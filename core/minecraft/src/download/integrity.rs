@@ -1,9 +1,10 @@
-use super::StructuralLibraryVerification;
 use super::model::{ActualIntegrity, DownloadError, DownloadIntegrityError, ExpectedIntegrity};
 use super::path_safety::{bounded_download_file_label, filesystem_path};
 use sha1::{Digest as _, Sha1};
 use std::io::{self, Read};
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use tokio::fs as async_fs;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,135 +136,6 @@ pub fn verify_existing_launcher_managed_artifact(
     }
 }
 
-pub fn verify_existing_structural_library(
-    verification: &StructuralLibraryVerification,
-) -> LauncherManagedArtifactReadiness {
-    let (path, metadata) = match structural_library_file(verification) {
-        Ok(value) => value,
-        Err(readiness) => return readiness,
-    };
-    if metadata.len() == 0 {
-        return LauncherManagedArtifactReadiness::Corrupt;
-    }
-    if let Some(expected_size) = verification.expected_size
-        && metadata.len() != expected_size
-    {
-        return LauncherManagedArtifactReadiness::Corrupt;
-    }
-    if path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
-        && !checksumless_jar_is_readable(&path)
-    {
-        return LauncherManagedArtifactReadiness::Corrupt;
-    }
-    LauncherManagedArtifactReadiness::Verified
-}
-
-pub fn verify_existing_structural_library_metadata(
-    verification: &StructuralLibraryVerification,
-) -> LauncherManagedArtifactReadiness {
-    let (_, metadata) = match structural_library_file(verification) {
-        Ok(value) => value,
-        Err(readiness) => return readiness,
-    };
-    if metadata.len() == 0 {
-        return LauncherManagedArtifactReadiness::Corrupt;
-    }
-    if let Some(expected_size) = verification.expected_size
-        && metadata.len() != expected_size
-    {
-        return LauncherManagedArtifactReadiness::Corrupt;
-    }
-    LauncherManagedArtifactReadiness::Verified
-}
-
-fn structural_library_file(
-    verification: &StructuralLibraryVerification,
-) -> Result<(PathBuf, std::fs::Metadata), LauncherManagedArtifactReadiness> {
-    let root = absolute_lexical_path(&verification.minecraft_root)
-        .ok_or(LauncherManagedArtifactReadiness::UnsupportedExisting)?;
-    verify_directory(&root)?;
-
-    let mut current = root;
-    current.push("libraries");
-    verify_directory(&current)?;
-    for (index, component) in verification.relative_path.as_str().split('/').enumerate() {
-        current.push(component);
-        let is_final = index + 1 == verification.relative_path.as_str().split('/').count();
-        if is_final {
-            let metadata = checked_metadata(&current)?;
-            if !metadata.is_file() {
-                return Err(LauncherManagedArtifactReadiness::UnsupportedExisting);
-            }
-            return Ok((current, metadata));
-        }
-        verify_directory(&current)?;
-    }
-    Err(LauncherManagedArtifactReadiness::UnsupportedExisting)
-}
-
-fn absolute_lexical_path(path: &Path) -> Option<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return None;
-                }
-            }
-            Component::Normal(value) => normalized.push(value),
-        }
-    }
-    Some(normalized)
-}
-
-fn verify_directory(path: &Path) -> Result<(), LauncherManagedArtifactReadiness> {
-    let metadata = checked_metadata(path)?;
-    if metadata.is_dir() {
-        Ok(())
-    } else {
-        Err(LauncherManagedArtifactReadiness::UnsupportedExisting)
-    }
-}
-
-fn checked_metadata(path: &Path) -> Result<std::fs::Metadata, LauncherManagedArtifactReadiness> {
-    let metadata = std::fs::symlink_metadata(filesystem_path(path).as_ref()).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            LauncherManagedArtifactReadiness::Missing
-        } else {
-            LauncherManagedArtifactReadiness::UnsupportedExisting
-        }
-    })?;
-    if metadata_is_link(&metadata) {
-        return Err(LauncherManagedArtifactReadiness::UnsupportedExisting);
-    }
-    Ok(metadata)
-}
-
-fn metadata_is_link(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
-    }
-    #[cfg(not(windows))]
-    false
-}
-
 pub fn jar_contains_signed_metadata(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(filesystem_path(path).as_ref()) else {
         return false;
@@ -289,28 +161,8 @@ pub fn signed_jar_metadata_entry_name(name: &str) -> bool {
             && (upper.ends_with(".SF") || upper.ends_with(".RSA") || upper.ends_with(".DSA")))
 }
 
-fn checksumless_jar_is_readable(path: &Path) -> bool {
-    checksumless_jar_readability(path).unwrap_or(false)
-}
-
 pub(super) fn checksumless_jar_file_is_readable(file: &std::fs::File) -> io::Result<bool> {
     let file = file.try_clone()?;
-    let Ok(mut archive) = zip::ZipArchive::new(file) else {
-        return Ok(false);
-    };
-    for index in 0..archive.len() {
-        let Ok(entry) = archive.by_index(index) else {
-            return Ok(false);
-        };
-        if !entry.is_dir() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn checksumless_jar_readability(path: &Path) -> io::Result<bool> {
-    let file = std::fs::File::open(filesystem_path(path).as_ref())?;
     let Ok(mut archive) = zip::ZipArchive::new(file) else {
         return Ok(false);
     };

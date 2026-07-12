@@ -19,8 +19,7 @@ pub use assets::{
 pub use install::Downloader;
 pub use integrity::{
     LauncherManagedArtifactReadiness, jar_contains_signed_metadata,
-    verify_existing_launcher_managed_artifact, verify_existing_structural_library,
-    verify_existing_structural_library_metadata,
+    verify_existing_launcher_managed_artifact,
 };
 #[cfg(test)]
 pub(crate) use libraries::DownloadJob;
@@ -30,9 +29,8 @@ pub(crate) use libraries::{
     library_artifact_plans_for,
 };
 pub use libraries::{
-    LibraryVerificationIntegrity, LibraryVerificationPlan, StructuralLibraryVerification,
-    download_libraries, download_libraries_with_facts_and_descriptors,
-    library_verification_plans_for,
+    LibraryVerificationIntegrity, LibraryVerificationPlan, download_libraries,
+    download_libraries_with_facts_and_descriptors, library_verification_plans_for,
 };
 pub(crate) use model::ExactLibraryDownloadProof;
 pub use model::{

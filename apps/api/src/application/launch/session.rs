@@ -749,11 +749,6 @@ async fn build_launch_preflight_facts_with_memory_capture(
             version_id: instance.version_id.clone(),
             requested_java: requested_java.clone(),
             guardian_mode: guardian.mode,
-            known_good_inventory: state.active_known_good_inventory(
-                &instance.id,
-                &instance.version_id,
-                library_dir,
-            ),
         })
     };
     let readiness_elapsed = readiness_started_at.elapsed();

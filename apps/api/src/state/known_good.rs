@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock};
 
-const KNOWN_GOOD_SCHEMA: &str = "axial.state.known_good_inventory.v1";
+const KNOWN_GOOD_SCHEMA: &str = "axial.state.known_good_inventory.v2";
 const KNOWN_GOOD_DIR: &str = "known-good";
 const MAX_KNOWN_GOOD_SNAPSHOT_BYTES: u64 = 256 << 20;
 const STORE_LOCK_INVARIANT: &str =
@@ -75,7 +75,6 @@ enum KnownGoodArtifactKindSnapshot {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum KnownGoodIntegritySnapshot {
     Sha1 { digest: String, size: Option<u64> },
-    StructuralJar { size: Option<u64> },
     ExactBytes { digest: String, size: u64 },
     Directory,
     LinkTarget { target: String },
@@ -298,6 +297,13 @@ impl KnownGoodInventoryStore {
         Ok(())
     }
 
+    pub(super) fn library_roots_match(left: &Path, right: &Path) -> bool {
+        normalize_library_root(left)
+            .ok()
+            .zip(normalize_library_root(right).ok())
+            .is_some_and(|(left, right)| left == right)
+    }
+
     pub(super) fn active_inventory(
         &self,
         instance_id: &str,
@@ -312,13 +318,6 @@ impl KnownGoodInventoryStore {
             .lock()
             .expect(STORE_LOCK_INVARIANT)
             .get(instance_id, version_id, &library_root)
-    }
-
-    pub(super) fn library_roots_match(left: &Path, right: &Path) -> bool {
-        normalize_library_root(left)
-            .ok()
-            .zip(normalize_library_root(right).ok())
-            .is_some_and(|(left, right)| left == right)
     }
 
     pub(super) fn deactivate_exact(
@@ -757,7 +756,6 @@ impl From<&KnownGoodIntegrity> for KnownGoodIntegritySnapshot {
                 digest: digest.as_str().to_string(),
                 size: *size,
             },
-            KnownGoodIntegrity::StructuralJar { size } => Self::StructuralJar { size: *size },
             KnownGoodIntegrity::ExactBytes { digest, size } => Self::ExactBytes {
                 digest: digest.as_str().to_string(),
                 size: *size,
@@ -813,13 +811,6 @@ impl KnownGoodEntrySnapshot {
         match &self.integrity {
             KnownGoodIntegritySnapshot::Sha1 { digest, .. }
             | KnownGoodIntegritySnapshot::ExactBytes { digest, .. } => validate_digest(digest)?,
-            KnownGoodIntegritySnapshot::StructuralJar { .. } => {
-                if !self.path.to_ascii_lowercase().ends_with(".jar") {
-                    return Err(invalid_snapshot(
-                        "structural known-good artifact is not a jar",
-                    ));
-                }
-            }
             KnownGoodIntegritySnapshot::LinkTarget { target } => {
                 validate_link_target(&self.path, target)?;
             }
@@ -888,11 +879,7 @@ fn integrity_kind_compatible(
             matches!(integrity, KnownGoodIntegritySnapshot::Sha1 { .. })
         }
         KnownGoodArtifactKindSnapshot::Library | KnownGoodArtifactKindSnapshot::NativeLibrary => {
-            matches!(
-                integrity,
-                KnownGoodIntegritySnapshot::Sha1 { .. }
-                    | KnownGoodIntegritySnapshot::StructuralJar { .. }
-            )
+            matches!(integrity, KnownGoodIntegritySnapshot::Sha1 { .. })
         }
         KnownGoodArtifactKindSnapshot::LoaderMetadata
         | KnownGoodArtifactKindSnapshot::RuntimeManifestProof
@@ -1168,6 +1155,7 @@ mod tests {
 
     #[test]
     fn strict_schema_rejects_unknown_fields_and_invalid_contracts() {
+        assert_eq!(KNOWN_GOOD_SCHEMA, "axial.state.known_good_inventory.v2");
         let mut value =
             serde_json::to_value(snapshot("0000000000000001", "1.21.5")).expect("snapshot value");
         value["extra"] = serde_json::json!(true);
@@ -1180,6 +1168,18 @@ mod tests {
         let mut duplicate = snapshot("0000000000000001", "1.21.5");
         duplicate.entries.push(duplicate.entries[0].clone());
         assert!(duplicate.validate().is_err());
+
+        let mut v1 = snapshot("0000000000000001", "1.21.5");
+        v1.schema = "axial.state.known_good_inventory.v1".to_string();
+        assert!(v1.validate().is_err());
+
+        let mut structural =
+            serde_json::to_value(snapshot("0000000000000001", "1.21.5")).expect("snapshot value");
+        structural["entries"][0]["kind"] = serde_json::json!("library");
+        structural["entries"][0]["root"] = serde_json::json!({ "kind": "libraries" });
+        structural["entries"][0]["integrity"] =
+            serde_json::json!({ "kind": "structural_jar", "size": 42 });
+        assert!(serde_json::from_value::<KnownGoodSnapshot>(structural).is_err());
     }
 
     #[test]
@@ -1270,7 +1270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_corrupt_and_stale_snapshots_are_replaced_without_warning_state() {
+    async fn missing_corrupt_v1_and_stale_snapshots_are_replaced_without_warning_state() {
         let (root, paths) = paths("replace");
         let backend = FileBackend::new(0);
         let store = store(&paths, backend.clone());
@@ -1289,6 +1289,16 @@ mod tests {
             .expect("reconcile corrupt snapshot");
         store.flush_for_test().await.expect("flush corrupt rebuild");
 
+        let mut v1 = current.clone();
+        v1.schema = "axial.state.known_good_inventory.v1".to_string();
+        fs::write(&path, serde_json::to_vec(&v1).expect("v1 bytes")).expect("v1 snapshot");
+        assert_eq!(read_snapshot(&path).expect("read v1 snapshot"), None);
+        store
+            .reconcile_snapshot(current.clone())
+            .await
+            .expect("reconcile v1 snapshot");
+        store.flush_for_test().await.expect("flush v1 rebuild");
+
         let stale = snapshot(&current.instance_id, "1.21.4");
         fs::write(&path, encode_snapshot(stale).expect("stale bytes")).expect("stale snapshot");
         store
@@ -1297,7 +1307,7 @@ mod tests {
             .expect("reconcile stale snapshot");
         store.flush_for_test().await.expect("flush stale rebuild");
         assert_eq!(read_snapshot(&path).expect("read rebuilt"), Some(current));
-        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 4);
         drop(store);
         let _ = fs::remove_dir_all(root);
     }
@@ -1332,20 +1342,16 @@ mod tests {
         let current = snapshot("0000000000000002", "1.21.5");
         let snapshot_root = paths.config_dir.join("state").join(KNOWN_GOOD_DIR);
         fs::create_dir_all(&snapshot_root).expect("snapshot root");
-        fs::write(
-            snapshot_root.join(format!("{}.json", current.instance_id)),
-            encode_snapshot(current.clone()).expect("snapshot bytes"),
-        )
-        .expect("seed snapshot");
+        let path = snapshot_root.join(format!("{}.json", current.instance_id));
+        let bytes = encode_snapshot(current).expect("snapshot bytes");
+        fs::write(&path, &bytes).expect("seed snapshot");
 
-        let store = store(&paths, backend);
+        let store = store(&paths, backend.clone());
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(path).expect("read untouched snapshot"), bytes);
         assert!(
             store
-                .active_inventory(
-                    &current.instance_id,
-                    &current.version_id,
-                    &paths.library_dir,
-                )
+                .active_inventory("0000000000000002", "1.21.5", &paths.library_dir,)
                 .is_none()
         );
         drop(store);

@@ -35,16 +35,8 @@ pub struct LibraryVerificationPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StructuralLibraryVerification {
-    pub(crate) minecraft_root: PathBuf,
-    pub(crate) relative_path: ArtifactRelativePath,
-    pub(crate) expected_size: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibraryVerificationIntegrity {
     Sha1(ExpectedIntegrity),
-    StructuralJar(StructuralLibraryVerification),
     MissingChecksum,
 }
 
@@ -58,26 +50,9 @@ pub(crate) struct LibraryArtifactPlan {
 }
 
 impl LibraryArtifactPlan {
-    fn into_verification_plan(
-        self,
-        mc_dir: &Path,
-        known_good: Option<&crate::known_good::KnownGoodInventoryAuthority>,
-    ) -> LibraryVerificationPlan {
+    fn into_verification_plan(self, mc_dir: &Path) -> LibraryVerificationPlan {
         let integrity = if self.expected.sha1.is_some() {
             LibraryVerificationIntegrity::Sha1(self.expected.clone())
-        } else if let Some(managed_root) = known_good.and_then(|inventory| {
-            inventory.authorizes_structural_library(
-                mc_dir,
-                &self.relative_path,
-                self.is_native,
-                self.expected.size,
-            )
-        }) {
-            LibraryVerificationIntegrity::StructuralJar(StructuralLibraryVerification {
-                minecraft_root: managed_root,
-                relative_path: self.relative_path.clone(),
-                expected_size: self.expected.size,
-            })
         } else {
             LibraryVerificationIntegrity::MissingChecksum
         };
@@ -564,11 +539,10 @@ pub fn library_verification_plans_for(
     mc_dir: &Path,
     libraries: &[Library],
     env: &Environment,
-    known_good: Option<&crate::known_good::KnownGoodInventoryAuthority>,
 ) -> Result<Vec<LibraryVerificationPlan>, LibraryPlanError> {
     Ok(library_artifact_plans_for(libraries, env)?
         .into_iter()
-        .map(|plan| plan.into_verification_plan(mc_dir, known_good))
+        .map(|plan| plan.into_verification_plan(mc_dir))
         .collect())
 }
 

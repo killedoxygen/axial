@@ -25,7 +25,6 @@ use super::transfer::{
     fetch_verified_selected_artifact_bytes_with_retry_delays_for_test, remove_stale_download_temp,
 };
 use super::*;
-use crate::artifact_path::ArtifactRelativePath;
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
 use crate::manifest::VersionManifest;
 use crate::paths::versions_dir;
@@ -43,100 +42,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Duration, timeout};
-
-#[test]
-fn structural_library_verification_accepts_only_managed_unsymlinked_paths() {
-    let root = temp_dir("structural-library-path");
-    let relative_path = ArtifactRelativePath::new("com/example/test.jar").expect("safe path");
-    let path = root.join("libraries").join(relative_path.as_str());
-    fs::create_dir_all(path.parent().expect("library parent")).expect("library parent");
-    let bytes = structural_test_jar();
-    fs::write(&path, &bytes).expect("library jar");
-    let verification = StructuralLibraryVerification {
-        minecraft_root: root.clone(),
-        relative_path,
-        expected_size: Some(bytes.len() as u64),
-    };
-
-    assert_eq!(
-        verify_existing_structural_library_metadata(&verification),
-        LauncherManagedArtifactReadiness::Verified
-    );
-    assert_eq!(
-        verify_existing_structural_library(&verification),
-        LauncherManagedArtifactReadiness::Verified
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[cfg(unix)]
-#[test]
-fn structural_library_verification_rejects_root_intermediate_and_final_symlinks() {
-    use std::os::unix::fs::symlink;
-
-    let outside = temp_dir("structural-library-outside");
-    let outside_jar = outside.join("test.jar");
-    fs::create_dir_all(&outside).expect("outside directory");
-    fs::write(&outside_jar, structural_test_jar()).expect("outside jar");
-
-    let real_root = temp_dir("structural-library-real-root");
-    let linked_root = temp_dir("structural-library-linked-root");
-    fs::create_dir_all(real_root.join("libraries/com/example")).expect("real root");
-    fs::copy(
-        &outside_jar,
-        real_root.join("libraries/com/example/test.jar"),
-    )
-    .expect("real root jar");
-    symlink(&real_root, &linked_root).expect("root symlink");
-    assert_structural_path_is_unsupported(&linked_root, "com/example/test.jar");
-
-    let intermediate_root = temp_dir("structural-library-intermediate-link");
-    fs::create_dir_all(intermediate_root.join("libraries/com")).expect("intermediate root");
-    symlink(&outside, intermediate_root.join("libraries/com/example"))
-        .expect("intermediate symlink");
-    assert_structural_path_is_unsupported(&intermediate_root, "com/example/test.jar");
-
-    let final_root = temp_dir("structural-library-final-link");
-    fs::create_dir_all(final_root.join("libraries/com/example")).expect("final root");
-    symlink(
-        &outside_jar,
-        final_root.join("libraries/com/example/test.jar"),
-    )
-    .expect("final symlink");
-    assert_structural_path_is_unsupported(&final_root, "com/example/test.jar");
-
-    let _ = fs::remove_file(linked_root);
-    let _ = fs::remove_dir_all(real_root);
-    let _ = fs::remove_dir_all(intermediate_root);
-    let _ = fs::remove_dir_all(final_root);
-    let _ = fs::remove_dir_all(outside);
-}
-
-#[cfg(unix)]
-fn assert_structural_path_is_unsupported(root: &Path, relative_path: &str) {
-    let verification = StructuralLibraryVerification {
-        minecraft_root: root.to_path_buf(),
-        relative_path: ArtifactRelativePath::new(relative_path).expect("safe path"),
-        expected_size: None,
-    };
-    assert_eq!(
-        verify_existing_structural_library(&verification),
-        LauncherManagedArtifactReadiness::UnsupportedExisting
-    );
-}
-
-fn structural_test_jar() -> Vec<u8> {
-    let cursor = std::io::Cursor::new(Vec::new());
-    let mut archive = zip::ZipWriter::new(cursor);
-    archive
-        .start_file(
-            "example/Entry.class",
-            zip::write::SimpleFileOptions::default(),
-        )
-        .expect("start jar entry");
-    std::io::Write::write_all(&mut archive, b"entry").expect("write jar entry");
-    archive.finish().expect("finish jar").into_inner()
-}
 
 #[tokio::test]
 async fn install_version_emits_terminal_error_when_setup_fails() {
@@ -723,7 +628,6 @@ fn library_planning_rejects_unsafe_applicable_path() {
         Path::new("/tmp/axial-test"),
         &[lib],
         &crate::rules::default_environment(),
-        None,
     )
     .expect_err("unsafe path");
 
@@ -757,7 +661,6 @@ fn url_less_library_is_inventory_and_verification_visible_but_not_downloadable()
         Path::new("/tmp/axial-test"),
         std::slice::from_ref(&lib),
         &env,
-        None,
     )
     .expect("verification plan");
     assert_eq!(verification_plans.len(), 1);
@@ -1114,7 +1017,7 @@ async fn checksumless_proof_rejects_temp_path_substitution_after_handle_validati
     let root = temp_dir("checksumless-temp-identity-race");
     fs::create_dir_all(&root).expect("create root");
     let destination = root.join("artifact.jar");
-    let body = structural_test_jar();
+    let body = checksumless_test_jar();
     let url = spawn_download_response_server(
         "200 OK",
         vec![(
@@ -1134,7 +1037,7 @@ async fn checksumless_proof_rejects_temp_path_substitution_after_handle_validati
         execute_download_to_temp_with_pre_promote_hook(&client, request, |temp, _destination| {
             let retained = temp.with_extension("validated-retained");
             fs::rename(temp, retained).expect("substitute validated temp path");
-            fs::write(temp, structural_test_jar()).expect("write replacement temp");
+            fs::write(temp, checksumless_test_jar()).expect("write replacement temp");
         })
         .await
         .expect_err("replacement pathname cannot consume validated authority");
@@ -1142,6 +1045,19 @@ async fn checksumless_proof_rejects_temp_path_substitution_after_handle_validati
     assert_eq!(error.kind, ExecutionDownloadFactKind::PromoteFailed);
     assert!(!destination.exists());
     let _ = fs::remove_dir_all(root);
+}
+
+fn checksumless_test_jar() -> Vec<u8> {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut archive = zip::ZipWriter::new(cursor);
+    archive
+        .start_file(
+            "example/Entry.class",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .expect("start jar entry");
+    std::io::Write::write_all(&mut archive, b"entry").expect("write jar entry");
+    archive.finish().expect("finish jar").into_inner()
 }
 
 #[tokio::test]
