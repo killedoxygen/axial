@@ -1,7 +1,4 @@
-use super::rules::{
-    ActionEligibility, DestructiveMutationRisk, JournalRequirement, OwnershipRequirement,
-    RedactionRequirement, RetryLoopSensitivity, UserIntentSensitivity, rule_order,
-};
+use super::rules::rule_order;
 use super::{
     ActionPlanPrerequisite, Diagnosis, GuardianAction, GuardianActionKind, GuardianActionPlan,
     GuardianDecision, GuardianMode, GuardianSeverity, SafetyCase,
@@ -60,55 +57,90 @@ struct SelectedPolicyAction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CandidateRejection {
-    HardInvariant,
-    Mode,
-    Suppression,
+enum PolicyRejection {
+    PublicRedactionUnavailable,
+    JournalUnavailable,
+    ProtectedOwnershipMutation,
+    ExplicitUserIntent,
+    CustomRepairOwnership,
+    ActionUnavailableInMode,
+    UnknownOwnershipIntervention,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct PolicyReasoningInput {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModeActionPermission {
+    Always,
+    CustomRepair,
+    CustomAttempt,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ModeActionRule {
     action: GuardianActionKind,
-    ownership: OwnershipClass,
-    ownership_requirement: OwnershipRequirement,
-    public_redaction_required: bool,
-    journal_required: bool,
-    destructive_mutation: bool,
-    retry_loop_sensitive: bool,
-    user_intent_sensitive: bool,
+    permission: ModeActionPermission,
 }
 
-impl PolicyReasoningInput {
-    fn public_redaction_blocked(self, context: GuardianPolicyContext) -> bool {
-        self.public_redaction_required && !context.public_redaction_ready
-    }
+const MANAGED_MODE_ACTIONS: [ModeActionRule; 11] = [
+    mode_action(GuardianActionKind::Allow, ModeActionPermission::Always),
+    mode_action(GuardianActionKind::Repair, ModeActionPermission::Always),
+    mode_action(GuardianActionKind::Fallback, ModeActionPermission::Always),
+    mode_action(GuardianActionKind::Strip, ModeActionPermission::Always),
+    mode_action(GuardianActionKind::Downgrade, ModeActionPermission::Always),
+    mode_action(GuardianActionKind::Retry, ModeActionPermission::Always),
+    mode_action(GuardianActionKind::Quarantine, ModeActionPermission::Always),
+    mode_action(GuardianActionKind::Warn, ModeActionPermission::Always),
+    mode_action(GuardianActionKind::AskUser, ModeActionPermission::Always),
+    mode_action(GuardianActionKind::RecordOnly, ModeActionPermission::Always),
+    mode_action(GuardianActionKind::Block, ModeActionPermission::Always),
+];
 
-    fn journal_blocked(self, context: GuardianPolicyContext) -> bool {
-        self.journal_required && !context.journal_available
-    }
+const CUSTOM_MODE_ACTIONS: [ModeActionRule; 11] = [
+    mode_action(GuardianActionKind::Allow, ModeActionPermission::Always),
+    mode_action(
+        GuardianActionKind::Repair,
+        ModeActionPermission::CustomRepair,
+    ),
+    mode_action(
+        GuardianActionKind::Fallback,
+        ModeActionPermission::CustomAttempt,
+    ),
+    mode_action(GuardianActionKind::Strip, ModeActionPermission::Unavailable),
+    mode_action(
+        GuardianActionKind::Downgrade,
+        ModeActionPermission::Unavailable,
+    ),
+    mode_action(
+        GuardianActionKind::Retry,
+        ModeActionPermission::CustomAttempt,
+    ),
+    mode_action(
+        GuardianActionKind::Quarantine,
+        ModeActionPermission::Unavailable,
+    ),
+    mode_action(GuardianActionKind::Warn, ModeActionPermission::Always),
+    mode_action(GuardianActionKind::AskUser, ModeActionPermission::Always),
+    mode_action(GuardianActionKind::RecordOnly, ModeActionPermission::Always),
+    mode_action(GuardianActionKind::Block, ModeActionPermission::Always),
+];
 
-    fn ownership_blocks_mutation(self) -> bool {
-        self.destructive_mutation
-            && matches!(
-                self.ownership,
-                OwnershipClass::UserOwned | OwnershipClass::Unknown
-            )
-    }
+const fn mode_action(
+    action: GuardianActionKind,
+    permission: ModeActionPermission,
+) -> ModeActionRule {
+    ModeActionRule { action, permission }
+}
 
-    fn suppression_blocks(self, context: GuardianPolicyContext) -> bool {
-        self.retry_loop_sensitive && context.suppression_active
+fn mode_actions(mode: GuardianMode) -> Option<&'static [ModeActionRule; 11]> {
+    match mode {
+        GuardianMode::Managed => Some(&MANAGED_MODE_ACTIONS),
+        GuardianMode::Custom => Some(&CUSTOM_MODE_ACTIONS),
+        GuardianMode::Disabled => None,
     }
+}
 
-    fn explicit_intent_blocks_automatic_change(self, context: GuardianPolicyContext) -> bool {
-        context.explicit_user_intent
-            && (self.user_intent_sensitive || action_changes_user_intent(self.action))
-    }
-
-    fn hard_invariant_rejects(self, context: GuardianPolicyContext) -> bool {
-        self.public_redaction_blocked(context)
-            || self.journal_blocked(context)
-            || self.ownership_blocks_mutation()
-    }
+fn public_boundary_rejection(context: GuardianPolicyContext) -> Option<PolicyRejection> {
+    (!context.public_redaction_ready).then_some(PolicyRejection::PublicRedactionUnavailable)
 }
 
 pub fn decide_guardian_policy(
@@ -121,7 +153,7 @@ pub fn decide_guardian_policy(
         .map(|diagnosis| diagnosis.id())
         .collect::<Vec<_>>();
 
-    if !context.public_redaction_ready {
+    if public_boundary_rejection(context).is_some() {
         return GuardianDecision {
             operation_id: safety_case.operation_id.clone(),
             mode: safety_case.mode,
@@ -141,15 +173,7 @@ pub fn decide_guardian_policy(
         };
     };
 
-    let Some(selection) = select_policy_action(safety_case.mode, diagnosis, context) else {
-        return GuardianDecision {
-            operation_id: safety_case.operation_id.clone(),
-            mode: safety_case.mode,
-            kind: GuardianActionKind::Block,
-            diagnoses,
-            action_plan: None,
-        };
-    };
+    let selection = select_policy_action(safety_case.mode, diagnosis, context);
     GuardianDecision {
         operation_id: safety_case.operation_id.clone(),
         mode: safety_case.mode,
@@ -177,47 +201,30 @@ fn strongest_diagnosis(diagnoses: &[Diagnosis]) -> Option<&Diagnosis> {
     })
 }
 
-fn policy_reasoning_input(
-    diagnosis: &Diagnosis,
-    action: GuardianActionKind,
-) -> PolicyReasoningInput {
-    let eligibility = diagnosis.eligibility();
-    PolicyReasoningInput {
-        action,
-        ownership: diagnosis.ownership(),
-        ownership_requirement: eligibility.ownership_requirement,
-        public_redaction_required: action_requires_public_redaction(eligibility),
-        journal_required: action_requires_journal(action, eligibility),
-        destructive_mutation: action_is_destructive_mutation(action, eligibility),
-        retry_loop_sensitive: action_is_retry_loop_sensitive(action, eligibility),
-        user_intent_sensitive: action_is_user_intent_sensitive(eligibility),
-    }
-}
-
 fn select_policy_action(
     mode: GuardianMode,
     diagnosis: &Diagnosis,
     context: GuardianPolicyContext,
-) -> Option<SelectedPolicyAction> {
+) -> SelectedPolicyAction {
     let prerequisite = public_safe_prerequisite(diagnosis.action_prerequisite());
 
-    if mode == GuardianMode::Disabled {
-        return Some(SelectedPolicyAction {
+    let Some(mode_actions) = mode_actions(mode) else {
+        return SelectedPolicyAction {
             kind: disabled_mode_action(diagnosis, context),
             prerequisite,
-        });
-    }
+        };
+    };
 
     if context.suppression_active
         && diagnosis
             .candidate_actions()
             .iter()
-            .any(|action| policy_reasoning_input(diagnosis, *action).retry_loop_sensitive)
+            .any(|action| action_is_retry_loop_sensitive(*action))
     {
-        return Some(SelectedPolicyAction {
-            kind: suppression_fallback_action(diagnosis),
+        return SelectedPolicyAction {
+            kind: GuardianActionKind::Block,
             prerequisite,
-        });
+        };
     }
 
     if (diagnosis.severity() == GuardianSeverity::Info
@@ -226,61 +233,28 @@ fn select_policy_action(
             .candidate_actions()
             .contains(&GuardianActionKind::RecordOnly)
     {
-        return Some(SelectedPolicyAction {
+        return SelectedPolicyAction {
             kind: GuardianActionKind::RecordOnly,
             prerequisite,
-        });
+        };
     }
 
-    let mut saw_hard_rejection = false;
-    let mut saw_suppression = false;
-    let mut candidates = diagnosis.candidate_actions().to_vec();
-    candidates.sort_by_key(|action| action_rank(mode, *action));
-
-    for action in candidates {
-        match reject_candidate(mode, diagnosis, action, context) {
-            None => {
-                if diagnosis.ownership() == OwnershipClass::Unknown
-                    && action_changes_user_intent(action)
-                {
-                    continue;
-                }
-                return Some(SelectedPolicyAction {
-                    kind: action,
-                    prerequisite,
-                });
-            }
-            Some(CandidateRejection::HardInvariant) => saw_hard_rejection = true,
-            Some(CandidateRejection::Suppression) => saw_suppression = true,
-            Some(CandidateRejection::Mode) => {}
+    for rule in mode_actions {
+        if !diagnosis.candidate_actions().contains(&rule.action) {
+            continue;
+        }
+        if reject_candidate(*rule, diagnosis, context).is_ok() {
+            return SelectedPolicyAction {
+                kind: rule.action,
+                prerequisite,
+            };
         }
     }
 
-    let fallback = if saw_hard_rejection || saw_suppression {
-        GuardianActionKind::Block
-    } else if diagnosis
-        .candidate_actions()
-        .contains(&GuardianActionKind::AskUser)
-    {
-        GuardianActionKind::AskUser
-    } else if diagnosis
-        .candidate_actions()
-        .contains(&GuardianActionKind::Warn)
-    {
-        GuardianActionKind::Warn
-    } else if diagnosis
-        .candidate_actions()
-        .contains(&GuardianActionKind::RecordOnly)
-    {
-        GuardianActionKind::RecordOnly
-    } else {
-        GuardianActionKind::Block
-    };
-
-    Some(SelectedPolicyAction {
-        kind: fallback,
+    SelectedPolicyAction {
+        kind: GuardianActionKind::Block,
         prerequisite,
-    })
+    }
 }
 
 fn public_safe_prerequisite(prerequisite: ActionPlanPrerequisite) -> ActionPlanPrerequisite {
@@ -313,171 +287,76 @@ fn disabled_mode_action(
     diagnosis: &Diagnosis,
     context: GuardianPolicyContext,
 ) -> GuardianActionKind {
-    if !context.public_redaction_ready
-        || matches!(
-            diagnosis.severity(),
-            GuardianSeverity::Blocking | GuardianSeverity::Critical
-        )
-        || diagnosis
-            .candidate_actions()
-            .iter()
-            .any(|action| hard_invariant_rejects(diagnosis, *action, context))
+    if matches!(
+        diagnosis.severity(),
+        GuardianSeverity::Blocking | GuardianSeverity::Critical
+    ) || diagnosis
+        .candidate_actions()
+        .iter()
+        .any(|action| hard_invariant_rejection(diagnosis, *action, context).is_some())
     {
         GuardianActionKind::Block
-    } else {
-        GuardianActionKind::RecordOnly
-    }
-}
-
-fn suppression_fallback_action(diagnosis: &Diagnosis) -> GuardianActionKind {
-    if diagnosis
-        .candidate_actions()
-        .contains(&GuardianActionKind::Block)
-    {
-        GuardianActionKind::Block
-    } else if diagnosis
-        .candidate_actions()
-        .contains(&GuardianActionKind::AskUser)
-    {
-        GuardianActionKind::AskUser
-    } else if diagnosis
-        .candidate_actions()
-        .contains(&GuardianActionKind::Warn)
-    {
-        GuardianActionKind::Warn
     } else {
         GuardianActionKind::RecordOnly
     }
 }
 
 fn reject_candidate(
-    mode: GuardianMode,
+    rule: ModeActionRule,
+    diagnosis: &Diagnosis,
+    context: GuardianPolicyContext,
+) -> Result<(), PolicyRejection> {
+    if let Some(rejection) = hard_invariant_rejection(diagnosis, rule.action, context) {
+        return Err(rejection);
+    }
+    match rule.permission {
+        ModeActionPermission::Always => {}
+        ModeActionPermission::CustomRepair => {
+            if context.explicit_user_intent {
+                return Err(PolicyRejection::ExplicitUserIntent);
+            }
+            if !matches!(
+                diagnosis.ownership(),
+                OwnershipClass::LauncherManaged | OwnershipClass::CompositionManaged
+            ) {
+                return Err(PolicyRejection::CustomRepairOwnership);
+            }
+        }
+        ModeActionPermission::CustomAttempt => {
+            if context.explicit_user_intent {
+                return Err(PolicyRejection::ExplicitUserIntent);
+            }
+        }
+        ModeActionPermission::Unavailable => {
+            return Err(PolicyRejection::ActionUnavailableInMode);
+        }
+    }
+    if diagnosis.ownership() == OwnershipClass::Unknown && action_is_intervention(rule.action) {
+        return Err(PolicyRejection::UnknownOwnershipIntervention);
+    }
+    Ok(())
+}
+
+fn hard_invariant_rejection(
     diagnosis: &Diagnosis,
     action: GuardianActionKind,
     context: GuardianPolicyContext,
-) -> Option<CandidateRejection> {
-    if hard_invariant_rejects(diagnosis, action, context) {
-        return Some(CandidateRejection::HardInvariant);
+) -> Option<PolicyRejection> {
+    if action_is_intervention(action) && !context.journal_available {
+        return Some(PolicyRejection::JournalUnavailable);
     }
-    if policy_reasoning_input(diagnosis, action).suppression_blocks(context) {
-        return Some(CandidateRejection::Suppression);
-    }
-    if mode_permission(
-        mode,
-        diagnosis,
-        action,
-        context,
-        policy_reasoning_input(diagnosis, action),
-    ) == 0.0
+    if action_is_destructive_mutation(action)
+        && matches!(
+            diagnosis.ownership(),
+            OwnershipClass::UserOwned | OwnershipClass::Unknown
+        )
     {
-        return Some(CandidateRejection::Mode);
+        return Some(PolicyRejection::ProtectedOwnershipMutation);
     }
     None
 }
 
-fn hard_invariant_rejects(
-    diagnosis: &Diagnosis,
-    action: GuardianActionKind,
-    context: GuardianPolicyContext,
-) -> bool {
-    policy_reasoning_input(diagnosis, action).hard_invariant_rejects(context)
-}
-
-fn mode_permission(
-    mode: GuardianMode,
-    diagnosis: &Diagnosis,
-    action: GuardianActionKind,
-    context: GuardianPolicyContext,
-    reasoning: PolicyReasoningInput,
-) -> f32 {
-    match mode {
-        GuardianMode::Managed => 1.0,
-        GuardianMode::Custom => custom_mode_permission(diagnosis, action, context, reasoning),
-        GuardianMode::Disabled => {
-            if matches!(
-                action,
-                GuardianActionKind::Allow
-                    | GuardianActionKind::RecordOnly
-                    | GuardianActionKind::Block
-            ) {
-                1.0
-            } else {
-                0.0
-            }
-        }
-    }
-}
-
-fn custom_mode_permission(
-    diagnosis: &Diagnosis,
-    action: GuardianActionKind,
-    context: GuardianPolicyContext,
-    reasoning: PolicyReasoningInput,
-) -> f32 {
-    match action {
-        GuardianActionKind::Allow
-        | GuardianActionKind::Warn
-        | GuardianActionKind::AskUser
-        | GuardianActionKind::Block
-        | GuardianActionKind::RecordOnly => 1.0,
-        GuardianActionKind::Repair => {
-            if !reasoning.explicit_intent_blocks_automatic_change(context)
-                && matches!(
-                    diagnosis.ownership(),
-                    OwnershipClass::LauncherManaged | OwnershipClass::CompositionManaged
-                )
-            {
-                0.85
-            } else {
-                0.0
-            }
-        }
-        GuardianActionKind::Fallback => {
-            if !reasoning.explicit_intent_blocks_automatic_change(context) {
-                0.75
-            } else {
-                0.0
-            }
-        }
-        GuardianActionKind::Retry => {
-            if !reasoning.explicit_intent_blocks_automatic_change(context) {
-                0.65
-            } else {
-                0.0
-            }
-        }
-        GuardianActionKind::Strip
-        | GuardianActionKind::Downgrade
-        | GuardianActionKind::Quarantine => 0.0,
-    }
-}
-
-fn action_rank(mode: GuardianMode, action: GuardianActionKind) -> u8 {
-    if mode == GuardianMode::Disabled {
-        return match action {
-            GuardianActionKind::RecordOnly => 0,
-            GuardianActionKind::Block => 1,
-            GuardianActionKind::Allow => 2,
-            _ => 100,
-        };
-    }
-
-    match action {
-        GuardianActionKind::Allow => 0,
-        GuardianActionKind::Repair => 20,
-        GuardianActionKind::Fallback => 25,
-        GuardianActionKind::Strip => 35,
-        GuardianActionKind::Downgrade => 40,
-        GuardianActionKind::Retry => 45,
-        GuardianActionKind::Quarantine => 50,
-        GuardianActionKind::Warn => 70,
-        GuardianActionKind::AskUser => 80,
-        GuardianActionKind::RecordOnly => 90,
-        GuardianActionKind::Block => 100,
-    }
-}
-
-fn requires_journal(action: GuardianActionKind) -> bool {
+fn action_is_intervention(action: GuardianActionKind) -> bool {
     matches!(
         action,
         GuardianActionKind::Repair
@@ -489,103 +368,27 @@ fn requires_journal(action: GuardianActionKind) -> bool {
     )
 }
 
-fn action_requires_public_redaction(eligibility: ActionEligibility) -> bool {
-    matches!(
-        eligibility.redaction_requirement,
-        RedactionRequirement::PublicOutcome
-    )
-}
-
-fn action_requires_journal(action: GuardianActionKind, eligibility: ActionEligibility) -> bool {
-    let eligibility_requires = match eligibility.journal_requirement {
-        JournalRequirement::None => false,
-        JournalRequirement::RequiredForAttemptAction => is_attempt_action(action),
-        JournalRequirement::RequiredForManagedMutation => is_managed_mutation_action(action),
-    };
-    eligibility_requires || requires_journal(action)
-}
-
-fn is_destructive_mutation(action: GuardianActionKind) -> bool {
+fn action_is_destructive_mutation(action: GuardianActionKind) -> bool {
     matches!(
         action,
         GuardianActionKind::Repair | GuardianActionKind::Quarantine
     )
 }
 
-fn action_is_destructive_mutation(
-    action: GuardianActionKind,
-    eligibility: ActionEligibility,
-) -> bool {
-    let eligibility_marks_destructive = match eligibility.destructive_mutation_risk {
-        DestructiveMutationRisk::None => false,
-        DestructiveMutationRisk::ManagedMutation
-        | DestructiveMutationRisk::UserOrUnknownProtected => is_managed_mutation_action(action),
-    };
-    eligibility_marks_destructive || is_destructive_mutation(action)
-}
-
-fn is_loopable_action(action: GuardianActionKind) -> bool {
+fn action_is_retry_loop_sensitive(action: GuardianActionKind) -> bool {
     matches!(
         action,
         GuardianActionKind::Retry | GuardianActionKind::Repair
     )
 }
 
-fn action_is_retry_loop_sensitive(
-    action: GuardianActionKind,
-    eligibility: ActionEligibility,
-) -> bool {
-    let eligibility_marks_loop_sensitive = match eligibility.retry_loop_sensitivity {
-        RetryLoopSensitivity::None | RetryLoopSensitivity::OneAttemptOverride => false,
-        RetryLoopSensitivity::RepairAttempt => action == GuardianActionKind::Repair,
-        RetryLoopSensitivity::ProviderRetry => action == GuardianActionKind::Retry,
-        RetryLoopSensitivity::RepeatedFailureMemory => is_loopable_action(action),
-    };
-    eligibility_marks_loop_sensitive || is_loopable_action(action)
-}
-
-fn action_is_user_intent_sensitive(eligibility: ActionEligibility) -> bool {
-    !matches!(
-        eligibility.user_intent_sensitivity,
-        UserIntentSensitivity::None
-    )
-}
-
-fn action_changes_user_intent(action: GuardianActionKind) -> bool {
-    matches!(
-        action,
-        GuardianActionKind::Repair
-            | GuardianActionKind::Retry
-            | GuardianActionKind::Strip
-            | GuardianActionKind::Downgrade
-            | GuardianActionKind::Fallback
-            | GuardianActionKind::Quarantine
-    )
-}
-
-fn is_attempt_action(action: GuardianActionKind) -> bool {
-    matches!(
-        action,
-        GuardianActionKind::Retry
-            | GuardianActionKind::Strip
-            | GuardianActionKind::Downgrade
-            | GuardianActionKind::Fallback
-    )
-}
-
-fn is_managed_mutation_action(action: GuardianActionKind) -> bool {
-    matches!(
-        action,
-        GuardianActionKind::Repair | GuardianActionKind::Quarantine
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardianPolicyContext, decide_guardian_policy, policy_reasoning_input, strongest_diagnosis,
+        GuardianPolicyContext, ModeActionPermission, PolicyRejection, action_is_intervention,
+        decide_guardian_policy, mode_actions, public_boundary_rejection, reject_candidate,
+        strongest_diagnosis,
     };
-    use crate::guardian::rules::OwnershipRequirement;
     use crate::guardian::{
         Diagnosis, DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence,
         GuardianDomain, GuardianFact, GuardianFactId, GuardianMode, GuardianSeverity, SafetyCase,
@@ -1097,151 +900,348 @@ mod tests {
     }
 
     #[test]
-    fn policy_reasoning_consumes_rule_eligibility_inputs() {
-        let diagnosis = rule_diagnosis(
-            GuardianFactId::JvmArgsParseFailed,
-            GuardianDomain::Jvm,
-            OperationPhase::Validating,
-            OwnershipClass::UserOwned,
-        );
+    fn mode_action_rules_are_total_and_encode_action_preference() {
+        let expected_order = [
+            GuardianActionKind::Allow,
+            GuardianActionKind::Repair,
+            GuardianActionKind::Fallback,
+            GuardianActionKind::Strip,
+            GuardianActionKind::Downgrade,
+            GuardianActionKind::Retry,
+            GuardianActionKind::Quarantine,
+            GuardianActionKind::Warn,
+            GuardianActionKind::AskUser,
+            GuardianActionKind::RecordOnly,
+            GuardianActionKind::Block,
+        ];
 
-        let reasoning = policy_reasoning_input(&diagnosis, GuardianActionKind::Strip);
-
-        assert_eq!(
-            reasoning.ownership_requirement,
-            OwnershipRequirement::Classified
-        );
-        assert!(reasoning.public_redaction_required);
-        assert!(reasoning.journal_required);
-        assert!(!reasoning.destructive_mutation);
-        assert!(!reasoning.retry_loop_sensitive);
-        assert!(reasoning.user_intent_sensitive);
-        assert!(reasoning.public_redaction_blocked(
-            GuardianPolicyContext::current_operation().with_unredacted_public_boundary()
-        ));
+        for mode in [GuardianMode::Managed, GuardianMode::Custom] {
+            let rules = mode_actions(mode).expect("active mode action rules");
+            assert_eq!(rules.map(|rule| rule.action), expected_order, "{mode:?}");
+            let expected_permissions = match mode {
+                GuardianMode::Managed => [ModeActionPermission::Always; 11],
+                GuardianMode::Custom => [
+                    ModeActionPermission::Always,
+                    ModeActionPermission::CustomRepair,
+                    ModeActionPermission::CustomAttempt,
+                    ModeActionPermission::Unavailable,
+                    ModeActionPermission::Unavailable,
+                    ModeActionPermission::CustomAttempt,
+                    ModeActionPermission::Unavailable,
+                    ModeActionPermission::Always,
+                    ModeActionPermission::Always,
+                    ModeActionPermission::Always,
+                    ModeActionPermission::Always,
+                ],
+                GuardianMode::Disabled => unreachable!("Disabled has a disposition rule"),
+            };
+            assert_eq!(
+                rules.map(|rule| rule.permission),
+                expected_permissions,
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]
-    fn rule_policy_reasoning_truth_table_covers_hard_constraint_inputs() {
-        struct Case {
-            fact_id: GuardianFactId,
-            domain: GuardianDomain,
-            phase: OperationPhase,
-            ownership: OwnershipClass,
-            action: GuardianActionKind,
-            ownership_requirement: OwnershipRequirement,
-            journal_required: bool,
-            destructive_mutation: bool,
-            retry_loop_sensitive: bool,
-            user_intent_sensitive: bool,
-        }
-
-        let cases = [
-            Case {
-                fact_id: GuardianFactId::ManagedRuntimeReadyMarkerMissing,
-                domain: GuardianDomain::Runtime,
-                phase: OperationPhase::Preparing,
-                ownership: OwnershipClass::LauncherManaged,
-                action: GuardianActionKind::Repair,
-                ownership_requirement: OwnershipRequirement::LauncherManaged,
-                journal_required: true,
-                destructive_mutation: true,
-                retry_loop_sensitive: true,
-                user_intent_sensitive: false,
-            },
-            Case {
-                fact_id: GuardianFactId::ArtifactChecksumMismatch,
-                domain: GuardianDomain::Install,
-                phase: OperationPhase::Downloading,
-                ownership: OwnershipClass::UserOwned,
-                action: GuardianActionKind::Repair,
-                ownership_requirement: OwnershipRequirement::LauncherManaged,
-                journal_required: true,
-                destructive_mutation: true,
-                retry_loop_sensitive: true,
-                user_intent_sensitive: false,
-            },
-            Case {
-                fact_id: GuardianFactId::DownloadProviderUnavailable,
-                domain: GuardianDomain::Download,
-                phase: OperationPhase::Downloading,
-                ownership: OwnershipClass::ExternalProviderDerived,
-                action: GuardianActionKind::Retry,
-                ownership_requirement: OwnershipRequirement::Classified,
-                journal_required: true,
-                destructive_mutation: false,
-                retry_loop_sensitive: true,
-                user_intent_sensitive: false,
-            },
-            Case {
-                fact_id: GuardianFactId::PerformanceUserOwnedConflict,
-                domain: GuardianDomain::Performance,
-                phase: OperationPhase::Planning,
-                ownership: OwnershipClass::UserOwned,
-                action: GuardianActionKind::AskUser,
-                ownership_requirement: OwnershipRequirement::UserOrUnknownProtected,
-                journal_required: false,
-                destructive_mutation: false,
-                retry_loop_sensitive: false,
-                user_intent_sensitive: true,
-            },
-            Case {
-                fact_id: GuardianFactId::ExitCodeZero,
-                domain: GuardianDomain::Session,
-                phase: OperationPhase::Running,
-                ownership: OwnershipClass::LauncherManaged,
-                action: GuardianActionKind::RecordOnly,
-                ownership_requirement: OwnershipRequirement::None,
-                journal_required: false,
-                destructive_mutation: false,
-                retry_loop_sensitive: false,
-                user_intent_sensitive: false,
-            },
+    fn mode_action_ownership_context_truth_table_has_typed_rejections() {
+        let ownerships = [
+            OwnershipClass::LauncherManaged,
+            OwnershipClass::CompositionManaged,
+            OwnershipClass::UserOwned,
+            OwnershipClass::ExternalProviderDerived,
+            OwnershipClass::Unknown,
         ];
 
-        for case in cases {
-            let diagnosis = rule_diagnosis(case.fact_id, case.domain, case.phase, case.ownership);
-            let reasoning = policy_reasoning_input(&diagnosis, case.action);
-
-            assert_eq!(
-                reasoning.ownership_requirement,
-                case.ownership_requirement,
-                "{}",
-                case.fact_id.as_str()
-            );
-            assert_eq!(
-                reasoning.journal_required,
-                case.journal_required,
-                "{}",
-                case.fact_id.as_str()
-            );
-            assert_eq!(
-                reasoning.destructive_mutation,
-                case.destructive_mutation,
-                "{}",
-                case.fact_id.as_str()
-            );
-            assert_eq!(
-                reasoning.retry_loop_sensitive,
-                case.retry_loop_sensitive,
-                "{}",
-                case.fact_id.as_str()
-            );
-            assert_eq!(
-                reasoning.user_intent_sensitive,
-                case.user_intent_sensitive,
-                "{}",
-                case.fact_id.as_str()
-            );
-            assert_eq!(
-                reasoning.journal_blocked(
-                    GuardianPolicyContext::current_operation().with_missing_journal()
-                ),
-                case.journal_required,
-                "{}",
-                case.fact_id.as_str()
-            );
+        for mode in [GuardianMode::Managed, GuardianMode::Custom] {
+            for ownership in ownerships {
+                let diagnosis = rule_diagnosis(
+                    GuardianFactId::CustomJavaOverridePresent,
+                    GuardianDomain::Runtime,
+                    OperationPhase::Preparing,
+                    ownership,
+                );
+                for rule in mode_actions(mode).expect("active mode action rules") {
+                    for journal_available in [false, true] {
+                        for suppression_active in [false, true] {
+                            for explicit_user_intent in [false, true] {
+                                let context = GuardianPolicyContext {
+                                    journal_available,
+                                    suppression_active,
+                                    public_redaction_ready: true,
+                                    explicit_user_intent,
+                                };
+                                let actual = reject_candidate(*rule, &diagnosis, context).err();
+                                let expected =
+                                    expected_rejection(mode, rule.action, ownership, context);
+                                assert_eq!(
+                                    actual, expected,
+                                    "{mode:?} {:?} {ownership:?} {context:?}",
+                                    rule.action
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    #[test]
+    fn explicit_preference_ignores_candidate_declaration_order() {
+        let artifact = rule_diagnosis(
+            GuardianFactId::ArtifactChecksumMismatch,
+            GuardianDomain::Install,
+            OperationPhase::Downloading,
+            OwnershipClass::LauncherManaged,
+        );
+        let performance = rule_diagnosis(
+            GuardianFactId::PerformanceRulesInvalid,
+            GuardianDomain::Performance,
+            OperationPhase::Planning,
+            OwnershipClass::CompositionManaged,
+        );
+
+        assert_eq!(
+            decide_guardian_policy(
+                &safety_case(GuardianMode::Managed, artifact),
+                GuardianPolicyContext::current_operation(),
+            )
+            .kind,
+            GuardianActionKind::Repair
+        );
+        assert_eq!(
+            decide_guardian_policy(
+                &safety_case(GuardianMode::Managed, performance),
+                GuardianPolicyContext::current_operation(),
+            )
+            .kind,
+            GuardianActionKind::Warn
+        );
+    }
+
+    #[test]
+    fn safe_fallbacks_survive_rejected_interventions() {
+        let malformed_args = rule_diagnosis(
+            GuardianFactId::JvmArgsParseFailed,
+            GuardianDomain::Jvm,
+            OperationPhase::Validating,
+            OwnershipClass::Unknown,
+        );
+        let unavailable_java = rule_diagnosis(
+            GuardianFactId::JavaOverrideMissing,
+            GuardianDomain::Runtime,
+            OperationPhase::Preparing,
+            OwnershipClass::UserOwned,
+        );
+
+        assert_eq!(
+            decide_guardian_policy(
+                &safety_case(GuardianMode::Managed, malformed_args),
+                GuardianPolicyContext::current_operation(),
+            )
+            .kind,
+            GuardianActionKind::AskUser
+        );
+        assert_eq!(
+            decide_guardian_policy(
+                &safety_case(GuardianMode::Managed, unavailable_java),
+                GuardianPolicyContext::current_operation().with_missing_journal(),
+            )
+            .kind,
+            GuardianActionKind::AskUser
+        );
+    }
+
+    #[test]
+    fn public_boundary_rejection_precedes_planning_for_every_mode() {
+        let rejected = GuardianPolicyContext::current_operation()
+            .with_missing_journal()
+            .with_unredacted_public_boundary();
+        assert_eq!(
+            public_boundary_rejection(rejected),
+            Some(PolicyRejection::PublicRedactionUnavailable)
+        );
+
+        for mode in [
+            GuardianMode::Managed,
+            GuardianMode::Custom,
+            GuardianMode::Disabled,
+        ] {
+            let safety_case = SafetyCase {
+                operation_id: None,
+                mode,
+                phase: OperationPhase::Preparing,
+                diagnoses: Vec::new(),
+            };
+            let decision = decide_guardian_policy(&safety_case, rejected);
+            assert_eq!(decision.kind, GuardianActionKind::Block, "{mode:?}");
+            assert!(decision.action_plan.is_none(), "{mode:?}");
+
+            let decision =
+                decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
+            assert_eq!(decision.kind, GuardianActionKind::Allow, "{mode:?}");
+            assert!(decision.action_plan.is_none(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn disabled_disposition_is_total_over_ownership_and_context() {
+        let ownerships = [
+            OwnershipClass::LauncherManaged,
+            OwnershipClass::CompositionManaged,
+            OwnershipClass::UserOwned,
+            OwnershipClass::ExternalProviderDerived,
+            OwnershipClass::Unknown,
+        ];
+
+        for ownership in ownerships {
+            for journal_available in [false, true] {
+                for suppression_active in [false, true] {
+                    for public_redaction_ready in [false, true] {
+                        for explicit_user_intent in [false, true] {
+                            let context = GuardianPolicyContext {
+                                journal_available,
+                                suppression_active,
+                                public_redaction_ready,
+                                explicit_user_intent,
+                            };
+                            let warning = rule_diagnosis(
+                                GuardianFactId::CustomJavaOverridePresent,
+                                GuardianDomain::Runtime,
+                                OperationPhase::Preparing,
+                                ownership,
+                            );
+                            let repairable = rule_diagnosis(
+                                GuardianFactId::ManagedRuntimeReadyMarkerMissing,
+                                GuardianDomain::Runtime,
+                                OperationPhase::Preparing,
+                                ownership,
+                            );
+                            let blocking = rule_diagnosis(
+                                GuardianFactId::JavaOverrideMissing,
+                                GuardianDomain::Runtime,
+                                OperationPhase::Preparing,
+                                ownership,
+                            );
+
+                            let warning_decision = decide_guardian_policy(
+                                &safety_case(GuardianMode::Disabled, warning),
+                                context,
+                            );
+                            let repair_decision = decide_guardian_policy(
+                                &safety_case(GuardianMode::Disabled, repairable),
+                                context,
+                            );
+                            let blocking_decision = decide_guardian_policy(
+                                &safety_case(GuardianMode::Disabled, blocking),
+                                context,
+                            );
+                            let outer_block = !public_redaction_ready;
+                            assert_eq!(
+                                warning_decision.kind,
+                                if outer_block {
+                                    GuardianActionKind::Block
+                                } else {
+                                    GuardianActionKind::RecordOnly
+                                },
+                                "warning {ownership:?} {context:?}"
+                            );
+                            assert_eq!(
+                                repair_decision.kind,
+                                if outer_block
+                                    || !journal_available
+                                    || matches!(
+                                        ownership,
+                                        OwnershipClass::UserOwned | OwnershipClass::Unknown
+                                    )
+                                {
+                                    GuardianActionKind::Block
+                                } else {
+                                    GuardianActionKind::RecordOnly
+                                },
+                                "repairable {ownership:?} {context:?}"
+                            );
+                            assert_eq!(
+                                blocking_decision.kind,
+                                GuardianActionKind::Block,
+                                "blocking {ownership:?} {context:?}"
+                            );
+                            for decision in [warning_decision, repair_decision, blocking_decision] {
+                                assert_eq!(
+                                    decision.action_plan.is_none(),
+                                    outer_block,
+                                    "{ownership:?} {context:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn expected_rejection(
+        mode: GuardianMode,
+        action: GuardianActionKind,
+        ownership: OwnershipClass,
+        context: GuardianPolicyContext,
+    ) -> Option<PolicyRejection> {
+        let intervention = matches!(
+            action,
+            GuardianActionKind::Repair
+                | GuardianActionKind::Retry
+                | GuardianActionKind::Strip
+                | GuardianActionKind::Downgrade
+                | GuardianActionKind::Fallback
+                | GuardianActionKind::Quarantine
+        );
+        if intervention && !context.journal_available {
+            return Some(PolicyRejection::JournalUnavailable);
+        }
+        if matches!(
+            action,
+            GuardianActionKind::Repair | GuardianActionKind::Quarantine
+        ) && matches!(
+            ownership,
+            OwnershipClass::UserOwned | OwnershipClass::Unknown
+        ) {
+            return Some(PolicyRejection::ProtectedOwnershipMutation);
+        }
+
+        let permission_rejection = match (mode, action) {
+            (GuardianMode::Managed, _) => None,
+            (GuardianMode::Custom, GuardianActionKind::Repair) => {
+                if context.explicit_user_intent {
+                    Some(PolicyRejection::ExplicitUserIntent)
+                } else if matches!(
+                    ownership,
+                    OwnershipClass::LauncherManaged | OwnershipClass::CompositionManaged
+                ) {
+                    None
+                } else {
+                    Some(PolicyRejection::CustomRepairOwnership)
+                }
+            }
+            (GuardianMode::Custom, GuardianActionKind::Fallback | GuardianActionKind::Retry)
+                if context.explicit_user_intent =>
+            {
+                Some(PolicyRejection::ExplicitUserIntent)
+            }
+            (
+                GuardianMode::Custom,
+                GuardianActionKind::Strip
+                | GuardianActionKind::Downgrade
+                | GuardianActionKind::Quarantine,
+            ) => Some(PolicyRejection::ActionUnavailableInMode),
+            (GuardianMode::Custom, _) => None,
+            (GuardianMode::Disabled, _) => unreachable!("Disabled has a disposition rule"),
+        };
+        if permission_rejection.is_some() {
+            return permission_rejection;
+        }
+        (ownership == OwnershipClass::Unknown && action_is_intervention(action))
+            .then_some(PolicyRejection::UnknownOwnershipIntervention)
     }
 
     fn safety_case(mode: GuardianMode, diagnosis: Diagnosis) -> SafetyCase {

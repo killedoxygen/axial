@@ -104,11 +104,11 @@ Guardian decisions follow the same shape even when a domain has only partial wor
 2. Diagnosis
    Guardian evaluates an ordered declarative rule table once per rule. Each matching rule emits at most one diagnosis with domain, diagnosis id, confidence, severity, ownership, and a public reason template. Facts in the same rule family fuse into distinct source fact ids and deterministically deduplicated real targets; ownership resolves conservatively to the least-trusted supporting owner. Diagnosis order follows the earliest matching input fact, with rule order as the tie-breaker.
 
-3. Rule priority and eligibility
-   Each resolved rule carries a closed typed priority band and total action-eligibility metadata. Priority bands preserve the declared cross-family ordering for records, degraded state, repairable corruption, launch blockers, ownership boundaries, and critical failures; stable rule order breaks equal-band ties. Phase-matched condition facts may select a rule clause, but they do not become diagnosis evidence, targets, or ownership inputs.
+3. Rule priority
+   Each resolved rule carries a closed typed priority band. Priority bands preserve the declared cross-family ordering for records, degraded state, repairable corruption, launch blockers, ownership boundaries, and critical failures; stable rule order breaks equal-band ties. Phase-matched condition facts may select a rule clause, but they do not become diagnosis evidence, targets, or ownership inputs.
 
 4. Action selection
-   Guardian evaluates the strongest diagnosis's declared candidate actions against mode, ownership, redaction, journaling, user-intent, and failure-memory constraints. Unsupported or unsafe actions become bounded warnings, questions, records, or blocks instead of improvised mutation.
+   Guardian evaluates the strongest diagnosis's declared candidate actions through a closed per-mode action table. Hard redaction, journal, and protected-ownership invariants run first; typed mode, explicit-intent, and unknown-ownership rejections then preserve safe questions, warnings, records, or blocks instead of improvised mutation. Disabled mode uses a diagnosis-level hard-invariant disposition, and active retry-loop suppression uses a diagnosis-level Block disposition.
 
 5. Plan and ownership gates
    Any mutating plan must have launcher-managed or composition-managed ownership, an operation journal, a rollback/quarantine/postcondition story where applicable, redaction-ready public output, and loop-control checks.

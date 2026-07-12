@@ -5,61 +5,6 @@ use super::{
 use crate::state::contracts::OperationPhase;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum OwnershipRequirement {
-    None,
-    Classified,
-    LauncherManaged,
-    CompositionManaged,
-    UserOrUnknownProtected,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum JournalRequirement {
-    None,
-    RequiredForAttemptAction,
-    RequiredForManagedMutation,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RedactionRequirement {
-    PublicOutcome,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RetryLoopSensitivity {
-    None,
-    OneAttemptOverride,
-    RepairAttempt,
-    ProviderRetry,
-    RepeatedFailureMemory,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum DestructiveMutationRisk {
-    None,
-    ManagedMutation,
-    UserOrUnknownProtected,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum UserIntentSensitivity {
-    None,
-    ExplicitTechnicalIntent,
-    PerformanceComposition,
-    UserDataBoundary,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ActionEligibility {
-    pub(super) ownership_requirement: OwnershipRequirement,
-    pub(super) journal_requirement: JournalRequirement,
-    pub(super) redaction_requirement: RedactionRequirement,
-    pub(super) retry_loop_sensitivity: RetryLoopSensitivity,
-    pub(super) destructive_mutation_risk: DestructiveMutationRisk,
-    pub(super) user_intent_sensitivity: UserIntentSensitivity,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RuleDomain {
     Fixed(GuardianDomain),
     SupportingFact,
@@ -162,7 +107,6 @@ pub(super) struct DiagnosisRule {
     pub(super) severity: RuleSeverity,
     pub(super) confidence: RuleConfidence,
     priority_profile: PriorityProfile,
-    pub(super) eligibility: ActionEligibility,
     pub(super) candidate_actions: &'static [GuardianActionKind],
     pub(super) clauses: &'static [RuleClause],
     pub(super) public_reason_template: &'static str,
@@ -303,72 +247,10 @@ const fn confidence_rank(confidence: GuardianConfidence) -> u8 {
     }
 }
 
-const RECORD_ONLY_ELIGIBILITY: ActionEligibility = ActionEligibility {
-    ownership_requirement: OwnershipRequirement::None,
-    journal_requirement: JournalRequirement::None,
-    redaction_requirement: RedactionRequirement::PublicOutcome,
-    retry_loop_sensitivity: RetryLoopSensitivity::None,
-    destructive_mutation_risk: DestructiveMutationRisk::None,
-    user_intent_sensitivity: UserIntentSensitivity::None,
-};
-pub(super) const UNKNOWN_ELIGIBILITY: ActionEligibility = RECORD_ONLY_ELIGIBILITY;
-const BLOCK_ONLY_ELIGIBILITY: ActionEligibility = ActionEligibility {
-    ownership_requirement: OwnershipRequirement::Classified,
-    ..RECORD_ONLY_ELIGIBILITY
-};
-const RUNTIME_ATTEMPT_ELIGIBILITY: ActionEligibility = ActionEligibility {
-    ownership_requirement: OwnershipRequirement::Classified,
-    journal_requirement: JournalRequirement::RequiredForAttemptAction,
-    retry_loop_sensitivity: RetryLoopSensitivity::OneAttemptOverride,
-    user_intent_sensitivity: UserIntentSensitivity::ExplicitTechnicalIntent,
-    ..RECORD_ONLY_ELIGIBILITY
-};
-const MANAGED_RUNTIME_REPAIR_ELIGIBILITY: ActionEligibility = ActionEligibility {
-    ownership_requirement: OwnershipRequirement::LauncherManaged,
-    journal_requirement: JournalRequirement::RequiredForManagedMutation,
-    retry_loop_sensitivity: RetryLoopSensitivity::RepairAttempt,
-    destructive_mutation_risk: DestructiveMutationRisk::ManagedMutation,
-    ..RECORD_ONLY_ELIGIBILITY
-};
-const EXPLICIT_INTENT_WARNING_ELIGIBILITY: ActionEligibility = ActionEligibility {
-    ownership_requirement: OwnershipRequirement::Classified,
-    user_intent_sensitivity: UserIntentSensitivity::ExplicitTechnicalIntent,
-    ..RECORD_ONLY_ELIGIBILITY
-};
-const JVM_ATTEMPT_ELIGIBILITY: ActionEligibility = RUNTIME_ATTEMPT_ELIGIBILITY;
-const MANAGED_ARTIFACT_REPAIR_ELIGIBILITY: ActionEligibility = MANAGED_RUNTIME_REPAIR_ELIGIBILITY;
-const PROVIDER_RETRY_ELIGIBILITY: ActionEligibility = ActionEligibility {
-    ownership_requirement: OwnershipRequirement::Classified,
-    journal_requirement: JournalRequirement::RequiredForAttemptAction,
-    retry_loop_sensitivity: RetryLoopSensitivity::ProviderRetry,
-    ..RECORD_ONLY_ELIGIBILITY
-};
-const USER_OR_UNKNOWN_PROTECTION_ELIGIBILITY: ActionEligibility = ActionEligibility {
-    ownership_requirement: OwnershipRequirement::UserOrUnknownProtected,
-    destructive_mutation_risk: DestructiveMutationRisk::UserOrUnknownProtected,
-    user_intent_sensitivity: UserIntentSensitivity::UserDataBoundary,
-    ..RECORD_ONLY_ELIGIBILITY
-};
-const PERFORMANCE_RECORD_ELIGIBILITY: ActionEligibility = ActionEligibility {
-    ownership_requirement: OwnershipRequirement::CompositionManaged,
-    user_intent_sensitivity: UserIntentSensitivity::PerformanceComposition,
-    ..RECORD_ONLY_ELIGIBILITY
-};
-const PERFORMANCE_MEMORY_ELIGIBILITY: ActionEligibility = ActionEligibility {
-    retry_loop_sensitivity: RetryLoopSensitivity::RepeatedFailureMemory,
-    ..PERFORMANCE_RECORD_ELIGIBILITY
-};
-const PERFORMANCE_USER_CONFLICT_ELIGIBILITY: ActionEligibility = ActionEligibility {
-    ownership_requirement: OwnershipRequirement::UserOrUnknownProtected,
-    destructive_mutation_risk: DestructiveMutationRisk::UserOrUnknownProtected,
-    user_intent_sensitivity: UserIntentSensitivity::UserDataBoundary,
-    ..RECORD_ONLY_ELIGIBILITY
-};
-
 macro_rules! rule {
     (
         $id:ident, [$($fact:ident),+ $(,)?], $domain:expr, $severity:expr,
-        $confidence:expr, $eligibility:ident, [$($action:ident),+ $(,)?], $reason:literal
+        $confidence:expr, [$($action:ident),+ $(,)?], $reason:literal
     ) => {
         DiagnosisRule {
             id: DiagnosisId::$id,
@@ -381,7 +263,6 @@ macro_rules! rule {
             severity: $severity,
             confidence: $confidence,
             priority_profile: priority_profile(DiagnosisId::$id),
-            eligibility: $eligibility,
             candidate_actions: &[$(GuardianActionKind::$action),+],
             clauses: &[],
             public_reason_template: $reason,
@@ -397,7 +278,7 @@ macro_rules! full_rule {
         phases: $phases:expr,
         required: $required:expr,
         suppressions: $suppressions:expr,
-        $domain:expr, $severity:expr, $confidence:expr, $eligibility:ident,
+        $domain:expr, $severity:expr, $confidence:expr,
         [$($action:ident),+ $(,)?],
         clauses: $clauses:expr,
         $reason:literal
@@ -413,7 +294,6 @@ macro_rules! full_rule {
             severity: $severity,
             confidence: $confidence,
             priority_profile: priority_profile(DiagnosisId::$id),
-            eligibility: $eligibility,
             candidate_actions: &[$(GuardianActionKind::$action),+],
             clauses: $clauses,
             public_reason_template: $reason,
@@ -605,7 +485,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Runtime),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        RUNTIME_ATTEMPT_ELIGIBILITY,
         [Fallback, AskUser, Block],
         "selected_java_runtime_unavailable"
     ),
@@ -615,7 +494,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Runtime),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::High),
-        RUNTIME_ATTEMPT_ELIGIBILITY,
         [Fallback, Block],
         "java_runtime_probe_failed"
     ),
@@ -629,7 +507,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Runtime),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        RUNTIME_ATTEMPT_ELIGIBILITY,
         [Fallback, Block],
         clauses: &[
             clause(
@@ -695,7 +572,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Runtime),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        RUNTIME_ATTEMPT_ELIGIBILITY,
         [Fallback, Block],
         "java_update_too_old"
     ),
@@ -705,7 +581,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Runtime),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Recoverable),
         RuleConfidence::SupportingFactOr(GuardianConfidence::Confirmed),
-        RECORD_ONLY_ELIGIBILITY,
         [RecordOnly],
         "managed_runtime_missing"
     ),
@@ -715,7 +590,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Runtime),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "managed_runtime_unavailable_for_platform"
     ),
@@ -725,7 +599,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Runtime),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "managed_runtime_rosetta_required"
     ),
@@ -735,7 +608,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Runtime),
         RuleSeverity::Fixed(GuardianSeverity::Repairable),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        MANAGED_RUNTIME_REPAIR_ELIGIBILITY,
         [Repair, Block],
         "managed_runtime_needs_repair"
     ),
@@ -745,7 +617,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Install),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Blocking),
         RuleConfidence::SupportingFactOr(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "version_json_missing"
     ),
@@ -755,7 +626,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Install),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Blocking),
         RuleConfidence::SupportingFactOr(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "parent_version_missing"
     ),
@@ -765,7 +635,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Install),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Blocking),
         RuleConfidence::SupportingFactOr(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "incomplete_install"
     ),
@@ -775,7 +644,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Install),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Blocking),
         RuleConfidence::SupportingFactOr(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "client_jar_missing"
     ),
@@ -785,7 +653,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Install),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Blocking),
         RuleConfidence::SupportingFactOr(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "libraries_missing"
     ),
@@ -795,7 +662,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Install),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Blocking),
         RuleConfidence::SupportingFactOr(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "asset_index_missing"
     ),
@@ -805,7 +671,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Launch),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "launch_command_invalid"
     ),
@@ -815,7 +680,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Launch),
         RuleSeverity::Fixed(GuardianSeverity::Info),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        RECORD_ONLY_ELIGIBILITY,
         [RecordOnly],
         "launch_command_prepared"
     ),
@@ -825,7 +689,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::SupportingFact,
         RuleSeverity::SupportingFactOr(GuardianSeverity::Warning),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        RECORD_ONLY_ELIGIBILITY,
         [Warn, RecordOnly],
         "launch_memory_min_clamped"
     ),
@@ -835,7 +698,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::SupportingFact,
         RuleSeverity::SupportingFactOr(GuardianSeverity::Warning),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        RECORD_ONLY_ELIGIBILITY,
         [Warn, RecordOnly],
         "launch_memory_allocation_low"
     ),
@@ -845,7 +707,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::SupportingFact,
         RuleSeverity::SupportingFactOr(GuardianSeverity::Warning),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        RECORD_ONLY_ELIGIBILITY,
         [Warn, RecordOnly],
         "launch_resource_memory_pressure"
     ),
@@ -855,7 +716,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::SupportingFact,
         RuleSeverity::SupportingFactOr(GuardianSeverity::Warning),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        RECORD_ONLY_ELIGIBILITY,
         [Warn, RecordOnly],
         "launch_resource_cpu_pressure"
     ),
@@ -865,7 +725,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::SupportingFact,
         RuleSeverity::SupportingFactOr(GuardianSeverity::Warning),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        RECORD_ONLY_ELIGIBILITY,
         [Warn, RecordOnly],
         "launch_resource_install_pressure"
     ),
@@ -875,7 +734,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::SupportingFact,
         RuleSeverity::SupportingFactOr(GuardianSeverity::Warning),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        RECORD_ONLY_ELIGIBILITY,
         [Warn, RecordOnly],
         "launch_resource_disk_pressure"
     ),
@@ -885,7 +743,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::SupportingFact,
         RuleSeverity::SupportingFactOr(GuardianSeverity::Warning),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        EXPLICIT_INTENT_WARNING_ELIGIBILITY,
         [Warn, RecordOnly],
         "custom_java_override_present"
     ),
@@ -895,7 +752,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::SupportingFact,
         RuleSeverity::SupportingFactOr(GuardianSeverity::Warning),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        EXPLICIT_INTENT_WARNING_ELIGIBILITY,
         [Warn, RecordOnly],
         "custom_jvm_preset_present"
     ),
@@ -905,7 +761,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::SupportingFact,
         RuleSeverity::SupportingFactOr(GuardianSeverity::Warning),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        EXPLICIT_INTENT_WARNING_ELIGIBILITY,
         [Warn, RecordOnly],
         "custom_jvm_args_present"
     ),
@@ -915,7 +770,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Jvm),
         RuleSeverity::Fixed(GuardianSeverity::Info),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        RECORD_ONLY_ELIGIBILITY,
         [RecordOnly],
         "jvm_args_empty"
     ),
@@ -925,7 +779,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Jvm),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        JVM_ATTEMPT_ELIGIBILITY,
         [Strip, AskUser, Block],
         "jvm_args_malformed"
     ),
@@ -949,7 +802,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Jvm),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        JVM_ATTEMPT_ELIGIBILITY,
         [Strip, AskUser, Block],
         clauses: &[
             clause(
@@ -1045,7 +897,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Jvm),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        JVM_ATTEMPT_ELIGIBILITY,
         [Strip, AskUser, Block],
         "jvm_arg_unsafe_override"
     ),
@@ -1062,7 +913,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Download),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         clauses: &[context_clause(
             OperationPhase::Launching,
@@ -1097,7 +947,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
                 confidence: GuardianConfidence::High,
             }],
         },
-        MANAGED_ARTIFACT_REPAIR_ELIGIBILITY,
         [Quarantine, Repair, Block],
         "managed_artifact_corrupt"
     ),
@@ -1107,7 +956,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Install),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "install_artifact_metadata_invalid"
     ),
@@ -1117,7 +965,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Install),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "install_dependency_failed"
     ),
@@ -1127,7 +974,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Download),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Medium),
-        PROVIDER_RETRY_ELIGIBILITY,
         [Retry, AskUser, Block],
         "download_unavailable"
     ),
@@ -1137,7 +983,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Filesystem),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "filesystem_permission_denied"
     ),
@@ -1147,7 +992,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Filesystem),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "temp_file_leftover"
     ),
@@ -1157,7 +1001,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Filesystem),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         "atomic_promotion_failed"
     ),
@@ -1167,7 +1010,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Filesystem),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        USER_OR_UNKNOWN_PROTECTION_ELIGIBILITY,
         [Block],
         "artifact_ownership_unsafe"
     ),
@@ -1177,7 +1019,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Performance),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Degraded),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        PERFORMANCE_RECORD_ELIGIBILITY,
         [RecordOnly, Warn],
         "performance_rules_invalid"
     ),
@@ -1187,7 +1028,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Performance),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Degraded),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        PERFORMANCE_RECORD_ELIGIBILITY,
         [RecordOnly, Warn],
         "performance_health_degraded"
     ),
@@ -1197,7 +1037,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Performance),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Degraded),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        PERFORMANCE_RECORD_ELIGIBILITY,
         [RecordOnly, Warn],
         "performance_health_invalid"
     ),
@@ -1207,7 +1046,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Performance),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Warning),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        PERFORMANCE_RECORD_ELIGIBILITY,
         [RecordOnly, Warn],
         "performance_fallback_selected"
     ),
@@ -1217,7 +1055,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Performance),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Degraded),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        PERFORMANCE_MEMORY_ELIGIBILITY,
         [RecordOnly, Warn],
         "performance_repeated_failure_memory"
     ),
@@ -1227,7 +1064,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Performance),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Blocking),
         RuleConfidence::SupportingFactOr(GuardianConfidence::Confirmed),
-        PERFORMANCE_USER_CONFLICT_ELIGIBILITY,
         [RecordOnly, Warn, AskUser, Block],
         "performance_user_owned_conflict"
     ),
@@ -1269,7 +1105,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Session),
         RuleSeverity::Fixed(GuardianSeverity::Info),
         RuleConfidence::Fixed(GuardianConfidence::High),
-        RECORD_ONLY_ELIGIBILITY,
         [RecordOnly],
         clauses: &[],
         "process_lifecycle_observed"
@@ -1280,7 +1115,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::State),
         RuleSeverity::Fixed(GuardianSeverity::Warning),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        RECORD_ONLY_ELIGIBILITY,
         [Warn, RecordOnly],
         "persisted_state_schema_invalid"
     ),
@@ -1294,7 +1128,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Jvm),
         RuleSeverity::Fixed(GuardianSeverity::Recoverable),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        JVM_ATTEMPT_ELIGIBILITY,
         [Downgrade, AskUser, Block],
         clauses: &[],
         "jvm_preset_adjusted"
@@ -1339,7 +1172,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
                 confidence: GuardianConfidence::Low,
             }],
         },
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         clauses: &[],
         "launch_prepare_failed"
@@ -1354,7 +1186,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Startup),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::High),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         clauses: &[context_clause(
             OperationPhase::Launching,
@@ -1382,7 +1213,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Startup),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::High),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         clauses: &[],
         "out_of_memory"
@@ -1400,7 +1230,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Startup),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::High),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         clauses: &[],
         "graphics_driver_crash"
@@ -1418,7 +1247,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Startup),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::High),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         clauses: &[],
         "missing_dependency"
@@ -1436,7 +1264,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Startup),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::High),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         clauses: &[],
         "mod_transformation_failure"
@@ -1454,7 +1281,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Startup),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::High),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         clauses: &[],
         "mod_attributed_crash"
@@ -1472,7 +1298,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Startup),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::High),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         clauses: &[],
         "classpath_module_conflict"
@@ -1490,7 +1315,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Startup),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::High),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         clauses: &[],
         "auth_mode_incompatible"
@@ -1508,7 +1332,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Startup),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::High),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         clauses: &[],
         "loader_bootstrap_failure"
@@ -1526,7 +1349,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Startup),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Low),
-        BLOCK_ONLY_ELIGIBILITY,
         [Block],
         clauses: &[],
         "startup_failed_unknown"

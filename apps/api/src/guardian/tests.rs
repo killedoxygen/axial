@@ -1,8 +1,4 @@
-use super::rules::{
-    ActionEligibility, DIAGNOSIS_RULES, DestructiveMutationRisk, JournalRequirement,
-    OwnershipRequirement, RedactionRequirement, RetryLoopSensitivity, UserIntentSensitivity,
-    rule_for_diagnosis,
-};
+use super::rules::{DIAGNOSIS_RULES, rule_for_diagnosis};
 use super::{
     DiagnosisId, FactReliability, GuardianAction, GuardianActionKind, GuardianActionPlan,
     GuardianConfidence, GuardianDecision, GuardianDomain, GuardianFact, GuardianFactId,
@@ -350,34 +346,6 @@ fn managed_runtime_readiness_fact_maps_to_recoverable_diagnosis() {
 }
 
 #[test]
-fn rule_action_eligibility_stays_internal_to_public_diagnosis_output() {
-    let fact = guardian_test_fact(
-        GuardianFactId::JvmArgsParseFailed,
-        GuardianDomain::Jvm,
-        OperationPhase::Validating,
-        FactReliability::ExactClassifier,
-        OwnershipClass::UserOwned,
-    );
-
-    let diagnoses = diagnose(&[fact], OperationPhase::Validating);
-    let encoded = serde_json::to_string(&diagnoses[0]).expect("diagnosis json");
-
-    assert!(!encoded.contains("action_eligibility"));
-    assert!(!encoded.contains("journal_requirement"));
-    assert!(!encoded.contains("destructive_mutation_risk"));
-    assert_eq!(diagnoses[0].id().as_str(), "jvm_args_malformed");
-    assert_eq!(diagnoses[0].confidence(), GuardianConfidence::Confirmed);
-    assert_eq!(
-        diagnoses[0].candidate_actions(),
-        vec![
-            GuardianActionKind::Strip,
-            GuardianActionKind::AskUser,
-            GuardianActionKind::Block
-        ]
-    );
-}
-
-#[test]
 fn declarative_rules_have_unique_ids_and_keep_conditions_out_of_evidence() {
     let mut diagnosis_ids = std::collections::HashSet::new();
     let conditions = [
@@ -392,12 +360,6 @@ fn declarative_rules_have_unique_ids_and_keep_conditions_out_of_evidence() {
         assert!(diagnosis_ids.insert(rule.id), "duplicate rule {}", rule.id);
         assert!(!rule.trigger_fact_ids.is_empty(), "{}", rule.id);
         assert!(!rule.evidence_fact_ids.is_empty(), "{}", rule.id);
-        assert_eq!(
-            rule.eligibility.redaction_requirement,
-            RedactionRequirement::PublicOutcome,
-            "{}",
-            rule.id
-        );
         for condition in conditions {
             assert!(!rule.trigger_fact_ids.contains(&condition), "{}", rule.id);
             assert!(!rule.evidence_fact_ids.contains(&condition), "{}", rule.id);
@@ -410,132 +372,6 @@ fn declarative_rules_have_unique_ids_and_keep_conditions_out_of_evidence() {
             );
         }
         assert_eq!(rule_for_diagnosis(rule.id), Some(rule));
-    }
-}
-
-#[test]
-fn rule_action_eligibility_covers_each_policy_constraint_family() {
-    let cases = [
-        (
-            DiagnosisId::JavaOverrideUnavailable,
-            ActionEligibility {
-                ownership_requirement: OwnershipRequirement::Classified,
-                journal_requirement: JournalRequirement::RequiredForAttemptAction,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::OneAttemptOverride,
-                destructive_mutation_risk: DestructiveMutationRisk::None,
-                user_intent_sensitivity: UserIntentSensitivity::ExplicitTechnicalIntent,
-            },
-        ),
-        (
-            DiagnosisId::ManagedRuntimeCorrupt,
-            ActionEligibility {
-                ownership_requirement: OwnershipRequirement::LauncherManaged,
-                journal_requirement: JournalRequirement::RequiredForManagedMutation,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::RepairAttempt,
-                destructive_mutation_risk: DestructiveMutationRisk::ManagedMutation,
-                user_intent_sensitivity: UserIntentSensitivity::None,
-            },
-        ),
-        (
-            DiagnosisId::LauncherManagedArtifactCorrupt,
-            ActionEligibility {
-                ownership_requirement: OwnershipRequirement::LauncherManaged,
-                journal_requirement: JournalRequirement::RequiredForManagedMutation,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::RepairAttempt,
-                destructive_mutation_risk: DestructiveMutationRisk::ManagedMutation,
-                user_intent_sensitivity: UserIntentSensitivity::None,
-            },
-        ),
-        (
-            DiagnosisId::DownloadUnavailable,
-            ActionEligibility {
-                ownership_requirement: OwnershipRequirement::Classified,
-                journal_requirement: JournalRequirement::RequiredForAttemptAction,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::ProviderRetry,
-                destructive_mutation_risk: DestructiveMutationRisk::None,
-                user_intent_sensitivity: UserIntentSensitivity::None,
-            },
-        ),
-        (
-            DiagnosisId::ArtifactOwnershipUnsafe,
-            ActionEligibility {
-                ownership_requirement: OwnershipRequirement::UserOrUnknownProtected,
-                journal_requirement: JournalRequirement::None,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::None,
-                destructive_mutation_risk: DestructiveMutationRisk::UserOrUnknownProtected,
-                user_intent_sensitivity: UserIntentSensitivity::UserDataBoundary,
-            },
-        ),
-        (
-            DiagnosisId::PerformanceHealthInvalid,
-            ActionEligibility {
-                ownership_requirement: OwnershipRequirement::CompositionManaged,
-                journal_requirement: JournalRequirement::None,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::None,
-                destructive_mutation_risk: DestructiveMutationRisk::None,
-                user_intent_sensitivity: UserIntentSensitivity::PerformanceComposition,
-            },
-        ),
-        (
-            DiagnosisId::PerformanceRepeatedFailureMemory,
-            ActionEligibility {
-                ownership_requirement: OwnershipRequirement::CompositionManaged,
-                journal_requirement: JournalRequirement::None,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::RepeatedFailureMemory,
-                destructive_mutation_risk: DestructiveMutationRisk::None,
-                user_intent_sensitivity: UserIntentSensitivity::PerformanceComposition,
-            },
-        ),
-        (
-            DiagnosisId::PerformanceUserOwnedConflict,
-            ActionEligibility {
-                ownership_requirement: OwnershipRequirement::UserOrUnknownProtected,
-                journal_requirement: JournalRequirement::None,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::None,
-                destructive_mutation_risk: DestructiveMutationRisk::UserOrUnknownProtected,
-                user_intent_sensitivity: UserIntentSensitivity::UserDataBoundary,
-            },
-        ),
-        (
-            DiagnosisId::ProcessLifecycleObserved,
-            ActionEligibility {
-                ownership_requirement: OwnershipRequirement::None,
-                journal_requirement: JournalRequirement::None,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::None,
-                destructive_mutation_risk: DestructiveMutationRisk::None,
-                user_intent_sensitivity: UserIntentSensitivity::None,
-            },
-        ),
-        (
-            DiagnosisId::PersistedStateSchemaInvalid,
-            ActionEligibility {
-                ownership_requirement: OwnershipRequirement::None,
-                journal_requirement: JournalRequirement::None,
-                redaction_requirement: RedactionRequirement::PublicOutcome,
-                retry_loop_sensitivity: RetryLoopSensitivity::None,
-                destructive_mutation_risk: DestructiveMutationRisk::None,
-                user_intent_sensitivity: UserIntentSensitivity::None,
-            },
-        ),
-    ];
-
-    for (diagnosis_id, expected) in cases {
-        assert_eq!(
-            rule_for_diagnosis(diagnosis_id)
-                .expect("diagnosis rule")
-                .eligibility,
-            expected,
-            "{diagnosis_id}"
-        );
     }
 }
 

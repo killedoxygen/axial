@@ -1,6 +1,4 @@
-use super::rules::{
-    ActionEligibility, DIAGNOSIS_RULES, DecisionPriorityBand, DiagnosisRule, UNKNOWN_ELIGIBILITY,
-};
+use super::rules::{DIAGNOSIS_RULES, DecisionPriorityBand, DiagnosisRule};
 use super::{
     ActionPlanPrerequisite, DiagnosisId, GuardianActionKind, GuardianConfidence, GuardianDomain,
     GuardianFact, GuardianFactId, GuardianMode, GuardianSeverity, SafetyCase,
@@ -24,8 +22,6 @@ pub struct Diagnosis {
     affected_targets: Vec<TargetDescriptor>,
     candidate_actions: Vec<GuardianActionKind>,
     public_reason_template: String,
-    #[serde(skip)]
-    eligibility: ActionEligibility,
     #[serde(skip)]
     priority: DecisionPriorityBand,
 }
@@ -69,10 +65,6 @@ impl Diagnosis {
 
     pub fn public_reason_template(&self) -> &str {
         &self.public_reason_template
-    }
-
-    pub(super) fn eligibility(&self) -> ActionEligibility {
-        self.eligibility
     }
 
     pub(super) fn priority(&self) -> DecisionPriorityBand {
@@ -174,7 +166,6 @@ fn diagnosis_for_rule(
             ),
             candidate_actions: resolved.candidate_actions.to_vec(),
             public_reason_template: rule.public_reason_template.to_string(),
-            eligibility: rule.eligibility,
             priority: resolved.priority,
         },
     ))
@@ -206,7 +197,6 @@ fn unknown_diagnosis(facts: &[GuardianFact], phase: OperationPhase) -> Diagnosis
             GuardianActionKind::AskUser,
         ],
         public_reason_template: "unknown_failure".to_string(),
-        eligibility: UNKNOWN_ELIGIBILITY,
         priority: DecisionPriorityBand::UnknownLow,
     }
 }
