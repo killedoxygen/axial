@@ -11,7 +11,7 @@ use super::{
 use crate::application::install::loader_install_guardian_evidence_kind;
 use crate::application::launch::readiness_guardian_facts_for_coverage;
 use crate::application::timing::{LAUNCH_PREFLIGHT_SENSE_TIMING_SIGNAL, LaunchPreflightSenseId};
-use crate::execution::{ExecutionFact, ExecutionFactKind};
+use crate::execution::{ExecutionFact, ExecutionFactKind, ExecutionFactSemantics};
 use crate::observability::evidence_text_looks_sensitive;
 use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
@@ -120,7 +120,7 @@ struct PreflightSenseCoverage {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AdapterCoverage {
-    execution: Vec<AdapterCell>,
+    execution: Vec<ExecutionAdapterCell>,
     install: Vec<AdapterCell>,
     loader_active_install: Vec<LoaderActiveInstallAdapterCell>,
     loader_pre_operation: Vec<LoaderBoundaryAdapterCell>,
@@ -133,6 +133,15 @@ struct AdapterCoverage {
 struct AdapterCell {
     source: String,
     fact: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionAdapterCell {
+    source: String,
+    classification: String,
+    fact: String,
+    diagnoses: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -212,7 +221,7 @@ fn generate_coverage() -> InvariantCoverage {
             invariant("I4", "current_hand_attempt_bounds_registered"),
             invariant("I5", "launch_failure_surfaces_bounded_and_redacted"),
             invariant("I6", "implemented_memory_trigger_rules_registered"),
-            invariant("I7", "pending_typed_install_error_and_delegation_proof"),
+            invariant("I7", "execution_sources_classified_loader_worker_pending"),
             invariant("I8", "preflight_costs_declared_measurement_pending_phase_4"),
             invariant("I9", "reserved_facts_unused_agent_demo_pending_phase_5"),
         ],
@@ -533,7 +542,7 @@ fn rule_references_fact(rule: &super::rules::DiagnosisRule, fact: &GuardianFactI
         })
 }
 
-fn execution_adapter_coverage() -> Vec<AdapterCell> {
+fn execution_adapter_coverage() -> Vec<ExecutionAdapterCell> {
     ExecutionFactKind::ALL
         .iter()
         .map(|kind| {
@@ -552,9 +561,40 @@ fn execution_adapter_coverage() -> Vec<AdapterCell> {
                 OperationPhase::Validating,
             );
             assert!(guardian_fact_is_registered(&fact.id));
-            AdapterCell {
-                source: debug_name(kind),
+            let diagnoses = DIAGNOSIS_RULES
+                .iter()
+                .filter(|rule| rule.trigger_fact_ids.contains(&fact.id))
+                .map(|rule| {
+                    assert!(DiagnosisId::ALL.contains(&rule.id));
+                    rule.id.as_str().to_string()
+                })
+                .collect::<Vec<_>>();
+            match kind.semantics() {
+                ExecutionFactSemantics::Diagnostic => assert!(
+                    !diagnoses.is_empty(),
+                    "execution diagnostic has no diagnosis: {}",
+                    kind.as_str()
+                ),
+                ExecutionFactSemantics::ConditionEvidence => assert!(
+                    DIAGNOSIS_RULES
+                        .iter()
+                        .any(|rule| rule_references_fact(rule, &fact.id)),
+                    "execution condition is not referenced by a rule: {}",
+                    kind.as_str()
+                ),
+                ExecutionFactSemantics::NonFailure => assert!(
+                    !DIAGNOSIS_RULES
+                        .iter()
+                        .any(|rule| rule_references_fact(rule, &fact.id)),
+                    "non-failure execution source is referenced by a rule: {}",
+                    kind.as_str()
+                ),
+            }
+            ExecutionAdapterCell {
+                source: kind.as_str().to_string(),
+                classification: kind.semantics().as_str().to_string(),
                 fact: fact_name(&fact.id),
+                diagnoses,
             }
         })
         .collect()

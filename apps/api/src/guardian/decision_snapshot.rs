@@ -15,9 +15,9 @@ const SNAPSHOT_FIXTURE: &str = include_str!(concat!(
     "/tests/fixtures/guardian/guardian-decision-snapshot-v1.json"
 ));
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_DECISION_SNAPSHOT";
-const FACT_SOURCE_COUNT: usize = 68;
-const DIAGNOSIS_COUNT: usize = 45;
-const FACT_SOURCE_PHASE_COUNT: usize = 267;
+const FACT_SOURCE_COUNT: usize = 70;
+const DIAGNOSIS_COUNT: usize = 46;
+const FACT_SOURCE_PHASE_COUNT: usize = 275;
 const UNKNOWN_SOURCE_COUNT: usize = 12;
 const CONTEXT_COUNT: usize = 16;
 const FACT_SOURCE_OWNERSHIP_COUNT: usize = 5;
@@ -211,7 +211,6 @@ fn regenerate_guardian_decision_snapshot_fixture() {
     );
     let committed = serde_json::from_str::<GuardianDecisionSnapshot>(SNAPSHOT_FIXTURE)
         .expect("strict Guardian decision snapshot fixture");
-    assert_snapshot_coverage(&committed);
     let replayed = replay_snapshot(&committed);
     assert_snapshot_coverage(&replayed);
     let fixture = serde_json::to_string_pretty(&replayed)
@@ -223,11 +222,28 @@ fn regenerate_guardian_decision_snapshot_fixture() {
 fn replay_snapshot(committed: &GuardianDecisionSnapshot) -> GuardianDecisionSnapshot {
     let contexts = committed.contexts.clone();
     let mut matrices = BTreeMap::<String, Vec<ModePolicyRow>>::new();
-    let source_cases = committed
+    let mut source_cases = committed
         .source_cases
         .iter()
         .map(|source| replay_source_case(source, &contexts, &mut matrices))
-        .collect();
+        .collect::<Vec<_>>();
+    for required in required_source_cases() {
+        if let Some(existing) = source_cases.iter().find(|source| source.id == required.id) {
+            assert_eq!(existing.input, required.input, "{} input", required.id);
+            assert_eq!(
+                existing.allowed_phases, required.allowed_phases,
+                "{} phases",
+                required.id
+            );
+        } else {
+            source_cases.push(replay_required_source_case(
+                required,
+                &contexts,
+                &mut matrices,
+            ));
+        }
+    }
+    source_cases.sort_by(|left, right| left.id.cmp(&right.id));
 
     let policy_profiles = matrices
         .into_iter()
@@ -240,6 +256,88 @@ fn replay_snapshot(committed: &GuardianDecisionSnapshot) -> GuardianDecisionSnap
         source_cases,
         policy_profiles,
     }
+}
+
+struct RequiredSourceCase {
+    id: &'static str,
+    input: SourceInput,
+    allowed_phases: Vec<OperationPhase>,
+}
+
+fn required_source_cases() -> Vec<RequiredSourceCase> {
+    vec![
+        RequiredSourceCase {
+            id: "filesystem_locked--filesystem_locked",
+            input: SourceInput::Fact {
+                fact_id: GuardianFactId::FilesystemLocked,
+                domain: GuardianDomain::Filesystem,
+                reliability: FactReliability::DirectStructured,
+                severity: None,
+                confidence: None,
+            },
+            allowed_phases: vec![
+                OperationPhase::Planning,
+                OperationPhase::Validating,
+                OperationPhase::Installing,
+                OperationPhase::Preparing,
+            ],
+        },
+        RequiredSourceCase {
+            id: "process_lifecycle_observed--process_killed",
+            input: SourceInput::Fact {
+                fact_id: GuardianFactId::ProcessKilled,
+                domain: GuardianDomain::Session,
+                reliability: FactReliability::ProcessLifecycle,
+                severity: None,
+                confidence: None,
+            },
+            allowed_phases: vec![
+                OperationPhase::Launching,
+                OperationPhase::Running,
+                OperationPhase::Completed,
+                OperationPhase::Failed,
+            ],
+        },
+        RequiredSourceCase {
+            id: "process_lifecycle_observed--watchdog_action_observed",
+            input: SourceInput::Fact {
+                fact_id: GuardianFactId::WatchdogActionObserved,
+                domain: GuardianDomain::Session,
+                reliability: FactReliability::ProcessLifecycle,
+                severity: None,
+                confidence: None,
+            },
+            allowed_phases: vec![
+                OperationPhase::Launching,
+                OperationPhase::Running,
+                OperationPhase::Completed,
+                OperationPhase::Failed,
+            ],
+        },
+    ]
+}
+
+fn replay_required_source_case(
+    required: RequiredSourceCase,
+    contexts: &[PolicyContextCoordinate],
+    matrices: &mut BTreeMap<String, Vec<ModePolicyRow>>,
+) -> SourceCase {
+    let diagnosis =
+        replay_source_diagnosis(&required.input, required.allowed_phases[0], OWNERSHIPS[0]);
+    let source = SourceCase {
+        id: required.id.to_string(),
+        input: required.input,
+        allowed_phases: required.allowed_phases,
+        diagnosis: DiagnosisProjection::from(&diagnosis),
+        ownership_profiles: OWNERSHIPS
+            .into_iter()
+            .map(|ownership| OwnershipProfileRef {
+                ownership,
+                policy_profile: String::new(),
+            })
+            .collect(),
+    };
+    replay_source_case(&source, contexts, matrices)
 }
 
 fn replay_source_case(
@@ -466,9 +564,9 @@ fn assert_snapshot_coverage(snapshot: &GuardianDecisionSnapshot) {
         snapshot.source_cases.len(),
         FACT_SOURCE_COUNT + UNKNOWN_SOURCE_COUNT
     );
-    assert_eq!(RAW_DIAGNOSIS_CASE_COUNT, 1_347);
-    assert_eq!(RAW_POLICY_EVALUATION_COUNT, 64_656);
-    assert_eq!(COMPRESSED_POLICY_CELL_COUNT, 16_896);
+    assert_eq!(RAW_DIAGNOSIS_CASE_COUNT, 1_387);
+    assert_eq!(RAW_POLICY_EVALUATION_COUNT, 66_576);
+    assert_eq!(COMPRESSED_POLICY_CELL_COUNT, 17_376);
     assert!(
         snapshot
             .source_cases

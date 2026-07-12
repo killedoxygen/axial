@@ -1871,7 +1871,7 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
         (
             "temp-write-status-install",
             ExecutionDownloadFactKind::TempWriteFailed,
-            DiagnosisId::TempFileLeftover,
+            DiagnosisId::TempFileWriteFailed,
             "block",
             "temporary download state could not be written safely",
             "temporary download state",

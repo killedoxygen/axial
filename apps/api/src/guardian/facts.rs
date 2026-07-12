@@ -29,14 +29,11 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
         ExecutionFactKind::ArtifactMissing | ExecutionFactKind::FileMissing => {
             (GuardianFactId::ArtifactMissing, GuardianDomain::Library)
         }
-        ExecutionFactKind::ArtifactVerified => {
-            (GuardianFactId::ArtifactVerified, GuardianDomain::Library)
-        }
-        ExecutionFactKind::ChecksumMismatch | ExecutionFactKind::DownloadChecksumMismatch => (
+        ExecutionFactKind::DownloadChecksumMismatch => (
             GuardianFactId::ArtifactChecksumMismatch,
             GuardianDomain::Library,
         ),
-        ExecutionFactKind::SizeMismatch | ExecutionFactKind::DownloadSizeMismatch => (
+        ExecutionFactKind::DownloadSizeMismatch => (
             GuardianFactId::ArtifactSizeMismatch,
             GuardianDomain::Library,
         ),
@@ -52,9 +49,10 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
             GuardianFactId::DownloadTempDiscarded,
             GuardianDomain::Download,
         ),
-        ExecutionFactKind::DownloadTempWriteFailed | ExecutionFactKind::FileTempLeftover => {
-            (GuardianFactId::TempFileLeftover, GuardianDomain::Filesystem)
-        }
+        ExecutionFactKind::DownloadTempWriteFailed => (
+            GuardianFactId::TempFileWriteFailed,
+            GuardianDomain::Filesystem,
+        ),
         ExecutionFactKind::DownloadWrittenToTemp => (
             GuardianFactId::DownloadWrittenToTemp,
             GuardianDomain::Download,
@@ -67,9 +65,6 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
             GuardianFactId::AtomicPromotionCompleted,
             GuardianDomain::Filesystem,
         ),
-        ExecutionFactKind::FileCorrupt => {
-            (GuardianFactId::ManagedFileCorrupt, GuardianDomain::Unknown)
-        }
         ExecutionFactKind::FileLocked => {
             (GuardianFactId::FilesystemLocked, GuardianDomain::Filesystem)
         }
@@ -80,6 +75,9 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
             GuardianFactId::FilesystemPermissionDenied,
             GuardianDomain::Filesystem,
         ),
+        ExecutionFactKind::FileTempLeftover => {
+            (GuardianFactId::TempFileObserved, GuardianDomain::Filesystem)
+        }
         ExecutionFactKind::FileQuarantined => {
             (GuardianFactId::ArtifactQuarantined, GuardianDomain::Library)
         }
@@ -191,13 +189,13 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
             GuardianFactId::LauncherStopRequested,
             GuardianDomain::Session,
         ),
-        ExecutionFactKind::ProcessKilled | ExecutionFactKind::ProcessWatchdogAction => (
-            GuardianFactId::WatchdogKilledProcess,
-            GuardianDomain::Session,
-        ),
+        ExecutionFactKind::ProcessKilled => (process_killed_fact_id(fact), GuardianDomain::Session),
         ExecutionFactKind::ProcessExitCode => (exit_code_fact_id(fact), GuardianDomain::Session),
         ExecutionFactKind::ProcessBootEvidence => {
             (GuardianFactId::BootMarkerObserved, GuardianDomain::Session)
+        }
+        ExecutionFactKind::ProcessWatchdogAction => {
+            (process_watchdog_fact_id(fact), GuardianDomain::Session)
         }
         ExecutionFactKind::ProcessExited => {
             (GuardianFactId::ProcessExited, GuardianDomain::Session)
@@ -207,12 +205,6 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
         }
         ExecutionFactKind::ProviderDataInvalid => {
             (GuardianFactId::ProviderDataInvalid, GuardianDomain::Network)
-        }
-        ExecutionFactKind::RollbackAvailable => {
-            (GuardianFactId::RollbackAvailable, GuardianDomain::Unknown)
-        }
-        ExecutionFactKind::RollbackUnavailable => {
-            (GuardianFactId::RollbackUnavailable, GuardianDomain::Unknown)
         }
     };
     (id, domain, reliability_for_execution_fact(fact.kind))
@@ -242,16 +234,34 @@ fn public_safe_fields(fields: &[EvidenceField]) -> Vec<EvidenceField> {
 }
 
 fn exit_code_fact_id(fact: &ExecutionFact) -> GuardianFactId {
-    let exit_code = fact
-        .fields
-        .iter()
-        .find(|field| field.key == "exit_code")
-        .and_then(|field| field.value.parse::<i32>().ok());
+    let exit_code = execution_field(fact, "exit_code").and_then(|value| value.parse::<i32>().ok());
     match exit_code {
         Some(0) => GuardianFactId::ExitCodeZero,
         Some(_) => GuardianFactId::ExitCodeNonzero,
         None => GuardianFactId::ExitCodeUnknown,
     }
+}
+
+fn process_killed_fact_id(fact: &ExecutionFact) -> GuardianFactId {
+    match execution_field(fact, "reason") {
+        Some("startup_watchdog") => GuardianFactId::WatchdogKilledProcess,
+        Some(_) | None => GuardianFactId::ProcessKilled,
+    }
+}
+
+fn process_watchdog_fact_id(fact: &ExecutionFact) -> GuardianFactId {
+    match execution_field(fact, "action") {
+        Some("startup_no_output_kill") => GuardianFactId::WatchdogKilledProcess,
+        Some("startup_window_expired") => GuardianFactId::StartupWindowExpired,
+        Some(_) | None => GuardianFactId::WatchdogActionObserved,
+    }
+}
+
+fn execution_field<'a>(fact: &'a ExecutionFact, key: &str) -> Option<&'a str> {
+    fact.fields
+        .iter()
+        .find(|field| field.key == key)
+        .map(|field| field.value.as_str())
 }
 
 fn reliability_for_execution_fact(kind: ExecutionFactKind) -> FactReliability {
@@ -262,9 +272,7 @@ fn reliability_for_execution_fact(kind: ExecutionFactKind) -> FactReliability {
         | ExecutionFactKind::RuntimeWrongMajor
         | ExecutionFactKind::RuntimeWrongUpdate
         | ExecutionFactKind::DownloadChecksumMismatch
-        | ExecutionFactKind::DownloadSizeMismatch
-        | ExecutionFactKind::ChecksumMismatch
-        | ExecutionFactKind::SizeMismatch => FactReliability::ValidatedProbe,
+        | ExecutionFactKind::DownloadSizeMismatch => FactReliability::ValidatedProbe,
         ExecutionFactKind::RuntimeJavaOverrideEmpty
         | ExecutionFactKind::RuntimeJavaOverrideUndefinedSentinel => {
             FactReliability::ExactClassifier

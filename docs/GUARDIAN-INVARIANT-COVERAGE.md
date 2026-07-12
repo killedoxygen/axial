@@ -16,7 +16,7 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | I4 | current_hand_attempt_bounds_registered |
 | I5 | launch_failure_surfaces_bounded_and_redacted |
 | I6 | implemented_memory_trigger_rules_registered |
-| I7 | pending_typed_install_error_and_delegation_proof |
+| I7 | execution_sources_classified_loader_worker_pending |
 | I8 | preflight_costs_declared_measurement_pending_phase_4 |
 | I9 | reserved_facts_unused_agent_demo_pending_phase_5 |
 
@@ -28,10 +28,10 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Guardian modes | 3 |
 | Kernel cells | 540 |
 | Public kernel cells | 90 |
-| Diagnosis rules | 59 |
-| Registered facts | 120 |
+| Diagnosis rules | 60 |
+| Registered facts | 119 |
 | Preflight senses | 6 |
-| Adapter sources | 110 |
+| Adapter sources | 104 |
 | Repair hands | 3 |
 
 ### Decision Distribution

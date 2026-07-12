@@ -283,10 +283,10 @@
       }
     },
     {
-      "id": "install_failure.temp_file_leftover",
+      "id": "install_failure.temp_file_write_failed",
       "input": {
         "surface": "install_failure",
-        "diagnosis": "temp_file_leftover",
+        "diagnosis": "temp_file_write_failed",
         "decision": "Block",
         "component": null,
         "platform": null
@@ -296,7 +296,7 @@
         "phase": "Downloading",
         "summary": "Guardian blocked install because temporary download state could not be written safely.",
         "details": [
-          "The install did not continue after temporary download state could not be written or cleaned safely."
+          "The install did not continue after temporary download state could not be written safely."
         ],
         "guidance": [
           "Check app data permissions and disk availability before retrying the install."

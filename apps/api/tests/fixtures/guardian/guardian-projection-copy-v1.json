@@ -289,23 +289,23 @@
       }
     },
     {
-      "id": "install.temp_leftover",
+      "id": "install.temp_write_failed",
       "input": {
         "surface": "install_persistence",
-        "diagnosis_id": "temp_file_leftover",
+        "diagnosis_id": "temp_file_write_failed",
         "facts": [
           "guardian_outcome_decision:block",
           "guardian_outcome_summary:Guardian blocked install because temporary download state could not be written safely.",
-          "guardian_outcome_detail:The install did not continue after temporary download state could not be written or cleaned safely."
+          "guardian_outcome_detail:The install did not continue after temporary download state could not be written safely."
         ]
       },
       "output": {
         "surface": "install_persistence",
         "outcome": {
-          "diagnosis_id": "temp_file_leftover",
+          "diagnosis_id": "temp_file_write_failed",
           "decision": "block",
           "label": "Guardian blocked install because temporary download state could not be written safely.",
-          "detail": "The install did not continue after temporary download state could not be written or cleaned safely.",
+          "detail": "The install did not continue after temporary download state could not be written safely.",
           "guidance": [
             "Check app data permissions and disk availability before retrying the install."
           ]

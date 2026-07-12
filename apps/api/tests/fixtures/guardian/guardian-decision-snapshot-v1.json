@@ -640,6 +640,58 @@
       ]
     },
     {
+      "id": "filesystem_locked--filesystem_locked",
+      "input": {
+        "kind": "fact",
+        "fact_id": "filesystem_locked",
+        "domain": "Filesystem",
+        "reliability": "DirectStructured",
+        "severity": null,
+        "confidence": null
+      },
+      "allowed_phases": [
+        "Planning",
+        "Validating",
+        "Installing",
+        "Preparing"
+      ],
+      "diagnosis": {
+        "id": "filesystem_locked",
+        "domain": "Filesystem",
+        "severity": "Blocking",
+        "confidence": "Confirmed",
+        "fact_ids": [
+          "filesystem_locked"
+        ],
+        "candidate_actions": [
+          "Block"
+        ],
+        "public_reason_template": "filesystem_locked"
+      },
+      "ownership_profiles": [
+        {
+          "ownership": "LauncherManaged",
+          "policy_profile": "profile-b8097791b159425c"
+        },
+        {
+          "ownership": "CompositionManaged",
+          "policy_profile": "profile-b8097791b159425c"
+        },
+        {
+          "ownership": "UserOwned",
+          "policy_profile": "profile-b8097791b159425c"
+        },
+        {
+          "ownership": "ExternalProviderDerived",
+          "policy_profile": "profile-b8097791b159425c"
+        },
+        {
+          "ownership": "Unknown",
+          "policy_profile": "profile-b8097791b159425c"
+        }
+      ]
+    },
+    {
       "id": "filesystem_permission_denied--filesystem_permission_denied",
       "input": {
         "kind": "fact",
@@ -2281,60 +2333,6 @@
       ]
     },
     {
-      "id": "launcher_managed_artifact_corrupt--managed_file_corrupt",
-      "input": {
-        "kind": "fact",
-        "fact_id": "managed_file_corrupt",
-        "domain": "Unknown",
-        "reliability": "DirectStructured",
-        "severity": null,
-        "confidence": null
-      },
-      "allowed_phases": [
-        "Validating",
-        "Downloading",
-        "Installing",
-        "Planning"
-      ],
-      "diagnosis": {
-        "id": "launcher_managed_artifact_corrupt",
-        "domain": "Unknown",
-        "severity": "Repairable",
-        "confidence": "Confirmed",
-        "fact_ids": [
-          "managed_file_corrupt"
-        ],
-        "candidate_actions": [
-          "Quarantine",
-          "Repair",
-          "Block"
-        ],
-        "public_reason_template": "managed_artifact_corrupt"
-      },
-      "ownership_profiles": [
-        {
-          "ownership": "LauncherManaged",
-          "policy_profile": "profile-39949cdc13023965"
-        },
-        {
-          "ownership": "CompositionManaged",
-          "policy_profile": "profile-39949cdc13023965"
-        },
-        {
-          "ownership": "UserOwned",
-          "policy_profile": "profile-b8097791b159425c"
-        },
-        {
-          "ownership": "ExternalProviderDerived",
-          "policy_profile": "profile-3d8b7dc9a59e08bc"
-        },
-        {
-          "ownership": "Unknown",
-          "policy_profile": "profile-b8097791b159425c"
-        }
-      ]
-    },
-    {
       "id": "launcher_managed_artifact_signature_corrupt--launcher_managed_artifact_signature_corruption",
       "input": {
         "kind": "fact",
@@ -3548,6 +3546,58 @@
       ]
     },
     {
+      "id": "process_lifecycle_observed--process_killed",
+      "input": {
+        "kind": "fact",
+        "fact_id": "process_killed",
+        "domain": "Session",
+        "reliability": "ProcessLifecycle",
+        "severity": null,
+        "confidence": null
+      },
+      "allowed_phases": [
+        "Launching",
+        "Running",
+        "Completed",
+        "Failed"
+      ],
+      "diagnosis": {
+        "id": "process_lifecycle_observed",
+        "domain": "Session",
+        "severity": "Info",
+        "confidence": "High",
+        "fact_ids": [
+          "process_killed"
+        ],
+        "candidate_actions": [
+          "RecordOnly"
+        ],
+        "public_reason_template": "process_lifecycle_observed"
+      },
+      "ownership_profiles": [
+        {
+          "ownership": "LauncherManaged",
+          "policy_profile": "profile-561e3fab29ecd7a6"
+        },
+        {
+          "ownership": "CompositionManaged",
+          "policy_profile": "profile-561e3fab29ecd7a6"
+        },
+        {
+          "ownership": "UserOwned",
+          "policy_profile": "profile-561e3fab29ecd7a6"
+        },
+        {
+          "ownership": "ExternalProviderDerived",
+          "policy_profile": "profile-561e3fab29ecd7a6"
+        },
+        {
+          "ownership": "Unknown",
+          "policy_profile": "profile-561e3fab29ecd7a6"
+        }
+      ]
+    },
+    {
       "id": "process_lifecycle_observed--process_spawned",
       "input": {
         "kind": "fact",
@@ -3570,6 +3620,58 @@
         "confidence": "High",
         "fact_ids": [
           "process_spawned"
+        ],
+        "candidate_actions": [
+          "RecordOnly"
+        ],
+        "public_reason_template": "process_lifecycle_observed"
+      },
+      "ownership_profiles": [
+        {
+          "ownership": "LauncherManaged",
+          "policy_profile": "profile-561e3fab29ecd7a6"
+        },
+        {
+          "ownership": "CompositionManaged",
+          "policy_profile": "profile-561e3fab29ecd7a6"
+        },
+        {
+          "ownership": "UserOwned",
+          "policy_profile": "profile-561e3fab29ecd7a6"
+        },
+        {
+          "ownership": "ExternalProviderDerived",
+          "policy_profile": "profile-561e3fab29ecd7a6"
+        },
+        {
+          "ownership": "Unknown",
+          "policy_profile": "profile-561e3fab29ecd7a6"
+        }
+      ]
+    },
+    {
+      "id": "process_lifecycle_observed--watchdog_action_observed",
+      "input": {
+        "kind": "fact",
+        "fact_id": "watchdog_action_observed",
+        "domain": "Session",
+        "reliability": "ProcessLifecycle",
+        "severity": null,
+        "confidence": null
+      },
+      "allowed_phases": [
+        "Launching",
+        "Running",
+        "Completed",
+        "Failed"
+      ],
+      "diagnosis": {
+        "id": "process_lifecycle_observed",
+        "domain": "Session",
+        "severity": "Info",
+        "confidence": "High",
+        "fact_ids": [
+          "watchdog_action_observed"
         ],
         "candidate_actions": [
           "RecordOnly"
@@ -3652,10 +3754,10 @@
       ]
     },
     {
-      "id": "temp_file_leftover--temp_file_leftover",
+      "id": "temp_file_write_failed--temp_file_write_failed",
       "input": {
         "kind": "fact",
-        "fact_id": "temp_file_leftover",
+        "fact_id": "temp_file_write_failed",
         "domain": "Filesystem",
         "reliability": "DirectStructured",
         "severity": null,
@@ -3668,17 +3770,17 @@
         "Planning"
       ],
       "diagnosis": {
-        "id": "temp_file_leftover",
+        "id": "temp_file_write_failed",
         "domain": "Filesystem",
         "severity": "Blocking",
         "confidence": "Confirmed",
         "fact_ids": [
-          "temp_file_leftover"
+          "temp_file_write_failed"
         ],
         "candidate_actions": [
           "Block"
         ],
-        "public_reason_template": "temp_file_leftover"
+        "public_reason_template": "temp_file_write_failed"
       },
       "ownership_profiles": [
         {

@@ -8,11 +8,11 @@ use super::{
     GuardianMinecraftArtifactRepairDescriptor, GuardianMode, MissingDownload, QuarantineRedownload,
     RepairAuthorization,
 };
+use crate::execution::ExecutionFact;
 use crate::execution::download::{
     DownloadChecksum, DownloadChecksumAlgorithm, DownloadToTempRequest, download_url_to_temp,
 };
 use crate::execution::file::{QuarantineFileRequest, quarantine_launcher_managed_file};
-use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
     CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
@@ -928,34 +928,9 @@ fn default_suppression_until(observed_at: &str) -> Option<String> {
 fn fact_ids(facts: &[ExecutionFact]) -> Vec<String> {
     facts
         .iter()
-        .map(|fact| fact_id(fact.kind))
+        .map(|fact| fact.kind.as_str())
         .map(|fact| safe_id(fact, "execution_fact"))
         .collect()
-}
-
-fn fact_id(kind: ExecutionFactKind) -> &'static str {
-    match kind {
-        ExecutionFactKind::FileQuarantined => "file_quarantined",
-        ExecutionFactKind::DownloadPromoted => "download_promoted",
-        ExecutionFactKind::FilePromoted => "file_promoted",
-        ExecutionFactKind::ArtifactVerified => "artifact_verified",
-        ExecutionFactKind::DownloadChecksumMismatch => "download_checksum_mismatch",
-        ExecutionFactKind::DownloadSizeMismatch => "download_size_mismatch",
-        ExecutionFactKind::DownloadProviderFailure => "download_provider_failure",
-        ExecutionFactKind::DownloadNetworkFailure => "download_network_failure",
-        ExecutionFactKind::DownloadInterrupted => "download_interrupted",
-        ExecutionFactKind::DownloadTempDiscarded => "download_temp_discarded",
-        ExecutionFactKind::DownloadTempWriteFailed => "download_temp_write_failed",
-        ExecutionFactKind::DownloadWrittenToTemp => "download_written_to_temp",
-        ExecutionFactKind::DownloadPromotionFailed => "download_promotion_failed",
-        ExecutionFactKind::FileMissing => "file_missing",
-        ExecutionFactKind::FileLocked => "file_locked",
-        ExecutionFactKind::FileOwnershipUnknown => "file_ownership_unknown",
-        ExecutionFactKind::FilePermissionDenied => "file_permission_denied",
-        ExecutionFactKind::ProviderDataInvalid => "provider_data_invalid",
-        ExecutionFactKind::PrimitiveRefused => "primitive_refused",
-        _ => "execution_fact",
-    }
 }
 
 fn artifact_repair_outcome(
@@ -1076,19 +1051,19 @@ mod tests {
     #[test]
     fn artifact_repair_fact_ids_preserve_download_failure_family() {
         assert_eq!(
-            super::fact_id(crate::execution::ExecutionFactKind::DownloadPromotionFailed),
+            crate::execution::ExecutionFactKind::DownloadPromotionFailed.as_str(),
             "download_promotion_failed"
         );
         assert_eq!(
-            super::fact_id(crate::execution::ExecutionFactKind::DownloadTempWriteFailed),
+            crate::execution::ExecutionFactKind::DownloadTempWriteFailed.as_str(),
             "download_temp_write_failed"
         );
         assert_eq!(
-            super::fact_id(crate::execution::ExecutionFactKind::DownloadTempDiscarded),
+            crate::execution::ExecutionFactKind::DownloadTempDiscarded.as_str(),
             "download_temp_discarded"
         );
         assert_eq!(
-            super::fact_id(crate::execution::ExecutionFactKind::ProviderDataInvalid),
+            crate::execution::ExecutionFactKind::ProviderDataInvalid.as_str(),
             "provider_data_invalid"
         );
     }

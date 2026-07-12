@@ -64,8 +64,25 @@ pub struct ExecutionFact {
     pub fields: Vec<EvidenceField>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ExecutionFactSemantics {
+    Diagnostic,
+    ConditionEvidence,
+    NonFailure,
+}
+
+impl ExecutionFactSemantics {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Diagnostic => "diagnostic",
+            Self::ConditionEvidence => "condition_evidence",
+            Self::NonFailure => "non_failure",
+        }
+    }
+}
+
 macro_rules! execution_fact_kinds {
-    ($($variant:ident),+ $(,)?) => {
+    ($($variant:ident => ($id:literal, $semantics:ident)),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
         pub enum ExecutionFactKind {
             $($variant),+
@@ -73,70 +90,76 @@ macro_rules! execution_fact_kinds {
 
         impl ExecutionFactKind {
             pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $id),+
+                }
+            }
+
+            pub const fn semantics(self) -> ExecutionFactSemantics {
+                match self {
+                    $(Self::$variant => ExecutionFactSemantics::$semantics),+
+                }
+            }
         }
     };
 }
 
 execution_fact_kinds! {
-    ArtifactMissing,
-    ArtifactVerified,
-    ChecksumMismatch,
-    DownloadChecksumMismatch,
-    DownloadInterrupted,
-    DownloadNetworkFailure,
-    DownloadPromoted,
-    DownloadPromotionFailed,
-    DownloadProviderFailure,
-    DownloadSizeMismatch,
-    DownloadTempDiscarded,
-    DownloadTempWriteFailed,
-    DownloadWrittenToTemp,
-    SizeMismatch,
-    FileCorrupt,
-    FileLocked,
-    FileMissing,
-    FileOwnershipUnknown,
-    FilePermissionDenied,
-    FileQuarantined,
-    FilePromoted,
-    FileTempLeftover,
-    FileWrittenToTemp,
-    InstallDependencyFailed,
-    InstallExecutionFailed,
-    InstallProcessorFailed,
-    RuntimeCorrupt,
-    RuntimeJavaOverrideEmpty,
-    RuntimeJavaOverrideUndefinedSentinel,
-    RuntimeMissingExecutable,
-    RuntimeProbeFailed,
-    RuntimeReadyMarkerMissing,
-    RuntimeRepairApplied,
-    RuntimeRosettaRequired,
-    RuntimeUnavailableForPlatform,
-    RuntimeWrongMajor,
-    RuntimeWrongUpdate,
-    JvmArgsEmpty,
-    JvmArgsParseFailed,
-    JvmArgReservedLauncherFlag,
-    JvmArgMemoryConflict,
-    JvmArgUnsupportedGc,
-    JvmArgUnlockOrderInvalid,
-    JvmArgUnsafeClasspathOverride,
-    JvmArgUnsafeNativePathOverride,
-    JvmArgAgentOverride,
-    LaunchCommandInvalid,
-    LaunchCommandPrepared,
-    ProcessSpawned,
-    ProcessStopIntent,
-    ProcessKilled,
-    ProcessExitCode,
-    ProcessBootEvidence,
-    ProcessWatchdogAction,
-    ProcessExited,
-    PrimitiveRefused,
-    ProviderDataInvalid,
-    RollbackAvailable,
-    RollbackUnavailable,
+    ArtifactMissing => ("artifact_missing", Diagnostic),
+    DownloadChecksumMismatch => ("download_checksum_mismatch", Diagnostic),
+    DownloadInterrupted => ("download_interrupted", Diagnostic),
+    DownloadNetworkFailure => ("download_network_failure", Diagnostic),
+    DownloadPromoted => ("download_promoted", NonFailure),
+    DownloadPromotionFailed => ("download_promotion_failed", Diagnostic),
+    DownloadProviderFailure => ("download_provider_failure", Diagnostic),
+    DownloadSizeMismatch => ("download_size_mismatch", Diagnostic),
+    DownloadTempDiscarded => ("download_temp_discarded", NonFailure),
+    DownloadTempWriteFailed => ("download_temp_write_failed", Diagnostic),
+    DownloadWrittenToTemp => ("download_written_to_temp", NonFailure),
+    FileLocked => ("file_locked", Diagnostic),
+    FileMissing => ("file_missing", Diagnostic),
+    FileOwnershipUnknown => ("file_ownership_unknown", Diagnostic),
+    FilePermissionDenied => ("file_permission_denied", Diagnostic),
+    FileQuarantined => ("file_quarantined", NonFailure),
+    FilePromoted => ("file_promoted", NonFailure),
+    FileTempLeftover => ("file_temp_leftover", ConditionEvidence),
+    FileWrittenToTemp => ("file_written_to_temp", NonFailure),
+    InstallDependencyFailed => ("install_dependency_failed", Diagnostic),
+    InstallExecutionFailed => ("install_execution_failed", Diagnostic),
+    InstallProcessorFailed => ("install_processor_failed", Diagnostic),
+    RuntimeCorrupt => ("runtime_corrupt", Diagnostic),
+    RuntimeJavaOverrideEmpty => ("runtime_java_override_empty", ConditionEvidence),
+    RuntimeJavaOverrideUndefinedSentinel => ("runtime_java_override_undefined_sentinel", ConditionEvidence),
+    RuntimeMissingExecutable => ("runtime_missing_executable", Diagnostic),
+    RuntimeProbeFailed => ("runtime_probe_failed", Diagnostic),
+    RuntimeReadyMarkerMissing => ("runtime_ready_marker_missing", ConditionEvidence),
+    RuntimeRepairApplied => ("runtime_repair_applied", NonFailure),
+    RuntimeRosettaRequired => ("runtime_rosetta_required", Diagnostic),
+    RuntimeUnavailableForPlatform => ("runtime_unavailable_for_platform", Diagnostic),
+    RuntimeWrongMajor => ("runtime_wrong_major", ConditionEvidence),
+    RuntimeWrongUpdate => ("runtime_wrong_update", ConditionEvidence),
+    JvmArgsEmpty => ("jvm_args_empty", ConditionEvidence),
+    JvmArgsParseFailed => ("jvm_args_parse_failed", ConditionEvidence),
+    JvmArgReservedLauncherFlag => ("jvm_arg_reserved_launcher_flag", ConditionEvidence),
+    JvmArgMemoryConflict => ("jvm_arg_memory_conflict", ConditionEvidence),
+    JvmArgUnsupportedGc => ("jvm_arg_unsupported_gc", ConditionEvidence),
+    JvmArgUnlockOrderInvalid => ("jvm_arg_unlock_order_invalid", ConditionEvidence),
+    JvmArgUnsafeClasspathOverride => ("jvm_arg_unsafe_classpath_override", ConditionEvidence),
+    JvmArgUnsafeNativePathOverride => ("jvm_arg_unsafe_native_path_override", ConditionEvidence),
+    JvmArgAgentOverride => ("jvm_arg_agent_override", ConditionEvidence),
+    LaunchCommandInvalid => ("launch_command_invalid", Diagnostic),
+    LaunchCommandPrepared => ("launch_command_prepared", ConditionEvidence),
+    ProcessSpawned => ("process_spawned", ConditionEvidence),
+    ProcessStopIntent => ("process_stop_intent", ConditionEvidence),
+    ProcessKilled => ("process_killed", ConditionEvidence),
+    ProcessExitCode => ("process_exit_code", ConditionEvidence),
+    ProcessBootEvidence => ("process_boot_evidence", ConditionEvidence),
+    ProcessWatchdogAction => ("process_watchdog_action", ConditionEvidence),
+    ProcessExited => ("process_exited", ConditionEvidence),
+    PrimitiveRefused => ("primitive_refused", Diagnostic),
+    ProviderDataInvalid => ("provider_data_invalid", Diagnostic),
 }
 
 pub fn execution_fact_stage_evidence(facts: &[ExecutionFact]) -> Vec<LaunchStageEvidence> {

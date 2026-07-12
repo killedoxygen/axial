@@ -26,6 +26,7 @@
         "artifact_ownership_unsafe",
         "atomic_promotion_failed",
         "download_unavailable",
+        "filesystem_locked",
         "filesystem_permission_denied",
         "install_artifact_metadata_invalid",
         "install_dependency_failed",
@@ -77,7 +78,7 @@
       "guardian_diagnosis_ids": [
         "persisted_state_schema_invalid",
         "process_lifecycle_observed",
-        "temp_file_leftover",
+        "temp_file_write_failed",
         "installed_version_metadata_missing",
         "parent_version_metadata_missing",
         "install_incomplete",

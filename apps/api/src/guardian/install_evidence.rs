@@ -514,7 +514,7 @@ mod tests {
             ),
             (
                 GuardianInstallArtifactFailureKind::TempWriteFailed,
-                "temp_file_leftover",
+                "temp_file_write_failed",
             ),
             (
                 GuardianInstallArtifactFailureKind::PromotionFailed,
@@ -742,7 +742,7 @@ mod tests {
             ),
             (
                 GuardianInstallArtifactFailureKind::TempWriteFailed,
-                "temp_file_leftover",
+                "temp_file_write_failed",
                 "temporary download state could not be written safely",
             ),
             (
@@ -951,7 +951,7 @@ mod tests {
             (
                 MinecraftDownloadFactKind::TempWriteFailed,
                 GuardianInstallArtifactFailureKind::TempWriteFailed,
-                "temp_file_leftover",
+                "temp_file_write_failed",
             ),
             (
                 MinecraftDownloadFactKind::PromoteFailed,

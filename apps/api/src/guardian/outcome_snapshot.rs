@@ -31,7 +31,7 @@ const EXPECTED_CASE_IDS: [&str; EXPECTED_CASE_COUNT] = [
     "install_failure.runtime_unavailable",
     "install_failure.rosetta_required",
     "install_failure.permission_denied",
-    "install_failure.temp_file_leftover",
+    "install_failure.temp_file_write_failed",
     "install_failure.atomic_promotion_failed",
     "install_failure.unsafe_ownership",
     "launch_recovery_suppressed.managed_runtime",
@@ -439,8 +439,8 @@ fn install_failure_case_id(
         (DiagnosisId::FilesystemPermissionDenied, GuardianActionKind::Block, None, None) => {
             "install_failure.permission_denied"
         }
-        (DiagnosisId::TempFileLeftover, GuardianActionKind::Block, None, None) => {
-            "install_failure.temp_file_leftover"
+        (DiagnosisId::TempFileWriteFailed, GuardianActionKind::Block, None, None) => {
+            "install_failure.temp_file_write_failed"
         }
         (DiagnosisId::AtomicPromotionFailed, GuardianActionKind::Block, None, None) => {
             "install_failure.atomic_promotion_failed"

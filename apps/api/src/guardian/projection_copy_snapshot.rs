@@ -25,7 +25,7 @@ const EXPECTED_CASE_IDS: [&str; 20] = [
     "install.runtime_unavailable",
     "install.rosetta",
     "install.filesystem_permission",
-    "install.temp_leftover",
+    "install.temp_write_failed",
     "install.atomic_promotion",
     "install.ownership_unsafe",
     "install.malformed_summary",
@@ -253,7 +253,7 @@ fn assert_snapshot_coverage(snapshot: &GuardianProjectionCopySnapshot) {
         (DiagnosisId::ManagedRuntimeUnavailableForPlatform, "block"),
         (DiagnosisId::ManagedRuntimeRosettaRequired, "block"),
         (DiagnosisId::FilesystemPermissionDenied, "block"),
-        (DiagnosisId::TempFileLeftover, "block"),
+        (DiagnosisId::TempFileWriteFailed, "block"),
         (DiagnosisId::AtomicPromotionFailed, "block"),
         (DiagnosisId::ArtifactOwnershipUnsafe, "block"),
     ];

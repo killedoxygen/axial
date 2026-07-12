@@ -367,8 +367,9 @@ const fn priority_profile(id: DiagnosisId) -> PriorityProfile {
         | DiagnosisId::InstallExecutionFailed
         | DiagnosisId::InstallProcessorFailed
         | DiagnosisId::DownloadUnavailable
+        | DiagnosisId::FilesystemLocked
         | DiagnosisId::FilesystemPermissionDenied
-        | DiagnosisId::TempFileLeftover
+        | DiagnosisId::TempFileWriteFailed
         | DiagnosisId::AtomicPromotionFailed
         | DiagnosisId::LaunchPrepareFailed
         | DiagnosisId::OutOfMemory
@@ -937,7 +938,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         [
             ArtifactChecksumMismatch,
             ArtifactSizeMismatch,
-            ManagedFileCorrupt,
             ArtifactMissing,
         ],
         RuleDomain::SupportingFact,
@@ -998,6 +998,15 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         "download_unavailable"
     ),
     rule!(
+        FilesystemLocked,
+        [FilesystemLocked],
+        RuleDomain::Fixed(GuardianDomain::Filesystem),
+        RuleSeverity::Fixed(GuardianSeverity::Blocking),
+        RuleConfidence::Fixed(GuardianConfidence::Confirmed),
+        [Block],
+        "filesystem_locked"
+    ),
+    rule!(
         FilesystemPermissionDenied,
         [FilesystemPermissionDenied],
         RuleDomain::Fixed(GuardianDomain::Filesystem),
@@ -1006,14 +1015,19 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         [Block],
         "filesystem_permission_denied"
     ),
-    rule!(
-        TempFileLeftover,
-        [TempFileLeftover],
+    full_rule!(
+        TempFileWriteFailed,
+        triggers: [TempFileWriteFailed],
+        evidence: [TempFileWriteFailed, TempFileObserved],
+        phases: &[],
+        required: &[],
+        suppressions: &[],
         RuleDomain::Fixed(GuardianDomain::Filesystem),
         RuleSeverity::Fixed(GuardianSeverity::Blocking),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
         [Block],
-        "temp_file_leftover"
+        clauses: &[],
+        "temp_file_write_failed"
     ),
     rule!(
         AtomicPromotionFailed,
@@ -1083,6 +1097,8 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         triggers: [
             ProcessSpawned,
             LauncherStopRequested,
+            ProcessKilled,
+            WatchdogActionObserved,
             WatchdogKilledProcess,
             ExitCodeZero,
             ExitCodeNonzero,
@@ -1095,6 +1111,8 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         evidence: [
             ProcessSpawned,
             LauncherStopRequested,
+            ProcessKilled,
+            WatchdogActionObserved,
             WatchdogKilledProcess,
             ExitCodeZero,
             ExitCodeNonzero,

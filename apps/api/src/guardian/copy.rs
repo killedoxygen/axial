@@ -2156,6 +2156,21 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
     ),
     fixed_rule(
         key(
+            Some(DiagnosisId::FilesystemLocked),
+            GuardianActionKind::Block,
+            CopyContextKey::InstallFailure,
+        ),
+        OperationPhase::Downloading,
+        "Guardian blocked install because a launcher-managed file is in use.",
+        &[CopyLine::Static(
+            "The install did not continue after the filesystem reported a locked file.",
+        )],
+        &[CopyLine::Static(
+            "Close apps that may be using launcher files, then retry the install.",
+        )],
+    ),
+    fixed_rule(
+        key(
             Some(DiagnosisId::FilesystemPermissionDenied),
             GuardianActionKind::Block,
             CopyContextKey::InstallFailure,
@@ -2171,14 +2186,14 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
     ),
     fixed_rule(
         key(
-            Some(DiagnosisId::TempFileLeftover),
+            Some(DiagnosisId::TempFileWriteFailed),
             GuardianActionKind::Block,
             CopyContextKey::InstallFailure,
         ),
         OperationPhase::Downloading,
         "Guardian blocked install because temporary download state could not be written safely.",
         &[CopyLine::Static(
-            "The install did not continue after temporary download state could not be written or cleaned safely.",
+            "The install did not continue after temporary download state could not be written safely.",
         )],
         &[CopyLine::Static(
             "Check app data permissions and disk availability before retrying the install.",
@@ -4338,7 +4353,7 @@ mod tests {
 
     #[test]
     fn copy_rule_table_is_unique_and_covers_the_five_migrated_families() {
-        assert_eq!(GUARDIAN_COPY_RULES.len(), 27);
+        assert_eq!(GUARDIAN_COPY_RULES.len(), 28);
         for (index, rule) in GUARDIAN_COPY_RULES.iter().enumerate() {
             assert!(
                 GUARDIAN_COPY_RULES[index + 1..]
@@ -4373,7 +4388,7 @@ mod tests {
             assert!(rule.details.len() <= MAX_COLLECTION_LINES);
             assert!(rule.guidance.len() <= MAX_COLLECTION_LINES);
         }
-        assert_eq!(counts, [4, 4, 12, 6, 1]);
+        assert_eq!(counts, [4, 4, 13, 6, 1]);
     }
 
     #[test]

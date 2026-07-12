@@ -27,7 +27,7 @@
     },
     {
       "id": "I7",
-      "status": "pending_typed_install_error_and_delegation_proof"
+      "status": "execution_sources_classified_loader_worker_pending"
     },
     {
       "id": "I8",
@@ -4865,13 +4865,11 @@
       "triggers": [
         "artifact_checksum_mismatch",
         "artifact_size_mismatch",
-        "managed_file_corrupt",
         "artifact_missing"
       ],
       "evidence": [
         "artifact_checksum_mismatch",
         "artifact_size_mismatch",
-        "managed_file_corrupt",
         "artifact_missing"
       ],
       "phases": [],
@@ -4957,6 +4955,20 @@
       "memory_feedback": false
     },
     {
+      "diagnosis": "filesystem_locked",
+      "triggers": [
+        "filesystem_locked"
+      ],
+      "evidence": [
+        "filesystem_locked"
+      ],
+      "phases": [],
+      "actions": [
+        "Block"
+      ],
+      "memory_feedback": false
+    },
+    {
       "diagnosis": "filesystem_permission_denied",
       "triggers": [
         "filesystem_permission_denied"
@@ -4971,12 +4983,13 @@
       "memory_feedback": false
     },
     {
-      "diagnosis": "temp_file_leftover",
+      "diagnosis": "temp_file_write_failed",
       "triggers": [
-        "temp_file_leftover"
+        "temp_file_write_failed"
       ],
       "evidence": [
-        "temp_file_leftover"
+        "temp_file_write_failed",
+        "temp_file_observed"
       ],
       "phases": [],
       "actions": [
@@ -5098,6 +5111,8 @@
       "triggers": [
         "process_spawned",
         "launcher_stop_requested",
+        "process_killed",
+        "watchdog_action_observed",
         "watchdog_killed_process",
         "exit_code_zero",
         "exit_code_nonzero",
@@ -5110,6 +5125,8 @@
       "evidence": [
         "process_spawned",
         "launcher_stop_requested",
+        "process_killed",
+        "watchdog_action_observed",
         "watchdog_killed_process",
         "exit_code_zero",
         "exit_code_nonzero",
@@ -5396,11 +5413,6 @@
       "referenced_by_rule": true
     },
     {
-      "fact": "artifact_verified",
-      "availability": "registered_current",
-      "referenced_by_rule": false
-    },
-    {
       "fact": "asset_index_missing",
       "availability": "registered_current",
       "referenced_by_rule": true
@@ -5503,7 +5515,7 @@
     {
       "fact": "filesystem_locked",
       "availability": "registered_current",
-      "referenced_by_rule": false
+      "referenced_by_rule": true
     },
     {
       "fact": "filesystem_permission_denied",
@@ -5726,11 +5738,6 @@
       "referenced_by_rule": true
     },
     {
-      "fact": "managed_file_corrupt",
-      "availability": "registered_current",
-      "referenced_by_rule": true
-    },
-    {
       "fact": "managed_runtime_corrupt",
       "availability": "registered_current",
       "referenced_by_rule": true
@@ -5906,6 +5913,11 @@
       "referenced_by_rule": true
     },
     {
+      "fact": "process_killed",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
       "fact": "process_spawned",
       "availability": "registered_current",
       "referenced_by_rule": true
@@ -5931,22 +5943,17 @@
       "referenced_by_rule": false
     },
     {
-      "fact": "rollback_available",
-      "availability": "registered_current",
-      "referenced_by_rule": false
-    },
-    {
-      "fact": "rollback_unavailable",
-      "availability": "registered_current",
-      "referenced_by_rule": false
-    },
-    {
       "fact": "startup_window_expired",
       "availability": "registered_current",
       "referenced_by_rule": true
     },
     {
-      "fact": "temp_file_leftover",
+      "fact": "temp_file_observed",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "temp_file_write_failed",
       "availability": "registered_current",
       "referenced_by_rule": true
     },
@@ -5957,6 +5964,11 @@
     },
     {
       "fact": "version_json_missing",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "watchdog_action_observed",
       "availability": "registered_current",
       "referenced_by_rule": true
     },
@@ -6019,240 +6031,412 @@
   "adapters": {
     "execution": [
       {
-        "source": "ArtifactMissing",
-        "fact": "artifact_missing"
+        "source": "artifact_missing",
+        "classification": "diagnostic",
+        "fact": "artifact_missing",
+        "diagnoses": [
+          "launcher_managed_artifact_corrupt"
+        ]
       },
       {
-        "source": "ArtifactVerified",
-        "fact": "artifact_verified"
+        "source": "download_checksum_mismatch",
+        "classification": "diagnostic",
+        "fact": "artifact_checksum_mismatch",
+        "diagnoses": [
+          "launcher_managed_artifact_corrupt"
+        ]
       },
       {
-        "source": "ChecksumMismatch",
-        "fact": "artifact_checksum_mismatch"
+        "source": "download_interrupted",
+        "classification": "diagnostic",
+        "fact": "download_interrupted",
+        "diagnoses": [
+          "download_unavailable"
+        ]
       },
       {
-        "source": "DownloadChecksumMismatch",
-        "fact": "artifact_checksum_mismatch"
+        "source": "download_network_failure",
+        "classification": "diagnostic",
+        "fact": "download_interrupted",
+        "diagnoses": [
+          "download_unavailable"
+        ]
       },
       {
-        "source": "DownloadInterrupted",
-        "fact": "download_interrupted"
+        "source": "download_promoted",
+        "classification": "non_failure",
+        "fact": "atomic_promotion_completed",
+        "diagnoses": []
       },
       {
-        "source": "DownloadNetworkFailure",
-        "fact": "download_interrupted"
+        "source": "download_promotion_failed",
+        "classification": "diagnostic",
+        "fact": "atomic_promotion_failed",
+        "diagnoses": [
+          "atomic_promotion_failed"
+        ]
       },
       {
-        "source": "DownloadPromoted",
-        "fact": "atomic_promotion_completed"
+        "source": "download_provider_failure",
+        "classification": "diagnostic",
+        "fact": "download_provider_unavailable",
+        "diagnoses": [
+          "download_unavailable"
+        ]
       },
       {
-        "source": "DownloadPromotionFailed",
-        "fact": "atomic_promotion_failed"
+        "source": "download_size_mismatch",
+        "classification": "diagnostic",
+        "fact": "artifact_size_mismatch",
+        "diagnoses": [
+          "launcher_managed_artifact_corrupt"
+        ]
       },
       {
-        "source": "DownloadProviderFailure",
-        "fact": "download_provider_unavailable"
+        "source": "download_temp_discarded",
+        "classification": "non_failure",
+        "fact": "download_temp_discarded",
+        "diagnoses": []
       },
       {
-        "source": "DownloadSizeMismatch",
-        "fact": "artifact_size_mismatch"
+        "source": "download_temp_write_failed",
+        "classification": "diagnostic",
+        "fact": "temp_file_write_failed",
+        "diagnoses": [
+          "temp_file_write_failed"
+        ]
       },
       {
-        "source": "DownloadTempDiscarded",
-        "fact": "download_temp_discarded"
+        "source": "download_written_to_temp",
+        "classification": "non_failure",
+        "fact": "download_written_to_temp",
+        "diagnoses": []
       },
       {
-        "source": "DownloadTempWriteFailed",
-        "fact": "temp_file_leftover"
+        "source": "file_locked",
+        "classification": "diagnostic",
+        "fact": "filesystem_locked",
+        "diagnoses": [
+          "filesystem_locked"
+        ]
       },
       {
-        "source": "DownloadWrittenToTemp",
-        "fact": "download_written_to_temp"
+        "source": "file_missing",
+        "classification": "diagnostic",
+        "fact": "artifact_missing",
+        "diagnoses": [
+          "launcher_managed_artifact_corrupt"
+        ]
       },
       {
-        "source": "SizeMismatch",
-        "fact": "artifact_size_mismatch"
+        "source": "file_ownership_unknown",
+        "classification": "diagnostic",
+        "fact": "ownership_unknown",
+        "diagnoses": [
+          "artifact_ownership_unsafe"
+        ]
       },
       {
-        "source": "FileCorrupt",
-        "fact": "managed_file_corrupt"
+        "source": "file_permission_denied",
+        "classification": "diagnostic",
+        "fact": "filesystem_permission_denied",
+        "diagnoses": [
+          "filesystem_permission_denied"
+        ]
       },
       {
-        "source": "FileLocked",
-        "fact": "filesystem_locked"
+        "source": "file_quarantined",
+        "classification": "non_failure",
+        "fact": "artifact_quarantined",
+        "diagnoses": []
       },
       {
-        "source": "FileMissing",
-        "fact": "artifact_missing"
+        "source": "file_promoted",
+        "classification": "non_failure",
+        "fact": "atomic_promotion_completed",
+        "diagnoses": []
       },
       {
-        "source": "FileOwnershipUnknown",
-        "fact": "ownership_unknown"
+        "source": "file_temp_leftover",
+        "classification": "condition_evidence",
+        "fact": "temp_file_observed",
+        "diagnoses": []
       },
       {
-        "source": "FilePermissionDenied",
-        "fact": "filesystem_permission_denied"
+        "source": "file_written_to_temp",
+        "classification": "non_failure",
+        "fact": "file_written_to_temp",
+        "diagnoses": []
       },
       {
-        "source": "FileQuarantined",
-        "fact": "artifact_quarantined"
+        "source": "install_dependency_failed",
+        "classification": "diagnostic",
+        "fact": "install_dependency_failed",
+        "diagnoses": [
+          "install_dependency_failed"
+        ]
       },
       {
-        "source": "FilePromoted",
-        "fact": "atomic_promotion_completed"
+        "source": "install_execution_failed",
+        "classification": "diagnostic",
+        "fact": "install_execution_failed",
+        "diagnoses": [
+          "install_execution_failed"
+        ]
       },
       {
-        "source": "FileTempLeftover",
-        "fact": "temp_file_leftover"
+        "source": "install_processor_failed",
+        "classification": "diagnostic",
+        "fact": "install_processor_failed",
+        "diagnoses": [
+          "install_processor_failed"
+        ]
       },
       {
-        "source": "FileWrittenToTemp",
-        "fact": "file_written_to_temp"
+        "source": "runtime_corrupt",
+        "classification": "diagnostic",
+        "fact": "managed_runtime_corrupt",
+        "diagnoses": [
+          "managed_runtime_corrupt"
+        ]
       },
       {
-        "source": "InstallDependencyFailed",
-        "fact": "install_dependency_failed"
+        "source": "runtime_java_override_empty",
+        "classification": "condition_evidence",
+        "fact": "java_override_empty",
+        "diagnoses": [
+          "java_override_unavailable"
+        ]
       },
       {
-        "source": "InstallExecutionFailed",
-        "fact": "install_execution_failed"
+        "source": "runtime_java_override_undefined_sentinel",
+        "classification": "condition_evidence",
+        "fact": "java_override_undefined_sentinel",
+        "diagnoses": [
+          "java_override_unavailable"
+        ]
       },
       {
-        "source": "InstallProcessorFailed",
-        "fact": "install_processor_failed"
+        "source": "runtime_missing_executable",
+        "classification": "diagnostic",
+        "fact": "managed_runtime_missing",
+        "diagnoses": [
+          "managed_runtime_missing"
+        ]
       },
       {
-        "source": "RuntimeCorrupt",
-        "fact": "managed_runtime_corrupt"
+        "source": "runtime_probe_failed",
+        "classification": "diagnostic",
+        "fact": "java_probe_failed",
+        "diagnoses": [
+          "java_probe_failed"
+        ]
       },
       {
-        "source": "RuntimeJavaOverrideEmpty",
-        "fact": "java_override_empty"
+        "source": "runtime_ready_marker_missing",
+        "classification": "condition_evidence",
+        "fact": "managed_runtime_ready_marker_missing",
+        "diagnoses": [
+          "managed_runtime_corrupt"
+        ]
       },
       {
-        "source": "RuntimeJavaOverrideUndefinedSentinel",
-        "fact": "java_override_undefined_sentinel"
+        "source": "runtime_repair_applied",
+        "classification": "non_failure",
+        "fact": "managed_runtime_repair_applied",
+        "diagnoses": []
       },
       {
-        "source": "RuntimeMissingExecutable",
-        "fact": "managed_runtime_missing"
+        "source": "runtime_rosetta_required",
+        "classification": "diagnostic",
+        "fact": "managed_runtime_rosetta_required",
+        "diagnoses": [
+          "managed_runtime_rosetta_required"
+        ]
       },
       {
-        "source": "RuntimeProbeFailed",
-        "fact": "java_probe_failed"
+        "source": "runtime_unavailable_for_platform",
+        "classification": "diagnostic",
+        "fact": "managed_runtime_unavailable_for_platform",
+        "diagnoses": [
+          "managed_runtime_unavailable_for_platform"
+        ]
       },
       {
-        "source": "RuntimeReadyMarkerMissing",
-        "fact": "managed_runtime_ready_marker_missing"
+        "source": "runtime_wrong_major",
+        "classification": "condition_evidence",
+        "fact": "java_major_mismatch",
+        "diagnoses": [
+          "java_runtime_major_mismatch"
+        ]
       },
       {
-        "source": "RuntimeRepairApplied",
-        "fact": "managed_runtime_repair_applied"
+        "source": "runtime_wrong_update",
+        "classification": "condition_evidence",
+        "fact": "java_update_too_old",
+        "diagnoses": [
+          "java_runtime_update_too_old"
+        ]
       },
       {
-        "source": "RuntimeRosettaRequired",
-        "fact": "managed_runtime_rosetta_required"
+        "source": "jvm_args_empty",
+        "classification": "condition_evidence",
+        "fact": "jvm_args_empty",
+        "diagnoses": [
+          "jvm_args_empty"
+        ]
       },
       {
-        "source": "RuntimeUnavailableForPlatform",
-        "fact": "managed_runtime_unavailable_for_platform"
+        "source": "jvm_args_parse_failed",
+        "classification": "condition_evidence",
+        "fact": "jvm_args_parse_failed",
+        "diagnoses": [
+          "jvm_args_malformed"
+        ]
       },
       {
-        "source": "RuntimeWrongMajor",
-        "fact": "java_major_mismatch"
+        "source": "jvm_arg_reserved_launcher_flag",
+        "classification": "condition_evidence",
+        "fact": "jvm_arg_reserved_launcher_flag",
+        "diagnoses": [
+          "jvm_arg_unsafe_override"
+        ]
       },
       {
-        "source": "RuntimeWrongUpdate",
-        "fact": "java_update_too_old"
+        "source": "jvm_arg_memory_conflict",
+        "classification": "condition_evidence",
+        "fact": "jvm_arg_memory_conflict",
+        "diagnoses": [
+          "jvm_arg_unsafe_override"
+        ]
       },
       {
-        "source": "JvmArgsEmpty",
-        "fact": "jvm_args_empty"
+        "source": "jvm_arg_unsupported_gc",
+        "classification": "condition_evidence",
+        "fact": "jvm_arg_unsupported_gc",
+        "diagnoses": [
+          "jvm_arg_unsupported"
+        ]
       },
       {
-        "source": "JvmArgsParseFailed",
-        "fact": "jvm_args_parse_failed"
+        "source": "jvm_arg_unlock_order_invalid",
+        "classification": "condition_evidence",
+        "fact": "jvm_arg_unlock_order_invalid",
+        "diagnoses": [
+          "jvm_arg_unsupported"
+        ]
       },
       {
-        "source": "JvmArgReservedLauncherFlag",
-        "fact": "jvm_arg_reserved_launcher_flag"
+        "source": "jvm_arg_unsafe_classpath_override",
+        "classification": "condition_evidence",
+        "fact": "jvm_arg_unsafe_classpath_override",
+        "diagnoses": [
+          "jvm_arg_unsafe_override"
+        ]
       },
       {
-        "source": "JvmArgMemoryConflict",
-        "fact": "jvm_arg_memory_conflict"
+        "source": "jvm_arg_unsafe_native_path_override",
+        "classification": "condition_evidence",
+        "fact": "jvm_arg_unsafe_native_path_override",
+        "diagnoses": [
+          "jvm_arg_unsafe_override"
+        ]
       },
       {
-        "source": "JvmArgUnsupportedGc",
-        "fact": "jvm_arg_unsupported_gc"
+        "source": "jvm_arg_agent_override",
+        "classification": "condition_evidence",
+        "fact": "jvm_arg_agent_override",
+        "diagnoses": [
+          "jvm_arg_unsafe_override"
+        ]
       },
       {
-        "source": "JvmArgUnlockOrderInvalid",
-        "fact": "jvm_arg_unlock_order_invalid"
+        "source": "launch_command_invalid",
+        "classification": "diagnostic",
+        "fact": "launch_command_invalid",
+        "diagnoses": [
+          "launch_command_invalid"
+        ]
       },
       {
-        "source": "JvmArgUnsafeClasspathOverride",
-        "fact": "jvm_arg_unsafe_classpath_override"
+        "source": "launch_command_prepared",
+        "classification": "condition_evidence",
+        "fact": "launch_command_prepared",
+        "diagnoses": [
+          "launch_command_prepared"
+        ]
       },
       {
-        "source": "JvmArgUnsafeNativePathOverride",
-        "fact": "jvm_arg_unsafe_native_path_override"
+        "source": "process_spawned",
+        "classification": "condition_evidence",
+        "fact": "process_spawned",
+        "diagnoses": [
+          "process_lifecycle_observed"
+        ]
       },
       {
-        "source": "JvmArgAgentOverride",
-        "fact": "jvm_arg_agent_override"
+        "source": "process_stop_intent",
+        "classification": "condition_evidence",
+        "fact": "launcher_stop_requested",
+        "diagnoses": [
+          "process_lifecycle_observed"
+        ]
       },
       {
-        "source": "LaunchCommandInvalid",
-        "fact": "launch_command_invalid"
+        "source": "process_killed",
+        "classification": "condition_evidence",
+        "fact": "process_killed",
+        "diagnoses": [
+          "process_lifecycle_observed"
+        ]
       },
       {
-        "source": "LaunchCommandPrepared",
-        "fact": "launch_command_prepared"
+        "source": "process_exit_code",
+        "classification": "condition_evidence",
+        "fact": "exit_code_unknown",
+        "diagnoses": [
+          "process_lifecycle_observed"
+        ]
       },
       {
-        "source": "ProcessSpawned",
-        "fact": "process_spawned"
+        "source": "process_boot_evidence",
+        "classification": "condition_evidence",
+        "fact": "boot_marker_observed",
+        "diagnoses": [
+          "process_lifecycle_observed"
+        ]
       },
       {
-        "source": "ProcessStopIntent",
-        "fact": "launcher_stop_requested"
+        "source": "process_watchdog_action",
+        "classification": "condition_evidence",
+        "fact": "watchdog_action_observed",
+        "diagnoses": [
+          "process_lifecycle_observed"
+        ]
       },
       {
-        "source": "ProcessKilled",
-        "fact": "watchdog_killed_process"
+        "source": "process_exited",
+        "classification": "condition_evidence",
+        "fact": "process_exited",
+        "diagnoses": [
+          "process_lifecycle_observed"
+        ]
       },
       {
-        "source": "ProcessExitCode",
-        "fact": "exit_code_unknown"
+        "source": "primitive_refused",
+        "classification": "diagnostic",
+        "fact": "primitive_refused",
+        "diagnoses": [
+          "artifact_ownership_unsafe"
+        ]
       },
       {
-        "source": "ProcessBootEvidence",
-        "fact": "boot_marker_observed"
-      },
-      {
-        "source": "ProcessWatchdogAction",
-        "fact": "watchdog_killed_process"
-      },
-      {
-        "source": "ProcessExited",
-        "fact": "process_exited"
-      },
-      {
-        "source": "PrimitiveRefused",
-        "fact": "primitive_refused"
-      },
-      {
-        "source": "ProviderDataInvalid",
-        "fact": "provider_data_invalid"
-      },
-      {
-        "source": "RollbackAvailable",
-        "fact": "rollback_available"
-      },
-      {
-        "source": "RollbackUnavailable",
-        "fact": "rollback_unavailable"
+        "source": "provider_data_invalid",
+        "classification": "diagnostic",
+        "fact": "provider_data_invalid",
+        "diagnoses": [
+          "install_artifact_metadata_invalid"
+        ]
       }
     ],
     "install": [
@@ -6286,7 +6470,7 @@
       },
       {
         "source": "TempWriteFailed",
-        "fact": "temp_file_leftover"
+        "fact": "temp_file_write_failed"
       },
       {
         "source": "PromotionFailed",

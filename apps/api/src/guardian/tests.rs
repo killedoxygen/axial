@@ -1,8 +1,9 @@
 use super::rules::{DIAGNOSIS_RULES, rule_for_diagnosis};
 use super::{
     DiagnosisId, FactReliability, GuardianAction, GuardianActionKind, GuardianActionPlan,
-    GuardianConfidence, GuardianDecision, GuardianDomain, GuardianFact, GuardianFactId,
-    GuardianMode, GuardianSeverity, GuardianSeverity::Repairable, build_safety_case, diagnose,
+    GuardianConfidence, GuardianCopyRequest, GuardianDecision, GuardianDomain, GuardianFact,
+    GuardianFactId, GuardianMode, GuardianSeverity, GuardianSeverity::Repairable,
+    author_guardian_copy, build_safety_case, decide_guardian_policy, diagnose,
     guardian_fact_from_execution,
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind};
@@ -380,7 +381,7 @@ fn declarative_rules_have_unique_ids_and_keep_conditions_out_of_evidence() {
         GuardianFactId::LaunchJvmPresetDowngradeAvailable,
     ];
 
-    assert_eq!(DIAGNOSIS_RULES.len(), 59);
+    assert_eq!(DIAGNOSIS_RULES.len(), 60);
     for rule in DIAGNOSIS_RULES {
         assert!(diagnosis_ids.insert(rule.id), "duplicate rule {}", rule.id);
         assert!(!rule.trigger_fact_ids.is_empty(), "{}", rule.id);
@@ -440,7 +441,6 @@ fn nine_multi_fact_rule_families_emit_once_with_declared_support_order() {
             &[
                 GuardianFactId::ArtifactChecksumMismatch,
                 GuardianFactId::ArtifactSizeMismatch,
-                GuardianFactId::ManagedFileCorrupt,
                 GuardianFactId::ArtifactMissing,
             ],
         ),
@@ -470,6 +470,8 @@ fn nine_multi_fact_rule_families_emit_once_with_declared_support_order() {
             &[
                 GuardianFactId::ProcessSpawned,
                 GuardianFactId::LauncherStopRequested,
+                GuardianFactId::ProcessKilled,
+                GuardianFactId::WatchdogActionObserved,
                 GuardianFactId::WatchdogKilledProcess,
                 GuardianFactId::ExitCodeZero,
                 GuardianFactId::ExitCodeNonzero,
@@ -844,7 +846,7 @@ fn execution_download_and_process_facts_map_to_guardian_fact_ids() {
         ),
         (
             ExecutionFactKind::DownloadTempWriteFailed,
-            "temp_file_leftover",
+            "temp_file_write_failed",
         ),
         (
             ExecutionFactKind::DownloadPromotionFailed,
@@ -880,7 +882,7 @@ fn execution_download_and_process_facts_map_to_guardian_fact_ids() {
         ),
         (
             ExecutionFactKind::ProcessWatchdogAction,
-            "watchdog_killed_process",
+            "watchdog_action_observed",
         ),
         (
             ExecutionFactKind::ProcessBootEvidence,
@@ -930,6 +932,114 @@ fn exit_code_fact_maps_zero_and_nonzero_without_exit_classification() {
             diagnoses[0].candidate_actions(),
             vec![GuardianActionKind::RecordOnly]
         );
+    }
+
+    let unknown = guardian_fact_from_execution(
+        &ExecutionFact {
+            operation_id: None,
+            kind: ExecutionFactKind::ProcessExitCode,
+            target: Some(target),
+            fields: Vec::new(),
+        },
+        OperationPhase::Running,
+    );
+    assert_eq!(unknown.id, GuardianFactId::ExitCodeUnknown);
+}
+
+#[test]
+fn process_kill_and_watchdog_fields_preserve_exact_lifecycle_meaning() {
+    let target = target(
+        "session",
+        TargetKind::Session,
+        OwnershipClass::LauncherManaged,
+    );
+    let cases = [
+        (
+            ExecutionFactKind::ProcessKilled,
+            Some(("reason", "startup_watchdog")),
+            GuardianFactId::WatchdogKilledProcess,
+        ),
+        (
+            ExecutionFactKind::ProcessKilled,
+            Some(("reason", "user_requested")),
+            GuardianFactId::ProcessKilled,
+        ),
+        (
+            ExecutionFactKind::ProcessKilled,
+            Some(("reason", "launcher_shutdown")),
+            GuardianFactId::ProcessKilled,
+        ),
+        (
+            ExecutionFactKind::ProcessKilled,
+            Some(("reason", "unknown")),
+            GuardianFactId::ProcessKilled,
+        ),
+        (
+            ExecutionFactKind::ProcessKilled,
+            None,
+            GuardianFactId::ProcessKilled,
+        ),
+        (
+            ExecutionFactKind::ProcessWatchdogAction,
+            Some(("action", "startup_no_output_kill")),
+            GuardianFactId::WatchdogKilledProcess,
+        ),
+        (
+            ExecutionFactKind::ProcessWatchdogAction,
+            Some(("action", "startup_window_expired")),
+            GuardianFactId::StartupWindowExpired,
+        ),
+        (
+            ExecutionFactKind::ProcessWatchdogAction,
+            Some(("action", "unknown")),
+            GuardianFactId::WatchdogActionObserved,
+        ),
+        (
+            ExecutionFactKind::ProcessWatchdogAction,
+            None,
+            GuardianFactId::WatchdogActionObserved,
+        ),
+    ];
+
+    for (kind, field, expected) in cases {
+        let fields = field
+            .map(|(key, value)| vec![EvidenceField::new(key, value, EvidenceSensitivity::Public)])
+            .unwrap_or_default();
+        let fact = guardian_fact_from_execution(
+            &ExecutionFact {
+                operation_id: None,
+                kind,
+                target: Some(target.clone()),
+                fields,
+            },
+            OperationPhase::Running,
+        );
+        assert_eq!(fact.id, expected);
+    }
+}
+
+#[test]
+fn runtime_missing_executable_preserves_managed_and_user_owned_branches() {
+    for (ownership, expected) in [
+        (
+            OwnershipClass::LauncherManaged,
+            GuardianFactId::ManagedRuntimeMissing,
+        ),
+        (
+            OwnershipClass::UserOwned,
+            GuardianFactId::JavaOverrideMissing,
+        ),
+    ] {
+        let fact = guardian_fact_from_execution(
+            &ExecutionFact {
+                operation_id: None,
+                kind: ExecutionFactKind::RuntimeMissingExecutable,
+                target: Some(target("runtime", TargetKind::Runtime, ownership)),
+                fields: Vec::new(),
+            },
+            OperationPhase::Validating,
+        );
+        assert_eq!(fact.id, expected);
     }
 }
 
@@ -1428,6 +1538,49 @@ fn safety_case_carries_diagnosis() {
     assert_eq!(
         safety_case.diagnoses[0].id().as_str(),
         "java_runtime_major_mismatch"
+    );
+}
+
+#[test]
+fn would_block_file_error_reaches_managed_block_policy() {
+    let target = target(
+        "managed_artifact",
+        TargetKind::Artifact,
+        OwnershipClass::LauncherManaged,
+    );
+    let execution_fact =
+        crate::execution::file::io_error_fact(std::io::ErrorKind::WouldBlock, None, &target);
+    assert_eq!(execution_fact.kind, ExecutionFactKind::FileLocked);
+
+    let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Validating);
+    assert_eq!(fact.id, GuardianFactId::FilesystemLocked);
+    let safety_case = build_safety_case(
+        None,
+        GuardianMode::Managed,
+        OperationPhase::Validating,
+        &[fact],
+    );
+    assert_eq!(safety_case.diagnoses.len(), 1);
+    assert_eq!(safety_case.diagnoses[0].id(), DiagnosisId::FilesystemLocked);
+
+    let decision = decide_guardian_policy(
+        &safety_case,
+        super::GuardianPolicyContext::current_operation(),
+    );
+    assert_eq!(decision.kind(), GuardianActionKind::Block);
+    let copy = author_guardian_copy(GuardianCopyRequest::install_failure(
+        DiagnosisId::FilesystemLocked,
+        decision.kind(),
+        &[],
+    ))
+    .expect("filesystem lock copy");
+    assert_eq!(
+        copy.summary(),
+        "Guardian blocked install because a launcher-managed file is in use."
+    );
+    assert_eq!(
+        copy.guidance(),
+        ["Close apps that may be using launcher files, then retry the install."]
     );
 }
 
