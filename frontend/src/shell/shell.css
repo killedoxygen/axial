@@ -436,6 +436,9 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   border-top-right-radius: 0;
   border-bottom-right-radius: 0;
 }
+.cp-status-slot[data-update='true'] .cp-update-dock-wrap {
+  margin-left: -1px;
+}
 
 .cp-update-dock-wrap {
   position: relative;
@@ -498,20 +501,45 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   position: relative;
   z-index: 1;
 }
-.cp-update-dock[data-busy='true']::before {
+.cp-status-slot[data-busy='true'] {
+  border-radius: 999px;
+  overflow: hidden;
+  background: color-mix(in oklab, var(--surface) 92%, var(--bg));
+  box-shadow:
+    inset 0 1px 0 color-mix(in oklab, var(--surface-3) 62%, transparent),
+    0 1px 0 oklch(0 0 0 / 0.14);
+}
+.cp-status-slot[data-busy='true']::after {
   content: '';
   position: absolute;
-  inset: 0;
-  right: calc((1 - var(--cp-update-ratio)) * 100%);
+  top: 0;
+  bottom: 0;
+  left: 0;
   z-index: 0;
+  width: calc(var(--cp-update-ratio, 0) * 100%);
   background: linear-gradient(
     90deg,
-    color-mix(in oklab, var(--accent) 10%, transparent),
-    color-mix(in oklab, var(--accent) 26%, transparent)
+    color-mix(in oklab, var(--accent) 12%, transparent),
+    color-mix(in oklab, var(--accent) 28%, transparent)
   );
-  box-shadow: inset -1px 0 0 color-mix(in oklab, var(--accent) 42%, transparent);
-  transition: right 280ms cubic-bezier(0.22, 1, 0.36, 1);
+  box-shadow: inset -1px 0 0 color-mix(in oklab, var(--accent) 45%, transparent);
+  transition: width 280ms cubic-bezier(0.22, 1, 0.36, 1);
   pointer-events: none;
+}
+.cp-status-slot[data-busy='true'][data-indeterminate='true']::after {
+  width: 38%;
+  box-shadow: none;
+  animation: cp-status-fill-slide 1200ms ease-in-out infinite;
+  transition: none;
+}
+.cp-status-slot[data-busy='true'] > .cp-status-pill,
+.cp-status-slot[data-busy='true'] .cp-update-dock {
+  background: transparent;
+  box-shadow: none;
+}
+.cp-status-slot[data-busy='true'] > .cp-status-pill,
+.cp-status-slot[data-busy='true'] .cp-update-dock-wrap {
+  z-index: 1;
 }
 .cp-update-dock-icon {
   flex: 0 0 auto;
@@ -529,14 +557,18 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
 
 .cp-update-card {
   position: absolute;
-  top: calc(100% + 8px);
+  top: calc(100% + 9px);
   right: 0;
-  width: 268px;
+  width: 266px;
   background: var(--surface);
   border: none;
   border-radius: var(--r-md);
-  padding: 14px;
-  box-shadow: var(--shadow);
+  padding: 15px 15px 13px;
+  box-shadow:
+    inset 0 0 0 1px var(--line),
+    inset 0 1px 0 oklch(1 0 0 / 0.06),
+    0 14px 34px -14px oklch(0 0 0 / 0.55),
+    0 3px 10px -4px oklch(0 0 0 / 0.32);
   z-index: 60;
   display: flex;
   flex-direction: column;
@@ -546,8 +578,34 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
 }
 .cp-update-card-head {
   display: flex;
+  align-items: center;
+  gap: 11px;
+}
+.cp-update-card-badge {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-2);
+  color: color-mix(in oklab, var(--accent) 78%, var(--text));
+  box-shadow:
+    inset 0 0 0 1px var(--line),
+    inset 0 1px 0 oklch(1 0 0 / 0.05);
+}
+.cp-update-card-badge[data-tone='error'] {
+  color: color-mix(in oklab, var(--err) 82%, var(--text));
+}
+.cp-update-card-badge svg {
+  display: block;
+}
+.cp-update-card-heading {
+  display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
+  min-width: 0;
 }
 .cp-update-card-title {
   font-size: 13.5px;
@@ -556,38 +614,48 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   color: var(--text);
 }
 .cp-update-card-sub {
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.35;
   font-variant-numeric: tabular-nums;
   color: var(--text-dim);
 }
 .cp-update-card-sub[data-tone='error'] {
-  color: var(--err);
+  color: color-mix(in oklab, var(--err) 80%, var(--text));
 }
-.cp-update-card-bar {
+.cp-update-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.cp-update-progress .cp-boot-bar {
   position: relative;
-  height: 5px;
-  border-radius: 999px;
-  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
-  overflow: hidden;
+  flex: 1;
+  width: auto;
 }
-.cp-update-card-bar-fill {
+.cp-update-progress .cp-boot-bar-fill[data-indeterminate='true'] {
   position: absolute;
-  inset: 0 auto 0 0;
-  width: 0%;
-  border-radius: 999px;
-  background: var(--accent);
-  transition: width 260ms ease;
-}
-.cp-update-card-bar[data-indeterminate='true'] .cp-update-card-bar-fill {
-  width: 36%;
+  top: 0;
+  bottom: 0;
+  width: 40%;
   animation: cp-update-bar-slide 1200ms ease-in-out infinite;
   transition: none;
 }
+.cp-update-progress-pct {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: color-mix(in oklab, var(--accent) 70%, var(--text));
+}
 .cp-update-card-actions {
   display: flex;
+}
+.cp-update-card-links {
+  display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
+  margin-top: -3px;
 }
 
 @keyframes cp-update-glyph-in {
@@ -618,6 +686,14 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
+  }
+}
+@keyframes cp-status-fill-slide {
+  from {
+    left: -38%;
+  }
+  to {
+    left: 100%;
   }
 }
 @keyframes cp-update-bar-slide {
@@ -660,17 +736,18 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   .cp-status-pill--installing::before,
   .cp-music-eq > span,
   .cp-update-dock,
-  .cp-update-dock::before,
   .cp-update-dock-icon,
   .cp-update-card,
-  .cp-update-card-bar-fill {
+  .cp-status-slot[data-busy='true']::after,
+  .cp-update-progress .cp-boot-bar-fill {
     animation: none !important;
     animation-duration: 0s !important;
     animation-iteration-count: 1 !important;
     transition: none !important;
   }
-  .cp-update-card-bar[data-indeterminate='true'] .cp-update-card-bar-fill {
-    left: 32%;
+  .cp-update-progress .cp-boot-bar-fill[data-indeterminate='true'],
+  .cp-status-slot[data-busy='true'][data-indeterminate='true']::after {
+    left: 30%;
   }
 }
 

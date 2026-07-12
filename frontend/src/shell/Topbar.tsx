@@ -8,7 +8,7 @@ import { UpdateWidget } from './UpdateWidget';
 import { goBack, goForward, navigate, route } from '../ui-state';
 import { runningSessions, instances, versionById, launchState } from '../store';
 import { activeDownload, downloadFailure, downloadQueue } from '../machines/downloads';
-import { hasVisibleUpdate, updateFlowActive } from '../updater';
+import { hasVisibleUpdate, updateFlow, updateFlowActive } from '../updater';
 import { minecraftVersionLabel } from '../version-display';
 import { hasCustomDragRegion, windowStartDragging, windowToggleMaximize } from '../native';
 
@@ -179,7 +179,11 @@ export function Topbar(): JSX.Element {
   };
 
   const crumbs = crumbsFor();
+  const flow = updateFlow.value;
   const hasUpdate = hasVisibleUpdate() || updateFlowActive();
+  const updateBusy = flow.phase === 'downloading' || flow.phase === 'applying';
+  const updateIndeterminate = flow.percent == null || flow.phase === 'applying';
+  const updateRatio = flow.percent != null ? Math.min(100, Math.max(0, flow.percent)) / 100 : 0;
   return (
     <div
       class={`cp-topbar${usesCustomDrag ? ' cp-drag' : ''}`}
@@ -215,7 +219,13 @@ export function Topbar(): JSX.Element {
       <div class="cp-topbar-spacer" />
       <div class="cp-topbar-actions cp-nodrag">
         <MusicWidget />
-        <div class="cp-status-slot" data-update={hasUpdate}>
+        <div
+          class="cp-status-slot"
+          data-update={hasUpdate}
+          data-busy={updateBusy}
+          data-indeterminate={updateIndeterminate}
+          style={updateBusy ? ({ '--cp-update-ratio': String(updateRatio) } as JSX.CSSProperties) : undefined}
+        >
           <StatusPill />
           {hasUpdate && <UpdateWidget />}
         </div>

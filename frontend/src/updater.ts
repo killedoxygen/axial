@@ -17,6 +17,7 @@ const FLOW_POLL_MS = 350;
 
 let autoCheckTimer: number | null = null;
 let autoCheckFailureCount = 0;
+let autoApplyOnReady = false;
 let pendingCheck: Promise<UpdateInfo | null> | null = null;
 let pendingCheckSeq = 0;
 let pendingCheckToken: symbol | null = null;
@@ -150,10 +151,7 @@ function updateFlowFromResponse(res: unknown): UpdateFlowState {
 
 function announceUpdateFlowTransition(previous: UpdateFlowState, next: UpdateFlowState): void {
   if (previous.phase === next.phase) return;
-  if (next.phase === 'ready') {
-    Sound.ui('affirm');
-    toast(`Update ${displayVersion(next.version)} downloaded. Restart to install.`);
-  } else if (next.phase === 'failed') {
+  if (next.phase === 'failed') {
     toast(next.message || 'Update failed', 'error');
   }
 }
@@ -162,6 +160,20 @@ function setUpdateFlow(next: UpdateFlowState): void {
   const previous = updateFlow.value;
   updateFlow.value = next;
   announceUpdateFlowTransition(previous, next);
+  if (next.phase === 'failed') autoApplyOnReady = false;
+  if (previous.phase !== 'ready' && next.phase === 'ready') {
+    Sound.ui('affirm');
+    if (autoApplyOnReady) {
+      autoApplyOnReady = false;
+      if (restartBlockedByActivity()) {
+        toast(`Update ${displayVersion(next.version)} ready. It installs once downloads and games finish.`);
+      } else {
+        void applyUpdateAndRestart();
+      }
+    } else {
+      toast(`Update ${displayVersion(next.version)} downloaded. Restart to install.`);
+    }
+  }
 }
 
 function updateFlowPollActive(phase: UpdateFlowPhase): boolean {
@@ -199,6 +211,21 @@ export async function startUpdateDownload(): Promise<void> {
   } catch (err: unknown) {
     toast(`Update download failed: ${errMessage(err)}`, 'error');
   }
+}
+
+export async function downloadAndInstallUpdate(): Promise<void> {
+  const info = updateInfo.value;
+  if (!info?.available) return;
+  if (!canInstallUpdateInApp()) {
+    await openUpdateAction();
+    return;
+  }
+  if (updateFlow.value.phase === 'ready') {
+    await applyUpdateAndRestart();
+    return;
+  }
+  autoApplyOnReady = true;
+  await startUpdateDownload();
 }
 
 export async function applyUpdateAndRestart(): Promise<void> {
