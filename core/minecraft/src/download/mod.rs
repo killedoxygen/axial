@@ -24,10 +24,6 @@ pub use integrity::{
 };
 #[cfg(test)]
 pub(crate) use libraries::DownloadJob;
-#[expect(
-    unused_imports,
-    reason = "the receipt-producing Forge install cutover consumes this capability next"
-)]
 pub(crate) use libraries::download_installer_libraries_with_authority_and_facts_and_descriptors;
 pub(crate) use libraries::{
     LibraryArtifactPlan, LibraryChecksumPolicy, library_artifact_plans_for,

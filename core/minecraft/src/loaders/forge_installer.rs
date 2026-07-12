@@ -160,13 +160,6 @@ pub(crate) struct BoundForgeProcessorExecution {
     continuation: BoundForgeInstallerContinuation,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Forge receipt cutover consumes this capability next"
-    )
-)]
 pub(crate) enum BoundForgeInstallExecution {
     Run(Box<BoundForgeProcessorExecution>),
     Continue(Box<BoundForgeInstallerContinuation>),
@@ -291,10 +284,6 @@ impl AuthenticatedForgeInstallerPlan {
         self.source.bytes()
     }
 
-    pub(crate) fn install_profile_json(&self) -> Option<&[u8]> {
-        self.install_profile_json.as_deref()
-    }
-
     pub(crate) fn libraries(&self) -> &[Library] {
         &self.libraries
     }
@@ -309,53 +298,11 @@ impl AuthenticatedForgeInstallerPlan {
 }
 
 impl BoundForgeInstallerPlan {
-    pub(crate) fn source_bytes(&self) -> &[u8] {
-        self.authenticated.source.bytes()
-    }
-
-    pub(crate) fn version(&self) -> &LoaderProfileFragment {
-        &self.authenticated.version
-    }
-
-    pub(crate) fn install_profile_json(&self) -> Option<&[u8]> {
-        debug_assert!(!matches!(
-            &self.processor_disposition,
-            BoundProcessorDisposition::TypedRunnable(plan)
-                if !plan.is_structurally_complete()
-        ));
-        self.authenticated.install_profile_json.as_deref()
-    }
-
-    pub(crate) fn libraries(&self) -> &[Library] {
-        &self.authenticated.libraries
-    }
-
-    pub(crate) fn embedded_maven_artifacts(&self) -> &[AuthenticatedEmbeddedMavenArtifact] {
-        &self.authenticated.embedded_maven_artifacts
-    }
-
-    pub(crate) fn strip_client_meta(&self) -> bool {
-        self.authenticated.strip_client_meta
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the receipt-producing Forge install cutover consumes this capability next"
-        )
-    )]
+    #[cfg(test)]
     pub(crate) fn processor_disposition(&self) -> &BoundProcessorDisposition {
         &self.processor_disposition
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Forge receipt cutover consumes this capability next"
-        )
-    )]
     pub(crate) fn into_install_execution(self) -> BoundForgeInstallExecution {
         let Self {
             mut authenticated,
@@ -386,13 +333,6 @@ impl BoundForgeProcessorExecution {
         (self.continuation, self.plan)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Forge receipt cutover consumes this capability next"
-        )
-    )]
     pub(crate) fn excluded_live_library_paths(
         &self,
     ) -> Result<BTreeSet<ArtifactRelativePath>, ForgeInstallerError> {
@@ -407,6 +347,10 @@ impl BoundForgeProcessorExecution {
         );
         Ok(paths)
     }
+
+    pub(crate) fn libraries(&self) -> &[Library] {
+        &self.continuation.authenticated.libraries
+    }
 }
 
 impl BoundForgeInstallerContinuation {
@@ -420,6 +364,10 @@ impl BoundForgeInstallerContinuation {
 
     pub(crate) fn version(&self) -> &LoaderProfileFragment {
         &self.authenticated.version
+    }
+
+    pub(crate) fn libraries(&self) -> &[Library] {
+        &self.authenticated.libraries
     }
 
     fn final_embedded_library_paths(
@@ -443,23 +391,12 @@ impl BoundForgeInstallerContinuation {
             .collect())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Forge receipt cutover consumes this capability next"
-        )
-    )]
     pub(crate) fn excluded_live_library_paths(
         &self,
     ) -> Result<BTreeSet<ArtifactRelativePath>, ForgeInstallerError> {
         self.final_embedded_library_paths()
     }
 
-    #[expect(
-        dead_code,
-        reason = "the receipt-producing Forge install cutover consumes this capability next"
-    )]
     pub(crate) fn into_receipt_source(self) -> VerifiedInstallerReceiptSource {
         let AuthenticatedForgeInstallerPlan {
             source,
@@ -479,13 +416,6 @@ impl BoundForgeInstallerContinuation {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Forge receipt cutover consumes this capability next"
-    )
-)]
 impl VerifiedInstallerReceiptSource {
     pub(crate) fn source_bytes(&self) -> &[u8] {
         self.source.bytes()
@@ -560,13 +490,6 @@ impl VerifiedInstallerReceiptSource {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Forge receipt cutover consumes this capability next"
-    )
-)]
 impl VerifiedInstallerClientBytes {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -3598,10 +3521,6 @@ mod tests {
 
         let plan = plan(&jar);
         assert_eq!(plan.source_bytes(), jar);
-        assert_eq!(
-            plan.install_profile_json(),
-            Some(install_profile.as_slice())
-        );
         assert_eq!(plan.libraries().len(), 3);
     }
 

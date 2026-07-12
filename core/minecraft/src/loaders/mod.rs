@@ -1,9 +1,5 @@
 pub mod api;
 pub mod artifacts;
-#[expect(
-    dead_code,
-    reason = "disconnected bound Forge processor capability; wired by the receipt cutover next"
-)]
 mod bound_processors;
 mod compose;
 mod forge_installer;
@@ -12,7 +8,6 @@ pub mod index;
 mod installed_metadata;
 pub mod legacy;
 mod managed_fs;
-mod processors;
 pub mod providers;
 mod source;
 pub mod strategies;
@@ -49,26 +44,11 @@ use std::path::{Component, Path};
 
 pub(crate) const MAX_VERSION_ID_BYTES: usize = MAX_ARTIFACT_PATH_SEGMENT_BYTES - ".json".len();
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum LoaderInstallOutcome {
-    KnownGood(Box<KnownGoodInstallReceipt>),
-    PendingAuthority { version_id: String },
-}
-
-impl LoaderInstallOutcome {
-    pub fn version_id(&self) -> &str {
-        match self {
-            Self::KnownGood(receipt) => receipt.version_id(),
-            Self::PendingAuthority { version_id } => version_id,
-        }
-    }
-}
-
 pub async fn install_build<F>(
     library_dir: &Path,
     record: LoaderBuildRecord,
     send: F,
-) -> Result<LoaderInstallOutcome, LoaderInstallError>
+) -> Result<KnownGoodInstallReceipt, LoaderInstallError>
 where
     F: FnMut(DownloadProgress),
 {

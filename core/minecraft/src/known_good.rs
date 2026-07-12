@@ -212,13 +212,6 @@ struct VerifiedInstallerLibraryFact {
     terminal_bytes: Option<Arc<[u8]>>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Forge receipt cutover consumes this capability next"
-    )
-)]
 pub(crate) fn seal_verified_installer_library_authority(
     source: &VerifiedInstallerReceiptSource,
     downloads: Vec<InstallerLibraryDownloadAuthority>,
@@ -301,13 +294,6 @@ pub(crate) fn seal_verified_installer_library_authority(
     Ok(VerifiedInstallerLibraryAuthority { entries })
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Forge receipt cutover consumes this capability next"
-    )
-)]
 impl VerifiedInstallerLibraryAuthority {
     pub(crate) fn into_terminal_materializations(self) -> Vec<(ArtifactRelativePath, Arc<[u8]>)> {
         self.entries
@@ -596,13 +582,6 @@ impl KnownGoodInstallReceipt {
         })
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Forge receipt cutover consumes this capability next"
-        )
-    )]
     #[expect(
         clippy::too_many_arguments,
         reason = "receipt derivation keeps each authenticated input explicit"
@@ -628,21 +607,11 @@ impl KnownGoodInstallReceipt {
                 LoaderInstallStrategy::NeoForgeModern
             )
         );
-        let recomposed = compose_loader_version(
-            &base.effective_version,
-            &record.minecraft_version,
-            &record.version_id,
-            source.version(),
-        )
-        .ok();
         if !strategy_matches
             || crate::loaders::api::validate_loader_build_record_identity(record).is_err()
             || base.version_id.as_str() != record.minecraft_version
             || base.effective_version.id != record.minecraft_version
-            || recomposed.as_ref() != Some(&resolved_version)
             || resolved_version.id != record.version_id
-            || !serde_json::from_slice::<VersionJson>(version_bytes)
-                .is_ok_and(|version| version == resolved_version)
             || source.source_bytes().is_empty()
         {
             return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
@@ -654,12 +623,35 @@ impl KnownGoodInstallReceipt {
             return Err(KnownGoodInventoryError::ClientIntegrity);
         }
         let child_client_bytes = child_client.bytes();
+        let child_size = i64::try_from(child_client_bytes.len())
+            .map_err(|_| KnownGoodInventoryError::InputTooLarge)?;
+        let child_digest = sha1_digest(child_client_bytes);
+        let mut recomposed = compose_loader_version(
+            &base.effective_version,
+            &record.minecraft_version,
+            &record.version_id,
+            source.version(),
+        )
+        .map_err(|_| KnownGoodInventoryError::LoaderIdentityMismatch)?;
+        let recomposed_client = recomposed
+            .downloads
+            .client
+            .as_mut()
+            .ok_or(KnownGoodInventoryError::MissingClient)?;
+        recomposed_client.sha1 = child_digest.as_str().to_string();
+        recomposed_client.size = child_size;
+        recomposed_client.url.clear();
+        if recomposed != resolved_version
+            || !serde_json::from_slice::<VersionJson>(version_bytes)
+                .is_ok_and(|version| version == resolved_version)
+        {
+            return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
+        }
         let child_client = resolved_version
             .downloads
             .client
             .as_ref()
             .ok_or(KnownGoodInventoryError::MissingClient)?;
-        let child_digest = sha1_digest(child_client_bytes);
         if u64::try_from(child_client.size).ok() != Some(child_client_bytes.len() as u64)
             || Sha1Digest::from_metadata(&child_client.sha1)? != child_digest
         {
@@ -1692,13 +1684,17 @@ mod tests {
             effective_version: base_version.clone(),
             environment: crate::rules::default_environment(),
         };
-        let resolved = compose_loader_version(
+        let mut resolved = compose_loader_version(
             &base_version,
             &record.minecraft_version,
             &record.version_id,
             source.version(),
         )
         .expect("resolved installer version");
+        let resolved_client = resolved.downloads.client.as_mut().expect("resolved client");
+        resolved_client.sha1 = sha1_digest(child_client.bytes()).as_str().to_string();
+        resolved_client.size = child_client.bytes().len() as i64;
+        resolved_client.url.clear();
         let version_bytes = serde_json::to_vec_pretty(&resolved).expect("version bytes");
         let metadata = installed_loader_metadata_bytes(&record).expect("loader metadata");
 

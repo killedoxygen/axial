@@ -1,7 +1,7 @@
 use crate::download::ExpectedIntegrity;
 use crate::launch::{
     ArgumentsSection, AssetIndex, Downloads, JavaVersion, Library, LoggingConf, VersionJson,
-    merge_libraries_prefer_first, resolve_version,
+    merge_libraries_prefer_first,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -126,18 +126,6 @@ pub fn compose_loader_version(
     }
 
     Ok(composed)
-}
-
-pub fn compose_loader_version_from_installed_base(
-    mc_dir: &Path,
-    base_version_id: &str,
-    version_id: &str,
-    fragment: &LoaderProfileFragment,
-) -> Result<VersionJson, LoaderError> {
-    let base = resolve_version(mc_dir, base_version_id).map_err(|error| {
-        LoaderError::InstallExecutionFailed(format!("resolve base version: {error}"))
-    })?;
-    compose_loader_version(&base, base_version_id, version_id, fragment)
 }
 
 pub async fn write_composed_version(
@@ -279,9 +267,8 @@ async fn copy_authenticated_base_jar(
 #[cfg(test)]
 mod tests {
     use super::{
-        LoaderProfileFragment, cleanup_incomplete_version,
-        compose_loader_version_from_installed_base, finalize_version_install, managed_version_dir,
-        write_composed_version,
+        LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
+        finalize_version_install, managed_version_dir, write_composed_version,
     };
     use crate::LoaderError;
     use crate::download::ExpectedIntegrity;
@@ -356,9 +343,9 @@ mod tests {
 
         let version_id = installed_version_id_for(LoaderComponentId::Fabric, "1.21.6", "0.16.10")
             .expect("canonical installed id");
+        let base = resolve_version(&root, "1.21.6").expect("resolve base");
         let composed =
-            compose_loader_version_from_installed_base(&root, "1.21.6", &version_id, &fragment)
-                .expect("compose");
+            compose_loader_version(&base, "1.21.6", &version_id, &fragment).expect("compose");
         assert_eq!(composed.asset_index.id, "1.21.6");
         assert_eq!(
             composed.main_class,
@@ -418,9 +405,9 @@ mod tests {
 
         let version_id = installed_version_id_for(LoaderComponentId::Fabric, "1.21.6", "0.16.10")
             .expect("canonical installed id");
+        let base = resolve_version(&root, "1.21.6").expect("resolve base");
         let composed =
-            compose_loader_version_from_installed_base(&root, "1.21.6", &version_id, &fragment)
-                .expect("compose");
+            compose_loader_version(&base, "1.21.6", &version_id, &fragment).expect("compose");
 
         let asm_libraries = composed
             .libraries
@@ -631,9 +618,9 @@ mod tests {
 
         let version_id = installed_version_id_for(LoaderComponentId::Fabric, "1.21.6", "0.16.10")
             .expect("canonical installed version id");
-        let composed =
-            compose_loader_version_from_installed_base(&root, "1.21.6", &version_id, &fragment)
-                .expect("compose loader version");
+        let base = resolve_version(&root, "1.21.6").expect("resolve base");
+        let composed = compose_loader_version(&base, "1.21.6", &version_id, &fragment)
+            .expect("compose loader version");
         write_composed_version(
             &root,
             &version_id,

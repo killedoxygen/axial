@@ -10,10 +10,6 @@ pub(crate) struct LoaderWorkspace {
     target_version_id: String,
 }
 
-pub(crate) struct LoaderWorkspaceTemp {
-    directory: ManagedDir,
-}
-
 pub(crate) struct ProcessorWorkspace {
     stage: ManagedDir,
     root: ManagedDir,
@@ -28,14 +24,11 @@ impl LoaderWorkspace {
     pub(crate) fn target_version_id(&self) -> &str {
         &self.target_version_id
     }
+
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         self.directory.path()
     }
-
-    pub(crate) async fn write_exact(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
-        self.directory.write_exact(name, bytes).await
-    }
-
     pub(crate) fn revalidate(&self) -> Result<(), LoaderError> {
         self.root.revalidate()?;
         self.directory.revalidate()
@@ -63,14 +56,6 @@ impl LoaderWorkspace {
             .open_child("versions")?
             .open_child(version_id)?
             .read_authenticated(&format!("{version_id}.jar"), expected_size, expected_sha1)
-    }
-
-    pub(crate) fn create_temp(&self, name: &str) -> Result<LoaderWorkspaceTemp, LoaderError> {
-        if let Some(stale) = self.directory.open_child_if_exists(name)? {
-            stale.clear_owned_contents()?;
-        }
-        let directory = self.directory.open_or_create_child(name)?;
-        Ok(LoaderWorkspaceTemp { directory })
     }
 
     pub(crate) fn prepare_processor_stage(
@@ -101,20 +86,6 @@ impl LoaderWorkspace {
         workspace.revalidate()?;
         workspace.validate_fresh_layout(minecraft_version)?;
         Ok(workspace)
-    }
-
-    pub(crate) fn cleanup(self) -> Result<(), LoaderError> {
-        self.directory.clear_owned_contents()
-    }
-}
-
-impl LoaderWorkspaceTemp {
-    pub(crate) async fn write_relative_exact(
-        &self,
-        relative: &crate::artifact_path::ArtifactRelativePath,
-        bytes: &[u8],
-    ) -> Result<(), LoaderError> {
-        self.directory.write_relative_exact(relative, bytes).await
     }
 
     pub(crate) fn cleanup(self) -> Result<(), LoaderError> {

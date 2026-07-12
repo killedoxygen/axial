@@ -22,8 +22,8 @@ use crate::state::{AppState, InstallStore, ProducerLease};
 use axial_minecraft::loaders::LoaderActiveInstallFailure;
 use axial_minecraft::{
     DownloadProgress, LoaderComponentId, LoaderError, LoaderInstallError, LoaderInstallFailureKind,
-    LoaderInstallOutcome, LoaderPreOperationFailureKind, LoaderProviderFailureKind, fetch_builds,
-    fetch_components, fetch_supported_versions, install_build, resolve_build_record_for_install,
+    LoaderPreOperationFailureKind, LoaderProviderFailureKind, fetch_builds, fetch_components,
+    fetch_supported_versions, install_build, resolve_build_record_for_install,
 };
 use axum::{Json, http::StatusCode};
 use std::future::Future;
@@ -273,64 +273,27 @@ pub(super) async fn start_loader_install_owned(
                         }
                         return;
                     }
-                    Ok(outcome) => {
+                    Ok(receipt) => {
                         let captured_terminal = final_progress
                             .lock()
                             .ok()
                             .and_then(|mut progress| progress.take());
-                        let publication = match outcome {
-                            LoaderInstallOutcome::KnownGood(receipt) => {
-                                publish_known_good_loader_terminal(
-                                    async {
-                                        require_exact_loader_receipt_version(
-                                            &version_id,
-                                            receipt.version_id(),
-                                        )?;
-                                        worker_state
-                                            .accept_known_good_install_receipt(
-                                                &library_dir,
-                                                *receipt,
-                                            )
-                                            .await
-                                    },
-                                    captured_terminal,
-                                    |progress| {
-                                        let _ = progress_tx.send(progress);
-                                    },
-                                )
-                                .await
-                            }
-                            LoaderInstallOutcome::PendingAuthority {
-                                version_id: pending_version_id,
-                            } if matches!(
-                                build.component_id,
-                                LoaderComponentId::Forge | LoaderComponentId::NeoForge
-                            ) && pending_version_id == version_id =>
-                            {
-                                let _ = progress_tx.send(
-                                    captured_terminal.unwrap_or_else(loader_install_done_progress),
-                                );
-                                LoaderTerminalPublication::success()
-                            }
-                            LoaderInstallOutcome::PendingAuthority { .. } => {
-                                tracing::warn!(
-                                    operation_id = worker_operation_id.as_str(),
-                                    version_id = version_id.as_str(),
-                                    failure_kind = "known_good_reconciliation",
-                                    "loader install returned unsupported pending authority"
-                                );
-                                publish_known_good_loader_terminal(
-                                    std::future::ready(Err(std::io::Error::other(
-                                        "loader install authority was not produced",
-                                    ))),
-                                    captured_terminal,
-                                    |progress| {
-                                        let _ = progress_tx.send(progress);
-                                    },
-                                )
-                                .await
-                            }
-                        };
+                        let publication = publish_known_good_loader_terminal(
+                            async {
+                                require_exact_loader_receipt_version(
+                                    &version_id,
+                                    receipt.version_id(),
+                                )?;
+                                worker_state
+                                    .accept_known_good_install_receipt(&library_dir, receipt)
+                                    .await
+                            },
+                            captured_terminal,
+                            |progress| {
+                                let _ = progress_tx.send(progress);
+                            },
+                        )
+                        .await;
                         if publication.acceptance_failed {
                             tracing::warn!(
                                 operation_id = worker_operation_id.as_str(),

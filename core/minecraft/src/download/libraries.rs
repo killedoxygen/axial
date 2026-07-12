@@ -186,13 +186,6 @@ where
     result
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Forge receipt cutover consumes this capability next"
-    )
-)]
 pub(crate) async fn download_installer_libraries_with_authority_and_facts_and_descriptors<F, G, H>(
     mc_dir: &Path,
     libraries: &[Library],

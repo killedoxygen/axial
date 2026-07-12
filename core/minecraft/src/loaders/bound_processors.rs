@@ -79,6 +79,7 @@ struct VerifiedStepOutput {
 
 pub(crate) struct BoundProcessorExecutionResult {
     pub(crate) base_receipt: KnownGoodInstallReceipt,
+    pub(crate) base_client_bytes: Vec<u8>,
     pub(crate) continuation: BoundForgeInstallerContinuation,
     pub(crate) outputs: VerifiedProcessorOutputs,
 }
@@ -103,13 +104,6 @@ impl Drop for BoundProcessorExecutionHandle {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the receipt-producing Forge install cutover consumes this capability next"
-    )
-)]
 impl BoundProcessorExecutionHandle {
     pub(crate) async fn finish(
         mut self,
@@ -134,13 +128,6 @@ impl BoundProcessorExecutionHandle {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the receipt-producing Forge install cutover consumes this capability next"
-    )
-)]
 pub(crate) fn spawn_bound_processor_execution(
     base_receipt: KnownGoodInstallReceipt,
     execution: BoundForgeProcessorExecution,
@@ -220,11 +207,14 @@ async fn run_owned_execution(
         .map_err(|_| BoundProcessorError::Cleanup);
     processor_cleanup?;
     loader_cleanup?;
-    execution.map(|outputs| BoundProcessorExecutionResult {
-        base_receipt,
-        continuation,
-        outputs,
-    })
+    execution.map(
+        |(outputs, base_client_bytes)| BoundProcessorExecutionResult {
+            base_receipt,
+            base_client_bytes,
+            continuation,
+            outputs,
+        },
+    )
 }
 
 async fn execute_in_workspace(
@@ -235,7 +225,7 @@ async fn execute_in_workspace(
     workspace: &ProcessorWorkspace,
     cancel: &mut oneshot::Receiver<()>,
     progress: &mpsc::UnboundedSender<BoundProcessorProgress>,
-) -> Result<VerifiedProcessorOutputs, BoundProcessorError> {
+) -> Result<(VerifiedProcessorOutputs, Vec<u8>), BoundProcessorError> {
     check_cancel(cancel)?;
     let mut authority = stage_inputs(
         loader_workspace,
@@ -308,7 +298,10 @@ async fn execute_in_workspace(
         &authority,
         &initial_stage,
     )?;
-    Ok(VerifiedProcessorOutputs { entries: verified })
+    Ok((
+        VerifiedProcessorOutputs { entries: verified },
+        authority.base_client_bytes,
+    ))
 }
 
 struct AuthenticatedBytes {
@@ -321,6 +314,7 @@ struct StagedAuthority {
     version: AuthenticatedBytes,
     processor_data: BTreeMap<ArtifactRelativePath, AuthenticatedBytes>,
     installer: Option<AuthenticatedBytes>,
+    base_client_bytes: Vec<u8>,
 }
 
 async fn stage_inputs(
@@ -417,6 +411,7 @@ async fn stage_inputs(
         version,
         processor_data,
         installer,
+        base_client_bytes: client_bytes,
     })
 }
 
@@ -1227,13 +1222,6 @@ fn check_cancel(cancel: &mut oneshot::Receiver<()>) -> Result<(), BoundProcessor
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the receipt-producing Forge install cutover consumes this carrier next"
-    )
-)]
 impl VerifiedProcessorOutputs {
     pub(crate) fn none() -> Self {
         Self {
@@ -1394,6 +1382,7 @@ mod tests {
             version: facts(b"client"),
             processor_data: BTreeMap::from([(data.clone(), facts(b"patch"))]),
             installer: Some(facts(b"installer")),
+            base_client_bytes: Vec::new(),
         };
         let artifact = BoundProcessorArtifact {
             coordinate: "example:processor:1".to_string(),

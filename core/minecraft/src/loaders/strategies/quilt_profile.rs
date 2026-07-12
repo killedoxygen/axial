@@ -1,6 +1,6 @@
 use super::common::install_from_profile_source;
 use crate::download::DownloadProgress;
-use crate::loaders::LoaderInstallOutcome;
+use crate::known_good::KnownGoodInstallReceipt;
 use crate::loaders::types::{LoaderError, LoaderInstallPlan, LoaderInstallSource};
 use std::path::Path;
 
@@ -8,7 +8,7 @@ pub async fn install<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
     send: &mut F,
-) -> Result<LoaderInstallOutcome, LoaderError>
+) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
@@ -17,7 +17,5 @@ where
             "quilt build requires a profile json source".to_string(),
         ));
     };
-    install_from_profile_source(library_dir, plan, url, send)
-        .await
-        .map(|receipt| LoaderInstallOutcome::KnownGood(Box::new(receipt)))
+    install_from_profile_source(library_dir, plan, url, send).await
 }

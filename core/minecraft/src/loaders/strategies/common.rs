@@ -1,27 +1,29 @@
 #[cfg(test)]
 use crate::download::download_libraries_with_facts_and_descriptors;
 use crate::download::{
-    DownloadProgress, Downloader, ExpectedIntegrity,
+    DownloadProgress, Downloader, InstallerLibraryDownloadAuthority, LibraryChecksumPolicy,
+    download_installer_libraries_with_authority_and_facts_and_descriptors,
     download_libraries_allowing_missing_checksums_with_facts_and_descriptors,
+    library_artifact_plans_for,
 };
-use crate::known_good::KnownGoodInstallReceipt;
-use crate::launch::{DownloadEntry, VersionJson, library_merge_key, resolve_version};
+use crate::known_good::{KnownGoodInstallReceipt, seal_verified_installer_library_authority};
+use crate::launch::library_merge_key;
 use crate::loaders::api::validate_loader_build_record_identity;
+use crate::loaders::bound_processors::spawn_bound_processor_execution;
 use crate::loaders::compose::{
     LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
-    compose_loader_version_from_installed_base, create_managed_version_dir,
-    finalize_version_install, managed_version_dir, write_composed_version,
+    create_managed_version_dir, finalize_version_install, managed_version_dir,
+    write_composed_version,
 };
 use crate::loaders::forge_installer::{
-    AuthenticatedEmbeddedMavenArtifact, AuthenticatedForgeInstallerPlan, BoundForgeInstallerPlan,
-    bind_authenticated_installer_plan, plan_authenticated_installer,
+    AuthenticatedEmbeddedMavenArtifact, AuthenticatedForgeInstallerPlan,
+    BoundForgeInstallExecution, bind_authenticated_installer_plan, plan_authenticated_installer,
 };
 #[cfg(not(test))]
 use crate::loaders::http::fetch_bytes;
 #[cfg(test)]
 use crate::loaders::http::fetch_bytes_for_test as fetch_bytes;
 use crate::loaders::managed_fs::ManagedDir;
-use crate::loaders::processors::run_processors;
 use crate::loaders::providers::{self, ProfileInstallProof};
 use crate::loaders::source::{VerifiedLoaderSource, fetch_sha1_verified_source};
 use crate::loaders::types::{
@@ -35,7 +37,7 @@ use crate::loaders::{
 use crate::paths::versions_dir;
 use crate::profiles::ensure_launcher_profiles;
 use sha1::{Digest as _, Sha1};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -184,7 +186,7 @@ pub async fn install_from_installer_source<F>(
     plan: &LoaderInstallPlan,
     installer_url: &str,
     send: &mut F,
-) -> Result<String, LoaderError>
+) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
@@ -208,142 +210,215 @@ where
         extract_installer_blocking(installer_source, plan.record.component_name.clone()).await?;
     let installer_plan = bind_authenticated_installer_plan(authenticated, &plan.record)
         .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
+    let execution = installer_plan.into_install_execution();
+    let excluded_paths = match &execution {
+        BoundForgeInstallExecution::Run(execution) => execution
+            .excluded_live_library_paths()
+            .map_err(|error| installer_extract_error(&plan.record.component_name, error))?,
+        BoundForgeInstallExecution::Continue(continuation) => continuation
+            .excluded_live_library_paths()
+            .map_err(|error| installer_extract_error(&plan.record.component_name, error))?,
+        BoundForgeInstallExecution::UnsupportedMissingOutputs => {
+            return Err(LoaderError::InvalidProfile(
+                "loader installer processors do not expose authenticated client outputs"
+                    .to_string(),
+            ));
+        }
+    };
     let base_receipt = Box::pin(ensure_base_version(
         library_dir,
         &plan.record.minecraft_version,
         send,
     ))
     .await?;
-    let authenticated_client = base_receipt
-        .authenticated_client_integrity()
-        .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
-    drop(base_receipt);
-    Box::pin(install_bound_installer_after_authenticated_base(
+    let installer_libraries = match &execution {
+        BoundForgeInstallExecution::Run(execution) => execution.libraries(),
+        BoundForgeInstallExecution::Continue(continuation) => continuation.libraries(),
+        BoundForgeInstallExecution::UnsupportedMissingOutputs => unreachable!(),
+    };
+    let download_authority = Box::pin(download_installer_libraries_with_evidence(
+        library_dir,
+        installer_libraries,
+        &excluded_paths,
+        "loader_libraries",
+        &mut *send,
+    ))
+    .await?;
+    Box::pin(finish_supported_installer_install(
         library_dir,
         plan,
-        installer_plan,
-        &authenticated_client,
+        execution,
+        download_authority,
+        base_receipt,
         send,
     ))
     .await
 }
 
-async fn install_bound_installer_after_authenticated_base<F>(
+async fn finish_supported_installer_install<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
-    installer_plan: BoundForgeInstallerPlan,
-    authenticated_client: &ExpectedIntegrity,
+    execution: BoundForgeInstallExecution,
+    download_authority: Vec<InstallerLibraryDownloadAuthority>,
+    base_receipt: KnownGoodInstallReceipt,
     send: &mut F,
-) -> Result<String, LoaderError>
+) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
-    send(progress(
-        "profile",
-        0,
-        1,
-        Some(format!(
-            "Extracting {} installer...",
-            plan.record.component_name
-        )),
-    ));
-    let installer_version = installer_plan.version();
     let installed_version_id = plan.record.version_id.clone();
     validate_version_id(&installed_version_id, "installed loader version id")?;
-    let version = compose_loader_version_from_installed_base(
-        library_dir,
+    let (base_receipt, base_client_bytes, continuation, processor_outputs) = match execution {
+        BoundForgeInstallExecution::Run(execution) => {
+            let workspace = prepare_fresh_work_dir(library_dir, &installed_version_id)?;
+            send(progress(
+                "processors",
+                0,
+                1,
+                Some("Running processors...".to_string()),
+            ));
+            let result = spawn_bound_processor_execution(base_receipt, *execution, workspace)
+                .finish(|update| {
+                    send(DownloadProgress {
+                        phase: "processors".to_string(),
+                        current: update.current as i32,
+                        total: update.total as i32,
+                        file: Some("Running processors...".to_string()),
+                        error: None,
+                        done: false,
+                        bytes_done: None,
+                        bytes_total: None,
+                    });
+                })
+                .await
+                .map_err(|error| LoaderError::ProcessorFailed(error.to_string()))?;
+            (
+                result.base_receipt,
+                result.base_client_bytes,
+                result.continuation,
+                result.outputs,
+            )
+        }
+        BoundForgeInstallExecution::Continue(continuation) => {
+            let integrity = base_receipt
+                .authenticated_client_integrity()
+                .map_err(|error| {
+                    LoaderError::Verify(format!("authenticate base client: {error:?}"))
+                })?;
+            let workspace = prepare_fresh_work_dir(library_dir, &installed_version_id)?;
+            let base_client_bytes = workspace
+                .read_base_client_authenticated(
+                    base_receipt.version_id(),
+                    integrity.size,
+                    integrity.sha1.as_deref(),
+                )
+                .and_then(|bytes| {
+                    base_receipt
+                        .authenticate_client_bytes(&bytes)
+                        .map_err(|error| {
+                            LoaderError::Verify(format!("authenticate base client: {error:?}"))
+                        })?;
+                    Ok(bytes)
+                });
+            let workspace_cleanup = workspace.cleanup();
+            let base_client_bytes = base_client_bytes?;
+            workspace_cleanup?;
+            (
+                base_receipt,
+                base_client_bytes,
+                *continuation,
+                crate::loaders::VerifiedProcessorOutputs::none(),
+            )
+        }
+        BoundForgeInstallExecution::UnsupportedMissingOutputs => unreachable!(),
+    };
+    let source = continuation.into_receipt_source();
+    let mut version = compose_loader_version(
+        base_receipt.effective_version(),
         &plan.record.minecraft_version,
         &installed_version_id,
-        installer_version,
+        source.version(),
     )?;
+    let child_client = source
+        .derive_child_client_bytes(&base_client_bytes)
+        .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
+    let client = version.downloads.client.as_mut().ok_or_else(|| {
+        LoaderError::Verify("authenticated base version has no client download".to_string())
+    })?;
+    client.sha1 = format!("{:x}", Sha1::digest(child_client.bytes()));
+    client.size = i64::try_from(child_client.bytes().len())
+        .map_err(|_| LoaderError::Verify("loader client is too large".to_string()))?;
+    client.url.clear();
     let version_bytes = serde_json::to_vec_pretty(&version)?;
+    let loader_metadata_bytes = installed_loader_metadata_bytes(&plan.record)?;
+    let materialized_library_paths = library_artifact_plans_for(
+        source.libraries(),
+        &crate::rules::default_environment(),
+        LibraryChecksumPolicy::AllowMissing,
+    )
+    .map_err(|error| LoaderError::Verify(format!("plan installer libraries: {error}")))?
+    .into_iter()
+    .map(|library| library.relative_path)
+    .collect::<BTreeSet<_>>();
+    let library_authority =
+        seal_verified_installer_library_authority(&source, download_authority, processor_outputs)
+            .map_err(|error| {
+            LoaderError::Verify(format!("derive loader library authority: {error:?}"))
+        })?;
+    let receipt = KnownGoodInstallReceipt::from_verified_installer_source(
+        base_receipt,
+        &plan.record,
+        &source,
+        version,
+        &version_bytes,
+        &base_client_bytes,
+        &child_client,
+        &loader_metadata_bytes,
+        &library_authority,
+    )
+    .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
+
+    if child_client.bytes() != base_client_bytes {
+        send(progress(
+            "client_jar",
+            0,
+            1,
+            Some(format!("{installed_version_id}.jar")),
+        ));
+    }
+    let child_client_bytes = child_client.into_bytes();
+    let embedded = source.into_embedded_maven_artifacts();
+    let terminal = library_authority.into_terminal_materializations();
+    let version_dir = create_managed_version_dir(library_dir, &installed_version_id)?;
     cleanup_on_error(
-        write_composed_version(
-            library_dir,
+        write_loader_install_effects(
+            &version_dir,
             &installed_version_id,
-            &version,
             &version_bytes,
-            &plan.record.minecraft_version,
-            authenticated_client,
+            &child_client_bytes,
+            &loader_metadata_bytes,
         )
         .await,
         library_dir,
         &installed_version_id,
     )?;
     cleanup_on_error(
-        materialize_embedded_maven_artifacts(
+        materialize_selected_embedded_maven_artifacts(
             library_dir,
-            installer_plan.embedded_maven_artifacts(),
+            embedded,
+            &materialized_library_paths,
         )
         .await,
         library_dir,
         &installed_version_id,
     )?;
-    let library_download_result = Box::pin(download_profile_loader_libraries_with_evidence(
+    cleanup_on_error(
+        materialize_terminal_processor_outputs(library_dir, terminal, &materialized_library_paths)
+            .await,
         library_dir,
-        installer_plan.libraries(),
-        "loader_libraries",
-        &mut *send,
-    ))
-    .await;
-    cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
-
-    if let Some(install_profile_json) = installer_plan.install_profile_json() {
-        let workspace = prepare_fresh_work_dir(library_dir, &installed_version_id)?;
-        workspace
-            .write_exact("source-installer.jar", installer_plan.source_bytes())
-            .await?;
-        send(progress(
-            "processors",
-            0,
-            1,
-            Some("Running processors...".to_string()),
-        ));
-        let processor_result = Box::pin(run_processors(
-            library_dir,
-            &plan.record.minecraft_version,
-            install_profile_json,
-            installer_plan.source_bytes(),
-            &workspace,
-            |current, total, detail| {
-                send(DownloadProgress {
-                    phase: "processors".to_string(),
-                    current: current as i32,
-                    total: total as i32,
-                    file: Some(detail),
-                    error: None,
-                    done: false,
-                    bytes_done: None,
-                    bytes_total: None,
-                });
-            },
-        ))
-        .await
-        .map_err(|error| LoaderError::ProcessorFailed(error.to_string()));
-        let workspace_revalidation = workspace.revalidate();
-        let workspace_cleanup = workspace.cleanup();
-        cleanup_on_error(processor_result, library_dir, &installed_version_id)?;
-        workspace_revalidation?;
-        workspace_cleanup?;
-    }
-
-    if installer_plan.strip_client_meta() {
-        send(progress(
-            "client_jar",
-            0,
-            1,
-            Some(format!("{installed_version_id}.jar")),
-        ));
-        cleanup_on_error(
-            strip_child_client_jar_meta(library_dir, &installed_version_id).await,
-            library_dir,
-            &installed_version_id,
-        )?;
-        cleanup_on_error(
-            write_patched_client_jar_integrity(library_dir, &installed_version_id).await,
-            library_dir,
-            &installed_version_id,
-        )?;
+        &installed_version_id,
+    )?;
+    if child_client_bytes != base_client_bytes {
         send(progress(
             "client_jar",
             1,
@@ -352,16 +427,6 @@ where
         ));
     }
 
-    cleanup_on_error(
-        write_installed_loader_metadata(library_dir, &installed_version_id, &plan.record).await,
-        library_dir,
-        &installed_version_id,
-    )?;
-    cleanup_on_error(
-        verify_install(library_dir, &installed_version_id),
-        library_dir,
-        &installed_version_id,
-    )?;
     cleanup_on_error(
         ensure_launcher_profiles(library_dir, &installed_version_id),
         library_dir,
@@ -373,7 +438,7 @@ where
         &installed_version_id,
     )?;
     send(done());
-    Ok(installed_version_id)
+    Ok(receipt)
 }
 
 fn validate_installer_record_authority(
@@ -494,7 +559,7 @@ where
 
     let version_dir = create_managed_version_dir(library_dir, &plan.record.version_id)?;
     cleanup_on_error(
-        write_legacy_archive_install_effects(
+        write_loader_install_effects(
             &version_dir,
             &plan.record.version_id,
             &version_bytes,
@@ -506,11 +571,6 @@ where
         &plan.record.version_id,
     )?;
 
-    cleanup_on_error(
-        verify_install(library_dir, &plan.record.version_id),
-        library_dir,
-        &plan.record.version_id,
-    )?;
     cleanup_on_error(
         ensure_launcher_profiles(library_dir, &plan.record.version_id),
         library_dir,
@@ -630,40 +690,37 @@ where
     .map_err(|_| LoaderError::ArtifactDownloadFailed { facts, descriptors })
 }
 
+async fn download_installer_libraries_with_evidence<F>(
+    library_dir: &Path,
+    libraries: &[crate::launch::Library],
+    excluded_paths: &BTreeSet<crate::artifact_path::ArtifactRelativePath>,
+    phase: &str,
+    send: &mut F,
+) -> Result<Vec<InstallerLibraryDownloadAuthority>, LoaderError>
+where
+    F: FnMut(DownloadProgress),
+{
+    let mut facts = Vec::new();
+    let mut descriptors = Vec::new();
+    download_installer_libraries_with_authority_and_facts_and_descriptors(
+        library_dir,
+        libraries,
+        excluded_paths,
+        phase,
+        &mut *send,
+        |fact| facts.push(fact),
+        |descriptor| descriptors.push(descriptor),
+    )
+    .await
+    .map_err(|_| LoaderError::ArtifactDownloadFailed { facts, descriptors })
+}
+
 fn cleanup_on_error<T, E>(
     result: Result<T, E>,
     library_dir: &Path,
     version_id: &str,
 ) -> Result<T, E> {
     result.inspect_err(|_| cleanup_incomplete_version(library_dir, version_id))
-}
-
-fn verify_install(library_dir: &Path, version_id: &str) -> Result<(), LoaderError> {
-    validate_version_id(version_id, "installed loader version id")?;
-    let version = resolve_version(library_dir, version_id)
-        .map_err(|error| LoaderError::Verify(format!("resolve version: {error}")))?;
-    if version.main_class.trim().is_empty() {
-        return Err(LoaderError::Verify("mainClass is empty".to_string()));
-    }
-    if version.asset_index.id.trim().is_empty() {
-        return Err(LoaderError::Verify("assetIndex is empty".to_string()));
-    }
-    let jar_path = versions_dir(library_dir)
-        .join(version_id)
-        .join(format!("{version_id}.jar"));
-    if !jar_path.is_file() {
-        return Err(LoaderError::Verify("client jar is missing".to_string()));
-    }
-    Ok(())
-}
-
-async fn write_installed_loader_metadata(
-    library_dir: &Path,
-    version_id: &str,
-    record: &LoaderBuildRecord,
-) -> Result<(), LoaderError> {
-    let metadata = installed_loader_metadata_bytes(record)?;
-    write_installed_loader_metadata_bytes(library_dir, version_id, &metadata).await
 }
 
 async fn write_installed_loader_metadata_bytes(
@@ -803,14 +860,36 @@ async fn extract_installer_blocking(
     .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
 }
 
-async fn materialize_embedded_maven_artifacts(
+async fn materialize_selected_embedded_maven_artifacts(
     library_dir: &Path,
-    artifacts: &[AuthenticatedEmbeddedMavenArtifact],
+    artifacts: Vec<AuthenticatedEmbeddedMavenArtifact>,
+    selected_paths: &BTreeSet<crate::artifact_path::ArtifactRelativePath>,
 ) -> Result<(), LoaderError> {
     let root = ManagedDir::open_root(library_dir)?.open_or_create_child("libraries")?;
-    for artifact in artifacts {
+    for artifact in artifacts
+        .into_iter()
+        .filter(|artifact| selected_paths.contains(artifact.relative_path()))
+    {
         root.write_relative_exact(artifact.relative_path(), artifact.bytes())
             .await?;
+    }
+    root.revalidate()?;
+    Ok(())
+}
+
+async fn materialize_terminal_processor_outputs(
+    library_dir: &Path,
+    outputs: Vec<(crate::artifact_path::ArtifactRelativePath, Arc<[u8]>)>,
+    selected_paths: &BTreeSet<crate::artifact_path::ArtifactRelativePath>,
+) -> Result<(), LoaderError> {
+    let root = ManagedDir::open_root(library_dir)?.open_or_create_child("libraries")?;
+    for (path, bytes) in outputs {
+        if !selected_paths.contains(&path) {
+            return Err(LoaderError::Verify(
+                "processor output is outside the sealed installer library inventory".to_string(),
+            ));
+        }
+        root.write_relative_exact(&path, &bytes).await?;
     }
     root.revalidate()?;
     Ok(())
@@ -827,7 +906,7 @@ async fn overlay_legacy_archive_bytes_blocking(
     .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
 }
 
-async fn write_legacy_archive_install_effects(
+async fn write_loader_install_effects(
     version_dir: &ManagedDir,
     version_id: &str,
     version_bytes: &[u8],
@@ -848,66 +927,6 @@ async fn write_legacy_archive_install_effects(
         .write_exact(LOADER_METADATA_FILE, loader_metadata_bytes)
         .await?;
     version_dir.revalidate()
-}
-
-async fn write_patched_client_jar_integrity(
-    library_dir: &Path,
-    version_id: &str,
-) -> Result<(), LoaderError> {
-    validate_version_id(version_id, "installed loader version id")?;
-    let version_dir = managed_version_dir(library_dir, version_id)?;
-    let jar_bytes = version_dir.read_exact(&format!("{version_id}.jar"))?;
-    let mut hasher = Sha1::new();
-    hasher.update(&jar_bytes);
-    let sha1 = format!("{:x}", hasher.finalize());
-    let size = i64::try_from(jar_bytes.len()).unwrap_or(i64::MAX);
-
-    let version_bytes = version_dir.read_exact(&format!("{version_id}.json"))?;
-    let mut version: VersionJson = serde_json::from_slice(&version_bytes).map_err(|error| {
-        LoaderError::InvalidProfile(format!("parse installed version: {error}"))
-    })?;
-    let client = version
-        .downloads
-        .client
-        .get_or_insert_with(DownloadEntry::default);
-    client.sha1 = sha1;
-    client.size = size;
-    client.url.clear();
-    version_dir
-        .write_exact(
-            &format!("{version_id}.json"),
-            &serde_json::to_vec_pretty(&version)?,
-        )
-        .await?;
-    version_dir.revalidate()
-}
-
-async fn strip_child_client_jar_meta(
-    library_dir: &Path,
-    version_id: &str,
-) -> Result<(), LoaderError> {
-    validate_version_id(version_id, "installed loader version id")?;
-    let version_dir = managed_version_dir(library_dir, version_id)?;
-    let source = version_dir.read_exact(&format!("{version_id}.jar"))?;
-    let stripped = tokio::task::spawn_blocking(move || strip_zip_metadata_bytes(&source))
-        .await
-        .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))??;
-    version_dir
-        .write_exact(&format!("{version_id}.jar"), &stripped)
-        .await?;
-    version_dir.revalidate()
-}
-
-fn strip_zip_metadata_bytes(source: &[u8]) -> Result<Vec<u8>, LoaderError> {
-    let mut source_archive = ZipArchive::new(std::io::Cursor::new(source))
-        .map_err(|error| legacy_archive_error("legacy client", error))?;
-    let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    copy_zip_entries(&mut source_archive, &mut writer, None)?;
-    let output = writer
-        .finish()
-        .map_err(|error| legacy_archive_error("legacy client metadata strip", error))?
-        .into_inner();
-    Ok(output)
 }
 
 fn overlay_legacy_archive_bytes(
@@ -1062,38 +1081,6 @@ fn legacy_overlay_limit_error() -> LoaderError {
     LoaderError::InvalidProfile("legacy Forge overlay exceeds bounded output limits".to_string())
 }
 
-fn copy_zip_entries<R: std::io::Read + std::io::Seek, W: std::io::Write + std::io::Seek>(
-    archive: &mut ZipArchive<R>,
-    writer: &mut ZipWriter<W>,
-    replaced_names: Option<&HashSet<String>>,
-) -> Result<(), LoaderError> {
-    for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|error| legacy_archive_error("legacy Forge", error))?;
-        let name = entry.name().to_string();
-        if legacy_archive_entry_is_skipped(&name)
-            || replaced_names.is_some_and(|names| names.contains(&name))
-        {
-            continue;
-        }
-        if entry.is_dir() || name.ends_with('/') {
-            writer
-                .add_directory(&name, SimpleFileOptions::default())
-                .map_err(|error| legacy_archive_error("legacy Forge overlay", error))?;
-            continue;
-        }
-
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes).map_err(LoaderError::Io)?;
-        writer
-            .start_file(&name, SimpleFileOptions::default())
-            .map_err(|error| legacy_archive_error("legacy Forge overlay", error))?;
-        writer.write_all(&bytes).map_err(LoaderError::Io)?;
-    }
-    Ok(())
-}
-
 fn legacy_archive_entry_is_skipped(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     upper == "META-INF/MANIFEST.MF"
@@ -1142,13 +1129,12 @@ fn done() -> DownloadProgress {
 mod tests {
     use super::{
         base_version_install_lock_from_map, cleanup_on_error,
-        download_loader_libraries_with_evidence, download_profile_loader_libraries_with_evidence,
-        ensure_base_version, fetch_sha1_verified_source,
-        install_bound_installer_after_authenticated_base, install_from_installer_source,
-        install_from_legacy_archive, install_from_profile_source,
+        download_installer_libraries_with_evidence, download_loader_libraries_with_evidence,
+        download_profile_loader_libraries_with_evidence, ensure_base_version,
+        fetch_sha1_verified_source, finish_supported_installer_install,
+        install_from_installer_source, install_from_legacy_archive, install_from_profile_source,
         install_legacy_archive_after_authenticated_base, overlay_legacy_archive_bytes,
-        strip_child_client_jar_meta, validate_and_enrich_profile_source,
-        validate_installer_record_authority, write_patched_client_jar_integrity,
+        validate_and_enrich_profile_source, validate_installer_record_authority,
     };
     use crate::download::{
         DownloadProgress, ExecutionDownloadFactKind, ExpectedIntegrity,
@@ -1161,7 +1147,8 @@ mod tests {
     };
     use crate::loaders::compose::LoaderProfileFragment;
     use crate::loaders::forge_installer::{
-        BoundForgeInstallerPlan, bind_authenticated_installer_plan, plan_authenticated_installer,
+        BoundForgeInstallExecution, BoundForgeInstallerPlan, bind_authenticated_installer_plan,
+        plan_authenticated_installer,
     };
     use crate::loaders::providers::{ProfileInstallProof, ProfileLibraryProof};
     use crate::loaders::source::VerifiedLoaderSource;
@@ -1670,6 +1657,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_neoforge_processors_are_rejected_without_install_effects() {
+        let root = temp_dir("unsupported-neoforge-no-effects");
+        let mut record = installer_record();
+        record.component_id = LoaderComponentId::NeoForge;
+        record.component_name = "NeoForge".to_string();
+        record.loader_version = "21.5.74".to_string();
+        canonicalize_record_identity(&mut record);
+        record.strategy = LoaderInstallStrategy::NeoForgeModern;
+        let server = TestByteServer::start_with_sha1(unsupported_neoforge_installer_jar(&record));
+        record.install_source = LoaderInstallSource::InstallerJar {
+            url: server.url.clone(),
+        };
+        let plan = LoaderInstallPlan { record };
+
+        let error = install_from_installer_source(&root, &plan, &server.url, &mut |_| {})
+            .await
+            .expect_err("unsupported NeoForge processors");
+
+        assert!(matches!(error, LoaderError::InvalidProfile(_)));
+        assert!(!root.exists());
+        assert_eq!(server.request_count(), 2);
+        server.stop();
+    }
+
+    #[tokio::test]
     async fn authenticated_installer_identity_installs_to_backend_version_id() {
         let root = temp_dir("installer-bound-identity");
         write_base_version(&root, "1.21.5");
@@ -1684,23 +1696,191 @@ mod tests {
             verified_test_source(&installer_server.url, "loader installer").await;
         let installer_plan = bind_test_installer(installer_source, &record);
 
-        let installed_version_id = install_bound_installer_after_authenticated_base(
-            &root,
-            &plan,
-            installer_plan,
-            &test_client_integrity(&root, &record.minecraft_version),
-            &mut progress,
-        )
-        .await
-        .expect("install installer-backed loader");
+        let receipt = finish_test_installer(&root, &plan, installer_plan, &mut progress).await;
 
-        assert_eq!(installed_version_id, record.version_id);
+        assert_eq!(receipt.version_id(), record.version_id);
         assert_backend_version_was_written(
             &root,
             &record.version_id,
             &format!("1.21.5-forge-{}", record.loader_version),
         );
+        let processor_path = "example/processor-only/1.0/processor-only-1.0.jar";
+        let installed_version: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                versions_dir(&root)
+                    .join(&record.version_id)
+                    .join(format!("{}.json", record.version_id)),
+            )
+            .expect("installed version bytes"),
+        )
+        .expect("installed version json");
+        assert!(
+            !installed_version["libraries"]
+                .as_array()
+                .expect("installed libraries")
+                .iter()
+                .any(|library| library["name"] == "example:processor-only:1.0")
+        );
+        assert!(root.join("libraries").join(processor_path).is_file());
+        assert!(
+            receipt
+                .into_inventory()
+                .entries()
+                .iter()
+                .any(|entry| entry.path().as_str() == processor_path)
+        );
         assert_eq!(installer_server.request_count(), 2);
+        installer_server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn continue_receipt_failure_precedes_writes_and_cleans_workspace() {
+        let root = temp_dir("installer-continue-receipt-before-write");
+        write_base_version(&root, "1.21.5");
+        write_base_version(&root, "1.21.4");
+        let record = installer_record();
+        let installer_server =
+            TestByteServer::start_with_sha1(modern_forge_installer_jar(&record, None));
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+        };
+        let installer_source =
+            verified_test_source(&installer_server.url, "loader installer").await;
+        let execution = bind_test_installer(installer_source, &record).into_install_execution();
+        let BoundForgeInstallExecution::Continue(continuation) = &execution else {
+            panic!("continue fixture");
+        };
+        let excluded = continuation
+            .excluded_live_library_paths()
+            .expect("continue exclusions");
+        let authority = download_installer_libraries_with_evidence(
+            &root,
+            continuation.libraries(),
+            &excluded,
+            "loader_libraries",
+            &mut |_| {},
+        )
+        .await
+        .expect("installer authority");
+
+        let error = finish_supported_installer_install(
+            &root,
+            &plan,
+            execution,
+            authority,
+            test_authenticated_receipt(&root, "1.21.4"),
+            &mut |_| {},
+        )
+        .await
+        .expect_err("mismatched base receipt");
+
+        assert!(matches!(error, LoaderError::InvalidProfile(_)));
+        assert!(!versions_dir(&root).join(&record.version_id).exists());
+        let workspace = crate::paths::loader_work_dir(&root).join(&record.version_id);
+        assert!(workspace.is_dir());
+        assert_eq!(fs::read_dir(workspace).expect("clean workspace").count(), 0);
+        installer_server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn run_failure_precedes_writes_and_cleans_workspace() {
+        let root = temp_dir("installer-run-receipt-before-write");
+        write_base_version(&root, "1.21.5");
+        write_base_version(&root, "1.21.4");
+        let record = installer_record();
+        let installer_server =
+            TestByteServer::start_with_sha1(runnable_forge_installer_jar(&record));
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+        };
+        let installer_source =
+            verified_test_source(&installer_server.url, "loader installer").await;
+        let execution = bind_test_installer(installer_source, &record).into_install_execution();
+        let BoundForgeInstallExecution::Run(run) = &execution else {
+            panic!("run fixture");
+        };
+        let excluded = run.excluded_live_library_paths().expect("run exclusions");
+        let authority = download_installer_libraries_with_evidence(
+            &root,
+            run.libraries(),
+            &excluded,
+            "loader_libraries",
+            &mut |_| {},
+        )
+        .await
+        .expect("installer authority");
+
+        let error = finish_supported_installer_install(
+            &root,
+            &plan,
+            execution,
+            authority,
+            test_authenticated_receipt(&root, "1.21.4"),
+            &mut |_| {},
+        )
+        .await
+        .expect_err("mismatched processor base receipt");
+
+        assert!(matches!(error, LoaderError::ProcessorFailed(_)));
+        assert!(!versions_dir(&root).join(&record.version_id).exists());
+        let workspace = crate::paths::loader_work_dir(&root).join(&record.version_id);
+        assert!(workspace.is_dir());
+        assert_eq!(fs::read_dir(workspace).expect("clean workspace").count(), 0);
+        installer_server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn finalization_failure_cleans_receipt_backed_version_without_done() {
+        let root = temp_dir("installer-finalization-cleanup");
+        write_base_version(&root, "1.21.5");
+        fs::create_dir_all(root.join("launcher_profiles.json"))
+            .expect("block launcher profile write");
+        let record = installer_record();
+        let installer_server =
+            TestByteServer::start_with_sha1(modern_forge_installer_jar(&record, None));
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+        };
+        let installer_source =
+            verified_test_source(&installer_server.url, "loader installer").await;
+        let execution = bind_test_installer(installer_source, &record).into_install_execution();
+        let BoundForgeInstallExecution::Continue(continuation) = &execution else {
+            panic!("continue fixture");
+        };
+        let excluded = continuation
+            .excluded_live_library_paths()
+            .expect("continue exclusions");
+        let authority = download_installer_libraries_with_evidence(
+            &root,
+            continuation.libraries(),
+            &excluded,
+            "loader_libraries",
+            &mut |_| {},
+        )
+        .await
+        .expect("installer authority");
+        let mut progress = Vec::new();
+
+        let error = finish_supported_installer_install(
+            &root,
+            &plan,
+            execution,
+            authority,
+            test_authenticated_receipt(&root, "1.21.5"),
+            &mut |update| progress.push(update),
+        )
+        .await
+        .expect_err("launcher profile finalization failure");
+
+        assert!(matches!(error, LoaderError::Io(_) | LoaderError::Verify(_)));
+        let version_dir = versions_dir(&root).join(&record.version_id);
+        if version_dir.exists() {
+            assert_eq!(fs::read_dir(version_dir).expect("clean version").count(), 0);
+        }
+        assert!(!progress.iter().any(|update| update.done));
         installer_server.stop();
         let _ = fs::remove_dir_all(root);
     }
@@ -1711,6 +1891,30 @@ mod tests {
         let minecraft_version = "1.21.5";
         write_base_version(&root, minecraft_version);
         let library_body = zip_entries(&[("net/minecraftforge/Forge.class", b"forge")]);
+        let base_library_body = zip_entries(&[("example/Base.class", b"base")]);
+        let coordinate = "net.minecraftforge:forge:1.21.5-55.0.0:universal";
+        let relative_path =
+            "net/minecraftforge/forge/1.21.5-55.0.0/forge-1.21.5-55.0.0-universal.jar";
+        let base_version_path = versions_dir(&root)
+            .join(minecraft_version)
+            .join(format!("{minecraft_version}.json"));
+        let mut base_version: serde_json::Value =
+            serde_json::from_slice(&fs::read(&base_version_path).expect("base version bytes"))
+                .expect("base version json");
+        base_version["libraries"] = serde_json::json!([{
+            "name": coordinate,
+            "sha1": sha1_hex(&base_library_body),
+            "size": base_library_body.len()
+        }]);
+        fs::write(
+            &base_version_path,
+            serde_json::to_vec_pretty(&base_version).expect("serialize base version"),
+        )
+        .expect("write shadowing base version");
+        let library_path = root.join("libraries").join(relative_path);
+        fs::create_dir_all(library_path.parent().expect("library parent"))
+            .expect("create library parent");
+        fs::write(&library_path, &base_library_body).expect("write base-selected library");
         let library_server = TestByteServer::start(library_body);
         let record = installer_record();
         let installer_server = TestByteServer::start_with_sha1(modern_forge_installer_jar(
@@ -1724,26 +1928,16 @@ mod tests {
             verified_test_source(&installer_server.url, "loader installer").await;
         let installer_plan = bind_test_installer(installer_source, &record);
 
-        let installed_version_id = install_bound_installer_after_authenticated_base(
-            &root,
-            &plan,
-            installer_plan,
-            &test_client_integrity(&root, &record.minecraft_version),
-            &mut |_| {},
-        )
-        .await
-        .expect("install legacy installer-backed loader");
+        let receipt = finish_test_installer(&root, &plan, installer_plan, &mut |_| {}).await;
 
-        assert_eq!(installed_version_id, record.version_id);
+        assert_eq!(receipt.version_id(), record.version_id);
         assert_eq!(installer_server.request_count(), 2);
         assert_eq!(library_server.request_count(), 1);
-        let library_path = root
-            .join("libraries")
-            .join("net/minecraftforge/forge/1.21.5-55.0.0/forge-1.21.5-55.0.0-universal.jar");
         assert!(zip_contains(
             &library_path,
             "net/minecraftforge/Forge.class"
         ));
+        assert!(!zip_contains(&library_path, "example/Base.class"));
         let version_json = fs::read(
             versions_dir(&root)
                 .join(&record.version_id)
@@ -1757,79 +1951,21 @@ mod tests {
             library["name"] == "net.minecraftforge:forge:1.21.5-55.0.0:universal"
                 && library.get("axialChecksumlessAllowed").is_none()
         }));
+        let inventory = receipt.into_inventory();
+        let entry = inventory
+            .entries()
+            .iter()
+            .find(|entry| entry.path().as_str() == relative_path)
+            .expect("loader-shadowed receipt entry");
+        assert!(matches!(
+            entry.integrity(),
+            KnownGoodIntegrity::Sha1 { digest, size }
+                if digest.as_str() == sha1_hex(&fs::read(&library_path).expect("final library"))
+                    && *size == Some(fs::metadata(&library_path).expect("library metadata").len())
+        ));
 
         installer_server.stop();
         library_server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn strip_meta_legacy_installer_rewrites_child_client_and_integrity() {
-        let root = temp_dir("installer-strip-meta-child-client");
-        let version_id = "patched-child";
-        let version_dir = versions_dir(&root).join(version_id);
-        fs::create_dir_all(&version_dir).expect("version dir");
-        let signed_client = zip_entries(&[
-            ("META-INF/MANIFEST.MF", b"signed manifest".as_slice()),
-            ("META-INF/MOJANG_C.SF", b"signature".as_slice()),
-            ("META-INF/MOJANG_C.RSA", b"signature".as_slice()),
-            ("net/minecraft/client/Minecraft.class", b"class".as_slice()),
-        ]);
-        fs::write(
-            version_dir.join(format!("{version_id}.jar")),
-            &signed_client,
-        )
-        .expect("write signed child client");
-        fs::write(
-            version_dir.join(format!("{version_id}.json")),
-            r#"{
-                "id":"patched-child",
-                "type":"release",
-                "mainClass":"net.minecraft.launchwrapper.Launch",
-                "assetIndex":{"id":"pre-1.6","url":"","sha1":"","size":0,"totalSize":0},
-                "downloads":{
-                    "client":{
-                        "url":"https://example.invalid/1.5.2.jar",
-                        "sha1":"originalvanillasha1",
-                        "size":123
-                    }
-                },
-                "libraries":[]
-            }"#,
-        )
-        .expect("write version json");
-
-        strip_child_client_jar_meta(&root, version_id)
-            .await
-            .expect("strip child client metadata");
-        write_patched_client_jar_integrity(&root, version_id)
-            .await
-            .expect("write stripped client integrity");
-
-        let installed_jar = version_dir.join(format!("{version_id}.jar"));
-        assert!(zip_contains(
-            &installed_jar,
-            "net/minecraft/client/Minecraft.class"
-        ));
-        assert!(!zip_contains(&installed_jar, "META-INF/MANIFEST.MF"));
-        assert!(!zip_contains(&installed_jar, "META-INF/MOJANG_C.SF"));
-        assert!(!zip_contains(&installed_jar, "META-INF/MOJANG_C.RSA"));
-        let installed_jar_bytes = fs::read(&installed_jar).expect("read stripped jar");
-        let installed_version_json =
-            fs::read_to_string(version_dir.join(format!("{version_id}.json")))
-                .expect("read version json");
-        let installed_version: serde_json::Value =
-            serde_json::from_str(&installed_version_json).expect("parse version json");
-        assert_eq!(
-            installed_version["downloads"]["client"]["sha1"],
-            sha1_hex(&installed_jar_bytes)
-        );
-        assert_eq!(
-            installed_version["downloads"]["client"]["size"],
-            installed_jar_bytes.len() as i64
-        );
-        assert_eq!(installed_version["downloads"]["client"]["url"], "");
-
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1927,15 +2063,8 @@ mod tests {
             verified_test_source(&installer_server.url, "loader installer").await;
         let installer_plan = bind_test_installer(installer_source, &record);
 
-        install_bound_installer_after_authenticated_base(
-            &root,
-            &plan,
-            installer_plan,
-            &test_client_integrity(&root, &record.minecraft_version),
-            &mut |_| {},
-        )
-        .await
-        .expect("install stripMeta legacy installer");
+        let receipt = finish_test_installer(&root, &plan, installer_plan, &mut |_| {}).await;
+        assert_eq!(receipt.version_id(), record.version_id);
 
         let child_jar = versions_dir(&root)
             .join(&version_id)
@@ -2315,6 +2444,7 @@ mod tests {
             "libraries": [library]
         }))
         .expect("serialize Forge version profile");
+        let processor_only = zip_entries(&[("example/Processor.class", b"processor")]);
         let install_profile = serde_json::to_vec(&serde_json::json!({
             "spec": 1,
             "profile": "forge",
@@ -2325,7 +2455,11 @@ mod tests {
             ),
             "minecraft": record.minecraft_version,
             "processors": [],
-            "libraries": []
+            "libraries": [{
+                "name": "example:processor-only:1.0",
+                "sha1": sha1_hex(&processor_only),
+                "size": processor_only.len()
+            }]
         }))
         .expect("serialize Forge install profile");
 
@@ -2343,6 +2477,15 @@ mod tests {
         archive
             .write_all(&install_profile)
             .expect("write install profile");
+        archive
+            .start_file(
+                "maven/example/processor-only/1.0/processor-only-1.0.jar",
+                SimpleFileOptions::default(),
+            )
+            .expect("start embedded processor-only library");
+        archive
+            .write_all(&processor_only)
+            .expect("write embedded processor-only library");
         if library_url.is_none() {
             let embedded = zip_entries(&[("net/minecraftforge/Forge.class", b"forge")]);
             archive
@@ -2362,6 +2505,144 @@ mod tests {
         cursor.into_inner()
     }
 
+    fn unsupported_neoforge_installer_jar(record: &LoaderBuildRecord) -> Vec<u8> {
+        let version_id = format!("neoforge-{}", record.loader_version);
+        let version_json = serde_json::to_vec(&serde_json::json!({
+            "id": version_id,
+            "inheritsFrom": record.minecraft_version,
+            "type": "release",
+            "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+            "logging": {},
+            "libraries": [{
+                "name": format!("net.neoforged:neoforge:{}:universal", record.loader_version)
+            }]
+        }))
+        .expect("serialize NeoForge version profile");
+        let install_profile = serde_json::to_vec(&serde_json::json!({
+            "spec": 1,
+            "profile": "NeoForge",
+            "version": version_id,
+            "minecraft": record.minecraft_version,
+            "processors": [{
+                "jar": "net.neoforged.installertools:installertools:2.1.3"
+            }],
+            "libraries": []
+        }))
+        .expect("serialize NeoForge install profile");
+        zip_entries(&[
+            ("version.json", version_json.as_slice()),
+            ("install_profile.json", install_profile.as_slice()),
+        ])
+    }
+
+    fn runnable_forge_installer_jar(record: &LoaderBuildRecord) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+
+        let forge_version = format!("{}-{}", record.minecraft_version, record.loader_version);
+        let universal = zip_entries(&[("example/Universal.class", b"universal")]);
+        let shim = zip_entries(&[("example/Shim.class", b"shim")]);
+        let processor = zip_entries(&[
+            ("META-INF/MANIFEST.MF", b"Main-Class: example.Processor\n\n"),
+            ("example/Processor.class", b"processor"),
+        ]);
+        let universal_coordinate = format!("net.minecraftforge:forge:{}:universal", forge_version);
+        let client_coordinate = format!("net.minecraftforge:forge:{}:client", forge_version);
+        let shim_coordinate = format!("net.minecraftforge:forge:{}:shim", forge_version);
+        let version_id = format!(
+            "{}-forge-{}",
+            record.minecraft_version, record.loader_version
+        );
+        let version_json = serde_json::to_vec(&serde_json::json!({
+            "id": version_id,
+            "inheritsFrom": record.minecraft_version,
+            "type": "release",
+            "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+            "logging": {},
+            "libraries": [
+                {
+                    "name": universal_coordinate,
+                    "sha1": sha1_hex(&universal),
+                    "size": universal.len()
+                },
+                {
+                    "name": client_coordinate,
+                    "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            ]
+        }))
+        .expect("serialize runnable Forge version profile");
+        let install_profile = serde_json::to_vec(&serde_json::json!({
+            "spec": 1,
+            "profile": "forge",
+            "version": version_id,
+            "path": shim_coordinate,
+            "minecraft": record.minecraft_version,
+            "libraries": [
+                {
+                    "name": universal_coordinate,
+                    "sha1": sha1_hex(&universal),
+                    "size": universal.len()
+                },
+                {
+                    "name": shim_coordinate,
+                    "sha1": sha1_hex(&shim),
+                    "size": shim.len()
+                },
+                {
+                    "name": "example:processor:1.0",
+                    "sha1": sha1_hex(&processor),
+                    "size": processor.len()
+                }
+            ],
+            "data": {
+                "PATCHED": {"client": format!("[{}]", client_coordinate)},
+                "PATCHED_SHA": {
+                    "client": "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
+                }
+            },
+            "processors": [{
+                "jar": "example:processor:1.0",
+                "args": ["{PATCHED}"],
+                "sides": ["client"],
+                "outputs": {"{PATCHED}": "{PATCHED_SHA}"}
+            }]
+        }))
+        .expect("serialize runnable Forge install profile");
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut archive = zip::ZipWriter::new(&mut cursor);
+        for (name, bytes) in [
+            ("version.json".to_string(), version_json),
+            ("install_profile.json".to_string(), install_profile),
+            (
+                format!(
+                    "maven/net/minecraftforge/forge/{0}/forge-{0}-universal.jar",
+                    forge_version
+                ),
+                universal,
+            ),
+            (
+                format!(
+                    "maven/net/minecraftforge/forge/{0}/forge-{0}-shim.jar",
+                    forge_version
+                ),
+                shim,
+            ),
+            (
+                "maven/example/processor/1.0/processor-1.0.jar".to_string(),
+                processor,
+            ),
+        ] {
+            archive
+                .start_file(name, SimpleFileOptions::default())
+                .expect("start runnable Forge entry");
+            archive
+                .write_all(&bytes)
+                .expect("write runnable Forge entry");
+        }
+        archive.finish().expect("finish runnable Forge installer");
+        cursor.into_inner()
+    }
+
     fn bind_test_installer(
         source: VerifiedLoaderSource,
         record: &LoaderBuildRecord,
@@ -2369,6 +2650,51 @@ mod tests {
         let authenticated =
             plan_authenticated_installer(source).expect("authenticated installer plan");
         bind_authenticated_installer_plan(authenticated, record).expect("bound installer plan")
+    }
+
+    async fn finish_test_installer(
+        root: &std::path::Path,
+        plan: &LoaderInstallPlan,
+        installer_plan: BoundForgeInstallerPlan,
+        send: &mut impl FnMut(DownloadProgress),
+    ) -> KnownGoodInstallReceipt {
+        let execution = installer_plan.into_install_execution();
+        let (libraries, excluded_paths) = match &execution {
+            BoundForgeInstallExecution::Run(execution) => (
+                execution.libraries(),
+                execution
+                    .excluded_live_library_paths()
+                    .expect("run exclusions"),
+            ),
+            BoundForgeInstallExecution::Continue(continuation) => (
+                continuation.libraries(),
+                continuation
+                    .excluded_live_library_paths()
+                    .expect("continue exclusions"),
+            ),
+            BoundForgeInstallExecution::UnsupportedMissingOutputs => {
+                panic!("supported installer fixture")
+            }
+        };
+        let download_authority = download_installer_libraries_with_evidence(
+            root,
+            libraries,
+            &excluded_paths,
+            "loader_libraries",
+            send,
+        )
+        .await
+        .expect("installer library authority");
+        finish_supported_installer_install(
+            root,
+            plan,
+            execution,
+            download_authority,
+            test_authenticated_receipt(root, &plan.record.minecraft_version),
+            send,
+        )
+        .await
+        .expect("finish installer install")
     }
 
     fn installer_jar_with_profile_json(profile_json: &[u8]) -> Vec<u8> {
