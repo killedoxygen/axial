@@ -603,52 +603,61 @@
 }
 
 /* Discover */
-.cp-discover-controls {
+.cp-discover-search {
+  margin-bottom: 12px;
+}
+.cp-discover-search .cp-field {
+  width: 100%;
+  padding: 12px 15px;
+  border-radius: var(--r-md);
+  font-size: 14px;
+}
+.cp-discover-search .cp-field svg {
+  width: 17px;
+  height: 17px;
+}
+.cp-discover-clear {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-mute);
+  cursor: pointer;
+}
+.cp-discover-clear:hover {
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+.cp-discover-filters {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 18px;
+  gap: 10px;
+  margin-bottom: 10px;
 }
-.cp-discover-tabs {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
+.cp-discover-filters-spacer {
+  flex: 1;
+  min-width: 0;
 }
-.cp-discover-tab {
-  padding: 7px 14px;
-  border: none;
-  border-radius: 999px;
-  background: var(--surface-2);
-  color: var(--text-dim);
-  font-size: 13px;
-  font-weight: 550;
-  cursor: pointer;
-  transition:
-    background 140ms ease,
-    color 140ms ease;
-}
-.cp-discover-tab:hover {
-  color: var(--text);
-}
-.cp-discover-tab[data-active='true'] {
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-.cp-discover-tab:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
+.cp-discover-count {
+  font-size: 12px;
+  color: var(--text-mute);
+  margin-bottom: 14px;
+  min-height: 14px;
 }
 
 .cp-discover-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
   gap: 14px;
   transition: opacity 140ms ease;
 }
 .cp-discover-grid[data-loading='true'] {
-  opacity: 0.6;
+  opacity: 0.55;
 }
 
 .cp-discover-card {
@@ -663,6 +672,7 @@
     inset 0 1px 0 oklch(1 0 0 / 0.05),
     var(--shadow-raised);
   cursor: pointer;
+  animation: cp-fade-in 160ms ease both;
   transition:
     transform 140ms ease,
     box-shadow 140ms ease;
@@ -674,11 +684,18 @@
   outline: none;
   box-shadow: var(--focus-ring);
 }
+.cp-discover-card--skeleton {
+  cursor: default;
+  animation: none;
+}
+.cp-discover-card--skeleton:hover {
+  transform: none;
+}
 
 .cp-discover-card-icon {
   flex-shrink: 0;
-  width: 48px;
-  height: 48px;
+  width: 52px;
+  height: 52px;
   border-radius: var(--r-sm);
   background: var(--surface-3);
   display: grid;
@@ -712,9 +729,9 @@
   color: var(--text-mute);
 }
 .cp-discover-card-summary {
-  margin: 4px 0 0;
+  margin: 5px 0 0;
   font-size: 12.5px;
-  line-height: 1.4;
+  line-height: 1.45;
   color: var(--text-dim);
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -727,7 +744,8 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  margin-top: 8px;
+  margin-top: auto;
+  padding-top: 9px;
   font-size: 11.5px;
   color: var(--text-mute);
 }
@@ -746,41 +764,56 @@
 }
 
 .cp-discover-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
   color: var(--text-dim);
   font-size: 13px;
 }
 .cp-discover-empty--pad {
-  padding: 40px 0;
+  padding: 56px 0;
   text-align: center;
 }
 
-.cp-discover-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-  background: oklch(0 0 0 / 0.5);
-  backdrop-filter: blur(3px);
-  display: grid;
-  place-items: center;
-  padding: 24px;
+.cp-discover-loadmore {
+  display: flex;
+  justify-content: center;
+  margin-top: 18px;
 }
+
+.cp-discover-spinner {
+  display: inline-block;
+  border: 2px solid var(--surface-3);
+  border-top-color: var(--accent);
+  border-radius: 999px;
+  animation: cp-spin 640ms linear infinite;
+}
+
+.cp-skeleton {
+  background: var(--surface-3);
+  border-radius: 6px;
+  animation: cp-pulse 1.3s ease-in-out infinite;
+}
+.cp-skeleton-line {
+  height: 10px;
+  margin-bottom: 6px;
+}
+
+/* Discover detail sheet (rendered inside a Modal panel) */
 .cp-discover-sheet {
   width: min(560px, 100%);
   max-height: 86vh;
   overflow-y: auto;
-  background: var(--surface);
-  border-radius: var(--r-lg);
-  box-shadow:
-    inset 0 1px 0 oklch(1 0 0 / 0.06),
-    var(--shadow-raised);
   padding: 22px;
 }
 .cp-discover-sheet-head {
   display: flex;
   align-items: flex-start;
   gap: 14px;
+  padding-right: 28px;
 }
-.cp-discover-sheet-head h2 {
+.cp-discover-sheet-title {
   margin: 0;
   font-size: 18px;
   font-weight: 650;
@@ -792,21 +825,6 @@
 .cp-discover-sheet-icon {
   width: 56px;
   height: 56px;
-}
-.cp-discover-close {
-  flex-shrink: 0;
-  width: 30px;
-  height: 30px;
-  border: none;
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
-  color: var(--text-dim);
-  cursor: pointer;
-  display: grid;
-  place-items: center;
-}
-.cp-discover-close:hover {
-  color: var(--text);
 }
 .cp-discover-sheet-meta {
   display: flex;
@@ -822,6 +840,19 @@
   color: var(--text-dim);
 }
 
+.cp-discover-gallery {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  margin-top: 14px;
+  padding-bottom: 4px;
+}
+.cp-discover-gallery img {
+  height: 96px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+}
+
 .cp-discover-install {
   margin-top: 18px;
   padding: 15px;
@@ -829,33 +860,16 @@
   background: var(--surface-2);
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 .cp-discover-install--muted {
   color: var(--text-dim);
   font-size: 12.5px;
 }
 .cp-discover-install-label {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
   font-size: 12px;
   font-weight: 550;
   color: var(--text-dim);
-}
-.cp-discover-select {
-  width: 100%;
-  padding: 9px 11px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--surface);
-  color: var(--text);
-  font-size: 13px;
-}
-.cp-discover-select:focus-visible {
-  outline: none;
-  border-color: var(--focus-border);
-  box-shadow: var(--focus-ring);
 }
 .cp-discover-plan {
   display: flex;
@@ -863,6 +877,9 @@
   gap: 6px;
 }
 .cp-discover-plan-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 12px;
   color: var(--text-dim);
 }
@@ -881,7 +898,7 @@
   font-size: 12px;
   font-weight: 600;
   color: var(--text-dim);
-  margin-bottom: 8px;
+  margin-bottom: 4px;
 }
 .cp-discover-version-row {
   display: flex;
