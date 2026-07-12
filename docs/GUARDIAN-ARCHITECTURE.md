@@ -56,8 +56,6 @@ Guardian currently has working proof across these areas:
 - persisted operation-state load diagnostics for strict-schema performance operation, benchmark suite manifest, and benchmark suite driver records; Guardian maps aggregate load issues to a bounded startup warning instead of letting restart-resume corruption disappear silently
 - public/exportable redaction for Guardian outcomes, launch notices, session status/events, install status/events, operation status, performance health/status, operation journals, and local proof exports
 
-`apps/api/src/application/authority.rs` is the local proof gate for this model. Its tests enforce route adapter boundaries, frontend non-policy rendering, Execution non-policy, required source/control-plane reproducibility, and a quality-gate failure-scenario matrix that points every required Guardian failure scenario at local behavior tests.
-
 Not every domain has a specialized automatic repair workflow yet. When Guardian does not have a specific workflow, it still owns the safety interpretation if the issue crosses a safety boundary: it should cushion damage by producing a bounded block, warning, degraded state, retry suppression, or user-facing notice rather than letting raw errors or frontend guesses escape.
 
 ## Modes

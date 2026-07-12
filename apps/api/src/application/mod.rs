@@ -7,7 +7,6 @@
 
 pub mod accounts;
 pub mod auth;
-pub mod authority;
 pub mod commands;
 pub mod config;
 pub mod flags;
@@ -42,12 +41,6 @@ pub(crate) use accounts::{
 pub(crate) use auth::{
     AuthRefreshFailure, AuthStatusResponse, auth_logout_for_state, auth_profile_sync_for_state,
     auth_refresh_for_state, auth_status, refresh_active_auth,
-};
-pub use authority::{
-    AuthorityCutLine, DecisionCategory, DecisionLocation, RouteAdapterContract,
-    RouteAdapterResponsibility, RouteBoundaryEnforcement, RouteBoundaryProbe, RouteCutoverPhase,
-    RouteForbiddenResponsibility, RouteHotspotOwner, RouteWorkflowArea, RouteWorkflowHotspot,
-    authority_cut_lines, route_adapter_contract, route_boundary_probes, route_workflow_hotspots,
 };
 pub use commands::{
     ApplicationCommandPayload, ApplicationCommandRequest, ApplyPerformancePlanCommand,

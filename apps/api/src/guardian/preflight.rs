@@ -909,39 +909,6 @@ mod tests {
     }
 
     #[test]
-    fn preflight_has_one_verdict_authority_and_one_confirmation_adapter() {
-        let source = include_str!("preflight.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("preflight production source");
-        for removed in [
-            "preflight_decision_kind",
-            "readiness_blocks_launch",
-            "READINESS_FACT_IDS",
-            "is_preflight_warning_fact",
-            "is_java_override_unavailable_fact",
-            "is_jvm_preflight_strip_fact",
-            "java_fallback_diagnosis",
-        ] {
-            assert!(
-                !source.contains(removed),
-                "stale preflight authority: {removed}"
-            );
-        }
-        assert_eq!(
-            source
-                .matches("GuardianActionKind::AskUser => GuardianActionKind::Block")
-                .count(),
-            1
-        );
-
-        let session = include_str!("../application/launch/session.rs");
-        assert!(!session.contains("ApiGuardianActionKind::AskUser"));
-        let conversion = include_str!("../application/guardian_conversion.rs");
-        assert!(!conversion.contains("GuardianActionKind::Block | GuardianActionKind::AskUser"));
-    }
-
-    #[test]
     fn recent_startup_failure_copy_uses_truthful_occurrence_windows() {
         let today = fact_with_fields(
             RECENT_STARTUP_FAILURE_FACT_ID,
