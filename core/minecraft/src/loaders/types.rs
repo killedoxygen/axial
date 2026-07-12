@@ -3,7 +3,6 @@ use crate::types::VersionSubjectKind;
 use crate::version_meta::MinecraftVersionMeta;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use thiserror::Error;
 
 pub type LoaderBuildId = String;
@@ -275,7 +274,6 @@ impl<T> CachedCatalog<T> {
 #[derive(Debug, Clone)]
 pub struct LoaderInstallPlan {
     pub record: LoaderBuildRecord,
-    pub stage_dir: PathBuf,
 }
 
 macro_rules! loader_failure_kinds {

@@ -1,20 +1,12 @@
-use crate::download::{
-    ExpectedIntegrity, LauncherManagedArtifactReadiness,
-    promote_launcher_managed_artifact_temp_once, verify_existing_launcher_managed_artifact,
-};
+use crate::download::ExpectedIntegrity;
 use crate::launch::{
     ArgumentsSection, AssetIndex, Downloads, JavaVersion, Library, LoggingConf, VersionJson,
     merge_libraries_prefer_first, resolve_version,
 };
-use crate::paths::versions_dir;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::fs as async_fs;
-use tokio::io::AsyncWriteExt;
+use std::path::Path;
 
+use super::managed_fs::ManagedDir;
 use super::types::LoaderError;
 use super::validate_version_id;
 
@@ -168,130 +160,76 @@ pub async fn write_composed_version(
             "composed loader profile identity does not match its install target".to_string(),
         ));
     }
-    let version_dir = prepare_managed_version_dir(mc_dir, version_id)?;
-    let marker = version_dir.join(".incomplete");
-    write_exact_managed_version_artifact(&marker, b"installing").await?;
-    write_exact_managed_version_artifact(
-        &version_dir.join(format!("{version_id}.json")),
-        version_bytes,
+    let root = ManagedDir::open_root(mc_dir)?;
+    let versions = root.open_or_create_child("versions")?;
+    let version_dir = versions.open_or_create_child(version_id)?;
+    version_dir
+        .write_exact(".incomplete", b"installing")
+        .await?;
+    version_dir
+        .write_exact(&format!("{version_id}.json"), version_bytes)
+        .await?;
+    copy_authenticated_base_jar(
+        &versions,
+        &version_dir,
+        base_version_id,
+        version_id,
+        authenticated_client,
     )
     .await?;
-    link_or_copy_base_jar(mc_dir, base_version_id, version_id, authenticated_client).await?;
+    root.revalidate()?;
     Ok(())
 }
 
-pub(crate) async fn write_exact_managed_version_artifact(
-    path: &Path,
-    source_bytes: &[u8],
-) -> Result<(), LoaderError> {
-    let parent = path.parent().ok_or_else(|| {
-        LoaderError::Verify("managed loader artifact has no version directory".to_string())
-    })?;
-    require_exact_directory(parent, "managed version directory")?;
-    let temp_path = managed_artifact_temp_path(path);
-    let mut output = async_fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .await?;
-    if let Err(error) = async {
-        output.write_all(source_bytes).await?;
-        output.flush().await?;
-        output.sync_all().await
-    }
-    .await
-    {
-        drop(output);
-        let _ = async_fs::remove_file(&temp_path).await;
-        return Err(LoaderError::Io(error));
-    }
-    drop(output);
-    if async_fs::read(&temp_path).await? != source_bytes {
-        let _ = async_fs::remove_file(&temp_path).await;
-        return Err(LoaderError::Verify(
-            "temporary loader artifact differs from authenticated source bytes".to_string(),
-        ));
-    }
-    if let Err(error) = promote_launcher_managed_artifact_temp_once(&temp_path, path).await {
-        let _ = async_fs::remove_file(&temp_path).await;
-        return Err(LoaderError::Io(error));
-    }
-    if async_fs::read(path).await? != source_bytes {
-        let _ = async_fs::remove_file(path).await;
-        return Err(LoaderError::Verify(
-            "installed loader artifact differs from authenticated source bytes".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn managed_artifact_temp_path(path: &Path) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    path.with_extension(format!("tmp-{}-{nanos:x}", std::process::id()))
-}
-
-pub(crate) fn prepare_managed_version_dir(
+pub(crate) fn create_managed_version_dir(
     mc_dir: &Path,
     version_id: &str,
-) -> Result<PathBuf, LoaderError> {
+) -> Result<ManagedDir, LoaderError> {
     validate_version_id(version_id, "installed loader version id")?;
-    require_exact_directory(mc_dir, "minecraft root")?;
-    let versions = versions_dir(mc_dir);
-    create_exact_directory_if_missing(&versions, "versions root")?;
-    let version_dir = versions.join(version_id);
-    create_exact_directory_if_missing(&version_dir, "managed version directory")?;
-    Ok(version_dir)
+    ManagedDir::open_root(mc_dir)?
+        .open_or_create_child("versions")?
+        .open_or_create_child(version_id)
 }
 
-fn create_exact_directory_if_missing(path: &Path, label: &str) -> Result<(), LoaderError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => require_directory_metadata(metadata, label),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(path)?;
-            require_exact_directory(path, label)
-        }
-        Err(error) => Err(LoaderError::Io(error)),
-    }
-}
-
-fn require_exact_directory(path: &Path, label: &str) -> Result<(), LoaderError> {
-    let metadata = fs::symlink_metadata(path)?;
-    require_directory_metadata(metadata, label)
-}
-
-fn require_directory_metadata(metadata: fs::Metadata, label: &str) -> Result<(), LoaderError> {
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        Ok(())
-    } else {
-        Err(LoaderError::Verify(format!(
-            "{label} is not an exact managed directory"
-        )))
-    }
+pub(crate) fn managed_version_dir(
+    mc_dir: &Path,
+    version_id: &str,
+) -> Result<ManagedDir, LoaderError> {
+    validate_version_id(version_id, "installed loader version id")?;
+    ManagedDir::open_root(mc_dir)?
+        .open_child("versions")?
+        .open_child(version_id)
 }
 
 pub fn finalize_version_install(mc_dir: &Path, version_id: &str) -> Result<(), LoaderError> {
-    let version_dir = prepare_managed_version_dir(mc_dir, version_id)?;
-    let marker = version_dir.join(".incomplete");
-    if marker.exists() {
-        let _ = fs::remove_file(marker);
+    let version_dir = managed_version_dir(mc_dir, version_id)?;
+    if version_dir.read_exact(".incomplete")? != b"installing" {
+        return Err(LoaderError::Verify(
+            "managed loader completion marker is invalid".to_string(),
+        ));
     }
-    Ok(())
+    version_dir.remove_file(".incomplete")?;
+    version_dir.revalidate()
 }
 
 pub fn cleanup_incomplete_version(mc_dir: &Path, version_id: &str) {
     if validate_version_id(version_id, "installed loader version id").is_err() {
         return;
     }
-    let version_dir = versions_dir(mc_dir).join(version_id);
-    let marker = version_dir.join(".incomplete");
-    let marker_is_regular_file = fs::symlink_metadata(&marker)
-        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-        .unwrap_or(false);
-    if marker_is_regular_file {
-        let _ = fs::remove_dir_all(version_dir);
+    let Ok(root) = ManagedDir::open_root(mc_dir) else {
+        return;
+    };
+    let Ok(versions) = root.open_child("versions") else {
+        return;
+    };
+    let Ok(version_dir) = versions.open_child(version_id) else {
+        return;
+    };
+    if version_dir
+        .read_exact(".incomplete")
+        .is_ok_and(|marker| marker == b"installing")
+    {
+        let _ = version_dir.clear_and_remove();
     }
 }
 
@@ -315,59 +253,26 @@ fn merge_arguments(
     Some(merged)
 }
 
-async fn link_or_copy_base_jar(
-    mc_dir: &Path,
+async fn copy_authenticated_base_jar(
+    versions: &ManagedDir,
+    destination: &ManagedDir,
     base_version_id: &str,
     version_id: &str,
     authenticated_client: &ExpectedIntegrity,
 ) -> Result<(), LoaderError> {
     validate_version_id(base_version_id, "base minecraft version id")?;
     validate_version_id(version_id, "installed loader version id")?;
-    let base_jar = versions_dir(mc_dir)
-        .join(base_version_id)
-        .join(format!("{base_version_id}.jar"));
-    if verify_existing_launcher_managed_artifact(&base_jar, authenticated_client)
-        != LauncherManagedArtifactReadiness::Verified
-    {
-        return Err(LoaderError::Verify(format!(
-            "base client jar is not authenticated for {base_version_id}"
-        )));
-    }
-    let dst_jar = versions_dir(mc_dir)
-        .join(version_id)
-        .join(format!("{version_id}.jar"));
-    if verify_existing_launcher_managed_artifact(&dst_jar, authenticated_client)
-        == LauncherManagedArtifactReadiness::Verified
-    {
-        return Ok(());
-    }
-    if async_fs::symlink_metadata(&dst_jar).await.is_ok() {
-        async_fs::remove_file(&dst_jar).await?;
-    }
-    if async_fs::hard_link(&base_jar, &dst_jar).await.is_err() {
-        let temp_jar = dst_jar.with_extension("jar.axial-tmp");
-        if async_fs::symlink_metadata(&temp_jar).await.is_ok() {
-            async_fs::remove_file(&temp_jar).await?;
-        }
-        async_fs::copy(&base_jar, &temp_jar).await?;
-        if verify_existing_launcher_managed_artifact(&temp_jar, authenticated_client)
-            != LauncherManagedArtifactReadiness::Verified
-        {
-            let _ = async_fs::remove_file(&temp_jar).await;
-            return Err(LoaderError::Verify(format!(
-                "copied client jar is not authenticated for {version_id}"
-            )));
-        }
-        async_fs::rename(&temp_jar, &dst_jar).await?;
-    }
-    if verify_existing_launcher_managed_artifact(&dst_jar, authenticated_client)
-        != LauncherManagedArtifactReadiness::Verified
-    {
-        let _ = async_fs::remove_file(&dst_jar).await;
-        return Err(LoaderError::Verify(format!(
-            "installed client jar is not authenticated for {version_id}"
-        )));
-    }
+    let base = versions.open_child(base_version_id)?;
+    let bytes = base.read_authenticated(
+        &format!("{base_version_id}.jar"),
+        authenticated_client.size,
+        authenticated_client.sha1.as_deref(),
+    )?;
+    destination
+        .write_exact(&format!("{version_id}.jar"), &bytes)
+        .await?;
+    base.revalidate()?;
+    versions.revalidate()?;
     Ok(())
 }
 
@@ -375,7 +280,7 @@ async fn link_or_copy_base_jar(
 mod tests {
     use super::{
         LoaderProfileFragment, cleanup_incomplete_version,
-        compose_loader_version_from_installed_base, prepare_managed_version_dir,
+        compose_loader_version_from_installed_base, finalize_version_install, managed_version_dir,
         write_composed_version,
     };
     use crate::LoaderError;
@@ -409,12 +314,10 @@ mod tests {
         fs::create_dir_all(&outside).expect("outside root");
         std::os::unix::fs::symlink(&outside, root.join("versions")).expect("symlink versions root");
 
-        let error = prepare_managed_version_dir(&root, "managed-child")
+        let error = managed_version_dir(&root, "managed-child")
             .expect_err("symlinked versions root must fail");
 
-        assert!(
-            matches!(error, LoaderError::Verify(message) if message.contains("exact managed directory"))
-        );
+        assert!(matches!(error, LoaderError::Io(_) | LoaderError::Verify(_)));
         assert_eq!(fs::read_dir(&outside).expect("outside root").count(), 0);
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
@@ -577,6 +480,47 @@ mod tests {
         assert!(version_dir.is_dir());
         assert!(version_dir.join("loader-complete.json").is_file());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finalize_version_install_rejects_missing_version_directory() {
+        let root = temp_dir("finalize-missing-version");
+        create_minecraft_dir(&root).expect("library");
+
+        let error = finalize_version_install(&root, "loader-missing")
+            .expect_err("missing version directory must not be created");
+
+        assert!(matches!(error, LoaderError::Io(_) | LoaderError::Verify(_)));
+        assert!(!root.join("versions").join("loader-missing").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finalize_version_install_requires_expected_completion_marker() {
+        let root = temp_dir("finalize-marker");
+        create_minecraft_dir(&root).expect("library");
+        let version_dir = root.join("versions").join("loader-marker");
+        fs::create_dir_all(&version_dir).expect("version dir");
+
+        let missing =
+            finalize_version_install(&root, "loader-marker").expect_err("missing marker must fail");
+        assert!(matches!(
+            missing,
+            LoaderError::Io(_) | LoaderError::Verify(_)
+        ));
+
+        let marker = version_dir.join(".incomplete");
+        fs::write(&marker, b"unexpected").expect("invalid marker");
+        let invalid =
+            finalize_version_install(&root, "loader-marker").expect_err("invalid marker must fail");
+        assert!(matches!(invalid, LoaderError::Verify(_)));
+        assert_eq!(fs::read(&marker).expect("retained marker"), b"unexpected");
+
+        fs::write(&marker, b"installing").expect("valid marker");
+        finalize_version_install(&root, "loader-marker").expect("finalize version");
+        assert!(!marker.exists());
+        assert!(version_dir.is_dir());
         let _ = fs::remove_dir_all(root);
     }
 

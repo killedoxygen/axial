@@ -365,6 +365,7 @@ dependencies = [
  "md5",
  "regex",
  "reqwest 0.12.28",
+ "rustix",
  "serde",
  "serde_json",
  "sha1",
@@ -372,6 +373,7 @@ dependencies = [
  "sysinfo",
  "thiserror 2.0.18",
  "tokio",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

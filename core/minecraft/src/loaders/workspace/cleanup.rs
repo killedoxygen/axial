@@ -1,69 +1,77 @@
-use crate::paths::loader_work_dir;
-use std::fs;
-use std::io;
-use std::path::{Component, Path, PathBuf};
+use crate::loaders::managed_fs::ManagedDir;
+use crate::loaders::types::LoaderError;
+use crate::loaders::validate_version_id;
+use std::path::Path;
 
-pub(crate) fn prepare_fresh_work_dir(library_dir: &Path, version_id: &str) -> io::Result<PathBuf> {
-    let mut components = Path::new(version_id).components();
-    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-        return Err(unsafe_workspace_error());
+pub(crate) struct LoaderWorkspace {
+    directory: ManagedDir,
+}
+
+pub(crate) struct LoaderWorkspaceTemp {
+    directory: ManagedDir,
+}
+
+impl LoaderWorkspace {
+    pub(crate) fn path(&self) -> &Path {
+        self.directory.path()
     }
-    require_exact_directory(library_dir)?;
-    let cache = library_dir.join("cache");
-    create_exact_directory_if_missing(&cache)?;
-    let loaders = cache.join("loaders");
-    create_exact_directory_if_missing(&loaders)?;
-    let work = loader_work_dir(library_dir);
-    create_exact_directory_if_missing(&work)?;
-    let stage = work.join(version_id);
-    match fs::symlink_metadata(&stage) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            fs::remove_dir_all(&stage)?;
+
+    pub(crate) async fn write_exact(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
+        self.directory.write_exact(name, bytes).await
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), LoaderError> {
+        self.directory.revalidate()
+    }
+
+    pub(crate) fn create_temp(&self, name: &str) -> Result<LoaderWorkspaceTemp, LoaderError> {
+        if let Some(stale) = self.directory.open_child_if_exists(name)? {
+            stale.clear_and_remove()?;
         }
-        Ok(_) => return Err(unsafe_workspace_error()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        let directory = self.directory.open_or_create_child(name)?;
+        Ok(LoaderWorkspaceTemp { directory })
     }
-    fs::create_dir(&stage)?;
-    require_exact_directory(&stage)?;
-    Ok(stage)
-}
 
-pub(crate) fn remove_work_dir(path: &Path) {
-    if fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-    {
-        let _ = fs::remove_dir_all(path);
+    pub(crate) fn cleanup(self) -> Result<(), LoaderError> {
+        self.directory.clear_and_remove()
     }
 }
 
-fn create_exact_directory_if_missing(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => require_exact_directory(path),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(path)?;
-            require_exact_directory(path)
-        }
-        Err(error) => Err(error),
+impl LoaderWorkspaceTemp {
+    pub(crate) async fn write_relative_exact(
+        &self,
+        relative: &crate::artifact_path::ArtifactRelativePath,
+        bytes: &[u8],
+    ) -> Result<(), LoaderError> {
+        self.directory.write_relative_exact(relative, bytes).await
+    }
+
+    pub(crate) fn cleanup(self) -> Result<(), LoaderError> {
+        self.directory.clear_and_remove()
     }
 }
 
-fn require_exact_directory(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        Ok(())
-    } else {
-        Err(unsafe_workspace_error())
+pub(crate) fn prepare_fresh_work_dir(
+    library_dir: &Path,
+    version_id: &str,
+) -> Result<LoaderWorkspace, LoaderError> {
+    validate_version_id(version_id, "installer workspace version id")?;
+    let root = ManagedDir::open_root(library_dir)?;
+    let work = root
+        .open_or_create_child("cache")?
+        .open_or_create_child("loaders")?
+        .open_or_create_child("work")?;
+    if let Some(stale) = work.open_child_if_exists(version_id)? {
+        stale.clear_and_remove()?;
     }
-}
-
-fn unsafe_workspace_error() -> io::Error {
-    io::Error::other("loader workspace path is not an exact managed directory")
+    let directory = work.open_or_create_child(version_id)?;
+    directory.revalidate()?;
+    Ok(LoaderWorkspace { directory })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{prepare_fresh_work_dir, remove_work_dir};
+    use super::prepare_fresh_work_dir;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -82,7 +90,7 @@ mod tests {
 
         assert!(prepare_fresh_work_dir(&root, "version").is_err());
         assert_eq!(fs::read(&sentinel).expect("sentinel"), b"untouched");
-        remove_work_dir(&root.join("cache/loaders/work/version"));
+        assert!(root.join("cache/loaders/work/version").is_symlink());
         assert_eq!(fs::read(&sentinel).expect("sentinel"), b"untouched");
 
         let _ = fs::remove_dir_all(root);

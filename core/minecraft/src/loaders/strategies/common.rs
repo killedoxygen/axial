@@ -8,8 +8,8 @@ use crate::known_good::KnownGoodInstallReceipt;
 use crate::launch::{DownloadEntry, VersionJson, library_merge_key, resolve_version};
 use crate::loaders::compose::{
     LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
-    compose_loader_version_from_installed_base, finalize_version_install,
-    prepare_managed_version_dir, write_composed_version, write_exact_managed_version_artifact,
+    compose_loader_version_from_installed_base, create_managed_version_dir,
+    finalize_version_install, managed_version_dir, write_composed_version,
 };
 use crate::loaders::forge_installer::{
     AuthenticatedEmbeddedMavenArtifact, AuthenticatedForgeInstallerPlan,
@@ -19,23 +19,22 @@ use crate::loaders::forge_installer::{
 use crate::loaders::http::fetch_bytes;
 #[cfg(test)]
 use crate::loaders::http::fetch_bytes_for_test as fetch_bytes;
+use crate::loaders::managed_fs::ManagedDir;
 use crate::loaders::processors::run_processors;
 use crate::loaders::providers::{self, ProfileInstallProof};
 use crate::loaders::source::{VerifiedLoaderSource, fetch_sha1_verified_source};
 use crate::loaders::types::{LoaderBuildRecord, LoaderError, LoaderInstallPlan};
-use crate::loaders::workspace::cleanup::{prepare_fresh_work_dir, remove_work_dir};
+use crate::loaders::workspace::cleanup::prepare_fresh_work_dir;
 use crate::loaders::{
     installed_loader_metadata_bytes, validate_provider_version_id, validate_version_id,
 };
-use crate::paths::{libraries_dir, versions_dir};
+use crate::paths::versions_dir;
 use crate::profiles::ensure_launcher_profiles;
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs as async_fs;
 use zip::ZipArchive;
 use zip::ZipWriter;
@@ -210,16 +209,14 @@ where
         .authenticated_client_integrity()
         .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
     drop(base_receipt);
-    let result = Box::pin(install_installer_source_after_authenticated_base(
+    Box::pin(install_installer_source_after_authenticated_base(
         library_dir,
         plan,
         installer_source,
         &authenticated_client,
         send,
     ))
-    .await;
-    remove_work_dir(&plan.stage_dir);
-    result
+    .await
 }
 
 async fn install_installer_source_after_authenticated_base<F>(
@@ -290,15 +287,10 @@ where
     cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
 
     if let Some(install_profile_json) = installer_plan.install_profile_json() {
-        let stage_dir = prepare_fresh_work_dir(library_dir, &installed_version_id)?;
-        if stage_dir != plan.stage_dir {
-            remove_work_dir(&stage_dir);
-            return Err(LoaderError::InvalidProfile(
-                "installer workspace does not match its canonical install plan".to_string(),
-            ));
-        }
-        let installer_path = plan.stage_dir.join("source-installer.jar");
-        async_fs::write(&installer_path, installer_plan.source_bytes()).await?;
+        let workspace = prepare_fresh_work_dir(library_dir, &installed_version_id)?;
+        workspace
+            .write_exact("source-installer.jar", installer_plan.source_bytes())
+            .await?;
         send(progress(
             "processors",
             0,
@@ -310,8 +302,7 @@ where
             &plan.record.minecraft_version,
             install_profile_json,
             installer_plan.source_bytes(),
-            &plan.stage_dir,
-            &installer_path,
+            &workspace,
             |current, total, detail| {
                 send(DownloadProgress {
                     phase: "processors".to_string(),
@@ -327,7 +318,11 @@ where
         ))
         .await
         .map_err(|error| LoaderError::ProcessorFailed(error.to_string()));
+        let workspace_revalidation = workspace.revalidate();
+        let workspace_cleanup = workspace.cleanup();
         cleanup_on_error(processor_result, library_dir, &installed_version_id)?;
+        workspace_revalidation?;
+        workspace_cleanup?;
     }
 
     if installer_plan.strip_client_meta() {
@@ -466,7 +461,7 @@ where
     )
     .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
 
-    let version_dir = prepare_managed_version_dir(library_dir, &plan.record.version_id)?;
+    let version_dir = create_managed_version_dir(library_dir, &plan.record.version_id)?;
     cleanup_on_error(
         write_legacy_archive_install_effects(
             &version_dir,
@@ -645,8 +640,9 @@ async fn write_installed_loader_metadata_bytes(
     version_id: &str,
     metadata: &[u8],
 ) -> Result<(), LoaderError> {
-    let path = prepare_managed_version_dir(library_dir, version_id)?.join(LOADER_METADATA_FILE);
-    write_exact_managed_version_artifact(&path, metadata).await
+    managed_version_dir(library_dir, version_id)?
+        .write_exact(LOADER_METADATA_FILE, metadata)
+        .await
 }
 
 async fn download_to_memory(url: &str) -> Result<Vec<u8>, LoaderError> {
@@ -780,14 +776,12 @@ async fn materialize_embedded_maven_artifacts(
     library_dir: &Path,
     artifacts: &[AuthenticatedEmbeddedMavenArtifact],
 ) -> Result<(), LoaderError> {
-    let root = libraries_dir(library_dir);
+    let root = ManagedDir::open_root(library_dir)?.open_or_create_child("libraries")?;
     for artifact in artifacts {
-        let destination = artifact.relative_path().join_under(&root);
-        if let Some(parent) = destination.parent() {
-            async_fs::create_dir_all(parent).await?;
-        }
-        async_fs::write(destination, artifact.bytes()).await?;
+        root.write_relative_exact(artifact.relative_path(), artifact.bytes())
+            .await?;
     }
+    root.revalidate()?;
     Ok(())
 }
 
@@ -803,29 +797,26 @@ async fn overlay_legacy_archive_bytes_blocking(
 }
 
 async fn write_legacy_archive_install_effects(
-    version_dir: &Path,
+    version_dir: &ManagedDir,
     version_id: &str,
     version_bytes: &[u8],
     child_client_bytes: &[u8],
     loader_metadata_bytes: &[u8],
 ) -> Result<(), LoaderError> {
     validate_version_id(version_id, "installed loader version id")?;
-    write_exact_managed_version_artifact(&version_dir.join(".incomplete"), b"installing").await?;
-    write_exact_managed_version_artifact(
-        &version_dir.join(format!("{version_id}.json")),
-        version_bytes,
-    )
-    .await?;
-    write_exact_managed_version_artifact(
-        &version_dir.join(format!("{version_id}.jar")),
-        child_client_bytes,
-    )
-    .await?;
-    write_exact_managed_version_artifact(
-        &version_dir.join(LOADER_METADATA_FILE),
-        loader_metadata_bytes,
-    )
-    .await
+    version_dir
+        .write_exact(".incomplete", b"installing")
+        .await?;
+    version_dir
+        .write_exact(&format!("{version_id}.json"), version_bytes)
+        .await?;
+    version_dir
+        .write_exact(&format!("{version_id}.jar"), child_client_bytes)
+        .await?;
+    version_dir
+        .write_exact(LOADER_METADATA_FILE, loader_metadata_bytes)
+        .await?;
+    version_dir.revalidate()
 }
 
 async fn write_patched_client_jar_integrity(
@@ -833,16 +824,14 @@ async fn write_patched_client_jar_integrity(
     version_id: &str,
 ) -> Result<(), LoaderError> {
     validate_version_id(version_id, "installed loader version id")?;
-    let version_dir = versions_dir(library_dir).join(version_id);
-    let version_path = version_dir.join(format!("{version_id}.json"));
-    let jar_path = version_dir.join(format!("{version_id}.jar"));
-    let jar_bytes = async_fs::read(&jar_path).await?;
+    let version_dir = managed_version_dir(library_dir, version_id)?;
+    let jar_bytes = version_dir.read_exact(&format!("{version_id}.jar"))?;
     let mut hasher = Sha1::new();
     hasher.update(&jar_bytes);
     let sha1 = format!("{:x}", hasher.finalize());
     let size = i64::try_from(jar_bytes.len()).unwrap_or(i64::MAX);
 
-    let version_bytes = async_fs::read(&version_path).await?;
+    let version_bytes = version_dir.read_exact(&format!("{version_id}.json"))?;
     let mut version: VersionJson = serde_json::from_slice(&version_bytes).map_err(|error| {
         LoaderError::InvalidProfile(format!("parse installed version: {error}"))
     })?;
@@ -853,8 +842,13 @@ async fn write_patched_client_jar_integrity(
     client.sha1 = sha1;
     client.size = size;
     client.url.clear();
-    async_fs::write(&version_path, serde_json::to_vec_pretty(&version)?).await?;
-    Ok(())
+    version_dir
+        .write_exact(
+            &format!("{version_id}.json"),
+            &serde_json::to_vec_pretty(&version)?,
+        )
+        .await?;
+    version_dir.revalidate()
 }
 
 async fn strip_child_client_jar_meta(
@@ -862,50 +856,27 @@ async fn strip_child_client_jar_meta(
     version_id: &str,
 ) -> Result<(), LoaderError> {
     validate_version_id(version_id, "installed loader version id")?;
-    let jar_path = versions_dir(library_dir)
-        .join(version_id)
-        .join(format!("{version_id}.jar"));
-    let temp_jar = artifact_tmp_path(&jar_path);
-    let source_jar = jar_path.clone();
-    let blocking_temp_jar = temp_jar.clone();
-    tokio::task::spawn_blocking(move || {
-        strip_zip_metadata_blocking(&source_jar, &blocking_temp_jar)
-    })
-    .await
-    .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))??;
-
-    match async_fs::remove_file(&jar_path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            let _ = async_fs::remove_file(&temp_jar).await;
-            return Err(LoaderError::Io(error));
-        }
-    }
-    match async_fs::rename(&temp_jar, &jar_path).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = async_fs::remove_file(&temp_jar).await;
-            Err(LoaderError::Io(error))
-        }
-    }
+    let version_dir = managed_version_dir(library_dir, version_id)?;
+    let source = version_dir.read_exact(&format!("{version_id}.jar"))?;
+    let stripped = tokio::task::spawn_blocking(move || strip_zip_metadata_bytes(&source))
+        .await
+        .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))??;
+    version_dir
+        .write_exact(&format!("{version_id}.jar"), &stripped)
+        .await?;
+    version_dir.revalidate()
 }
 
-fn strip_zip_metadata_blocking(source_jar: &Path, temp_jar: &Path) -> Result<(), LoaderError> {
-    if let Some(parent) = temp_jar.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let source_file = File::open(source_jar)?;
-    let mut source_archive = ZipArchive::new(source_file)
+fn strip_zip_metadata_bytes(source: &[u8]) -> Result<Vec<u8>, LoaderError> {
+    let mut source_archive = ZipArchive::new(std::io::Cursor::new(source))
         .map_err(|error| legacy_archive_error("legacy client", error))?;
-    let output_file = File::create(temp_jar)?;
-    let mut writer = ZipWriter::new(output_file);
+    let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
     copy_zip_entries(&mut source_archive, &mut writer, None)?;
-    writer
+    let output = writer
         .finish()
-        .map_err(|error| legacy_archive_error("legacy client metadata strip", error))?;
-    Ok(())
+        .map_err(|error| legacy_archive_error("legacy client metadata strip", error))?
+        .into_inner();
+    Ok(output)
 }
 
 fn overlay_legacy_archive_bytes(
@@ -1100,14 +1071,6 @@ fn legacy_archive_entry_is_skipped(name: &str) -> bool {
         || upper.ends_with(".DSA")
 }
 
-fn artifact_tmp_path(path: &Path) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    path.with_extension(format!("tmp-{}-{nanos:x}", std::process::id()))
-}
-
 fn installer_extract_error(component_name: &str, error: impl std::fmt::Display) -> LoaderError {
     LoaderError::InvalidProfile(format!("extracting {component_name} installer: {error}"))
 }
@@ -1279,15 +1242,12 @@ mod tests {
         let root = PathBuf::from("/tmp/axial-loader-future-size");
         let profile_plan = LoaderInstallPlan {
             record: profile_record(),
-            stage_dir: root.join("profile-stage"),
         };
         let installer_plan = LoaderInstallPlan {
             record: installer_record(),
-            stage_dir: root.join("installer-stage"),
         };
         let legacy_plan = LoaderInstallPlan {
             record: legacy_archive_record(),
-            stage_dir: root.join("legacy-stage"),
         };
 
         let mut send = |_progress: DownloadProgress| {};
@@ -1569,10 +1529,7 @@ mod tests {
             record.component_name = component.display_name().to_string();
             record.strategy = strategy;
             canonicalize_record_identity(&mut record);
-            let plan = LoaderInstallPlan {
-                record,
-                stage_dir: root.join("stage"),
-            };
+            let plan = LoaderInstallPlan { record };
 
             let error = install_from_installer_source(&root, &plan, &server.url, &mut |_| {})
                 .await
@@ -1595,10 +1552,7 @@ mod tests {
             b"not-a-digest installer.jar".to_vec(),
         );
         let record = installer_record();
-        let plan = LoaderInstallPlan {
-            record,
-            stage_dir: root.join("stage"),
-        };
+        let plan = LoaderInstallPlan { record };
 
         let error = install_from_installer_source(&root, &plan, &server.url, &mut |_| {})
             .await
@@ -1621,7 +1575,6 @@ mod tests {
             TestByteServer::start_with_sha1(installer_jar("upstream-installer-id"));
         let plan = LoaderInstallPlan {
             record: record.clone(),
-            stage_dir: root.join("stage"),
         };
         let mut progress = |_progress: DownloadProgress| {};
         let installer_source =
@@ -1673,7 +1626,6 @@ mod tests {
             ));
         let plan = LoaderInstallPlan {
             record: record.clone(),
-            stage_dir: root.join("stage"),
         };
         let installer_source =
             verified_test_source(&installer_server.url, "loader installer").await;
@@ -1869,7 +1821,6 @@ mod tests {
         let installer_server = TestByteServer::start_with_sha1(installer);
         let plan = LoaderInstallPlan {
             record: record.clone(),
-            stage_dir: crate::paths::loader_work_dir(&root).join(&record.version_id),
         };
         let installer_source =
             verified_test_source(&installer_server.url, "loader installer").await;
@@ -1974,7 +1925,6 @@ mod tests {
         canonicalize_record_identity(&mut record);
         let plan = LoaderInstallPlan {
             record: record.clone(),
-            stage_dir: root.join("stage"),
         };
 
         let archive_source = verified_test_source(&server.url, "legacy Forge archive").await;
@@ -2080,7 +2030,6 @@ mod tests {
         let record = legacy_archive_record();
         let plan = LoaderInstallPlan {
             record: record.clone(),
-            stage_dir: root.join("stage"),
         };
         let archive_source = verified_test_source(&server.url, "legacy Forge archive").await;
 
@@ -2110,7 +2059,6 @@ mod tests {
         let record = legacy_archive_record();
         let plan = LoaderInstallPlan {
             record: record.clone(),
-            stage_dir: root.join("stage"),
         };
         let error = install_from_legacy_archive(&root, &plan, &server.url, &mut |_| {})
             .await
@@ -2135,7 +2083,6 @@ mod tests {
         let record = legacy_archive_record();
         let plan = LoaderInstallPlan {
             record: record.clone(),
-            stage_dir: root.join("stage"),
         };
 
         let error = install_from_legacy_archive(&root, &plan, &server.url, &mut |_| {})
@@ -2177,7 +2124,6 @@ mod tests {
         )]));
         let plan = LoaderInstallPlan {
             record: record.clone(),
-            stage_dir: root.join("stage"),
         };
         let archive_source = verified_test_source(&server.url, "legacy Forge archive").await;
 
@@ -2191,10 +2137,7 @@ mod tests {
         .await
         .expect_err("symlinked child must fail");
 
-        assert!(
-            matches!(&error, LoaderError::Verify(message) if message.contains("exact managed directory")),
-            "unexpected error: {error:?}"
-        );
+        assert!(matches!(error, LoaderError::Io(_) | LoaderError::Verify(_)));
         assert_eq!(fs::read(&sentinel).expect("read sentinel"), b"untouched");
         assert_eq!(fs::read_dir(&outside).expect("outside dir").count(), 1);
         server.stop();

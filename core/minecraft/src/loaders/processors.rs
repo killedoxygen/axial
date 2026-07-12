@@ -1,12 +1,15 @@
+use crate::artifact_path::ArtifactRelativePath;
 use crate::launch::{JavaVersion, Library, maven_to_path};
+use crate::loaders::workspace::cleanup::LoaderWorkspace;
 use crate::paths::{libraries_dir, versions_dir};
 use crate::{JavaRuntimeLookupError, find_java_runtime};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tokio::process::Command;
@@ -16,6 +19,7 @@ use zip::ZipArchive;
 const MAX_INSTALLER_DATA_ENTRY_BYTES: u64 = 128 << 20;
 #[cfg(test)]
 const MAX_INSTALLER_DATA_ENTRY_BYTES: u64 = 1024;
+static PROCESSOR_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum ProcessorError {
@@ -63,8 +67,7 @@ pub async fn run_processors<F>(
     mc_version: &str,
     install_profile_json: &[u8],
     installer_data: &[u8],
-    work_dir: &Path,
-    installer_path: &Path,
+    workspace: &LoaderWorkspace,
     mut progress: F,
 ) -> Result<(), ProcessorError>
 where
@@ -85,15 +88,34 @@ where
         }
     }
 
-    let (data_vars, temp_dir) = build_data_vars_blocking(
+    let installer_path = workspace.path().join("source-installer.jar");
+    let (data_vars, temp_plan) = build_data_vars_blocking(
         &profile.data,
         mc_dir,
         mc_version,
         installer_data,
-        work_dir,
-        installer_path,
+        workspace.path(),
+        &installer_path,
     )
     .await?;
+    let temp_dir = if let Some(plan) = temp_plan {
+        let temp = workspace
+            .create_temp(&plan.name)
+            .map_err(|error| ProcessorError::Io(loader_io_error(error)))?;
+        for file in plan.files {
+            if let Err(error) = temp
+                .write_relative_exact(&file.relative_path, &file.bytes)
+                .await
+            {
+                let cleanup = temp.cleanup().map_err(loader_io_error);
+                cleanup?;
+                return Err(ProcessorError::Io(loader_io_error(error)));
+            }
+        }
+        Some(temp)
+    } else {
+        None
+    };
     let processors = profile
         .processors
         .into_iter()
@@ -102,23 +124,35 @@ where
         })
         .collect::<Vec<_>>();
 
-    let total = processors.len();
-    for (index, processor) in processors.iter().enumerate() {
-        progress(
-            index + 1,
-            total,
-            format!("Processor {}/{}", index + 1, total),
-        );
-        run_processor(
-            &java_path, processor, &lib_paths, &data_vars, &lib_dir, &lib_dir,
-        )
-        .await?;
+    let result = async {
+        let total = processors.len();
+        for (index, processor) in processors.iter().enumerate() {
+            progress(
+                index + 1,
+                total,
+                format!("Processor {}/{}", index + 1, total),
+            );
+            run_processor(
+                &java_path, processor, &lib_paths, &data_vars, &lib_dir, &lib_dir,
+            )
+            .await?;
+        }
+        Ok::<(), ProcessorError>(())
     }
-
-    if let Some(temp_dir) = temp_dir {
-        let _ = fs::remove_dir_all(temp_dir);
-    }
+    .await;
+    let cleanup = temp_dir
+        .map(|temp| temp.cleanup().map_err(loader_io_error))
+        .transpose();
+    result?;
+    cleanup.map_err(ProcessorError::Io)?;
     Ok(())
+}
+
+fn loader_io_error(error: crate::loaders::types::LoaderError) -> io::Error {
+    match error {
+        crate::loaders::types::LoaderError::Io(error) => error,
+        error => io::Error::other(error.to_string()),
+    }
 }
 
 fn find_java_for_processors(mc_dir: &Path) -> Result<PathBuf, ProcessorError> {
@@ -193,9 +227,9 @@ fn build_data_vars(
     installer_data: &[u8],
     work_dir: &Path,
     installer_path: &Path,
-) -> Result<(HashMap<String, String>, Option<PathBuf>), ProcessorError> {
+) -> Result<(HashMap<String, String>, Option<ProcessorTempPlan>), ProcessorError> {
     let mut vars = HashMap::new();
-    let mut temp_dir = None;
+    let mut temp_plan = None;
 
     for (key, entry) in data {
         let value = entry.client.trim();
@@ -208,9 +242,6 @@ fn build_data_vars(
             let maven_path = maven_to_path(coord);
             if !maven_path.as_os_str().is_empty() {
                 let path = libraries_dir(mc_dir).join(maven_path);
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
                 vars.insert(key.clone(), path.to_string_lossy().to_string());
             }
             continue;
@@ -218,18 +249,18 @@ fn build_data_vars(
 
         if let Some(entry_path) = value.strip_prefix('/') {
             let destination_path = safe_installer_entry_path(entry_path)?;
-            if temp_dir.is_none() {
-                temp_dir = Some(create_temp_dir(work_dir)?);
-            }
-            let temp_dir_path = temp_dir.as_deref().ok_or_else(|| {
-                ProcessorError::Command("processor temp directory unavailable".to_string())
-            })?;
-            let extracted = extract_from_installer_jar(
-                installer_data,
-                entry_path,
-                &destination_path,
-                temp_dir_path,
-            )?;
+            let relative_path = ArtifactRelativePath::from_path(&destination_path)
+                .map_err(|_| unsafe_installer_entry_error(entry_path))?;
+            let plan = temp_plan.get_or_insert_with(|| ProcessorTempPlan {
+                name: processor_temp_name(),
+                files: Vec::new(),
+            });
+            let extracted = work_dir.join(&plan.name).join(&destination_path);
+            let bytes = read_installer_entry(installer_data, entry_path)?;
+            plan.files.push(PlannedWorkspaceFile {
+                relative_path,
+                bytes,
+            });
             vars.insert(key.clone(), extracted.to_string_lossy().to_string());
             continue;
         }
@@ -257,7 +288,7 @@ fn build_data_vars(
         installer_path.to_string_lossy().to_string(),
     );
 
-    Ok((vars, temp_dir))
+    Ok((vars, temp_plan))
 }
 
 async fn build_data_vars_blocking(
@@ -267,7 +298,7 @@ async fn build_data_vars_blocking(
     installer_data: &[u8],
     work_dir: &Path,
     installer_path: &Path,
-) -> Result<(HashMap<String, String>, Option<PathBuf>), ProcessorError> {
+) -> Result<(HashMap<String, String>, Option<ProcessorTempPlan>), ProcessorError> {
     let data = data.clone();
     let mc_dir = mc_dir.to_path_buf();
     let mc_version = mc_version.to_string();
@@ -289,41 +320,46 @@ async fn build_data_vars_blocking(
     .map_err(|error| ProcessorError::Command(format!("blocking task failed: {error}")))?
 }
 
-fn create_temp_dir(work_dir: &Path) -> Result<PathBuf, std::io::Error> {
+#[derive(Debug)]
+struct ProcessorTempPlan {
+    name: String,
+    files: Vec<PlannedWorkspaceFile>,
+}
+
+#[derive(Debug)]
+struct PlannedWorkspaceFile {
+    relative_path: ArtifactRelativePath,
+    bytes: Vec<u8>,
+}
+
+fn processor_temp_name() -> String {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|value| value.as_nanos())
         .unwrap_or_default();
-    let dir = work_dir.join(format!("processors-{nanos:x}"));
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
+    let sequence = PROCESSOR_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("processors-{}-{nanos:x}-{sequence:x}", std::process::id())
 }
 
-fn extract_from_installer_jar(
-    jar_data: &[u8],
-    entry_path: &str,
-    destination_path: &Path,
-    temp_dir: &Path,
-) -> Result<PathBuf, ProcessorError> {
+fn read_installer_entry(jar_data: &[u8], entry_path: &str) -> Result<Vec<u8>, ProcessorError> {
     let mut archive = ZipArchive::new(std::io::Cursor::new(jar_data))?;
     let mut file = archive
         .by_name(entry_path)
         .map_err(|_| ProcessorError::Command(format!("extracting {entry_path} from installer")))?;
-    if file.size() > MAX_INSTALLER_DATA_ENTRY_BYTES {
+    let declared_size = file.size();
+    if declared_size > MAX_INSTALLER_DATA_ENTRY_BYTES {
         return Err(oversized_installer_entry_error(entry_path));
     }
-    let destination = temp_dir.join(destination_path);
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut output = fs::File::create(&destination)?;
+    let capacity =
+        usize::try_from(declared_size).map_err(|_| oversized_installer_entry_error(entry_path))?;
+    let mut output = Vec::with_capacity(capacity);
     let mut bounded = (&mut file).take(MAX_INSTALLER_DATA_ENTRY_BYTES + 1);
-    let copied = std::io::copy(&mut bounded, &mut output)?;
-    if copied > MAX_INSTALLER_DATA_ENTRY_BYTES {
-        let _ = fs::remove_file(&destination);
+    bounded.read_to_end(&mut output)?;
+    if output.len() as u64 > MAX_INSTALLER_DATA_ENTRY_BYTES || output.len() as u64 != declared_size
+    {
         return Err(oversized_installer_entry_error(entry_path));
     }
-    Ok(destination)
+    Ok(output)
 }
 
 fn safe_installer_entry_path(entry_path: &str) -> Result<PathBuf, ProcessorError> {

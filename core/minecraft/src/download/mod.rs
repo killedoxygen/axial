@@ -39,6 +39,7 @@ pub use model::{
     SelectedDownloadArtifactKind,
 };
 pub use transfer::download_file_with_client_report;
+#[cfg(test)]
 pub(crate) use transfer::promote_launcher_managed_artifact_temp_once;
 pub(crate) use transfer::write_launcher_managed_artifact_bytes_to_temp;
 
