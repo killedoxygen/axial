@@ -10,7 +10,7 @@ use super::layout::{
 use super::manifest::{
     COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, ComponentManifestDownload,
     ComponentManifestDownloads, ComponentManifestFile, RUNTIME_MANIFEST_URL, RuntimeManifest,
-    fetch_runtime_json,
+    component_manifest_proof_bytes, fetch_runtime_json,
 };
 use super::model::{JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeId};
 use futures_util::StreamExt;
@@ -159,7 +159,7 @@ async fn persist_component_manifest_proof(
     temp_dir: &Path,
     component_manifest: &ComponentManifest,
 ) -> Result<(), JavaRuntimeLookupError> {
-    let bytes = serde_json::to_vec_pretty(component_manifest)
+    let bytes = component_manifest_proof_bytes(component_manifest)
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
     let proof_path = temp_dir.join(COMPONENT_MANIFEST_PROOF_FILE);
     async_fs::write(runtime_filesystem_path(&proof_path).as_ref(), bytes)
@@ -291,14 +291,14 @@ pub(super) fn runtime_manifest_file_bytes(file: &ComponentManifestFile) -> u64 {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct RuntimeManifestInstallPlan {
-    pub(super) directory_entries: Vec<(String, ComponentManifestFile)>,
-    pub(super) file_entries: Vec<(String, ComponentManifestFile)>,
-    pub(super) link_entries: Vec<(String, ComponentManifestFile)>,
-    pub(super) other_entries: Vec<(String, ComponentManifestFile)>,
+pub(crate) struct RuntimeManifestInstallPlan {
+    pub(crate) directory_entries: Vec<(String, ComponentManifestFile)>,
+    pub(crate) file_entries: Vec<(String, ComponentManifestFile)>,
+    pub(crate) link_entries: Vec<(String, ComponentManifestFile)>,
+    pub(crate) other_entries: Vec<(String, ComponentManifestFile)>,
 }
 
-pub(super) fn plan_runtime_manifest_files(
+pub(crate) fn plan_runtime_manifest_files(
     files: HashMap<String, ComponentManifestFile>,
 ) -> RuntimeManifestInstallPlan {
     let mut entries = files.into_iter().collect::<Vec<_>>();

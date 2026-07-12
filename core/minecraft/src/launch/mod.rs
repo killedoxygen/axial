@@ -178,12 +178,6 @@ pub struct Library {
     pub checksums: Vec<String>,
     #[serde(default)]
     pub size: i64,
-    #[serde(
-        rename = "axialChecksumlessAllowed",
-        default,
-        skip_serializing_if = "is_false"
-    )]
-    pub axial_checksumless_allowed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -210,10 +204,6 @@ pub struct LibraryArtifact {
 pub struct ExtractRule {
     #[serde(default)]
     pub exclude: Vec<String>,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

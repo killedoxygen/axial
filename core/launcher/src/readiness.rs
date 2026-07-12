@@ -1,8 +1,9 @@
 use crate::GuardianMode;
 use crate::build::find_client_jar;
 use axial_minecraft::download::{
-    ExpectedIntegrity, LauncherManagedArtifactReadiness, asset_object_hash_prefix,
-    jar_contains_signed_metadata, library_jobs_for, verify_existing_launcher_managed_artifact,
+    ExpectedIntegrity, LauncherManagedArtifactReadiness, LibraryChecksumPolicy,
+    asset_object_hash_prefix, jar_contains_signed_metadata, library_jobs_for,
+    verify_existing_launcher_managed_artifact,
     verify_existing_launcher_managed_artifact_allowing_missing_checksum,
 };
 use axial_minecraft::paths::assets_dir;
@@ -208,16 +209,30 @@ fn inspect_version_files(
         }
     }
 
-    let library_jobs: Vec<ArtifactVerificationJob> =
-        library_jobs_for(library_dir, &version.libraries, &default_environment())
-            .into_iter()
-            .map(|library| ArtifactVerificationJob {
-                path: library.path,
-                name: Some(library.name),
-                expected: library.expected,
-                allow_missing_checksum: library.allow_missing_checksum,
-            })
-            .collect();
+    let checksum_policy = if read_loader_metadata(library_dir, version_id)
+        .is_some_and(|metadata| metadata.is_valid())
+    {
+        LibraryChecksumPolicy::AllowMissing
+    } else {
+        LibraryChecksumPolicy::Strict
+    };
+    let planned_library_jobs = library_jobs_for(
+        library_dir,
+        &version.libraries,
+        &default_environment(),
+        checksum_policy,
+    );
+    let library_planning_failed = planned_library_jobs.is_err();
+    let library_jobs: Vec<ArtifactVerificationJob> = planned_library_jobs
+        .unwrap_or_default()
+        .into_iter()
+        .map(|library| ArtifactVerificationJob {
+            path: library.path,
+            name: Some(library.name),
+            expected: library.expected,
+            allow_missing_checksum: library.allow_missing_checksum,
+        })
+        .collect();
     let library_signature_corrupt = inspection == LaunchReadinessInspection::Full
         && legacy_forge_libraries_have_signed_metadata(
             library_dir,
@@ -236,7 +251,13 @@ fn inspect_version_files(
     let libraries_corrupt = library_readiness
         .iter()
         .any(|status| *status != LauncherManagedArtifactReadiness::Verified);
-    if libraries_missing {
+    if library_planning_failed {
+        reasons.push(reason(
+            LaunchReadinessReasonId::LibrariesCorrupt,
+            "Library metadata is invalid. Repair this version before launching.",
+            LaunchReadinessSeverity::Blocking,
+        ));
+    } else if libraries_missing {
         reasons.push(reason(
             LaunchReadinessReasonId::LibrariesMissing,
             "Required libraries are missing. Install this version before launching.",
@@ -502,9 +523,19 @@ fn child_version_jar(library_dir: &Path, version_id: &str, jar: &Path) -> bool {
 #[derive(Deserialize)]
 struct ReadinessLoaderMetadata {
     #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
     component_id: String,
     #[serde(default)]
     minecraft_version: String,
+}
+
+impl ReadinessLoaderMetadata {
+    fn is_valid(&self) -> bool {
+        self.schema_version == 1
+            && axial_minecraft::LoaderComponentId::parse(&self.component_id).is_some()
+            && !self.minecraft_version.trim().is_empty()
+    }
 }
 
 fn legacy_forge_artifacts_must_be_unsigned(
@@ -1045,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn marked_checksumless_library_allows_readable_jar() {
+    fn installed_loader_metadata_allows_readable_checksumless_library() {
         let library_dir = temp_library("marked-checksumless-library-readable");
         let client = b"client";
         write_version_json(
@@ -1062,14 +1093,14 @@ mod tests {
                     }},
                     "libraries": [{{
                         "name": "org.quiltmc:quilt-loader:0.29.2",
-                        "url": "https://maven.example.invalid/",
-                        "axialChecksumlessAllowed": true
+                        "url": "https://maven.example.invalid/"
                     }}]
                 }}"#,
                 sha1_hex(client),
                 client.len()
             ),
         );
+        write_loader_metadata(&library_dir, "quilt-loader-test");
         fs::write(
             library_dir
                 .join("versions")
@@ -1107,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn marked_checksumless_library_rejects_unreadable_jar() {
+    fn installed_loader_metadata_rejects_unreadable_checksumless_library() {
         let library_dir = temp_library("marked-checksumless-library-unreadable");
         let client = b"client";
         write_version_json(
@@ -1124,14 +1155,14 @@ mod tests {
                     }},
                     "libraries": [{{
                         "name": "org.quiltmc:quilt-loader:0.29.2",
-                        "url": "https://maven.example.invalid/",
-                        "axialChecksumlessAllowed": true
+                        "url": "https://maven.example.invalid/"
                     }}]
                 }}"#,
                 sha1_hex(client),
                 client.len()
             ),
         );
+        write_loader_metadata(&library_dir, "quilt-loader-test");
         fs::write(
             library_dir
                 .join("versions")
@@ -1644,6 +1675,25 @@ mod tests {
         let version_dir = library_dir.join("versions").join(version_id);
         fs::create_dir_all(&version_dir).expect("version dir");
         fs::write(version_dir.join(format!("{version_id}.json")), json).expect("version json");
+    }
+
+    fn write_loader_metadata(library_dir: &Path, version_id: &str) {
+        fs::write(
+            library_dir
+                .join("versions")
+                .join(version_id)
+                .join(".axial-loader.json"),
+            r#"{
+                "schema_version": 1,
+                "component_id": "org.quiltmc.quilt-loader",
+                "component_name": "Quilt",
+                "build_id": "quilt-loader-test",
+                "minecraft_version": "1.21.1",
+                "loader_version": "0.29.2",
+                "build_meta": {}
+            }"#,
+        )
+        .expect("loader metadata");
     }
 
     fn write_asset_version_fixture(library_dir: &Path, asset: &[u8], legacy: bool) {

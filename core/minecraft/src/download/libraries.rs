@@ -1,19 +1,19 @@
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
 use super::integrity::is_sha1_hex;
 use super::model::{
-    DownloadError, DownloadProgress, ExecutionDownloadFact, ExpectedIntegrity,
+    DownloadError, DownloadProgress, ExecutionDownloadFact, ExpectedIntegrity, LibraryPlanError,
     SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
 };
-use super::path_safety::resolve_path_under_root;
 use super::transfer::{
     ensure_selected_artifact_with_client,
     ensure_selected_artifact_with_client_allowing_missing_checksum,
 };
+use crate::artifact_path::ArtifactRelativePath;
 use crate::launch::{Library, maven_to_path};
 use crate::paths::libraries_dir;
-use crate::rules::{current_os_arch, default_environment, evaluate_rules};
+use crate::rules::{Environment, default_environment, evaluate_rules};
 use futures_util::StreamExt;
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
@@ -26,6 +26,43 @@ pub struct DownloadJob {
     pub allow_missing_checksum: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryChecksumPolicy {
+    Strict,
+    AllowMissing,
+}
+
+impl LibraryChecksumPolicy {
+    fn allows_missing(self) -> bool {
+        matches!(self, Self::AllowMissing)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LibraryArtifactPlan {
+    pub(crate) relative_path: ArtifactRelativePath,
+    pub(crate) source_url: Option<String>,
+    pub(crate) name: String,
+    pub(crate) expected: ExpectedIntegrity,
+    pub(crate) allow_missing_checksum: bool,
+    pub(crate) is_native: bool,
+}
+
+impl LibraryArtifactPlan {
+    fn into_download_job(self, mc_dir: &Path) -> Result<DownloadJob, LibraryPlanError> {
+        let url = self
+            .source_url
+            .ok_or(LibraryPlanError::MissingDownloadSource)?;
+        Ok(DownloadJob {
+            path: self.relative_path.join_under(&libraries_dir(mc_dir)),
+            url,
+            name: self.name,
+            expected: self.expected,
+            allow_missing_checksum: self.allow_missing_checksum,
+        })
+    }
+}
+
 pub async fn download_libraries<F>(
     mc_dir: &Path,
     libraries: &[Library],
@@ -36,8 +73,8 @@ where
     F: FnMut(DownloadProgress),
 {
     let env = default_environment();
-    let jobs = library_jobs_for(mc_dir, libraries, &env);
-    download_library_jobs(jobs, phase, send, None, None, false).await
+    let jobs = library_jobs_for(mc_dir, libraries, &env, LibraryChecksumPolicy::Strict)?;
+    download_library_jobs(jobs, phase, send, None, None).await
 }
 
 pub async fn download_libraries_with_facts_and_descriptors<F, G, H>(
@@ -54,11 +91,10 @@ where
     H: FnMut(SelectedDownloadArtifactDescriptor),
 {
     let env = default_environment();
-    let jobs = library_jobs_for(mc_dir, libraries, &env);
+    let jobs = library_jobs_for(mc_dir, libraries, &env, LibraryChecksumPolicy::Strict)?;
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
-    let result =
-        download_library_jobs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx), false).await;
+    let result = download_library_jobs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx)).await;
     while let Ok(fact) = fact_rx.try_recv() {
         send_fact(fact);
     }
@@ -82,11 +118,10 @@ where
     H: FnMut(SelectedDownloadArtifactDescriptor),
 {
     let env = default_environment();
-    let jobs = library_jobs_for(mc_dir, libraries, &env);
+    let jobs = library_jobs_for(mc_dir, libraries, &env, LibraryChecksumPolicy::AllowMissing)?;
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
-    let result =
-        download_library_jobs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx), true).await;
+    let result = download_library_jobs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx)).await;
     while let Ok(fact) = fact_rx.try_recv() {
         send_fact(fact);
     }
@@ -102,7 +137,6 @@ async fn download_library_jobs<F>(
     mut send: F,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
     descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-    allow_missing_checksum: bool,
 ) -> Result<(), DownloadError>
 where
     F: FnMut(DownloadProgress),
@@ -116,7 +150,7 @@ where
         let fact_tx = fact_tx.clone();
         let descriptor_tx = descriptor_tx.clone();
         async move {
-            if allow_missing_checksum {
+            if job.allow_missing_checksum {
                 ensure_selected_artifact_with_client_allowing_missing_checksum(
                     SelectedDownloadArtifactKind::Library,
                     &client,
@@ -151,15 +185,17 @@ where
     Ok(())
 }
 
-pub fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<DownloadJob> {
-    let lib_dir = libraries_dir(mc_dir);
+fn resolve_library_plan(
+    lib: &Library,
+    checksum_policy: LibraryChecksumPolicy,
+) -> Result<Option<LibraryArtifactPlan>, LibraryPlanError> {
     if !lib.natives.is_empty()
         && lib
             .downloads
             .as_ref()
             .is_none_or(|downloads| downloads.artifact.is_none())
     {
-        return None;
+        return Ok(None);
     }
 
     if let Some(artifact) = lib
@@ -167,80 +203,98 @@ pub fn resolve_library_download(lib: &Library, mc_dir: &Path) -> Option<Download
         .as_ref()
         .and_then(|downloads| downloads.artifact.as_ref())
     {
-        if !artifact.url.trim().is_empty() {
-            let path = resolve_path_under_root(&lib_dir, &artifact.path)?;
-            return Some(DownloadJob {
-                name: Path::new(&artifact.path)
-                    .file_name()
-                    .map(|value| value.to_string_lossy().to_string())
-                    .unwrap_or_else(|| lib.name.clone()),
-                path,
-                url: artifact.url.clone(),
-                expected: library_expected_integrity(lib, artifact.size, &artifact.sha1),
-                allow_missing_checksum: lib.axial_checksumless_allowed,
-            });
-        }
-        return None;
+        let relative_path = artifact_relative_path(&artifact.path)?;
+        return Ok(Some(LibraryArtifactPlan {
+            name: artifact_name(&relative_path, &lib.name),
+            relative_path,
+            source_url: nonempty_url(&artifact.url),
+            expected: library_expected_integrity(lib, artifact.size, &artifact.sha1)?,
+            allow_missing_checksum: checksum_policy.allows_missing(),
+            is_native: false,
+        }));
     }
 
     let maven_path = maven_to_path(&lib.name);
     if maven_path.as_os_str().is_empty() {
-        return None;
+        return Err(LibraryPlanError::InvalidArtifactPath);
     }
-    let base_url = if lib.url.is_empty() {
-        "https://libraries.minecraft.net/".to_string()
-    } else if lib.url.ends_with('/') {
-        lib.url.clone()
-    } else {
-        format!("{}/", lib.url)
-    };
-    let path = lib_dir.join(&maven_path);
-    Some(DownloadJob {
-        name: path
-            .file_name()
-            .map(|value| value.to_string_lossy().to_string())
-            .unwrap_or_else(|| lib.name.clone()),
-        path,
-        url: format!(
-            "{}{}",
-            base_url,
-            maven_path.to_string_lossy().replace('\\', "/")
-        ),
-        expected: library_expected_integrity(lib, lib.size, &lib.sha1),
-        allow_missing_checksum: lib.axial_checksumless_allowed,
-    })
+    let relative_path = ArtifactRelativePath::from_path(&maven_path)
+        .map_err(|_| LibraryPlanError::InvalidArtifactPath)?;
+    Ok(Some(LibraryArtifactPlan {
+        name: artifact_name(&relative_path, &lib.name),
+        source_url: Some(maven_url(lib, &relative_path)),
+        relative_path,
+        expected: library_expected_integrity(lib, lib.size, &lib.sha1)?,
+        allow_missing_checksum: checksum_policy.allows_missing(),
+        is_native: false,
+    }))
 }
 
-pub fn resolve_native_download(lib: &Library, mc_dir: &Path, os_name: &str) -> Option<DownloadJob> {
-    let lib_dir = libraries_dir(mc_dir);
-    for classifier_key in native_classifier_candidates(lib, os_name) {
+fn resolve_native_plan(
+    lib: &Library,
+    os_name: &str,
+    os_arch: &str,
+    checksum_policy: LibraryChecksumPolicy,
+) -> Result<Option<LibraryArtifactPlan>, LibraryPlanError> {
+    let classifier_candidates = native_classifier_candidates(lib, os_name, os_arch);
+    for classifier_key in &classifier_candidates {
         if let Some(artifact) = lib
             .downloads
             .as_ref()
-            .and_then(|downloads| downloads.classifiers.get(&classifier_key))
-            && !artifact.url.trim().is_empty()
+            .and_then(|downloads| downloads.classifiers.get(classifier_key))
         {
-            let path = resolve_path_under_root(&lib_dir, &artifact.path)?;
-            return Some(DownloadJob {
-                name: Path::new(&artifact.path)
-                    .file_name()
-                    .map(|value| value.to_string_lossy().to_string())
-                    .unwrap_or_else(|| format!("{}:{classifier_key}", lib.name)),
-                path,
-                url: artifact.url.clone(),
-                expected: library_expected_integrity(lib, artifact.size, &artifact.sha1),
-                allow_missing_checksum: lib.axial_checksumless_allowed,
-            });
+            let relative_path = artifact_relative_path(&artifact.path)?;
+            return Ok(Some(LibraryArtifactPlan {
+                name: artifact_name(&relative_path, &format!("{}:{classifier_key}", lib.name)),
+                relative_path,
+                source_url: nonempty_url(&artifact.url),
+                expected: library_expected_integrity(lib, artifact.size, &artifact.sha1)?,
+                allow_missing_checksum: checksum_policy.allows_missing(),
+                is_native: true,
+            }));
         }
     }
 
-    let classifier_key = native_classifier_candidates(lib, os_name)
-        .into_iter()
-        .next()?;
+    let Some(classifier_key) = classifier_candidates.into_iter().next() else {
+        return Ok(None);
+    };
     let maven_path = maven_to_path(&format!("{}:{classifier_key}", lib.name));
     if maven_path.as_os_str().is_empty() {
-        return None;
+        return Err(LibraryPlanError::InvalidArtifactPath);
     }
+    let relative_path = ArtifactRelativePath::from_path(&maven_path)
+        .map_err(|_| LibraryPlanError::InvalidArtifactPath)?;
+    Ok(Some(LibraryArtifactPlan {
+        name: artifact_name(&relative_path, &format!("{}:{classifier_key}", lib.name)),
+        source_url: Some(maven_url(lib, &relative_path)),
+        relative_path,
+        expected: library_expected_integrity(lib, lib.size, &lib.sha1)?,
+        allow_missing_checksum: checksum_policy.allows_missing(),
+        is_native: true,
+    }))
+}
+
+fn artifact_relative_path(value: &str) -> Result<ArtifactRelativePath, LibraryPlanError> {
+    ArtifactRelativePath::new(value).map_err(|_| LibraryPlanError::InvalidArtifactPath)
+}
+
+fn artifact_name(path: &ArtifactRelativePath, fallback: &str) -> String {
+    let name = path
+        .as_str()
+        .rsplit_once('/')
+        .map_or(path.as_str(), |(_, name)| name);
+    if name.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn nonempty_url(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.to_string())
+}
+
+fn maven_url(lib: &Library, path: &ArtifactRelativePath) -> String {
     let base_url = if lib.url.is_empty() {
         "https://libraries.minecraft.net/".to_string()
     } else if lib.url.ends_with('/') {
@@ -248,44 +302,53 @@ pub fn resolve_native_download(lib: &Library, mc_dir: &Path, os_name: &str) -> O
     } else {
         format!("{}/", lib.url)
     };
-    let path = lib_dir.join(&maven_path);
-    Some(DownloadJob {
-        name: path
-            .file_name()
-            .map(|value| value.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("{}:{classifier_key}", lib.name)),
-        path,
-        url: format!(
-            "{}{}",
-            base_url,
-            maven_path.to_string_lossy().replace('\\', "/")
-        ),
-        expected: library_expected_integrity(lib, lib.size, &lib.sha1),
-        allow_missing_checksum: lib.axial_checksumless_allowed,
+    format!("{base_url}{}", path.as_str())
+}
+
+fn library_expected_integrity(
+    lib: &Library,
+    size: i64,
+    sha1: &str,
+) -> Result<ExpectedIntegrity, LibraryPlanError> {
+    let mut legacy_sha1 = None;
+    for checksum in lib.checksums.iter().map(|checksum| checksum.trim()) {
+        if checksum.is_empty() {
+            continue;
+        }
+        if !is_sha1_hex(checksum) {
+            return Err(LibraryPlanError::InvalidChecksum);
+        }
+        legacy_sha1.get_or_insert(checksum);
+    }
+
+    let sha1 = if sha1.trim().is_empty() {
+        lib.sha1.trim()
+    } else {
+        sha1.trim()
+    };
+    if !sha1.is_empty() {
+        if !is_sha1_hex(sha1) {
+            return Err(LibraryPlanError::InvalidChecksum);
+        }
+        return Ok(ExpectedIntegrity::from_mojang(size, sha1));
+    }
+
+    Ok(match legacy_sha1 {
+        Some(checksum) => ExpectedIntegrity {
+            size: u64::try_from(size).ok().filter(|value| *value > 0),
+            sha1: Some(checksum.to_string()),
+        },
+        None => ExpectedIntegrity::from_mojang(size, ""),
     })
 }
 
-fn library_expected_integrity(lib: &Library, size: i64, sha1: &str) -> ExpectedIntegrity {
-    let expected = ExpectedIntegrity::from_mojang(size, sha1);
-    if expected.sha1.is_some() {
-        return expected;
-    }
-    lib.checksums
-        .iter()
-        .map(|checksum| checksum.trim())
-        .find(|checksum| is_sha1_hex(checksum))
-        .map(ExpectedIntegrity::from_sha1)
-        .unwrap_or(expected)
-}
-
-pub fn native_classifier_candidates(lib: &Library, os_name: &str) -> Vec<String> {
+fn native_classifier_candidates(lib: &Library, os_name: &str, os_arch: &str) -> Vec<String> {
     let Some(base) = lib.natives.get(os_name) else {
         return Vec::new();
     };
 
-    let arch = current_os_arch();
     let mut candidates = Vec::new();
-    let variants = match arch {
+    let variants = match os_arch {
         "x86_64" => vec![
             base.replace("${arch}", "64"),
             base.replace("-${arch}", ""),
@@ -299,7 +362,7 @@ pub fn native_classifier_candidates(lib: &Library, os_name: &str) -> Vec<String>
             base.replace("${arch}", "arm64"),
             base.replace("${arch}", "64"),
         ],
-        _ => vec![base.replace("${arch}", arch)],
+        _ => vec![base.replace("${arch}", os_arch)],
     };
 
     for variant in variants {
@@ -314,10 +377,21 @@ pub fn native_classifier_candidates(lib: &Library, os_name: &str) -> Vec<String>
 pub fn library_jobs_for(
     mc_dir: &Path,
     libraries: &[Library],
-    env: &crate::rules::Environment,
-) -> Vec<DownloadJob> {
-    let mut jobs = Vec::new();
-    let mut queued_paths = HashSet::new();
+    env: &Environment,
+    checksum_policy: LibraryChecksumPolicy,
+) -> Result<Vec<DownloadJob>, LibraryPlanError> {
+    library_artifact_plans_for(libraries, env, checksum_policy)?
+        .into_iter()
+        .map(|plan| plan.into_download_job(mc_dir))
+        .collect()
+}
+
+pub(crate) fn library_artifact_plans_for(
+    libraries: &[Library],
+    env: &Environment,
+    checksum_policy: LibraryChecksumPolicy,
+) -> Result<Vec<LibraryArtifactPlan>, LibraryPlanError> {
+    let mut plans = BTreeMap::new();
 
     for lib in libraries {
         if !evaluate_rules(&lib.rules, env) {
@@ -328,19 +402,30 @@ pub fn library_jobs_for(
             continue;
         }
 
-        if let Some(job) = resolve_library_download(lib, mc_dir)
-            && queued_paths.insert(job.path.clone())
-        {
-            jobs.push(job);
+        if let Some(plan) = resolve_library_plan(lib, checksum_policy)? {
+            insert_plan(&mut plans, plan)?;
         }
-        if let Some(job) = resolve_native_download(lib, mc_dir, &env.os_name)
-            && queued_paths.insert(job.path.clone())
-        {
-            jobs.push(job);
+        if let Some(plan) = resolve_native_plan(lib, &env.os_name, &env.os_arch, checksum_policy)? {
+            insert_plan(&mut plans, plan)?;
         }
     }
 
-    jobs
+    Ok(plans.into_values().collect())
+}
+
+fn insert_plan(
+    plans: &mut BTreeMap<ArtifactRelativePath, LibraryArtifactPlan>,
+    plan: LibraryArtifactPlan,
+) -> Result<(), LibraryPlanError> {
+    if let Some(existing) = plans.get(&plan.relative_path) {
+        return if existing == &plan {
+            Ok(())
+        } else {
+            Err(LibraryPlanError::ConflictingArtifactPath)
+        };
+    }
+    plans.insert(plan.relative_path.clone(), plan);
+    Ok(())
 }
 
 fn native_name_matches_env(name: &str, env: &crate::rules::Environment) -> bool {

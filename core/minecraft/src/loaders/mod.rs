@@ -4,6 +4,7 @@ mod compose;
 mod forge_installer;
 mod http;
 pub mod index;
+mod installed_metadata;
 pub mod legacy;
 mod processors;
 pub mod providers;
@@ -15,6 +16,10 @@ pub use api::{build_id_for, installed_version_id_for, loader_components, parse_b
 pub use index::{
     fetch_builds, fetch_cached_builds, fetch_components, fetch_supported_versions,
     resolve_build_record,
+};
+pub(crate) use installed_metadata::{
+    INSTALLED_LOADER_METADATA_SCHEMA_VERSION, InstalledLoaderMetadata,
+    installed_loader_metadata_bytes,
 };
 pub use types::{
     LOADER_CATALOG_SCHEMA_VERSION, LoaderActiveInstallFailure, LoaderArtifactKind,

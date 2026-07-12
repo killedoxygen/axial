@@ -1,5 +1,5 @@
 use crate::launch::{Downloads, JavaVersion, effective_java_version_for};
-use crate::loaders::types::{LoaderBuildMetadata, LoaderComponentId};
+use crate::loaders::{INSTALLED_LOADER_METADATA_SCHEMA_VERSION, InstalledLoaderMetadata};
 use crate::paths::versions_dir;
 use crate::types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 use crate::version_meta::{analyze_minecraft_version, compare_version_entries};
@@ -285,20 +285,6 @@ struct VersionStub {
     java_version: Option<JavaVersion>,
     #[serde(default)]
     downloads: Downloads,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct InstalledLoaderMetadata {
-    #[serde(default)]
-    schema_version: u32,
-    component_id: LoaderComponentId,
-    #[serde(default)]
-    component_name: String,
-    build_id: String,
-    minecraft_version: String,
-    loader_version: String,
-    #[serde(default)]
-    build_meta: LoaderBuildMetadata,
 }
 
 pub fn scan_versions(mc_dir: &Path) -> io::Result<Vec<VersionEntry>> {
@@ -631,7 +617,7 @@ fn read_installed_loader_metadata(
     let Ok(metadata) = serde_json::from_slice::<InstalledLoaderMetadata>(&data) else {
         return LoaderMetadataScan::Malformed;
     };
-    if metadata.schema_version != 1
+    if metadata.schema_version != INSTALLED_LOADER_METADATA_SCHEMA_VERSION
         || metadata.build_id.trim().is_empty()
         || metadata.minecraft_version.trim().is_empty()
         || metadata.loader_version.trim().is_empty()
@@ -662,8 +648,8 @@ fn version_scan_issue(kind: VersionScanIssueKind, version_id: Option<String>) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        InstalledLoaderMetadata, VersionScanIssueKind, VersionScanState, VersionStub,
-        resolve_java_version, scan_versions, scan_versions_report,
+        INSTALLED_LOADER_METADATA_SCHEMA_VERSION, InstalledLoaderMetadata, VersionScanIssueKind,
+        VersionScanState, VersionStub, resolve_java_version, scan_versions, scan_versions_report,
     };
     use crate::launch::{Downloads, JavaVersion};
     use crate::loaders::types::{
@@ -936,7 +922,7 @@ mod tests {
         loader_version: &str,
     ) -> InstalledLoaderMetadata {
         InstalledLoaderMetadata {
-            schema_version: 1,
+            schema_version: INSTALLED_LOADER_METADATA_SCHEMA_VERSION,
             component_id,
             component_name: component_id.display_name().to_string(),
             build_id: format!(

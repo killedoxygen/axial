@@ -10,7 +10,7 @@ use super::integrity::{
     download_size_mismatch, existing_asset_object_satisfies, existing_file_satisfies, hash_file,
     observe_hash_file_calls, verify_download_integrity,
 };
-use super::libraries::{library_jobs_for, resolve_library_download, resolve_native_download};
+use super::libraries::library_jobs_for;
 use super::model::{ActualIntegrity, DownloadIntegrityError};
 use super::path_safety::{
     bounded_download_file_label, safe_download_target_label, windows_verbatim_path_string,
@@ -483,7 +483,7 @@ fn mixed_windows_native_libraries_only_download_matching_arch() {
         native_library("org.lwjgl:lwjgl:3.3.3:natives-windows"),
     ];
 
-    let jobs = library_jobs_for(mc_dir, &libraries, &env);
+    let jobs = strict_library_jobs(mc_dir, &libraries, &env);
     let names = jobs.into_iter().map(|job| job.name).collect::<Vec<_>>();
 
     assert!(
@@ -524,7 +524,15 @@ fn legacy_native_classifier_prefers_windows_generic_classifier() {
         ..Library::default()
     };
 
-    let job = resolve_native_download(&lib, Path::new("/tmp/axial-test"), "windows")
+    let env = Environment {
+        os_name: "windows".to_string(),
+        os_arch: "x86_64".to_string(),
+        os_version: String::new(),
+        features: HashMap::new(),
+    };
+    let job = strict_library_jobs(Path::new("/tmp/axial-test"), &[lib], &env)
+        .into_iter()
+        .next()
         .expect("native download");
 
     assert!(job.name.contains("natives-windows.jar"));
@@ -554,10 +562,184 @@ fn library_jobs_deduplicate_same_destination() {
         normal_library("org.example:duplicate:1.0.0"),
     ];
 
-    let jobs = library_jobs_for(mc_dir, &libraries, &env);
+    let jobs = strict_library_jobs(mc_dir, &libraries, &env);
 
     assert_eq!(jobs.len(), 1);
     assert!(jobs[0].name.contains("duplicate-1.0.0.jar"));
+}
+
+#[test]
+fn library_jobs_reject_conflicting_destination_contracts() {
+    let env = Environment {
+        os_name: "linux".to_string(),
+        os_arch: "x86_64".to_string(),
+        os_version: String::new(),
+        features: HashMap::new(),
+    };
+    let path = "org/example/conflict/1.0.0/conflict-1.0.0.jar";
+    let first = Library {
+        name: "org.example:conflict:1.0.0".to_string(),
+        downloads: Some(LibraryDownload {
+            artifact: Some(artifact(path)),
+            classifiers: HashMap::new(),
+        }),
+        ..Library::default()
+    };
+    let mut second = first.clone();
+    second
+        .downloads
+        .as_mut()
+        .and_then(|downloads| downloads.artifact.as_mut())
+        .expect("artifact")
+        .url = "https://mirror.invalid/conflict.jar".to_string();
+
+    let error = library_jobs_for(
+        Path::new("/tmp/axial-test"),
+        &[first, second],
+        &env,
+        LibraryChecksumPolicy::Strict,
+    )
+    .expect_err("conflicting plan");
+
+    assert_eq!(error, LibraryPlanError::ConflictingArtifactPath);
+}
+
+#[test]
+fn library_planning_rejects_unsafe_applicable_path() {
+    let lib = Library {
+        name: "org.example:unsafe:1.0.0".to_string(),
+        downloads: Some(LibraryDownload {
+            artifact: Some(LibraryArtifact {
+                path: "../outside.jar".to_string(),
+                url: "https://libraries.minecraft.net/outside.jar".to_string(),
+                ..LibraryArtifact::default()
+            }),
+            classifiers: HashMap::new(),
+        }),
+        ..Library::default()
+    };
+
+    let error = library_jobs_for(
+        Path::new("/tmp/axial-test"),
+        &[lib],
+        &crate::rules::default_environment(),
+        LibraryChecksumPolicy::Strict,
+    )
+    .expect_err("unsafe path");
+
+    assert_eq!(error, LibraryPlanError::InvalidArtifactPath);
+}
+
+#[test]
+fn url_less_library_is_inventory_visible_but_not_downloadable() {
+    let path = "org/example/offline/1.0.0/offline-1.0.0.jar";
+    let lib = Library {
+        name: "org.example:offline:1.0.0".to_string(),
+        downloads: Some(LibraryDownload {
+            artifact: Some(LibraryArtifact {
+                path: path.to_string(),
+                url: String::new(),
+                ..LibraryArtifact::default()
+            }),
+            classifiers: HashMap::new(),
+        }),
+        ..Library::default()
+    };
+    let env = crate::rules::default_environment();
+
+    let plans = library_artifact_plans_for(
+        std::slice::from_ref(&lib),
+        &env,
+        LibraryChecksumPolicy::Strict,
+    )
+    .expect("inventory plan");
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].relative_path.as_str(), path);
+    assert_eq!(plans[0].source_url, None);
+
+    let error = library_jobs_for(
+        Path::new("/tmp/axial-test"),
+        &[lib],
+        &env,
+        LibraryChecksumPolicy::Strict,
+    )
+    .expect_err("missing source");
+    assert_eq!(error, LibraryPlanError::MissingDownloadSource);
+}
+
+#[test]
+fn library_planning_rejects_invalid_nonempty_checksum() {
+    let mut direct = normal_library("org.example:invalid-direct-checksum:1.0.0");
+    direct.sha1 = "not-a-sha1".to_string();
+    let mut legacy = normal_library("org.example:invalid-legacy-checksum:1.0.0");
+    legacy.checksums = vec!["not-a-sha1".to_string()];
+
+    for lib in [direct, legacy] {
+        let error = library_jobs_for(
+            Path::new("/tmp/axial-test"),
+            &[lib],
+            &crate::rules::default_environment(),
+            LibraryChecksumPolicy::Strict,
+        )
+        .expect_err("invalid checksum");
+
+        assert_eq!(error, LibraryPlanError::InvalidChecksum);
+    }
+}
+
+#[test]
+fn checksumless_permission_comes_only_from_planning_policy() {
+    let lib = normal_library("org.example:checksumless:1.0.0");
+    let env = crate::rules::default_environment();
+
+    let strict = library_jobs_for(
+        Path::new("/tmp/axial-test"),
+        std::slice::from_ref(&lib),
+        &env,
+        LibraryChecksumPolicy::Strict,
+    )
+    .expect("strict plan");
+    let allowed = library_jobs_for(
+        Path::new("/tmp/axial-test"),
+        &[lib],
+        &env,
+        LibraryChecksumPolicy::AllowMissing,
+    )
+    .expect("checksumless plan");
+
+    assert!(!strict[0].allow_missing_checksum);
+    assert!(allowed[0].allow_missing_checksum);
+}
+
+#[test]
+fn native_selection_uses_supplied_environment_architecture() {
+    let mut natives = HashMap::new();
+    natives.insert("windows".to_string(), "natives-windows-${arch}".to_string());
+    let mut classifiers = HashMap::new();
+    classifiers.insert(
+        "natives-windows-arm64".to_string(),
+        artifact("org/example/native/1.0.0/native-1.0.0-arm64.jar"),
+    );
+    let lib = Library {
+        name: "org.example:native:1.0.0".to_string(),
+        downloads: Some(LibraryDownload {
+            artifact: None,
+            classifiers,
+        }),
+        natives,
+        ..Library::default()
+    };
+    let env = Environment {
+        os_name: "windows".to_string(),
+        os_arch: "arm64".to_string(),
+        os_version: String::new(),
+        features: HashMap::new(),
+    };
+
+    let jobs = strict_library_jobs(Path::new("/tmp/axial-test"), &[lib], &env);
+
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].name.ends_with("arm64.jar"));
 }
 
 #[test]
@@ -1721,7 +1903,14 @@ fn library_artifact_job_carries_expected_integrity() {
         ..Library::default()
     };
 
-    let job = resolve_library_download(&lib, Path::new("/tmp/axial-test")).expect("library job");
+    let job = strict_library_jobs(
+        Path::new("/tmp/axial-test"),
+        &[lib],
+        &crate::rules::default_environment(),
+    )
+    .into_iter()
+    .next()
+    .expect("library job");
 
     assert_eq!(job.expected, ExpectedIntegrity::from_mojang(1234, sha1));
 }
@@ -1741,11 +1930,18 @@ fn library_job_uses_legacy_checksums_when_mojang_sha1_is_missing() {
             }),
             classifiers: HashMap::new(),
         }),
-        checksums: vec!["not-a-sha1".to_string(), sha1.to_string()],
+        checksums: vec![sha1.to_string()],
         ..Library::default()
     };
 
-    let job = resolve_library_download(&lib, Path::new("/tmp/axial-test")).expect("library job");
+    let job = strict_library_jobs(
+        Path::new("/tmp/axial-test"),
+        &[lib],
+        &crate::rules::default_environment(),
+    )
+    .into_iter()
+    .next()
+    .expect("library job");
 
     assert_eq!(job.expected, ExpectedIntegrity::from_sha1(sha1));
 }
@@ -1776,8 +1972,16 @@ fn native_classifier_job_carries_expected_integrity() {
         ..Library::default()
     };
 
-    let job =
-        resolve_native_download(&lib, Path::new("/tmp/axial-test"), "windows").expect("native job");
+    let env = Environment {
+        os_name: "windows".to_string(),
+        os_arch: "x86_64".to_string(),
+        os_version: String::new(),
+        features: HashMap::new(),
+    };
+    let job = strict_library_jobs(Path::new("/tmp/axial-test"), &[lib], &env)
+        .into_iter()
+        .next()
+        .expect("native job");
 
     assert_eq!(job.expected, ExpectedIntegrity::from_mojang(4321, sha1));
 }
@@ -1790,7 +1994,14 @@ fn library_maven_fallback_job_reuses_when_metadata_missing() {
         ..Library::default()
     };
 
-    let job = resolve_library_download(&lib, Path::new("/tmp/axial-test")).expect("library job");
+    let job = strict_library_jobs(
+        Path::new("/tmp/axial-test"),
+        &[lib],
+        &crate::rules::default_environment(),
+    )
+    .into_iter()
+    .next()
+    .expect("library job");
 
     assert_eq!(job.expected, ExpectedIntegrity::default());
     assert!(!job.expected.has_evidence());
@@ -1826,6 +2037,15 @@ fn sha1_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha1::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+fn strict_library_jobs(
+    mc_dir: &Path,
+    libraries: &[Library],
+    env: &Environment,
+) -> Vec<DownloadJob> {
+    library_jobs_for(mc_dir, libraries, env, LibraryChecksumPolicy::Strict)
+        .expect("valid library plan")
 }
 
 fn native_library(name: &str) -> Library {

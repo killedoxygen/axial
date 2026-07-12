@@ -28,17 +28,17 @@ pub(super) struct AssetDownloadPipeline {
 }
 
 #[derive(Deserialize)]
-struct AssetIndex {
-    objects: HashMap<String, AssetObject>,
+pub(crate) struct AssetIndex {
+    pub(crate) objects: HashMap<String, AssetObject>,
     #[serde(flatten)]
     flags: AssetIndexFlags,
 }
 
 #[derive(Deserialize)]
-struct AssetObject {
-    hash: String,
+pub(crate) struct AssetObject {
+    pub(crate) hash: String,
     #[serde(default)]
-    size: i64,
+    pub(crate) size: i64,
 }
 
 pub(super) fn spawn_asset_download_pipeline(
@@ -245,10 +245,12 @@ pub async fn repair_virtual_assets_from_index(
 }
 
 async fn read_asset_index(asset_index_path: &Path) -> Result<AssetIndex, DownloadError> {
-    serde_json::from_str::<AssetIndex>(
-        &async_fs::read_to_string(filesystem_path(asset_index_path).as_ref()).await?,
-    )
-    .map_err(DownloadError::ParseVersion)
+    let bytes = async_fs::read(filesystem_path(asset_index_path).as_ref()).await?;
+    parse_asset_index(&bytes).map_err(DownloadError::ParseVersion)
+}
+
+pub(crate) fn parse_asset_index(bytes: &[u8]) -> Result<AssetIndex, serde_json::Error> {
+    serde_json::from_slice(bytes)
 }
 
 pub(super) async fn recv_asset_progress(

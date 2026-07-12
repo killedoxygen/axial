@@ -1,5 +1,7 @@
 use std::borrow::Cow;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use tokio::fs as async_fs;
 
 pub(super) fn bounded_download_file_label(path: &Path) -> String {
@@ -77,22 +79,6 @@ pub(super) fn bounded_provider_path_label(path: &str) -> String {
 
 pub(super) async fn path_is_file(path: &Path) -> bool {
     matches!(async_fs::metadata(filesystem_path(path).as_ref()).await, Ok(metadata) if metadata.is_file())
-}
-
-pub(super) fn resolve_path_under_root(root: &Path, relative: &str) -> Option<PathBuf> {
-    let clean = PathBuf::from(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-    if clean.as_os_str().is_empty() || clean.is_absolute() {
-        return None;
-    }
-    let joined = root.join(&clean);
-    let relative_check = joined.strip_prefix(root).ok()?;
-    if relative_check
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return None;
-    }
-    Some(joined)
 }
 
 pub(super) fn filesystem_path(path: &Path) -> Cow<'_, Path> {

@@ -934,6 +934,10 @@ fn install_failure_target_and_kind_from_download_error(
             "version_json",
             GuardianInstallArtifactFailureKind::MetadataInvalid,
         ),
+        DownloadError::LibraryPlan(_) => (
+            "library_metadata",
+            GuardianInstallArtifactFailureKind::MetadataInvalid,
+        ),
         DownloadError::PrepareRuntime(_) => (
             "java_runtime",
             GuardianInstallArtifactFailureKind::ProviderFailure,

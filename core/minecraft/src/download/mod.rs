@@ -12,6 +12,7 @@ mod runtime;
 mod transfer;
 mod transfer_failure;
 
+pub(crate) use assets::parse_asset_index;
 pub use assets::{
     asset_object_hash_prefix, repair_virtual_assets_from_index, virtual_asset_destination,
 };
@@ -22,14 +23,16 @@ pub use integrity::{
     verify_existing_launcher_managed_artifact_allowing_missing_checksum,
 };
 pub use libraries::{
-    DownloadJob, download_libraries,
+    DownloadJob, LibraryChecksumPolicy, download_libraries,
     download_libraries_allowing_missing_checksums_with_facts_and_descriptors,
     download_libraries_with_facts_and_descriptors, library_jobs_for,
 };
+pub(crate) use libraries::{LibraryArtifactPlan, library_artifact_plans_for};
 pub use model::{
     DownloadError, DownloadProgress, ExecutionDownloadError, ExecutionDownloadFact,
     ExecutionDownloadFactKind, ExecutionDownloadOwnership, ExecutionDownloadReport,
-    ExpectedIntegrity, SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind,
+    ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactDescriptor,
+    SelectedDownloadArtifactKind,
 };
 pub use transfer::download_file_with_client_report;
 #[cfg(test)]

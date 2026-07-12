@@ -43,6 +43,20 @@ pub enum DownloadError {
     RuntimeRosettaRequired { component: String },
     #[error("download integrity: {0}")]
     Integrity(String),
+    #[error(transparent)]
+    LibraryPlan(#[from] LibraryPlanError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum LibraryPlanError {
+    #[error("library metadata contains an unsafe artifact path")]
+    InvalidArtifactPath,
+    #[error("library metadata contains an invalid checksum")]
+    InvalidChecksum,
+    #[error("library artifact has no download source")]
+    MissingDownloadSource,
+    #[error("library artifacts have conflicting contracts for the same path")]
+    ConflictingArtifactPath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

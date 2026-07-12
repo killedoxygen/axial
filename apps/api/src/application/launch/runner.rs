@@ -3205,12 +3205,10 @@ exit 1
                 "arguments": { "jvm": [], "game": [] },
                 "libraries": [
                     {
-                        "name": "net.fabricmc:fabric-loader:0.16.10",
-                        "axialChecksumlessAllowed": true
+                        "name": "net.fabricmc:fabric-loader:0.16.10"
                     },
                     {
-                        "name": "net.fabricmc:intermediary:1.21.1",
-                        "axialChecksumlessAllowed": true
+                        "name": "net.fabricmc:intermediary:1.21.1"
                     }
                 ]
             }))
@@ -3225,7 +3223,8 @@ exit 1
                 "component_name": "Fabric",
                 "build_id": "fabric:1.21.1:0.16.10",
                 "minecraft_version": "1.21.1",
-                "loader_version": "0.16.10"
+                "loader_version": "0.16.10",
+                "build_meta": {}
             }))
             .expect("encode Fabric crash fixture metadata"),
         )

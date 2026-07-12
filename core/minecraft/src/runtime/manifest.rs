@@ -1,12 +1,12 @@
 use super::model::JavaRuntimeLookupError;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
 pub(super) const RUNTIME_MANIFEST_URL: &str = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 pub(super) const MAX_RUNTIME_MANIFEST_BYTES: u64 = 16 << 20;
-pub(super) const COMPONENT_MANIFEST_PROOF_FILE: &str = ".axial-runtime-manifest.json";
+pub(crate) const COMPONENT_MANIFEST_PROOF_FILE: &str = ".axial-runtime-manifest.json";
 const RUNTIME_MANIFEST_CONNECT_TIMEOUT_SECS: u64 = 10;
 const RUNTIME_MANIFEST_READ_TIMEOUT_SECS: u64 = 30;
 
@@ -76,36 +76,53 @@ pub(super) struct RuntimeDownloadManifest {
 pub(super) type RuntimeManifest = HashMap<String, HashMap<String, Vec<RuntimeManifestEntry>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct ComponentManifest {
-    pub(super) files: HashMap<String, ComponentManifestFile>,
+pub(crate) struct ComponentManifest {
+    pub(crate) files: HashMap<String, ComponentManifestFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct ComponentManifestFile {
+pub(crate) struct ComponentManifestFile {
     #[serde(rename = "type")]
-    pub(super) kind: String,
+    pub(crate) kind: String,
     #[cfg_attr(not(unix), allow(dead_code))]
     #[serde(default)]
-    pub(super) executable: bool,
+    pub(crate) executable: bool,
     #[serde(default)]
-    pub(super) downloads: Option<ComponentManifestDownloads>,
+    pub(crate) downloads: Option<ComponentManifestDownloads>,
     #[serde(default)]
-    pub(super) target: Option<String>,
+    pub(crate) target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct ComponentManifestDownloads {
+pub(crate) struct ComponentManifestDownloads {
     #[serde(default)]
-    pub(super) raw: Option<ComponentManifestDownload>,
+    pub(crate) raw: Option<ComponentManifestDownload>,
     #[serde(default)]
-    pub(super) lzma: Option<ComponentManifestDownload>,
+    pub(crate) lzma: Option<ComponentManifestDownload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct ComponentManifestDownload {
-    pub(super) url: String,
+pub(crate) struct ComponentManifestDownload {
+    pub(crate) url: String,
     #[serde(default)]
-    pub(super) sha1: Option<String>,
+    pub(crate) sha1: Option<String>,
     #[serde(default)]
-    pub(super) size: Option<u64>,
+    pub(crate) size: Option<u64>,
+}
+
+pub(crate) fn component_manifest_proof_bytes(
+    manifest: &ComponentManifest,
+) -> Result<Vec<u8>, serde_json::Error> {
+    #[derive(Serialize)]
+    struct CanonicalManifest<'a> {
+        files: BTreeMap<&'a str, &'a ComponentManifestFile>,
+    }
+
+    serde_json::to_vec_pretty(&CanonicalManifest {
+        files: manifest
+            .files
+            .iter()
+            .map(|(path, file)| (path.as_str(), file))
+            .collect(),
+    })
 }

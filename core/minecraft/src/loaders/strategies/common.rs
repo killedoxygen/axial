@@ -2,7 +2,7 @@
 use crate::download::download_libraries_with_facts_and_descriptors;
 use crate::download::{
     DownloadError, DownloadProgress, Downloader, ExecutionDownloadError, ExecutionDownloadReport,
-    LauncherManagedArtifactReadiness,
+    LauncherManagedArtifactReadiness, LibraryChecksumPolicy,
     download_libraries_allowing_missing_checksums_with_facts_and_descriptors, library_jobs_for,
     verify_existing_launcher_managed_artifact, write_launcher_managed_artifact_bytes_to_temp,
 };
@@ -17,10 +17,11 @@ use crate::loaders::forge_installer::{
 use crate::loaders::http::fetch_bytes;
 use crate::loaders::processors::run_processors;
 use crate::loaders::types::{LoaderBuildRecord, LoaderError, LoaderInstallPlan};
-use crate::loaders::{validate_provider_version_id, validate_version_id};
+use crate::loaders::{
+    installed_loader_metadata_bytes, validate_provider_version_id, validate_version_id,
+};
 use crate::paths::{loader_artifacts_dir, versions_dir};
 use crate::profiles::ensure_launcher_profiles;
-use serde::Serialize;
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -41,17 +42,6 @@ const LOADER_METADATA_FILE: &str = ".axial-loader.json";
 struct CachedProfile {
     bytes: Vec<u8>,
     fragment: LoaderProfileFragment,
-}
-
-#[derive(Debug, Serialize)]
-struct InstalledLoaderMetadata<'a> {
-    schema_version: u32,
-    component_id: crate::loaders::types::LoaderComponentId,
-    component_name: &'a str,
-    build_id: &'a str,
-    minecraft_version: &'a str,
-    loader_version: &'a str,
-    build_meta: &'a crate::loaders::types::LoaderBuildMetadata,
 }
 
 // Profile-source loaders ship a ready version JSON and then download its libraries.
@@ -78,8 +68,7 @@ where
     )
     .await?;
     let profile_bytes = cached_profile.bytes;
-    let mut fragment = cached_profile.fragment;
-    mark_loader_libraries_checksumless_allowed(&mut fragment.libraries);
+    let fragment = cached_profile.fragment;
     if !fragment.id.trim().is_empty() {
         validate_provider_version_id(&fragment.id, "upstream loader profile version id")?;
     }
@@ -182,10 +171,8 @@ where
             plan.record.component_name
         )),
     ));
-    let (installer_data, mut extracted) =
+    let (installer_data, extracted) =
         read_valid_installer(&installer_path, installer_url, &plan.record.component_name).await?;
-    mark_loader_libraries_checksumless_allowed(&mut extracted.version_fragment.libraries);
-    mark_loader_libraries_checksumless_allowed(&mut extracted.libraries);
 
     send(progress(
         "profile",
@@ -490,11 +477,15 @@ async fn is_base_game_installed(library_dir: &Path, game_version: &str) -> bool 
     let Ok(version) = resolve_version(library_dir, game_version) else {
         return false;
     };
-    for job in library_jobs_for(
+    let Ok(jobs) = library_jobs_for(
         library_dir,
         &version.libraries,
         &crate::rules::default_environment(),
-    ) {
+        LibraryChecksumPolicy::Strict,
+    ) else {
+        return false;
+    };
+    for job in jobs {
         if verify_existing_launcher_managed_artifact_on_blocking_thread(job.path, job.expected)
             .await
             != LauncherManagedArtifactReadiness::Verified
@@ -512,12 +503,6 @@ async fn verify_existing_launcher_managed_artifact_on_blocking_thread(
     tokio::task::spawn_blocking(move || verify_existing_launcher_managed_artifact(&path, &expected))
         .await
         .unwrap_or(LauncherManagedArtifactReadiness::Corrupt)
-}
-
-fn mark_loader_libraries_checksumless_allowed(libraries: &mut [crate::launch::Library]) {
-    for library in libraries {
-        library.axial_checksumless_allowed = true;
-    }
 }
 
 #[cfg(test)]
@@ -600,19 +585,11 @@ async fn write_installed_loader_metadata(
     record: &LoaderBuildRecord,
 ) -> Result<(), LoaderError> {
     validate_version_id(version_id, "installed loader version id")?;
-    let metadata = InstalledLoaderMetadata {
-        schema_version: 1,
-        component_id: record.component_id,
-        component_name: &record.component_name,
-        build_id: &record.build_id,
-        minecraft_version: &record.minecraft_version,
-        loader_version: &record.loader_version,
-        build_meta: &record.build_meta,
-    };
+    let metadata = installed_loader_metadata_bytes(record)?;
     let path = versions_dir(library_dir)
         .join(version_id)
         .join(LOADER_METADATA_FILE);
-    async_fs::write(path, serde_json::to_vec_pretty(&metadata)?).await?;
+    async_fs::write(path, metadata).await?;
     Ok(())
 }
 
@@ -1857,7 +1834,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_source_marks_checksumless_libraries_in_composed_version() {
+    async fn profile_source_does_not_persist_checksumless_authority() {
         let root = temp_dir("profile-marks-checksumless-libraries");
         write_base_version(&root, "1.21.5");
         let library_body = zip_entries(&[("org/quiltmc/loader/impl/QuiltLoader.class", b"loader")]);
@@ -1897,7 +1874,7 @@ mod tests {
         let libraries = version["libraries"].as_array().expect("libraries");
         assert!(libraries.iter().any(|library| {
             library["name"] == "org.quiltmc:quilt-loader:0.29.2"
-                && library["axialChecksumlessAllowed"] == true
+                && library.get("axialChecksumlessAllowed").is_none()
         }));
 
         server.stop();
@@ -2003,7 +1980,7 @@ mod tests {
         let libraries = version["libraries"].as_array().expect("libraries");
         assert!(libraries.iter().any(|library| {
             library["name"] == "net.minecraftforge:forge:1.7.10-10.13.4.1614-1.7.10"
-                && library["axialChecksumlessAllowed"] == true
+                && library.get("axialChecksumlessAllowed").is_none()
         }));
 
         server.stop();

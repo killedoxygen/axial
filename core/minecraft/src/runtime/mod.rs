@@ -44,19 +44,24 @@ use file_download::{
     runtime_file_download_concurrency_for, runtime_windows_verbatim_path_string,
     verify_runtime_download,
 };
+pub(crate) use install::plan_runtime_manifest_files;
 #[cfg(test)]
 use install::{
     install_managed_runtime_from_manifest_url, install_runtime_manifest_file,
-    install_runtime_manifest_files, plan_runtime_manifest_files, remove_runtime_install_path,
-    remove_runtime_install_path_async, select_runtime_manifest_url,
+    install_runtime_manifest_files, remove_runtime_install_path, remove_runtime_install_path_async,
+    select_runtime_manifest_url,
 };
 #[cfg(test)]
 use layout::{java_executable, java_executable_for_os, runtime_os_arch_for};
-#[cfg(test)]
-use manifest::{
-    ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
-    ComponentManifestFile, MAX_RUNTIME_MANIFEST_BYTES, RuntimeManifest, fetch_runtime_json,
+pub(crate) use manifest::{
+    COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, component_manifest_proof_bytes,
 };
+#[cfg(test)]
+pub(crate) use manifest::{
+    ComponentManifestDownload, ComponentManifestDownloads, ComponentManifestFile,
+};
+#[cfg(test)]
+use manifest::{MAX_RUNTIME_MANIFEST_BYTES, RuntimeManifest, fetch_runtime_json};
 #[cfg(test)]
 use probe::detect_distribution;
 #[cfg(test)]
