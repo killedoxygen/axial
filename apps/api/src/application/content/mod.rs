@@ -345,6 +345,20 @@ pub async fn instance_content(
     Ok(InstanceContentResponse { entries })
 }
 
+/// Project titles for a batch of ids. Best-effort: a failure costs a nicer label,
+/// not the operation. Callers need this because a hash lookup and a version
+/// record both name the *version* ("Sodium 0.7.3 for Fabric 1.21.8"), never the
+/// project, and the project is what a person calls the thing.
+pub(super) async fn project_titles(
+    state: &AppState,
+    ids: &[CanonicalId],
+) -> HashMap<CanonicalId, String> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    state.content().titles(ids).await.unwrap_or_default()
+}
+
 /// Hash whatever is sitting in the content directories that we did not put there,
 /// ask the provider what it is, and adopt what it recognizes. This is how an
 /// instance that predates Discover gains provenance. Every managed kind is
@@ -381,9 +395,19 @@ async fn retrofit_unmanaged(
         return false;
     };
 
+    let ids: Vec<CanonicalId> = identified
+        .values()
+        .map(|identity| CanonicalId::for_project(identity.provider, &identity.project_id))
+        .collect();
+    let titles = project_titles(state, &ids).await;
+
     let mut changed = false;
-    for (hash, identity) in identified {
+    for (hash, mut identity) in identified {
         if let Some(file) = by_hash.get(&hash) {
+            let id = CanonicalId::for_project(identity.provider, &identity.project_id);
+            if let Some(title) = titles.get(&id) {
+                identity.title = Some(title.clone());
+            }
             manifest.upsert(ManifestEntry::imported(
                 file.kind,
                 file.filename.clone(),

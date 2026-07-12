@@ -34,6 +34,9 @@ const InstanceDetailRoute = createRouteLoader<{ id: string }>(
 const InstancesRoute = createRouteLoader(async () => (await import('./views/instances/InstancesView')).InstancesView);
 
 const DiscoverRoute = createRouteLoader(async () => (await import('./views/discover/DiscoverView')).DiscoverView);
+const ContentDetailRoute = createRouteLoader(
+  async () => (await import('./views/discover/ContentDetailView')).ContentDetailView,
+);
 
 const CreateOverlay = createRouteLoader(async () => (await import('./views/create/CreateView')).CreateView);
 
@@ -144,7 +147,7 @@ function LazyAccountSwitcherHost(): JSX.Element | null {
 
 function CurrentView(): JSX.Element {
   const r = route.value;
-  const routeKey = r.name === 'instance' ? `instance:${r.id}` : r.name;
+  const routeKey = r.name === 'instance' || r.name === 'content' ? `${r.name}:${r.id}` : r.name;
   useEffect(() => {
     resetViewScroll();
   }, [routeKey]);
@@ -157,6 +160,8 @@ function CurrentView(): JSX.Element {
       return <InstanceDetailRoute id={r.id} />;
     case 'discover':
       return <DiscoverRoute />;
+    case 'content':
+      return <ContentDetailRoute />;
     case 'dev-lab':
       return <DevLabRoute />;
     case 'downloads':

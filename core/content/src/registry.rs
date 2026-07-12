@@ -58,6 +58,11 @@ impl ContentRegistry {
         self.modrinth.identify(sha512_hashes).await
     }
 
+    /// Project titles for a batch of ids, in one round trip.
+    pub async fn titles(&self, ids: &[CanonicalId]) -> ContentResult<HashMap<CanonicalId, String>> {
+        self.modrinth.titles(ids).await
+    }
+
     fn provider_for(&self, id: &CanonicalId) -> ContentResult<&ModrinthProvider> {
         match provider_of(id) {
             Some(ProviderId::Modrinth) => Ok(&self.modrinth),

@@ -6,13 +6,18 @@ import type { UpdateFlowState, UpdateInfo } from '../types-update';
 import type { Version } from '../types-version';
 import type {
   CanonicalContent,
+  ContentCompatResponse,
   ContentDetail,
   ContentKind,
   ContentPage,
   ContentSelection,
   InstanceContentEntry,
   InstanceContentResponse,
+  ModpackInstallResponse,
+  ModpackTarget,
   ResolutionPlan,
+  SearchHit,
+  TargetRef,
 } from '../types-content';
 
 type Handler = (body?: unknown, path?: string, request?: MockRequest) => unknown | Promise<unknown>;
@@ -332,9 +337,11 @@ function mockCatalogItem(canonicalId: string): CanonicalContent | undefined {
 function mockContentSearch(request: MockRequest | undefined): ContentPage {
   const kind = (request?.searchParams.get('kind') as ContentKind | null) ?? 'mod';
   const query = (request?.searchParams.get('query') ?? '').toLowerCase();
-  const items = (mockContentCatalog[kind] ?? []).filter(
-    (item) => !query || item.title.toLowerCase().includes(query) || item.summary.toLowerCase().includes(query),
-  );
+  const instanceId = request?.searchParams.get('instance_id') ?? '';
+  const installed = new Set((mockInstanceContent[instanceId] ?? []).map((entry) => entry.canonical_id));
+  const items: SearchHit[] = (mockContentCatalog[kind] ?? [])
+    .filter((item) => !query || item.title.toLowerCase().includes(query) || item.summary.toLowerCase().includes(query))
+    .map((item) => (installed.has(item.canonical_id) ? { ...item, install_state: 'installed' as const } : item));
   return { items, offset: 0, limit: items.length, total: items.length };
 }
 
@@ -372,8 +379,8 @@ function mockContentDetail(request: MockRequest | undefined): ContentDetail {
   };
 }
 
-function mockResolvePlan(instanceId: string, selections: ContentSelection[]): ResolutionPlan {
-  const installed = mockInstanceContent[instanceId] ?? [];
+function mockResolvePlan(instanceId: string | undefined, selections: ContentSelection[]): ResolutionPlan {
+  const installed = instanceId ? (mockInstanceContent[instanceId] ?? []) : [];
   const seen = new Set<string>();
   const queue = [...selections.map((selection) => ({ id: selection.canonical_id, dependency: false }))];
   for (const selection of selections) {
@@ -414,6 +421,76 @@ function mockResolvePlan(instanceId: string, selections: ContentSelection[]): Re
     items,
     conflicts: [],
     total_download_bytes: totalBytes,
+  };
+}
+
+function mockContentCompatibility(selections: ContentSelection[]): ContentCompatResponse {
+  if (selections.length === 0) return { candidates: [] };
+  const total = selections.length;
+  return {
+    candidates: [
+      {
+        loader: 'fabric',
+        loader_label: 'Fabric',
+        game_version: '1.21.6',
+        selection_id: 'loader_version|fabric|1.21.6',
+        summary: total === 1 ? 'Works here' : `All ${total} work here`,
+        supported_count: total,
+        total_count: total,
+        complete: true,
+        drops: [],
+      },
+      {
+        loader: 'fabric',
+        loader_label: 'Fabric',
+        game_version: '1.21.4',
+        selection_id: 'loader_version|fabric|1.21.4',
+        summary: `${Math.max(1, total - 1)} of ${total} work here`,
+        supported_count: Math.max(1, total - 1),
+        total_count: total,
+        complete: total === 1,
+        drops:
+          total > 1
+            ? [
+                {
+                  canonical_id: selections[total - 1].canonical_id,
+                  title: mockCatalogItem(selections[total - 1].canonical_id)?.title ?? 'an item',
+                },
+              ]
+            : [],
+      },
+    ],
+  };
+}
+
+function mockModpackTarget(canonicalId: string): ModpackTarget {
+  const item = mockCatalogItem(canonicalId);
+  if (!item) throw apiError(404, 'Not Found', { error: 'content not found' });
+  return {
+    canonical_id: canonicalId,
+    version_id: `${item.project_id}-v1`,
+    name: item.title,
+    minecraft: '1.21.6',
+    loader: 'fabric',
+    loader_label: 'Fabric',
+    selection_id: 'loader_version|fabric|1.21.6',
+  };
+}
+
+function mockModpackInstall(body: unknown): ModpackInstallResponse {
+  if (!isRecord(body) || typeof body.instance_id !== 'string' || typeof body.canonical_id !== 'string') {
+    throw apiError(400, 'Bad Request', { error: 'invalid modpack install request' });
+  }
+  const item = mockCatalogItem(body.canonical_id);
+  return {
+    instance_id: body.instance_id,
+    name: item?.title ?? 'Modpack',
+    version: '1.0.0',
+    minecraft: '1.21.6',
+    loader: 'fabric',
+    file_count: 42,
+    overrides_applied: 25,
+    identified_count: 40,
   };
 }
 
@@ -542,12 +619,22 @@ const handlers: Record<string, Handler> = {
   'GET /content/search': (_body, _path, request) => mockContentSearch(request),
   'GET /content/item': (_body, _path, request) => mockContentDetail(request),
   'POST /content/plan': (body) => {
-    if (!isRecord(body) || typeof body.instance_id !== 'string' || !Array.isArray(body.selections)) {
+    if (!isRecord(body) || !isRecord(body.target) || !Array.isArray(body.selections)) {
       throw apiError(400, 'Bad Request', { error: 'invalid plan request' });
     }
-    return mockResolvePlan(body.instance_id, body.selections as ContentSelection[]);
+    const target = body.target as TargetRef;
+    const instanceId = target.kind === 'instance' ? target.instance_id : undefined;
+    return mockResolvePlan(instanceId, body.selections as ContentSelection[]);
   },
   'POST /content/install': (body) => mockContentInstall(body),
+  'POST /content/compatibility': (body) => {
+    if (!isRecord(body) || !Array.isArray(body.selections)) {
+      throw apiError(400, 'Bad Request', { error: 'invalid compatibility request' });
+    }
+    return mockContentCompatibility(body.selections as ContentSelection[]);
+  },
+  'GET /content/modpack/target': (_body, _path, request) => mockModpackTarget(request?.searchParams.get('id') ?? ''),
+  'POST /content/modpack/install': (body) => mockModpackInstall(body),
   'GET /instances/{id}/content': (_body, path) => mockInstanceContentList(instanceIdFromContentPath(path)),
   'DELETE /instances/{id}/content': (_body, path, request) =>
     mockContentUninstall(instanceIdFromContentPath(path), request?.searchParams.get('id') ?? ''),

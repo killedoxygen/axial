@@ -161,13 +161,21 @@ pub async fn modpack_install(
         )
     })?;
 
+    let pack_title = detail.content.title.clone();
     let archive = download_archive(state, &game_dir, &archive_file).await?;
     let install = install_pack(state.content().client(), &game_dir, &archive, |_| {}).await;
     let _ = std::fs::remove_file(&archive);
     let report = install.map_err(content_error_response)?;
 
-    let identified =
-        record_pack_provenance(state, &game_dir, &report.installed, &id, version).await?;
+    let identified = record_pack_provenance(
+        state,
+        &game_dir,
+        &report.installed,
+        &id,
+        &pack_title,
+        version,
+    )
+    .await?;
 
     let mismatch = mismatch_notice(
         &target.loader,
@@ -232,6 +240,7 @@ async fn record_pack_provenance(
     game_dir: &Path,
     installed: &[axial_content::PackFile],
     pack_id: &CanonicalId,
+    pack_title: &str,
     version: &axial_content::ContentVersion,
 ) -> Result<usize, ContentApiError> {
     let mut manifest = ContentManifest::load(game_dir).map_err(content_error_response)?;
@@ -252,7 +261,7 @@ async fn record_pack_provenance(
         enabled: true,
         source: EntrySource::Managed,
         installed_at: chrono::Utc::now().to_rfc3339(),
-        title: Some(version.name.clone()),
+        title: Some(pack_title.to_string()),
     });
 
     let by_hash: HashMap<String, &axial_content::PackFile> = installed
@@ -265,13 +274,22 @@ async fn record_pack_provenance(
     if !by_hash.is_empty() {
         let hashes: Vec<String> = by_hash.keys().cloned().collect();
         if let Ok(resolved) = state.content().identify(&hashes).await {
+            let ids: Vec<CanonicalId> = resolved
+                .values()
+                .map(|identity| CanonicalId::for_project(identity.provider, &identity.project_id))
+                .collect();
+            let titles = super::project_titles(state, &ids).await;
+
             for (hash, identity) in resolved {
                 let Some(file) = by_hash.get(&hash) else {
                     continue;
                 };
                 let Some(kind) = file.kind() else { continue };
+                let canonical_id =
+                    CanonicalId::for_project(identity.provider, &identity.project_id);
+                let title = titles.get(&canonical_id).cloned().or(identity.title);
                 manifest.upsert(ManifestEntry {
-                    canonical_id: CanonicalId::for_project(identity.provider, &identity.project_id),
+                    canonical_id,
                     provider: identity.provider,
                     project_id: identity.project_id,
                     version_id: identity.version_id,
@@ -284,7 +302,7 @@ async fn record_pack_provenance(
                     enabled: true,
                     source: EntrySource::Managed,
                     installed_at: chrono::Utc::now().to_rfc3339(),
-                    title: identity.title,
+                    title,
                 });
                 identified += 1;
             }

@@ -5,6 +5,7 @@ import { Button, Input } from '../../../ui/Atoms';
 import { openContextMenu } from '../../../ui/ContextMenu';
 import { SelectionActionPill, SelectionCheckbox } from '../../../ui/SelectionActionPill';
 import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../../ui/selection';
+import { navigate } from '../../../ui-state';
 import type { EnrichedInstance, InstanceMod } from '../../../types-instance';
 import { fmtBytes } from '../format';
 import type { ResourceLoadState } from '../resources';
@@ -74,8 +75,16 @@ export function ModsPane({
           <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>
             Refresh
           </Button>
-          <Button variant="soft" size="sm" icon="plus" onClick={() => void openInstanceFolder(inst.id, 'mods')}>
-            Add mod
+          <Button variant="soft" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'mods')}>
+            Open folder
+          </Button>
+          <Button
+            variant="soft"
+            size="sm"
+            icon="compass"
+            onClick={() => navigate({ name: 'discover', target: inst.id })}
+          >
+            Add content
           </Button>
         </div>
       </div>
@@ -94,7 +103,19 @@ export function ModsPane({
         {resources.status !== 'loading' && filteredMods.length === 0 ? (
           <div class="cp-mods-empty-row">
             <strong>{mods.length === 0 ? 'No mods installed in this instance' : 'No mods match this filter'}</strong>
-            Drop jar files into the mods folder. In-app mod browsing and metadata are still backend-team work.
+            {mods.length === 0 ? (
+              <>
+                Browse Discover to add mods that fit {inst.version_display.summary_label}, or drop jar files straight
+                into the mods folder.
+                <div class="cp-mods-empty-actions">
+                  <Button size="sm" icon="compass" onClick={() => navigate({ name: 'discover', target: inst.id })}>
+                    Browse Discover
+                  </Button>
+                </div>
+              </>
+            ) : (
+              'Try a different filter.'
+            )}
           </div>
         ) : (
           filteredMods.map((mod) => (

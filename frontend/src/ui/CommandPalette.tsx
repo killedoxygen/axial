@@ -46,6 +46,13 @@ function buildCommands(): Command[] {
     { id: 'jump:home', group: 'jump', icon: 'home', label: 'Home', perform: goto({ name: 'home' }) },
     { id: 'jump:instances', group: 'jump', icon: 'stack', label: 'Instances', perform: goto({ name: 'instances' }) },
     {
+      id: 'jump:discover',
+      group: 'jump',
+      icon: 'compass',
+      label: 'Discover mods and packs',
+      perform: goto({ name: 'discover' }),
+    },
+    {
       id: 'jump:create',
       group: 'jump',
       icon: 'plus',

@@ -84,17 +84,20 @@ pub struct InstanceVersionDisplay {
 }
 
 impl InstanceVersionDisplay {
-    /// The installed version entry is the source of truth; while it is still
-    /// downloading there is none, so the loader and Minecraft version the
-    /// instance was created with stand in for it.
+    /// What the instance is, as opposed to what has finished downloading.
+    ///
+    /// The installed version entry is the better witness for anything on disk
+    /// (the exact loader build, its display tags). But it is a scan artifact: it
+    /// is absent before the download starts and can be missing its loader
+    /// attachment while one is in flight. The loader and Minecraft version
+    /// recorded at creation are immutable and always true, so they fill any gap
+    /// the entry leaves — otherwise a brand new modded instance briefly claims to
+    /// be vanilla, and content installed into it during that window is refused.
     fn from_version(version: Option<&VersionEntry>, declared: &Instance) -> Self {
-        // An installed entry is authoritative even when it carries no loader: it
-        // means the instance really is vanilla. The declaration only stands in
-        // while there is no entry at all.
-        let loader = match version {
-            Some(entry) => entry.loader.as_ref().map(|loader| loader.component_id),
-            None => LoaderComponentId::parse(declared.loader_key.trim()),
-        };
+        let loader = version
+            .and_then(|entry| entry.loader.as_ref())
+            .map(|loader| loader.component_id)
+            .or_else(|| LoaderComponentId::parse(declared.loader_key.trim()));
         let loader_key = loader
             .map(|id| id.short_key().to_string())
             .unwrap_or_else(|| "vanilla".to_string());
@@ -1082,18 +1085,53 @@ mod tests {
         assert!(!enriched.version_display.supports_mods);
     }
 
+    /// A version entry that exists but has not had its loader attached yet is a
+    /// half-scanned install, not a vanilla instance. Reading it as vanilla made a
+    /// freshly created modded instance refuse mods for as long as its download
+    /// took.
     #[test]
-    fn installed_version_entry_outranks_the_declared_loader() {
-        let mut instance = stored_instance("stale-declaration");
-        instance.loader_key = "forge".to_string();
-        instance.minecraft_version = "1.16.5".to_string();
-        let version = version_entry("1.21.1");
+    fn a_half_installed_version_does_not_make_a_modded_instance_look_vanilla() {
+        let mut instance = stored_instance("mid-install");
+        instance.version_id = "fabric-loader-0.19.3-1.21.6".to_string();
+        instance.loader_key = "fabric".to_string();
+        instance.minecraft_version = "1.21.6".to_string();
+        let mut version = version_entry(&instance.version_id);
+        version.loader = None;
 
         let enriched =
             EnrichedInstance::from_instance_without_resource_counts(instance, Some(&version));
 
-        assert_eq!(enriched.version_display.loader_key, "vanilla");
-        assert_eq!(enriched.version_display.minecraft_label, "1.21.1");
+        assert_eq!(enriched.version_display.loader_key, "fabric");
+        assert!(enriched.version_display.supports_mods);
+    }
+
+    /// The installed entry still wins where it actually knows more: the exact
+    /// loader build behind the instance.
+    #[test]
+    fn the_installed_entry_supplies_the_loader_build_detail() {
+        let mut instance = stored_instance("settled");
+        instance.version_id = "quilt-loader-0.30.0-1.21.1".to_string();
+        instance.loader_key = "quilt".to_string();
+        instance.minecraft_version = "1.21.1".to_string();
+        let mut version = version_entry(&instance.version_id);
+        version.inherits_from = "1.21.1".to_string();
+        version.loader = Some(VersionLoaderAttachment {
+            component_id: LoaderComponentId::Quilt,
+            component_name: "Quilt".to_string(),
+            build_id: "org.quiltmc.quilt-loader:1.21.1:0.30.0".to_string(),
+            loader_version: "0.30.0".to_string(),
+            build_meta: LoaderBuildMetadata::default(),
+        });
+
+        let enriched =
+            EnrichedInstance::from_instance_without_resource_counts(instance, Some(&version));
+
+        assert_eq!(enriched.version_display.loader_key, "quilt");
+        assert_eq!(enriched.version_display.loader_version_label, "0.30.0");
+        assert_eq!(
+            enriched.version_display.loader_detail_label,
+            "Quilt · 0.30.0"
+        );
     }
 
     #[test]

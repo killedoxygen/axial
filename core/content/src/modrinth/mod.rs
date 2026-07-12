@@ -133,6 +133,31 @@ impl ContentProvider for ModrinthProvider {
         Ok(versions.into_iter().map(map_version).collect())
     }
 
+    async fn titles(&self, ids: &[CanonicalId]) -> ContentResult<HashMap<CanonicalId, String>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let project_ids: Vec<String> = ids.iter().filter_map(|id| project_id_of(id).ok()).collect();
+        if project_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let projects: Vec<dto::Project> = self
+            .get_json(
+                &self.endpoint("/projects"),
+                &[("ids", json_string_array(&project_ids))],
+            )
+            .await?;
+        Ok(projects
+            .into_iter()
+            .map(|project| {
+                (
+                    CanonicalId::for_project(ProviderId::Modrinth, &project.id),
+                    project.title,
+                )
+            })
+            .collect())
+    }
+
     async fn identify(
         &self,
         sha512_hashes: &[String],

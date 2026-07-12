@@ -69,8 +69,14 @@ export interface ContentDetail extends CanonicalContent {
   versions: ContentVersion[];
 }
 
+export type InstallState = 'installed';
+
+export interface SearchHit extends CanonicalContent {
+  install_state?: InstallState;
+}
+
 export interface ContentPage {
-  items: CanonicalContent[];
+  items: SearchHit[];
   offset: number;
   limit: number;
   total: number;
@@ -107,12 +113,60 @@ export interface PlanConflict {
 }
 
 export interface ResolutionPlan {
-  instance_id: string;
+  instance_id?: string;
   loader: string;
   game_version: string;
   items: PlanItem[];
   conflicts: PlanConflict[];
   total_download_bytes: number;
+}
+
+/** Where content is headed: an instance that exists, or one about to be created. */
+export type TargetRef =
+  | { kind: 'instance'; instance_id: string }
+  | { kind: 'draft'; loader?: string; game_version: string };
+
+export interface CompatDrop {
+  canonical_id: string;
+  title: string;
+}
+
+export interface CompatCandidate {
+  loader: string;
+  loader_label: string;
+  game_version: string;
+  selection_id: string;
+  summary: string;
+  supported_count: number;
+  total_count: number;
+  complete: boolean;
+  drops: CompatDrop[];
+}
+
+export interface ContentCompatResponse {
+  candidates: CompatCandidate[];
+}
+
+export interface ModpackTarget {
+  canonical_id: string;
+  version_id: string;
+  name: string;
+  minecraft: string;
+  loader?: string;
+  loader_label: string;
+  selection_id: string;
+}
+
+export interface ModpackInstallResponse {
+  instance_id: string;
+  name: string;
+  version: string;
+  minecraft: string;
+  loader?: string;
+  file_count: number;
+  overrides_applied: number;
+  identified_count: number;
+  mismatch?: string;
 }
 
 export type EntrySource = 'managed' | 'imported';

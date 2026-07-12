@@ -1,10 +1,17 @@
 import { signal } from '@preact/signals';
 
+/**
+ * `discover` and `content` carry an optional `target`: the instance every action
+ * on the page goes to. Search text and filters deliberately stay out of the
+ * route — they live in discover state, so typing does not spam history and
+ * leaving a content page and coming back keeps your results.
+ */
 export type Route =
   | { name: 'home' }
   | { name: 'instances' }
   | { name: 'instance'; id: string }
-  | { name: 'discover' }
+  | { name: 'discover'; target?: string }
+  | { name: 'content'; id: string; target?: string }
   | { name: 'dev-lab' }
   | { name: 'downloads' }
   | { name: 'accounts' }
@@ -56,15 +63,20 @@ export function goForward(): void {
 function isRoute(value: unknown): value is Route {
   if (!value || typeof value !== 'object') return false;
   const candidate = value as Partial<Route>;
+  const target = (candidate as { target?: unknown }).target;
+  const targetOk = target === undefined || typeof target === 'string';
   switch (candidate.name) {
     case 'home':
     case 'instances':
-    case 'discover':
     case 'dev-lab':
     case 'downloads':
     case 'accounts':
     case 'settings':
       return true;
+    case 'discover':
+      return targetOk;
+    case 'content':
+      return typeof (candidate as { id?: unknown }).id === 'string' && targetOk;
     case 'instance':
       return typeof (candidate as { id?: unknown }).id === 'string';
     default:

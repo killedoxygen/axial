@@ -23,8 +23,31 @@ function crumbsFor(): { label: string; onClick?: () => void }[] {
       return [{ label: 'Home' }];
     case 'instances':
       return [{ label: 'Instances' }];
-    case 'discover':
-      return [{ label: 'Discover' }];
+    // A targeted Discover shows the instance it is adding to, so the trail says
+    // where the content is headed, not just where you are.
+    case 'discover': {
+      const target = r.target ? instances.value.find((i) => i.id === r.target) : undefined;
+      if (!target) return [{ label: 'Discover' }];
+      return [
+        { label: 'Instances', onClick: () => navigate({ name: 'instances' }) },
+        { label: target.name, onClick: () => navigate({ name: 'instance', id: target.id }) },
+        { label: 'Discover' },
+      ];
+    }
+    case 'content': {
+      const target = r.target ? instances.value.find((i) => i.id === r.target) : undefined;
+      const trail = target
+        ? [
+            { label: 'Instances', onClick: () => navigate({ name: 'instances' }) },
+            { label: target.name, onClick: () => navigate({ name: 'instance', id: target.id }) },
+          ]
+        : [];
+      return [
+        ...trail,
+        { label: 'Discover', onClick: () => navigate({ name: 'discover', target: r.target }) },
+        { label: 'Details' },
+      ];
+    }
     case 'instance': {
       const inst = instances.value.find((i) => i.id === r.id);
       return [

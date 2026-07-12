@@ -661,17 +661,14 @@
 }
 
 .cp-discover-card {
+  position: relative;
   display: flex;
-  gap: 13px;
-  padding: 15px;
-  text-align: left;
-  border: none;
+  flex-direction: column;
   border-radius: var(--r-md);
   background: var(--surface);
   box-shadow:
     inset 0 1px 0 oklch(1 0 0 / 0.05),
     var(--shadow-raised);
-  cursor: pointer;
   animation: cp-fade-in 160ms ease both;
   transition:
     transform 140ms ease,
@@ -680,16 +677,77 @@
 .cp-discover-card:hover {
   transform: translateY(-2px);
 }
-.cp-discover-card:focus-visible {
+.cp-discover-card[data-staged='true'] {
+  box-shadow:
+    inset 0 0 0 1px var(--accent),
+    var(--shadow-raised);
+}
+.cp-discover-card-open {
+  display: flex;
+  gap: 13px;
+  flex: 1;
+  padding: 15px;
+  text-align: left;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  border-radius: var(--r-md);
+  cursor: pointer;
+}
+.cp-discover-card-open:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
 }
 .cp-discover-card--skeleton {
-  cursor: default;
+  flex-direction: row;
+  gap: 13px;
+  padding: 15px;
   animation: none;
 }
 .cp-discover-card--skeleton:hover {
   transform: none;
+}
+
+/* The card's own action. With an instance targeted it installs on the spot;
+   with none it stages, because there is nowhere to install to yet. */
+.cp-discover-card-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin: 0 15px 13px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    border-color 120ms ease;
+}
+.cp-discover-card-action:hover:not(:disabled) {
+  background: var(--surface-3);
+  color: var(--text);
+  border-color: var(--line-strong, var(--line));
+}
+.cp-discover-card-action:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+.cp-discover-card-action[data-staged='true'] {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: transparent;
+}
+.cp-discover-card-action--done {
+  color: var(--ok, var(--text-mute));
+  background: transparent;
+  cursor: default;
 }
 
 .cp-discover-card-icon {
@@ -800,82 +858,405 @@
   margin-bottom: 6px;
 }
 
-/* Discover detail sheet (rendered inside a Modal panel) */
-.cp-discover-sheet {
-  width: min(560px, 100%);
-  max-height: 86vh;
-  overflow-y: auto;
-  padding: 22px;
-}
-.cp-discover-sheet-head {
+/* The standing answer to "where is this going?" while Discover is targeted. */
+.cp-discover-target {
   display: flex;
-  align-items: flex-start;
-  gap: 14px;
-  padding-right: 28px;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px var(--line);
+  animation: cp-fade-in 160ms ease both;
 }
-.cp-discover-sheet-title {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 650;
+.cp-discover-target-tile {
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+}
+.cp-discover-target-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.3;
+}
+.cp-discover-target-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-mute);
+}
+.cp-discover-target-name {
+  font-size: 13.5px;
+  font-weight: 600;
   color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.cp-discover-sheet-icon {
-  width: 56px;
-  height: 56px;
+.cp-discover-target-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-dim);
+  font-size: 11.5px;
 }
-.cp-discover-sheet-meta {
+.cp-discover-target-spacer {
+  flex: 1;
+}
+.cp-discover-target-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+.cp-discover-target-action:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.cp-discover-locked {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--text-mute);
+  font-size: 12px;
+}
+
+/* Staging dock: pick several, commit once. */
+.cp-discover {
+  padding-bottom: 8px;
+}
+.cp-discover[data-tray='true'] {
+  padding-bottom: 84px;
+}
+.cp-discover-tray {
+  position: sticky;
+  bottom: 12px;
+  z-index: 3;
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 20px;
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  background: var(--surface);
+  box-shadow:
+    inset 0 0 0 1px var(--line),
+    var(--shadow-overlay, var(--shadow-raised));
+  animation: cp-float-up 180ms ease both;
+}
+.cp-discover-tray-items {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+}
+.cp-discover-tray-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  max-width: 190px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+.cp-discover-tray-chip:hover {
+  color: var(--err);
+  border-color: var(--err);
+}
+.cp-discover-tray-chip-icon {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--surface-3);
+}
+.cp-discover-tray-chip-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.cp-discover-tray-chip-name {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cp-discover-tray-more {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-mute);
+}
+.cp-discover-tray-actions {
+  display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 14px;
+  flex-shrink: 0;
 }
-.cp-discover-sheet-summary {
-  margin: 12px 0 0;
-  font-size: 13px;
+.cp-discover-tray-clear {
+  border: none;
+  background: none;
+  color: var(--text-mute);
+  font-size: 12px;
+  cursor: pointer;
+}
+.cp-discover-tray-clear:hover {
+  color: var(--text);
+}
+
+/* Dialogs: only shown when there is genuinely something to decide. */
+.cp-discover-dialog {
+  width: min(460px, 100%);
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.cp-discover-dialog-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--text);
+}
+.cp-discover-dialog-sub {
+  margin: 0;
+  font-size: 12.5px;
   line-height: 1.5;
   color: var(--text-dim);
 }
-
-.cp-discover-gallery {
+.cp-discover-dialog-actions {
   display: flex;
+  justify-content: flex-end;
   gap: 8px;
-  overflow-x: auto;
-  margin-top: 14px;
-  padding-bottom: 4px;
-}
-.cp-discover-gallery img {
-  height: 96px;
-  border-radius: var(--r-sm);
-  border: 1px solid var(--line);
+  margin-top: 4px;
 }
 
-.cp-discover-install {
-  margin-top: 18px;
-  padding: 15px;
-  border-radius: var(--r-md);
-  background: var(--surface-2);
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.cp-discover-install--muted {
-  color: var(--text-dim);
-  font-size: 12.5px;
-}
-.cp-discover-install-label {
-  font-size: 12px;
-  font-weight: 550;
-  color: var(--text-dim);
-}
-.cp-discover-plan {
+.cp-discover-candidates {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  max-height: 300px;
+  overflow-y: auto;
 }
+.cp-discover-candidate {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  text-align: left;
+  cursor: pointer;
+}
+.cp-discover-candidate:hover:not(:disabled) {
+  background: var(--surface-3);
+}
+.cp-discover-candidate:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.cp-discover-candidate[data-complete='true'] {
+  border-color: var(--accent);
+}
+.cp-discover-candidate-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cp-discover-candidate-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.cp-discover-candidate-summary {
+  font-size: 11.5px;
+  color: var(--text-mute);
+}
+.cp-discover-candidate-drops {
+  max-width: 40%;
+  font-size: 11px;
+  color: var(--warn);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Content detail: a page, not a modal. */
+.cp-content-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 14px;
+  padding: 5px 9px 5px 6px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--text-mute);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.cp-content-back:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.cp-content-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+.cp-content-icon {
+  flex-shrink: 0;
+  width: 72px;
+  height: 72px;
+  border-radius: var(--r-md);
+  background: var(--surface-3);
+  display: grid;
+  place-items: center;
+  color: var(--text-mute);
+  overflow: hidden;
+}
+.cp-content-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.cp-content-headings {
+  min-width: 0;
+  flex: 1;
+}
+.cp-content-title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 650;
+  color: var(--text);
+}
+.cp-content-author {
+  margin-top: 3px;
+  font-size: 12.5px;
+  color: var(--text-mute);
+}
+.cp-content-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  margin-top: 11px;
+}
+.cp-content-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 24px;
+  margin-top: 22px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .cp-content-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.cp-content-summary {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.cp-content-gallery {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  margin-top: 18px;
+  padding-bottom: 6px;
+}
+.cp-content-gallery figure {
+  margin: 0;
+  flex-shrink: 0;
+}
+.cp-content-gallery img {
+  height: 150px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  display: block;
+}
+.cp-content-gallery figcaption {
+  margin-top: 5px;
+  max-width: 220px;
+  font-size: 11px;
+  color: var(--text-mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cp-content-section-title {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.cp-content-rail {
+  position: sticky;
+  top: 12px;
+}
+.cp-content-rail-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.cp-content-rail-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.cp-content-rail-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-mute);
+}
+.cp-content-rail-foot {
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 11.5px;
+  color: var(--text-mute);
+}
+
+.cp-mods-empty-actions {
+  margin-top: 10px;
+}
+
 .cp-discover-plan-note {
   display: flex;
   align-items: center;
@@ -893,12 +1274,6 @@
 
 .cp-discover-versions {
   margin-top: 18px;
-}
-.cp-discover-versions-head {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-dim);
-  margin-bottom: 4px;
 }
 .cp-discover-version-row {
   display: flex;

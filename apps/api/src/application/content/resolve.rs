@@ -266,6 +266,9 @@ pub async fn resolve(
             kind,
             version_id: version.id.clone(),
             version_number: version.version_number.clone(),
+            // A placeholder: a version is named things like "Sodium 0.7.3 for
+            // Fabric 1.21.8", which is not what anyone calls the mod. The real
+            // project titles are fetched in one batch below.
             title: version.name.clone(),
             file,
             dependencies: version.dependencies.clone(),
@@ -275,7 +278,25 @@ pub async fn resolve(
         });
     }
 
+    apply_project_titles(state, &mut items).await;
     Ok(Resolution { items, conflicts })
+}
+
+/// Replace version names with project names in one round trip. Best-effort: if
+/// the lookup fails the plan still stands, it just reads worse.
+async fn apply_project_titles(state: &AppState, items: &mut [ResolvedItem]) {
+    if items.is_empty() {
+        return;
+    }
+    let ids: Vec<CanonicalId> = items.iter().map(|item| item.canonical_id.clone()).collect();
+    let Ok(titles) = state.content().titles(&ids).await else {
+        return;
+    };
+    for item in items {
+        if let Some(title) = titles.get(&item.canonical_id) {
+            item.title = title.clone();
+        }
+    }
 }
 
 pub fn pick_version<'a>(
