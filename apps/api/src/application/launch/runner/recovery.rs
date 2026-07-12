@@ -1,14 +1,15 @@
 use super::trace_launch_event;
 use crate::guardian::{
-    GuardianLaunchRecoveryCurrentIntent, GuardianLaunchRecoveryDirective,
-    GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryJournalTransition,
-    GuardianLaunchRecoveryKind, GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryPlan,
-    GuardianLaunchRecoveryPlanRejection, GuardianLaunchRecoveryPlanRequest,
-    GuardianLaunchRecoveryRecordRequest, GuardianUserOutcome,
+    GuardianDirective, GuardianLaunchRecoveryCurrentIntent,
+    GuardianLaunchRecoveryJournalTransition, GuardianLaunchRecoveryOutcome,
+    GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
+    GuardianLaunchRecoveryPlanRequest, GuardianLaunchRecoveryRecordRequest,
+    GuardianManagedJavaReason, GuardianPresetDowngradeReason, GuardianStripJvmArgsReason,
+    GuardianUserOutcome, guardian_directive_description, guardian_directive_recovery_label,
     launch_recovery_journal_transition_conflicts, launch_recovery_journal_transition_matches,
-    launch_recovery_public_action_label, launch_recovery_suppressed_user_outcome,
-    launch_recovery_user_intent_fingerprint, plan_launch_recovery_directive,
-    record_launch_recovery_attempt, record_launch_recovery_failure, record_launch_recovery_success,
+    launch_recovery_suppressed_user_outcome, launch_recovery_user_intent_fingerprint,
+    plan_launch_recovery_directive, record_launch_recovery_attempt, record_launch_recovery_failure,
+    record_launch_recovery_success,
 };
 use crate::logging::timestamp_utc;
 use crate::state::{AppState, OperationJournalReconciliation, OperationJournalStoreError};
@@ -27,11 +28,27 @@ pub(super) enum RecoveryDirectiveOutcome {
     Suppressed(GuardianUserOutcome),
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum RecoveryDirectiveStage {
+    Prepare,
+    Startup,
+}
+
+impl RecoveryDirectiveStage {
+    fn accepts(self, directive: &GuardianDirective) -> bool {
+        match self {
+            Self::Prepare => directive.is_prepare_recovery(),
+            Self::Startup => directive.is_startup_recovery(),
+        }
+    }
+}
+
 pub(super) struct RecoveryDirectiveRequest<'a> {
     pub(super) state: &'a AppState,
     pub(super) session_id: &'a str,
     pub(super) intent: &'a axial_launcher::LaunchIntent,
-    pub(super) directive: GuardianLaunchRecoveryDirective,
+    pub(super) directive: GuardianDirective,
+    pub(super) stage: RecoveryDirectiveStage,
     pub(super) mode: crate::guardian::GuardianMode,
     pub(super) failure_class: LaunchFailureClass,
     pub(super) recovery_attempts: &'a mut u8,
@@ -42,6 +59,9 @@ pub(super) struct RecoveryDirectiveRequest<'a> {
 pub(super) async fn handle_recovery_directive(
     request: RecoveryDirectiveRequest<'_>,
 ) -> Result<RecoveryDirectiveOutcome, OperationJournalStoreError> {
+    if !request.stage.accepts(&request.directive) {
+        return Ok(RecoveryDirectiveOutcome::Rejected);
+    }
     if *request.recovery_attempts >= request.max_recovery_attempts {
         return Ok(RecoveryDirectiveOutcome::Exhausted);
     }
@@ -58,7 +78,7 @@ pub(super) async fn handle_recovery_directive(
     let outcome =
         record_guardian_launch_recovery_attempt(request.state, request.session_id, &plan).await?;
     if outcome.status == crate::guardian::GuardianLaunchRecoveryStatus::Suppressed {
-        let user_outcome = suppressed_launch_recovery_outcome(&plan);
+        let user_outcome = launch_recovery_suppressed_user_outcome(&plan);
         request
             .state
             .sessions()
@@ -74,7 +94,7 @@ pub(super) async fn handle_recovery_directive(
         .emit_log(
             request.session_id,
             "system",
-            plan.directive.description.clone(),
+            guardian_directive_description(&plan.directive),
         )
         .await;
     Ok(RecoveryDirectiveOutcome::Apply(plan))
@@ -82,7 +102,7 @@ pub(super) async fn handle_recovery_directive(
 
 fn plan_guardian_launch_recovery_directive(
     intent: &axial_launcher::LaunchIntent,
-    directive: GuardianLaunchRecoveryDirective,
+    directive: GuardianDirective,
     mode: crate::guardian::GuardianMode,
     failure_class: LaunchFailureClass,
 ) -> Result<GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection> {
@@ -93,7 +113,7 @@ fn plan_guardian_launch_recovery_directive(
             explicit_jvm_args: &intent.extra_jvm_args,
             requested_preset: &intent.requested_preset,
         },
-        directive.kind,
+        &directive,
     )
     .ok_or(GuardianLaunchRecoveryPlanRejection::InvalidUserIntentFingerprint)?;
     plan_launch_recovery_directive(GuardianLaunchRecoveryPlanRequest {
@@ -151,8 +171,8 @@ async fn record_guardian_launch_recovery_attempt(
     trace_launch_event(
         session_id,
         &format!(
-            "guardian launch recovery attempt: kind={:?} status={:?} operation={}",
-            plan.directive.kind,
+            "guardian launch recovery attempt: directive={:?} status={:?} operation={}",
+            plan.directive,
             outcome.status,
             outcome.operation_id.as_str()
         ),
@@ -209,8 +229,8 @@ pub(super) async fn record_successful_self_healing_if_any(
     trace_launch_event(
         session_id,
         &format!(
-            "guardian launch recovery succeeded: kind={:?} operation={}",
-            plan.directive.kind,
+            "guardian launch recovery succeeded: directive={:?} operation={}",
+            plan.directive,
             outcome.operation_id.as_str()
         ),
     );
@@ -268,8 +288,8 @@ pub(super) async fn record_failed_self_healing_if_any(
     trace_launch_event(
         session_id,
         &format!(
-            "guardian launch recovery failed: kind={:?} trigger={trigger_failure_class:?} observed={observed_failure_class:?} operation={}",
-            plan.directive.kind,
+            "guardian launch recovery failed: directive={:?} trigger={trigger_failure_class:?} observed={observed_failure_class:?} operation={}",
+            plan.directive,
             outcome.operation_id.as_str()
         ),
     );
@@ -280,7 +300,7 @@ pub(super) async fn record_failed_self_healing_if_any(
             "system",
             format!(
                 "Guardian recorded failed launch self-healing for {}.",
-                launch_recovery_public_action_label(plan.directive.kind)
+                guardian_directive_recovery_label(&plan.directive)
             ),
         )
         .await;
@@ -350,10 +370,6 @@ fn reject_mismatched_launch_recovery_transition(
     Ok(())
 }
 
-fn suppressed_launch_recovery_outcome(plan: &GuardianLaunchRecoveryPlan) -> GuardianUserOutcome {
-    launch_recovery_suppressed_user_outcome(plan)
-}
-
 fn block_guardian_for_suppressed_launch_recovery(
     guardian: &mut GuardianSummary,
     outcome: &GuardianUserOutcome,
@@ -379,21 +395,19 @@ fn record_guardian_intervention(
 
 pub(super) fn record_prelaunch_preset_adjustment_directive(
     guardian: &mut GuardianSummary,
-    directive: &GuardianLaunchRecoveryDirective,
+    directive: &GuardianDirective,
 ) {
-    if matches!(
-        (&directive.kind, &directive.effect),
-        (
-            GuardianLaunchRecoveryKind::DowngradePreset,
-            GuardianLaunchRecoveryEffect::DowngradePreset { .. }
-        )
-    ) {
-        record_guardian_intervention(
+    match directive {
+        GuardianDirective::DowngradeJvmPreset {
+            reason: GuardianPresetDowngradeReason::Compatibility { .. },
+            ..
+        } => record_guardian_intervention(
             guardian,
             GuardianInterventionKind::DowngradePreset,
-            directive.description.clone(),
+            guardian_directive_description(directive),
             false,
-        );
+        ),
+        _ => unreachable!("prelaunch preset adjustment emitted non-compatibility directive"),
     }
 }
 
@@ -417,11 +431,16 @@ pub(super) fn apply_prepare_recovery_directive(
     guardian: &mut GuardianSummary,
     attempt: &mut axial_launcher::service::AttemptOverrides,
     plan: &GuardianLaunchRecoveryPlan,
-) {
+) -> bool {
     let directive = &plan.directive;
-    let description = directive.description.clone();
-    match &directive.effect {
-        GuardianLaunchRecoveryEffect::ForceManagedRuntime => {
+    if !directive.is_prepare_recovery() {
+        return false;
+    }
+    let description = guardian_directive_description(directive);
+    match directive {
+        GuardianDirective::UseManagedJava {
+            reason: GuardianManagedJavaReason::PrepareFailure,
+        } => {
             record_guardian_intervention(
                 guardian,
                 GuardianInterventionKind::SwitchManagedRuntime,
@@ -430,7 +449,9 @@ pub(super) fn apply_prepare_recovery_directive(
             );
             attempt.record_runtime_intervention(description);
         }
-        GuardianLaunchRecoveryEffect::StripRawJvmArgs => {
+        GuardianDirective::StripJvmArgs {
+            reason: GuardianStripJvmArgsReason::PrepareFailure,
+        } => {
             record_guardian_intervention(
                 guardian,
                 GuardianInterventionKind::StripJvmArgs,
@@ -439,31 +460,37 @@ pub(super) fn apply_prepare_recovery_directive(
             );
             attempt.record_raw_jvm_args_intervention(description);
         }
-        GuardianLaunchRecoveryEffect::DowngradePreset { .. }
-        | GuardianLaunchRecoveryEffect::DisableCustomGc => {}
+        _ => return false,
     }
+    true
 }
 
 pub(super) fn apply_startup_recovery_directive(
     guardian: &mut GuardianSummary,
     attempt: &mut axial_launcher::service::AttemptOverrides,
     plan: &GuardianLaunchRecoveryPlan,
-) {
+) -> bool {
     let directive = &plan.directive;
-    let description = directive.description.clone();
+    if !directive.is_startup_recovery() {
+        return false;
+    }
+    let description = guardian_directive_description(directive);
     attempt.record_startup_recovery(description.clone());
-    match &directive.effect {
-        GuardianLaunchRecoveryEffect::DowngradePreset { preset } => {
+    match directive {
+        GuardianDirective::DowngradeJvmPreset {
+            preset,
+            reason: GuardianPresetDowngradeReason::StartupRecovery,
+        } => {
             record_guardian_intervention(
                 guardian,
                 GuardianInterventionKind::DowngradePreset,
                 description,
                 false,
             );
-            attempt.preset_override = Some(preset.clone());
+            attempt.preset_override = Some(preset.as_str().to_string());
             attempt.disable_custom_gc = false;
         }
-        GuardianLaunchRecoveryEffect::DisableCustomGc => {
+        GuardianDirective::DisableCustomGc => {
             record_guardian_intervention(
                 guardian,
                 GuardianInterventionKind::DisableCustomGc,
@@ -473,7 +500,9 @@ pub(super) fn apply_startup_recovery_directive(
             attempt.preset_override = None;
             attempt.disable_custom_gc = true;
         }
-        GuardianLaunchRecoveryEffect::ForceManagedRuntime => {
+        GuardianDirective::UseManagedJava {
+            reason: GuardianManagedJavaReason::StartupRecovery,
+        } => {
             record_guardian_intervention(
                 guardian,
                 GuardianInterventionKind::SwitchManagedRuntime,
@@ -484,16 +513,9 @@ pub(super) fn apply_startup_recovery_directive(
             attempt.preset_override = None;
             attempt.disable_custom_gc = false;
         }
-        GuardianLaunchRecoveryEffect::StripRawJvmArgs => {
-            record_guardian_intervention(
-                guardian,
-                GuardianInterventionKind::StripJvmArgs,
-                description,
-                false,
-            );
-            attempt.ignore_extra_jvm_args = true;
-        }
+        _ => return false,
     }
+    true
 }
 
 pub(super) fn block_guardian_with_user_outcome(
@@ -556,6 +578,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[derive(Clone, Copy, Debug)]
+    enum RecoveryCase {
+        SwitchManagedRuntime,
+        StripRawJvmArgs,
+        DowngradePreset,
+        DisableCustomGc,
+    }
+
     #[test]
     fn launch_guardian_intervention_preserves_existing_warning_guidance() {
         let warning = "Launch memory budget is tight.".to_string();
@@ -571,6 +601,90 @@ mod tests {
 
         assert!(guardian.guidance.iter().any(|detail| detail == &warning));
         assert!(guardian.details.iter().any(|detail| detail == &warning));
+    }
+
+    #[test]
+    fn recovery_executors_apply_every_closed_directive_effect() {
+        let intent = test_launch_intent(Path::new("/tmp/axial-test"), "executor-effects");
+
+        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        let mut attempt = axial_launcher::service::AttemptOverrides::default();
+        let managed_prepare = test_recovery_plan_for_directive(
+            &intent,
+            GuardianDirective::UseManagedJava {
+                reason: GuardianManagedJavaReason::PrepareFailure,
+            },
+            LaunchFailureClass::JavaRuntimeMismatch,
+        );
+        assert!(apply_prepare_recovery_directive(
+            &mut guardian,
+            &mut attempt,
+            &managed_prepare
+        ));
+        assert!(attempt.force_managed_runtime);
+        assert!(attempt.runtime_intervention_applied);
+
+        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        let mut attempt = axial_launcher::service::AttemptOverrides::default();
+        let strip_prepare = test_recovery_plan(&intent, RecoveryCase::StripRawJvmArgs);
+        assert!(apply_prepare_recovery_directive(
+            &mut guardian,
+            &mut attempt,
+            &strip_prepare
+        ));
+        assert!(attempt.ignore_extra_jvm_args);
+        assert!(attempt.raw_jvm_args_intervention_applied);
+
+        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        let mut attempt = axial_launcher::service::AttemptOverrides::default();
+        let managed_startup = test_recovery_plan(&intent, RecoveryCase::SwitchManagedRuntime);
+        assert!(apply_startup_recovery_directive(
+            &mut guardian,
+            &mut attempt,
+            &managed_startup
+        ));
+        assert!(attempt.force_managed_runtime);
+        assert!(attempt.startup_recovery_applied);
+        assert_eq!(attempt.retry_count, 1);
+
+        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        let mut attempt = axial_launcher::service::AttemptOverrides::default();
+        let preset_startup = test_recovery_plan(&intent, RecoveryCase::DowngradePreset);
+        assert!(apply_startup_recovery_directive(
+            &mut guardian,
+            &mut attempt,
+            &preset_startup
+        ));
+        assert_eq!(attempt.preset_override.as_deref(), Some("performance"));
+        assert!(!attempt.disable_custom_gc);
+
+        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        let mut attempt = axial_launcher::service::AttemptOverrides::default();
+        let gc_startup = test_recovery_plan(&intent, RecoveryCase::DisableCustomGc);
+        assert!(apply_startup_recovery_directive(
+            &mut guardian,
+            &mut attempt,
+            &gc_startup
+        ));
+        assert_eq!(attempt.preset_override, None);
+        assert!(attempt.disable_custom_gc);
+
+        let mut guardian = GuardianSummary::new(GuardianMode::Managed);
+        let mut attempt = axial_launcher::service::AttemptOverrides::default();
+        assert!(!apply_startup_recovery_directive(
+            &mut guardian,
+            &mut attempt,
+            &managed_prepare
+        ));
+        assert!(!attempt.startup_recovery_applied);
+        assert!(!attempt.force_managed_runtime);
+
+        assert!(!apply_prepare_recovery_directive(
+            &mut guardian,
+            &mut attempt,
+            &managed_startup
+        ));
+        assert!(!attempt.runtime_intervention_applied);
     }
 
     #[test]
@@ -741,15 +855,7 @@ mod tests {
 
     #[test]
     fn prelaunch_preset_adjustment_records_backend_authored_guardian_intervention() {
-        let directive = GuardianLaunchRecoveryDirective {
-            kind: GuardianLaunchRecoveryKind::DowngradePreset,
-            effect: GuardianLaunchRecoveryEffect::DowngradePreset {
-                preset: "performance".to_string(),
-            },
-            description:
-                "Guardian downgraded JVM preset from \"graalvm\" to \"performance\" before launch"
-                    .to_string(),
-        };
+        let directive = GuardianDirective::compatibility_preset_downgrade("graalvm", "performance");
         let mut guardian = GuardianSummary::new(GuardianMode::Managed);
         guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
 
@@ -803,7 +909,8 @@ mod tests {
             state: &state,
             session_id,
             intent: &intent,
-            directive: test_recovery_directive(GuardianLaunchRecoveryKind::StripRawJvmArgs),
+            directive: test_recovery_directive(RecoveryCase::StripRawJvmArgs),
+            stage: RecoveryDirectiveStage::Prepare,
             mode: crate::guardian::GuardianMode::Managed,
             failure_class: LaunchFailureClass::JvmUnsupportedOption,
             recovery_attempts: &mut recovery_attempts,
@@ -837,7 +944,7 @@ mod tests {
             .await
             .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
-        let failed_plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
+        let failed_plan = test_recovery_plan(&intent, RecoveryCase::StripRawJvmArgs);
         record_guardian_launch_recovery_attempt(&state, session_id, &failed_plan)
             .await
             .expect("persist initial recovery attempt");
@@ -856,7 +963,7 @@ mod tests {
             .subscribe(session_id)
             .await
             .expect("subscribe to session events");
-        let expected = suppressed_launch_recovery_outcome(&failed_plan);
+        let expected = launch_recovery_suppressed_user_outcome(&failed_plan);
         let mut recovery_attempts = 0;
         let mut guardian = GuardianSummary::new(GuardianMode::Managed);
         guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
@@ -865,7 +972,8 @@ mod tests {
             state: &state,
             session_id,
             intent: &intent,
-            directive: test_recovery_directive(GuardianLaunchRecoveryKind::StripRawJvmArgs),
+            directive: test_recovery_directive(RecoveryCase::StripRawJvmArgs),
+            stage: RecoveryDirectiveStage::Prepare,
             mode: crate::guardian::GuardianMode::Managed,
             failure_class: LaunchFailureClass::JvmUnsupportedOption,
             recovery_attempts: &mut recovery_attempts,
@@ -926,7 +1034,7 @@ mod tests {
             .await
             .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
-        let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
+        let plan = test_recovery_plan(&intent, RecoveryCase::StripRawJvmArgs);
         assert_eq!(plan.target.kind, TargetKind::Instance);
         assert_eq!(plan.target.id, intent.instance_id);
 
@@ -947,8 +1055,7 @@ mod tests {
         .await
         .expect("persist failed launch recovery");
 
-        let suppressed_plan =
-            test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
+        let suppressed_plan = test_recovery_plan(&intent, RecoveryCase::StripRawJvmArgs);
         let later_session_id = "runner-launch-recovery-memory-later-session";
 
         let suppressed =
@@ -959,7 +1066,7 @@ mod tests {
             suppressed.status,
             crate::guardian::GuardianLaunchRecoveryStatus::Suppressed
         );
-        let user_outcome = suppressed_launch_recovery_outcome(&suppressed_plan);
+        let user_outcome = launch_recovery_suppressed_user_outcome(&suppressed_plan);
         let mut guardian = GuardianSummary::new(GuardianMode::Managed);
         guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
         block_guardian_for_suppressed_launch_recovery(&mut guardian, &user_outcome);
@@ -1021,11 +1128,11 @@ mod tests {
         for (name, kind) in [
             (
                 "runner-strip-recovery-trigger-identity",
-                GuardianLaunchRecoveryKind::StripRawJvmArgs,
+                RecoveryCase::StripRawJvmArgs,
             ),
             (
                 "runner-gc-recovery-trigger-identity",
-                GuardianLaunchRecoveryKind::DisableCustomGc,
+                RecoveryCase::DisableCustomGc,
             ),
         ] {
             let root = unique_test_dir(name);
@@ -1104,7 +1211,7 @@ mod tests {
             .await
             .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
-        let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::DowngradePreset);
+        let plan = test_recovery_plan(&intent, RecoveryCase::DowngradePreset);
 
         let attempt = record_guardian_launch_recovery_attempt(&state, session_id, &plan)
             .await
@@ -1123,8 +1230,7 @@ mod tests {
         .await
         .expect("persist failed launch recovery");
 
-        let suppressed_plan =
-            test_recovery_plan(&intent, GuardianLaunchRecoveryKind::DowngradePreset);
+        let suppressed_plan = test_recovery_plan(&intent, RecoveryCase::DowngradePreset);
 
         let suppressed =
             record_guardian_launch_recovery_attempt(&state, session_id, &suppressed_plan)
@@ -1178,7 +1284,7 @@ mod tests {
             .await
             .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
-        let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
+        let plan = test_recovery_plan(&intent, RecoveryCase::StripRawJvmArgs);
         record_guardian_launch_recovery_attempt(&state, session_id, &plan)
             .await
             .expect("persist launch recovery attempt");
@@ -1240,7 +1346,7 @@ mod tests {
             .await
             .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
-        let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
+        let plan = test_recovery_plan(&intent, RecoveryCase::StripRawJvmArgs);
 
         let error = tokio::time::timeout(
             Duration::from_millis(250),
@@ -1275,7 +1381,7 @@ mod tests {
             .await
             .expect("insert session");
         let intent = test_launch_intent(&root, session_id);
-        let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
+        let plan = test_recovery_plan(&intent, RecoveryCase::StripRawJvmArgs);
         record_guardian_launch_recovery_attempt(&state, session_id, &plan)
             .await
             .expect("persist launch recovery attempt");
@@ -1333,8 +1439,8 @@ mod tests {
     #[test]
     fn suppressed_launch_recovery_block_uses_existing_guardian_block_copy() {
         let intent = test_launch_intent(Path::new("/tmp/axial-test"), "session");
-        let plan = test_recovery_plan(&intent, GuardianLaunchRecoveryKind::StripRawJvmArgs);
-        let outcome = suppressed_launch_recovery_outcome(&plan);
+        let plan = test_recovery_plan(&intent, RecoveryCase::StripRawJvmArgs);
+        let outcome = launch_recovery_suppressed_user_outcome(&plan);
         let reason = outcome.summary.clone();
         let mut guardian = GuardianSummary::new(GuardianMode::Managed);
         guardian.warn_with_guidance(vec!["Keep existing launch guidance.".to_string()]);
@@ -1371,11 +1477,8 @@ mod tests {
             }
             let rejection = plan_guardian_launch_recovery_directive(
                 &intent,
-                GuardianLaunchRecoveryDirective {
-                    kind: GuardianLaunchRecoveryKind::StripRawJvmArgs,
-                    effect: GuardianLaunchRecoveryEffect::StripRawJvmArgs,
-                    description: "Guardian removed incompatible explicit JVM args before launch"
-                        .to_string(),
+                GuardianDirective::StripJvmArgs {
+                    reason: GuardianStripJvmArgsReason::PrepareFailure,
                 },
                 crate::guardian::GuardianMode::Managed,
                 LaunchFailureClass::JvmUnsupportedOption,
@@ -1390,56 +1493,47 @@ mod tests {
 
     fn test_recovery_plan(
         intent: &axial_launcher::LaunchIntent,
-        kind: GuardianLaunchRecoveryKind,
+        kind: RecoveryCase,
     ) -> GuardianLaunchRecoveryPlan {
         let directive = test_recovery_directive(kind);
+        test_recovery_plan_for_directive(
+            intent,
+            directive,
+            match kind {
+                RecoveryCase::SwitchManagedRuntime => LaunchFailureClass::JavaRuntimeMismatch,
+                RecoveryCase::StripRawJvmArgs
+                | RecoveryCase::DowngradePreset
+                | RecoveryCase::DisableCustomGc => LaunchFailureClass::JvmUnsupportedOption,
+            },
+        )
+    }
+
+    fn test_recovery_plan_for_directive(
+        intent: &axial_launcher::LaunchIntent,
+        directive: GuardianDirective,
+        failure_class: LaunchFailureClass,
+    ) -> GuardianLaunchRecoveryPlan {
         plan_guardian_launch_recovery_directive(
             intent,
             directive,
             crate::guardian::GuardianMode::Managed,
-            match kind {
-                GuardianLaunchRecoveryKind::SwitchManagedRuntime => {
-                    LaunchFailureClass::JavaRuntimeMismatch
-                }
-                GuardianLaunchRecoveryKind::StripRawJvmArgs
-                | GuardianLaunchRecoveryKind::DowngradePreset
-                | GuardianLaunchRecoveryKind::DisableCustomGc => {
-                    LaunchFailureClass::JvmUnsupportedOption
-                }
-            },
+            failure_class,
         )
         .expect("recovery plan")
     }
 
-    fn test_recovery_directive(
-        kind: GuardianLaunchRecoveryKind,
-    ) -> GuardianLaunchRecoveryDirective {
+    fn test_recovery_directive(kind: RecoveryCase) -> GuardianDirective {
         match kind {
-            GuardianLaunchRecoveryKind::SwitchManagedRuntime => GuardianLaunchRecoveryDirective {
-                kind,
-                effect: GuardianLaunchRecoveryEffect::ForceManagedRuntime,
-                description: "Guardian switched to managed Java before launch".to_string(),
+            RecoveryCase::SwitchManagedRuntime => GuardianDirective::UseManagedJava {
+                reason: GuardianManagedJavaReason::StartupRecovery,
             },
-            GuardianLaunchRecoveryKind::StripRawJvmArgs => GuardianLaunchRecoveryDirective {
-                kind,
-                effect: GuardianLaunchRecoveryEffect::StripRawJvmArgs,
-                description: "Guardian removed incompatible explicit JVM args before launch"
-                    .to_string(),
+            RecoveryCase::StripRawJvmArgs => GuardianDirective::StripJvmArgs {
+                reason: GuardianStripJvmArgsReason::PrepareFailure,
             },
-            GuardianLaunchRecoveryKind::DowngradePreset => GuardianLaunchRecoveryDirective {
-                kind,
-                effect: GuardianLaunchRecoveryEffect::DowngradePreset {
-                    preset: "performance".to_string(),
-                },
-                description: "Automatic retry: downgraded JVM preset to \"performance\" after startup failure"
-                    .to_string(),
-            },
-            GuardianLaunchRecoveryKind::DisableCustomGc => GuardianLaunchRecoveryDirective {
-                kind,
-                effect: GuardianLaunchRecoveryEffect::DisableCustomGc,
-                description: "Automatic retry: disabled custom GC flags after startup failure"
-                    .to_string(),
-            },
+            RecoveryCase::DowngradePreset => {
+                GuardianDirective::startup_preset_downgrade("performance")
+            }
+            RecoveryCase::DisableCustomGc => GuardianDirective::DisableCustomGc,
         }
     }
 

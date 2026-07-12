@@ -1,10 +1,10 @@
 use super::{
     DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianCopyRequest,
-    GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-    GuardianLaunchRecoveryDirective, GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind,
-    GuardianLaunchRecoveryPlanRequest, GuardianMode, GuardianPerformanceSupervisionRejection,
-    GuardianRepairStatus, GuardianUserOutcome, author_guardian_copy,
-    launch_recovery_suppressed_user_outcome, plan_launch_recovery_directive,
+    GuardianDirective, GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
+    GuardianLaunchRecoveryPlanRequest, GuardianManagedJavaReason, GuardianMode,
+    GuardianPerformanceSupervisionRejection, GuardianRepairStatus, GuardianStripJvmArgsReason,
+    GuardianUserOutcome, author_guardian_copy, launch_recovery_suppressed_user_outcome,
+    plan_launch_recovery_directive,
 };
 use crate::state::contracts::OperationPhase;
 use axial_launcher::LaunchFailureClass;
@@ -85,7 +85,7 @@ enum GuardianOutcomeCopyInput {
         platform: Option<String>,
     },
     LaunchRecoverySuppressed {
-        kind: GuardianLaunchRecoveryKind,
+        kind: RecoveryKindInput,
     },
     PerformanceRejection {
         rejection: PerformanceRejectionInput,
@@ -94,6 +94,14 @@ enum GuardianOutcomeCopyInput {
     PersistedStateLoad {
         decision: GuardianActionKind,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum RecoveryKindInput {
+    SwitchManagedRuntime,
+    StripRawJvmArgs,
+    DowngradePreset,
+    DisableCustomGc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -254,35 +262,33 @@ fn install_failure_evidence(
     vec![evidence]
 }
 
-fn launch_recovery_plan(kind: GuardianLaunchRecoveryKind) -> super::GuardianLaunchRecoveryPlan {
-    let (effect, failure_class) = match kind {
-        GuardianLaunchRecoveryKind::SwitchManagedRuntime => (
-            GuardianLaunchRecoveryEffect::ForceManagedRuntime,
+fn launch_recovery_plan(kind: RecoveryKindInput) -> super::GuardianLaunchRecoveryPlan {
+    let (directive, failure_class) = match kind {
+        RecoveryKindInput::SwitchManagedRuntime => (
+            GuardianDirective::UseManagedJava {
+                reason: GuardianManagedJavaReason::StartupRecovery,
+            },
             LaunchFailureClass::JavaRuntimeMismatch,
         ),
-        GuardianLaunchRecoveryKind::StripRawJvmArgs => (
-            GuardianLaunchRecoveryEffect::StripRawJvmArgs,
-            LaunchFailureClass::JvmUnsupportedOption,
-        ),
-        GuardianLaunchRecoveryKind::DowngradePreset => (
-            GuardianLaunchRecoveryEffect::DowngradePreset {
-                preset: "balanced".to_string(),
+        RecoveryKindInput::StripRawJvmArgs => (
+            GuardianDirective::StripJvmArgs {
+                reason: GuardianStripJvmArgsReason::PrepareFailure,
             },
             LaunchFailureClass::JvmUnsupportedOption,
         ),
-        GuardianLaunchRecoveryKind::DisableCustomGc => (
-            GuardianLaunchRecoveryEffect::DisableCustomGc,
+        RecoveryKindInput::DowngradePreset => (
+            GuardianDirective::startup_preset_downgrade("balanced"),
+            LaunchFailureClass::JvmUnsupportedOption,
+        ),
+        RecoveryKindInput::DisableCustomGc => (
+            GuardianDirective::DisableCustomGc,
             LaunchFailureClass::JvmUnsupportedOption,
         ),
     };
     plan_launch_recovery_directive(GuardianLaunchRecoveryPlanRequest {
         instance_id: "copy-snapshot-instance",
         mode: GuardianMode::Managed,
-        directive: GuardianLaunchRecoveryDirective {
-            kind,
-            effect,
-            description: "snapshot directive description".to_string(),
-        },
+        directive,
         failure_class,
         user_intent_hash:
             "sha256.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa.aaaaaaaa",
@@ -325,12 +331,12 @@ fn repair_status_id(status: GuardianRepairStatus) -> &'static str {
     }
 }
 
-fn launch_recovery_kind_id(kind: GuardianLaunchRecoveryKind) -> &'static str {
+fn launch_recovery_kind_id(kind: RecoveryKindInput) -> &'static str {
     match kind {
-        GuardianLaunchRecoveryKind::SwitchManagedRuntime => "managed_runtime",
-        GuardianLaunchRecoveryKind::StripRawJvmArgs => "strip_jvm_args",
-        GuardianLaunchRecoveryKind::DowngradePreset => "downgrade_preset",
-        GuardianLaunchRecoveryKind::DisableCustomGc => "disable_custom_gc",
+        RecoveryKindInput::SwitchManagedRuntime => "managed_runtime",
+        RecoveryKindInput::StripRawJvmArgs => "strip_jvm_args",
+        RecoveryKindInput::DowngradePreset => "downgrade_preset",
+        RecoveryKindInput::DisableCustomGc => "disable_custom_gc",
     }
 }
 

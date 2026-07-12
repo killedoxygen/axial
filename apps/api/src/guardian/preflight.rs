@@ -1,8 +1,9 @@
 use super::{
     FactReliability, GuardianActionKind, GuardianConfidence, GuardianCopyRequest, GuardianDecision,
-    GuardianDomain, GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext,
-    GuardianSeverity, GuardianUserOutcome, PreflightAdmission, SafetyCase, SafetyOutcome,
-    author_guardian_copy, build_safety_case, decide_guardian_policy,
+    GuardianDirective, GuardianDomain, GuardianFact, GuardianFactId, GuardianManagedJavaReason,
+    GuardianMode, GuardianPolicyContext, GuardianSeverity, GuardianStripJvmArgsReason,
+    GuardianUserOutcome, PreflightAdmission, SafetyCase, SafetyOutcome, author_guardian_copy,
+    build_safety_case, decide_guardian_policy,
 };
 use crate::observability::{
     EvidenceField, EvidenceSensitivity, RedactionAudience, sanitize_evidence_token,
@@ -82,13 +83,7 @@ pub struct GuardianPreflightOutcome {
     pub safety: SafetyOutcome,
     pub user_outcome: GuardianUserOutcome,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub directives: Vec<GuardianPreflightDirective>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum GuardianPreflightDirective {
-    UseManagedJavaForAttempt,
-    StripExplicitJvmArgsForAttempt,
+    pub directives: Vec<GuardianDirective>,
 }
 
 pub fn guardian_preflight_outcome(
@@ -199,14 +194,14 @@ fn preflight_boundary_verdict(decision: GuardianActionKind) -> GuardianActionKin
     }
 }
 
-fn preflight_directives(decision: GuardianActionKind) -> Vec<GuardianPreflightDirective> {
+fn preflight_directives(decision: GuardianActionKind) -> Vec<GuardianDirective> {
     match decision {
-        GuardianActionKind::Fallback => {
-            vec![GuardianPreflightDirective::UseManagedJavaForAttempt]
-        }
-        GuardianActionKind::Strip => {
-            vec![GuardianPreflightDirective::StripExplicitJvmArgsForAttempt]
-        }
+        GuardianActionKind::Fallback => vec![GuardianDirective::UseManagedJava {
+            reason: GuardianManagedJavaReason::Preflight,
+        }],
+        GuardianActionKind::Strip => vec![GuardianDirective::StripJvmArgs {
+            reason: GuardianStripJvmArgsReason::Preflight,
+        }],
         _ => Vec::new(),
     }
 }
@@ -396,8 +391,8 @@ mod tests {
         GuardianPreflightResourceSignals, guardian_preflight_outcome,
     };
     use crate::guardian::{
-        FactReliability, GuardianActionKind, GuardianConfidence, GuardianDomain, GuardianFact,
-        GuardianFactId, GuardianMode, GuardianPreflightDirective, GuardianSeverity,
+        FactReliability, GuardianActionKind, GuardianConfidence, GuardianDirective, GuardianDomain,
+        GuardianFact, GuardianFactId, GuardianMode, GuardianSeverity, GuardianStripJvmArgsReason,
         launch_failure_memory::{
             RECENT_REPAIR_FAILED_FACT_ID, RECENT_STARTUP_FAILURE_FACT_ID,
             REPAIR_SUPPRESSED_UNTIL_FACT_ID,
@@ -716,7 +711,9 @@ mod tests {
         assert_eq!(managed.user_outcome.decision, GuardianActionKind::Strip);
         assert_eq!(
             managed.directives,
-            vec![GuardianPreflightDirective::StripExplicitJvmArgsForAttempt]
+            vec![GuardianDirective::StripJvmArgs {
+                reason: GuardianStripJvmArgsReason::Preflight,
+            }]
         );
         assert!(managed.user_outcome.details.iter().any(|detail| {
             detail == "Guardian removed malformed explicit JVM args for this launch."

@@ -1,10 +1,10 @@
 use super::decision_snapshot::{PolicyDecisionCell, scoped_decision_projection};
 use super::{
-    DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence, GuardianDomain,
-    GuardianFact, GuardianFactId, GuardianMode, GuardianPreflightDirective,
+    DiagnosisId, FactReliability, GuardianActionKind, GuardianConfidence, GuardianDirective,
+    GuardianDomain, GuardianFact, GuardianFactId, GuardianManagedJavaReason, GuardianMode,
     GuardianPreflightOutcomeRequest, GuardianPreflightOverrideSignals, GuardianPreflightReadiness,
-    GuardianPreflightResourceSignals, GuardianSeverity, guardian_fact_from_execution,
-    guardian_preflight_outcome,
+    GuardianPreflightResourceSignals, GuardianSeverity, GuardianStripJvmArgsReason,
+    guardian_fact_from_execution, guardian_preflight_outcome,
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{EvidenceField, EvidenceSensitivity};
@@ -119,7 +119,38 @@ struct BoundaryCase {
     diagnosis_ids: Vec<DiagnosisId>,
     kernel_decision: PolicyDecisionCell,
     effective_decision: GuardianActionKind,
-    directives: Vec<GuardianPreflightDirective>,
+    directives: Vec<PreflightDirectiveProjection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum PreflightDirectiveProjection {
+    UseManagedJavaForAttempt,
+    StripExplicitJvmArgsForAttempt,
+}
+
+impl From<&GuardianDirective> for PreflightDirectiveProjection {
+    fn from(directive: &GuardianDirective) -> Self {
+        match directive {
+            GuardianDirective::UseManagedJava {
+                reason: GuardianManagedJavaReason::Preflight,
+            } => Self::UseManagedJavaForAttempt,
+            GuardianDirective::StripJvmArgs {
+                reason: GuardianStripJvmArgsReason::Preflight,
+            } => Self::StripExplicitJvmArgsForAttempt,
+            GuardianDirective::UseManagedJava {
+                reason:
+                    GuardianManagedJavaReason::PrepareFailure
+                    | GuardianManagedJavaReason::StartupRecovery,
+            }
+            | GuardianDirective::StripJvmArgs {
+                reason: GuardianStripJvmArgsReason::PrepareFailure,
+            }
+            | GuardianDirective::DowngradeJvmPreset { .. }
+            | GuardianDirective::DisableCustomGc => {
+                panic!("preflight snapshot received recovery-only directive")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -566,7 +597,11 @@ fn boundary_case(id: impl Into<String>, family: BoundaryFamily, spec: CaseSpec) 
             &outcome.safety_case,
         ),
         effective_decision: outcome.user_outcome.decision,
-        directives: outcome.directives,
+        directives: outcome
+            .directives
+            .iter()
+            .map(PreflightDirectiveProjection::from)
+            .collect(),
     }
 }
 
@@ -823,7 +858,7 @@ fn assert_snapshot_coverage(snapshot: &GuardianPreflightBoundarySnapshot) {
         .collect::<Vec<_>>();
     assert!(fallback.iter().all(|case| {
         case.effective_decision == GuardianActionKind::Fallback
-            && case.directives == [GuardianPreflightDirective::UseManagedJavaForAttempt]
+            && case.directives == [PreflightDirectiveProjection::UseManagedJavaForAttempt]
     }));
     let strip = snapshot
         .cases
@@ -832,7 +867,7 @@ fn assert_snapshot_coverage(snapshot: &GuardianPreflightBoundarySnapshot) {
         .collect::<Vec<_>>();
     assert!(strip.iter().all(|case| {
         case.effective_decision == GuardianActionKind::Strip
-            && case.directives == [GuardianPreflightDirective::StripExplicitJvmArgsForAttempt]
+            && case.directives == [PreflightDirectiveProjection::StripExplicitJvmArgsForAttempt]
     }));
     assert!(snapshot.cases.iter().all(|case| {
         case.family != BoundaryFamily::Warning

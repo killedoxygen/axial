@@ -1,19 +1,14 @@
 use super::{
-    FactReliability, GuardianActionKind, GuardianDecision, GuardianDomain, GuardianFact,
-    GuardianFactId, GuardianLaunchRecoveryDirective, GuardianLaunchRecoveryEffect,
-    GuardianLaunchRecoveryKind, GuardianMode, GuardianPolicyContext, GuardianUserOutcome,
-    SafetyCase, build_safety_case, decide_guardian_policy,
+    FactReliability, GuardianActionKind, GuardianCopyRequest, GuardianDecision, GuardianDirective,
+    GuardianDomain, GuardianFact, GuardianFactId, GuardianManagedJavaReason, GuardianMode,
+    GuardianPolicyContext, GuardianStripJvmArgsReason, GuardianUserOutcome, SafetyCase,
+    author_guardian_copy, build_safety_case, decide_guardian_policy,
 };
-use crate::observability::{RedactionAudience, sanitize_evidence_text};
 use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
 use axial_launcher::{CrashEvidence, LaunchFailureClass};
 use serde::{Deserialize, Serialize};
-
-const MAX_LAUNCH_DECISION_SUMMARY_CHARS: usize = 180;
-const MAX_LAUNCH_DECISION_DETAIL_CHARS: usize = 240;
-const MAX_LAUNCH_DECISION_LINES: usize = 6;
 
 #[derive(Clone, Debug)]
 pub struct GuardianPrepareFailureRequest<'a> {
@@ -33,7 +28,7 @@ pub struct GuardianLaunchFailureOutcome {
     pub safety_case: SafetyCase,
     pub guardian_decision: GuardianDecision,
     pub user_outcome: GuardianUserOutcome,
-    pub directive: Option<GuardianLaunchRecoveryDirective>,
+    pub directive: Option<GuardianDirective>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,8 +71,15 @@ pub fn guardian_prepare_failure_outcome(
         policy_context(request_has_explicit_prepare_intent(&request)),
     );
     let directive = prepare_failure_directive(&request, &guardian_decision);
-    let user_outcome =
-        prepare_failure_user_outcome(&request, &guardian_decision, directive.as_ref());
+    let user_outcome = author_guardian_copy(GuardianCopyRequest::prepare_failure(
+        guardian_decision.kind,
+        request.failure_class,
+        request.public_error,
+        request.explicit_java_override_present,
+        request.explicit_jvm_args_present,
+        directive.as_ref(),
+    ))
+    .expect("launch prepare copy request is closed");
 
     GuardianLaunchFailureOutcome {
         failure_class: request.failure_class,
@@ -90,7 +92,7 @@ pub fn guardian_prepare_failure_outcome(
 
 pub fn guardian_prelaunch_preset_adjustment_directive(
     request: GuardianPresetAdjustmentRequest<'_>,
-) -> Option<GuardianLaunchRecoveryDirective> {
+) -> Option<GuardianDirective> {
     let (_, decision) = evaluate_preset_adjustment(&request)?;
     preset_adjustment_directive(&request, &decision)
 }
@@ -127,32 +129,19 @@ fn evaluate_preset_adjustment(
 fn preset_adjustment_directive(
     request: &GuardianPresetAdjustmentRequest<'_>,
     decision: &GuardianDecision,
-) -> Option<GuardianLaunchRecoveryDirective> {
+) -> Option<GuardianDirective> {
     (decision.kind == GuardianActionKind::Downgrade).then(|| {
-        let requested = request.requested_preset.trim();
-        let effective = request.effective_preset.trim();
-        let requested = safe_preset_label(requested);
-        let effective = safe_preset_label(effective);
-        GuardianLaunchRecoveryDirective {
-            kind: GuardianLaunchRecoveryKind::DowngradePreset,
-            effect: GuardianLaunchRecoveryEffect::DowngradePreset {
-                preset: effective.clone(),
-            },
-            description: format!(
-                "Guardian downgraded JVM preset from \"{requested}\" to \"{effective}\" before launch"
-            ),
-        }
+        GuardianDirective::compatibility_preset_downgrade(
+            request.requested_preset,
+            request.effective_preset,
+        )
     })
 }
 
 #[cfg(test)]
 pub(super) fn preset_adjustment_snapshot(
     request: &GuardianPresetAdjustmentRequest<'_>,
-) -> Option<(
-    SafetyCase,
-    GuardianDecision,
-    Option<GuardianLaunchRecoveryDirective>,
-)> {
+) -> Option<(SafetyCase, GuardianDecision, Option<GuardianDirective>)> {
     let (safety_case, decision) = evaluate_preset_adjustment(request)?;
     let directive = preset_adjustment_directive(request, &decision);
     Some((safety_case, decision, directive))
@@ -170,12 +159,16 @@ pub fn guardian_startup_failure_outcome(
         policy_context(request_has_explicit_startup_intent(&request)),
     );
     let directive = startup_failure_directive(recovery_options, &guardian_decision);
-    let user_outcome = startup_failure_user_outcome(
-        &request,
-        failure_class,
-        &guardian_decision,
+    let user_outcome = author_guardian_copy(GuardianCopyRequest::startup_failure(
+        guardian_decision.kind,
+        request.observation,
+        request.crash_evidence,
+        request.explicit_java_override_present,
+        request.explicit_jvm_args_present,
+        request.explicit_jvm_preset_present,
         directive.as_ref(),
-    );
+    ))
+    .expect("launch startup copy request is closed");
 
     GuardianLaunchFailureOutcome {
         failure_class,
@@ -208,114 +201,11 @@ pub fn guardian_observed_launch_failure_outcome(
     crash_evidence: Option<&CrashEvidence>,
     observed_phase: GuardianObservedLaunchFailurePhase,
 ) -> Option<GuardianUserOutcome> {
-    let copy = accepted_launch_failure_copy(failure_class, crash_evidence)?;
-    let (decision, phase, summary, detail) = match observed_phase {
-        GuardianObservedLaunchFailurePhase::BeforeBoot => (
-            GuardianActionKind::Block,
-            OperationPhase::Launching,
-            "Guardian blocked launch startup.",
-            copy.startup_detail.as_str(),
-        ),
-        GuardianObservedLaunchFailurePhase::AfterBoot => (
-            GuardianActionKind::Warn,
-            OperationPhase::Running,
-            copy.running_summary.as_str(),
-            copy.running_detail.as_str(),
-        ),
-    };
-    Some(GuardianUserOutcome {
-        decision,
-        phase,
-        summary: public_summary(summary),
-        details: bounded_public_lines([detail]),
-        guidance: bounded_public_lines([copy.guidance.as_str()]),
-    })
-}
-
-struct AcceptedLaunchFailureCopy {
-    startup_detail: String,
-    running_summary: String,
-    running_detail: String,
-    guidance: String,
-}
-
-fn accepted_launch_failure_copy(
-    failure_class: LaunchFailureClass,
-    crash_evidence: Option<&CrashEvidence>,
-) -> Option<AcceptedLaunchFailureCopy> {
-    let copy = match failure_class {
-        LaunchFailureClass::OutOfMemory => (
-            "Minecraft exited before startup completed after running out of memory.",
-            "Minecraft stopped after running out of memory.",
-            "Guardian detected an out-of-memory crash after startup completed.",
-            "Review the instance memory allocation and close memory-heavy apps before retrying.",
-        ),
-        LaunchFailureClass::GraphicsDriverCrash => (
-            "Minecraft exited before startup completed with a detected graphics driver crash.",
-            "Minecraft stopped after a graphics driver crash.",
-            "Guardian detected a native graphics driver crash after startup completed.",
-            "Update or reinstall the graphics driver, then retry without graphics overlays.",
-        ),
-        LaunchFailureClass::MissingDependency => (
-            "Minecraft exited before startup completed because a required dependency was missing.",
-            "Minecraft stopped because a dependency was missing.",
-            "Guardian detected a missing class or dependency after startup completed.",
-            "Check the installed mods for missing or incompatible dependencies before retrying.",
-        ),
-        LaunchFailureClass::ModTransformationFailure => (
-            "Minecraft exited before startup completed with a detected mod transformation or mixin failure.",
-            "Minecraft stopped during mod transformation.",
-            "Guardian detected a mod transformation or mixin failure after startup completed.",
-            "Update or remove the recently changed mod before retrying.",
-        ),
-        LaunchFailureClass::ModAttributedCrash => {
-            let suspected_mod = suspected_mod_label(crash_evidence);
-            let startup_detail = suspected_mod
-                .as_ref()
-                .map(|name| format!("Minecraft exited before startup completed with a crash attributed to {name}."))
-                .unwrap_or_else(|| "Minecraft exited before startup completed with a crash attributed to an installed mod.".to_string());
-            let running_summary = suspected_mod
-                .as_ref()
-                .map(|name| format!("Minecraft stopped in a crash attributed to {name}."))
-                .unwrap_or_else(|| "Minecraft stopped in a mod-attributed crash.".to_string());
-            let running_detail = suspected_mod
-                .as_ref()
-                .map(|name| format!("Guardian attributes the crash to the installed mod {name}."))
-                .unwrap_or_else(|| {
-                    "Guardian found typed crash evidence that attributes the failure to an installed mod."
-                        .to_string()
-                });
-            let guidance = suspected_mod
-                .as_ref()
-                .map(|name| format!("Update or remove {name} before retrying."))
-                .unwrap_or_else(|| {
-                    "Update or remove the suspected mod before retrying.".to_string()
-                });
-            return Some(AcceptedLaunchFailureCopy {
-                startup_detail,
-                running_summary,
-                running_detail,
-                guidance,
-            });
-        }
-        LaunchFailureClass::Unknown
-        | LaunchFailureClass::JvmUnsupportedOption
-        | LaunchFailureClass::JvmExperimentalUnlock
-        | LaunchFailureClass::JvmOptionOrdering
-        | LaunchFailureClass::JavaRuntimeMismatch
-        | LaunchFailureClass::ClasspathModuleConflict
-        | LaunchFailureClass::LauncherManagedArtifactSignature
-        | LaunchFailureClass::AuthModeIncompatible
-        | LaunchFailureClass::LoaderBootstrapFailure
-        | LaunchFailureClass::StartupStalled => return None,
-    };
-
-    Some(AcceptedLaunchFailureCopy {
-        startup_detail: copy.0.to_string(),
-        running_summary: copy.1.to_string(),
-        running_detail: copy.2.to_string(),
-        guidance: copy.3.to_string(),
-    })
+    author_guardian_copy(GuardianCopyRequest::observed_launch_failure(
+        failure_class,
+        crash_evidence,
+        observed_phase,
+    ))
 }
 
 pub fn conservative_launch_recovery_preset(version_id: &str, runtime_major: u32) -> String {
@@ -465,7 +355,7 @@ fn startup_failure_facts(
             OperationPhase::Launching,
         ));
     }
-    if recovery_options.jvm_strip.is_some() {
+    if recovery_options.disable_custom_gc.is_some() {
         facts.push(condition_fact(
             GuardianFactId::LaunchJvmStripAvailable,
             OperationPhase::Launching,
@@ -513,17 +403,15 @@ fn condition_fact(id: GuardianFactId, phase: OperationPhase) -> GuardianFact {
 fn prepare_failure_directive(
     request: &GuardianPrepareFailureRequest<'_>,
     decision: &GuardianDecision,
-) -> Option<GuardianLaunchRecoveryDirective> {
+) -> Option<GuardianDirective> {
     match (request.failure_class, decision.kind) {
         (LaunchFailureClass::JavaRuntimeMismatch, GuardianActionKind::Fallback)
             if request.requested_java_present
                 && request.explicit_java_override_present
                 && !request.runtime_intervention_applied =>
         {
-            Some(GuardianLaunchRecoveryDirective {
-                kind: GuardianLaunchRecoveryKind::SwitchManagedRuntime,
-                effect: GuardianLaunchRecoveryEffect::ForceManagedRuntime,
-                description: "Guardian switched to managed Java before launch".to_string(),
+            Some(GuardianDirective::UseManagedJava {
+                reason: GuardianManagedJavaReason::PrepareFailure,
             })
         }
         (
@@ -532,11 +420,8 @@ fn prepare_failure_directive(
             | LaunchFailureClass::JvmOptionOrdering,
             GuardianActionKind::Strip,
         ) if request.explicit_jvm_args_present && !request.raw_jvm_args_intervention_applied => {
-            Some(GuardianLaunchRecoveryDirective {
-                kind: GuardianLaunchRecoveryKind::StripRawJvmArgs,
-                effect: GuardianLaunchRecoveryEffect::StripRawJvmArgs,
-                description: "Guardian removed incompatible explicit JVM args before launch"
-                    .to_string(),
+            Some(GuardianDirective::StripJvmArgs {
+                reason: GuardianStripJvmArgsReason::PrepareFailure,
             })
         }
         _ => None,
@@ -546,18 +431,14 @@ fn prepare_failure_directive(
 fn startup_failure_directive(
     recovery_options: StartupRecoveryOptions,
     decision: &GuardianDecision,
-) -> Option<GuardianLaunchRecoveryDirective> {
+) -> Option<GuardianDirective> {
     let template = match decision.kind {
         GuardianActionKind::Fallback => recovery_options.runtime_fallback,
         GuardianActionKind::Downgrade => recovery_options.jvm_preset_downgrade,
-        GuardianActionKind::Strip => recovery_options.jvm_strip,
+        GuardianActionKind::Strip => recovery_options.disable_custom_gc,
         _ => None,
     }?;
-    Some(GuardianLaunchRecoveryDirective {
-        kind: template.kind,
-        effect: template.effect,
-        description: template.description,
-    })
+    Some(template)
 }
 
 fn startup_recovery_options(
@@ -580,34 +461,19 @@ fn startup_recovery_options(
                     request.runtime_major,
                 );
                 if !preset.is_empty() && preset != effective_preset {
-                    options.jvm_preset_downgrade = Some(StartupRecoveryTemplate {
-                        kind: GuardianLaunchRecoveryKind::DowngradePreset,
-                        effect: GuardianLaunchRecoveryEffect::DowngradePreset {
-                            preset: preset.clone(),
-                        },
-                        description: format!(
-                            "Automatic retry: downgraded JVM preset to \"{preset}\" after startup failure"
-                        ),
-                    });
+                    options.jvm_preset_downgrade =
+                        Some(GuardianDirective::startup_preset_downgrade(&preset));
                 }
             }
             if !request.disable_custom_gc {
-                options.jvm_strip = Some(StartupRecoveryTemplate {
-                    kind: GuardianLaunchRecoveryKind::DisableCustomGc,
-                    effect: GuardianLaunchRecoveryEffect::DisableCustomGc,
-                    description: "Automatic retry: disabled custom GC flags after startup failure"
-                        .to_string(),
-                });
+                options.disable_custom_gc = Some(GuardianDirective::DisableCustomGc);
             }
         }
         LaunchFailureClass::JavaRuntimeMismatch
             if request.requested_java_present && request.explicit_java_override_present =>
         {
-            options.runtime_fallback = Some(StartupRecoveryTemplate {
-                kind: GuardianLaunchRecoveryKind::SwitchManagedRuntime,
-                effect: GuardianLaunchRecoveryEffect::ForceManagedRuntime,
-                description: "Automatic retry: switched to managed Java after runtime mismatch"
-                    .to_string(),
+            options.runtime_fallback = Some(GuardianDirective::UseManagedJava {
+                reason: GuardianManagedJavaReason::StartupRecovery,
             });
         }
         LaunchFailureClass::OutOfMemory => {}
@@ -618,110 +484,9 @@ fn startup_recovery_options(
 
 #[derive(Clone, Debug, Default)]
 struct StartupRecoveryOptions {
-    runtime_fallback: Option<StartupRecoveryTemplate>,
-    jvm_preset_downgrade: Option<StartupRecoveryTemplate>,
-    jvm_strip: Option<StartupRecoveryTemplate>,
-}
-
-#[derive(Clone, Debug)]
-struct StartupRecoveryTemplate {
-    kind: GuardianLaunchRecoveryKind,
-    effect: GuardianLaunchRecoveryEffect,
-    description: String,
-}
-
-fn prepare_failure_user_outcome(
-    request: &GuardianPrepareFailureRequest<'_>,
-    decision: &GuardianDecision,
-    directive: Option<&GuardianLaunchRecoveryDirective>,
-) -> GuardianUserOutcome {
-    let mut details = Vec::new();
-    if let Some(directive) = directive {
-        push_public_line(&mut details, &directive.description);
-    } else if let Some(detail) = bounded_public_text(request.public_error) {
-        push_public_line(&mut details, &detail);
-    } else {
-        push_public_line(&mut details, prepare_failure_reason(request.failure_class));
-    }
-
-    let mut guidance = Vec::new();
-    for line in prepare_failure_guidance(
-        request.failure_class,
-        request.explicit_java_override_present,
-        request.explicit_jvm_args_present,
-        false,
-    ) {
-        push_public_line(&mut guidance, line);
-    }
-
-    let summary = match decision.kind {
-        GuardianActionKind::Fallback | GuardianActionKind::Strip => {
-            "Guardian adjusted launch preparation."
-        }
-        GuardianActionKind::AskUser => "Guardian needs confirmation before launch preparation.",
-        GuardianActionKind::Block => "Guardian blocked launch preparation.",
-        _ => "Guardian recorded launch preparation failure.",
-    };
-
-    GuardianUserOutcome {
-        decision: public_user_decision(decision.kind),
-        phase: OperationPhase::Preparing,
-        summary: public_summary(summary),
-        details: capped_lines(details),
-        guidance: capped_lines(guidance),
-    }
-}
-
-fn startup_failure_user_outcome(
-    request: &GuardianStartupFailureRequest<'_>,
-    failure_class: LaunchFailureClass,
-    decision: &GuardianDecision,
-    directive: Option<&GuardianLaunchRecoveryDirective>,
-) -> GuardianUserOutcome {
-    let mut details = Vec::new();
-    if let Some(directive) = directive {
-        push_public_line(&mut details, &directive.description);
-    } else {
-        push_public_line(
-            &mut details,
-            &startup_failure_reason(request, failure_class),
-        );
-    }
-
-    let mut guidance = Vec::new();
-    for line in startup_failure_guidance(request, failure_class) {
-        push_public_line(&mut guidance, &line);
-    }
-
-    let summary = match decision.kind {
-        GuardianActionKind::Downgrade
-        | GuardianActionKind::Strip
-        | GuardianActionKind::Fallback => "Guardian selected a guarded startup retry.",
-        GuardianActionKind::AskUser => "Guardian needs confirmation before startup recovery.",
-        GuardianActionKind::Block => "Guardian blocked launch startup.",
-        _ => "Guardian recorded launch startup failure.",
-    };
-
-    GuardianUserOutcome {
-        decision: public_user_decision(decision.kind),
-        phase: OperationPhase::Launching,
-        summary: public_summary(summary),
-        details: capped_lines(details),
-        guidance: capped_lines(guidance),
-    }
-}
-
-fn public_user_decision(decision: GuardianActionKind) -> GuardianActionKind {
-    match decision {
-        GuardianActionKind::Fallback
-        | GuardianActionKind::Strip
-        | GuardianActionKind::Downgrade
-        | GuardianActionKind::Retry => decision,
-        GuardianActionKind::AskUser => GuardianActionKind::AskUser,
-        GuardianActionKind::Block => GuardianActionKind::Block,
-        GuardianActionKind::Allow | GuardianActionKind::RecordOnly => decision,
-        _ => GuardianActionKind::Warn,
-    }
+    runtime_fallback: Option<GuardianDirective>,
+    jvm_preset_downgrade: Option<GuardianDirective>,
+    disable_custom_gc: Option<GuardianDirective>,
 }
 
 fn request_has_explicit_prepare_intent(request: &GuardianPrepareFailureRequest<'_>) -> bool {
@@ -825,213 +590,6 @@ fn failure_class_fact_id(failure_class: LaunchFailureClass) -> GuardianFactId {
     }
 }
 
-fn prepare_failure_reason(failure_class: LaunchFailureClass) -> &'static str {
-    match failure_class {
-        LaunchFailureClass::JavaRuntimeMismatch => {
-            "The selected Java runtime is not compatible with this version."
-        }
-        LaunchFailureClass::JvmUnsupportedOption
-        | LaunchFailureClass::JvmExperimentalUnlock
-        | LaunchFailureClass::JvmOptionOrdering => {
-            "The selected JVM settings are not compatible with this Java runtime."
-        }
-        _ => "Launch preparation failed before Minecraft could start.",
-    }
-}
-
-fn startup_failure_reason(
-    request: &GuardianStartupFailureRequest<'_>,
-    failure_class: LaunchFailureClass,
-) -> String {
-    if let Some(copy) = accepted_launch_failure_copy(failure_class, request.crash_evidence) {
-        return copy.startup_detail;
-    }
-    let reason = match request.observation {
-        GuardianStartupFailureObservation::Stalled => {
-            "No startup activity was observed before the startup window ended."
-        }
-        GuardianStartupFailureObservation::Exited { .. } => match failure_class {
-            LaunchFailureClass::JvmUnsupportedOption
-            | LaunchFailureClass::JvmExperimentalUnlock
-            | LaunchFailureClass::JvmOptionOrdering => {
-                "Minecraft exited before startup completed with a detected JVM option compatibility failure."
-            }
-            LaunchFailureClass::JavaRuntimeMismatch => {
-                "Minecraft exited before startup completed with a detected Java runtime mismatch."
-            }
-            LaunchFailureClass::ClasspathModuleConflict => {
-                "Minecraft exited before startup completed with a detected classpath or module conflict."
-            }
-            LaunchFailureClass::LauncherManagedArtifactSignature => {
-                "Minecraft exited before startup completed with detected launcher-managed jar signature corruption."
-            }
-            LaunchFailureClass::AuthModeIncompatible => {
-                "Minecraft exited before startup completed because the selected auth mode was not launch-ready."
-            }
-            LaunchFailureClass::LoaderBootstrapFailure => {
-                "Minecraft exited before startup completed with a detected loader bootstrap failure."
-            }
-            LaunchFailureClass::StartupStalled => {
-                "Minecraft exited before startup completed after startup activity stalled."
-            }
-            LaunchFailureClass::OutOfMemory
-            | LaunchFailureClass::GraphicsDriverCrash
-            | LaunchFailureClass::MissingDependency
-            | LaunchFailureClass::ModTransformationFailure
-            | LaunchFailureClass::ModAttributedCrash
-            | LaunchFailureClass::Unknown => {
-                "Minecraft exited before Guardian could verify a completed startup."
-            }
-        },
-    };
-    reason.to_string()
-}
-
-fn prepare_failure_guidance(
-    failure_class: LaunchFailureClass,
-    explicit_java_override_present: bool,
-    explicit_jvm_args_present: bool,
-    explicit_jvm_preset_present: bool,
-) -> Vec<&'static str> {
-    match failure_class {
-        LaunchFailureClass::JavaRuntimeMismatch => {
-            if explicit_java_override_present {
-                vec!["Remove the Java override or switch Guardian Mode back to Managed."]
-            } else {
-                vec!["Use a compatible Java runtime or let Axial use the managed runtime."]
-            }
-        }
-        LaunchFailureClass::JvmUnsupportedOption
-        | LaunchFailureClass::JvmExperimentalUnlock
-        | LaunchFailureClass::JvmOptionOrdering => {
-            if explicit_jvm_args_present {
-                vec!["Remove the explicit JVM args or switch Guardian Mode back to Managed."]
-            } else if explicit_jvm_preset_present {
-                vec!["Choose a safer JVM preset or switch Guardian Mode back to Managed."]
-            } else {
-                vec!["Use safer launch settings or let Axial manage compatibility."]
-            }
-        }
-        LaunchFailureClass::StartupStalled => {
-            vec!["Launch stalled before startup. Review recent override changes first."]
-        }
-        LaunchFailureClass::LauncherManagedArtifactSignature => {
-            vec![
-                "Repair the installed version so Axial can replace the affected launcher-managed jars.",
-            ]
-        }
-        _ => Vec::new(),
-    }
-}
-
-fn startup_failure_guidance(
-    request: &GuardianStartupFailureRequest<'_>,
-    failure_class: LaunchFailureClass,
-) -> Vec<String> {
-    if let Some(copy) = accepted_launch_failure_copy(failure_class, request.crash_evidence) {
-        return vec![copy.guidance];
-    }
-    if failure_class == LaunchFailureClass::StartupStalled {
-        return if request_has_explicit_startup_intent(request) {
-            vec![
-                "Review recent Java, JVM preset, or JVM argument overrides before retrying."
-                    .to_string(),
-            ]
-        } else {
-            vec!["Review the latest game log before retrying.".to_string()]
-        };
-    }
-
-    let mut guidance = prepare_failure_guidance(
-        failure_class,
-        request.explicit_java_override_present,
-        request.explicit_jvm_args_present,
-        request.explicit_jvm_preset_present,
-    )
-    .into_iter()
-    .map(str::to_string)
-    .collect::<Vec<_>>();
-    if !guidance.is_empty() {
-        return guidance;
-    }
-    if request_has_explicit_startup_intent(request) {
-        guidance.push(
-            "Review recent Java, JVM preset, or JVM argument overrides before retrying."
-                .to_string(),
-        );
-    } else {
-        guidance.push("Review the latest game log before retrying.".to_string());
-    }
-    guidance
-}
-
-fn bounded_public_text(value: &str) -> Option<String> {
-    sanitize_evidence_text(
-        value,
-        RedactionAudience::UserVisible,
-        MAX_LAUNCH_DECISION_DETAIL_CHARS,
-    )
-}
-
-fn suspected_mod_label(crash_evidence: Option<&CrashEvidence>) -> Option<String> {
-    crash_evidence
-        .and_then(|evidence| evidence.suspected_mods.first())
-        .and_then(|suspected_mod| bounded_public_text(suspected_mod.name.as_str()))
-}
-
-fn bounded_public_lines<const N: usize>(values: [&str; N]) -> Vec<String> {
-    values
-        .into_iter()
-        .filter_map(bounded_public_text)
-        .take(MAX_LAUNCH_DECISION_LINES)
-        .collect()
-}
-
-fn public_summary(value: &str) -> String {
-    sanitize_evidence_text(
-        value,
-        RedactionAudience::UserVisible,
-        MAX_LAUNCH_DECISION_SUMMARY_CHARS,
-    )
-    .unwrap_or_else(|| "Guardian recorded launch safety outcome.".to_string())
-}
-
-fn safe_preset_label(value: &str) -> String {
-    let sanitized = value
-        .chars()
-        .take(64)
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-        .collect::<String>();
-    if sanitized.trim().is_empty() {
-        "none".to_string()
-    } else {
-        sanitized
-    }
-}
-
-fn push_public_line(lines: &mut Vec<String>, value: &str) {
-    if lines.len() >= MAX_LAUNCH_DECISION_LINES {
-        return;
-    }
-    let Some(value) = sanitize_evidence_text(
-        value,
-        RedactionAudience::UserVisible,
-        MAX_LAUNCH_DECISION_DETAIL_CHARS,
-    ) else {
-        return;
-    };
-    let value = value.trim();
-    if value.is_empty() || lines.iter().any(|line| line == value) {
-        return;
-    }
-    lines.push(value.to_string());
-}
-
-fn capped_lines(mut lines: Vec<String>) -> Vec<String> {
-    lines.truncate(MAX_LAUNCH_DECISION_LINES);
-    lines
-}
-
 fn is_legacy_version_family(version_id: &str) -> bool {
     if matches!(version_id.as_bytes().first(), Some(b'a' | b'b')) {
         return true;
@@ -1046,15 +604,15 @@ fn is_legacy_version_family(version_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardianLaunchRecoveryEffect, GuardianObservedLaunchFailurePhase,
-        GuardianPrepareFailureRequest, GuardianStartupFailureObservation,
-        GuardianStartupFailureRequest, guardian_observed_launch_failure_outcome,
-        guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
-        guardian_startup_failure_outcome,
+        GuardianObservedLaunchFailurePhase, GuardianPrepareFailureRequest,
+        GuardianStartupFailureObservation, GuardianStartupFailureRequest,
+        guardian_observed_launch_failure_outcome, guardian_prelaunch_preset_adjustment_directive,
+        guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
     };
     use crate::guardian::{
-        GuardianActionKind, GuardianFactId, GuardianLaunchRecoveryKind, GuardianMode,
-        conservative_launch_recovery_preset,
+        GuardianActionKind, GuardianDirective, GuardianFactId, GuardianMode,
+        GuardianPresetDowngradeReason, conservative_launch_recovery_preset,
+        guardian_directive_description,
     };
     use crate::state::contracts::{OperationPhase, OwnershipClass};
     use axial_launcher::{CrashEvidence, LaunchFailureClass};
@@ -1071,15 +629,17 @@ mod tests {
         )
         .expect("preset directive");
 
-        assert_eq!(directive.kind, GuardianLaunchRecoveryKind::DowngradePreset);
+        let GuardianDirective::DowngradeJvmPreset { preset, reason } = &directive else {
+            panic!("expected preset downgrade directive")
+        };
+        assert_eq!(preset.as_str(), "performance");
+        assert!(matches!(
+            reason,
+            GuardianPresetDowngradeReason::Compatibility { requested_preset }
+                if requested_preset.as_str() == "ultra_low_latency"
+        ));
         assert_eq!(
-            directive.effect,
-            GuardianLaunchRecoveryEffect::DowngradePreset {
-                preset: "performance".to_string()
-            }
-        );
-        assert_eq!(
-            directive.description,
+            guardian_directive_description(&directive),
             "Guardian downgraded JVM preset from \"ultra_low_latency\" to \"performance\" before launch"
         );
     }
@@ -1161,17 +721,14 @@ mod tests {
             outcome.user_outcome.guidance,
             ["Review the instance memory allocation and close memory-heavy apps before retrying."]
         );
-        assert!(
-            outcome.user_outcome.summary.chars().count()
-                <= super::MAX_LAUNCH_DECISION_SUMMARY_CHARS
-        );
+        assert!(outcome.user_outcome.summary.chars().count() <= 180);
         assert!(
             outcome
                 .user_outcome
                 .details
                 .iter()
                 .chain(&outcome.user_outcome.guidance)
-                .all(|line| line.chars().count() <= super::MAX_LAUNCH_DECISION_DETAIL_CHARS)
+                .all(|line| line.chars().count() <= 240)
         );
 
         assert_eq!(
@@ -1191,13 +748,13 @@ mod tests {
             post_boot.summary,
             "Minecraft stopped after running out of memory."
         );
-        assert!(post_boot.summary.chars().count() <= super::MAX_LAUNCH_DECISION_SUMMARY_CHARS);
+        assert!(post_boot.summary.chars().count() <= 180);
         assert!(
             post_boot
                 .details
                 .iter()
                 .chain(&post_boot.guidance)
-                .all(|line| line.chars().count() <= super::MAX_LAUNCH_DECISION_DETAIL_CHARS)
+                .all(|line| line.chars().count() <= 240)
         );
     }
 
@@ -1241,7 +798,7 @@ mod tests {
                     .details
                     .iter()
                     .chain(&outcome.user_outcome.guidance)
-                    .all(|line| line.chars().count() <= super::MAX_LAUNCH_DECISION_DETAIL_CHARS)
+                    .all(|line| line.chars().count() <= 240)
             );
 
             let before_boot = guardian_observed_launch_failure_outcome(
@@ -1368,6 +925,26 @@ mod tests {
         assert!(!lower.contains("-xmx"));
         assert!(!lower.contains("--username"));
         assert!(!lower.contains("secret"));
+    }
+
+    #[test]
+    fn public_prepare_outcome_falls_back_when_text_exceeds_byte_bound() {
+        let public_error = "é".repeat(121);
+        let outcome = guardian_prepare_failure_outcome(GuardianPrepareFailureRequest {
+            mode: GuardianMode::Managed,
+            failure_class: LaunchFailureClass::Unknown,
+            public_error: &public_error,
+            requested_java_present: false,
+            explicit_java_override_present: false,
+            explicit_jvm_args_present: false,
+            runtime_intervention_applied: false,
+            raw_jvm_args_intervention_applied: false,
+        });
+
+        assert_eq!(
+            outcome.user_outcome.details,
+            ["Launch preparation failed before Minecraft could start."]
+        );
     }
 
     #[test]

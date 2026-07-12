@@ -41,10 +41,10 @@ use metadata::persist_launch_metadata;
 use prewarm::{format_prewarm_run_summary, prewarm_launch_plan};
 use proof::persist_launch_proof_with_context_owned as persist_launch_proof_with_context;
 use recovery::{
-    RecoveryDirectiveOutcome, RecoveryDirectiveRequest, apply_prepare_recovery_directive,
-    apply_startup_recovery_directive, block_guardian_with_user_outcome, handle_recovery_directive,
-    record_failed_self_healing_if_any, record_prelaunch_preset_adjustment_directive,
-    record_successful_self_healing_if_any,
+    RecoveryDirectiveOutcome, RecoveryDirectiveRequest, RecoveryDirectiveStage,
+    apply_prepare_recovery_directive, apply_startup_recovery_directive,
+    block_guardian_with_user_outcome, handle_recovery_directive, record_failed_self_healing_if_any,
+    record_prelaunch_preset_adjustment_directive, record_successful_self_healing_if_any,
 };
 use spawn::{
     launch_command_target, launch_spawn_failed_stage_evidence, launch_spawn_stage_evidence,
@@ -634,6 +634,7 @@ async fn launch_session_inner_with_control(
                             session_id: &session_id,
                             intent: &intent,
                             directive,
+                            stage: RecoveryDirectiveStage::Prepare,
                             mode: api_guardian_mode(intent.guardian.mode),
                             failure_class,
                             recovery_attempts: &mut recovery_attempts,
@@ -1129,6 +1130,7 @@ async fn launch_session_inner_with_control(
                             session_id: &session_id,
                             intent: &intent,
                             directive,
+                            stage: RecoveryDirectiveStage::Startup,
                             mode: api_guardian_mode(intent.guardian.mode),
                             failure_class,
                             recovery_attempts: &mut recovery_attempts,
@@ -1139,13 +1141,20 @@ async fn launch_session_inner_with_control(
                         .map_err(guardian_journal_error)?
                         {
                             RecoveryDirectiveOutcome::Apply(recovery_plan) => {
-                                apply_startup_recovery_directive(
+                                if apply_startup_recovery_directive(
                                     &mut guardian,
                                     &mut attempt,
                                     &recovery_plan,
-                                );
-                                last_recovery_plan = Some(recovery_plan);
-                                continue;
+                                ) {
+                                    last_recovery_plan = Some(recovery_plan);
+                                    continue;
+                                } else {
+                                    block_guardian_with_user_outcome(
+                                        &mut guardian,
+                                        &startup_outcome.user_outcome,
+                                    );
+                                    startup_outcome.user_outcome.summary.clone()
+                                }
                             }
                             RecoveryDirectiveOutcome::Exhausted => {
                                 block_guardian_with_user_outcome(
@@ -1231,8 +1240,7 @@ impl LaunchLoopControl {
         if self.forced_prepare_failure.is_some() {
             return false;
         }
-        apply_prepare_recovery_directive(guardian, attempt, recovery_plan);
-        true
+        apply_prepare_recovery_directive(guardian, attempt, recovery_plan)
     }
 
     fn record_capped_prepare_failure(&self, _error: &axial_launcher::LaunchPreparationError) {

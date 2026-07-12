@@ -7,6 +7,7 @@
 pub mod artifact_descriptor;
 pub mod artifact_repair;
 mod copy;
+mod directive;
 pub mod healing;
 pub mod install_evidence;
 pub mod jvm_preset;
@@ -46,8 +47,17 @@ pub use artifact_repair::{
     GuardianArtifactRepairMutation, GuardianArtifactRepairOutcome, GuardianArtifactRepairRequest,
     GuardianArtifactRepairSource, GuardianArtifactRepairStatus, execute_guardian_artifact_repair,
 };
-pub(crate) use copy::{GuardianCopyRequest, author_guardian_copy};
+pub use copy::launch_recovery_suppressed_user_outcome;
+pub(crate) use copy::{
+    GuardianCopyRequest, author_guardian_copy, guardian_directive_description,
+    guardian_directive_recovery_label,
+};
 pub use diagnosis::{Diagnosis, build_safety_case, diagnose};
+pub use directive::{
+    GuardianDirective, GuardianManagedJavaReason, GuardianPresetDowngradeReason,
+    GuardianPresetValue, GuardianStripJvmArgsReason,
+};
+pub(crate) use directive::{GuardianRecoveryIntentAxis, GuardianRecoveryMetadata};
 pub use facts::guardian_fact_from_execution;
 pub use healing::{
     GuardianManagedRuntimeRepairRequest, GuardianRepairOutcome, GuardianRepairStatus,
@@ -78,24 +88,20 @@ pub use launch_failure_memory::{
     record_launch_failure_observation,
 };
 pub use launch_recovery::{
-    GuardianLaunchRecoveryCurrentIntent, GuardianLaunchRecoveryDirective,
-    GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryJournalTransition,
-    GuardianLaunchRecoveryKind, GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryPlan,
-    GuardianLaunchRecoveryPlanRejection, GuardianLaunchRecoveryPlanRequest,
-    GuardianLaunchRecoveryRecordRequest, GuardianLaunchRecoveryStatus,
-    launch_recovery_journal_transition_conflicts, launch_recovery_journal_transition_matches,
-    launch_recovery_user_intent_fingerprint, plan_launch_recovery_directive,
-    record_launch_recovery_attempt, record_launch_recovery_failure, record_launch_recovery_success,
+    GuardianLaunchRecoveryCurrentIntent, GuardianLaunchRecoveryJournalTransition,
+    GuardianLaunchRecoveryOutcome, GuardianLaunchRecoveryPlan, GuardianLaunchRecoveryPlanRejection,
+    GuardianLaunchRecoveryPlanRequest, GuardianLaunchRecoveryRecordRequest,
+    GuardianLaunchRecoveryStatus, launch_recovery_journal_transition_conflicts,
+    launch_recovery_journal_transition_matches, launch_recovery_user_intent_fingerprint,
+    plan_launch_recovery_directive, record_launch_recovery_attempt, record_launch_recovery_failure,
+    record_launch_recovery_success,
 };
 pub use model::{
     ActionPlanPrerequisite, DiagnosisId, FactReliability, GuardianAction, GuardianActionKind,
     GuardianActionPlan, GuardianConfidence, GuardianDecision, GuardianDomain, GuardianFact,
     GuardianFactId, GuardianMode, GuardianSeverity, SafetyCase, SafetyOutcome,
 };
-pub use outcome::{
-    GuardianUserOutcome, launch_recovery_public_action_label,
-    launch_recovery_suppressed_user_outcome,
-};
+pub use outcome::GuardianUserOutcome;
 pub use performance::{
     GuardianPerformanceOperationKind, GuardianPerformanceSupervisionPlan,
     GuardianPerformanceSupervisionRejection, GuardianPerformanceSupervisionRequest,
@@ -106,9 +112,8 @@ pub use performance::{
 pub(super) use policy::PreflightAdmission;
 pub use policy::{GuardianPolicyContext, decide_guardian_policy};
 pub use preflight::{
-    GuardianPreflightDirective, GuardianPreflightOutcome, GuardianPreflightOutcomeRequest,
-    GuardianPreflightOverrideSignals, GuardianPreflightReadiness, GuardianPreflightResourceSignals,
-    guardian_preflight_outcome,
+    GuardianPreflightOutcome, GuardianPreflightOutcomeRequest, GuardianPreflightOverrideSignals,
+    GuardianPreflightReadiness, GuardianPreflightResourceSignals, guardian_preflight_outcome,
 };
 pub use repair_plan::{
     GuardianRepairExecutor, GuardianRepairMutation, GuardianRepairPlan,

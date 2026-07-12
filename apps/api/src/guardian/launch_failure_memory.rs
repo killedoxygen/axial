@@ -377,7 +377,8 @@ fn launch_failure_class_for_diagnosis(diagnosis_id: DiagnosisId) -> Option<Launc
 mod tests {
     use super::*;
     use crate::guardian::{
-        GuardianActionKind, GuardianLaunchRecoveryKind, launch_recovery_user_intent_fingerprint,
+        GuardianActionKind, GuardianDirective, GuardianManagedJavaReason,
+        GuardianStripJvmArgsReason, launch_recovery_user_intent_fingerprint,
     };
     use crate::observability::RedactionAudience;
 
@@ -470,7 +471,7 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T10:00:00Z",
             Some("2026-07-11T11:00:00Z"),
-            &intent_fingerprint(GuardianLaunchRecoveryKind::DowngradePreset),
+            &intent_fingerprint(RecoveryCase::DowngradePreset),
         );
         let entries = vec![startup, repair];
 
@@ -559,7 +560,7 @@ mod tests {
             FailureMemoryActionOutcome::Suppressed,
             "2026-07-11T09:30:00Z",
             Some("2026-07-11T11:00:00Z"),
-            &intent_fingerprint(GuardianLaunchRecoveryKind::StripRawJvmArgs),
+            &intent_fingerprint(RecoveryCase::StripRawJvmArgs),
         );
         let expired = repair_entry(
             "instance-a",
@@ -569,7 +570,7 @@ mod tests {
             FailureMemoryActionOutcome::Suppressed,
             "2026-07-11T09:40:00Z",
             Some("2026-07-11T09:59:00Z"),
-            &intent_fingerprint(GuardianLaunchRecoveryKind::DisableCustomGc),
+            &intent_fingerprint(RecoveryCase::DisableCustomGc),
         );
 
         let active_facts =
@@ -601,7 +602,7 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
             None,
-            &intent_fingerprint(GuardianLaunchRecoveryKind::StripRawJvmArgs),
+            &intent_fingerprint(RecoveryCase::StripRawJvmArgs),
         );
         let custom_gc_repair = repair_entry(
             "instance-a",
@@ -611,7 +612,7 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
             None,
-            &intent_fingerprint(GuardianLaunchRecoveryKind::DisableCustomGc),
+            &intent_fingerprint(RecoveryCase::DisableCustomGc),
         );
 
         let raw_match = launch_failure_memory_guardian_facts(intake_request(std::slice::from_ref(
@@ -653,7 +654,7 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
             Some("2026-07-11T11:00:00Z"),
-            &intent_fingerprint(GuardianLaunchRecoveryKind::SwitchManagedRuntime),
+            &intent_fingerprint(RecoveryCase::SwitchManagedRuntime),
         );
         let preset_repair = repair_entry(
             "instance-a",
@@ -663,7 +664,7 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
             Some("2026-07-11T11:00:00Z"),
-            &intent_fingerprint(GuardianLaunchRecoveryKind::DowngradePreset),
+            &intent_fingerprint(RecoveryCase::DowngradePreset),
         );
         let args_repair = repair_entry(
             "instance-a",
@@ -673,7 +674,7 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
             Some("2026-07-11T11:00:00Z"),
-            &intent_fingerprint(GuardianLaunchRecoveryKind::StripRawJvmArgs),
+            &intent_fingerprint(RecoveryCase::StripRawJvmArgs),
         );
         let changed_args = vec!["-XX:+UseG1GC".to_string()];
         let changed_cases = [
@@ -801,7 +802,7 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
             "2026-07-11T09:00:00Z",
             Some("2026-07-11T11:00:00Z"),
-            &intent_fingerprint(GuardianLaunchRecoveryKind::DowngradePreset),
+            &intent_fingerprint(RecoveryCase::DowngradePreset),
         );
         let facts =
             launch_failure_memory_guardian_facts(intake_request(std::slice::from_ref(&repair)));
@@ -929,8 +930,28 @@ mod tests {
         }
     }
 
-    fn intent_fingerprint(kind: GuardianLaunchRecoveryKind) -> String {
-        launch_recovery_user_intent_fingerprint(current_intent(), kind)
+    #[derive(Clone, Copy)]
+    enum RecoveryCase {
+        SwitchManagedRuntime,
+        StripRawJvmArgs,
+        DowngradePreset,
+        DisableCustomGc,
+    }
+
+    fn intent_fingerprint(case: RecoveryCase) -> String {
+        let directive = match case {
+            RecoveryCase::SwitchManagedRuntime => GuardianDirective::UseManagedJava {
+                reason: GuardianManagedJavaReason::StartupRecovery,
+            },
+            RecoveryCase::StripRawJvmArgs => GuardianDirective::StripJvmArgs {
+                reason: GuardianStripJvmArgsReason::PrepareFailure,
+            },
+            RecoveryCase::DowngradePreset => {
+                GuardianDirective::startup_preset_downgrade("performance")
+            }
+            RecoveryCase::DisableCustomGc => GuardianDirective::DisableCustomGc,
+        };
+        launch_recovery_user_intent_fingerprint(current_intent(), &directive)
             .expect("valid test recovery intent")
     }
 

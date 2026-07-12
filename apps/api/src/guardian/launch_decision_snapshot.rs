@@ -1,9 +1,8 @@
 use super::decision_snapshot::{PolicyDecisionCell, decision_projection};
 use super::launch_decision::preset_adjustment_snapshot;
 use super::{
-    Diagnosis, GuardianActionKind, GuardianConfidence, GuardianDecision, GuardianDomain,
-    GuardianFactId, GuardianLaunchFailureOutcome, GuardianLaunchRecoveryDirective,
-    GuardianLaunchRecoveryEffect, GuardianLaunchRecoveryKind, GuardianMode,
+    Diagnosis, GuardianActionKind, GuardianConfidence, GuardianDecision, GuardianDirective,
+    GuardianDomain, GuardianFactId, GuardianLaunchFailureOutcome, GuardianMode,
     GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest, GuardianSeverity,
     GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianUserOutcome,
     SafetyCase, guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
@@ -133,7 +132,7 @@ pub(super) struct LaunchBoundaryCopySource {
     pub id: String,
     pub authored_decision: Option<GuardianActionKind>,
     pub outcome: Option<GuardianUserOutcome>,
-    pub directive: Option<GuardianLaunchRecoveryDirective>,
+    pub directive: Option<GuardianDirective>,
 }
 
 struct BoundarySnapshotCase {
@@ -180,8 +179,26 @@ impl From<&Diagnosis> for DiagnosisProjection {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DirectiveProjection {
-    kind: GuardianLaunchRecoveryKind,
+    kind: DirectiveKindProjection,
     effect: DirectiveEffectProjection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum DirectiveKindProjection {
+    SwitchManagedRuntime,
+    StripRawJvmArgs,
+    DowngradePreset,
+    DisableCustomGc,
+}
+
+impl DirectiveKindProjection {
+    fn action_kind(self) -> GuardianActionKind {
+        match self {
+            Self::SwitchManagedRuntime => GuardianActionKind::Fallback,
+            Self::StripRawJvmArgs | Self::DisableCustomGc => GuardianActionKind::Strip,
+            Self::DowngradePreset => GuardianActionKind::Downgrade,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -666,25 +683,26 @@ fn boundary_decision_projection(
     decision_projection(decision, safety_case)
 }
 
-impl From<&GuardianLaunchRecoveryDirective> for DirectiveProjection {
-    fn from(directive: &GuardianLaunchRecoveryDirective) -> Self {
-        Self {
-            kind: directive.kind,
-            effect: match &directive.effect {
-                GuardianLaunchRecoveryEffect::ForceManagedRuntime => {
-                    DirectiveEffectProjection::ForceManagedRuntime
-                }
-                GuardianLaunchRecoveryEffect::StripRawJvmArgs => {
-                    DirectiveEffectProjection::StripRawJvmArgs
-                }
-                GuardianLaunchRecoveryEffect::DowngradePreset { preset } => {
-                    DirectiveEffectProjection::DowngradePreset {
-                        preset: preset.clone(),
-                    }
-                }
-                GuardianLaunchRecoveryEffect::DisableCustomGc => {
-                    DirectiveEffectProjection::DisableCustomGc
-                }
+impl From<&GuardianDirective> for DirectiveProjection {
+    fn from(directive: &GuardianDirective) -> Self {
+        match directive {
+            GuardianDirective::UseManagedJava { .. } => Self {
+                kind: DirectiveKindProjection::SwitchManagedRuntime,
+                effect: DirectiveEffectProjection::ForceManagedRuntime,
+            },
+            GuardianDirective::StripJvmArgs { .. } => Self {
+                kind: DirectiveKindProjection::StripRawJvmArgs,
+                effect: DirectiveEffectProjection::StripRawJvmArgs,
+            },
+            GuardianDirective::DowngradeJvmPreset { preset, .. } => Self {
+                kind: DirectiveKindProjection::DowngradePreset,
+                effect: DirectiveEffectProjection::DowngradePreset {
+                    preset: preset.as_str().to_string(),
+                },
+            },
+            GuardianDirective::DisableCustomGc => Self {
+                kind: DirectiveKindProjection::DisableCustomGc,
+                effect: DirectiveEffectProjection::DisableCustomGc,
             },
         }
     }
@@ -775,16 +793,16 @@ fn assert_snapshot_coverage(snapshot: &GuardianLaunchBoundarySnapshot) {
         assert!(matches!(
             (&directive.kind, &directive.effect),
             (
-                GuardianLaunchRecoveryKind::SwitchManagedRuntime,
+                DirectiveKindProjection::SwitchManagedRuntime,
                 DirectiveEffectProjection::ForceManagedRuntime
             ) | (
-                GuardianLaunchRecoveryKind::StripRawJvmArgs,
+                DirectiveKindProjection::StripRawJvmArgs,
                 DirectiveEffectProjection::StripRawJvmArgs
             ) | (
-                GuardianLaunchRecoveryKind::DowngradePreset,
+                DirectiveKindProjection::DowngradePreset,
                 DirectiveEffectProjection::DowngradePreset { .. }
             ) | (
-                GuardianLaunchRecoveryKind::DisableCustomGc,
+                DirectiveKindProjection::DisableCustomGc,
                 DirectiveEffectProjection::DisableCustomGc
             )
         ));

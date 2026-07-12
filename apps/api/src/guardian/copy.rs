@@ -1,17 +1,73 @@
 use super::{
-    DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianFact,
+    DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianDirective, GuardianFact,
     GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
-    GuardianPerformanceSupervisionRejection, GuardianRepairStatus, GuardianUserOutcome,
+    GuardianLaunchRecoveryPlan, GuardianManagedJavaReason, GuardianObservedLaunchFailurePhase,
+    GuardianPerformanceSupervisionRejection, GuardianPresetDowngradeReason, GuardianRepairStatus,
+    GuardianStartupFailureObservation, GuardianStripJvmArgsReason, GuardianUserOutcome,
 };
-use crate::observability::{RedactionAudience, sanitize_evidence_token};
+use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
 use crate::state::contracts::OperationPhase;
-use axial_launcher::LaunchFailureClass;
+use axial_launcher::{CrashEvidence, LaunchFailureClass};
 use chrono::{DateTime, Timelike, Utc};
 
 const MAX_SUMMARY_BYTES: usize = 180;
 const MAX_LINE_BYTES: usize = 240;
 const MAX_COLLECTION_LINES: usize = 6;
 const MAX_DYNAMIC_TOKEN_BYTES: usize = 64;
+
+pub(crate) fn guardian_directive_description(directive: &GuardianDirective) -> String {
+    let rendered = match directive {
+        GuardianDirective::UseManagedJava {
+            reason: GuardianManagedJavaReason::Preflight,
+        } => "Guardian will use managed Java for this launch.".to_string(),
+        GuardianDirective::UseManagedJava {
+            reason: GuardianManagedJavaReason::PrepareFailure,
+        } => "Guardian switched to managed Java before launch".to_string(),
+        GuardianDirective::UseManagedJava {
+            reason: GuardianManagedJavaReason::StartupRecovery,
+        } => "Automatic retry: switched to managed Java after runtime mismatch".to_string(),
+        GuardianDirective::StripJvmArgs {
+            reason: GuardianStripJvmArgsReason::Preflight,
+        } => "Guardian will remove incompatible explicit JVM args for this launch.".to_string(),
+        GuardianDirective::StripJvmArgs {
+            reason: GuardianStripJvmArgsReason::PrepareFailure,
+        } => "Guardian removed incompatible explicit JVM args before launch".to_string(),
+        GuardianDirective::DowngradeJvmPreset {
+            preset,
+            reason: GuardianPresetDowngradeReason::Compatibility { requested_preset },
+        } => format!(
+            "Guardian downgraded JVM preset from \"{requested_preset}\" to \"{preset}\" before launch"
+        ),
+        GuardianDirective::DowngradeJvmPreset {
+            preset,
+            reason: GuardianPresetDowngradeReason::StartupRecovery,
+        } => {
+            format!("Automatic retry: downgraded JVM preset to \"{preset}\" after startup failure")
+        }
+        GuardianDirective::DisableCustomGc => {
+            "Automatic retry: disabled custom GC flags after startup failure".to_string()
+        }
+    };
+    checked_rendered_line(rendered)
+}
+
+pub(crate) fn guardian_directive_recovery_label(directive: &GuardianDirective) -> &'static str {
+    match directive {
+        GuardianDirective::UseManagedJava { .. } => "managed Java recovery",
+        GuardianDirective::StripJvmArgs { .. } => "explicit JVM argument recovery",
+        GuardianDirective::DowngradeJvmPreset { .. } => "JVM preset recovery",
+        GuardianDirective::DisableCustomGc => "custom GC flag recovery",
+    }
+}
+
+pub fn launch_recovery_suppressed_user_outcome(
+    plan: &GuardianLaunchRecoveryPlan,
+) -> GuardianUserOutcome {
+    author_guardian_copy(GuardianCopyRequest::launch_recovery_suppressed(
+        &plan.directive,
+    ))
+    .expect("launch recovery suppression copy request is closed")
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct GuardianCopyRequest<'a> {
@@ -44,6 +100,32 @@ enum GuardianCopyContext<'a> {
         phase: OperationPhase,
         diagnoses: Vec<DiagnosisId>,
         history: Vec<PreflightHistory>,
+    },
+    PrepareFailure {
+        decision: GuardianActionKind,
+        failure_class: LaunchFailureClass,
+        public_error: Option<String>,
+        explicit_java_override_present: bool,
+        explicit_jvm_args_present: bool,
+        directive: Option<GuardianDirective>,
+    },
+    StartupFailure {
+        decision: GuardianActionKind,
+        failure_class: LaunchFailureClass,
+        stalled: bool,
+        first_suspected_mod: Option<String>,
+        explicit_java_override_present: bool,
+        explicit_jvm_args_present: bool,
+        explicit_jvm_preset_present: bool,
+        directive: Option<GuardianDirective>,
+    },
+    ObservedLaunchFailure {
+        failure_class: LaunchFailureClass,
+        observed_phase: GuardianObservedLaunchFailurePhase,
+        first_suspected_mod: Option<String>,
+    },
+    LaunchRecoverySuppressed {
+        directive: GuardianDirective,
     },
 }
 
@@ -129,6 +211,85 @@ impl<'a> GuardianCopyRequest<'a> {
                 phase,
                 diagnoses: diagnoses.to_vec(),
                 history: preflight_history(facts),
+            },
+        }
+    }
+
+    pub(crate) fn prepare_failure(
+        decision: GuardianActionKind,
+        failure_class: LaunchFailureClass,
+        public_error: &str,
+        explicit_java_override_present: bool,
+        explicit_jvm_args_present: bool,
+        directive: Option<&GuardianDirective>,
+    ) -> Self {
+        Self {
+            diagnosis_id: None,
+            context: GuardianCopyContext::PrepareFailure {
+                decision,
+                failure_class,
+                public_error: sanitize_evidence_text(
+                    public_error,
+                    RedactionAudience::UserVisible,
+                    MAX_LINE_BYTES,
+                )
+                .filter(|public_error| public_error.len() <= MAX_LINE_BYTES),
+                explicit_java_override_present,
+                explicit_jvm_args_present,
+                directive: directive.cloned(),
+            },
+        }
+    }
+
+    pub(crate) fn startup_failure(
+        decision: GuardianActionKind,
+        observation: GuardianStartupFailureObservation,
+        crash_evidence: Option<&CrashEvidence>,
+        explicit_java_override_present: bool,
+        explicit_jvm_args_present: bool,
+        explicit_jvm_preset_present: bool,
+        directive: Option<&GuardianDirective>,
+    ) -> Self {
+        Self {
+            diagnosis_id: None,
+            context: GuardianCopyContext::StartupFailure {
+                decision,
+                failure_class: match observation {
+                    GuardianStartupFailureObservation::Stalled => {
+                        LaunchFailureClass::StartupStalled
+                    }
+                    GuardianStartupFailureObservation::Exited { failure_class } => failure_class,
+                },
+                stalled: matches!(observation, GuardianStartupFailureObservation::Stalled),
+                first_suspected_mod: first_suspected_mod(crash_evidence),
+                explicit_java_override_present,
+                explicit_jvm_args_present,
+                explicit_jvm_preset_present,
+                directive: directive.cloned(),
+            },
+        }
+    }
+
+    pub(crate) fn observed_launch_failure(
+        failure_class: LaunchFailureClass,
+        crash_evidence: Option<&CrashEvidence>,
+        observed_phase: GuardianObservedLaunchFailurePhase,
+    ) -> Self {
+        Self {
+            diagnosis_id: None,
+            context: GuardianCopyContext::ObservedLaunchFailure {
+                failure_class,
+                observed_phase,
+                first_suspected_mod: first_suspected_mod(crash_evidence),
+            },
+        }
+    }
+
+    pub(crate) fn launch_recovery_suppressed(directive: &GuardianDirective) -> Self {
+        Self {
+            diagnosis_id: None,
+            context: GuardianCopyContext::LaunchRecoverySuppressed {
+                directive: directive.clone(),
             },
         }
     }
@@ -1096,6 +1257,61 @@ pub(crate) fn author_guardian_copy(
         diagnosis_id,
         context,
     } = request;
+    match &context {
+        GuardianCopyContext::PrepareFailure {
+            decision,
+            failure_class,
+            public_error,
+            explicit_java_override_present,
+            explicit_jvm_args_present,
+            directive,
+        } => {
+            return Some(author_prepare_failure_copy(
+                *decision,
+                *failure_class,
+                public_error.as_deref(),
+                *explicit_java_override_present,
+                *explicit_jvm_args_present,
+                directive.as_ref(),
+            ));
+        }
+        GuardianCopyContext::StartupFailure {
+            decision,
+            failure_class,
+            stalled,
+            first_suspected_mod,
+            explicit_java_override_present,
+            explicit_jvm_args_present,
+            explicit_jvm_preset_present,
+            directive,
+        } => {
+            return Some(author_startup_failure_copy(StartupFailureCopyInput {
+                decision: *decision,
+                failure_class: *failure_class,
+                stalled: *stalled,
+                suspected_mod: first_suspected_mod.as_deref(),
+                explicit_java: *explicit_java_override_present,
+                explicit_jvm_args: *explicit_jvm_args_present,
+                explicit_jvm_preset: *explicit_jvm_preset_present,
+                directive: directive.as_ref(),
+            }));
+        }
+        GuardianCopyContext::ObservedLaunchFailure {
+            failure_class,
+            observed_phase,
+            first_suspected_mod,
+        } => {
+            return author_observed_launch_failure_copy(
+                *failure_class,
+                *observed_phase,
+                first_suspected_mod.as_deref(),
+            );
+        }
+        GuardianCopyContext::LaunchRecoverySuppressed { directive } => {
+            return Some(author_launch_recovery_suppressed_copy(directive));
+        }
+        _ => {}
+    }
     if let GuardianCopyContext::Preflight {
         authored_decision,
         effective_decision,
@@ -1160,6 +1376,14 @@ impl GuardianCopyContext<'_> {
             Self::Preflight {
                 effective_decision, ..
             } => *effective_decision,
+            Self::PrepareFailure { decision, .. } | Self::StartupFailure { decision, .. } => {
+                *decision
+            }
+            Self::ObservedLaunchFailure { observed_phase, .. } => match observed_phase {
+                GuardianObservedLaunchFailurePhase::BeforeBoot => GuardianActionKind::Block,
+                GuardianObservedLaunchFailurePhase::AfterBoot => GuardianActionKind::Warn,
+            },
+            Self::LaunchRecoverySuppressed { .. } => GuardianActionKind::Block,
         }
     }
 
@@ -1199,7 +1423,11 @@ impl GuardianCopyContext<'_> {
                 }
             }),
             Self::PersistedStateLoad { .. } => Some(CopyContextKey::PersistedStateLoad),
-            Self::Preflight { .. } => None,
+            Self::Preflight { .. }
+            | Self::PrepareFailure { .. }
+            | Self::StartupFailure { .. }
+            | Self::ObservedLaunchFailure { .. }
+            | Self::LaunchRecoverySuppressed { .. } => None,
         }
     }
 
@@ -1241,6 +1469,358 @@ fn render_line(line: CopyLine, context: &GuardianCopyContext<'_>) -> String {
                 "Java runtime component {component} needs Rosetta 2 on this Mac."
             ))
         }
+    }
+}
+
+struct AcceptedLaunchFailureCopy {
+    startup_detail: String,
+    running_summary: String,
+    running_detail: String,
+    guidance: String,
+}
+
+fn first_suspected_mod(crash_evidence: Option<&CrashEvidence>) -> Option<String> {
+    crash_evidence
+        .and_then(|evidence| evidence.suspected_mods.first())
+        .and_then(|suspected_mod| {
+            sanitize_evidence_text(
+                suspected_mod.name.as_str(),
+                RedactionAudience::UserVisible,
+                MAX_LINE_BYTES,
+            )
+            .filter(|suspected_mod| suspected_mod.len() <= MAX_LINE_BYTES)
+        })
+}
+
+fn accepted_failure_copy(
+    failure_class: LaunchFailureClass,
+    suspected_mod: Option<&str>,
+) -> Option<AcceptedLaunchFailureCopy> {
+    let copy = match failure_class {
+        LaunchFailureClass::OutOfMemory => (
+            "Minecraft exited before startup completed after running out of memory.",
+            "Minecraft stopped after running out of memory.",
+            "Guardian detected an out-of-memory crash after startup completed.",
+            "Review the instance memory allocation and close memory-heavy apps before retrying.",
+        ),
+        LaunchFailureClass::GraphicsDriverCrash => (
+            "Minecraft exited before startup completed with a detected graphics driver crash.",
+            "Minecraft stopped after a graphics driver crash.",
+            "Guardian detected a native graphics driver crash after startup completed.",
+            "Update or reinstall the graphics driver, then retry without graphics overlays.",
+        ),
+        LaunchFailureClass::MissingDependency => (
+            "Minecraft exited before startup completed because a required dependency was missing.",
+            "Minecraft stopped because a dependency was missing.",
+            "Guardian detected a missing class or dependency after startup completed.",
+            "Check the installed mods for missing or incompatible dependencies before retrying.",
+        ),
+        LaunchFailureClass::ModTransformationFailure => (
+            "Minecraft exited before startup completed with a detected mod transformation or mixin failure.",
+            "Minecraft stopped during mod transformation.",
+            "Guardian detected a mod transformation or mixin failure after startup completed.",
+            "Update or remove the recently changed mod before retrying.",
+        ),
+        LaunchFailureClass::ModAttributedCrash => {
+            return Some(AcceptedLaunchFailureCopy {
+                startup_detail: suspected_mod
+                    .map(|name| format!("Minecraft exited before startup completed with a crash attributed to {name}."))
+                    .unwrap_or_else(|| "Minecraft exited before startup completed with a crash attributed to an installed mod.".to_string()),
+                running_summary: suspected_mod
+                    .map(|name| format!("Minecraft stopped in a crash attributed to {name}."))
+                    .unwrap_or_else(|| "Minecraft stopped in a mod-attributed crash.".to_string()),
+                running_detail: suspected_mod
+                    .map(|name| format!("Guardian attributes the crash to the installed mod {name}."))
+                    .unwrap_or_else(|| "Guardian found typed crash evidence that attributes the failure to an installed mod.".to_string()),
+                guidance: suspected_mod
+                    .map(|name| format!("Update or remove {name} before retrying."))
+                    .unwrap_or_else(|| "Update or remove the suspected mod before retrying.".to_string()),
+            });
+        }
+        LaunchFailureClass::Unknown
+        | LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering
+        | LaunchFailureClass::JavaRuntimeMismatch
+        | LaunchFailureClass::ClasspathModuleConflict
+        | LaunchFailureClass::LauncherManagedArtifactSignature
+        | LaunchFailureClass::AuthModeIncompatible
+        | LaunchFailureClass::LoaderBootstrapFailure
+        | LaunchFailureClass::StartupStalled => return None,
+    };
+    Some(AcceptedLaunchFailureCopy {
+        startup_detail: copy.0.to_string(),
+        running_summary: copy.1.to_string(),
+        running_detail: copy.2.to_string(),
+        guidance: copy.3.to_string(),
+    })
+}
+
+fn prepare_failure_reason(failure_class: LaunchFailureClass) -> &'static str {
+    match failure_class {
+        LaunchFailureClass::JavaRuntimeMismatch => {
+            "The selected Java runtime is not compatible with this version."
+        }
+        LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering => {
+            "The selected JVM settings are not compatible with this Java runtime."
+        }
+        LaunchFailureClass::Unknown
+        | LaunchFailureClass::ClasspathModuleConflict
+        | LaunchFailureClass::LauncherManagedArtifactSignature
+        | LaunchFailureClass::AuthModeIncompatible
+        | LaunchFailureClass::LoaderBootstrapFailure
+        | LaunchFailureClass::StartupStalled
+        | LaunchFailureClass::OutOfMemory
+        | LaunchFailureClass::GraphicsDriverCrash
+        | LaunchFailureClass::MissingDependency
+        | LaunchFailureClass::ModTransformationFailure
+        | LaunchFailureClass::ModAttributedCrash => {
+            "Launch preparation failed before Minecraft could start."
+        }
+    }
+}
+
+fn prepare_failure_guidance(
+    failure_class: LaunchFailureClass,
+    explicit_java: bool,
+    explicit_jvm_args: bool,
+    explicit_jvm_preset: bool,
+) -> Vec<String> {
+    let value = match failure_class {
+        LaunchFailureClass::JavaRuntimeMismatch if explicit_java => {
+            Some("Remove the Java override or switch Guardian Mode back to Managed.")
+        }
+        LaunchFailureClass::JavaRuntimeMismatch => {
+            Some("Use a compatible Java runtime or let Axial use the managed runtime.")
+        }
+        LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering
+            if explicit_jvm_args =>
+        {
+            Some("Remove the explicit JVM args or switch Guardian Mode back to Managed.")
+        }
+        LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering
+            if explicit_jvm_preset =>
+        {
+            Some("Choose a safer JVM preset or switch Guardian Mode back to Managed.")
+        }
+        LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering => {
+            Some("Use safer launch settings or let Axial manage compatibility.")
+        }
+        LaunchFailureClass::StartupStalled => {
+            Some("Launch stalled before startup. Review recent override changes first.")
+        }
+        LaunchFailureClass::LauncherManagedArtifactSignature => Some(
+            "Repair the installed version so Axial can replace the affected launcher-managed jars.",
+        ),
+        LaunchFailureClass::Unknown
+        | LaunchFailureClass::ClasspathModuleConflict
+        | LaunchFailureClass::AuthModeIncompatible
+        | LaunchFailureClass::LoaderBootstrapFailure
+        | LaunchFailureClass::OutOfMemory
+        | LaunchFailureClass::GraphicsDriverCrash
+        | LaunchFailureClass::MissingDependency
+        | LaunchFailureClass::ModTransformationFailure
+        | LaunchFailureClass::ModAttributedCrash => None,
+    };
+    value
+        .map(|line| vec![trusted_line(line, MAX_LINE_BYTES)])
+        .unwrap_or_default()
+}
+
+fn author_prepare_failure_copy(
+    decision: GuardianActionKind,
+    failure_class: LaunchFailureClass,
+    public_error: Option<&str>,
+    explicit_java: bool,
+    explicit_jvm_args: bool,
+    directive: Option<&GuardianDirective>,
+) -> GuardianUserOutcome {
+    let detail = directive
+        .map(guardian_directive_description)
+        .or_else(|| public_error.map(ToOwned::to_owned))
+        .unwrap_or_else(|| prepare_failure_reason(failure_class).to_string());
+    let summary = match decision {
+        GuardianActionKind::Fallback | GuardianActionKind::Strip => {
+            "Guardian adjusted launch preparation."
+        }
+        GuardianActionKind::AskUser => "Guardian needs confirmation before launch preparation.",
+        GuardianActionKind::Block => "Guardian blocked launch preparation.",
+        _ => "Guardian recorded launch preparation failure.",
+    };
+    GuardianUserOutcome {
+        decision: launch_public_decision(decision),
+        phase: OperationPhase::Preparing,
+        summary: trusted_line(summary, MAX_SUMMARY_BYTES),
+        details: finalize_launch_lines([detail]),
+        guidance: prepare_failure_guidance(failure_class, explicit_java, explicit_jvm_args, false),
+    }
+}
+
+fn startup_failure_reason(
+    failure_class: LaunchFailureClass,
+    stalled: bool,
+    suspected_mod: Option<&str>,
+) -> String {
+    if let Some(copy) = accepted_failure_copy(failure_class, suspected_mod) {
+        return copy.startup_detail;
+    }
+    if stalled {
+        return "No startup activity was observed before the startup window ended.".to_string();
+    }
+    match failure_class {
+        LaunchFailureClass::JvmUnsupportedOption
+        | LaunchFailureClass::JvmExperimentalUnlock
+        | LaunchFailureClass::JvmOptionOrdering => "Minecraft exited before startup completed with a detected JVM option compatibility failure.",
+        LaunchFailureClass::JavaRuntimeMismatch => "Minecraft exited before startup completed with a detected Java runtime mismatch.",
+        LaunchFailureClass::ClasspathModuleConflict => "Minecraft exited before startup completed with a detected classpath or module conflict.",
+        LaunchFailureClass::LauncherManagedArtifactSignature => "Minecraft exited before startup completed with detected launcher-managed jar signature corruption.",
+        LaunchFailureClass::AuthModeIncompatible => "Minecraft exited before startup completed because the selected auth mode was not launch-ready.",
+        LaunchFailureClass::LoaderBootstrapFailure => "Minecraft exited before startup completed with a detected loader bootstrap failure.",
+        LaunchFailureClass::StartupStalled => "Minecraft exited before startup completed after startup activity stalled.",
+        LaunchFailureClass::Unknown
+        | LaunchFailureClass::OutOfMemory
+        | LaunchFailureClass::GraphicsDriverCrash
+        | LaunchFailureClass::MissingDependency
+        | LaunchFailureClass::ModTransformationFailure
+        | LaunchFailureClass::ModAttributedCrash => {
+            "Minecraft exited before Guardian could verify a completed startup."
+        }
+    }.to_string()
+}
+
+struct StartupFailureCopyInput<'a> {
+    decision: GuardianActionKind,
+    failure_class: LaunchFailureClass,
+    stalled: bool,
+    suspected_mod: Option<&'a str>,
+    explicit_java: bool,
+    explicit_jvm_args: bool,
+    explicit_jvm_preset: bool,
+    directive: Option<&'a GuardianDirective>,
+}
+
+fn author_startup_failure_copy(input: StartupFailureCopyInput<'_>) -> GuardianUserOutcome {
+    let StartupFailureCopyInput {
+        decision,
+        failure_class,
+        stalled,
+        suspected_mod,
+        explicit_java,
+        explicit_jvm_args,
+        explicit_jvm_preset,
+        directive,
+    } = input;
+    let explicit_intent = explicit_java || explicit_jvm_args || explicit_jvm_preset;
+    let guidance = if let Some(copy) = accepted_failure_copy(failure_class, suspected_mod) {
+        vec![copy.guidance]
+    } else if failure_class == LaunchFailureClass::StartupStalled {
+        vec![if explicit_intent {
+            "Review recent Java, JVM preset, or JVM argument overrides before retrying.".to_string()
+        } else {
+            "Review the latest game log before retrying.".to_string()
+        }]
+    } else {
+        let specific = prepare_failure_guidance(
+            failure_class,
+            explicit_java,
+            explicit_jvm_args,
+            explicit_jvm_preset,
+        );
+        if specific.is_empty() {
+            vec![if explicit_intent {
+                "Review recent Java, JVM preset, or JVM argument overrides before retrying."
+                    .to_string()
+            } else {
+                "Review the latest game log before retrying.".to_string()
+            }]
+        } else {
+            specific
+        }
+    };
+    let summary = match decision {
+        GuardianActionKind::Downgrade
+        | GuardianActionKind::Strip
+        | GuardianActionKind::Fallback => "Guardian selected a guarded startup retry.",
+        GuardianActionKind::AskUser => "Guardian needs confirmation before startup recovery.",
+        GuardianActionKind::Block => "Guardian blocked launch startup.",
+        _ => "Guardian recorded launch startup failure.",
+    };
+    GuardianUserOutcome {
+        decision: launch_public_decision(decision),
+        phase: OperationPhase::Launching,
+        summary: trusted_line(summary, MAX_SUMMARY_BYTES),
+        details: finalize_launch_lines([directive
+            .map(guardian_directive_description)
+            .unwrap_or_else(|| startup_failure_reason(failure_class, stalled, suspected_mod))]),
+        guidance: finalize_launch_lines(guidance),
+    }
+}
+
+fn author_observed_launch_failure_copy(
+    failure_class: LaunchFailureClass,
+    observed_phase: GuardianObservedLaunchFailurePhase,
+    suspected_mod: Option<&str>,
+) -> Option<GuardianUserOutcome> {
+    let copy = accepted_failure_copy(failure_class, suspected_mod)?;
+    let (decision, phase, summary, detail) = match observed_phase {
+        GuardianObservedLaunchFailurePhase::BeforeBoot => (
+            GuardianActionKind::Block,
+            OperationPhase::Launching,
+            "Guardian blocked launch startup.".to_string(),
+            copy.startup_detail,
+        ),
+        GuardianObservedLaunchFailurePhase::AfterBoot => (
+            GuardianActionKind::Warn,
+            OperationPhase::Running,
+            copy.running_summary,
+            copy.running_detail,
+        ),
+    };
+    Some(GuardianUserOutcome {
+        decision,
+        phase,
+        summary: launch_summary(&summary),
+        details: finalize_launch_lines([detail]),
+        guidance: finalize_launch_lines([copy.guidance]),
+    })
+}
+
+fn author_launch_recovery_suppressed_copy(directive: &GuardianDirective) -> GuardianUserOutcome {
+    let label = guardian_directive_recovery_label(directive);
+    let detail = checked_rendered_line(format!(
+        "Guardian suppressed a repeated launch self-healing retry for {label} because the same recovery failed recently."
+    ));
+    GuardianUserOutcome {
+        decision: GuardianActionKind::Block,
+        phase: OperationPhase::Repairing,
+        summary: detail.clone(),
+        details: vec![detail],
+        guidance: vec![
+            "Review the latest game log or change the affected launch setting before retrying."
+                .to_string(),
+        ],
+    }
+}
+
+fn launch_public_decision(decision: GuardianActionKind) -> GuardianActionKind {
+    match decision {
+        GuardianActionKind::Fallback
+        | GuardianActionKind::Strip
+        | GuardianActionKind::Downgrade
+        | GuardianActionKind::Retry
+        | GuardianActionKind::AskUser
+        | GuardianActionKind::Block
+        | GuardianActionKind::Allow
+        | GuardianActionKind::RecordOnly => decision,
+        _ => GuardianActionKind::Warn,
     }
 }
 
@@ -1358,7 +1938,16 @@ fn preflight_startup_history(fact: &GuardianFact) -> Option<PreflightHistory> {
                 PreflightCrashClass::ModTransformationFailure
             }
             LaunchFailureClass::ModAttributedCrash => PreflightCrashClass::ModAttributedCrash,
-            _ => return None,
+            LaunchFailureClass::Unknown
+            | LaunchFailureClass::JvmUnsupportedOption
+            | LaunchFailureClass::JvmExperimentalUnlock
+            | LaunchFailureClass::JvmOptionOrdering
+            | LaunchFailureClass::JavaRuntimeMismatch
+            | LaunchFailureClass::ClasspathModuleConflict
+            | LaunchFailureClass::LauncherManagedArtifactSignature
+            | LaunchFailureClass::AuthModeIncompatible
+            | LaunchFailureClass::LoaderBootstrapFailure
+            | LaunchFailureClass::StartupStalled => return None,
         };
     let occurrences = copy_fact_field_u32(fact, "occurrences").filter(|count| *count > 0);
     let latest_today = copy_fact_field(fact, "latest_observed_today") == Some("true");
@@ -1629,10 +2218,36 @@ fn checked_rendered_line(value: String) -> String {
     value
 }
 
+fn launch_summary(value: &str) -> String {
+    sanitize_evidence_text(value, RedactionAudience::UserVisible, MAX_SUMMARY_BYTES)
+        .filter(|value| value.len() <= MAX_SUMMARY_BYTES)
+        .unwrap_or_else(|| "Guardian recorded launch safety outcome.".to_string())
+}
+
 fn finalize_lines(lines: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut values = Vec::new();
     for line in lines {
         assert!(!line.is_empty() && line.len() <= MAX_LINE_BYTES);
+        if values.iter().any(|existing| existing == &line) {
+            continue;
+        }
+        values.push(line);
+        if values.len() == MAX_COLLECTION_LINES {
+            break;
+        }
+    }
+    values
+}
+
+fn finalize_launch_lines(lines: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut values = Vec::new();
+    for line in lines {
+        let Some(line) =
+            sanitize_evidence_text(&line, RedactionAudience::UserVisible, MAX_LINE_BYTES)
+                .filter(|line| line.len() <= MAX_LINE_BYTES)
+        else {
+            continue;
+        };
         if values.iter().any(|existing| existing == &line) {
             continue;
         }

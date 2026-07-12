@@ -1,7 +1,7 @@
 use super::*;
 use crate::guardian::{
-    DiagnosisId, GuardianActionKind, GuardianDomain, GuardianLaunchRecoveryCurrentIntent,
-    GuardianLaunchRecoveryKind, GuardianMode as ApiGuardianMode,
+    DiagnosisId, GuardianActionKind, GuardianDirective, GuardianDomain,
+    GuardianLaunchRecoveryCurrentIntent, GuardianMode as ApiGuardianMode,
     launch_recovery_user_intent_fingerprint,
 };
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
@@ -177,7 +177,7 @@ async fn launch_preflight_surfaces_only_active_suppression_for_the_exact_current
         };
         let intent_hash = launch_recovery_user_intent_fingerprint(
             stored_intent,
-            GuardianLaunchRecoveryKind::DowngradePreset,
+            &GuardianDirective::startup_preset_downgrade("performance"),
         )
         .expect("valid stored recovery intent");
         fixture

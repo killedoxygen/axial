@@ -17,11 +17,11 @@ use crate::application::{
     launch_preflight_stage_evidence, stage_launch_instance_command,
 };
 use crate::guardian::{
-    GuardianActionKind as ApiGuardianActionKind, GuardianFact,
+    GuardianActionKind as ApiGuardianActionKind, GuardianDirective, GuardianFact,
     GuardianLaunchFailureMemoryIntakeRequest, GuardianLaunchRecoveryCurrentIntent,
-    GuardianPreflightDirective, GuardianPreflightOutcome, GuardianPreflightOutcomeRequest,
-    GuardianPreflightReadiness, guardian_fact_from_execution, guardian_preflight_outcome,
-    launch_failure_memory_guardian_facts,
+    GuardianManagedJavaReason, GuardianPreflightOutcome, GuardianPreflightOutcomeRequest,
+    GuardianPreflightReadiness, GuardianStripJvmArgsReason, guardian_fact_from_execution,
+    guardian_preflight_outcome, launch_failure_memory_guardian_facts,
 };
 use crate::logging::timestamp_utc;
 use crate::state::contracts::OperationPhase;
@@ -822,11 +822,27 @@ fn apply_guardian_preflight_interventions(
 ) {
     for directive in &outcome.directives {
         match directive {
-            GuardianPreflightDirective::UseManagedJavaForAttempt => {
+            GuardianDirective::UseManagedJava {
+                reason: GuardianManagedJavaReason::Preflight,
+            } => {
                 requested_java.clear();
                 *java_probe_receipt = None;
             }
-            GuardianPreflightDirective::StripExplicitJvmArgsForAttempt => extra_jvm_args.clear(),
+            GuardianDirective::StripJvmArgs {
+                reason: GuardianStripJvmArgsReason::Preflight,
+            } => extra_jvm_args.clear(),
+            GuardianDirective::UseManagedJava {
+                reason:
+                    GuardianManagedJavaReason::PrepareFailure
+                    | GuardianManagedJavaReason::StartupRecovery,
+            }
+            | GuardianDirective::StripJvmArgs {
+                reason: GuardianStripJvmArgsReason::PrepareFailure,
+            }
+            | GuardianDirective::DowngradeJvmPreset { .. }
+            | GuardianDirective::DisableCustomGc => {
+                unreachable!("launch preflight emitted a recovery-only directive")
+            }
         }
     }
 }
