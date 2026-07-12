@@ -1,31 +1,32 @@
 use super::repair::InstallRepairResume;
 use super::{
-    BASE_INSTALL_FAILED_MESSAGE, InstallApplicationError, InstallProgressCoalescer,
-    InstallProgressViewModel, InstallStartResponse, LOADER_INSTALL_INTERRUPTED_MESSAGE,
-    LoaderBuildsRequest, LoaderInstallStartRequest,
+    BASE_INSTALL_FAILED_MESSAGE, INSTALL_FAILURE_MESSAGE, InstallApplicationError,
+    InstallProgressCoalescer, InstallProgressViewModel, InstallStartResponse,
+    LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
     begin_install_journal_with_owned_reconciliation, emit_install_failed,
     finish_install_progress_task, generate_install_id, install_journal_error_response,
-    install_operation_id, operation::install_progress_with_terminal_error,
-    record_and_emit_install_progress, record_install_failure_outcome_and_repair,
-    record_install_failure_outcome_and_repair_for_error, record_install_operation_interrupted,
+    install_operation_id, known_good_acceptance_download_error,
+    operation::install_progress_with_terminal_error, record_and_emit_install_progress,
+    record_install_failure_outcome_and_repair, record_install_failure_outcome_and_repair_for_error,
+    record_install_operation_interrupted,
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome, sanitize_install_progress,
-    stage_install_version_command,
+    stage_install_version_command, terminal_failure_progress_or_default,
 };
 use crate::application::{InstallVersionCommand, instances::invalidate_create_view_source};
 use crate::dto::loaders::{
     LoaderBuildsResponse, LoaderComponentsResponse, LoaderGameVersionsResponse,
 };
-use crate::install_runtime::prewarm_version_runtime;
 use crate::state::InstallInitializationStatus;
 use crate::state::{AppState, InstallStore, ProducerLease};
 use axial_minecraft::loaders::LoaderActiveInstallFailure;
 use axial_minecraft::{
     DownloadProgress, LoaderComponentId, LoaderError, LoaderInstallError, LoaderInstallFailureKind,
-    LoaderPreOperationFailureKind, LoaderProviderFailureKind, fetch_builds, fetch_components,
-    fetch_supported_versions, install_build, resolve_build_record_for_install,
+    LoaderInstallOutcome, LoaderPreOperationFailureKind, LoaderProviderFailureKind, fetch_builds,
+    fetch_components, fetch_supported_versions, install_build, resolve_build_record_for_install,
 };
 use axum::{Json, http::StatusCode};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -112,6 +113,7 @@ pub(super) async fn start_loader_install_owned(
     let worker_operation_id = operation_id_task.clone();
     let worker_failure_memory = state.failure_memory().clone();
     let worker_telemetry = telemetry.clone();
+    let worker_state = state.clone();
     let progress_owner = producer.claim_child();
     InstallStore::spawn_tracked_worker_with_interrupt_handler_owned(
         store,
@@ -237,59 +239,110 @@ pub(super) async fn start_loader_install_owned(
                     return;
                 };
 
-                if let Err(error) = result {
-                    let observed_at = chrono::Utc::now().to_rfc3339();
-                    let progress = loader_install_error_progress(&error);
-                    let repair_outcome = dispatch_loader_install_failure(
-                        worker_journals.as_ref(),
-                        worker_failure_memory.as_ref(),
-                        &worker_operation_id,
-                        &loader_target_id,
-                        &base_version_id,
-                        error,
-                        &observed_at,
-                    )
-                    .await;
-                    if repair_resume.resume_after(repair_outcome.as_ref()) {
-                        continue;
+                match result {
+                    Err(error) => {
+                        let observed_at = chrono::Utc::now().to_rfc3339();
+                        let progress = loader_install_error_progress(&error);
+                        let repair_outcome = dispatch_loader_install_failure(
+                            worker_journals.as_ref(),
+                            worker_failure_memory.as_ref(),
+                            &worker_operation_id,
+                            &loader_target_id,
+                            &base_version_id,
+                            error,
+                            &observed_at,
+                        )
+                        .await;
+                        if repair_resume.resume_after(repair_outcome.as_ref()) {
+                            continue;
+                        }
+                        let failure_summary = progress
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| BASE_INSTALL_FAILED_MESSAGE.to_string());
+                        let _ = progress_tx.send(progress);
+                        drop(progress_tx);
+                        if finish_install_progress_task(
+                            store_task,
+                            worker_store.as_ref(),
+                            &worker_install_id,
+                        )
+                        .await
+                        {
+                            emit_install_failed(worker_telemetry.as_ref(), &failure_summary);
+                        }
+                        return;
                     }
-                    let failure_summary = progress
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| BASE_INSTALL_FAILED_MESSAGE.to_string());
-                    let _ = progress_tx.send(progress);
-                    drop(progress_tx);
-                    if finish_install_progress_task(
-                        store_task,
-                        worker_store.as_ref(),
-                        &worker_install_id,
-                    )
-                    .await
-                    {
-                        emit_install_failed(worker_telemetry.as_ref(), &failure_summary);
+                    Ok(outcome) => {
+                        let captured_terminal = final_progress
+                            .lock()
+                            .ok()
+                            .and_then(|mut progress| progress.take());
+                        let publication = match outcome {
+                            LoaderInstallOutcome::KnownGood(receipt) => {
+                                publish_known_good_loader_terminal(
+                                    worker_state
+                                        .accept_known_good_install_receipt(&library_dir, *receipt),
+                                    captured_terminal,
+                                    |progress| {
+                                        let _ = progress_tx.send(progress);
+                                    },
+                                )
+                                .await
+                            }
+                            LoaderInstallOutcome::PendingAuthority {
+                                version_id: pending_version_id,
+                            } if matches!(
+                                build.component_id,
+                                LoaderComponentId::Forge | LoaderComponentId::NeoForge
+                            ) && pending_version_id == version_id =>
+                            {
+                                let _ = progress_tx.send(
+                                    captured_terminal.unwrap_or_else(loader_install_done_progress),
+                                );
+                                LoaderTerminalPublication::success()
+                            }
+                            LoaderInstallOutcome::PendingAuthority { .. } => {
+                                tracing::warn!(
+                                    operation_id = worker_operation_id.as_str(),
+                                    version_id = version_id.as_str(),
+                                    failure_kind = "known_good_reconciliation",
+                                    "loader install returned unsupported pending authority"
+                                );
+                                publish_known_good_loader_terminal(
+                                    std::future::ready(Err(std::io::Error::other(
+                                        "loader install authority was not produced",
+                                    ))),
+                                    captured_terminal,
+                                    |progress| {
+                                        let _ = progress_tx.send(progress);
+                                    },
+                                )
+                                .await
+                            }
+                        };
+                        if publication.acceptance_failed {
+                            tracing::warn!(
+                                operation_id = worker_operation_id.as_str(),
+                                version_id = version_id.as_str(),
+                                failure_kind = "known_good_reconciliation",
+                                "loader install worker could not accept verified install authority"
+                            );
+                        }
+                        drop(progress_tx);
+                        let journal_committed = finish_install_progress_task(
+                            store_task,
+                            worker_store.as_ref(),
+                            &worker_install_id,
+                        )
+                        .await;
+                        if journal_committed && let Some(summary) = publication.failure_summary {
+                            emit_install_failed(worker_telemetry.as_ref(), &summary);
+                        }
+                        return;
                     }
-                    return;
                 }
-                break;
             }
-
-            let _ = prewarm_version_runtime(&library_dir, &version_id, |progress| {
-                let _ = progress_tx.send(progress);
-            })
-            .await;
-            if let Some(progress) = final_progress
-                .lock()
-                .ok()
-                .and_then(|mut progress| progress.take())
-            {
-                let _ = progress_tx.send(progress);
-            } else {
-                let _ = progress_tx.send(loader_install_done_progress());
-            }
-
-            drop(progress_tx);
-            finish_install_progress_task(store_task, worker_store.as_ref(), &worker_install_id)
-                .await;
         },
         move |progress| async move {
             if record_install_operation_interrupted(
@@ -313,6 +366,53 @@ pub(super) async fn start_loader_install_owned(
         operation_id: staging.result.operation_id.unwrap_or(operation_id),
         view_model: InstallProgressViewModel::starting(),
     })
+}
+
+pub(super) struct LoaderTerminalPublication {
+    pub(super) acceptance_failed: bool,
+    pub(super) failure_summary: Option<String>,
+}
+
+impl LoaderTerminalPublication {
+    fn success() -> Self {
+        Self {
+            acceptance_failed: false,
+            failure_summary: None,
+        }
+    }
+}
+
+pub(super) async fn publish_known_good_loader_terminal<F, P>(
+    acceptance: F,
+    captured_terminal: Option<DownloadProgress>,
+    publish: P,
+) -> LoaderTerminalPublication
+where
+    F: Future<Output = std::io::Result<usize>>,
+    P: FnOnce(DownloadProgress),
+{
+    match acceptance.await {
+        Ok(_) => {
+            publish(captured_terminal.unwrap_or_else(loader_install_done_progress));
+            LoaderTerminalPublication::success()
+        }
+        Err(error) => {
+            let error = known_good_acceptance_download_error(error);
+            let progress = install_progress_with_terminal_error(
+                terminal_failure_progress_or_default(captured_terminal),
+                &error,
+            );
+            let sanitized = sanitize_install_progress(progress.clone());
+            let failure_summary = sanitized
+                .error
+                .unwrap_or_else(|| INSTALL_FAILURE_MESSAGE.to_string());
+            publish(progress);
+            LoaderTerminalPublication {
+                acceptance_failed: true,
+                failure_summary: Some(failure_summary),
+            }
+        }
+    }
 }
 
 pub(super) async fn dispatch_loader_install_failure(

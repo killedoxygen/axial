@@ -2166,6 +2166,79 @@ fn loader_install_done_progress_marks_session_terminal() {
 }
 
 #[tokio::test]
+async fn loader_receipt_acceptance_completes_before_terminal_success_is_published() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let acceptance_events = Arc::clone(&events);
+    let publication_events = Arc::clone(&events);
+
+    let publication = publish_known_good_loader_terminal(
+        async move {
+            acceptance_events
+                .lock()
+                .expect("events lock")
+                .push("accepted");
+            Ok(1)
+        },
+        Some(done_progress()),
+        move |progress| {
+            assert!(progress.done);
+            assert!(progress.error.is_none());
+            publication_events
+                .lock()
+                .expect("events lock")
+                .push("published");
+        },
+    )
+    .await;
+
+    assert!(!publication.acceptance_failed);
+    assert!(publication.failure_summary.is_none());
+    assert_eq!(
+        events.lock().expect("events lock").as_slice(),
+        ["accepted", "published"]
+    );
+}
+
+#[tokio::test]
+async fn loader_receipt_acceptance_failure_cannot_publish_success() {
+    let published = Arc::new(Mutex::new(None));
+    let published_progress = Arc::clone(&published);
+
+    let publication = publish_known_good_loader_terminal(
+        async {
+            Err(io::Error::other(
+                "/private/library/state/known-good write failed",
+            ))
+        },
+        Some(done_progress()),
+        move |progress| {
+            *published_progress.lock().expect("published lock") = Some(progress);
+        },
+    )
+    .await;
+    let progress = published
+        .lock()
+        .expect("published lock")
+        .take()
+        .expect("terminal progress");
+    let progress = sanitize_install_progress(progress);
+
+    assert!(publication.acceptance_failed);
+    assert_eq!(
+        publication.failure_summary.as_deref(),
+        Some(INSTALL_FAILURE_MESSAGE)
+    );
+    assert!(progress.done);
+    assert_eq!(progress.error.as_deref(), Some(INSTALL_FAILURE_MESSAGE));
+    assert_ne!(progress.phase, "done");
+    assert!(
+        !serde_json::to_string(&progress)
+            .expect("progress json")
+            .contains("/private/library")
+    );
+}
+
+#[tokio::test]
 async fn loader_install_events_keep_terminal_installs_subscribable_after_stream_ends() {
     let root = temp_root("loader-install-events-terminal-retention");
     let state = build_test_state(&root);
