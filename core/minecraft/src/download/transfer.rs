@@ -62,38 +62,82 @@ pub(super) struct AuthenticatedArtifactDownload {
     pub(super) sha1: [u8; 20],
 }
 
-pub(super) struct VerifiedSelectedArtifactDownload<'a> {
-    pub(super) kind: SelectedDownloadArtifactKind,
+pub(super) struct AuthenticatedSelectedArtifactSource {
+    bytes: Arc<[u8]>,
+    observed_size: u64,
+    observed_sha1: [u8; 20],
+    expected: ExpectedIntegrity,
+    target: String,
+}
+
+impl AuthenticatedSelectedArtifactSource {
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[cfg(test)]
+    pub(super) fn observed_size(&self) -> u64 {
+        self.observed_size
+    }
+
+    #[cfg(test)]
+    pub(super) fn observed_sha1(&self) -> [u8; 20] {
+        self.observed_sha1
+    }
+}
+
+pub(super) struct PreparedSelectedArtifactInstall {
+    kind: SelectedDownloadArtifactKind,
+    destination: PathBuf,
+    expected: ExpectedIntegrity,
+    target: String,
+}
+
+impl PreparedSelectedArtifactInstall {
+    pub(super) fn target(&self) -> &str {
+        &self.target
+    }
+}
+
+pub(super) struct MaterializedSelectedArtifactSource {
+    source: AuthenticatedSelectedArtifactSource,
+}
+
+impl MaterializedSelectedArtifactSource {
+    pub(super) fn bytes(&self) -> &[u8] {
+        self.source.bytes()
+    }
+
+    pub(super) fn shared_bytes(&self) -> Arc<[u8]> {
+        Arc::clone(&self.source.bytes)
+    }
+
+    pub(super) fn into_parts(self) -> (Arc<[u8]>, u64, [u8; 20]) {
+        (
+            self.source.bytes,
+            self.source.observed_size,
+            self.source.observed_sha1,
+        )
+    }
+}
+
+pub(super) struct SelectedArtifactSourceRequest<'a> {
     pub(super) client: &'a reqwest::Client,
     pub(super) url: &'a str,
-    pub(super) destination: &'a Path,
     pub(super) expected: &'a ExpectedIntegrity,
     pub(super) max_bytes: usize,
+    pub(super) target: &'a str,
     pub(super) fact_tx: Option<&'a mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    pub(super) descriptor_tx: Option<&'a mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 }
 
-pub(super) async fn fetch_verified_selected_artifact_bytes_with_client(
-    request: VerifiedSelectedArtifactDownload<'_>,
-) -> Result<Arc<[u8]>, DownloadError> {
-    let retry_delays = default_download_retry_delays();
-    fetch_verified_selected_artifact_bytes_with_retry_delays(request, &retry_delays).await
-}
-
-async fn fetch_verified_selected_artifact_bytes_with_retry_delays(
-    request: VerifiedSelectedArtifactDownload<'_>,
-    retry_delays: &[Duration],
-) -> Result<Arc<[u8]>, DownloadError> {
-    let VerifiedSelectedArtifactDownload {
-        kind,
-        client,
-        url,
-        destination,
-        expected,
-        max_bytes,
-        fact_tx,
-        descriptor_tx,
-    } = request;
+pub(super) async fn prepare_selected_artifact_install(
+    kind: SelectedDownloadArtifactKind,
+    destination: &Path,
+    url: &str,
+    expected: &ExpectedIntegrity,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+) -> Result<PreparedSelectedArtifactInstall, DownloadError> {
     guard_existing_unsupported_selected_artifact(
         kind,
         destination,
@@ -103,47 +147,98 @@ async fn fetch_verified_selected_artifact_bytes_with_retry_delays(
         descriptor_tx,
     )
     .await?;
+    emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
+    emit_selected_artifact_missing_fact_if_absent(fact_tx, kind, destination, expected).await;
+    Ok(PreparedSelectedArtifactInstall {
+        kind,
+        destination: destination.to_path_buf(),
+        expected: expected.clone(),
+        target: selected_download_target_label(kind, destination),
+    })
+}
+
+pub(super) async fn materialize_authenticated_selected_artifact_source(
+    prepared: PreparedSelectedArtifactInstall,
+    source: AuthenticatedSelectedArtifactSource,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+) -> Result<MaterializedSelectedArtifactSource, DownloadError> {
+    if source.target != prepared.target || source.expected != prepared.expected {
+        return Err(DownloadError::Integrity(
+            "authenticated source does not match its prepared install contract".to_string(),
+        ));
+    }
+    let temp_path = download_temp_path(&prepared.destination);
+    let report = write_launcher_managed_artifact_bytes_to_temp(
+        &prepared.destination,
+        &temp_path,
+        source.bytes(),
+    )
+    .await
+    .map_err(ExecutionDownloadError::into_download_error)?;
+    let mut facts =
+        selected_execution_download_facts(prepared.kind, &prepared.destination, &report.facts)
+            .into_iter()
+            .filter(|fact| fact.kind != ExecutionDownloadFactKind::MetadataMissing)
+            .collect::<Vec<_>>();
+    facts.extend(metadata_facts(&source.expected, &source.target));
+    facts.push(execution_download_fact(
+        ExecutionDownloadFactKind::ArtifactVerified,
+        &source.target,
+        no_download_fact_fields(),
+    ));
+    emit_execution_download_facts(fact_tx, &facts);
+    Ok(MaterializedSelectedArtifactSource { source })
+}
+
+pub(super) async fn acquire_authenticated_selected_artifact_source(
+    request: SelectedArtifactSourceRequest<'_>,
+) -> Result<AuthenticatedSelectedArtifactSource, DownloadError> {
+    let retry_delays = default_download_retry_delays();
+    acquire_authenticated_selected_artifact_source_with_retry_delays(request, &retry_delays).await
+}
+
+async fn acquire_authenticated_selected_artifact_source_with_retry_delays(
+    request: SelectedArtifactSourceRequest<'_>,
+    retry_delays: &[Duration],
+) -> Result<AuthenticatedSelectedArtifactSource, DownloadError> {
+    let SelectedArtifactSourceRequest {
+        client,
+        url,
+        expected,
+        max_bytes,
+        target,
+        fact_tx,
+    } = request;
     let Some(expected_sha1) = expected.sha1.as_deref() else {
-        emit_selected_metadata_failure(
-            kind,
-            destination,
+        emit_source_metadata_failure(
             expected,
+            target,
             fact_tx,
             ExecutionDownloadFactKind::MetadataMissing,
             "sha1",
         );
-        return Err(selected_artifact_metadata_error(destination, "missing"));
+        return Err(source_artifact_metadata_error(target, "missing"));
     };
     if !is_sha1_hex(expected_sha1) {
-        emit_selected_metadata_failure(
-            kind,
-            destination,
+        emit_source_metadata_failure(
             expected,
+            target,
             fact_tx,
             ExecutionDownloadFactKind::MetadataInvalid,
             "sha1",
         );
-        return Err(selected_artifact_metadata_error(destination, "invalid"));
+        return Err(source_artifact_metadata_error(target, "invalid"));
     }
 
-    emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
-    emit_selected_artifact_missing_fact_if_absent(fact_tx, kind, destination, expected).await;
-    let target = selected_download_target_label(kind, destination);
     let max_bytes = u64::try_from(max_bytes).unwrap_or(u64::MAX);
     let mut next_delay = 0_usize;
-    let body = loop {
-        match fetch_verified_selected_artifact_bytes_attempt(
-            client,
-            url,
-            destination,
-            expected,
-            max_bytes,
-            fact_tx,
-            &target,
+    loop {
+        match acquire_authenticated_selected_artifact_source_attempt(
+            client, url, expected, max_bytes, fact_tx, target,
         )
         .await
         {
-            Ok(body) => break body,
+            Ok(source) => return Ok(source),
             Err(error) if error.retryable && next_delay < retry_delays.len() => {
                 let delay = retry_delays[next_delay];
                 next_delay += 1;
@@ -151,46 +246,26 @@ async fn fetch_verified_selected_artifact_bytes_with_retry_delays(
             }
             Err(error) => return Err(error.error),
         }
-    };
-
-    let temp_path = download_temp_path(destination);
-    let report = write_launcher_managed_artifact_bytes_to_temp(destination, &temp_path, &body)
-        .await
-        .map_err(ExecutionDownloadError::into_download_error)?;
-    let mut facts = selected_execution_download_facts(kind, destination, &report.facts)
-        .into_iter()
-        .filter(|fact| fact.kind != ExecutionDownloadFactKind::MetadataMissing)
-        .collect::<Vec<_>>();
-    facts.extend(metadata_facts(expected, &target));
-    facts.push(execution_download_fact(
-        ExecutionDownloadFactKind::ArtifactVerified,
-        &target,
-        no_download_fact_fields(),
-    ));
-    emit_execution_download_facts(fact_tx, &facts);
-    Ok(Arc::from(body))
+    }
 }
 
 #[cfg(test)]
-pub(super) async fn fetch_verified_selected_artifact_bytes_with_retry_delays_for_test(
-    kind: SelectedDownloadArtifactKind,
+pub(super) async fn acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
     client: &reqwest::Client,
     url: &str,
-    destination: &Path,
     expected: &ExpectedIntegrity,
     max_bytes: usize,
+    target: &str,
     retry_delays: &[Duration],
-) -> Result<Arc<[u8]>, DownloadError> {
-    fetch_verified_selected_artifact_bytes_with_retry_delays(
-        VerifiedSelectedArtifactDownload {
-            kind,
+) -> Result<AuthenticatedSelectedArtifactSource, DownloadError> {
+    acquire_authenticated_selected_artifact_source_with_retry_delays(
+        SelectedArtifactSourceRequest {
             client,
             url,
-            destination,
             expected,
             max_bytes,
+            target,
             fact_tx: None,
-            descriptor_tx: None,
         },
         retry_delays,
     )
@@ -202,15 +277,14 @@ struct VerifiedSelectedBytesAttemptError {
     retryable: bool,
 }
 
-async fn fetch_verified_selected_artifact_bytes_attempt(
+async fn acquire_authenticated_selected_artifact_source_attempt(
     client: &reqwest::Client,
     url: &str,
-    destination: &Path,
     expected: &ExpectedIntegrity,
     max_bytes: u64,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
     target: &str,
-) -> Result<Vec<u8>, VerifiedSelectedBytesAttemptError> {
+) -> Result<AuthenticatedSelectedArtifactSource, VerifiedSelectedBytesAttemptError> {
     let response = client.get(url).send().await.map_err(|error| {
         emit_execution_download_facts(
             fact_tx,
@@ -252,8 +326,7 @@ async fn fetch_verified_selected_artifact_bytes_attempt(
         );
         return Err(VerifiedSelectedBytesAttemptError {
             error: DownloadError::Integrity(format!(
-                "{} exceeds the safe in-memory size limit",
-                bounded_download_file_label(destination)
+                "{target} exceeds the safe in-memory size limit"
             )),
             retryable: false,
         });
@@ -288,8 +361,7 @@ async fn fetch_verified_selected_artifact_bytes_attempt(
             );
             return Err(VerifiedSelectedBytesAttemptError {
                 error: DownloadError::Integrity(format!(
-                    "{} exceeds the safe in-memory size limit",
-                    bounded_download_file_label(destination)
+                    "{target} exceeds the safe in-memory size limit"
                 )),
                 retryable: false,
             });
@@ -307,25 +379,86 @@ async fn fetch_verified_selected_artifact_bytes_attempt(
         );
         return Err(VerifiedSelectedBytesAttemptError {
             error: DownloadError::Integrity(format!(
-                "{} download ended before the declared content length",
-                bounded_download_file_label(destination)
+                "{target} download ended before the declared content length"
             )),
             retryable: true,
         });
     }
 
-    let actual = ActualIntegrity {
-        size: body.len() as u64,
-        sha1: Some(format!("{:x}", Sha1::digest(&body))),
-    };
-    if let Err(error) = verify_download_integrity(destination, expected, &actual) {
+    let observed_size = body.len() as u64;
+    let observed_sha1: [u8; 20] = Sha1::digest(&body).into();
+    if let Err(error) = verify_source_integrity(target, expected, observed_size, &observed_sha1) {
         emit_execution_download_facts(fact_tx, &[integrity_mismatch_fact(target, &error)]);
         return Err(VerifiedSelectedBytesAttemptError {
             error: DownloadError::Integrity(error.to_string()),
             retryable: false,
         });
     }
-    Ok(body)
+    Ok(AuthenticatedSelectedArtifactSource {
+        bytes: Arc::from(body),
+        observed_size,
+        observed_sha1,
+        expected: expected.clone(),
+        target: target.to_string(),
+    })
+}
+
+fn verify_source_integrity(
+    target: &str,
+    expected: &ExpectedIntegrity,
+    observed_size: u64,
+    observed_sha1: &[u8; 20],
+) -> Result<(), DownloadIntegrityError> {
+    if let Some(expected_size) = expected.size
+        && observed_size != expected_size
+    {
+        return Err(DownloadIntegrityError::SizeMismatch {
+            file: target.to_string(),
+            expected: expected_size,
+            actual: observed_size,
+        });
+    }
+    let expected_sha1 = expected
+        .sha1
+        .as_deref()
+        .expect("source acquisition validates expected sha1 first");
+    let actual_sha1 = observed_sha1
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if !actual_sha1.eq_ignore_ascii_case(expected_sha1) {
+        return Err(DownloadIntegrityError::Sha1Mismatch {
+            file: target.to_string(),
+            expected: expected_sha1.to_string(),
+            actual: actual_sha1,
+        });
+    }
+    Ok(())
+}
+
+fn emit_source_metadata_failure(
+    expected: &ExpectedIntegrity,
+    target: &str,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    fact_kind: ExecutionDownloadFactKind,
+    field: &str,
+) {
+    let Some(fact_tx) = fact_tx else {
+        return;
+    };
+    let mut facts = metadata_facts(expected, target);
+    if !facts.iter().any(|fact| fact.kind == fact_kind) {
+        facts.push(execution_download_fact(
+            fact_kind,
+            target,
+            vec![("field", field)],
+        ));
+    }
+    emit_execution_download_facts(Some(fact_tx), &facts);
+}
+
+fn source_artifact_metadata_error(target: &str, status: &str) -> DownloadError {
+    DownloadError::Integrity(format!("{target} integrity metadata is {status}"))
 }
 
 #[derive(Clone, Copy)]

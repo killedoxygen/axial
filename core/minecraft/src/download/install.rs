@@ -14,8 +14,10 @@ use super::runtime::{
     finish_runtime_pipeline_after_artifacts, recv_runtime_progress, spawn_runtime_ensure_pipeline,
 };
 use super::transfer::{
-    VerifiedSelectedArtifactDownload, ensure_selected_artifact_with_client_and_observed_size,
-    fetch_verified_selected_artifact_bytes_with_client,
+    MaterializedSelectedArtifactSource, SelectedArtifactSourceRequest,
+    acquire_authenticated_selected_artifact_source,
+    ensure_selected_artifact_with_client_and_observed_size,
+    materialize_authenticated_selected_artifact_source, prepare_selected_artifact_install,
 };
 use crate::artifact_path::validate_artifact_path_segment;
 use crate::known_good::{
@@ -200,21 +202,34 @@ impl Downloader {
         ));
 
         let version_json_expected = ExpectedIntegrity::from_sha1(&version_manifest_entry.sha1);
-        let version_json_bytes =
-            fetch_verified_selected_artifact_bytes_with_client(VerifiedSelectedArtifactDownload {
-                kind: SelectedDownloadArtifactKind::VersionJson,
+        let version_json_install = prepare_selected_artifact_install(
+            SelectedDownloadArtifactKind::VersionJson,
+            &json_path,
+            &version_manifest_entry.url,
+            &version_json_expected,
+            fact_tx,
+            descriptor_tx,
+        )
+        .await?;
+        let version_json_source =
+            acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
                 client: &self.client,
                 url: &version_manifest_entry.url,
-                destination: &json_path,
                 expected: &version_json_expected,
                 max_bytes: MAX_KNOWN_GOOD_VERSION_JSON_BYTES,
+                target: version_json_install.target(),
                 fact_tx,
-                descriptor_tx,
             })
             .await?;
+        let version_json_source = materialize_authenticated_selected_artifact_source(
+            version_json_install,
+            version_json_source,
+            fact_tx,
+        )
+        .await?;
 
-        let version = parse_vanilla_version_source(&version_json_bytes, version_id)?;
-        let asset_index_bytes = self
+        let version = parse_vanilla_version_source(version_json_source.bytes(), version_id)?;
+        let asset_index_source = self
             .fetch_asset_index_source(&version, send, plan, fact_tx, descriptor_tx)
             .await?;
         let client_jar_bytes = version
@@ -291,11 +306,11 @@ impl Downloader {
             } else {
                 None
             };
-            let mut asset_pipeline = asset_index_bytes.clone().map(|verified_index_bytes| {
+            let mut asset_pipeline = asset_index_source.as_ref().map(|source| {
                 spawn_asset_download_pipeline(
                     self.mc_dir.clone(),
                     self.client.clone(),
-                    verified_index_bytes,
+                    source.shared_bytes(),
                     fact_tx.cloned(),
                     descriptor_tx.cloned(),
                     plan.clone(),
@@ -460,10 +475,13 @@ impl Downloader {
                 "installed library authority could not be sealed: {error:?}"
             ))
         })?;
+        let (version_json_bytes, version_metadata_size, _version_metadata_sha1) =
+            version_json_source.into_parts();
+        let asset_index_bytes = asset_index_source.map(|source| source.into_parts().0);
         KnownGoodInstallReceipt::from_verified_vanilla_source(
             KnownGoodInventoryInput {
                 resolved_version: &version,
-                version_metadata_size: version_json_bytes.len() as u64,
+                version_metadata_size,
                 client_size: verified_artifacts.client_size,
                 libraries: &library_authority,
                 log_config_size: verified_artifacts.log_config_size,
@@ -496,7 +514,7 @@ impl Downloader {
         plan: &TransferPlan,
         fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
         descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-    ) -> Result<Option<Arc<[u8]>>, DownloadError>
+    ) -> Result<Option<MaterializedSelectedArtifactSource>, DownloadError>
     where
         F: FnMut(DownloadProgress),
     {
@@ -523,21 +541,30 @@ impl Downloader {
         let planned_bytes = expected.size.unwrap_or(0);
         plan.contribute_total(planned_bytes);
         send(progress("asset_index", 0, 1, Some(index_name.clone())));
-        let bytes =
-            fetch_verified_selected_artifact_bytes_with_client(VerifiedSelectedArtifactDownload {
-                kind: SelectedDownloadArtifactKind::AssetIndex,
+        let prepared = prepare_selected_artifact_install(
+            SelectedDownloadArtifactKind::AssetIndex,
+            &index_path,
+            &version.asset_index.url,
+            &expected,
+            fact_tx,
+            descriptor_tx,
+        )
+        .await?;
+        let source =
+            acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
                 client: &self.client,
                 url: &version.asset_index.url,
-                destination: &index_path,
                 expected: &expected,
                 max_bytes: MAX_KNOWN_GOOD_ASSET_INDEX_BYTES,
+                target: prepared.target(),
                 fact_tx,
-                descriptor_tx,
             })
             .await?;
+        let source =
+            materialize_authenticated_selected_artifact_source(prepared, source, fact_tx).await?;
         plan.add_done(planned_bytes);
         send(progress("asset_index", 1, 1, Some(index_name)));
-        Ok(Some(bytes))
+        Ok(Some(source))
     }
 
     async fn resolve_manifest_entry(

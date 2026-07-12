@@ -19,10 +19,13 @@ use super::runtime::{
     RuntimeEnsurePipeline, finish_runtime_pipeline_after_artifacts, runtime_ensure_progress,
 };
 use super::transfer::{
+    SelectedArtifactSourceRequest, acquire_authenticated_selected_artifact_source,
+    acquire_authenticated_selected_artifact_source_with_retry_delays_for_test,
     download_file_with_client, download_file_with_client_report_with_retry_delays,
     download_temp_path, ensure_selected_artifact_with_client, execute_download_to_temp,
     execute_download_to_temp_with_pre_promote_hook,
-    fetch_verified_selected_artifact_bytes_with_retry_delays_for_test, remove_stale_download_temp,
+    materialize_authenticated_selected_artifact_source, prepare_selected_artifact_install,
+    remove_stale_download_temp,
 };
 use super::*;
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
@@ -2473,9 +2476,13 @@ async fn download_file_with_client_report_retries_interrupted_body_stream() {
 }
 
 #[tokio::test]
-async fn verified_source_bytes_retry_provider_failure_and_preserve_successful_bytes() {
+async fn authenticated_source_retry_preserves_destination_and_binds_observed_bytes() {
     let root = temp_dir("verified-source-retry-provider");
     let destination = root.join("version.json");
+    let temp_path = download_temp_path(&destination);
+    fs::create_dir_all(&root).expect("source sentinel root");
+    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
+    fs::write(&temp_path, b"temp-sentinel").expect("temp sentinel");
     let body = br#"{"id":"1.21.1"}"#.to_vec();
     let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
     let (url, requests) = spawn_scripted_download_server(vec![
@@ -2484,28 +2491,41 @@ async fn verified_source_bytes_retry_provider_failure_and_preserve_successful_by
     ])
     .await;
 
-    let verified = fetch_verified_selected_artifact_bytes_with_retry_delays_for_test(
-        SelectedDownloadArtifactKind::VersionJson,
+    let source = acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
         &build_http_client(Duration::from_secs(5)),
         &url,
-        &destination,
         &expected,
         1024,
+        "minecraft_version_json_1.21.1",
         &[Duration::ZERO],
     )
     .await
     .expect("retryable provider failure should recover");
 
-    assert_eq!(verified.as_ref(), body);
+    assert_eq!(source.bytes(), body);
+    assert_eq!(source.observed_size(), body.len() as u64);
+    let expected_sha1: [u8; 20] = Sha1::digest(&body).into();
+    assert_eq!(source.observed_sha1(), expected_sha1);
     assert_eq!(requests.load(Ordering::SeqCst), 2);
-    assert_eq!(fs::read(&destination).expect("promoted source"), body);
+    assert_eq!(
+        fs::read(&destination).expect("destination sentinel"),
+        b"installed-sentinel"
+    );
+    assert_eq!(
+        fs::read(&temp_path).expect("temp sentinel"),
+        b"temp-sentinel"
+    );
     let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn verified_source_bytes_retry_interrupted_stream_without_retaining_partial_bytes() {
+async fn authenticated_source_interrupted_retry_never_mutates_destination() {
     let root = temp_dir("verified-source-retry-interrupted");
     let destination = root.join("asset-index.json");
+    let temp_path = download_temp_path(&destination);
+    fs::create_dir_all(&root).expect("source sentinel root");
+    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
+    fs::write(&temp_path, b"temp-sentinel").expect("temp sentinel");
     let body = br#"{"objects":{}}"#.to_vec();
     let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
     let (url, requests) = spawn_scripted_download_server(vec![
@@ -2514,22 +2534,325 @@ async fn verified_source_bytes_retry_interrupted_stream_without_retaining_partia
     ])
     .await;
 
-    let verified = fetch_verified_selected_artifact_bytes_with_retry_delays_for_test(
-        SelectedDownloadArtifactKind::AssetIndex,
+    let source = acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
         &build_http_client(Duration::from_secs(5)),
         &url,
-        &destination,
         &expected,
         1024,
+        "minecraft_asset_index_legacy",
         &[Duration::ZERO],
     )
     .await
     .expect("interrupted source stream should recover");
 
-    assert_eq!(verified.as_ref(), body);
+    assert_eq!(source.bytes(), body);
     assert_eq!(requests.load(Ordering::SeqCst), 2);
-    assert_eq!(fs::read(&destination).expect("promoted source"), body);
-    assert!(!download_temp_path(&destination).exists());
+    assert_eq!(
+        fs::read(&destination).expect("destination sentinel"),
+        b"installed-sentinel"
+    );
+    assert_eq!(
+        fs::read(&temp_path).expect("temp sentinel"),
+        b"temp-sentinel"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_checksum_failure_never_mutates_destination() {
+    let root = temp_dir("verified-source-checksum-failure");
+    let destination = root.join("version.json");
+    let temp_path = download_temp_path(&destination);
+    fs::create_dir_all(&root).expect("source sentinel root");
+    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
+    fs::write(&temp_path, b"temp-sentinel").expect("temp sentinel");
+    let body = b"wrong source".to_vec();
+    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(b"right source"));
+    let (url, requests) =
+        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
+
+    acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
+        &build_http_client(Duration::from_secs(5)),
+        &url,
+        &expected,
+        1024,
+        "minecraft_version_json_1.21.1",
+        &[Duration::ZERO],
+    )
+    .await
+    .err()
+    .expect("checksum mismatch must fail");
+
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fs::read(&destination).expect("destination sentinel"),
+        b"installed-sentinel"
+    );
+    assert_eq!(
+        fs::read(&temp_path).expect("temp sentinel"),
+        b"temp-sentinel"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_size_failure_never_mutates_destination() {
+    let root = temp_dir("verified-source-size-failure");
+    let destination = root.join("asset-index.json");
+    let temp_path = download_temp_path(&destination);
+    fs::create_dir_all(&root).expect("source sentinel root");
+    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
+    fs::write(&temp_path, b"temp-sentinel").expect("temp sentinel");
+    let body = b"asset index".to_vec();
+    let expected = ExpectedIntegrity {
+        size: Some(body.len() as u64 + 1),
+        sha1: Some(sha1_hex(&body)),
+    };
+    let (url, requests) =
+        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
+
+    acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
+        &build_http_client(Duration::from_secs(5)),
+        &url,
+        &expected,
+        1024,
+        "minecraft_asset_index_legacy",
+        &[Duration::ZERO],
+    )
+    .await
+    .err()
+    .expect("size mismatch must fail");
+
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fs::read(&destination).expect("destination sentinel"),
+        b"installed-sentinel"
+    );
+    assert_eq!(
+        fs::read(&temp_path).expect("temp sentinel"),
+        b"temp-sentinel"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_oversize_failure_never_mutates_destination() {
+    let root = temp_dir("verified-source-oversize-failure");
+    let destination = root.join("version.json");
+    let temp_path = download_temp_path(&destination);
+    fs::create_dir_all(&root).expect("source sentinel root");
+    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
+    fs::write(&temp_path, b"temp-sentinel").expect("temp sentinel");
+    let body = b"oversize source".to_vec();
+    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+    let (url, requests) =
+        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
+
+    acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
+        &build_http_client(Duration::from_secs(5)),
+        &url,
+        &expected,
+        4,
+        "minecraft_version_json_1.21.1",
+        &[Duration::ZERO],
+    )
+    .await
+    .err()
+    .expect("memory bound must fail");
+
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fs::read(&destination).expect("destination sentinel"),
+        b"installed-sentinel"
+    );
+    assert_eq!(
+        fs::read(&temp_path).expect("temp sentinel"),
+        b"temp-sentinel"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_provider_failure_never_mutates_destination() {
+    let root = temp_dir("verified-source-provider-failure");
+    let destination = root.join("asset-index.json");
+    let temp_path = download_temp_path(&destination);
+    fs::create_dir_all(&root).expect("source sentinel root");
+    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
+    fs::write(&temp_path, b"temp-sentinel").expect("temp sentinel");
+    let expected = ExpectedIntegrity::from_mojang(7, &sha1_hex(b"missing"));
+    let (url, requests) = spawn_scripted_download_server(vec![ScriptedDownloadResponse::full(
+        "404 Not Found",
+        b"missing".to_vec(),
+    )])
+    .await;
+
+    acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
+        &build_http_client(Duration::from_secs(5)),
+        &url,
+        &expected,
+        1024,
+        "minecraft_asset_index_legacy",
+        &[Duration::ZERO],
+    )
+    .await
+    .err()
+    .expect("terminal provider failure must fail");
+
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fs::read(&destination).expect("destination sentinel"),
+        b"installed-sentinel"
+    );
+    assert_eq!(
+        fs::read(&temp_path).expect("temp sentinel"),
+        b"temp-sentinel"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_materialization_consumes_matching_prepared_contract() {
+    let root = temp_dir("verified-source-materialization-contract");
+    let destination = root.join("version.json");
+    let body = br#"{"id":"1.21.1"}"#.to_vec();
+    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+    let (url, _) = spawn_scripted_download_server(vec![ScriptedDownloadResponse::full(
+        "200 OK",
+        body.clone(),
+    )])
+    .await;
+    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
+    let prepared = prepare_selected_artifact_install(
+        SelectedDownloadArtifactKind::VersionJson,
+        &destination,
+        &url,
+        &expected,
+        Some(&fact_tx),
+        None,
+    )
+    .await
+    .expect("prepare destination capability");
+    let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+        client: &build_http_client(Duration::from_secs(5)),
+        url: &url,
+        expected: &expected,
+        max_bytes: 1024,
+        target: prepared.target(),
+        fact_tx: Some(&fact_tx),
+    })
+    .await
+    .expect("acquire source");
+
+    let materialized =
+        materialize_authenticated_selected_artifact_source(prepared, source, Some(&fact_tx))
+            .await
+            .expect("materialize matching source");
+
+    assert_eq!(materialized.bytes(), body);
+    assert_eq!(fs::read(&destination).expect("materialized source"), body);
+    let facts = std::iter::from_fn(|| fact_rx.try_recv().ok()).collect::<Vec<_>>();
+    let promoted = facts
+        .iter()
+        .position(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
+        .expect("promoted fact");
+    let verified = facts
+        .iter()
+        .position(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactVerified)
+        .expect("verified fact");
+    assert!(promoted < verified);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_rejects_mismatched_prepared_contract_without_mutation() {
+    let root = temp_dir("verified-source-mismatched-contract");
+    let destination = root.join("asset-index.json");
+    fs::create_dir_all(&root).expect("source sentinel root");
+    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
+    let body = br#"{"objects":{}}"#.to_vec();
+    let source_expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+    let prepared_expected = ExpectedIntegrity::from_mojang(
+        body.len() as i64,
+        &sha1_hex(br#"{"objects":{"other":{}}}"#),
+    );
+    let (url, _) =
+        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
+    let prepared = prepare_selected_artifact_install(
+        SelectedDownloadArtifactKind::AssetIndex,
+        &destination,
+        &url,
+        &prepared_expected,
+        None,
+        None,
+    )
+    .await
+    .expect("prepare destination capability");
+    let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+        client: &build_http_client(Duration::from_secs(5)),
+        url: &url,
+        expected: &source_expected,
+        max_bytes: 1024,
+        target: prepared.target(),
+        fact_tx: None,
+    })
+    .await
+    .expect("acquire source");
+
+    materialize_authenticated_selected_artifact_source(prepared, source, None)
+        .await
+        .err()
+        .expect("mismatched contract must fail");
+
+    assert_eq!(
+        fs::read(&destination).expect("destination sentinel"),
+        b"installed-sentinel"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_materialization_failure_emits_no_verified_fact() {
+    let root = temp_dir("verified-source-materialization-failure");
+    fs::create_dir_all(&root).expect("source root");
+    let blocked_parent = root.join("blocked-parent");
+    fs::write(&blocked_parent, b"not-a-directory").expect("blocked parent");
+    let destination = blocked_parent.join("version.json");
+    let body = br#"{"id":"1.21.1"}"#.to_vec();
+    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+    let (url, _) =
+        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
+    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
+    let prepared = prepare_selected_artifact_install(
+        SelectedDownloadArtifactKind::VersionJson,
+        &destination,
+        &url,
+        &expected,
+        Some(&fact_tx),
+        None,
+    )
+    .await
+    .expect("prepare destination capability");
+    let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+        client: &build_http_client(Duration::from_secs(5)),
+        url: &url,
+        expected: &expected,
+        max_bytes: 1024,
+        target: prepared.target(),
+        fact_tx: Some(&fact_tx),
+    })
+    .await
+    .expect("acquire source");
+
+    materialize_authenticated_selected_artifact_source(prepared, source, Some(&fact_tx))
+        .await
+        .err()
+        .expect("materialization must fail");
+
+    assert!(
+        std::iter::from_fn(|| fact_rx.try_recv().ok())
+            .all(|fact| fact.kind != ExecutionDownloadFactKind::ArtifactVerified)
+    );
     let _ = fs::remove_dir_all(root);
 }
 
