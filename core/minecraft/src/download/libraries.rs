@@ -1,10 +1,12 @@
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
 use super::integrity::is_sha1_hex;
 use super::model::{
-    DownloadError, DownloadProgress, ExecutionDownloadFact, ExpectedIntegrity, LibraryPlanError,
-    SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
+    DownloadError, DownloadProgress, ExecutionDownloadFact, ExpectedIntegrity,
+    InstallerLibraryDownloadAuthority, LibraryPlanError, SelectedDownloadArtifactDescriptor,
+    SelectedDownloadArtifactKind, progress,
 };
 use super::transfer::{
+    download_file_with_client_and_fact_sender_allowing_missing_checksum_with_authority,
     ensure_selected_artifact_with_client,
     ensure_selected_artifact_with_client_allowing_missing_checksum,
 };
@@ -13,12 +15,13 @@ use crate::launch::{Library, maven_to_path};
 use crate::paths::libraries_dir;
 use crate::rules::{Environment, default_environment, evaluate_rules};
 use futures_util::StreamExt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadJob {
+    pub(crate) relative_path: ArtifactRelativePath,
     pub(crate) path: PathBuf,
     pub(crate) url: String,
     pub(crate) name: String,
@@ -105,6 +108,7 @@ impl LibraryArtifactPlan {
             .source_url
             .ok_or(LibraryPlanError::MissingDownloadSource)?;
         Ok(DownloadJob {
+            relative_path: self.relative_path.clone(),
             path: self.relative_path.join_under(&libraries_dir(mc_dir)),
             url,
             name: self.name,
@@ -182,6 +186,43 @@ where
     result
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Forge receipt cutover consumes this capability next"
+    )
+)]
+pub(crate) async fn download_installer_libraries_with_authority_and_facts_and_descriptors<F, G, H>(
+    mc_dir: &Path,
+    libraries: &[Library],
+    excluded_paths: &BTreeSet<ArtifactRelativePath>,
+    phase: &str,
+    send: F,
+    mut send_fact: G,
+    mut send_descriptor: H,
+) -> Result<Vec<InstallerLibraryDownloadAuthority>, DownloadError>
+where
+    F: FnMut(DownloadProgress),
+    G: FnMut(ExecutionDownloadFact),
+    H: FnMut(SelectedDownloadArtifactDescriptor),
+{
+    let env = default_environment();
+    let jobs = installer_library_jobs_for(mc_dir, libraries, &env, excluded_paths)?;
+    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
+    let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
+    let result =
+        download_installer_library_jobs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx))
+            .await;
+    while let Ok(fact) = fact_rx.try_recv() {
+        send_fact(fact);
+    }
+    while let Ok(descriptor) = descriptor_rx.try_recv() {
+        send_descriptor(descriptor);
+    }
+    result
+}
+
 async fn download_library_jobs<F>(
     jobs: Vec<DownloadJob>,
     phase: &str,
@@ -234,6 +275,101 @@ where
         send(progress(phase, completed_jobs, total_jobs, Some(name)));
     }
     Ok(())
+}
+
+async fn download_installer_library_jobs<F>(
+    jobs: Vec<DownloadJob>,
+    phase: &str,
+    mut send: F,
+    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+) -> Result<Vec<InstallerLibraryDownloadAuthority>, DownloadError>
+where
+    F: FnMut(DownloadProgress),
+{
+    let client = standard_minecraft_download_client();
+    send(progress(phase, 0, jobs.len() as i32, None));
+    let total_jobs = jobs.len() as i32;
+    let mut completed_jobs = 0;
+    let mut authorities = BTreeMap::new();
+    let mut downloads = futures_util::stream::iter(jobs.into_iter().map(|job| {
+        let client = client.clone();
+        let fact_tx = fact_tx.clone();
+        let descriptor_tx = descriptor_tx.clone();
+        async move {
+            let (size, sha1) = if job.expected.sha1.is_some() {
+                ensure_selected_artifact_with_client(
+                    SelectedDownloadArtifactKind::Library,
+                    &client,
+                    &job.url,
+                    &job.path,
+                    &job.expected,
+                    fact_tx.as_ref(),
+                    descriptor_tx.as_ref(),
+                )
+                .await?;
+                let sha1 = decode_sha1(
+                    job.expected
+                        .sha1
+                        .as_deref()
+                        .ok_or(LibraryPlanError::InvalidChecksum)?,
+                )
+                .ok_or(LibraryPlanError::InvalidChecksum)?;
+                (job.expected.size, sha1)
+            } else {
+                let download =
+                    download_file_with_client_and_fact_sender_allowing_missing_checksum_with_authority(
+                        SelectedDownloadArtifactKind::Library,
+                        &client,
+                        &job.url,
+                        &job.path,
+                        &job.expected,
+                        fact_tx.as_ref(),
+                        descriptor_tx.as_ref(),
+                    )
+                    .await?;
+                (Some(download.report.bytes_written), download.sha1)
+            };
+            let authority = InstallerLibraryDownloadAuthority::new(
+                job.relative_path.clone(),
+                size,
+                sha1,
+            );
+            Ok::<_, DownloadError>((job.relative_path, job.name, authority))
+        }
+    }))
+    .buffer_unordered(library_download_concurrency());
+    while let Some(result) = downloads.next().await {
+        let (path, name, authority) = result?;
+        completed_jobs += 1;
+        send(progress(phase, completed_jobs, total_jobs, Some(name)));
+        if authorities.insert(path, authority).is_some() {
+            return Err(LibraryPlanError::ConflictingArtifactPath.into());
+        }
+    }
+    Ok(authorities.into_values().collect())
+}
+
+fn decode_sha1(value: &str) -> Option<[u8; 20]> {
+    if !is_sha1_hex(value) {
+        return None;
+    }
+    let mut digest = [0_u8; 20];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        digest[index] = hex_nibble(pair[0])?
+            .checked_mul(16)?
+            .checked_add(hex_nibble(pair[1])?)?;
+    }
+    Some(digest)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn resolve_library_plan(
@@ -437,6 +573,27 @@ pub(crate) fn library_jobs_for(
         .collect()
 }
 
+fn installer_library_jobs_for(
+    mc_dir: &Path,
+    libraries: &[Library],
+    env: &Environment,
+    excluded_paths: &BTreeSet<ArtifactRelativePath>,
+) -> Result<Vec<DownloadJob>, LibraryPlanError> {
+    let plans = library_artifact_plans_for(libraries, env, LibraryChecksumPolicy::AllowMissing)?;
+    let planned_paths = plans
+        .iter()
+        .map(|plan| plan.relative_path.clone())
+        .collect::<BTreeSet<_>>();
+    if !excluded_paths.is_subset(&planned_paths) {
+        return Err(LibraryPlanError::InvalidArtifactExclusions);
+    }
+    plans
+        .into_iter()
+        .filter(|plan| !excluded_paths.contains(&plan.relative_path))
+        .map(|plan| plan.into_download_job(mc_dir))
+        .collect()
+}
+
 pub fn library_verification_plans_for(
     mc_dir: &Path,
     libraries: &[Library],
@@ -523,4 +680,214 @@ fn native_name_matches_env(name: &str, env: &crate::rules::Environment) -> bool 
         return env.os_name == "linux" && env.os_arch == "x86_64";
     }
     true
+}
+
+#[cfg(test)]
+mod installer_authority_tests {
+    use super::{
+        LibraryChecksumPolicy,
+        download_installer_libraries_with_authority_and_facts_and_descriptors,
+        installer_library_jobs_for, library_artifact_plans_for,
+    };
+    use crate::artifact_path::ArtifactRelativePath;
+    use crate::download::LibraryPlanError;
+    use crate::launch::{Library, LibraryArtifact, LibraryDownload};
+    use sha1::{Digest as _, Sha1};
+    use std::collections::{BTreeSet, HashMap};
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn installer_exclusions_are_exact_and_applied_before_download_source_validation() {
+        let path = ArtifactRelativePath::new("org/example/generated/1/generated-1.jar")
+            .expect("artifact path");
+        let library = direct_library(path.as_str(), "", "", 0);
+        let exclusions = BTreeSet::from([path.clone()]);
+
+        let jobs = installer_library_jobs_for(
+            Path::new("/tmp/axial-installer-authority"),
+            std::slice::from_ref(&library),
+            &crate::rules::default_environment(),
+            &exclusions,
+        )
+        .expect("excluded generated artifact does not need a source");
+        assert!(jobs.is_empty());
+
+        let unknown =
+            BTreeSet::from([
+                ArtifactRelativePath::new("org/example/unknown/1/unknown-1.jar")
+                    .expect("unknown path"),
+            ]);
+        assert_eq!(
+            installer_library_jobs_for(
+                Path::new("/tmp/axial-installer-authority"),
+                &[library],
+                &crate::rules::default_environment(),
+                &unknown,
+            )
+            .expect_err("unmatched exclusion"),
+            LibraryPlanError::InvalidArtifactExclusions
+        );
+    }
+
+    #[tokio::test]
+    async fn checksummed_installer_authority_reuses_verified_bytes() {
+        let root = temp_dir("checksummed-reuse");
+        let relative = "org/example/reused/1/reused-1.jar";
+        let body = jar_bytes(b"reused");
+        let sha1 = format!("{:x}", Sha1::digest(&body));
+        let destination = root.join("libraries").join(relative);
+        std::fs::create_dir_all(destination.parent().expect("library parent"))
+            .expect("library parent");
+        std::fs::write(&destination, &body).expect("existing library");
+        let library = direct_library(
+            relative,
+            "http://127.0.0.1:9/should-not-be-requested",
+            &sha1,
+            0,
+        );
+
+        let authorities = download_installer_libraries_with_authority_and_facts_and_descriptors(
+            &root,
+            &[library],
+            &BTreeSet::new(),
+            "libraries",
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .await
+        .expect("verified reuse");
+        let (path, size, digest) = authorities
+            .into_iter()
+            .next()
+            .expect("authority")
+            .into_parts();
+        assert_eq!(path.as_str(), relative);
+        assert_eq!(size, None);
+        let expected_digest: [u8; 20] = Sha1::digest(&body).into();
+        assert_eq!(digest, expected_digest);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn checksumless_installer_authority_forces_fresh_stream_and_promotion() {
+        let root = temp_dir("checksumless-fresh");
+        let relative = "org/example/fresh/1/fresh-1.jar";
+        let destination = root.join("libraries").join(relative);
+        std::fs::create_dir_all(destination.parent().expect("library parent"))
+            .expect("library parent");
+        let stale = jar_bytes(b"stale");
+        std::fs::write(&destination, stale).expect("stale usable library");
+        let fresh = jar_bytes(b"fresh");
+        let url = spawn_response(fresh.clone()).await;
+        let library = direct_library(relative, &url, "", 0);
+
+        let authorities = download_installer_libraries_with_authority_and_facts_and_descriptors(
+            &root,
+            &[library],
+            &BTreeSet::new(),
+            "libraries",
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .await
+        .expect("fresh checksumless transfer");
+        let (path, size, digest) = authorities
+            .into_iter()
+            .next()
+            .expect("authority")
+            .into_parts();
+        assert_eq!(std::fs::read(destination).expect("promoted library"), fresh);
+        assert_eq!(path.as_str(), relative);
+        assert_eq!(size, Some(fresh.len() as u64));
+        let expected_digest: [u8; 20] = Sha1::digest(&fresh).into();
+        assert_eq!(digest, expected_digest);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn direct_library(path: &str, url: &str, sha1: &str, size: i64) -> Library {
+        Library {
+            name: "org.example:fixture:1".to_string(),
+            downloads: Some(LibraryDownload {
+                artifact: Some(LibraryArtifact {
+                    path: path.to_string(),
+                    url: url.to_string(),
+                    sha1: sha1.to_string(),
+                    size,
+                }),
+                classifiers: HashMap::new(),
+            }),
+            ..Library::default()
+        }
+    }
+
+    fn jar_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("fixture", SimpleFileOptions::default())
+            .expect("jar entry");
+        writer.write_all(payload).expect("jar payload");
+        writer.finish().expect("finish jar").into_inner()
+    }
+
+    async fn spawn_response(body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind response server");
+        let url = format!(
+            "http://{}/artifact.jar",
+            listener.local_addr().expect("address")
+        );
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(headers.as_bytes()).await;
+            let _ = socket.write_all(&body).await;
+        });
+        url
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        std::env::temp_dir().join(format!(
+            "axial-installer-authority-{prefix}-{}-{nanos:x}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn installer_authority_plans_allow_checksumless_metadata() {
+        let library = direct_library(
+            "org/example/checksumless/1/checksumless-1.jar",
+            "https://example.invalid/checksumless.jar",
+            "",
+            0,
+        );
+        let plans = library_artifact_plans_for(
+            &[library],
+            &crate::rules::default_environment(),
+            LibraryChecksumPolicy::AllowMissing,
+        )
+        .expect("checksumless plan");
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].expected.sha1.is_none());
+    }
 }

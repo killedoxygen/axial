@@ -1,3 +1,4 @@
+use crate::artifact_path::ArtifactRelativePath;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io;
@@ -57,6 +58,24 @@ pub enum LibraryPlanError {
     MissingDownloadSource,
     #[error("library artifacts have conflicting contracts for the same path")]
     ConflictingArtifactPath,
+    #[error("installer library exclusions do not exactly match the planned artifact inventory")]
+    InvalidArtifactExclusions,
+}
+
+pub(crate) struct InstallerLibraryDownloadAuthority {
+    path: ArtifactRelativePath,
+    size: Option<u64>,
+    sha1: [u8; 20],
+}
+
+impl InstallerLibraryDownloadAuthority {
+    pub(super) fn new(path: ArtifactRelativePath, size: Option<u64>, sha1: [u8; 20]) -> Self {
+        Self { path, size, sha1 }
+    }
+
+    pub(crate) fn into_parts(self) -> (ArtifactRelativePath, Option<u64>, [u8; 20]) {
+        (self.path, self.size, self.sha1)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

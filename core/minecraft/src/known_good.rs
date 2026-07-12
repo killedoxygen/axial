@@ -2,12 +2,14 @@ use crate::artifact_path::{
     ArtifactRelativePath, MAX_ARTIFACT_PATH_SEGMENT_BYTES, MAX_ARTIFACT_RELATIVE_PATH_BYTES,
 };
 use crate::download::{
-    ExpectedIntegrity, LibraryArtifactPlan, LibraryChecksumPolicy, library_artifact_plans_for,
-    parse_asset_index,
+    ExpectedIntegrity, InstallerLibraryDownloadAuthority, LibraryArtifactPlan,
+    LibraryChecksumPolicy, library_artifact_plans_for, parse_asset_index,
 };
 use crate::launch::{Library, VersionJson};
 use crate::loaders::{
-    LoaderBuildRecord, LoaderComponentId, LoaderInstallStrategy, installed_loader_metadata_bytes,
+    LoaderBuildRecord, LoaderComponentId, LoaderInstallStrategy, VerifiedInstallerClientBytes,
+    VerifiedInstallerReceiptSource, VerifiedProcessorOutputs, compose_loader_version,
+    installed_loader_metadata_bytes,
 };
 use crate::manifest::ManifestEntry;
 use crate::rules::Environment;
@@ -198,6 +200,141 @@ pub struct KnownGoodInstallReceipt {
     inventory: KnownGoodInventory,
     effective_version: VersionJson,
     environment: Environment,
+}
+
+pub(crate) struct VerifiedInstallerLibraryAuthority {
+    entries: BTreeMap<ArtifactRelativePath, VerifiedInstallerLibraryFact>,
+}
+
+struct VerifiedInstallerLibraryFact {
+    size: Option<u64>,
+    sha1: [u8; 20],
+    terminal_bytes: Option<Arc<[u8]>>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Forge receipt cutover consumes this capability next"
+    )
+)]
+pub(crate) fn seal_verified_installer_library_authority(
+    source: &VerifiedInstallerReceiptSource,
+    downloads: Vec<InstallerLibraryDownloadAuthority>,
+    outputs: VerifiedProcessorOutputs,
+) -> Result<VerifiedInstallerLibraryAuthority, KnownGoodInventoryError> {
+    let plans = library_artifact_plans_for(
+        source.libraries(),
+        &crate::rules::default_environment(),
+        LibraryChecksumPolicy::AllowMissing,
+    )
+    .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+    let expected = plans
+        .into_iter()
+        .map(|plan| (plan.relative_path.clone(), plan))
+        .collect::<BTreeMap<_, _>>();
+    let mut entries = BTreeMap::new();
+
+    for download in downloads {
+        let (path, size, sha1) = download.into_parts();
+        insert_installer_library_fact(
+            &mut entries,
+            path,
+            VerifiedInstallerLibraryFact {
+                size,
+                sha1,
+                terminal_bytes: None,
+            },
+        )?;
+    }
+    for artifact in source.embedded_maven_artifacts() {
+        if !expected.contains_key(artifact.relative_path()) {
+            continue;
+        }
+        insert_installer_library_fact(
+            &mut entries,
+            artifact.relative_path().clone(),
+            VerifiedInstallerLibraryFact {
+                size: Some(artifact.bytes().len() as u64),
+                sha1: Sha1::digest(artifact.bytes()).into(),
+                terminal_bytes: None,
+            },
+        )?;
+    }
+    for (path, output) in outputs.into_entries() {
+        let (bytes, size, sha1) = output.into_parts();
+        let actual_sha1: [u8; 20] = Sha1::digest(bytes.as_ref()).into();
+        if size != bytes.len() as u64 || sha1 != actual_sha1 {
+            return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
+        }
+        insert_installer_library_fact(
+            &mut entries,
+            path,
+            VerifiedInstallerLibraryFact {
+                size: Some(size),
+                sha1,
+                terminal_bytes: Some(bytes),
+            },
+        )?;
+    }
+
+    if entries.len() != expected.len() || entries.keys().any(|path| !expected.contains_key(path)) {
+        return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
+    }
+    for (path, plan) in expected {
+        let fact = entries
+            .get(&path)
+            .ok_or(KnownGoodInventoryError::InstallerLibraryProofMismatch)?;
+        if plan
+            .expected
+            .size
+            .is_some_and(|size| fact.size != Some(size))
+            || plan.expected.sha1.as_deref().is_some_and(|sha1| {
+                !Sha1Digest::from_metadata(sha1)
+                    .is_ok_and(|expected| expected == sha1_array_digest(&fact.sha1))
+            })
+        {
+            return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
+        }
+    }
+    Ok(VerifiedInstallerLibraryAuthority { entries })
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Forge receipt cutover consumes this capability next"
+    )
+)]
+impl VerifiedInstallerLibraryAuthority {
+    pub(crate) fn into_terminal_materializations(self) -> Vec<(ArtifactRelativePath, Arc<[u8]>)> {
+        self.entries
+            .into_iter()
+            .filter_map(|(path, fact)| fact.terminal_bytes.map(|bytes| (path, bytes)))
+            .collect()
+    }
+}
+
+fn insert_installer_library_fact(
+    entries: &mut BTreeMap<ArtifactRelativePath, VerifiedInstallerLibraryFact>,
+    path: ArtifactRelativePath,
+    fact: VerifiedInstallerLibraryFact,
+) -> Result<(), KnownGoodInventoryError> {
+    if entries.insert(path, fact).is_some() {
+        return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
+    }
+    Ok(())
+}
+
+fn sha1_array_digest(value: &[u8; 20]) -> Sha1Digest {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(40);
+    for byte in value {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    Sha1Digest(encoded)
 }
 
 impl KnownGoodInstallReceipt {
@@ -459,6 +596,222 @@ impl KnownGoodInstallReceipt {
         })
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the Forge receipt cutover consumes this capability next"
+        )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "receipt derivation keeps each authenticated input explicit"
+    )]
+    pub(crate) fn from_verified_installer_source(
+        base: Self,
+        record: &LoaderBuildRecord,
+        source: &VerifiedInstallerReceiptSource,
+        resolved_version: VersionJson,
+        version_bytes: &[u8],
+        base_client_bytes: &[u8],
+        child_client: &VerifiedInstallerClientBytes,
+        loader_metadata_bytes: &[u8],
+        library_authority: &VerifiedInstallerLibraryAuthority,
+    ) -> Result<Self, KnownGoodInventoryError> {
+        let strategy_matches = matches!(
+            (record.component_id, record.strategy),
+            (
+                LoaderComponentId::Forge,
+                LoaderInstallStrategy::ForgeModern | LoaderInstallStrategy::ForgeLegacyInstaller
+            ) | (
+                LoaderComponentId::NeoForge,
+                LoaderInstallStrategy::NeoForgeModern
+            )
+        );
+        let recomposed = compose_loader_version(
+            &base.effective_version,
+            &record.minecraft_version,
+            &record.version_id,
+            source.version(),
+        )
+        .ok();
+        if !strategy_matches
+            || crate::loaders::api::validate_loader_build_record_identity(record).is_err()
+            || base.version_id.as_str() != record.minecraft_version
+            || base.effective_version.id != record.minecraft_version
+            || recomposed.as_ref() != Some(&resolved_version)
+            || resolved_version.id != record.version_id
+            || !serde_json::from_slice::<VersionJson>(version_bytes)
+                .is_ok_and(|version| version == resolved_version)
+            || source.source_bytes().is_empty()
+        {
+            return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
+        }
+        base.authenticate_client_bytes(base_client_bytes)?;
+        if !child_client.matches_derivation(source, base_client_bytes)
+            || child_client.bytes().is_empty()
+        {
+            return Err(KnownGoodInventoryError::ClientIntegrity);
+        }
+        let child_client_bytes = child_client.bytes();
+        let child_client = resolved_version
+            .downloads
+            .client
+            .as_ref()
+            .ok_or(KnownGoodInventoryError::MissingClient)?;
+        let child_digest = sha1_digest(child_client_bytes);
+        if u64::try_from(child_client.size).ok() != Some(child_client_bytes.len() as u64)
+            || Sha1Digest::from_metadata(&child_client.sha1)? != child_digest
+        {
+            return Err(KnownGoodInventoryError::ClientIntegrity);
+        }
+        let expected_metadata = installed_loader_metadata_bytes(record)
+            .map_err(|_| KnownGoodInventoryError::MetadataSerialization)?;
+        if expected_metadata != loader_metadata_bytes {
+            return Err(KnownGoodInventoryError::MetadataSerialization);
+        }
+
+        let version_id = KnownGoodId::new(&record.version_id)?;
+        let mut builder = InventoryBuilder::default();
+        for entry in base.inventory.entries.iter().filter(|entry| {
+            matches!(
+                &entry.root,
+                KnownGoodRoot::Assets | KnownGoodRoot::ManagedRuntime { .. }
+            )
+        }) {
+            builder.insert(entry.clone())?;
+        }
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Versions,
+            path: KnownGoodRelativePath::new(&format!("{0}/{0}.json", version_id.as_str()))?,
+            kind: KnownGoodArtifactKind::VersionMetadata,
+            integrity: exact_bytes_integrity(version_bytes),
+        })?;
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Versions,
+            path: KnownGoodRelativePath::new(&format!("{0}/{0}.jar", version_id.as_str()))?,
+            kind: KnownGoodArtifactKind::ClientJar,
+            integrity: KnownGoodIntegrity::Sha1 {
+                digest: child_digest,
+                size: Some(child_client_bytes.len() as u64),
+            },
+        })?;
+
+        let proofs = &library_authority.entries;
+        let mut used_proofs = BTreeMap::new();
+        let final_libraries = library_artifact_plans_for(
+            &resolved_version.libraries,
+            &base.environment,
+            LibraryChecksumPolicy::AllowMissing,
+        )
+        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+        for plan in final_libraries {
+            let path = KnownGoodRelativePath::new(plan.relative_path.as_str())?;
+            let kind = if plan.is_native {
+                KnownGoodArtifactKind::NativeLibrary
+            } else {
+                KnownGoodArtifactKind::Library
+            };
+            let integrity = if let Some(proof) = proofs.get(&plan.relative_path) {
+                if plan
+                    .expected
+                    .size
+                    .is_some_and(|size| proof.size != Some(size))
+                    || plan.expected.sha1.as_deref().is_some_and(|sha1| {
+                        !Sha1Digest::from_metadata(sha1)
+                            .is_ok_and(|expected| expected == sha1_array_digest(&proof.sha1))
+                    })
+                {
+                    return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
+                }
+                KnownGoodIntegrity::Sha1 {
+                    digest: sha1_array_digest(&proof.sha1),
+                    size: proof.size,
+                }
+            } else {
+                let expected = expected_integrity(&plan.expected, false, path.as_str())?;
+                let base_entry = base.inventory.entries.iter().find(|entry| {
+                    entry.root == KnownGoodRoot::Libraries
+                        && entry.path.as_str() == path.as_str()
+                        && entry.kind == kind
+                        && entry.integrity == expected
+                });
+                base_entry
+                    .ok_or(KnownGoodInventoryError::InstallerLibraryProofMismatch)?
+                    .integrity
+                    .clone()
+            };
+            builder.insert(KnownGoodEntry {
+                root: KnownGoodRoot::Libraries,
+                path,
+                kind,
+                integrity,
+            })?;
+            if proofs.contains_key(&plan.relative_path) {
+                used_proofs.insert(plan.relative_path, ());
+            }
+        }
+
+        let installer_libraries = library_artifact_plans_for(
+            source.libraries(),
+            &crate::rules::default_environment(),
+            LibraryChecksumPolicy::AllowMissing,
+        )
+        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+        for plan in installer_libraries {
+            if used_proofs.contains_key(&plan.relative_path) {
+                continue;
+            }
+            let proof = proofs
+                .get(&plan.relative_path)
+                .ok_or(KnownGoodInventoryError::InstallerLibraryProofMismatch)?;
+            if plan
+                .expected
+                .size
+                .is_some_and(|size| proof.size != Some(size))
+                || plan.expected.sha1.as_deref().is_some_and(|sha1| {
+                    !Sha1Digest::from_metadata(sha1)
+                        .is_ok_and(|expected| expected == sha1_array_digest(&proof.sha1))
+                })
+            {
+                return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
+            }
+            builder.insert(KnownGoodEntry {
+                root: KnownGoodRoot::Libraries,
+                path: KnownGoodRelativePath::new(plan.relative_path.as_str())?,
+                kind: if plan.is_native {
+                    KnownGoodArtifactKind::NativeLibrary
+                } else {
+                    KnownGoodArtifactKind::Library
+                },
+                integrity: KnownGoodIntegrity::Sha1 {
+                    digest: sha1_array_digest(&proof.sha1),
+                    size: proof.size,
+                },
+            })?;
+            used_proofs.insert(plan.relative_path, ());
+        }
+        if used_proofs.len() != proofs.len() {
+            return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
+        }
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Versions,
+            path: KnownGoodRelativePath::new(&format!(
+                "{}/.axial-loader.json",
+                version_id.as_str()
+            ))?,
+            kind: KnownGoodArtifactKind::LoaderMetadata,
+            integrity: exact_bytes_integrity(loader_metadata_bytes),
+        })?;
+
+        Ok(Self {
+            version_id,
+            inventory: builder.finish(),
+            effective_version: resolved_version,
+            environment: base.environment,
+        })
+    }
+
     pub(crate) fn from_verified_vanilla_source(
         input: KnownGoodInventoryInput<'_>,
         version_json_bytes: &[u8],
@@ -660,6 +1013,7 @@ pub enum KnownGoodInventoryError {
     InputTooLarge,
     InvalidLibraryPlan,
     StructuralLibraryMismatch,
+    InstallerLibraryProofMismatch,
     ConflictingEntry,
     ConflictingRuntimePath,
     TooManyEntries,
@@ -1247,6 +1601,385 @@ mod tests {
             })
             .expect("unique inventory entry");
         builder.finish()
+    }
+
+    struct InstallerReceiptFixture {
+        base: KnownGoodInstallReceipt,
+        record: LoaderBuildRecord,
+        source: VerifiedInstallerReceiptSource,
+        child_client: VerifiedInstallerClientBytes,
+        authority: VerifiedInstallerLibraryAuthority,
+        resolved: VersionJson,
+        version_bytes: Vec<u8>,
+        base_client_bytes: Vec<u8>,
+        metadata: Vec<u8>,
+        embedded_path: ArtifactRelativePath,
+        terminal_path: ArtifactRelativePath,
+        processor_path: ArtifactRelativePath,
+        embedded_bytes: Vec<u8>,
+        terminal_bytes: Vec<u8>,
+        processor_bytes: Vec<u8>,
+    }
+
+    fn installer_receipt_fixture(base_client_bytes: &[u8]) -> InstallerReceiptFixture {
+        let record = loader_record(FixtureShape::Forge, LoaderComponentId::Forge);
+        let embedded_bytes = b"authenticated embedded library".to_vec();
+        let terminal_bytes = b"authenticated terminal processor output".to_vec();
+        let processor_bytes = b"authenticated processor-only library".to_vec();
+        let embedded_path = ArtifactRelativePath::new("example/embedded/1.0/embedded-1.0.jar")
+            .expect("embedded path");
+        let terminal_path = ArtifactRelativePath::new("example/terminal/1.0/terminal-1.0.jar")
+            .expect("terminal path");
+        let processor_path =
+            ArtifactRelativePath::new("example/processor-only/1.0/processor-only-1.0.jar")
+                .expect("processor-only path");
+        let libraries = vec![
+            checksum_library(
+                "example:embedded:1.0",
+                embedded_path.as_str(),
+                sha1_digest(&embedded_bytes).as_str(),
+                embedded_bytes.len() as i64,
+            ),
+            checksum_library(
+                "example:terminal:1.0",
+                terminal_path.as_str(),
+                sha1_digest(&terminal_bytes).as_str(),
+                terminal_bytes.len() as i64,
+            ),
+        ];
+        let mut installer_libraries = libraries.clone();
+        installer_libraries.push(checksum_library(
+            "example:processor-only:1.0",
+            processor_path.as_str(),
+            sha1_digest(&processor_bytes).as_str(),
+            processor_bytes.len() as i64,
+        ));
+        let source = VerifiedInstallerReceiptSource::from_test(
+            libraries,
+            installer_libraries,
+            vec![
+                (embedded_path.clone(), embedded_bytes.clone()),
+                (processor_path.clone(), processor_bytes.clone()),
+            ],
+            false,
+        );
+        let child_client = source
+            .derive_child_client_bytes(base_client_bytes)
+            .expect("derived child client");
+        let authority = seal_verified_installer_library_authority(
+            &source,
+            Vec::new(),
+            VerifiedProcessorOutputs::from_test_terminal(vec![(
+                terminal_path.clone(),
+                terminal_bytes.clone(),
+            )]),
+        )
+        .expect("sealed library authority");
+
+        let mut base_version = fixture(FixtureShape::Vanilla, false).version;
+        base_version.id = record.minecraft_version.clone();
+        base_version.libraries.clear();
+        let client = base_version
+            .downloads
+            .client
+            .as_mut()
+            .expect("base client metadata");
+        client.sha1 = sha1_digest(base_client_bytes).as_str().to_string();
+        client.size = base_client_bytes.len() as i64;
+        let base = KnownGoodInstallReceipt {
+            version_id: KnownGoodId::new(&record.minecraft_version).expect("base id"),
+            inventory: InventoryBuilder::default().finish(),
+            effective_version: base_version.clone(),
+            environment: crate::rules::default_environment(),
+        };
+        let resolved = compose_loader_version(
+            &base_version,
+            &record.minecraft_version,
+            &record.version_id,
+            source.version(),
+        )
+        .expect("resolved installer version");
+        let version_bytes = serde_json::to_vec_pretty(&resolved).expect("version bytes");
+        let metadata = installed_loader_metadata_bytes(&record).expect("loader metadata");
+
+        InstallerReceiptFixture {
+            base,
+            record,
+            source,
+            child_client,
+            authority,
+            resolved,
+            version_bytes,
+            base_client_bytes: base_client_bytes.to_vec(),
+            metadata,
+            embedded_path,
+            terminal_path,
+            processor_path,
+            embedded_bytes,
+            terminal_bytes,
+            processor_bytes,
+        }
+    }
+
+    #[test]
+    fn installer_authority_rejects_missing_duplicate_and_extra_proofs() {
+        let path =
+            ArtifactRelativePath::new("example/proof/1.0/proof-1.0.jar").expect("proof path");
+        let bytes = b"proof bytes".to_vec();
+        let library = checksum_library(
+            "example:proof:1.0",
+            path.as_str(),
+            sha1_digest(&bytes).as_str(),
+            bytes.len() as i64,
+        );
+        let source = VerifiedInstallerReceiptSource::from_test(
+            Vec::new(),
+            vec![library],
+            vec![(path.clone(), bytes.clone())],
+            false,
+        );
+
+        assert!(matches!(
+            seal_verified_installer_library_authority(
+                &source,
+                Vec::new(),
+                VerifiedProcessorOutputs::from_test_terminal(vec![(path, bytes)]),
+            ),
+            Err(KnownGoodInventoryError::InstallerLibraryProofMismatch)
+        ));
+
+        let missing = VerifiedInstallerReceiptSource::from_test(
+            Vec::new(),
+            source.libraries().to_vec(),
+            Vec::new(),
+            false,
+        );
+        assert!(matches!(
+            seal_verified_installer_library_authority(
+                &missing,
+                Vec::new(),
+                VerifiedProcessorOutputs::none(),
+            ),
+            Err(KnownGoodInventoryError::InstallerLibraryProofMismatch)
+        ));
+
+        let extra_path =
+            ArtifactRelativePath::new("example/extra/1.0/extra-1.0.jar").expect("extra path");
+        let empty =
+            VerifiedInstallerReceiptSource::from_test(Vec::new(), Vec::new(), Vec::new(), false);
+        assert!(matches!(
+            seal_verified_installer_library_authority(
+                &empty,
+                Vec::new(),
+                VerifiedProcessorOutputs::from_test_terminal(vec![
+                    (extra_path, b"extra".to_vec(),)
+                ]),
+            ),
+            Err(KnownGoodInventoryError::InstallerLibraryProofMismatch)
+        ));
+
+        let declared = b"declared";
+        let tampered = b"tampered";
+        let drift_path =
+            ArtifactRelativePath::new("example/drift/1.0/drift-1.0.jar").expect("drift path");
+        let digest_drift = VerifiedInstallerReceiptSource::from_test(
+            Vec::new(),
+            vec![checksum_library(
+                "example:drift:1.0",
+                drift_path.as_str(),
+                sha1_digest(declared).as_str(),
+                declared.len() as i64,
+            )],
+            Vec::new(),
+            false,
+        );
+        assert!(matches!(
+            seal_verified_installer_library_authority(
+                &digest_drift,
+                Vec::new(),
+                VerifiedProcessorOutputs::from_test_terminal(vec![(
+                    drift_path.clone(),
+                    tampered.to_vec(),
+                )]),
+            ),
+            Err(KnownGoodInventoryError::InstallerLibraryProofMismatch)
+        ));
+
+        let size_drift = VerifiedInstallerReceiptSource::from_test(
+            Vec::new(),
+            vec![checksum_library(
+                "example:drift:1.0",
+                drift_path.as_str(),
+                sha1_digest(tampered).as_str(),
+                tampered.len() as i64 + 1,
+            )],
+            Vec::new(),
+            false,
+        );
+        assert!(matches!(
+            seal_verified_installer_library_authority(
+                &size_drift,
+                Vec::new(),
+                VerifiedProcessorOutputs::from_test_terminal(vec![
+                    (drift_path, tampered.to_vec(),)
+                ]),
+            ),
+            Err(KnownGoodInventoryError::InstallerLibraryProofMismatch)
+        ));
+    }
+
+    #[test]
+    fn installer_authority_seals_processor_only_embedded_artifacts() {
+        let processor_path = ArtifactRelativePath::new("example/processor/1.0/processor-1.0.jar")
+            .expect("processor path");
+        let processor_bytes = b"processor input".to_vec();
+        let source = VerifiedInstallerReceiptSource::from_test(
+            Vec::new(),
+            vec![checksum_library(
+                "example:processor:1.0",
+                processor_path.as_str(),
+                sha1_digest(&processor_bytes).as_str(),
+                processor_bytes.len() as i64,
+            )],
+            vec![(processor_path, processor_bytes)],
+            false,
+        );
+        let authority = seal_verified_installer_library_authority(
+            &source,
+            Vec::new(),
+            VerifiedProcessorOutputs::none(),
+        )
+        .expect("processor-only embedded input authority");
+        assert!(authority.into_terminal_materializations().is_empty());
+        assert_eq!(source.into_embedded_maven_artifacts().len(), 1);
+    }
+
+    #[test]
+    fn installer_receipt_is_exact_and_retains_materialization_carriers() {
+        let fixture = installer_receipt_fixture(b"authenticated base client");
+        let InstallerReceiptFixture {
+            base,
+            record,
+            source,
+            child_client,
+            authority,
+            resolved,
+            version_bytes,
+            base_client_bytes,
+            metadata,
+            embedded_path,
+            terminal_path,
+            processor_path,
+            embedded_bytes,
+            terminal_bytes,
+            processor_bytes,
+        } = fixture;
+        assert!(
+            !resolved
+                .libraries
+                .iter()
+                .any(|library| library.name == "example:processor-only:1.0")
+        );
+        let receipt = KnownGoodInstallReceipt::from_verified_installer_source(
+            base,
+            &record,
+            &source,
+            resolved,
+            &version_bytes,
+            &base_client_bytes,
+            &child_client,
+            &metadata,
+            &authority,
+        )
+        .expect("verified installer receipt");
+
+        assert_eq!(child_client.into_bytes(), base_client_bytes);
+        let embedded = source.into_embedded_maven_artifacts();
+        assert_eq!(embedded.len(), 2);
+        assert!(embedded.iter().any(|artifact| {
+            artifact.relative_path() == &embedded_path && artifact.bytes() == embedded_bytes
+        }));
+        assert!(embedded.iter().any(|artifact| {
+            artifact.relative_path() == &processor_path && artifact.bytes() == processor_bytes
+        }));
+        let terminal = authority.into_terminal_materializations();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].0, terminal_path);
+        assert_eq!(terminal[0].1.as_ref(), terminal_bytes);
+
+        let inventory = receipt.into_inventory();
+        assert_entry(
+            &inventory,
+            &KnownGoodRoot::Libraries,
+            embedded_path.as_str(),
+            KnownGoodArtifactKind::Library,
+            &KnownGoodIntegrity::Sha1 {
+                digest: sha1_digest(&embedded_bytes),
+                size: Some(embedded_bytes.len() as u64),
+            },
+        );
+        assert_entry(
+            &inventory,
+            &KnownGoodRoot::Libraries,
+            processor_path.as_str(),
+            KnownGoodArtifactKind::Library,
+            &KnownGoodIntegrity::Sha1 {
+                digest: sha1_digest(&processor_bytes),
+                size: Some(processor_bytes.len() as u64),
+            },
+        );
+        assert_entry(
+            &inventory,
+            &KnownGoodRoot::Libraries,
+            terminal_path.as_str(),
+            KnownGoodArtifactKind::Library,
+            &KnownGoodIntegrity::Sha1 {
+                digest: sha1_digest(&terminal_bytes),
+                size: Some(terminal_bytes.len() as u64),
+            },
+        );
+    }
+
+    #[test]
+    fn installer_receipt_rejects_identity_library_and_cross_base_drift() {
+        let mut identity = installer_receipt_fixture(b"authenticated base client");
+        identity.resolved.main_class = "tampered.Main".to_string();
+        identity.version_bytes = serde_json::to_vec_pretty(&identity.resolved).expect("version");
+        assert!(matches!(
+            KnownGoodInstallReceipt::from_verified_installer_source(
+                identity.base,
+                &identity.record,
+                &identity.source,
+                identity.resolved,
+                &identity.version_bytes,
+                &identity.base_client_bytes,
+                &identity.child_client,
+                &identity.metadata,
+                &identity.authority,
+            ),
+            Err(KnownGoodInventoryError::LoaderIdentityMismatch)
+        ));
+
+        let cross_base = installer_receipt_fixture(b"authenticated base client");
+        let foreign_source =
+            VerifiedInstallerReceiptSource::from_test(Vec::new(), Vec::new(), Vec::new(), false);
+        let foreign_client = foreign_source
+            .derive_child_client_bytes(b"different authenticated base")
+            .expect("foreign child client");
+        assert!(matches!(
+            KnownGoodInstallReceipt::from_verified_installer_source(
+                cross_base.base,
+                &cross_base.record,
+                &cross_base.source,
+                cross_base.resolved,
+                &cross_base.version_bytes,
+                &cross_base.base_client_bytes,
+                &foreign_client,
+                &cross_base.metadata,
+                &cross_base.authority,
+            ),
+            Err(KnownGoodInventoryError::ClientIntegrity)
+        ));
     }
 
     #[test]

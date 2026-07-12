@@ -160,17 +160,42 @@ pub(crate) struct BoundForgeProcessorExecution {
     continuation: BoundForgeInstallerContinuation,
 }
 
-#[expect(
-    dead_code,
-    reason = "non-runnable continuation is consumed by the receipt cutover next"
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Forge receipt cutover consumes this capability next"
+    )
 )]
-pub(crate) enum BoundForgeProcessorExtraction {
-    Runnable(Box<BoundForgeProcessorExecution>),
-    NonRunnable(Box<BoundForgeInstallerPlan>),
+pub(crate) enum BoundForgeInstallExecution {
+    Run(Box<BoundForgeProcessorExecution>),
+    Continue(Box<BoundForgeInstallerContinuation>),
+    UnsupportedMissingOutputs,
 }
 
 pub(crate) struct BoundForgeInstallerContinuation {
     authenticated: AuthenticatedForgeInstallerPlan,
+}
+
+pub(crate) struct VerifiedInstallerReceiptSource {
+    source: VerifiedLoaderSource,
+    version: LoaderProfileFragment,
+    libraries: Vec<Library>,
+    embedded_maven_artifacts: Vec<AuthenticatedEmbeddedMavenArtifact>,
+    strip_client_meta: bool,
+}
+
+pub(crate) struct VerifiedInstallerClientBytes {
+    bytes: Vec<u8>,
+    transformation: InstallerClientTransformation,
+    base_size: u64,
+    base_sha1: [u8; 20],
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum InstallerClientTransformation {
+    ExactBase,
+    StripSignedMetadata,
 }
 
 pub(crate) enum BoundProcessorDisposition {
@@ -324,23 +349,34 @@ impl BoundForgeInstallerPlan {
         &self.processor_disposition
     }
 
-    #[expect(
-        dead_code,
-        reason = "disconnected executor entry is wired by the receipt cutover next"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the Forge receipt cutover consumes this capability next"
+        )
     )]
-    pub(crate) fn into_processor_execution(self) -> BoundForgeProcessorExtraction {
-        match self {
-            Self {
-                mut authenticated,
-                processor_disposition: BoundProcessorDisposition::TypedRunnable(plan),
-            } => {
-                authenticated.install_profile_json = None;
-                BoundForgeProcessorExtraction::Runnable(Box::new(BoundForgeProcessorExecution {
+    pub(crate) fn into_install_execution(self) -> BoundForgeInstallExecution {
+        let Self {
+            mut authenticated,
+            processor_disposition,
+        } = self;
+        authenticated.install_profile_json = None;
+        let continuation = BoundForgeInstallerContinuation { authenticated };
+        match processor_disposition {
+            BoundProcessorDisposition::TypedRunnable(plan) => {
+                BoundForgeInstallExecution::Run(Box::new(BoundForgeProcessorExecution {
                     plan,
-                    continuation: BoundForgeInstallerContinuation { authenticated },
+                    continuation,
                 }))
             }
-            other => BoundForgeProcessorExtraction::NonRunnable(Box::new(other)),
+            BoundProcessorDisposition::LegacyNoClientWork
+            | BoundProcessorDisposition::EmptyClientWork => {
+                BoundForgeInstallExecution::Continue(Box::new(continuation))
+            }
+            BoundProcessorDisposition::UnsupportedMissingOutputs => {
+                BoundForgeInstallExecution::UnsupportedMissingOutputs
+            }
         }
     }
 }
@@ -348,6 +384,28 @@ impl BoundForgeInstallerPlan {
 impl BoundForgeProcessorExecution {
     pub(super) fn into_parts(self) -> (BoundForgeInstallerContinuation, BoundProcessorPlan) {
         (self.continuation, self.plan)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the Forge receipt cutover consumes this capability next"
+        )
+    )]
+    pub(crate) fn excluded_live_library_paths(
+        &self,
+    ) -> Result<BTreeSet<ArtifactRelativePath>, ForgeInstallerError> {
+        let mut paths = self.continuation.final_embedded_library_paths()?;
+        paths.extend(
+            self.plan
+                .steps
+                .iter()
+                .flat_map(|step| &step.outputs)
+                .filter(|output| matches!(output.role, BoundProcessorOutputRole::Terminal { .. }))
+                .map(|output| output.artifact.relative_path.clone()),
+        );
+        Ok(paths)
     }
 }
 
@@ -364,20 +422,174 @@ impl BoundForgeInstallerContinuation {
         &self.authenticated.version
     }
 
-    #[expect(
-        dead_code,
-        reason = "continuation is consumed by the receipt cutover next"
+    fn final_embedded_library_paths(
+        &self,
+    ) -> Result<BTreeSet<ArtifactRelativePath>, ForgeInstallerError> {
+        let final_paths = library_artifact_plans_for(
+            &self.authenticated.libraries,
+            &default_environment(),
+            LibraryChecksumPolicy::AllowMissing,
+        )
+        .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?
+        .into_iter()
+        .map(|plan| plan.relative_path)
+        .collect::<BTreeSet<_>>();
+        Ok(self
+            .authenticated
+            .embedded_maven_artifacts
+            .iter()
+            .filter(|artifact| final_paths.contains(&artifact.relative_path))
+            .map(|artifact| artifact.relative_path.clone())
+            .collect())
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the Forge receipt cutover consumes this capability next"
+        )
     )]
-    pub(crate) fn libraries(&self) -> &[Library] {
-        &self.authenticated.libraries
+    pub(crate) fn excluded_live_library_paths(
+        &self,
+    ) -> Result<BTreeSet<ArtifactRelativePath>, ForgeInstallerError> {
+        self.final_embedded_library_paths()
     }
 
     #[expect(
         dead_code,
-        reason = "continuation is consumed by the receipt cutover next"
+        reason = "the receipt-producing Forge install cutover consumes this capability next"
     )]
-    pub(crate) fn strip_client_meta(&self) -> bool {
-        self.authenticated.strip_client_meta
+    pub(crate) fn into_receipt_source(self) -> VerifiedInstallerReceiptSource {
+        let AuthenticatedForgeInstallerPlan {
+            source,
+            version,
+            install_profile_json: _,
+            libraries,
+            embedded_maven_artifacts,
+            strip_client_meta,
+        } = self.authenticated;
+        VerifiedInstallerReceiptSource {
+            source,
+            version,
+            libraries,
+            embedded_maven_artifacts,
+            strip_client_meta,
+        }
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Forge receipt cutover consumes this capability next"
+    )
+)]
+impl VerifiedInstallerReceiptSource {
+    pub(crate) fn source_bytes(&self) -> &[u8] {
+        self.source.bytes()
+    }
+
+    pub(crate) fn version(&self) -> &LoaderProfileFragment {
+        &self.version
+    }
+
+    pub(crate) fn libraries(&self) -> &[Library] {
+        &self.libraries
+    }
+
+    pub(crate) fn embedded_maven_artifacts(&self) -> &[AuthenticatedEmbeddedMavenArtifact] {
+        &self.embedded_maven_artifacts
+    }
+
+    pub(crate) fn derive_child_client_bytes(
+        &self,
+        authenticated_base_bytes: &[u8],
+    ) -> Result<VerifiedInstallerClientBytes, ForgeInstallerError> {
+        let (bytes, transformation) = if self.strip_client_meta {
+            (
+                strip_signed_metadata_in_memory(authenticated_base_bytes, "Minecraft client")?,
+                InstallerClientTransformation::StripSignedMetadata,
+            )
+        } else {
+            (
+                authenticated_base_bytes.to_vec(),
+                InstallerClientTransformation::ExactBase,
+            )
+        };
+        Ok(VerifiedInstallerClientBytes {
+            bytes,
+            transformation,
+            base_size: authenticated_base_bytes.len() as u64,
+            base_sha1: Sha1::digest(authenticated_base_bytes).into(),
+        })
+    }
+
+    pub(crate) fn into_embedded_maven_artifacts(self) -> Vec<AuthenticatedEmbeddedMavenArtifact> {
+        self.embedded_maven_artifacts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test(
+        version_libraries: Vec<Library>,
+        libraries: Vec<Library>,
+        embedded_maven_artifacts: Vec<(ArtifactRelativePath, Vec<u8>)>,
+        strip_client_meta: bool,
+    ) -> Self {
+        let version = LoaderProfileFragment {
+            main_class: "example.LoaderMain".to_string(),
+            libraries: version_libraries,
+            ..LoaderProfileFragment::default()
+        };
+        Self {
+            source: VerifiedLoaderSource::from_test_bytes(b"verified installer".to_vec()),
+            version,
+            libraries,
+            embedded_maven_artifacts: embedded_maven_artifacts
+                .into_iter()
+                .map(
+                    |(relative_path, bytes)| AuthenticatedEmbeddedMavenArtifact {
+                        relative_path,
+                        bytes,
+                    },
+                )
+                .collect(),
+            strip_client_meta,
+        }
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Forge receipt cutover consumes this capability next"
+    )
+)]
+impl VerifiedInstallerClientBytes {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    pub(crate) fn matches_derivation(
+        &self,
+        source: &VerifiedInstallerReceiptSource,
+        authenticated_base_bytes: &[u8],
+    ) -> bool {
+        let actual_base_sha1: [u8; 20] = Sha1::digest(authenticated_base_bytes).into();
+        self.base_size == authenticated_base_bytes.len() as u64
+            && self.base_sha1 == actual_base_sha1
+            && self.transformation
+                == if source.strip_client_meta {
+                    InstallerClientTransformation::StripSignedMetadata
+                } else {
+                    InstallerClientTransformation::ExactBase
+                }
     }
 }
 
@@ -2259,11 +2471,11 @@ fn normalize_legacy_forge_version_id(path: &str, minecraft: &str) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthenticatedForgeInstallerPlan, BoundForgeInstallerPlan, BoundProcessorDisposition,
-        BoundProcessorPlan, ForgeInstallerError, MAX_INSTALLER_EMBEDDED_ENTRY_BYTES,
-        MAX_INSTALLER_PROFILE_ENTRY_BYTES, bind_authenticated_installer_plan,
-        merge_libraries_by_name, normalize_legacy_forge_library, normalize_legacy_forge_version_id,
-        plan_authenticated_installer,
+        AuthenticatedForgeInstallerPlan, BoundForgeInstallExecution, BoundForgeInstallerPlan,
+        BoundProcessorDisposition, BoundProcessorPlan, ForgeInstallerError,
+        MAX_INSTALLER_EMBEDDED_ENTRY_BYTES, MAX_INSTALLER_PROFILE_ENTRY_BYTES,
+        bind_authenticated_installer_plan, merge_libraries_by_name, normalize_legacy_forge_library,
+        normalize_legacy_forge_version_id, plan_authenticated_installer,
     };
     use crate::launch::Library;
     use crate::loaders::source::VerifiedLoaderSource;
@@ -2272,7 +2484,7 @@ mod tests {
         LoaderComponentId, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
     };
     use crate::loaders::{build_id_for, installed_version_id_for};
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
     use zip::write::SimpleFileOptions;
 
@@ -2386,6 +2598,16 @@ mod tests {
             empty.processor_disposition(),
             BoundProcessorDisposition::EmptyClientWork
         ));
+        let BoundForgeInstallExecution::Continue(continuation) = empty.into_install_execution()
+        else {
+            panic!("empty client work continuation");
+        };
+        assert!(
+            continuation
+                .excluded_live_library_paths()
+                .expect("empty exclusions")
+                .is_empty()
+        );
 
         let mut server_only = install;
         server_only["processors"] = serde_json::json!([
@@ -2411,6 +2633,10 @@ mod tests {
         assert!(matches!(
             legacy_bound.processor_disposition(),
             BoundProcessorDisposition::LegacyNoClientWork
+        ));
+        assert!(matches!(
+            legacy_bound.into_install_execution(),
+            BoundForgeInstallExecution::Continue(_)
         ));
 
         let mut hybrid = legacy_profile;
@@ -2540,6 +2766,10 @@ mod tests {
         assert!(matches!(
             bound.processor_disposition(),
             BoundProcessorDisposition::UnsupportedMissingOutputs
+        ));
+        assert!(matches!(
+            bound.into_install_execution(),
+            BoundForgeInstallExecution::UnsupportedMissingOutputs
         ));
     }
 
@@ -2764,6 +2994,28 @@ mod tests {
                 expected_size: None,
             }
         ));
+        let BoundForgeInstallExecution::Run(execution) = bound.into_install_execution() else {
+            panic!("runnable processor execution");
+        };
+        let excluded = execution
+            .excluded_live_library_paths()
+            .expect("exact exclusions");
+        assert!(
+            !excluded.contains(
+                &crate::artifact_path::ArtifactRelativePath::new(
+                    "example/intermediate/1.0/intermediate-1.0.jar"
+                )
+                .expect("intermediate path")
+            )
+        );
+        assert!(
+            excluded.contains(
+                &crate::artifact_path::ArtifactRelativePath::new(
+                    "net/minecraftforge/forge/1.21.5-55.0.0/forge-1.21.5-55.0.0-client.jar"
+                )
+                .expect("terminal path")
+            )
+        );
     }
 
     #[test]
@@ -2803,6 +3055,20 @@ mod tests {
                 expected_size: Some(2),
             }
         ));
+        let BoundForgeInstallExecution::Run(execution) = bound.into_install_execution() else {
+            panic!("runnable processor execution");
+        };
+        assert!(
+            execution
+                .excluded_live_library_paths()
+                .expect("exact exclusions")
+                .contains(
+                    &crate::artifact_path::ArtifactRelativePath::new(
+                        "example/first/1.0/first-1.0.jar"
+                    )
+                    .expect("terminal final path")
+                )
+        );
     }
 
     #[test]
@@ -3484,6 +3750,40 @@ mod tests {
         let extracted = plan(&jar);
 
         assert!(extracted.strip_client_meta());
+    }
+
+    #[test]
+    fn verified_installer_source_derives_deterministic_stripped_client_bytes() {
+        let base = zip_with_entries(&[
+            ("META-INF/MANIFEST.MF", b"signed manifest"),
+            ("META-INF/CLIENT.SF", b"signature"),
+            ("META-INF/CLIENT.RSA", b"signature"),
+            ("client/payload.bin", b"payload"),
+        ]);
+        let source = super::VerifiedInstallerReceiptSource::from_test(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let first = source
+            .derive_child_client_bytes(&base)
+            .expect("stripped client");
+        let second = source
+            .derive_child_client_bytes(&base)
+            .expect("deterministic stripped client");
+        assert_eq!(first.bytes(), second.bytes());
+        assert!(!zip_contains(first.bytes(), "META-INF/MANIFEST.MF"));
+        assert!(!zip_contains(first.bytes(), "META-INF/CLIENT.SF"));
+        assert!(!zip_contains(first.bytes(), "META-INF/CLIENT.RSA"));
+        let mut archive = zip::ZipArchive::new(Cursor::new(first.bytes())).expect("client zip");
+        let mut payload = Vec::new();
+        archive
+            .by_name("client/payload.bin")
+            .expect("retained payload")
+            .read_to_end(&mut payload)
+            .expect("read retained payload");
+        assert_eq!(payload, b"payload");
     }
 
     #[test]

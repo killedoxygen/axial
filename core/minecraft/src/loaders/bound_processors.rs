@@ -1235,18 +1235,32 @@ fn check_cancel(cancel: &mut oneshot::Receiver<()>) -> Result<(), BoundProcessor
     )
 )]
 impl VerifiedProcessorOutputs {
+    pub(crate) fn none() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+
     pub(crate) fn into_entries(self) -> BTreeMap<ArtifactRelativePath, VerifiedProcessorOutput> {
         self.entries
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_terminal(entries: Vec<(ArtifactRelativePath, Vec<u8>)>) -> Self {
+        Self {
+            entries: entries
+                .into_iter()
+                .map(|(path, bytes)| {
+                    let bytes = Arc::<[u8]>::from(bytes);
+                    let size = bytes.len() as u64;
+                    let sha1 = Sha1::digest(bytes.as_ref()).into();
+                    (path, VerifiedProcessorOutput { bytes, size, sha1 })
+                })
+                .collect(),
+        }
+    }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the receipt-producing Forge install cutover consumes this carrier next"
-    )
-)]
 impl VerifiedProcessorOutput {
     pub(crate) fn into_parts(self) -> (Arc<[u8]>, u64, [u8; 20]) {
         (self.bytes, self.size, self.sha1)

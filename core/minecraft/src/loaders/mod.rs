@@ -20,6 +20,9 @@ pub mod types;
 pub mod workspace;
 
 pub use api::{build_id_for, installed_version_id_for, loader_components, parse_build_id};
+pub(crate) use bound_processors::VerifiedProcessorOutputs;
+pub(crate) use compose::compose_loader_version;
+pub(crate) use forge_installer::{VerifiedInstallerClientBytes, VerifiedInstallerReceiptSource};
 pub use index::{
     fetch_builds, fetch_cached_builds, fetch_components, fetch_supported_versions,
     resolve_build_record_for_install,

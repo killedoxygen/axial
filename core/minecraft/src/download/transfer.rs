@@ -57,6 +57,11 @@ struct SelectedArtifactDownload<'a> {
     descriptor_tx: Option<&'a mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 }
 
+pub(super) struct AuthenticatedArtifactDownload {
+    pub(super) report: ExecutionDownloadReport,
+    pub(super) sha1: [u8; 20],
+}
+
 pub(super) struct VerifiedSelectedArtifactDownload<'a> {
     pub(super) kind: SelectedDownloadArtifactKind,
     pub(super) client: &'a reqwest::Client,
@@ -356,6 +361,28 @@ pub(super) async fn download_file_with_client_and_fact_sender_allowing_missing_c
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
     descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 ) -> Result<ExecutionDownloadReport, DownloadError> {
+    download_file_with_client_and_fact_sender_allowing_missing_checksum_with_authority(
+        kind,
+        client,
+        url,
+        destination,
+        expected,
+        fact_tx,
+        descriptor_tx,
+    )
+    .await
+    .map(|download| download.report)
+}
+
+pub(super) async fn download_file_with_client_and_fact_sender_allowing_missing_checksum_with_authority(
+    kind: SelectedDownloadArtifactKind,
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+) -> Result<AuthenticatedArtifactDownload, DownloadError> {
     guard_existing_unsupported_selected_artifact(
         kind,
         destination,
@@ -368,7 +395,7 @@ pub(super) async fn download_file_with_client_and_fact_sender_allowing_missing_c
     emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
     emit_selected_artifact_missing_fact_if_absent(fact_tx, kind, destination, expected).await;
     let retry_delays = default_download_retry_delays();
-    match download_launcher_managed_with_transient_retries(
+    match download_launcher_managed_with_transient_retries_with_authority(
         client,
         url,
         destination,
@@ -378,14 +405,15 @@ pub(super) async fn download_file_with_client_and_fact_sender_allowing_missing_c
     )
     .await
     {
-        Ok(report) => {
+        Ok(download) => {
             if !checksumless_artifact_is_structurally_usable(destination, expected).await? {
                 let _ = async_fs::remove_file(filesystem_path(destination).as_ref()).await;
                 return Err(checksumless_artifact_structure_error(destination));
             }
-            let facts = selected_execution_download_facts(kind, destination, &report.facts);
+            let facts =
+                selected_execution_download_facts(kind, destination, &download.report.facts);
             emit_execution_download_facts(fact_tx, &facts);
-            Ok(report)
+            Ok(download)
         }
         Err(error) => {
             let facts = selected_execution_download_facts(kind, destination, &error.facts);
@@ -814,9 +842,29 @@ async fn download_launcher_managed_with_transient_retries(
     checksum_requirement: DownloadChecksumRequirement,
     retry_delays: &[Duration],
 ) -> Result<ExecutionDownloadReport, ExecutionDownloadError> {
+    download_launcher_managed_with_transient_retries_with_authority(
+        client,
+        url,
+        destination,
+        expected,
+        checksum_requirement,
+        retry_delays,
+    )
+    .await
+    .map(|download| download.report)
+}
+
+async fn download_launcher_managed_with_transient_retries_with_authority(
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+    checksum_requirement: DownloadChecksumRequirement,
+    retry_delays: &[Duration],
+) -> Result<AuthenticatedArtifactDownload, ExecutionDownloadError> {
     let mut next_delay = 0_usize;
     loop {
-        match execute_download_to_temp(
+        match execute_download_to_temp_with_authority(
             client,
             checksum_requirement.request(url, destination, expected),
         )
@@ -995,10 +1043,20 @@ pub(crate) async fn write_launcher_managed_artifact_bytes_to_temp(
     })
 }
 
+#[cfg(test)]
 pub(super) async fn execute_download_to_temp(
     client: &reqwest::Client,
     request: ExecutionDownloadRequest<'_>,
 ) -> Result<ExecutionDownloadReport, ExecutionDownloadError> {
+    execute_download_to_temp_with_authority(client, request)
+        .await
+        .map(|download| download.report)
+}
+
+async fn execute_download_to_temp_with_authority(
+    client: &reqwest::Client,
+    request: ExecutionDownloadRequest<'_>,
+) -> Result<AuthenticatedArtifactDownload, ExecutionDownloadError> {
     let target = safe_download_target_label(request.destination);
     let mut facts = metadata_facts(request.expected, &target);
     if !request.ownership.allows_managed_mutation() {
@@ -1230,9 +1288,10 @@ pub(super) async fn execute_download_to_temp(
         vec![("bytes", written.to_string())],
     ));
 
+    let sha1: [u8; 20] = hasher.finalize().into();
     let actual = ActualIntegrity {
         size: written,
-        sha1: Some(format!("{:x}", hasher.finalize())),
+        sha1: Some(hex_sha1(&sha1)),
     };
     if let Err(error) = verify_download_integrity(request.destination, request.expected, &actual) {
         let error_kind = match &error {
@@ -1288,11 +1347,24 @@ pub(super) async fn execute_download_to_temp(
         no_download_fact_fields(),
     ));
 
-    Ok(ExecutionDownloadReport {
-        target,
-        bytes_written: written,
-        facts,
+    Ok(AuthenticatedArtifactDownload {
+        report: ExecutionDownloadReport {
+            target,
+            bytes_written: written,
+            facts,
+        },
+        sha1,
     })
+}
+
+fn hex_sha1(digest: &[u8; 20]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(40);
+    for byte in digest {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    value
 }
 
 pub(super) async fn discard_download_temp(
