@@ -72,6 +72,11 @@ Do not use them for:
 - unrelated design decisions
 - temporary implementation notes
 
+### Generated coverage docs
+`docs/GUARDIAN-INVARIANT-COVERAGE.md` is the human-readable projection of the strict
+Guardian invariant coverage artifact. It is regenerated with the machine-readable JSON
+fixture and must not be edited by hand.
+
 ### `plans/stabilization/`
 Ignored local target architecture specs and stabilization execution control plane.
 
@@ -103,6 +108,7 @@ Do not use ADRs for:
 - If the current pipeline changes: update `docs/ARCHITECTURE.md`.
 - If frontend design guardrails change: update `docs/DESIGN.md`.
 - If one subsystem changes internally: update that subsystem’s architecture doc.
+- If Guardian invariant coverage changes: regenerate its JSON and Markdown artifacts together.
 - If stabilization execution state changes: update local `plans/stabilization/execution/PROGRESS.md` as current state only.
 - If the rules for working in the repo change: update `docs/CONVENTIONS.md`.
 - If a major decision is made and the reasoning matters long-term: add an ADR.

@@ -31,30 +31,10 @@ Guardian has a foot in every backend system, but it should not absorb every impl
 Guardian coordinates those systems through structured facts and bounded actions. It should not become a giant list of route-local conditionals, and lower layers should not smuggle product safety decisions back into helpers.
 
 ## Current Implemented Surface
-Guardian currently has working proof across these areas:
-
-- launch/runtime/JVM preflight facts for undefined, null, empty, missing, probe-failing, probe-timeout, wrong-major, outdated, incompatible, and bad custom Java overrides
-- malformed or unsupported JVM argument and preset facts
-- create/update JVM preset catalog and normalization for undefined, blank, automatic, supported, unknown, and tampered preset values, with bounded create notices and no raw preset echo
-- launch readiness facts for missing metadata, incomplete install markers, missing jars/libraries/assets, and managed-runtime readiness
-- managed-runtime ready-marker repair before session creation when ownership, journal, persisted runtime proof/checksum postcondition, and failure-memory gates allow it
-- memory, CPU, concurrent launch, active install/download, low disk, and Custom override warnings
-- startup stall, pre-boot exit, crash-after-boot, clean external close, and launcher-stop session outcome separation
-- bounded terminal fusion for stdout classes, exit status, and typed crash evidence, including OOM, graphics-driver, missing-dependency, mod-transformation, and mod-attributed failures
-- one startup recovery attempt when the target and failure memory allow it
-- State-backed failure-memory persistence for Guardian suppression windows and occurrence counts across API/desktop restarts
-- bounded next-launch advisories for recent accepted crashes, failed repairs, and active repair suppression, with exact instance, mode, recency, and current-intent filtering
-- install/download artifact evidence for checksum, size, missing-artifact, metadata, provider, network, permission, ownership, temp-write, promote, and success facts
-- Guardian-authored install safety outcomes for provider, network, interrupted, invalid-metadata, permission-denied, temp-write, promotion-failed, ownership-refused, installer-execution, and installer-processor failures that are not artifact-repair candidates
-- one-shot launcher-managed artifact repair when checksum, size, or missing selected-artifact facts exactly match a private selected descriptor
-- install repair outcome journaling and failure-memory suppression
-- State-backed operation-journal persistence for bounded current operation records, including install status/event restart replay of terminal progress and Guardian repair summaries when the transient install session snapshot is gone
-- Observability-bounded operation proofs derived from terminal journals, so failed install status and terminal queued Performance operation status can connect operation facts, Guardian diagnosis/action/outcome evidence, and latest verification facts without leaking raw provider, filesystem, or JVM material
-- durable Performance operation ownership for queued and synchronous callers: both persist a matching status/journal identity before effects and continue reconciliation independently of request lifetime, while synchronous callers still receive a bounded final payload when persistence remains healthy
-- one identity-bound managed-composition runtime authority: registered instance ids resolve to registry-owned storage, per-instance inspection, mutation, and exact recovery are serialized, accepted work survives caller cancellation, active sessions/launch/deletion exclude mutation and recovery through the shared instance lifecycle, indeterminate effects latch fail-closed, and shutdown retries proven recovery after session settlement before closing the instance registry
-- performance facts for invalid rules, degraded/fallback/invalid health, user-owned conflicts, repeated failures, and rollback availability
-- persisted operation-state load diagnostics for strict-schema performance operation, benchmark suite manifest, and benchmark suite driver records; Guardian maps aggregate load issues to a bounded startup warning instead of letting restart-resume corruption disappear silently
-- public/exportable redaction for Guardian outcomes, launch notices, session status/events, install status/events, operation status, performance health/status, operation journals, and local proof exports
+The [generated Guardian invariant coverage](GUARDIAN-INVARIANT-COVERAGE.md) is the
+drift-tested inventory of current kernel cells, rules, facts, preflight senses, adapters,
+launch failure mappings, and repair hands. Its complete machine-readable matrix and the Markdown
+projection are regenerated from the same typed coverage value.
 
 Not every domain has a specialized automatic repair workflow yet. When Guardian does not have a specific workflow, it still owns the safety interpretation if the issue crosses a safety boundary: it should cushion damage by producing a bounded block, warning, degraded state, retry suppression, or user-facing notice rather than letting raw errors or frontend guesses escape.
 
