@@ -182,8 +182,53 @@ jobs:
             dist/axial-windows-amd64-*.zip
             dist/axial-windows-amd64-*.zip.sha256
 
+  macos-desktop:
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: amd64
+          - runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frontend bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-frontend
+          path: frontend/static
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release desktop binary
+        env:
+          AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+        run: cargo build --locked -p axial-desktop --release
+
+      - name: Package macOS desktop binary
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/macos
+          cp target/release/axial-desktop dist/macos/axial
+          chmod +x dist/macos/axial
+          tar -C dist/macos -czf "dist/axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" axial
+          shasum -a 256 "dist/axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" > "dist/axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz.sha256"
+
+      - name: Upload macOS release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/axial-macos-${{ matrix.arch }}-*.tar.gz
+            dist/axial-macos-${{ matrix.arch }}-*.tar.gz.sha256
+
   verify-release:
-    needs: [linux-desktop, windows-desktop]
+    needs: [linux-desktop, windows-desktop, macos-desktop]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

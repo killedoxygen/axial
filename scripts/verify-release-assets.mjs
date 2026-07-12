@@ -14,7 +14,12 @@ const DELAY_MS = 3000;
 
 // Filenames the release pipeline attaches, per platform. Kept in sync with the
 // package steps in .github/workflows/release.yml.
-const ASSET_TEMPLATES = [(v) => `axial-linux-amd64-${v}.tar.gz`, (v) => `axial-windows-amd64-${v}.zip`];
+const ASSET_TEMPLATES = [
+  (v) => `axial-linux-amd64-${v}.tar.gz`,
+  (v) => `axial-windows-amd64-${v}.zip`,
+  (v) => `axial-macos-amd64-${v}.tar.gz`,
+  (v) => `axial-macos-arm64-${v}.tar.gz`,
+];
 
 function fail(message) {
   console.error(`verify-release-assets: ${message}`);
