@@ -1,12 +1,14 @@
 #[cfg(test)]
 use crate::download::download_libraries_with_facts_and_descriptors;
 use crate::download::{
-    DownloadProgress, Downloader, InstallerLibraryDownloadAuthority, LibraryChecksumPolicy,
+    DownloadProgress, Downloader, ExactLibraryDownloadProof,
     download_installer_libraries_with_authority_and_facts_and_descriptors,
-    download_libraries_allowing_missing_checksums_with_facts_and_descriptors,
-    library_artifact_plans_for,
+    download_profile_libraries_with_proofs_and_facts_and_descriptors, library_artifact_plans_for,
 };
-use crate::known_good::{KnownGoodInstallReceipt, seal_verified_installer_library_authority};
+use crate::known_good::{
+    KnownGoodInstallReceipt, seal_verified_installer_library_authority,
+    seal_verified_profile_library_authority,
+};
 use crate::launch::library_merge_key;
 use crate::loaders::api::validate_loader_build_record_identity;
 use crate::loaders::bound_processors::spawn_bound_processor_execution;
@@ -113,7 +115,16 @@ where
         &mut *send,
     ))
     .await;
-    cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
+    let library_proofs =
+        cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
+    let library_authority = cleanup_on_error(
+        seal_verified_profile_library_authority(&fragment.libraries, library_proofs).map_err(
+            |error| LoaderError::Verify(format!("derive profile library authority: {error:?}")),
+        ),
+        library_dir,
+        &installed_version_id,
+    )?;
+    fragment.libraries = library_authority.libraries().to_vec();
     let version = cleanup_on_error(
         compose_loader_version(
             base_receipt.effective_version(),
@@ -133,7 +144,7 @@ where
             &plan.record,
             version.clone(),
             &version_bytes,
-            &fragment.libraries,
+            library_authority,
             &loader_metadata_bytes,
         )
         .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}"))),
@@ -259,7 +270,7 @@ async fn finish_supported_installer_install<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
     execution: BoundForgeInstallExecution,
-    download_authority: Vec<InstallerLibraryDownloadAuthority>,
+    download_authority: Vec<ExactLibraryDownloadProof>,
     base_receipt: KnownGoodInstallReceipt,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
@@ -351,15 +362,12 @@ where
     client.url.clear();
     let version_bytes = serde_json::to_vec_pretty(&version)?;
     let loader_metadata_bytes = installed_loader_metadata_bytes(&plan.record)?;
-    let materialized_library_paths = library_artifact_plans_for(
-        source.libraries(),
-        &crate::rules::default_environment(),
-        LibraryChecksumPolicy::AllowMissing,
-    )
-    .map_err(|error| LoaderError::Verify(format!("plan installer libraries: {error}")))?
-    .into_iter()
-    .map(|library| library.relative_path)
-    .collect::<BTreeSet<_>>();
+    let materialized_library_paths =
+        library_artifact_plans_for(source.libraries(), &crate::rules::default_environment())
+            .map_err(|error| LoaderError::Verify(format!("plan installer libraries: {error}")))?
+            .into_iter()
+            .map(|library| library.relative_path)
+            .collect::<BTreeSet<_>>();
     let library_authority =
         seal_verified_installer_library_authority(&source, download_authority, processor_outputs)
             .map_err(|error| {
@@ -672,13 +680,13 @@ async fn download_profile_loader_libraries_with_evidence<F>(
     libraries: &[crate::launch::Library],
     phase: &str,
     send: &mut F,
-) -> Result<(), LoaderError>
+) -> Result<Vec<ExactLibraryDownloadProof>, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
     let mut facts = Vec::new();
     let mut descriptors = Vec::new();
-    download_libraries_allowing_missing_checksums_with_facts_and_descriptors(
+    download_profile_libraries_with_proofs_and_facts_and_descriptors(
         library_dir,
         libraries,
         phase,
@@ -696,7 +704,7 @@ async fn download_installer_libraries_with_evidence<F>(
     excluded_paths: &BTreeSet<crate::artifact_path::ArtifactRelativePath>,
     phase: &str,
     send: &mut F,
-) -> Result<Vec<InstallerLibraryDownloadAuthority>, LoaderError>
+) -> Result<Vec<ExactLibraryDownloadProof>, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
@@ -1133,7 +1141,8 @@ mod tests {
         download_profile_loader_libraries_with_evidence, ensure_base_version,
         fetch_sha1_verified_source, finish_supported_installer_install,
         install_from_installer_source, install_from_legacy_archive, install_from_profile_source,
-        install_legacy_archive_after_authenticated_base, overlay_legacy_archive_bytes,
+        install_legacy_archive_after_authenticated_base,
+        install_profile_source_after_authenticated_base, overlay_legacy_archive_bytes,
         validate_and_enrich_profile_source, validate_installer_record_authority,
     };
     use crate::download::{
@@ -1509,6 +1518,108 @@ mod tests {
         assert_eq!(server.request_count(), 1);
 
         server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn checksumless_quilt_install_writes_sealed_metadata_and_returns_sha1_receipt() {
+        let root = temp_dir("quilt-profile-sealed-write");
+        fs::create_dir_all(&root).expect("create root");
+        let mut record = profile_record();
+        record.component_id = LoaderComponentId::Quilt;
+        record.component_name = "Quilt".to_string();
+        record.loader_version = "0.29.2".to_string();
+        canonicalize_record_identity(&mut record);
+        record.strategy = LoaderInstallStrategy::QuiltProfile;
+        let coordinate = format!("org.quiltmc:quilt-loader:{}", record.loader_version);
+        let artifact_path = format!(
+            "org/quiltmc/quilt-loader/{0}/quilt-loader-{0}.jar",
+            record.loader_version
+        );
+        let library_bytes =
+            zip_entries(&[("org/quiltmc/loader/impl/QuiltLoader.class", b"loader")]);
+        let library_server = TestByteServer::start(library_bytes.clone());
+        let profile_id = format!(
+            "quilt-loader-{}-{}",
+            record.loader_version, record.minecraft_version
+        );
+        let profile_bytes = serde_json::to_vec(&serde_json::json!({
+            "id": profile_id.clone(),
+            "inheritsFrom": record.minecraft_version.clone(),
+            "type": "release",
+            "mainClass": "org.quiltmc.loader.impl.launch.knot.KnotClient",
+            "libraries": [{
+                "name": coordinate.clone(),
+                "downloads": {"artifact": {
+                    "path": artifact_path.clone(),
+                    "url": library_server.url.clone()
+                }}
+            }]
+        }))
+        .expect("profile json");
+        let profile_server = TestByteServer::start(profile_bytes);
+        record.install_source = LoaderInstallSource::ProfileJson {
+            url: profile_server.url.clone(),
+        };
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+        };
+        let proof = ProfileInstallProof {
+            canonical_profile_id: profile_id,
+            inherits_from: record.minecraft_version.clone(),
+            client_main_class: "org.quiltmc.loader.impl.launch.knot.KnotClient".to_string(),
+            required_libraries: vec![ProfileLibraryProof {
+                coordinate,
+                sha1: None,
+                size: None,
+            }],
+        };
+        write_base_version(&root, &record.minecraft_version);
+        let base = test_authenticated_receipt(&root, &record.minecraft_version);
+
+        let receipt = install_profile_source_after_authenticated_base(
+            &root,
+            &plan,
+            &profile_server.url,
+            &base,
+            &proof,
+            &mut |_progress| {},
+        )
+        .await
+        .expect("quilt profile install");
+        let version_path = versions_dir(&root)
+            .join(&record.version_id)
+            .join(format!("{}.json", record.version_id));
+        let written: crate::launch::VersionJson =
+            serde_json::from_slice(&fs::read(version_path).expect("written version json"))
+                .expect("parse written version");
+        let library = written
+            .libraries
+            .iter()
+            .find(|library| library.name == proof.required_libraries[0].coordinate)
+            .expect("written quilt library");
+        let digest = sha1_hex(&library_bytes);
+        assert_eq!(library.sha1, digest);
+        assert_eq!(library.size, library_bytes.len() as i64);
+        let artifact = library
+            .downloads
+            .as_ref()
+            .and_then(|downloads| downloads.artifact.as_ref())
+            .expect("written artifact");
+        assert_eq!(artifact.sha1, digest);
+        assert_eq!(artifact.size, library_bytes.len() as i64);
+        let inventory = receipt.into_inventory();
+        assert!(inventory.entries().iter().any(|entry| {
+            entry.path().as_str() == artifact_path
+                && matches!(
+                    entry.integrity(),
+                    KnownGoodIntegrity::Sha1 { digest: receipt_digest, size: Some(size) }
+                        if receipt_digest.as_str() == digest && *size == library_bytes.len() as u64
+                )
+        }));
+        assert_eq!(library_server.request_count(), 1);
+        profile_server.stop();
+        library_server.stop();
         let _ = fs::remove_dir_all(root);
     }
 

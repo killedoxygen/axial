@@ -58,23 +58,34 @@ pub enum LibraryPlanError {
     MissingDownloadSource,
     #[error("library artifacts have conflicting contracts for the same path")]
     ConflictingArtifactPath,
+    #[error("library artifact integrity metadata conflicts across representations")]
+    ConflictingArtifactIntegrity,
     #[error("installer library exclusions do not exactly match the planned artifact inventory")]
     InvalidArtifactExclusions,
 }
 
-pub(crate) struct InstallerLibraryDownloadAuthority {
+pub(crate) struct ExactLibraryDownloadProof {
     path: ArtifactRelativePath,
     size: Option<u64>,
     sha1: [u8; 20],
 }
 
-impl InstallerLibraryDownloadAuthority {
+impl ExactLibraryDownloadProof {
     pub(super) fn new(path: ArtifactRelativePath, size: Option<u64>, sha1: [u8; 20]) -> Self {
         Self { path, size, sha1 }
     }
 
     pub(crate) fn into_parts(self) -> (ArtifactRelativePath, Option<u64>, [u8; 20]) {
         (self.path, self.size, self.sha1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        path: ArtifactRelativePath,
+        size: Option<u64>,
+        sha1: [u8; 20],
+    ) -> Self {
+        Self::new(path, size, sha1)
     }
 }
 

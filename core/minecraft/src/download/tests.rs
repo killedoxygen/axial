@@ -21,6 +21,7 @@ use super::runtime::{
 use super::transfer::{
     download_file_with_client, download_file_with_client_report_with_retry_delays,
     download_temp_path, ensure_selected_artifact_with_client, execute_download_to_temp,
+    execute_download_to_temp_with_pre_promote_hook,
     fetch_verified_selected_artifact_bytes_with_retry_delays_for_test, remove_stale_download_temp,
 };
 use super::*;
@@ -697,13 +698,8 @@ fn library_jobs_reject_conflicting_destination_contracts() {
         .expect("artifact")
         .url = "https://mirror.invalid/conflict.jar".to_string();
 
-    let error = library_jobs_for(
-        Path::new("/tmp/axial-test"),
-        &[first, second],
-        &env,
-        LibraryChecksumPolicy::Strict,
-    )
-    .expect_err("conflicting plan");
+    let error = library_jobs_for(Path::new("/tmp/axial-test"), &[first, second], &env)
+        .expect_err("conflicting plan");
 
     assert_eq!(error, LibraryPlanError::ConflictingArtifactPath);
 }
@@ -751,12 +747,8 @@ fn url_less_library_is_inventory_and_verification_visible_but_not_downloadable()
     };
     let env = crate::rules::default_environment();
 
-    let plans = library_artifact_plans_for(
-        std::slice::from_ref(&lib),
-        &env,
-        LibraryChecksumPolicy::Strict,
-    )
-    .expect("inventory plan");
+    let plans =
+        library_artifact_plans_for(std::slice::from_ref(&lib), &env).expect("inventory plan");
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].relative_path.as_str(), path);
     assert_eq!(plans[0].source_url, None);
@@ -774,13 +766,8 @@ fn url_less_library_is_inventory_and_verification_visible_but_not_downloadable()
         Path::new("/tmp/axial-test").join("libraries").join(path)
     );
 
-    let error = library_jobs_for(
-        Path::new("/tmp/axial-test"),
-        &[lib],
-        &env,
-        LibraryChecksumPolicy::Strict,
-    )
-    .expect_err("missing source");
+    let error =
+        library_jobs_for(Path::new("/tmp/axial-test"), &[lib], &env).expect_err("missing source");
     assert_eq!(error, LibraryPlanError::MissingDownloadSource);
 }
 
@@ -796,36 +783,11 @@ fn library_planning_rejects_invalid_nonempty_checksum() {
             Path::new("/tmp/axial-test"),
             &[lib],
             &crate::rules::default_environment(),
-            LibraryChecksumPolicy::Strict,
         )
         .expect_err("invalid checksum");
 
         assert_eq!(error, LibraryPlanError::InvalidChecksum);
     }
-}
-
-#[test]
-fn checksumless_permission_comes_only_from_planning_policy() {
-    let lib = normal_library("org.example:checksumless:1.0.0");
-    let env = crate::rules::default_environment();
-
-    let strict = library_jobs_for(
-        Path::new("/tmp/axial-test"),
-        std::slice::from_ref(&lib),
-        &env,
-        LibraryChecksumPolicy::Strict,
-    )
-    .expect("strict plan");
-    let allowed = library_jobs_for(
-        Path::new("/tmp/axial-test"),
-        &[lib],
-        &env,
-        LibraryChecksumPolicy::AllowMissing,
-    )
-    .expect("checksumless plan");
-
-    assert!(!strict[0].allow_missing_checksum);
-    assert!(allowed[0].allow_missing_checksum);
 }
 
 #[test]
@@ -1144,6 +1106,41 @@ async fn execute_download_to_temp_reports_successful_integrity() {
     );
     assert!(!download_temp_path(&destination).exists());
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn checksumless_proof_rejects_temp_path_substitution_after_handle_validation() {
+    let root = temp_dir("checksumless-temp-identity-race");
+    fs::create_dir_all(&root).expect("create root");
+    let destination = root.join("artifact.jar");
+    let body = structural_test_jar();
+    let url = spawn_download_response_server(
+        "200 OK",
+        vec![(
+            "Content-Type".to_string(),
+            "application/octet-stream".to_string(),
+        )],
+        body,
+        1,
+    )
+    .await;
+    let client = build_http_client(Duration::from_secs(1));
+    let expected = ExpectedIntegrity::default();
+    let request =
+        ExecutionDownloadRequest::launcher_managed_best_effort(&url, &destination, &expected);
+
+    let error =
+        execute_download_to_temp_with_pre_promote_hook(&client, request, |temp, _destination| {
+            let retained = temp.with_extension("validated-retained");
+            fs::rename(temp, retained).expect("substitute validated temp path");
+            fs::write(temp, structural_test_jar()).expect("write replacement temp");
+        })
+        .await
+        .expect_err("replacement pathname cannot consume validated authority");
+
+    assert_eq!(error.kind, ExecutionDownloadFactKind::PromoteFailed);
+    assert!(!destination.exists());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -2206,8 +2203,7 @@ fn strict_library_jobs(
     libraries: &[Library],
     env: &Environment,
 ) -> Vec<DownloadJob> {
-    library_jobs_for(mc_dir, libraries, env, LibraryChecksumPolicy::Strict)
-        .expect("valid library plan")
+    library_jobs_for(mc_dir, libraries, env).expect("valid library plan")
 }
 
 fn native_library(name: &str) -> Library {

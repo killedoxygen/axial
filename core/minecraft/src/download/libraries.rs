@@ -1,14 +1,13 @@
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
 use super::integrity::is_sha1_hex;
 use super::model::{
-    DownloadError, DownloadProgress, ExecutionDownloadFact, ExpectedIntegrity,
-    InstallerLibraryDownloadAuthority, LibraryPlanError, SelectedDownloadArtifactDescriptor,
+    DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
+    ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactDescriptor,
     SelectedDownloadArtifactKind, progress,
 };
 use super::transfer::{
     download_file_with_client_and_fact_sender_allowing_missing_checksum_with_authority,
-    ensure_selected_artifact_with_client,
-    ensure_selected_artifact_with_client_allowing_missing_checksum,
+    ensure_selected_artifact_with_client, ensure_selected_artifact_with_client_and_observed_size,
 };
 use crate::artifact_path::ArtifactRelativePath;
 use crate::launch::{Library, maven_to_path};
@@ -26,7 +25,6 @@ pub(crate) struct DownloadJob {
     pub(crate) url: String,
     pub(crate) name: String,
     pub(crate) expected: ExpectedIntegrity,
-    pub(crate) allow_missing_checksum: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,25 +48,12 @@ pub enum LibraryVerificationIntegrity {
     MissingChecksum,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LibraryChecksumPolicy {
-    Strict,
-    AllowMissing,
-}
-
-impl LibraryChecksumPolicy {
-    fn allows_missing(self) -> bool {
-        matches!(self, Self::AllowMissing)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LibraryArtifactPlan {
     pub(crate) relative_path: ArtifactRelativePath,
     pub(crate) source_url: Option<String>,
     pub(crate) name: String,
     pub(crate) expected: ExpectedIntegrity,
-    pub(crate) allow_missing_checksum: bool,
     pub(crate) is_native: bool,
 }
 
@@ -113,7 +98,6 @@ impl LibraryArtifactPlan {
             url,
             name: self.name,
             expected: self.expected,
-            allow_missing_checksum: self.allow_missing_checksum,
         })
     }
 }
@@ -128,7 +112,7 @@ where
     F: FnMut(DownloadProgress),
 {
     let env = default_environment();
-    let jobs = library_jobs_for(mc_dir, libraries, &env, LibraryChecksumPolicy::Strict)?;
+    let jobs = library_jobs_for(mc_dir, libraries, &env)?;
     download_library_jobs(jobs, phase, send, None, None).await
 }
 
@@ -146,7 +130,7 @@ where
     H: FnMut(SelectedDownloadArtifactDescriptor),
 {
     let env = default_environment();
-    let jobs = library_jobs_for(mc_dir, libraries, &env, LibraryChecksumPolicy::Strict)?;
+    let jobs = library_jobs_for(mc_dir, libraries, &env)?;
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
     let result = download_library_jobs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx)).await;
@@ -159,24 +143,26 @@ where
     result
 }
 
-pub async fn download_libraries_allowing_missing_checksums_with_facts_and_descriptors<F, G, H>(
+pub(crate) async fn download_profile_libraries_with_proofs_and_facts_and_descriptors<F, G, H>(
     mc_dir: &Path,
     libraries: &[Library],
     phase: &str,
     send: F,
     mut send_fact: G,
     mut send_descriptor: H,
-) -> Result<(), DownloadError>
+) -> Result<Vec<ExactLibraryDownloadProof>, DownloadError>
 where
     F: FnMut(DownloadProgress),
     G: FnMut(ExecutionDownloadFact),
     H: FnMut(SelectedDownloadArtifactDescriptor),
 {
     let env = default_environment();
-    let jobs = library_jobs_for(mc_dir, libraries, &env, LibraryChecksumPolicy::AllowMissing)?;
+    let jobs = library_jobs_for(mc_dir, libraries, &env)?;
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
-    let result = download_library_jobs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx)).await;
+    let result =
+        download_library_jobs_with_proofs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx))
+            .await;
     while let Ok(fact) = fact_rx.try_recv() {
         send_fact(fact);
     }
@@ -194,7 +180,7 @@ pub(crate) async fn download_installer_libraries_with_authority_and_facts_and_de
     send: F,
     mut send_fact: G,
     mut send_descriptor: H,
-) -> Result<Vec<InstallerLibraryDownloadAuthority>, DownloadError>
+) -> Result<Vec<ExactLibraryDownloadProof>, DownloadError>
 where
     F: FnMut(DownloadProgress),
     G: FnMut(ExecutionDownloadFact),
@@ -205,7 +191,7 @@ where
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
     let result =
-        download_installer_library_jobs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx))
+        download_library_jobs_with_proofs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx))
             .await;
     while let Ok(fact) = fact_rx.try_recv() {
         send_fact(fact);
@@ -235,29 +221,16 @@ where
         let fact_tx = fact_tx.clone();
         let descriptor_tx = descriptor_tx.clone();
         async move {
-            if job.allow_missing_checksum {
-                ensure_selected_artifact_with_client_allowing_missing_checksum(
-                    SelectedDownloadArtifactKind::Library,
-                    &client,
-                    &job.url,
-                    &job.path,
-                    &job.expected,
-                    fact_tx.as_ref(),
-                    descriptor_tx.as_ref(),
-                )
-                .await?;
-            } else {
-                ensure_selected_artifact_with_client(
-                    SelectedDownloadArtifactKind::Library,
-                    &client,
-                    &job.url,
-                    &job.path,
-                    &job.expected,
-                    fact_tx.as_ref(),
-                    descriptor_tx.as_ref(),
-                )
-                .await?;
-            }
+            ensure_selected_artifact_with_client(
+                SelectedDownloadArtifactKind::Library,
+                &client,
+                &job.url,
+                &job.path,
+                &job.expected,
+                fact_tx.as_ref(),
+                descriptor_tx.as_ref(),
+            )
+            .await?;
             Ok::<String, DownloadError>(job.name)
         }
     }))
@@ -270,13 +243,13 @@ where
     Ok(())
 }
 
-async fn download_installer_library_jobs<F>(
+async fn download_library_jobs_with_proofs<F>(
     jobs: Vec<DownloadJob>,
     phase: &str,
     mut send: F,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
     descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-) -> Result<Vec<InstallerLibraryDownloadAuthority>, DownloadError>
+) -> Result<Vec<ExactLibraryDownloadProof>, DownloadError>
 where
     F: FnMut(DownloadProgress),
 {
@@ -291,7 +264,7 @@ where
         let descriptor_tx = descriptor_tx.clone();
         async move {
             let (size, sha1) = if job.expected.sha1.is_some() {
-                ensure_selected_artifact_with_client(
+                let (_, observed_size) = ensure_selected_artifact_with_client_and_observed_size(
                     SelectedDownloadArtifactKind::Library,
                     &client,
                     &job.url,
@@ -308,7 +281,7 @@ where
                         .ok_or(LibraryPlanError::InvalidChecksum)?,
                 )
                 .ok_or(LibraryPlanError::InvalidChecksum)?;
-                (job.expected.size, sha1)
+                (Some(observed_size), sha1)
             } else {
                 let download =
                     download_file_with_client_and_fact_sender_allowing_missing_checksum_with_authority(
@@ -323,7 +296,7 @@ where
                     .await?;
                 (Some(download.report.bytes_written), download.sha1)
             };
-            let authority = InstallerLibraryDownloadAuthority::new(
+            let authority = ExactLibraryDownloadProof::new(
                 job.relative_path.clone(),
                 size,
                 sha1,
@@ -365,10 +338,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-fn resolve_library_plan(
-    lib: &Library,
-    checksum_policy: LibraryChecksumPolicy,
-) -> Result<Option<LibraryArtifactPlan>, LibraryPlanError> {
+fn resolve_library_plan(lib: &Library) -> Result<Option<LibraryArtifactPlan>, LibraryPlanError> {
     if !lib.natives.is_empty()
         && lib
             .downloads
@@ -388,8 +358,7 @@ fn resolve_library_plan(
             name: artifact_name(&relative_path, &lib.name),
             relative_path,
             source_url: nonempty_url(&artifact.url),
-            expected: library_expected_integrity(lib, artifact.size, &artifact.sha1)?,
-            allow_missing_checksum: checksum_policy.allows_missing(),
+            expected: library_expected_integrity(lib, artifact.size, &artifact.sha1, true)?,
             is_native: false,
         }));
     }
@@ -404,8 +373,7 @@ fn resolve_library_plan(
         name: artifact_name(&relative_path, &lib.name),
         source_url: Some(maven_url(lib, &relative_path)),
         relative_path,
-        expected: library_expected_integrity(lib, lib.size, &lib.sha1)?,
-        allow_missing_checksum: checksum_policy.allows_missing(),
+        expected: library_expected_integrity(lib, lib.size, &lib.sha1, true)?,
         is_native: false,
     }))
 }
@@ -414,7 +382,6 @@ fn resolve_native_plan(
     lib: &Library,
     os_name: &str,
     os_arch: &str,
-    checksum_policy: LibraryChecksumPolicy,
 ) -> Result<Option<LibraryArtifactPlan>, LibraryPlanError> {
     let classifier_candidates = native_classifier_candidates(lib, os_name, os_arch);
     for classifier_key in &classifier_candidates {
@@ -428,8 +395,7 @@ fn resolve_native_plan(
                 name: artifact_name(&relative_path, &format!("{}:{classifier_key}", lib.name)),
                 relative_path,
                 source_url: nonempty_url(&artifact.url),
-                expected: library_expected_integrity(lib, artifact.size, &artifact.sha1)?,
-                allow_missing_checksum: checksum_policy.allows_missing(),
+                expected: library_expected_integrity(lib, artifact.size, &artifact.sha1, false)?,
                 is_native: true,
             }));
         }
@@ -448,8 +414,7 @@ fn resolve_native_plan(
         name: artifact_name(&relative_path, &format!("{}:{classifier_key}", lib.name)),
         source_url: Some(maven_url(lib, &relative_path)),
         relative_path,
-        expected: library_expected_integrity(lib, lib.size, &lib.sha1)?,
-        allow_missing_checksum: checksum_policy.allows_missing(),
+        expected: library_expected_integrity(lib, lib.size, &lib.sha1, false)?,
         is_native: true,
     }))
 }
@@ -489,7 +454,16 @@ fn library_expected_integrity(
     lib: &Library,
     size: i64,
     sha1: &str,
+    compare_top_level: bool,
 ) -> Result<ExpectedIntegrity, LibraryPlanError> {
+    if compare_top_level
+        && ((!sha1.trim().is_empty()
+            && !lib.sha1.trim().is_empty()
+            && !sha1.trim().eq_ignore_ascii_case(lib.sha1.trim()))
+            || (size > 0 && lib.size > 0 && size != lib.size))
+    {
+        return Err(LibraryPlanError::ConflictingArtifactIntegrity);
+    }
     let mut legacy_sha1 = None;
     for checksum in lib.checksums.iter().map(|checksum| checksum.trim()) {
         if checksum.is_empty() {
@@ -558,9 +532,8 @@ pub(crate) fn library_jobs_for(
     mc_dir: &Path,
     libraries: &[Library],
     env: &Environment,
-    checksum_policy: LibraryChecksumPolicy,
 ) -> Result<Vec<DownloadJob>, LibraryPlanError> {
-    library_artifact_plans_for(libraries, env, checksum_policy)?
+    library_artifact_plans_for(libraries, env)?
         .into_iter()
         .map(|plan| plan.into_download_job(mc_dir))
         .collect()
@@ -572,7 +545,7 @@ fn installer_library_jobs_for(
     env: &Environment,
     excluded_paths: &BTreeSet<ArtifactRelativePath>,
 ) -> Result<Vec<DownloadJob>, LibraryPlanError> {
-    let plans = library_artifact_plans_for(libraries, env, LibraryChecksumPolicy::AllowMissing)?;
+    let plans = library_artifact_plans_for(libraries, env)?;
     let planned_paths = plans
         .iter()
         .map(|plan| plan.relative_path.clone())
@@ -593,18 +566,15 @@ pub fn library_verification_plans_for(
     env: &Environment,
     known_good: Option<&crate::known_good::KnownGoodInventoryAuthority>,
 ) -> Result<Vec<LibraryVerificationPlan>, LibraryPlanError> {
-    Ok(
-        library_artifact_plans_for(libraries, env, LibraryChecksumPolicy::Strict)?
-            .into_iter()
-            .map(|plan| plan.into_verification_plan(mc_dir, known_good))
-            .collect(),
-    )
+    Ok(library_artifact_plans_for(libraries, env)?
+        .into_iter()
+        .map(|plan| plan.into_verification_plan(mc_dir, known_good))
+        .collect())
 }
 
 pub(crate) fn library_artifact_plans_for(
     libraries: &[Library],
     env: &Environment,
-    checksum_policy: LibraryChecksumPolicy,
 ) -> Result<Vec<LibraryArtifactPlan>, LibraryPlanError> {
     let mut plans = BTreeMap::new();
 
@@ -617,10 +587,10 @@ pub(crate) fn library_artifact_plans_for(
             continue;
         }
 
-        if let Some(plan) = resolve_library_plan(lib, checksum_policy)? {
+        if let Some(plan) = resolve_library_plan(lib)? {
             insert_plan(&mut plans, plan)?;
         }
-        if let Some(plan) = resolve_native_plan(lib, &env.os_name, &env.os_arch, checksum_policy)? {
+        if let Some(plan) = resolve_native_plan(lib, &env.os_name, &env.os_arch)? {
             insert_plan(&mut plans, plan)?;
         }
     }
@@ -676,10 +646,10 @@ fn native_name_matches_env(name: &str, env: &crate::rules::Environment) -> bool 
 }
 
 #[cfg(test)]
-mod installer_authority_tests {
+mod exact_library_proof_tests {
     use super::{
-        LibraryChecksumPolicy,
         download_installer_libraries_with_authority_and_facts_and_descriptors,
+        download_profile_libraries_with_proofs_and_facts_and_descriptors,
         installer_library_jobs_for, library_artifact_plans_for,
     };
     use crate::artifact_path::ArtifactRelativePath;
@@ -761,7 +731,7 @@ mod installer_authority_tests {
             .expect("authority")
             .into_parts();
         assert_eq!(path.as_str(), relative);
-        assert_eq!(size, None);
+        assert_eq!(size, Some(body.len() as u64));
         let expected_digest: [u8; 20] = Sha1::digest(&body).into();
         assert_eq!(digest, expected_digest);
 
@@ -803,6 +773,66 @@ mod installer_authority_tests {
         let expected_digest: [u8; 20] = Sha1::digest(&fresh).into();
         assert_eq!(digest, expected_digest);
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn checksumless_profile_proof_replaces_a_readable_existing_jar() {
+        let root = temp_dir("profile-checksumless-fresh");
+        let relative = "org/example/profile/1/profile-1.jar";
+        let destination = root.join("libraries").join(relative);
+        std::fs::create_dir_all(destination.parent().expect("library parent"))
+            .expect("library parent");
+        std::fs::write(&destination, jar_bytes(b"readable stale")).expect("readable stale library");
+        let fresh = jar_bytes(b"authenticated fresh");
+        let url = spawn_response(fresh.clone()).await;
+        let library = direct_library(relative, &url, "", 0);
+
+        let proofs = download_profile_libraries_with_proofs_and_facts_and_descriptors(
+            &root,
+            &[library],
+            "libraries",
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .await
+        .expect("fresh profile proof");
+        let (path, size, digest) = proofs
+            .into_iter()
+            .next()
+            .expect("profile proof")
+            .into_parts();
+
+        assert_eq!(path.as_str(), relative);
+        assert_eq!(size, Some(fresh.len() as u64));
+        assert_eq!(digest, <[u8; 20]>::from(Sha1::digest(&fresh)));
+        assert_eq!(std::fs::read(destination).expect("promoted library"), fresh);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn invalid_checksumless_profile_jar_returns_no_proof_or_promotion() {
+        let root = temp_dir("profile-invalid");
+        let relative = "org/example/profile/1/profile-1.jar";
+        let destination = root.join("libraries").join(relative);
+        let invalid = b"not a jar".to_vec();
+        let url = spawn_response(invalid).await;
+        let library = direct_library(relative, &url, "", 0);
+
+        assert!(
+            download_profile_libraries_with_proofs_and_facts_and_descriptors(
+                &root,
+                &[library],
+                "libraries",
+                |_| {},
+                |_| {},
+                |_| {},
+            )
+            .await
+            .is_err()
+        );
+        assert!(!destination.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -861,7 +891,7 @@ mod installer_authority_tests {
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         std::env::temp_dir().join(format!(
-            "axial-installer-authority-{prefix}-{}-{nanos:x}",
+            "axial-library-proof-{prefix}-{}-{nanos:x}",
             std::process::id()
         ))
     }
@@ -874,12 +904,8 @@ mod installer_authority_tests {
             "",
             0,
         );
-        let plans = library_artifact_plans_for(
-            &[library],
-            &crate::rules::default_environment(),
-            LibraryChecksumPolicy::AllowMissing,
-        )
-        .expect("checksumless plan");
+        let plans = library_artifact_plans_for(&[library], &crate::rules::default_environment())
+            .expect("checksumless plan");
         assert_eq!(plans.len(), 1);
         assert!(plans[0].expected.sha1.is_none());
     }

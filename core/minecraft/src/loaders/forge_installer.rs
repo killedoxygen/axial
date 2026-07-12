@@ -6,7 +6,7 @@ use super::types::{
     LoaderInstallStrategy,
 };
 use crate::artifact_path::ArtifactRelativePath;
-use crate::download::{DownloadError, LibraryChecksumPolicy, library_artifact_plans_for};
+use crate::download::{DownloadError, library_artifact_plans_for};
 use crate::launch::{Library, maven_to_path};
 use crate::rules::default_environment;
 use serde::{Deserialize, Deserializer, de};
@@ -373,15 +373,12 @@ impl BoundForgeInstallerContinuation {
     fn final_embedded_library_paths(
         &self,
     ) -> Result<BTreeSet<ArtifactRelativePath>, ForgeInstallerError> {
-        let final_paths = library_artifact_plans_for(
-            &self.authenticated.libraries,
-            &default_environment(),
-            LibraryChecksumPolicy::AllowMissing,
-        )
-        .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?
-        .into_iter()
-        .map(|plan| plan.relative_path)
-        .collect::<BTreeSet<_>>();
+        let final_paths =
+            library_artifact_plans_for(&self.authenticated.libraries, &default_environment())
+                .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?
+                .into_iter()
+                .map(|plan| plan.relative_path)
+                .collect::<BTreeSet<_>>();
         Ok(self
             .authenticated
             .embedded_maven_artifacts
@@ -1192,12 +1189,8 @@ fn resolved_processor_artifact_contracts(
     libraries: &[Library],
     embedded: &[AuthenticatedEmbeddedMavenArtifact],
 ) -> Result<ResolvedProcessorArtifactContracts, ForgeInstallerError> {
-    let plans = library_artifact_plans_for(
-        libraries,
-        &default_environment(),
-        LibraryChecksumPolicy::Strict,
-    )
-    .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?;
+    let plans = library_artifact_plans_for(libraries, &default_environment())
+        .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?;
     let mut external_inputs = HashMap::new();
     let mut final_inventory = HashMap::new();
     for plan in plans {

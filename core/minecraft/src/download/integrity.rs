@@ -12,7 +12,7 @@ pub(super) enum ExistingArtifactIntegrity {
     MetadataInvalid,
     MetadataMissing,
     UnsupportedExisting,
-    Verified,
+    Verified(u64),
     Corrupt(DownloadIntegrityError),
 }
 
@@ -92,12 +92,12 @@ async fn existing_artifact_integrity_with_policy(
         // Asset objects are named by SHA-1 and verified while being downloaded.
         // Later ensure passes only prove the expected-size file is still present
         // at that content-addressed path; full readiness/repair checks still hash.
-        return Ok(ExistingArtifactIntegrity::Verified);
+        return Ok(ExistingArtifactIntegrity::Verified(metadata.len()));
     }
 
     let actual = hash_file(path).await?;
     match verify_download_integrity(path, expected, &actual) {
-        Ok(()) => Ok(ExistingArtifactIntegrity::Verified),
+        Ok(()) => Ok(ExistingArtifactIntegrity::Verified(actual.size)),
         Err(error) => Ok(ExistingArtifactIntegrity::Corrupt(error)),
     }
 }
@@ -293,13 +293,20 @@ fn checksumless_jar_is_readable(path: &Path) -> bool {
     checksumless_jar_readability(path).unwrap_or(false)
 }
 
-pub(super) async fn checksumless_jar_is_readable_async(
-    path: PathBuf,
-) -> Result<bool, DownloadError> {
-    tokio::task::spawn_blocking(move || checksumless_jar_readability(&path))
-        .await
-        .map_err(blocking_join_error)?
-        .map_err(DownloadError::FileOperation)
+pub(super) fn checksumless_jar_file_is_readable(file: &std::fs::File) -> io::Result<bool> {
+    let file = file.try_clone()?;
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return Ok(false);
+    };
+    for index in 0..archive.len() {
+        let Ok(entry) = archive.by_index(index) else {
+            return Ok(false);
+        };
+        if !entry.is_dir() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn checksumless_jar_readability(path: &Path) -> io::Result<bool> {
@@ -325,7 +332,7 @@ pub(super) async fn existing_file_satisfies(
 ) -> Result<bool, DownloadError> {
     Ok(matches!(
         existing_artifact_integrity(path, expected).await?,
-        ExistingArtifactIntegrity::Verified
+        ExistingArtifactIntegrity::Verified(_)
     ))
 }
 
@@ -336,7 +343,7 @@ pub(super) async fn existing_asset_object_satisfies(
 ) -> Result<bool, DownloadError> {
     Ok(matches!(
         existing_content_addressed_asset_integrity(path, expected).await?,
-        ExistingArtifactIntegrity::Verified
+        ExistingArtifactIntegrity::Verified(_)
     ))
 }
 

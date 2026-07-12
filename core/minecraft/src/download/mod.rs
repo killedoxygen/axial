@@ -26,14 +26,15 @@ pub use integrity::{
 pub(crate) use libraries::DownloadJob;
 pub(crate) use libraries::download_installer_libraries_with_authority_and_facts_and_descriptors;
 pub(crate) use libraries::{
-    LibraryArtifactPlan, LibraryChecksumPolicy, library_artifact_plans_for,
+    LibraryArtifactPlan, download_profile_libraries_with_proofs_and_facts_and_descriptors,
+    library_artifact_plans_for,
 };
 pub use libraries::{
     LibraryVerificationIntegrity, LibraryVerificationPlan, StructuralLibraryVerification,
-    download_libraries, download_libraries_allowing_missing_checksums_with_facts_and_descriptors,
-    download_libraries_with_facts_and_descriptors, library_verification_plans_for,
+    download_libraries, download_libraries_with_facts_and_descriptors,
+    library_verification_plans_for,
 };
-pub(crate) use model::InstallerLibraryDownloadAuthority;
+pub(crate) use model::ExactLibraryDownloadProof;
 pub use model::{
     DownloadError, DownloadProgress, ExecutionDownloadError, ExecutionDownloadFact,
     ExecutionDownloadFactKind, ExecutionDownloadOwnership, ExecutionDownloadReport,

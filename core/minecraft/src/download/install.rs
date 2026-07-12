@@ -3,7 +3,7 @@ use super::assets::{
     spawn_asset_download_pipeline,
 };
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
-use super::libraries::{DownloadJob, LibraryChecksumPolicy, library_jobs_for};
+use super::libraries::{DownloadJob, library_jobs_for};
 use super::model::{
     DownloadError, DownloadProgress, ExecutionDownloadFact, ExecutionDownloadReport,
     ExpectedIntegrity, SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
@@ -525,12 +525,7 @@ impl Downloader {
 
     fn library_jobs(&self, version: &VersionJson) -> Result<Vec<DownloadJob>, DownloadError> {
         let env = default_environment();
-        Ok(library_jobs_for(
-            &self.mc_dir,
-            &version.libraries,
-            &env,
-            LibraryChecksumPolicy::Strict,
-        )?)
+        Ok(library_jobs_for(&self.mc_dir, &version.libraries, &env)?)
     }
 
     async fn ensure_artifact(

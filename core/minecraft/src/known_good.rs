@@ -2,10 +2,10 @@ use crate::artifact_path::{
     ArtifactRelativePath, MAX_ARTIFACT_PATH_SEGMENT_BYTES, MAX_ARTIFACT_RELATIVE_PATH_BYTES,
 };
 use crate::download::{
-    ExpectedIntegrity, InstallerLibraryDownloadAuthority, LibraryArtifactPlan,
-    LibraryChecksumPolicy, library_artifact_plans_for, parse_asset_index,
+    ExactLibraryDownloadProof, ExpectedIntegrity, LibraryArtifactPlan, library_artifact_plans_for,
+    parse_asset_index,
 };
-use crate::launch::{Library, VersionJson};
+use crate::launch::{Library, VersionJson, merge_libraries_prefer_first};
 use crate::loaders::{
     LoaderBuildRecord, LoaderComponentId, LoaderInstallStrategy, VerifiedInstallerClientBytes,
     VerifiedInstallerReceiptSource, VerifiedProcessorOutputs, compose_loader_version,
@@ -18,7 +18,7 @@ use crate::runtime::{
     plan_runtime_manifest_files, preferred_runtime_component,
 };
 use sha1::{Digest as _, Sha1};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -206,6 +206,154 @@ pub(crate) struct VerifiedInstallerLibraryAuthority {
     entries: BTreeMap<ArtifactRelativePath, VerifiedInstallerLibraryFact>,
 }
 
+pub(crate) struct VerifiedProfileLibraryAuthority {
+    libraries: Vec<Library>,
+    entries: BTreeMap<ArtifactRelativePath, VerifiedProfileLibraryFact>,
+}
+
+struct VerifiedProfileLibraryFact {
+    size: Option<u64>,
+    sha1: [u8; 20],
+    is_native: bool,
+}
+
+pub(crate) fn seal_verified_profile_library_authority(
+    libraries: &[Library],
+    downloads: Vec<ExactLibraryDownloadProof>,
+) -> Result<VerifiedProfileLibraryAuthority, KnownGoodInventoryError> {
+    let environment = crate::rules::default_environment();
+    let plans = library_artifact_plans_for(libraries, &environment)
+        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+    let expected = plans
+        .into_iter()
+        .map(|plan| (plan.relative_path.clone(), plan))
+        .collect::<BTreeMap<_, _>>();
+    let mut entries = BTreeMap::new();
+    for download in downloads {
+        let (path, size, sha1) = download.into_parts();
+        let plan = expected
+            .get(&path)
+            .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
+        if entries
+            .insert(
+                path,
+                VerifiedProfileLibraryFact {
+                    size,
+                    sha1,
+                    is_native: plan.is_native,
+                },
+            )
+            .is_some()
+        {
+            return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
+        }
+    }
+    if entries.len() != expected.len() {
+        return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
+    }
+    for (path, plan) in &expected {
+        let proof = entries
+            .get(path)
+            .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
+        if proof.is_native != plan.is_native
+            || plan
+                .expected
+                .size
+                .is_some_and(|size| proof.size != Some(size))
+            || plan.expected.sha1.as_deref().is_some_and(|sha1| {
+                !Sha1Digest::from_metadata(sha1)
+                    .is_ok_and(|expected| expected == sha1_array_digest(&proof.sha1))
+            })
+        {
+            return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
+        }
+    }
+
+    let mut enriched = libraries.to_vec();
+    for library in &mut enriched {
+        let selected = library_artifact_plans_for(std::slice::from_ref(library), &environment)
+            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+        if selected.is_empty() {
+            continue;
+        }
+        for plan in &selected {
+            let proof = entries
+                .get(&plan.relative_path)
+                .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
+            author_profile_library_integrity(library, plan, proof)?;
+        }
+    }
+
+    let enriched_plans = library_artifact_plans_for(&enriched, &environment)
+        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+    if enriched_plans.len() != expected.len()
+        || enriched_plans.iter().any(|plan| {
+            let Some(proof) = entries.get(&plan.relative_path) else {
+                return true;
+            };
+            plan.is_native != proof.is_native
+                || plan.expected.size != proof.size
+                || plan.expected.sha1.as_deref().is_none_or(|sha1| {
+                    !Sha1Digest::from_metadata(sha1)
+                        .is_ok_and(|digest| digest == sha1_array_digest(&proof.sha1))
+                })
+        })
+    {
+        return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
+    }
+
+    Ok(VerifiedProfileLibraryAuthority {
+        libraries: enriched,
+        entries,
+    })
+}
+
+fn author_profile_library_integrity(
+    library: &mut Library,
+    plan: &LibraryArtifactPlan,
+    proof: &VerifiedProfileLibraryFact,
+) -> Result<(), KnownGoodInventoryError> {
+    let size = proof
+        .size
+        .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
+    let size = i64::try_from(size).map_err(|_| KnownGoodInventoryError::InputTooLarge)?;
+    let digest = sha1_array_digest(&proof.sha1).as_str().to_string();
+    if !plan.is_native {
+        library.sha1.clone_from(&digest);
+        library.size = size;
+    }
+
+    if let Some(downloads) = library.downloads.as_mut() {
+        let mut matches = 0;
+        if let Some(artifact) = downloads.artifact.as_mut()
+            && ArtifactRelativePath::new(&artifact.path).as_ref() == Ok(&plan.relative_path)
+        {
+            artifact.sha1.clone_from(&digest);
+            artifact.size = size;
+            matches += 1;
+        }
+        for artifact in downloads.classifiers.values_mut() {
+            if ArtifactRelativePath::new(&artifact.path).as_ref() == Ok(&plan.relative_path) {
+                artifact.sha1.clone_from(&digest);
+                artifact.size = size;
+                matches += 1;
+            }
+        }
+        if matches != 1 {
+            return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
+        }
+    } else if plan.is_native {
+        return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
+    }
+    Ok(())
+}
+
+impl VerifiedProfileLibraryAuthority {
+    pub(crate) fn libraries(&self) -> &[Library] {
+        &self.libraries
+    }
+}
+
 struct VerifiedInstallerLibraryFact {
     size: Option<u64>,
     sha1: [u8; 20],
@@ -214,15 +362,12 @@ struct VerifiedInstallerLibraryFact {
 
 pub(crate) fn seal_verified_installer_library_authority(
     source: &VerifiedInstallerReceiptSource,
-    downloads: Vec<InstallerLibraryDownloadAuthority>,
+    downloads: Vec<ExactLibraryDownloadProof>,
     outputs: VerifiedProcessorOutputs,
 ) -> Result<VerifiedInstallerLibraryAuthority, KnownGoodInventoryError> {
-    let plans = library_artifact_plans_for(
-        source.libraries(),
-        &crate::rules::default_environment(),
-        LibraryChecksumPolicy::AllowMissing,
-    )
-    .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+    let plans =
+        library_artifact_plans_for(source.libraries(), &crate::rules::default_environment())
+            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
     let expected = plans
         .into_iter()
         .map(|plan| (plan.relative_path.clone(), plan))
@@ -437,12 +582,8 @@ impl KnownGoodInstallReceipt {
             },
         })?;
 
-        let libraries = library_artifact_plans_for(
-            &resolved_version.libraries,
-            &base.environment,
-            LibraryChecksumPolicy::Strict,
-        )
-        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+        let libraries = library_artifact_plans_for(&resolved_version.libraries, &base.environment)
+            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
         add_library_plans(&mut builder, libraries, &BTreeMap::new())?;
 
         let expected_metadata = installed_loader_metadata_bytes(record)
@@ -473,7 +614,7 @@ impl KnownGoodInstallReceipt {
         record: &LoaderBuildRecord,
         resolved_version: VersionJson,
         version_bytes: &[u8],
-        profile_libraries: &[Library],
+        library_authority: VerifiedProfileLibraryAuthority,
         loader_metadata_bytes: &[u8],
     ) -> Result<Self, KnownGoodInventoryError> {
         if base.version_id.as_str() != record.minecraft_version
@@ -535,29 +676,68 @@ impl KnownGoodInstallReceipt {
             )?,
         })?;
 
-        if resolved_version
-            .libraries
-            .len()
-            .saturating_add(profile_libraries.len())
-            > MAX_KNOWN_GOOD_ENTRIES
-        {
+        if resolved_version.libraries.len() > MAX_KNOWN_GOOD_ENTRIES {
             return Err(KnownGoodInventoryError::InputTooLarge);
         }
-        let structural_proofs = structural_library_proofs(
-            library_artifact_plans_for(
-                profile_libraries,
-                &base.environment,
-                LibraryChecksumPolicy::AllowMissing,
+        if resolved_version.libraries
+            != merge_libraries_prefer_first(
+                library_authority.libraries(),
+                &base.effective_version.libraries,
             )
-            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?,
-        )?;
-        let libraries = library_artifact_plans_for(
-            &resolved_version.libraries,
-            &base.environment,
-            LibraryChecksumPolicy::Strict,
-        )
-        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-        add_library_plans(&mut builder, libraries, &structural_proofs)?;
+        {
+            return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
+        }
+        let libraries = library_artifact_plans_for(&resolved_version.libraries, &base.environment)
+            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+        let mut used_proofs = BTreeSet::new();
+        for plan in libraries {
+            let path = KnownGoodRelativePath::new(plan.relative_path.as_str())?;
+            let kind = if plan.is_native {
+                KnownGoodArtifactKind::NativeLibrary
+            } else {
+                KnownGoodArtifactKind::Library
+            };
+            let integrity = if let Some(proof) = library_authority.entries.get(&plan.relative_path)
+            {
+                if proof.is_native != plan.is_native
+                    || plan.expected.size != proof.size
+                    || plan.expected.sha1.as_deref().is_none_or(|sha1| {
+                        !Sha1Digest::from_metadata(sha1)
+                            .is_ok_and(|digest| digest == sha1_array_digest(&proof.sha1))
+                    })
+                {
+                    return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
+                }
+                used_proofs.insert(plan.relative_path.clone());
+                KnownGoodIntegrity::Sha1 {
+                    digest: sha1_array_digest(&proof.sha1),
+                    size: proof.size,
+                }
+            } else {
+                let expected = expected_integrity(&plan.expected, false, path.as_str())?;
+                base.inventory
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.root == KnownGoodRoot::Libraries
+                            && entry.path == path
+                            && entry.kind == kind
+                            && entry.integrity == expected
+                    })
+                    .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?
+                    .integrity
+                    .clone()
+            };
+            builder.insert(KnownGoodEntry {
+                root: KnownGoodRoot::Libraries,
+                path,
+                kind,
+                integrity,
+            })?;
+        }
+        if used_proofs.len() != library_authority.entries.len() {
+            return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
+        }
 
         let expected_metadata = installed_loader_metadata_bytes(record)
             .map_err(|_| KnownGoodInventoryError::MetadataSerialization)?;
@@ -691,12 +871,9 @@ impl KnownGoodInstallReceipt {
 
         let proofs = &library_authority.entries;
         let mut used_proofs = BTreeMap::new();
-        let final_libraries = library_artifact_plans_for(
-            &resolved_version.libraries,
-            &base.environment,
-            LibraryChecksumPolicy::AllowMissing,
-        )
-        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+        let final_libraries =
+            library_artifact_plans_for(&resolved_version.libraries, &base.environment)
+                .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
         for plan in final_libraries {
             let path = KnownGoodRelativePath::new(plan.relative_path.as_str())?;
             let kind = if plan.is_native {
@@ -744,12 +921,9 @@ impl KnownGoodInstallReceipt {
             }
         }
 
-        let installer_libraries = library_artifact_plans_for(
-            source.libraries(),
-            &crate::rules::default_environment(),
-            LibraryChecksumPolicy::AllowMissing,
-        )
-        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+        let installer_libraries =
+            library_artifact_plans_for(source.libraries(), &crate::rules::default_environment())
+                .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
         for plan in installer_libraries {
             if used_proofs.contains_key(&plan.relative_path) {
                 continue;
@@ -1005,6 +1179,7 @@ pub enum KnownGoodInventoryError {
     InputTooLarge,
     InvalidLibraryPlan,
     StructuralLibraryMismatch,
+    ProfileLibraryProofMismatch,
     InstallerLibraryProofMismatch,
     ConflictingEntry,
     ConflictingRuntimePath,
@@ -1053,26 +1228,16 @@ pub fn derive_known_good_inventory(
         return Err(KnownGoodInventoryError::InputTooLarge);
     }
     let structural_proofs = structural_library_proofs(
-        library_artifact_plans_for(
-            input.shape.structural_libraries(),
-            input.environment,
-            LibraryChecksumPolicy::AllowMissing,
-        )
-        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?,
+        library_artifact_plans_for(input.shape.structural_libraries(), input.environment)
+            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?,
     )?;
-    let libraries = library_artifact_plans_for(
-        &input.resolved_version.libraries,
-        input.environment,
-        LibraryChecksumPolicy::Strict,
-    )
-    .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+    let libraries =
+        library_artifact_plans_for(&input.resolved_version.libraries, input.environment)
+            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
     add_library_plans(&mut builder, libraries, &structural_proofs)?;
-    let installer_libraries = library_artifact_plans_for(
-        input.shape.installer_libraries(),
-        input.environment,
-        LibraryChecksumPolicy::Strict,
-    )
-    .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+    let installer_libraries =
+        library_artifact_plans_for(input.shape.installer_libraries(), input.environment)
+            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
     add_library_plans(&mut builder, installer_libraries, &structural_proofs)?;
 
     if let Some(logging) = input
@@ -1575,6 +1740,7 @@ mod tests {
         LoaderArtifactKind, LoaderBuildMetadata, LoaderInstallSource, LoaderInstallability,
         build_id_for, installed_version_id_for,
     };
+    use crate::rules::Rule;
     use std::collections::HashMap;
 
     fn structural_inventory(
@@ -2106,6 +2272,330 @@ mod tests {
     }
 
     #[test]
+    fn profile_library_sealer_is_exact_and_authors_both_metadata_locations() {
+        let path = "org/example/profile/1/profile-1.jar";
+        let library = Library {
+            name: "org.example:profile:1".to_string(),
+            downloads: Some(LibraryDownload {
+                artifact: Some(LibraryArtifact {
+                    path: path.to_string(),
+                    url: "https://example.invalid/profile.jar".to_string(),
+                    ..LibraryArtifact::default()
+                }),
+                classifiers: HashMap::new(),
+            }),
+            ..Library::default()
+        };
+        let proof = || {
+            ExactLibraryDownloadProof::new_for_test(
+                ArtifactRelativePath::new(path).expect("profile path"),
+                Some(23),
+                [0xbb; 20],
+            )
+        };
+
+        assert_eq!(
+            seal_verified_profile_library_authority(std::slice::from_ref(&library), Vec::new())
+                .err()
+                .expect("missing proof"),
+            KnownGoodInventoryError::ProfileLibraryProofMismatch
+        );
+        assert_eq!(
+            seal_verified_profile_library_authority(
+                std::slice::from_ref(&library),
+                vec![proof(), proof()],
+            )
+            .err()
+            .expect("duplicate proof"),
+            KnownGoodInventoryError::ProfileLibraryProofMismatch
+        );
+        assert_eq!(
+            seal_verified_profile_library_authority(
+                std::slice::from_ref(&library),
+                vec![ExactLibraryDownloadProof::new_for_test(
+                    ArtifactRelativePath::new("org/example/extra/1/extra-1.jar")
+                        .expect("extra path"),
+                    Some(23),
+                    [0xbb; 20],
+                )],
+            )
+            .err()
+            .expect("extra proof"),
+            KnownGoodInventoryError::ProfileLibraryProofMismatch
+        );
+
+        let authority = seal_verified_profile_library_authority(&[library], vec![proof()])
+            .expect("sealed profile proof");
+        let enriched = &authority.libraries()[0];
+        assert_eq!(enriched.sha1, SHA_B);
+        assert_eq!(enriched.size, 23);
+        let artifact = enriched
+            .downloads
+            .as_ref()
+            .and_then(|downloads| downloads.artifact.as_ref())
+            .expect("download artifact");
+        assert_eq!(artifact.sha1, SHA_B);
+        assert_eq!(artifact.size, 23);
+
+        let mut declared = enriched.clone();
+        assert_eq!(
+            seal_verified_profile_library_authority(
+                std::slice::from_ref(&declared),
+                vec![ExactLibraryDownloadProof::new_for_test(
+                    ArtifactRelativePath::new(path).expect("profile path"),
+                    Some(24),
+                    [0xbb; 20],
+                )],
+            )
+            .err()
+            .expect("declared size drift"),
+            KnownGoodInventoryError::ProfileLibraryProofMismatch
+        );
+        assert_eq!(
+            seal_verified_profile_library_authority(
+                std::slice::from_ref(&declared),
+                vec![ExactLibraryDownloadProof::new_for_test(
+                    ArtifactRelativePath::new(path).expect("profile path"),
+                    Some(23),
+                    [0xaa; 20],
+                )],
+            )
+            .err()
+            .expect("declared digest drift"),
+            KnownGoodInventoryError::ProfileLibraryProofMismatch
+        );
+        declared
+            .downloads
+            .as_mut()
+            .and_then(|downloads| downloads.artifact.as_mut())
+            .expect("download artifact")
+            .sha1 = SHA_A.to_string();
+        assert_eq!(
+            seal_verified_profile_library_authority(&[declared], vec![proof()])
+                .err()
+                .expect("conflicting nested metadata"),
+            KnownGoodInventoryError::InvalidLibraryPlan
+        );
+
+        let mut disallowed = enriched.clone();
+        disallowed.rules = vec![Rule {
+            action: "disallow".to_string(),
+            os: None,
+            features: None,
+        }];
+        assert_eq!(
+            seal_verified_profile_library_authority(&[disallowed], vec![proof()])
+                .err()
+                .expect("current environment drift"),
+            KnownGoodInventoryError::ProfileLibraryProofMismatch
+        );
+    }
+
+    #[test]
+    fn profile_library_sealer_authors_primary_and_native_contracts_independently() {
+        let environment = crate::rules::default_environment();
+        let classifier = crate::rules::native_classifier_key();
+        let primary_path = "org/example/dual/1/dual-1.jar";
+        let native_path = format!("org/example/dual/1/dual-1-{classifier}.jar");
+        let library = Library {
+            name: "org.example:dual:1".to_string(),
+            downloads: Some(LibraryDownload {
+                artifact: Some(LibraryArtifact {
+                    path: primary_path.to_string(),
+                    url: "https://example.invalid/dual.jar".to_string(),
+                    ..LibraryArtifact::default()
+                }),
+                classifiers: HashMap::from([(
+                    classifier.clone(),
+                    LibraryArtifact {
+                        path: native_path.clone(),
+                        url: "https://example.invalid/dual-native.jar".to_string(),
+                        ..LibraryArtifact::default()
+                    },
+                )]),
+            }),
+            natives: HashMap::from([(environment.os_name, classifier.clone())]),
+            ..Library::default()
+        };
+        let authority = seal_verified_profile_library_authority(
+            &[library],
+            vec![
+                ExactLibraryDownloadProof::new_for_test(
+                    ArtifactRelativePath::new(primary_path).expect("primary path"),
+                    Some(31),
+                    [0xaa; 20],
+                ),
+                ExactLibraryDownloadProof::new_for_test(
+                    ArtifactRelativePath::new(&native_path).expect("native path"),
+                    Some(47),
+                    [0xcc; 20],
+                ),
+            ],
+        )
+        .expect("primary and native authority");
+        let enriched = &authority.libraries()[0];
+        assert_eq!(enriched.sha1, SHA_A);
+        assert_eq!(enriched.size, 31);
+        let downloads = enriched.downloads.as_ref().expect("downloads");
+        let primary = downloads.artifact.as_ref().expect("primary artifact");
+        assert_eq!(primary.sha1, SHA_A);
+        assert_eq!(primary.size, 31);
+        let native = downloads
+            .classifiers
+            .get(&classifier)
+            .expect("native artifact");
+        assert_eq!(native.sha1, SHA_C);
+        assert_eq!(native.size, 47);
+    }
+
+    #[test]
+    fn fabric_and_quilt_profile_receipts_bind_authored_checksumless_proofs() {
+        for shape in [FixtureShape::Fabric, FixtureShape::Quilt] {
+            let fixture = fixture(shape, false);
+            let record = fixture.loader_record.as_ref().expect("loader record");
+            let coordinate = format!("org.example:{}-proof:1", record.component_id.as_str());
+            let path = format!(
+                "org/example/{0}-proof/1/{0}-proof-1.jar",
+                record.component_id.as_str()
+            );
+            let library = Library {
+                name: coordinate,
+                downloads: Some(LibraryDownload {
+                    artifact: Some(LibraryArtifact {
+                        path: path.clone(),
+                        url: "https://example.invalid/profile.jar".to_string(),
+                        ..LibraryArtifact::default()
+                    }),
+                    classifiers: HashMap::new(),
+                }),
+                ..Library::default()
+            };
+            let authority = seal_verified_profile_library_authority(
+                &[library],
+                vec![ExactLibraryDownloadProof::new_for_test(
+                    ArtifactRelativePath::new(&path).expect("profile path"),
+                    Some(53),
+                    [0xcc; 20],
+                )],
+            )
+            .expect("profile authority");
+            let authored = authority.libraries()[0].clone();
+            assert_eq!(authored.sha1, SHA_C);
+            assert_eq!(authored.size, 53);
+            let artifact = authored
+                .downloads
+                .as_ref()
+                .and_then(|downloads| downloads.artifact.as_ref())
+                .expect("authored artifact");
+            assert_eq!(artifact.sha1, SHA_C);
+            assert_eq!(artifact.size, 53);
+
+            let mut base_version = fixture.version.clone();
+            base_version.id = record.minecraft_version.clone();
+            base_version.inherits_from.clear();
+            base_version.materialized = false;
+            base_version.libraries.clear();
+            let base = KnownGoodInstallReceipt {
+                version_id: KnownGoodId::new(&record.minecraft_version).expect("base id"),
+                inventory: InventoryBuilder::default().finish(),
+                effective_version: base_version.clone(),
+                environment: fixture.environment.clone(),
+            };
+            let mut child = base_version;
+            child.id = record.version_id.clone();
+            child.inherits_from = record.minecraft_version.clone();
+            child.materialized = true;
+            child.libraries = vec![authored];
+            let version_bytes = serde_json::to_vec_pretty(&child).expect("written version");
+            let written: VersionJson =
+                serde_json::from_slice(&version_bytes).expect("parse written version");
+            let written_artifact = written.libraries[0]
+                .downloads
+                .as_ref()
+                .and_then(|downloads| downloads.artifact.as_ref())
+                .expect("written artifact");
+            assert_eq!(written.libraries[0].sha1, SHA_C);
+            assert_eq!(written.libraries[0].size, 53);
+            assert_eq!(written_artifact.sha1, SHA_C);
+            assert_eq!(written_artifact.size, 53);
+            let metadata = installed_loader_metadata_bytes(record).expect("loader metadata");
+            let receipt = KnownGoodInstallReceipt::from_verified_profile_source(
+                &base,
+                record,
+                child,
+                &version_bytes,
+                authority,
+                &metadata,
+            )
+            .expect("profile receipt");
+            assert!(receipt.inventory.entries().iter().any(|entry| {
+                entry.path().as_str() == path
+                    && entry.integrity()
+                        == &KnownGoodIntegrity::Sha1 {
+                            digest: Sha1Digest::from_metadata(SHA_C).expect("digest"),
+                            size: Some(53),
+                        }
+            }));
+        }
+    }
+
+    #[test]
+    fn profile_receipt_rejects_checksumless_inherited_base_library() {
+        let fixture = fixture(FixtureShape::Fabric, false);
+        let record = fixture.loader_record.as_ref().expect("loader record");
+        let profile = Library {
+            name: "org.example:profile-proof:1".to_string(),
+            url: "https://example.invalid/maven/".to_string(),
+            ..Library::default()
+        };
+        let authority = seal_verified_profile_library_authority(
+            std::slice::from_ref(&profile),
+            vec![ExactLibraryDownloadProof::new_for_test(
+                ArtifactRelativePath::new("org/example/profile-proof/1/profile-proof-1.jar")
+                    .expect("profile path"),
+                Some(17),
+                [0xaa; 20],
+            )],
+        )
+        .expect("profile authority");
+        let mut base_version = fixture.version.clone();
+        base_version.id = record.minecraft_version.clone();
+        base_version.inherits_from.clear();
+        base_version.materialized = false;
+        base_version.libraries = vec![Library {
+            name: "org.example:unproved-base:1".to_string(),
+            url: "https://example.invalid/maven/".to_string(),
+            ..Library::default()
+        }];
+        let base = KnownGoodInstallReceipt {
+            version_id: KnownGoodId::new(&record.minecraft_version).expect("base id"),
+            inventory: InventoryBuilder::default().finish(),
+            effective_version: base_version.clone(),
+            environment: fixture.environment,
+        };
+        let mut child = base_version;
+        child.id = record.version_id.clone();
+        child.inherits_from = record.minecraft_version.clone();
+        child.materialized = true;
+        child.libraries =
+            merge_libraries_prefer_first(authority.libraries(), &base.effective_version.libraries);
+        let version_bytes = serde_json::to_vec_pretty(&child).expect("version bytes");
+        let metadata = installed_loader_metadata_bytes(record).expect("loader metadata");
+
+        assert_eq!(
+            KnownGoodInstallReceipt::from_verified_profile_source(
+                &base,
+                record,
+                child,
+                &version_bytes,
+                authority,
+                &metadata,
+            ),
+            Err(KnownGoodInventoryError::MissingChecksum)
+        );
+    }
+
+    #[test]
     fn profile_receipt_inventory_keeps_only_the_final_shadowing_library() {
         let fixture = fixture(FixtureShape::Fabric, false);
         let record = fixture.loader_record.as_ref().expect("loader record");
@@ -2115,10 +2605,19 @@ mod tests {
             size: 12,
             ..Library::default()
         };
+        let authority = seal_verified_profile_library_authority(
+            std::slice::from_ref(&profile_library),
+            vec![ExactLibraryDownloadProof::new_for_test(
+                ArtifactRelativePath::new("org/ow2/asm/asm/9.9/asm-9.9.jar").expect("profile path"),
+                Some(12),
+                [0xaa; 20],
+            )],
+        )
+        .expect("profile authority");
         let mut child = fixture.version.clone();
         child.inherits_from = record.minecraft_version.clone();
         child.materialized = true;
-        child.libraries = vec![profile_library.clone()];
+        child.libraries = authority.libraries().to_vec();
         let mut base_version = child.clone();
         base_version.id = record.minecraft_version.clone();
         base_version.inherits_from.clear();
@@ -2143,7 +2642,7 @@ mod tests {
             record,
             child,
             &version_bytes,
-            &[profile_library],
+            authority,
             &metadata,
         )
         .expect("profile receipt");
@@ -2153,7 +2652,7 @@ mod tests {
             entry.path().as_str() == "org/ow2/asm/asm/9.9/asm-9.9.jar"
                 && matches!(
                     entry.integrity(),
-                    KnownGoodIntegrity::StructuralJar { size: Some(12) }
+                    KnownGoodIntegrity::Sha1 { size: Some(12), .. }
                 )
         }));
         assert!(
@@ -3107,7 +3606,6 @@ mod tests {
             source_url: Some("https://example.invalid/library".to_string()),
             relative_path,
             expected: ExpectedIntegrity { size, sha1: None },
-            allow_missing_checksum: true,
             is_native,
         }
     }

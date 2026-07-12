@@ -5,7 +5,7 @@ use super::facts::{
     size_mismatch_fact,
 };
 use super::integrity::{
-    ExistingArtifactIntegrity, checksumless_jar_is_readable_async, download_size_mismatch,
+    ExistingArtifactIntegrity, checksumless_jar_file_is_readable, download_size_mismatch,
     existing_artifact_integrity, existing_content_addressed_asset_integrity, is_sha1_hex,
     verify_download_integrity,
 };
@@ -352,28 +352,6 @@ impl DownloadChecksumRequirement {
     }
 }
 
-pub(super) async fn download_file_with_client_and_fact_sender_allowing_missing_checksum(
-    kind: SelectedDownloadArtifactKind,
-    client: &reqwest::Client,
-    url: &str,
-    destination: &Path,
-    expected: &ExpectedIntegrity,
-    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-) -> Result<ExecutionDownloadReport, DownloadError> {
-    download_file_with_client_and_fact_sender_allowing_missing_checksum_with_authority(
-        kind,
-        client,
-        url,
-        destination,
-        expected,
-        fact_tx,
-        descriptor_tx,
-    )
-    .await
-    .map(|download| download.report)
-}
-
 pub(super) async fn download_file_with_client_and_fact_sender_allowing_missing_checksum_with_authority(
     kind: SelectedDownloadArtifactKind,
     client: &reqwest::Client,
@@ -406,10 +384,6 @@ pub(super) async fn download_file_with_client_and_fact_sender_allowing_missing_c
     .await
     {
         Ok(download) => {
-            if !checksumless_artifact_is_structurally_usable(destination, expected).await? {
-                let _ = async_fs::remove_file(filesystem_path(destination).as_ref()).await;
-                return Err(checksumless_artifact_structure_error(destination));
-            }
             let facts =
                 selected_execution_download_facts(kind, destination, &download.report.facts);
             emit_execution_download_facts(fact_tx, &facts);
@@ -432,8 +406,30 @@ pub(super) async fn ensure_selected_artifact_with_client(
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
     descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 ) -> Result<Option<ExecutionDownloadReport>, DownloadError> {
+    ensure_selected_artifact_with_client_and_observed_size(
+        kind,
+        client,
+        url,
+        destination,
+        expected,
+        fact_tx,
+        descriptor_tx,
+    )
+    .await
+    .map(|(report, _)| report)
+}
+
+pub(super) async fn ensure_selected_artifact_with_client_and_observed_size(
+    kind: SelectedDownloadArtifactKind,
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    expected: &ExpectedIntegrity,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+) -> Result<(Option<ExecutionDownloadReport>, u64), DownloadError> {
     match selected_existing_artifact_integrity(kind, destination, expected).await? {
-        ExistingArtifactIntegrity::Verified => Ok(None),
+        ExistingArtifactIntegrity::Verified(size) => Ok((None, size)),
         ExistingArtifactIntegrity::MetadataInvalid => {
             emit_selected_metadata_failure(
                 kind,
@@ -469,7 +465,10 @@ pub(super) async fn ensure_selected_artifact_with_client(
             Some(error),
         )
         .await
-        .map(Some),
+        .map(|report| {
+            let size = report.bytes_written;
+            (Some(report), size)
+        }),
         ExistingArtifactIntegrity::UnsupportedExisting => {
             emit_unsupported_selected_artifact(
                 kind,
@@ -494,109 +493,11 @@ pub(super) async fn ensure_selected_artifact_with_client(
             None,
         )
         .await
-        .map(Some),
+        .map(|report| {
+            let size = report.bytes_written;
+            (Some(report), size)
+        }),
     }
-}
-
-pub(super) async fn ensure_selected_artifact_with_client_allowing_missing_checksum(
-    kind: SelectedDownloadArtifactKind,
-    client: &reqwest::Client,
-    url: &str,
-    destination: &Path,
-    expected: &ExpectedIntegrity,
-    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-) -> Result<Option<ExecutionDownloadReport>, DownloadError> {
-    if expected
-        .sha1
-        .as_deref()
-        .is_some_and(|sha1| !is_sha1_hex(sha1))
-    {
-        emit_selected_metadata_failure(
-            kind,
-            destination,
-            expected,
-            fact_tx,
-            ExecutionDownloadFactKind::MetadataInvalid,
-            "sha1",
-        );
-        return Err(selected_artifact_metadata_error(destination, "invalid"));
-    }
-
-    if expected.sha1.is_some() {
-        return ensure_selected_artifact_with_client(
-            kind,
-            client,
-            url,
-            destination,
-            expected,
-            fact_tx,
-            descriptor_tx,
-        )
-        .await;
-    }
-
-    match async_fs::symlink_metadata(filesystem_path(destination).as_ref()).await {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            emit_unsupported_selected_artifact(
-                kind,
-                destination,
-                url,
-                expected,
-                fact_tx,
-                descriptor_tx,
-            );
-            return Err(unsupported_selected_artifact_error(destination));
-        }
-        Ok(metadata) => {
-            if expected
-                .size
-                .is_none_or(|expected_size| metadata.len() == expected_size)
-                && checksumless_artifact_is_structurally_usable(destination, expected).await?
-            {
-                return Ok(None);
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(DownloadError::FileOperation(error)),
-    }
-
-    download_file_with_client_and_fact_sender_allowing_missing_checksum(
-        kind,
-        client,
-        url,
-        destination,
-        expected,
-        fact_tx,
-        descriptor_tx,
-    )
-    .await
-    .map(Some)
-}
-
-async fn checksumless_artifact_is_structurally_usable(
-    destination: &Path,
-    expected: &ExpectedIntegrity,
-) -> Result<bool, DownloadError> {
-    if expected.sha1.is_some() {
-        return Ok(true);
-    }
-    let metadata = match async_fs::metadata(filesystem_path(destination).as_ref()).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(DownloadError::FileOperation(error)),
-    };
-    if !metadata.is_file() || metadata.len() == 0 {
-        return Ok(false);
-    }
-    if destination
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
-    {
-        return checksumless_jar_is_readable_async(destination.to_path_buf()).await;
-    }
-    Ok(true)
 }
 
 async fn selected_existing_artifact_integrity(
@@ -1057,6 +958,27 @@ async fn execute_download_to_temp_with_authority(
     client: &reqwest::Client,
     request: ExecutionDownloadRequest<'_>,
 ) -> Result<AuthenticatedArtifactDownload, ExecutionDownloadError> {
+    execute_download_to_temp_with_authority_and_hook(client, request, None).await
+}
+
+#[cfg(test)]
+pub(super) async fn execute_download_to_temp_with_pre_promote_hook(
+    client: &reqwest::Client,
+    request: ExecutionDownloadRequest<'_>,
+    hook: impl FnOnce(&Path, &Path) + Send + 'static,
+) -> Result<ExecutionDownloadReport, ExecutionDownloadError> {
+    execute_download_to_temp_with_authority_and_hook(client, request, Some(Box::new(hook)))
+        .await
+        .map(|download| download.report)
+}
+
+type PrePromoteHook = Box<dyn FnOnce(&Path, &Path) + Send>;
+
+async fn execute_download_to_temp_with_authority_and_hook(
+    client: &reqwest::Client,
+    request: ExecutionDownloadRequest<'_>,
+    pre_promote: Option<PrePromoteHook>,
+) -> Result<AuthenticatedArtifactDownload, ExecutionDownloadError> {
     let target = safe_download_target_label(request.destination);
     let mut facts = metadata_facts(request.expected, &target);
     if !request.ownership.allows_managed_mutation() {
@@ -1169,6 +1091,7 @@ async fn execute_download_to_temp_with_authority(
     }
 
     let mut output = match async_fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .open(filesystem_path(&tmp_path).as_ref())
@@ -1281,7 +1204,7 @@ async fn execute_download_to_temp_with_authority(
         )
         .await);
     }
-    drop(output);
+    let output = output.into_std().await;
     facts.push(execution_download_fact(
         ExecutionDownloadFactKind::WrittenToTemp,
         &target,
@@ -1294,6 +1217,7 @@ async fn execute_download_to_temp_with_authority(
         sha1: Some(hex_sha1(&sha1)),
     };
     if let Err(error) = verify_download_integrity(request.destination, request.expected, &actual) {
+        drop(output);
         let error_kind = match &error {
             DownloadIntegrityError::SizeMismatch {
                 expected, actual, ..
@@ -1328,9 +1252,86 @@ async fn execute_download_to_temp_with_authority(
         ));
     }
 
-    if let Err(error) =
-        promote_launcher_managed_artifact_temp_once(&tmp_path, request.destination).await
+    let mut validated_temp = if request.expected.sha1.is_none() {
+        let destination = request.destination.to_path_buf();
+        let validation_task = tokio::task::spawn_blocking(move || {
+            let usable = written > 0
+                && (!destination
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
+                    || checksumless_jar_file_is_readable(&output)?);
+            Ok::<_, io::Error>((output, usable))
+        })
+        .await;
+        let validation = match validation_task {
+            Ok(validation) => validation,
+            Err(error) => {
+                return Err(finish_execution_error_after_temp_discard(
+                    &tmp_path,
+                    &target,
+                    &mut facts,
+                    ExecutionDownloadFactKind::TempWriteFailed,
+                    DownloadError::FileOperation(io::Error::other(format!(
+                        "checksumless validation worker failed: {error}"
+                    ))),
+                )
+                .await);
+            }
+        };
+        match validation {
+            Ok((file, true)) => Some(file),
+            Ok((file, false)) => {
+                drop(file);
+                return Err(finish_execution_error_after_temp_discard(
+                    &tmp_path,
+                    &target,
+                    &mut facts,
+                    ExecutionDownloadFactKind::ChecksumMismatch,
+                    checksumless_artifact_structure_error(request.destination),
+                )
+                .await);
+            }
+            Err(error) => {
+                return Err(finish_execution_error_after_temp_discard(
+                    &tmp_path,
+                    &target,
+                    &mut facts,
+                    ExecutionDownloadFactKind::TempWriteFailed,
+                    DownloadError::FileOperation(error),
+                )
+                .await);
+            }
+        }
+    } else {
+        drop(output);
+        None
+    };
+
+    if let Some(hook) = pre_promote {
+        hook(&tmp_path, request.destination);
+    }
+    if let Some(file) = validated_temp.as_ref()
+        && !path_matches_open_file(file, &tmp_path, written).unwrap_or(false)
     {
+        validated_temp.take();
+        return Err(finish_execution_error_after_temp_discard(
+            &tmp_path,
+            &target,
+            &mut facts,
+            ExecutionDownloadFactKind::PromoteFailed,
+            DownloadError::Integrity("validated download temp identity changed".to_string()),
+        )
+        .await);
+    }
+
+    let promotion = if let Some(file) = validated_temp.as_ref() {
+        promote_validated_artifact_temp(file, &tmp_path, request.destination, written).await
+    } else {
+        promote_launcher_managed_artifact_temp_once(&tmp_path, request.destination).await
+    };
+    if let Err(error) = promotion {
+        validated_temp.take();
         return Err(finish_io_failure_after_temp_discard(
             &tmp_path,
             &target,
@@ -1341,11 +1342,23 @@ async fn execute_download_to_temp_with_authority(
         )
         .await);
     }
+    if let Some(file) = validated_temp.as_ref()
+        && !path_matches_open_file(file, request.destination, written).unwrap_or(false)
+    {
+        return Err(execution_download_error(
+            ExecutionDownloadFactKind::PromoteFailed,
+            facts,
+            DownloadError::Integrity(
+                "promoted download identity does not match validated bytes".to_string(),
+            ),
+        ));
+    }
     facts.push(execution_download_fact(
         ExecutionDownloadFactKind::Promoted,
         &target,
         no_download_fact_fields(),
     ));
+    drop(validated_temp);
 
     Ok(AuthenticatedArtifactDownload {
         report: ExecutionDownloadReport {
@@ -1365,6 +1378,68 @@ fn hex_sha1(digest: &[u8; 20]) -> String {
         value.push(HEX[(byte & 0x0f) as usize] as char);
     }
     value
+}
+
+#[cfg(unix)]
+fn path_matches_open_file(file: &std::fs::File, path: &Path, size: u64) -> io::Result<bool> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let held = file.metadata()?;
+    let path_file = std::fs::File::from(rustix::fs::open(
+        filesystem_path(path).as_ref(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    let path = path_file.metadata()?;
+    Ok(path.is_file()
+        && held.len() == size
+        && path.len() == size
+        && held.dev() == path.dev()
+        && held.ino() == path.ino())
+}
+
+#[cfg(windows)]
+fn path_matches_open_file(file: &std::fs::File, path: &Path, size: u64) -> io::Result<bool> {
+    use std::mem::size_of;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
+        GetFileInformationByHandleEx,
+    };
+
+    fn identity(file: &std::fs::File) -> io::Result<(u64, [u8; 16])> {
+        let mut value = FILE_ID_INFO::default();
+        let size = u32::try_from(size_of::<FILE_ID_INFO>())
+            .map_err(|_| io::Error::other("Windows file identity is too large"))?;
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                (&mut value as *mut FILE_ID_INFO).cast(),
+                size,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((value.VolumeSerialNumber, value.FileId.Identifier))
+    }
+
+    let path_file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(filesystem_path(path).as_ref())?;
+    let metadata = path_file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_file() {
+        return Ok(false);
+    }
+    Ok(file.metadata()?.len() == size
+        && path_file.metadata()?.len() == size
+        && identity(file)? == identity(&path_file)?)
 }
 
 pub(super) async fn discard_download_temp(
@@ -1446,6 +1521,69 @@ pub(crate) async fn promote_launcher_managed_artifact_temp_once(
             .await
         }
     }
+}
+
+async fn promote_validated_artifact_temp(
+    file: &std::fs::File,
+    temp_path: &Path,
+    destination: &Path,
+    size: u64,
+) -> io::Result<()> {
+    sweep_stale_promotion_backups(destination).await?;
+    let existing = async_fs::symlink_metadata(filesystem_path(destination).as_ref()).await;
+    let backup = if matches!(&existing, Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink())
+    {
+        let backup = promotion_backup_path(destination);
+        async_fs::rename(
+            filesystem_path(destination).as_ref(),
+            filesystem_path(&backup).as_ref(),
+        )
+        .await?;
+        Some(backup)
+    } else {
+        None
+    };
+
+    if let Err(error) = async_fs::rename(
+        filesystem_path(temp_path).as_ref(),
+        filesystem_path(destination).as_ref(),
+    )
+    .await
+    {
+        if let Some(backup) = backup.as_ref() {
+            async_fs::rename(
+                filesystem_path(backup).as_ref(),
+                filesystem_path(destination).as_ref(),
+            )
+            .await?;
+        }
+        return Err(error);
+    }
+
+    if !path_matches_open_file(file, destination, size).unwrap_or(false) {
+        if let Some(backup) = backup.as_ref() {
+            let rejected = download_temp_path(destination);
+            let _ = async_fs::rename(
+                filesystem_path(destination).as_ref(),
+                filesystem_path(&rejected).as_ref(),
+            )
+            .await;
+            async_fs::rename(
+                filesystem_path(backup).as_ref(),
+                filesystem_path(destination).as_ref(),
+            )
+            .await?;
+            let _ = async_fs::remove_file(filesystem_path(&rejected).as_ref()).await;
+        }
+        return Err(io::Error::other(
+            "promoted artifact identity does not match validated temp",
+        ));
+    }
+
+    if let Some(backup) = backup {
+        async_fs::remove_file(filesystem_path(&backup).as_ref()).await?;
+    }
+    Ok(())
 }
 
 pub(super) async fn remove_stale_download_temp(temp_path: &Path) -> Result<(), DownloadError> {
