@@ -387,6 +387,7 @@ impl TestFixture {
             serde_json::to_vec_pretty(&serde_json::json!({
                 "id": version_id,
                 "inheritsFrom": minecraft_version,
+                "axialMaterialized": true,
                 "type": "release",
                 "mainClass": "net.minecraft.client.main.Main",
                 "assetIndex": {},
@@ -399,13 +400,10 @@ impl TestFixture {
         fs::write(
             version_dir.join(".axial-loader.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "component_id": "net.fabricmc.fabric-loader",
-                "component_name": "Fabric",
-                "build_id": format!("fabric:{minecraft_version}:0.16.10"),
                 "minecraft_version": minecraft_version,
-                "loader_version": "0.16.10",
-                "build_meta": {}
+                "loader_version": "0.16.10"
             }))
             .expect("serialize loader metadata"),
         )
@@ -413,6 +411,15 @@ impl TestFixture {
         fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
             .expect("write version jar");
     }
+}
+
+fn fabric_version_id(minecraft_version: &str) -> String {
+    axial_minecraft::installed_version_id_for(
+        axial_minecraft::LoaderComponentId::Fabric,
+        minecraft_version,
+        "0.16.10",
+    )
+    .expect("valid Fabric test identity")
 }
 
 async fn spawn_rules_server(body: Vec<u8>, signature: Option<String>) -> String {

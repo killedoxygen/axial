@@ -121,17 +121,17 @@ where
         &installed_version_id,
     )?;
     cleanup_on_error(
+        write_installed_loader_metadata(library_dir, &installed_version_id, &plan.record).await,
+        library_dir,
+        &installed_version_id,
+    )?;
+    cleanup_on_error(
         verify_install(library_dir, &installed_version_id),
         library_dir,
         &installed_version_id,
     )?;
     cleanup_on_error(
         ensure_launcher_profiles(library_dir, &installed_version_id),
-        library_dir,
-        &installed_version_id,
-    )?;
-    cleanup_on_error(
-        write_installed_loader_metadata(library_dir, &installed_version_id, &plan.record).await,
         library_dir,
         &installed_version_id,
     )?;
@@ -282,17 +282,17 @@ where
     }
 
     cleanup_on_error(
+        write_installed_loader_metadata(library_dir, &installed_version_id, &plan.record).await,
+        library_dir,
+        &installed_version_id,
+    )?;
+    cleanup_on_error(
         verify_install(library_dir, &installed_version_id),
         library_dir,
         &installed_version_id,
     )?;
     cleanup_on_error(
         ensure_launcher_profiles(library_dir, &installed_version_id),
-        library_dir,
-        &installed_version_id,
-    )?;
-    cleanup_on_error(
-        write_installed_loader_metadata(library_dir, &installed_version_id, &plan.record).await,
         library_dir,
         &installed_version_id,
     )?;
@@ -338,7 +338,6 @@ where
 
     let fragment = LoaderProfileFragment {
         id: plan.record.version_id.clone(),
-        inherits_from: plan.record.minecraft_version.clone(),
         ..LoaderProfileFragment::default()
     };
     let version = compose_loader_version(
@@ -376,17 +375,17 @@ where
         &plan.record.version_id,
     )?;
     cleanup_on_error(
+        write_installed_loader_metadata(library_dir, &plan.record.version_id, &plan.record).await,
+        library_dir,
+        &plan.record.version_id,
+    )?;
+    cleanup_on_error(
         verify_install(library_dir, &plan.record.version_id),
         library_dir,
         &plan.record.version_id,
     )?;
     cleanup_on_error(
         ensure_launcher_profiles(library_dir, &plan.record.version_id),
-        library_dir,
-        &plan.record.version_id,
-    )?;
-    cleanup_on_error(
-        write_installed_loader_metadata(library_dir, &plan.record.version_id, &plan.record).await,
         library_dir,
         &plan.record.version_id,
     )?;
@@ -1057,7 +1056,7 @@ mod tests {
         LoaderComponentId, LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy,
         LoaderInstallability,
     };
-    use crate::loaders::validate_version_id;
+    use crate::loaders::{build_id_for, installed_version_id_for, validate_version_id};
     use crate::paths::versions_dir;
     use sha1::{Digest as _, Sha1};
     use std::collections::HashMap;
@@ -1807,8 +1806,7 @@ mod tests {
     async fn profile_source_installs_to_backend_version_id_when_upstream_id_differs() {
         let root = temp_dir("profile-upstream-id-mismatch");
         write_base_version(&root, "1.21.5");
-        let mut record = profile_record();
-        record.version_id = "backend-profile-id".to_string();
+        let record = profile_record();
         let profile_path = super::cached_profile_path(&root, &record);
         fs::create_dir_all(profile_path.parent().expect("profile parent"))
             .expect("create profile cache parent");
@@ -1885,8 +1883,7 @@ mod tests {
     async fn installer_source_installs_to_backend_version_id_when_upstream_id_differs() {
         let root = temp_dir("installer-upstream-id-mismatch");
         write_base_version(&root, "1.21.5");
-        let mut record = installer_record();
-        record.version_id = "backend-installer-id".to_string();
+        let record = installer_record();
         let installer_path = super::cached_installer_path(&root, &record);
         fs::create_dir_all(installer_path.parent().expect("installer parent"))
             .expect("create installer cache parent");
@@ -1922,7 +1919,7 @@ mod tests {
         let mut record = installer_record();
         record.minecraft_version = minecraft_version.to_string();
         record.loader_version = "10.13.4.1614-1.7.10".to_string();
-        record.version_id = "1.7.10-forge-10.13.4.1614-1.7.10".to_string();
+        canonicalize_record_identity(&mut record);
         let installer_path = super::cached_installer_path(&root, &record);
         fs::create_dir_all(installer_path.parent().expect("installer parent"))
             .expect("create installer cache parent");
@@ -1990,7 +1987,7 @@ mod tests {
     #[tokio::test]
     async fn strip_meta_legacy_installer_rewrites_child_client_and_integrity() {
         let root = temp_dir("installer-strip-meta-child-client");
-        let version_id = "1.5.2-forge-7.8.1.738";
+        let version_id = "patched-child";
         let version_dir = versions_dir(&root).join(version_id);
         fs::create_dir_all(&version_dir).expect("version dir");
         let signed_client = zip_entries(&[
@@ -2007,7 +2004,7 @@ mod tests {
         fs::write(
             version_dir.join(format!("{version_id}.json")),
             r#"{
-                "id":"1.5.2-forge-7.8.1.738",
+                "id":"patched-child",
                 "type":"release",
                 "mainClass":"net.minecraft.launchwrapper.Launch",
                 "assetIndex":{"id":"pre-1.6","url":"","sha1":"","size":0,"totalSize":0},
@@ -2061,7 +2058,10 @@ mod tests {
     async fn strip_meta_legacy_installer_install_strips_child_not_base_client() {
         let root = temp_dir("installer-strip-meta-install");
         let minecraft_version = "1.5.2";
-        let version_id = "1.5.2-forge-7.8.1.738";
+        let loader_version = "7.8.1.738";
+        let version_id =
+            installed_version_id_for(LoaderComponentId::Forge, minecraft_version, loader_version)
+                .expect("canonical installed version id");
         let base_dir = versions_dir(&root).join(minecraft_version);
         fs::create_dir_all(&base_dir).expect("base version dir");
         let signed_client = zip_entries(&[
@@ -2129,8 +2129,9 @@ mod tests {
         ]);
         let mut record = installer_record();
         record.minecraft_version = minecraft_version.to_string();
-        record.loader_version = "7.8.1.738".to_string();
-        record.version_id = version_id.to_string();
+        record.loader_version = loader_version.to_string();
+        canonicalize_record_identity(&mut record);
+        assert_eq!(record.version_id, version_id);
         record.strategy = LoaderInstallStrategy::ForgeLegacyInstaller;
         let installer_path = super::cached_installer_path(&root, &record);
         fs::create_dir_all(installer_path.parent().expect("installer parent"))
@@ -2151,7 +2152,7 @@ mod tests {
         .expect("install stripMeta legacy installer");
 
         let child_jar = versions_dir(&root)
-            .join(version_id)
+            .join(&version_id)
             .join(format!("{version_id}.jar"));
         assert!(zip_contains(
             &child_jar,
@@ -2181,7 +2182,7 @@ mod tests {
         let child_jar_bytes = fs::read(&child_jar).expect("read child jar");
         let version_json = fs::read_to_string(
             versions_dir(&root)
-                .join(version_id)
+                .join(&version_id)
                 .join(format!("{version_id}.json")),
         )
         .expect("read version json");
@@ -2235,7 +2236,7 @@ mod tests {
         let server = TestByteServer::start(forge_archive);
         let mut record = legacy_archive_record();
         record.minecraft_version = base_version_id.to_string();
-        record.version_id = "forge-1.2.5-3.4.9.171".to_string();
+        canonicalize_record_identity(&mut record);
         let plan = LoaderInstallPlan {
             record: record.clone(),
             stage_dir: root.join("stage"),
@@ -2464,14 +2465,18 @@ mod tests {
     }
 
     fn profile_record() -> LoaderBuildRecord {
+        let component_id = LoaderComponentId::Fabric;
+        let minecraft_version = "1.21.5";
+        let loader_version = "0.16.14";
         LoaderBuildRecord {
             subject_kind: LoaderBuildSubjectKind::LoaderBuild,
-            component_id: LoaderComponentId::Fabric,
+            component_id,
             component_name: "Fabric".to_string(),
-            build_id: "fabric-1.21.5-0.16.14".to_string(),
-            minecraft_version: "1.21.5".to_string(),
-            loader_version: "0.16.14".to_string(),
-            version_id: "fabric-loader-0.16.14-1.21.5".to_string(),
+            build_id: build_id_for(component_id, minecraft_version, loader_version),
+            minecraft_version: minecraft_version.to_string(),
+            loader_version: loader_version.to_string(),
+            version_id: installed_version_id_for(component_id, minecraft_version, loader_version)
+                .expect("canonical installed version id"),
             build_meta: LoaderBuildMetadata::default(),
             strategy: LoaderInstallStrategy::FabricProfile,
             artifact_kind: LoaderArtifactKind::ProfileJson,
@@ -2486,9 +2491,8 @@ mod tests {
         let mut record = profile_record();
         record.component_id = LoaderComponentId::Forge;
         record.component_name = "Forge".to_string();
-        record.build_id = "forge-1.21.5-55.0.0".to_string();
         record.loader_version = "55.0.0".to_string();
-        record.version_id = "forge-1.21.5-55.0.0".to_string();
+        canonicalize_record_identity(&mut record);
         record.strategy = LoaderInstallStrategy::ForgeModern;
         record.artifact_kind = LoaderArtifactKind::InstallerJar;
         record.install_source = LoaderInstallSource::InstallerJar {
@@ -2501,16 +2505,29 @@ mod tests {
         let mut record = profile_record();
         record.component_id = LoaderComponentId::Forge;
         record.component_name = "Forge".to_string();
-        record.build_id = "forge-1.2.5-3.4.9.171".to_string();
         record.minecraft_version = "1.2.5".to_string();
         record.loader_version = "3.4.9.171".to_string();
-        record.version_id = "forge-1.2.5-3.4.9.171".to_string();
+        canonicalize_record_identity(&mut record);
         record.strategy = LoaderInstallStrategy::ForgeEarliestLegacy;
         record.artifact_kind = LoaderArtifactKind::LegacyArchive;
         record.install_source = LoaderInstallSource::LegacyArchive {
             url: "https://example.test/legacy.jar".to_string(),
         };
         record
+    }
+
+    fn canonicalize_record_identity(record: &mut LoaderBuildRecord) {
+        record.build_id = build_id_for(
+            record.component_id,
+            &record.minecraft_version,
+            &record.loader_version,
+        );
+        record.version_id = installed_version_id_for(
+            record.component_id,
+            &record.minecraft_version,
+            &record.loader_version,
+        )
+        .expect("canonical installed version id");
     }
 
     struct TestByteServer {

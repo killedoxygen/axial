@@ -15,6 +15,12 @@ pub struct VersionJson {
         skip_serializing_if = "String::is_empty"
     )]
     pub inherits_from: String,
+    #[serde(
+        rename = "axialMaterialized",
+        default,
+        skip_serializing_if = "is_false"
+    )]
+    pub materialized: bool,
     #[serde(rename = "type", default)]
     pub kind: String,
     #[serde(rename = "mainClass", default)]
@@ -49,6 +55,10 @@ impl VersionJson {
     pub fn is_legacy_version(&self) -> bool {
         self.arguments.is_none() && !self.minecraft_arguments.is_empty()
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -314,6 +324,8 @@ pub enum LaunchModelError {
     },
     #[error("inheritsFrom chain too deep (>10) for {version_id}")]
     InheritanceTooDeep { version_id: String },
+    #[error("materialized loader profile provenance is invalid for {version_id}")]
+    InvalidMaterializedProvenance { version_id: String },
 }
 
 pub fn load_version_json(mc_dir: &Path, version_id: &str) -> Result<VersionJson, LaunchModelError> {
@@ -337,10 +349,10 @@ pub fn load_version_json(mc_dir: &Path, version_id: &str) -> Result<VersionJson,
 
 pub fn resolve_version(mc_dir: &Path, version_id: &str) -> Result<VersionJson, LaunchModelError> {
     let version = load_version_json(mc_dir, version_id)?;
-    if version.inherits_from.is_empty() {
+    if version.inherits_from.is_empty() && !version.materialized {
         return Ok(finalize_effective_version(version));
     }
-    resolve_inheritance(mc_dir, version, 0)
+    resolve_inheritance(mc_dir, version, version_id, 0)
 }
 
 pub fn resolve_libraries(
@@ -557,12 +569,29 @@ pub fn client_jar_path(
 fn resolve_inheritance(
     mc_dir: &Path,
     child: VersionJson,
+    expected_version_id: &str,
     depth: usize,
 ) -> Result<VersionJson, LaunchModelError> {
     if depth > 10 {
         return Err(LaunchModelError::InheritanceTooDeep {
             version_id: child.id.clone(),
         });
+    }
+
+    if child.materialized {
+        if !crate::loaders::materialized_profile_has_valid_provenance(
+            mc_dir,
+            expected_version_id,
+            &child,
+        ) {
+            return Err(LaunchModelError::InvalidMaterializedProvenance {
+                version_id: child.id,
+            });
+        }
+        let mut materialized = child;
+        materialized.inherits_from.clear();
+        materialized.materialized = false;
+        return Ok(finalize_effective_version(materialized));
     }
 
     if child.inherits_from.is_empty() {
@@ -576,8 +605,8 @@ fn resolve_inheritance(
             parent_id: parent_id.clone(),
             source: Box::new(source),
         })?;
-    if !parent.inherits_from.is_empty() {
-        parent = resolve_inheritance(mc_dir, parent, depth + 1)?;
+    if parent.materialized || !parent.inherits_from.is_empty() {
+        parent = resolve_inheritance(mc_dir, parent, &parent_id, depth + 1)?;
     }
 
     Ok(finalize_effective_version(merge_versions(&parent, &child)))
@@ -588,6 +617,7 @@ fn merge_versions(parent: &VersionJson, child: &VersionJson) -> VersionJson {
     let mut merged = VersionJson {
         id: child.id.clone(),
         inherits_from: String::new(),
+        materialized: false,
         kind: non_empty(&child.kind, &parent.kind),
         main_class: non_empty(&child.main_class, &parent.main_class),
         minimum_launcher_version: if child.minimum_launcher_version != 0 {
@@ -1186,6 +1216,40 @@ mod tests {
     }
 
     #[test]
+    fn inherited_materialized_parent_without_provenance_is_rejected() {
+        let temp_root = temp_root("materialized-parent-without-provenance");
+        write_version_json(
+            &temp_root,
+            "materialized-parent",
+            serde_json::json!({
+                "id": "materialized-parent",
+                "axialMaterialized": true,
+                "type": "release",
+                "mainClass": "untrusted.Main",
+                "libraries": []
+            }),
+        );
+        write_version_json(
+            &temp_root,
+            "child",
+            serde_json::json!({
+                "id": "child",
+                "inheritsFrom": "materialized-parent",
+                "type": "release",
+                "libraries": []
+            }),
+        );
+
+        assert!(matches!(
+            resolve_version(&temp_root, "child"),
+            Err(LaunchModelError::InvalidMaterializedProvenance { version_id })
+                if version_id == "materialized-parent"
+        ));
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
     fn missing_java_version_infers_java8_for_legacy_releases() {
         let temp_root = temp_root("legacy-java-inference");
         write_version_json(
@@ -1319,6 +1383,7 @@ mod tests {
         VersionJson {
             id: "test".to_string(),
             inherits_from: String::new(),
+            materialized: false,
             kind: "release".to_string(),
             main_class: "net.minecraft.client.main.Main".to_string(),
             minimum_launcher_version: 0,

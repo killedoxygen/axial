@@ -23,10 +23,10 @@ pub enum LoaderComponentId {
 impl LoaderComponentId {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
-            "fabric" | "net.fabricmc.fabric-loader" => Some(Self::Fabric),
-            "quilt" | "org.quiltmc.quilt-loader" => Some(Self::Quilt),
-            "forge" | "net.minecraftforge" => Some(Self::Forge),
-            "neoforge" | "net.neoforged" => Some(Self::NeoForge),
+            "net.fabricmc.fabric-loader" => Some(Self::Fabric),
+            "org.quiltmc.quilt-loader" => Some(Self::Quilt),
+            "net.minecraftforge" => Some(Self::Forge),
+            "net.neoforged" => Some(Self::NeoForge),
             _ => None,
         }
     }
@@ -260,7 +260,7 @@ pub struct CachedCatalog<T> {
     pub value: T,
 }
 
-pub const LOADER_CATALOG_SCHEMA_VERSION: u32 = 8;
+pub const LOADER_CATALOG_SCHEMA_VERSION: u32 = 9;
 
 impl<T> CachedCatalog<T> {
     pub fn new(value: T) -> Self {
@@ -621,11 +621,22 @@ fn provider_pre_operation_failure_kind(
 #[cfg(test)]
 mod tests {
     use super::{
-        LoaderError, LoaderGameVersion, LoaderInstallError, LoaderInstallFailureKind,
-        LoaderPreOperationFailureKind,
+        LoaderComponentId, LoaderError, LoaderGameVersion, LoaderInstallError,
+        LoaderInstallFailureKind, LoaderPreOperationFailureKind,
     };
     use std::collections::HashSet;
     use std::io;
+
+    #[test]
+    fn component_parser_accepts_only_canonical_ids() {
+        assert_eq!(
+            LoaderComponentId::parse("net.fabricmc.fabric-loader"),
+            Some(LoaderComponentId::Fabric)
+        );
+        for alias in ["fabric", "quilt", "forge", "neoforge"] {
+            assert_eq!(LoaderComponentId::parse(alias), None, "{alias}");
+        }
+    }
 
     #[test]
     fn active_loader_failure_inventory_is_unique_and_covers_runtime_categories() {

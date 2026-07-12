@@ -1,10 +1,12 @@
 use super::cache::{resolve_cached, resolve_fresh_cached};
 use super::normalize::{normalize_build_index, normalize_supported_versions};
-use crate::loaders::api::{loader_components, parse_build_id};
+use crate::loaders::api::{
+    loader_components, parse_build_id, validate_loader_build_record_identity,
+};
 use crate::loaders::providers;
 use crate::loaders::types::{
     LoaderBuildRecord, LoaderCatalogState, LoaderComponentId, LoaderComponentRecord, LoaderError,
-    LoaderGameVersion,
+    LoaderGameVersion, LoaderProviderFailureKind, LoaderVersionIndex,
 };
 use crate::manifest::fetch_version_manifest_cached;
 use crate::paths::loader_catalog_dir;
@@ -63,6 +65,7 @@ pub async fn fetch_builds(
     )
     .await?;
     let normalized = normalize_build_index(index);
+    validate_build_index_identity(&normalized, component_id, &minecraft_version)?;
     Ok((normalized.builds, catalog))
 }
 
@@ -79,7 +82,29 @@ pub fn fetch_cached_builds(
         return Ok(None);
     };
     let normalized = normalize_build_index(index);
+    validate_build_index_identity(&normalized, component_id, &minecraft_version)?;
     Ok(Some((normalized.builds, catalog)))
+}
+
+fn validate_build_index_identity(
+    index: &LoaderVersionIndex,
+    component_id: LoaderComponentId,
+    minecraft_version: &str,
+) -> Result<(), LoaderError> {
+    let valid = index.component_id == component_id
+        && index.builds.iter().all(|record| {
+            record.component_id == component_id
+                && record.minecraft_version == minecraft_version
+                && validate_loader_build_record_identity(record).is_ok()
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(LoaderError::ProviderDataInvalid {
+            kind: LoaderProviderFailureKind::SchemaInvalid,
+            status: None,
+        })
+    }
 }
 
 pub async fn resolve_build_record(
@@ -159,11 +184,13 @@ fn catalog_version_order(entries: &[crate::manifest::ManifestEntry]) -> HashMap<
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_build_record_from_catalog;
+    use super::{resolve_build_record_from_catalog, validate_build_index_identity};
+    use crate::loaders::installed_version_id_for;
     use crate::loaders::types::{
         LoaderArtifactKind, LoaderAvailability, LoaderBuildMetadata, LoaderBuildRecord,
         LoaderBuildSubjectKind, LoaderCatalogState, LoaderComponentId, LoaderError,
         LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
+        LoaderProviderFailureKind, LoaderVersionIndex,
     };
 
     #[test]
@@ -198,6 +225,31 @@ mod tests {
         assert_eq!(build.build_id, build_id);
     }
 
+    #[test]
+    fn catalog_rejects_noncanonical_installed_version_id() {
+        let component_id = LoaderComponentId::Fabric;
+        let mut record = build_record(component_id, "fabric:1.21.5:0.16.14");
+        record.version_id = "fabric-loader-0.16.14-1.21.5".to_string();
+
+        let error = validate_build_index_identity(
+            &LoaderVersionIndex {
+                component_id,
+                builds: vec![record],
+            },
+            component_id,
+            "1.21.5",
+        )
+        .expect_err("noncanonical provider identity");
+
+        assert!(matches!(
+            error,
+            LoaderError::ProviderDataInvalid {
+                kind: LoaderProviderFailureKind::SchemaInvalid,
+                status: None,
+            }
+        ));
+    }
+
     fn catalog_state(fresh: bool, stale: bool) -> LoaderCatalogState {
         LoaderCatalogState {
             availability: LoaderAvailability {
@@ -220,7 +272,8 @@ mod tests {
             build_id: build_id.to_string(),
             minecraft_version: "1.21.5".to_string(),
             loader_version: "0.16.14".to_string(),
-            version_id: "fabric-loader-0.16.14-1.21.5".to_string(),
+            version_id: installed_version_id_for(component_id, "1.21.5", "0.16.14")
+                .expect("canonical installed version id"),
             build_meta: LoaderBuildMetadata::default(),
             strategy: LoaderInstallStrategy::FabricProfile,
             artifact_kind: LoaderArtifactKind::ProfileJson,

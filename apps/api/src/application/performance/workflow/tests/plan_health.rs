@@ -382,8 +382,9 @@ async fn health_custom_mode_ignores_corrupt_state_and_has_one_warnings_field() {
 #[tokio::test]
 async fn health_response_includes_bounded_managed_artifact_summary() {
     let fixture = TestFixture::new("health-managed-artifacts");
-    let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
-    fixture.write_fabric_version("1.20.4-fabric", "1.20.4");
+    let version_id = fabric_version_id("1.20.4");
+    let instance_id = fixture.add_instance("Managed", &version_id);
+    fixture.write_fabric_version(&version_id, "1.20.4");
     let mods_dir = fixture
         .state
         .instances()
@@ -499,8 +500,9 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
 #[tokio::test]
 async fn health_response_bounds_public_composition_identifiers() {
     let fixture = TestFixture::new("health-public-composition-redaction");
-    let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
-    fixture.write_fabric_version("1.20.4-fabric", "1.20.4");
+    let version_id = fabric_version_id("1.20.4");
+    let instance_id = fixture.add_instance("Managed", &version_id);
+    fixture.write_fabric_version(&version_id, "1.20.4");
     let mods_dir = fixture
         .state
         .instances()
@@ -565,8 +567,9 @@ async fn health_response_bounds_public_composition_identifiers() {
 #[tokio::test]
 async fn health_response_exposes_degraded_and_fallback_guardian_view_models_and_proofs() {
     let degraded = TestFixture::new("health-degraded-contract");
-    let degraded_instance = degraded.add_instance("Managed", "1.20.4-fabric");
-    degraded.write_fabric_version("1.20.4-fabric", "1.20.4");
+    let version_id = fabric_version_id("1.20.4");
+    let degraded_instance = degraded.add_instance("Managed", &version_id);
+    degraded.write_fabric_version(&version_id, "1.20.4");
     let degraded_mods_dir = degraded
         .state
         .instances()
@@ -647,8 +650,9 @@ async fn health_response_exposes_degraded_and_fallback_guardian_view_models_and_
     );
 
     let fallback = TestFixture::new("health-fallback-contract");
-    let fallback_instance = fallback.add_instance("Managed", "1.20.4-fabric");
-    fallback.write_fabric_version("1.20.4-fabric", "1.20.4");
+    let version_id = fabric_version_id("1.20.4");
+    let fallback_instance = fallback.add_instance("Managed", &version_id);
+    fallback.write_fabric_version(&version_id, "1.20.4");
     let fallback_mods_dir = fallback
         .state
         .instances()
@@ -750,8 +754,9 @@ async fn health_plan_uses_user_installed_iris_file_for_nvidium_exclusion() {
         axial_performance::RuleSource::Remote
     );
     assert!(status.guardian_facts.is_empty());
-    let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
-    fixture.write_fabric_version("1.20.4-fabric", "1.20.4");
+    let version_id = fabric_version_id("1.20.4");
+    let instance_id = fixture.add_instance("Managed", &version_id);
+    fixture.write_fabric_version(&version_id, "1.20.4");
     let mods_dir = fixture
         .state
         .instances()

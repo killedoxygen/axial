@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 lzma-rs.workspace = true

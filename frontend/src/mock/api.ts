@@ -165,7 +165,8 @@ const flagOverrides = new Map<string, boolean>();
 
 const FABRIC_COMPONENT_ID = 'net.fabricmc.fabric-loader';
 const MOCK_FABRIC_MC_VERSION = '1.21.5';
-const MOCK_FABRIC_BUILD_ID = 'fabric-loader-0.16.14-1.21.5';
+const MOCK_FABRIC_BUILD_ID = 'fabric:1.21.5:0.16.14';
+const MOCK_FABRIC_VERSION_ID = 'loader-v2-YXhpYWwtaW5zdGFsbGVkLWxvYWRlcgABAAYxLjIxLjUABzAuMTYuMTQ';
 const MOCK_FABRIC_LOADER_VERSION = '0.16.14';
 
 let configFixture: Config = {
@@ -291,14 +292,14 @@ const versionFixtures: Version[] = [
   vanillaVersion('1.21.5', '2025-03-25T12:00:00Z', true),
   vanillaVersion('1.20.1', '2023-06-12T12:00:00Z', true),
   {
-    ...vanillaVersion('fabric-loader-0.16.14-1.21.5', '2025-03-26T12:00:00Z', true),
+    ...vanillaVersion(MOCK_FABRIC_VERSION_ID, '2025-03-26T12:00:00Z', true),
     raw_kind: 'fabric',
     inherits_from: '1.21.5',
     minecraft_meta: minecraftMeta('1.21.5'),
     loader: {
       component_id: 'net.fabricmc.fabric-loader',
       component_name: 'Fabric Loader',
-      build_id: 'fabric-loader-0.16.14-1.21.5',
+      build_id: MOCK_FABRIC_BUILD_ID,
       loader_version: '0.16.14',
       build_meta: {
         terms: ['recommended'],
@@ -329,7 +330,7 @@ const instanceFixtures: EnrichedInstance[] = [
   instanceFixture({
     id: 'mock-fabric-lab',
     name: 'Fabric Lab',
-    version_id: 'fabric-loader-0.16.14-1.21.5',
+    version_id: MOCK_FABRIC_VERSION_ID,
     created_at: '2026-06-20T14:30:00.000Z',
     last_played_at: '2026-07-05T18:05:00.000Z',
     art_seed: 84291,
@@ -646,7 +647,7 @@ function createSelection(selectionId: string): {
     (kind === 'loader_build' && componentId === FABRIC_COMPONENT_ID && value === MOCK_FABRIC_BUILD_ID)
   ) {
     return {
-      versionId: MOCK_FABRIC_BUILD_ID,
+      versionId: MOCK_FABRIC_VERSION_ID,
       versionDisplay: versionDisplay(
         'fabric',
         'Fabric',

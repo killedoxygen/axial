@@ -432,17 +432,30 @@ fn version_metadata_integrity(
             let record = loader_shape
                 .loader_record()
                 .ok_or(KnownGoodInventoryError::LoaderIdentityMismatch)?;
-            if record.version_id != version.id
+            if crate::loaders::api::validate_loader_build_record_identity(record).is_err()
+                || record.version_id != version.id
                 || loader_shape.component() != Some(record.component_id)
                 || !loader_strategy_matches(record.component_id, record.strategy)
             {
                 return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
             }
-            let bytes = serde_json::to_vec_pretty(version)
-                .map_err(|_| KnownGoodInventoryError::MetadataSerialization)?;
+            let bytes = authored_loader_version_bytes(record, version)?;
             Ok(exact_bytes_integrity(&bytes))
         }
     }
+}
+
+fn authored_loader_version_bytes(
+    record: &LoaderBuildRecord,
+    resolved_version: &VersionJson,
+) -> Result<Vec<u8>, KnownGoodInventoryError> {
+    if resolved_version.materialized || !resolved_version.inherits_from.is_empty() {
+        return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
+    }
+    let mut authored = resolved_version.clone();
+    authored.inherits_from = record.minecraft_version.clone();
+    authored.materialized = true;
+    serde_json::to_vec_pretty(&authored).map_err(|_| KnownGoodInventoryError::MetadataSerialization)
 }
 
 fn loader_strategy_matches(component: LoaderComponentId, strategy: LoaderInstallStrategy) -> bool {
@@ -809,6 +822,7 @@ mod tests {
     use crate::loaders::types::LoaderBuildSubjectKind;
     use crate::loaders::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderInstallSource, LoaderInstallability,
+        build_id_for, installed_version_id_for,
     };
     use std::collections::HashMap;
 
@@ -1139,6 +1153,27 @@ mod tests {
     }
 
     #[test]
+    fn noncanonical_loader_version_identity_cannot_mint_inventory() {
+        let mut fixture = fixture(FixtureShape::Fabric, false);
+        fixture.version.id = "noncanonical-loader-id".to_string();
+        fixture.loader_record.as_mut().unwrap().version_id = fixture.version.id.clone();
+
+        let error =
+            derive_known_good_inventory(fixture.input()).expect_err("noncanonical loader identity");
+        assert_eq!(error, KnownGoodInventoryError::LoaderIdentityMismatch);
+    }
+
+    #[test]
+    fn noncanonical_loader_build_identity_cannot_mint_inventory() {
+        let mut fixture = fixture(FixtureShape::Quilt, false);
+        fixture.loader_record.as_mut().unwrap().build_id = "quilt:wrong:identity".to_string();
+
+        let error = derive_known_good_inventory(fixture.input())
+            .expect_err("noncanonical loader build identity");
+        assert_eq!(error, KnownGoodInventoryError::LoaderIdentityMismatch);
+    }
+
+    #[test]
     fn runtime_component_identity_mismatch_fails_closed() {
         let mut fixture = fixture(FixtureShape::Vanilla, false);
         fixture.runtime_id = RuntimeId::from("java-runtime-gamma");
@@ -1271,13 +1306,25 @@ mod tests {
     ) {
         let record = fixture.loader_record.as_ref().unwrap();
         assert_eq!(record.component_id, component);
+        let version_base = &record.version_id;
         let expected = installed_loader_metadata_bytes(record).unwrap();
         assert_entry(
             inventory,
             &KnownGoodRoot::Versions,
-            "fixture-version/.axial-loader.json",
+            &format!("{version_base}/.axial-loader.json"),
             KnownGoodArtifactKind::LoaderMetadata,
             &exact_bytes_integrity(&expected),
+        );
+
+        let authored = authored_loader_version_bytes(record, &fixture.version).unwrap();
+        let resolved = serde_json::to_vec_pretty(&fixture.version).unwrap();
+        assert_ne!(authored, resolved);
+        assert_entry(
+            inventory,
+            &KnownGoodRoot::Versions,
+            &format!("{version_base}/{version_base}.json"),
+            KnownGoodArtifactKind::VersionMetadata,
+            &exact_bytes_integrity(&authored),
         );
     }
 
@@ -1406,9 +1453,17 @@ mod tests {
             libraries.reverse();
             installer_libraries.reverse();
         }
+        let loader_record = shape
+            .component()
+            .map(|component| loader_record(shape, component));
+        let version_id = loader_record
+            .as_ref()
+            .map(|record| record.version_id.clone())
+            .unwrap_or_else(|| "fixture-version".to_string());
         let version = VersionJson {
-            id: "fixture-version".to_string(),
+            id: version_id.clone(),
             inherits_from: String::new(),
+            materialized: false,
             kind: "release".to_string(),
             main_class: "net.minecraft.client.main.Main".to_string(),
             minimum_launcher_version: 0,
@@ -1453,13 +1508,10 @@ mod tests {
         };
         let runtime_manifest_bytes = runtime_manifest_bytes(shuffled);
         let runtime_manifest_expected = expected_for(&runtime_manifest_bytes);
-        let loader_record = shape
-            .component()
-            .map(|component| loader_record(shape, component));
         Fixture {
             version,
             version_manifest: ManifestEntry {
-                id: "fixture-version".to_string(),
+                id: version_id,
                 kind: "release".to_string(),
                 url: "https://example.invalid/version".to_string(),
                 time: String::new(),
@@ -1505,10 +1557,11 @@ mod tests {
             subject_kind: LoaderBuildSubjectKind::LoaderBuild,
             component_id: component,
             component_name: component.display_name().to_string(),
-            build_id: format!("{}-fixture-build", component.short_key()),
+            build_id: build_id_for(component, "1.21.1", "1.0"),
             minecraft_version: "1.21.1".to_string(),
             loader_version: "1.0".to_string(),
-            version_id: "fixture-version".to_string(),
+            version_id: installed_version_id_for(component, "1.21.1", "1.0")
+                .expect("canonical fixture loader version id"),
             build_meta: LoaderBuildMetadata::default(),
             strategy,
             artifact_kind,

@@ -1899,7 +1899,12 @@ async fn create_instance_quilt_java25_default_uses_compatible_beta_fallback() {
 
     assert_eq!(
         created.instance.version_id,
-        "quilt-loader-0.30.0-beta.8-26.1.2"
+        axial_minecraft::installed_version_id_for(
+            axial_minecraft::LoaderComponentId::Quilt,
+            "26.1.2",
+            "0.30.0-beta.8",
+        )
+        .expect("valid Quilt identity")
     );
     let queued = created.queued_install.expect("queued install summary");
     assert_eq!(queued.kind, "loader");
@@ -2515,7 +2520,15 @@ async fn create_instance_loader_selection_resolves_cached_build_and_queues_backe
     .await
     .expect("create and queue loader install");
 
-    assert_eq!(created.instance.version_id, "fabric-loader-0.16.14-1.21.99");
+    assert_eq!(
+        created.instance.version_id,
+        axial_minecraft::installed_version_id_for(
+            axial_minecraft::LoaderComponentId::Fabric,
+            "1.21.99",
+            "0.16.14",
+        )
+        .expect("valid Fabric identity")
+    );
     let queued = created.queued_install.expect("queued install summary");
     assert_eq!(queued.state_id, "install_queued");
     assert_eq!(queued.kind, "loader");
@@ -2642,6 +2655,7 @@ async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
     let remove_game_dir = fixture.state.instances().game_dir(&remove_files.id);
     fs::write(remove_game_dir.join("mods").join("example.jar"), "mod").expect("write mod");
     let known_good_dir = fixture.root.join("config").join("state").join("known-good");
+    fs::create_dir_all(&known_good_dir).expect("create known-good cache directory");
     let remove_known_good = known_good_dir.join(format!("{}.json", remove_files.id));
     fs::write(&remove_known_good, "known-good").expect("write remove-files known-good cache");
 
@@ -2859,9 +2873,10 @@ fn fabric_build_record(
     loader_version: &str,
     default_rank: i32,
 ) -> axial_minecraft::LoaderBuildRecord {
-    let build_id = axial_minecraft::build_id_for(component_id, minecraft_version, loader_version);
     let version_id =
-        axial_minecraft::installed_version_id_for(component_id, minecraft_version, loader_version);
+        axial_minecraft::installed_version_id_for(component_id, minecraft_version, loader_version)
+            .expect("valid loader identity");
+    let build_id = axial_minecraft::build_id_for(component_id, minecraft_version, loader_version);
     axial_minecraft::LoaderBuildRecord {
         subject_kind: axial_minecraft::loaders::types::LoaderBuildSubjectKind::LoaderBuild,
         component_id,
@@ -3241,9 +3256,9 @@ fn write_installed_loader_version(
     minecraft_version: &str,
     loader_version: &str,
 ) {
-    let build_id = axial_minecraft::build_id_for(component_id, minecraft_version, loader_version);
     let version_id =
-        axial_minecraft::installed_version_id_for(component_id, minecraft_version, loader_version);
+        axial_minecraft::installed_version_id_for(component_id, minecraft_version, loader_version)
+            .expect("valid loader identity");
     let version_dir = library_dir.join("versions").join(&version_id);
     fs::create_dir_all(&version_dir).expect("create loader version dir");
     fs::write(
@@ -3253,6 +3268,7 @@ fn write_installed_loader_version(
                 "id": "{version_id}",
                 "type": "release",
                 "inheritsFrom": "{minecraft_version}",
+                "axialMaterialized": true,
                 "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
                 "libraries": []
             }}"#
@@ -3262,13 +3278,10 @@ fn write_installed_loader_version(
     fs::write(
         version_dir.join(".axial-loader.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "component_id": component_id,
-            "component_name": component_id.display_name(),
-            "build_id": build_id,
             "minecraft_version": minecraft_version,
-            "loader_version": loader_version,
-            "build_meta": axial_minecraft::LoaderBuildMetadata::default()
+            "loader_version": loader_version
         }))
         .expect("serialize loader metadata"),
     )
@@ -3378,4 +3391,3 @@ fn test_launch_record(session_id: &str, instance_id: &str) -> LaunchSessionRecor
         stages: Vec::new(),
     }
 }
-    fs::create_dir_all(&known_good_dir).expect("create known-good cache directory");

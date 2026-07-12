@@ -18,9 +18,10 @@ pub use index::{
     resolve_build_record,
 };
 pub(crate) use installed_metadata::{
-    INSTALLED_LOADER_METADATA_SCHEMA_VERSION, InstalledLoaderMetadata,
-    installed_loader_metadata_bytes,
+    InstalledLoaderMetadata, installed_loader_metadata_bytes,
+    materialized_profile_has_valid_provenance,
 };
+pub use installed_metadata::{InstalledLoaderProvenance, validated_installed_loader_provenance};
 pub use types::{
     LOADER_CATALOG_SCHEMA_VERSION, LoaderActiveInstallFailure, LoaderArtifactKind,
     LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState,
@@ -31,10 +32,13 @@ pub use types::{
     LoaderTermEvidence, LoaderTermSource, LoaderVersionIndex,
 };
 
+use crate::artifact_path::MAX_ARTIFACT_PATH_SEGMENT_BYTES;
 use crate::download::DownloadProgress;
 use crate::paths::loader_work_dir;
 use std::fs;
 use std::path::{Component, Path};
+
+pub(crate) const MAX_VERSION_ID_BYTES: usize = MAX_ARTIFACT_PATH_SEGMENT_BYTES - ".json".len();
 
 pub async fn install_build<F>(
     library_dir: &Path,
@@ -44,6 +48,7 @@ pub async fn install_build<F>(
 where
     F: FnMut(DownloadProgress),
 {
+    api::validate_loader_build_record_identity(&record).map_err(LoaderInstallError::from)?;
     validate_version_id(&record.version_id, "loader build version id")
         .map_err(LoaderInstallError::from)?;
     let stage_dir = loader_work_dir(library_dir).join(&record.version_id);
@@ -79,6 +84,12 @@ fn validate_version_id_shape(version_id: &str, context: &str) -> Result<(), Stri
     if version_id != trimmed {
         return Err(format!("{context} contains surrounding whitespace"));
     }
+    if version_id.len() > MAX_VERSION_ID_BYTES {
+        return Err(format!("{context} is too long"));
+    }
+    if version_id.contains(':') || version_id.chars().any(char::is_control) {
+        return Err(format!("{context} is not a portable path segment"));
+    }
     if trimmed.contains(['/', '\\']) {
         return Err(format!("{context} contains path separators"));
     }
@@ -91,7 +102,16 @@ fn validate_version_id_shape(version_id: &str, context: &str) -> Result<(), Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{LoaderError, validate_version_id};
+    use super::{
+        LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderComponentId, LoaderError,
+        LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, MAX_VERSION_ID_BYTES,
+        install_build, installed_version_id_for, validate_version_id,
+    };
+    use crate::loaders::types::LoaderBuildSubjectKind;
+    use crate::paths::loader_work_dir;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn rejects_empty_version_ids() {
@@ -125,5 +145,56 @@ mod tests {
             LoaderError::InstallExecutionFailed(message)
                 if message == "loader build version id contains surrounding whitespace"
         ));
+    }
+
+    #[test]
+    fn rejects_ids_whose_json_filename_exceeds_known_good_segment_limit() {
+        let version_id = "a".repeat(MAX_VERSION_ID_BYTES + 1);
+        let error =
+            validate_version_id(&version_id, "loader build version id").expect_err("oversized id");
+
+        assert!(error.to_string().contains("too long"));
+    }
+
+    #[tokio::test]
+    async fn install_rejects_noncanonical_identity_before_creating_workspace() {
+        let root = temp_library("noncanonical-install-identity");
+        let component_id = LoaderComponentId::Fabric;
+        let version_id = installed_version_id_for(component_id, "1.21.5", "0.16.14")
+            .expect("canonical installed version id");
+        let record = LoaderBuildRecord {
+            subject_kind: LoaderBuildSubjectKind::LoaderBuild,
+            component_id,
+            component_name: component_id.display_name().to_string(),
+            build_id: "fabric:1.21.5:different".to_string(),
+            minecraft_version: "1.21.5".to_string(),
+            loader_version: "0.16.14".to_string(),
+            version_id,
+            build_meta: LoaderBuildMetadata::default(),
+            strategy: LoaderInstallStrategy::FabricProfile,
+            artifact_kind: LoaderArtifactKind::ProfileJson,
+            installability: LoaderInstallability::Installable,
+            install_source: LoaderInstallSource::ProfileJson {
+                url: "https://example.invalid/profile.json".to_string(),
+            },
+        };
+
+        install_build(&root, record, |_| {})
+            .await
+            .expect_err("noncanonical identity");
+
+        assert!(!loader_work_dir(&root).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn temp_library(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "axial-loader-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
     }
 }

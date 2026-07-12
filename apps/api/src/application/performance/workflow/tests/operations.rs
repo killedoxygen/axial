@@ -4,8 +4,9 @@ use crate::state::OperationJournalStoreError;
 #[tokio::test]
 async fn install_target_staging_refreshes_once_cold_and_zero_times_warm() {
     let fixture = TestFixture::new("performance-target-staging-version-index");
-    let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
-    fixture.write_fabric_version("1.20.4-fabric", "1.20.4");
+    let version_id = fabric_version_id("1.20.4");
+    let instance_id = fixture.add_instance("Managed", &version_id);
+    fixture.write_fabric_version(&version_id, "1.20.4");
     let instance = fixture
         .state
         .instances()

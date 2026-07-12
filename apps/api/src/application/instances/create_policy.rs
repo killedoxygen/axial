@@ -296,7 +296,8 @@ mod tests {
         default_rank: i32,
     ) -> LoaderBuildRecord {
         let build_id = build_id_for(component_id, minecraft_version, loader_version);
-        let version_id = installed_version_id_for(component_id, minecraft_version, loader_version);
+        let version_id = installed_version_id_for(component_id, minecraft_version, loader_version)
+            .expect("valid test loader identity");
         LoaderBuildRecord {
             subject_kind: LoaderBuildSubjectKind::LoaderBuild,
             component_id,

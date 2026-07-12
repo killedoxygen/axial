@@ -1,7 +1,9 @@
 use crate::loaders::http::fetch_bytes;
+use crate::loaders::installed_version_id_for;
 use crate::loaders::types::{
-    LoaderBuildMetadata, LoaderError, LoaderSelectionMeta, LoaderSelectionReason,
-    LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
+    LoaderBuildMetadata, LoaderComponentId, LoaderError, LoaderProviderFailureKind,
+    LoaderSelectionMeta, LoaderSelectionReason, LoaderSelectionSource, LoaderTerm,
+    LoaderTermEvidence, LoaderTermSource,
 };
 
 pub const FABRIC_META_BASE: &str = "https://meta.fabricmc.net/v2/versions";
@@ -21,6 +23,39 @@ pub async fn fetch_text(url: &str) -> Result<String, LoaderError> {
         kind: crate::loaders::types::LoaderProviderFailureKind::SchemaInvalid,
         status: None,
     })
+}
+
+pub fn provider_installed_version_id(
+    component_id: LoaderComponentId,
+    minecraft_version: &str,
+    loader_version: &str,
+) -> Result<String, LoaderError> {
+    installed_version_id_for(component_id, minecraft_version, loader_version).map_err(|_| {
+        LoaderError::ProviderDataInvalid {
+            kind: LoaderProviderFailureKind::SchemaInvalid,
+            status: None,
+        }
+    })
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::provider_installed_version_id;
+    use crate::loaders::types::{LoaderComponentId, LoaderError, LoaderProviderFailureKind};
+
+    #[test]
+    fn invalid_provider_coordinate_is_a_schema_failure() {
+        let error = provider_installed_version_id(LoaderComponentId::Fabric, "1.21.1", " invalid")
+            .expect_err("invalid provider coordinate");
+
+        assert!(matches!(
+            error,
+            LoaderError::ProviderDataInvalid {
+                kind: LoaderProviderFailureKind::SchemaInvalid,
+                status: None,
+            }
+        ));
+    }
 }
 
 pub fn parse_maven_versions(xml: &str) -> Vec<String> {

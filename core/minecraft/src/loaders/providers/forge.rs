@@ -2,9 +2,9 @@ use super::common::{
     FORGE_MAVEN_BASE, FORGE_MAVEN_META, FORGE_PROMOTIONS_URL, apply_forge_promotion_selection,
     extract_forge_loader_version, extract_forge_minecraft_version, fetch_text,
     infer_loader_build_metadata, is_prerelease_loader_version, minecraft_version_at_least,
-    parse_maven_versions,
+    parse_maven_versions, provider_installed_version_id,
 };
-use crate::loaders::api::{build_id_for, installed_version_id_for};
+use crate::loaders::api::build_id_for;
 use crate::loaders::http::fetch_json;
 use crate::loaders::types::{
     LoaderArtifactKind, LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId,
@@ -109,7 +109,11 @@ pub async fn fetch_builds(
             build_id: build_id_for(component_id, minecraft_version, &loader_version),
             minecraft_version: minecraft_version.to_string(),
             loader_version: loader_version.clone(),
-            version_id: installed_version_id_for(component_id, minecraft_version, &loader_version),
+            version_id: provider_installed_version_id(
+                component_id,
+                minecraft_version,
+                &loader_version,
+            )?,
             build_meta,
             strategy,
             artifact_kind,

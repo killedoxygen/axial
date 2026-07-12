@@ -15,8 +15,6 @@ use super::validate_version_id;
 pub struct LoaderProfileFragment {
     #[serde(default)]
     pub id: String,
-    #[serde(rename = "inheritsFrom", default)]
-    pub inherits_from: String,
     #[serde(rename = "type", default)]
     pub kind: String,
     #[serde(rename = "mainClass", default)]
@@ -61,7 +59,8 @@ pub fn compose_loader_version(
 
     let mut composed = VersionJson {
         id: version_id.to_string(),
-        inherits_from: String::new(),
+        inherits_from: base_version_id.to_string(),
+        materialized: true,
         kind: if fragment.kind.is_empty() {
             base.kind.clone()
         } else {
@@ -134,6 +133,12 @@ pub async fn write_composed_version(
 ) -> Result<(), LoaderError> {
     validate_version_id(base_version_id, "base minecraft version id")?;
     validate_version_id(version_id, "installed loader version id")?;
+    if version.id != version_id || version.inherits_from != base_version_id || !version.materialized
+    {
+        return Err(LoaderError::InvalidProfile(
+            "composed loader profile identity does not match its install target".to_string(),
+        ));
+    }
     let version_dir = versions_dir(mc_dir).join(version_id);
     async_fs::create_dir_all(&version_dir).await?;
     let marker = version_dir.join(".incomplete");
@@ -229,6 +234,8 @@ mod tests {
     };
     use crate::LoaderError;
     use crate::launch::{AssetIndex, Downloads, JavaVersion, VersionJson, resolve_version};
+    use crate::loaders::installed_metadata::INSTALLED_LOADER_METADATA_SCHEMA_VERSION;
+    use crate::loaders::{LoaderComponentId, installed_version_id_for};
     use crate::paths::create_minecraft_dir;
     use std::fs;
     use std::path::PathBuf;
@@ -243,7 +250,6 @@ mod tests {
             "libraries":[{"name":"net.fabricmc:fabric-loader:0.16.10"}]
         }"#;
         let fragment = serde_json::from_str::<LoaderProfileFragment>(json).expect("fragment");
-        assert_eq!(fragment.inherits_from, "1.21.6");
         assert!(fragment.asset_index.is_none());
     }
 
@@ -278,9 +284,10 @@ mod tests {
         )
         .expect("fragment");
 
+        let version_id = installed_version_id_for(LoaderComponentId::Fabric, "1.21.6", "0.16.10")
+            .expect("canonical installed id");
         let composed =
-            compose_loader_version(&root, "1.21.6", "fabric-loader-0.16.10-1.21.6", &fragment)
-                .expect("compose");
+            compose_loader_version(&root, "1.21.6", &version_id, &fragment).expect("compose");
         assert_eq!(composed.asset_index.id, "1.21.6");
         assert_eq!(
             composed.main_class,
@@ -338,9 +345,10 @@ mod tests {
         )
         .expect("fragment");
 
+        let version_id = installed_version_id_for(LoaderComponentId::Fabric, "1.21.6", "0.16.10")
+            .expect("canonical installed id");
         let composed =
-            compose_loader_version(&root, "1.21.6", "fabric-loader-0.16.10-1.21.6", &fragment)
-                .expect("compose");
+            compose_loader_version(&root, "1.21.6", &version_id, &fragment).expect("compose");
 
         let asm_libraries = composed
             .libraries
@@ -410,6 +418,7 @@ mod tests {
         let version = VersionJson {
             id: "loader-test".to_string(),
             inherits_from: String::new(),
+            materialized: false,
             kind: String::new(),
             main_class: String::new(),
             minimum_launcher_version: 0,
@@ -441,7 +450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_composed_version_keeps_resolved_loader_launch_model_standalone() {
+    async fn write_composed_version_declares_parent_without_remerging_it() {
         let root = temp_dir("write-composed-version-standalone");
         create_minecraft_dir(&root).expect("library");
         let base_dir = root.join("versions").join("1.21.6");
@@ -479,25 +488,39 @@ mod tests {
         )
         .expect("fragment");
 
-        let version_id = "fabric-loader-0.16.10-1.21.6";
-        let composed = compose_loader_version(&root, "1.21.6", version_id, &fragment)
+        let version_id = installed_version_id_for(LoaderComponentId::Fabric, "1.21.6", "0.16.10")
+            .expect("canonical installed version id");
+        let composed = compose_loader_version(&root, "1.21.6", &version_id, &fragment)
             .expect("compose loader version");
-        write_composed_version(&root, version_id, &composed, "1.21.6")
+        write_composed_version(&root, &version_id, &composed, "1.21.6")
             .await
             .expect("write composed version");
+        fs::write(
+            root.join("versions")
+                .join(&version_id)
+                .join(".axial-loader.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": INSTALLED_LOADER_METADATA_SCHEMA_VERSION,
+                "component_id": LoaderComponentId::Fabric,
+                "minecraft_version": "1.21.6",
+                "loader_version": "0.16.10"
+            }))
+            .expect("serialize installed loader metadata"),
+        )
+        .expect("write installed loader metadata");
 
         let written_json = fs::read_to_string(
             root.join("versions")
-                .join(version_id)
+                .join(&version_id)
                 .join(format!("{version_id}.json")),
         )
         .expect("read written json");
-        assert!(
-            !written_json.contains("inheritsFrom"),
-            "composed loader JSON must not re-inherit its already merged parent"
-        );
+        let written: serde_json::Value =
+            serde_json::from_str(&written_json).expect("parse written json");
+        assert_eq!(written["inheritsFrom"], "1.21.6");
+        assert_eq!(written["axialMaterialized"], true);
 
-        let resolved = resolve_version(&root, version_id).expect("resolve written loader version");
+        let resolved = resolve_version(&root, &version_id).expect("resolve written loader version");
         assert!(resolved.inherits_from.is_empty());
         let arguments = resolved.arguments.expect("resolved arguments");
         assert_eq!(count_arg_value(&arguments.jvm, "-cp"), 1);

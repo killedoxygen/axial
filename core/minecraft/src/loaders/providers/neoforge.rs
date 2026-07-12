@@ -1,9 +1,10 @@
 use super::common::{
     NEOFORGE_MAVEN_BASE, NEOFORGE_MAVEN_META, fetch_text, infer_loader_build_metadata,
     is_prerelease_loader_version, neoforge_to_minecraft_version, parse_maven_versions,
+    provider_installed_version_id,
 };
 use crate::lifecycle::LifecycleMeta;
-use crate::loaders::api::{build_id_for, installed_version_id_for};
+use crate::loaders::api::build_id_for;
 use crate::loaders::types::{
     LoaderArtifactKind, LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId,
     LoaderGameVersion, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
@@ -67,7 +68,7 @@ pub async fn fetch_builds(
             build_id: build_id_for(component_id, minecraft_version, &entry),
             minecraft_version: minecraft_version.to_string(),
             loader_version: entry.clone(),
-            version_id: installed_version_id_for(component_id, minecraft_version, &entry),
+            version_id: provider_installed_version_id(component_id, minecraft_version, &entry)?,
             build_meta: infer_loader_build_metadata(&entry, &[], false, false, Some(!prerelease)),
             strategy: LoaderInstallStrategy::NeoForgeModern,
             artifact_kind: LoaderArtifactKind::InstallerJar,

@@ -1417,6 +1417,7 @@ mod tests {
         OverrideOrigin, SessionId,
     };
     use axial_performance::PerformanceManager;
+    use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -1427,7 +1428,8 @@ mod tests {
     const TEST_TELEMETRY_INSTALL_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
     const TEST_TELEMETRY_KEY: &str = "phc_test";
     const CRASH_E2E_INSTANCE_ID: &str = "0123456789abcdef";
-    const CRASH_E2E_FABRIC_VERSION_ID: &str = "fabric-loader-0.16.10-1.21.1";
+    const CRASH_E2E_FABRIC_VERSION_ID: &str =
+        "loader-v2-YXhpYWwtaW5zdGFsbGVkLWxvYWRlcgABAAYxLjIxLjEABzAuMTYuMTA";
 
     fn empty_guardian_summary(mode: axial_launcher::GuardianMode) -> GuardianSummary {
         guardian_summary_for_test(
@@ -3189,6 +3191,36 @@ exit 1
 
     #[cfg(unix)]
     fn write_fabric_crash_install(root: &Path) {
+        let library_specs = [
+            (
+                "net.fabricmc:fabric-loader:0.16.10",
+                "net/fabricmc/fabric-loader/0.16.10/fabric-loader-0.16.10.jar",
+            ),
+            (
+                "net.fabricmc:intermediary:1.21.1",
+                "net/fabricmc/intermediary/1.21.1/intermediary-1.21.1.jar",
+            ),
+        ];
+        let libraries = library_specs
+            .into_iter()
+            .map(|(name, relative_path)| {
+                let path = root.join("library").join("libraries").join(relative_path);
+                fs::create_dir_all(path.parent().expect("Fabric library parent"))
+                    .expect("Fabric library directory");
+                write_readable_test_jar(&path);
+                let bytes = fs::read(path).expect("read Fabric crash fixture library");
+                serde_json::json!({
+                    "name": name,
+                    "downloads": {
+                        "artifact": {
+                            "path": relative_path,
+                            "sha1": hex::encode(Sha1::digest(&bytes)),
+                            "size": bytes.len()
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
         let version_dir = root
             .join("library")
             .join("versions")
@@ -3199,18 +3231,12 @@ exit 1
             serde_json::to_vec(&serde_json::json!({
                 "id": CRASH_E2E_FABRIC_VERSION_ID,
                 "inheritsFrom": "1.21.1",
+                "axialMaterialized": true,
                 "type": "release",
                 "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
                 "assetIndex": {},
                 "arguments": { "jvm": [], "game": [] },
-                "libraries": [
-                    {
-                        "name": "net.fabricmc:fabric-loader:0.16.10"
-                    },
-                    {
-                        "name": "net.fabricmc:intermediary:1.21.1"
-                    }
-                ]
+                "libraries": libraries
             }))
             .expect("encode Fabric crash fixture version"),
         )
@@ -3218,27 +3244,14 @@ exit 1
         fs::write(
             version_dir.join(".axial-loader.json"),
             serde_json::to_vec(&serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "component_id": "net.fabricmc.fabric-loader",
-                "component_name": "Fabric",
-                "build_id": "fabric:1.21.1:0.16.10",
                 "minecraft_version": "1.21.1",
-                "loader_version": "0.16.10",
-                "build_meta": {}
+                "loader_version": "0.16.10"
             }))
             .expect("encode Fabric crash fixture metadata"),
         )
         .expect("write Fabric crash fixture metadata");
-
-        for relative_path in [
-            "net/fabricmc/fabric-loader/0.16.10/fabric-loader-0.16.10.jar",
-            "net/fabricmc/intermediary/1.21.1/intermediary-1.21.1.jar",
-        ] {
-            let path = root.join("library").join("libraries").join(relative_path);
-            fs::create_dir_all(path.parent().expect("Fabric library parent"))
-                .expect("Fabric library directory");
-            write_readable_test_jar(&path);
-        }
     }
 
     #[cfg(unix)]

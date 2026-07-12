@@ -1,5 +1,5 @@
 use crate::launch::{Downloads, JavaVersion, effective_java_version_for};
-use crate::loaders::{INSTALLED_LOADER_METADATA_SCHEMA_VERSION, InstalledLoaderMetadata};
+use crate::loaders::InstalledLoaderMetadata;
 use crate::paths::versions_dir;
 use crate::types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 use crate::version_meta::{analyze_minecraft_version, compare_version_entries};
@@ -275,12 +275,16 @@ pub struct ResolvedVersion {
 
 #[derive(Debug, Clone, Deserialize)]
 struct VersionStub {
+    #[serde(default)]
+    id: String,
     #[serde(rename = "type", default)]
     kind: String,
     #[serde(rename = "releaseTime", default)]
     release_time: String,
     #[serde(rename = "inheritsFrom", default)]
     inherits_from: String,
+    #[serde(rename = "axialMaterialized", default)]
+    materialized: bool,
     #[serde(rename = "javaVersion", default)]
     java_version: Option<JavaVersion>,
     #[serde(default)]
@@ -383,10 +387,21 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
                 continue;
             }
         };
-        match read_installed_loader_metadata(&entry_path, &mut dependencies) {
+        match read_installed_loader_metadata(
+            &entry_path,
+            &id,
+            &stub.id,
+            &stub.inherits_from,
+            stub.materialized,
+            &mut dependencies,
+        ) {
             LoaderMetadataScan::Ready(metadata) => {
                 loader_metadata.insert(id.clone(), metadata);
             }
+            LoaderMetadataScan::Missing if stub.materialized => issues.push(version_scan_issue(
+                VersionScanIssueKind::LoaderMetadataMalformed,
+                Some(id.clone()),
+            )),
             LoaderMetadataScan::Missing => {}
             LoaderMetadataScan::Unreadable => issues.push(version_scan_issue(
                 VersionScanIssueKind::LoaderMetadataUnreadable,
@@ -403,11 +418,11 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
     let mut versions = Vec::new();
     for (id, stub) in &stubs {
         let metadata = loader_metadata.get(id);
-        let effective_parent = effective_parent_version(&stub.inherits_from, metadata);
+        let effective_parent = stub.inherits_from.clone();
         let jar_path = versions_dir.join(id).join(format!("{id}.jar"));
         let incomplete_marker = versions_dir.join(id).join(".incomplete");
 
-        let resolved_java = resolve_java_version(id, &stubs, &loader_metadata);
+        let resolved_java = resolve_java_version(id, &stubs);
         let incomplete = dependencies.exists(&incomplete_marker);
         let (launchable, status, status_detail, needs_install) = if incomplete {
             (
@@ -535,11 +550,7 @@ fn finish_scan_snapshot(
     }
 }
 
-fn resolve_java_version(
-    id: &str,
-    stubs: &HashMap<String, VersionStub>,
-    loader_metadata: &HashMap<String, InstalledLoaderMetadata>,
-) -> JavaVersion {
+fn resolve_java_version(id: &str, stubs: &HashMap<String, VersionStub>) -> JavaVersion {
     let mut current_id = id.to_string();
     let mut current = stubs.get(&current_id);
     let mut fallback_parent = String::new();
@@ -547,8 +558,7 @@ fn resolve_java_version(
         if let Some(java_version) = &stub.java_version {
             return effective_java_version_for(&current_id, &stub.kind, java_version);
         }
-        let next_parent =
-            effective_parent_version(&stub.inherits_from, loader_metadata.get(&current_id));
+        let next_parent = stub.inherits_from.clone();
         if next_parent.is_empty() {
             break;
         }
@@ -581,19 +591,6 @@ fn resolve_java_version(
     effective_java_version_for(inference_id, raw_kind, &JavaVersion::default())
 }
 
-fn effective_parent_version(
-    declared_parent: &str,
-    metadata: Option<&InstalledLoaderMetadata>,
-) -> String {
-    if !declared_parent.trim().is_empty() {
-        return declared_parent.to_string();
-    }
-    metadata
-        .map(|metadata| metadata.minecraft_version.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_default()
-}
-
 enum LoaderMetadataScan {
     Ready(InstalledLoaderMetadata),
     Missing,
@@ -603,6 +600,10 @@ enum LoaderMetadataScan {
 
 fn read_installed_loader_metadata(
     version_dir: &Path,
+    installed_version_id: &str,
+    profile_id: &str,
+    declared_parent: &str,
+    materialized: bool,
     dependencies: &mut DependencyTracker,
 ) -> LoaderMetadataScan {
     let path = version_dir.join(LOADER_METADATA_FILE);
@@ -617,11 +618,12 @@ fn read_installed_loader_metadata(
     let Ok(metadata) = serde_json::from_slice::<InstalledLoaderMetadata>(&data) else {
         return LoaderMetadataScan::Malformed;
     };
-    if metadata.schema_version != INSTALLED_LOADER_METADATA_SCHEMA_VERSION
-        || metadata.build_id.trim().is_empty()
-        || metadata.minecraft_version.trim().is_empty()
-        || metadata.loader_version.trim().is_empty()
-    {
+    if !metadata.is_valid_for_profile(
+        installed_version_id,
+        profile_id,
+        declared_parent,
+        materialized,
+    ) {
         return LoaderMetadataScan::Malformed;
     }
     LoaderMetadataScan::Ready(metadata)
@@ -630,14 +632,14 @@ fn read_installed_loader_metadata(
 fn loader_attachment_from_metadata(metadata: &InstalledLoaderMetadata) -> VersionLoaderAttachment {
     VersionLoaderAttachment {
         component_id: metadata.component_id,
-        component_name: if metadata.component_name.trim().is_empty() {
-            metadata.component_id.display_name().to_string()
-        } else {
-            metadata.component_name.clone()
-        },
-        build_id: metadata.build_id.clone(),
+        component_name: metadata.component_id.display_name().to_string(),
+        build_id: crate::loaders::build_id_for(
+            metadata.component_id,
+            &metadata.minecraft_version,
+            &metadata.loader_version,
+        ),
         loader_version: metadata.loader_version.clone(),
-        build_meta: metadata.build_meta.clone(),
+        build_meta: metadata.display_metadata(),
     }
 }
 
@@ -648,28 +650,30 @@ fn version_scan_issue(kind: VersionScanIssueKind, version_id: Option<String>) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        INSTALLED_LOADER_METADATA_SCHEMA_VERSION, InstalledLoaderMetadata, VersionScanIssueKind,
-        VersionScanState, VersionStub, resolve_java_version, scan_versions, scan_versions_report,
+        InstalledLoaderMetadata, VersionScanIssueKind, VersionScanState, VersionStub,
+        resolve_java_version, scan_versions, scan_versions_report,
     };
     use crate::launch::{Downloads, JavaVersion};
-    use crate::loaders::types::{
-        LoaderBuildMetadata, LoaderComponentId, LoaderSelectionMeta, LoaderSelectionReason,
-        LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
-    };
+    use crate::loaders::installed_version_id_for;
+    use crate::loaders::types::{LoaderComponentId, LoaderSelectionReason, LoaderTerm};
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn resolve_java_version_follows_metadata_parent_chain_for_loader_versions() {
+    fn resolve_java_version_follows_declared_parent_chain_for_loader_versions() {
+        let loader_id = installed_version_id_for(LoaderComponentId::Fabric, "1.20.1", "0.14.21")
+            .expect("valid loader identity");
         let mut stubs = HashMap::new();
         stubs.insert(
-            "fabric-loader-0.14.21-1.20.1".to_string(),
+            loader_id.clone(),
             VersionStub {
+                id: loader_id.clone(),
                 kind: "release".to_string(),
                 release_time: String::new(),
-                inherits_from: String::new(),
+                inherits_from: "1.20.1".to_string(),
+                materialized: true,
                 java_version: None,
                 downloads: Downloads::default(),
             },
@@ -677,9 +681,11 @@ mod tests {
         stubs.insert(
             "1.20.1".to_string(),
             VersionStub {
+                id: "1.20.1".to_string(),
                 kind: "release".to_string(),
                 release_time: String::new(),
                 inherits_from: String::new(),
+                materialized: false,
                 java_version: Some(JavaVersion {
                     component: "java-runtime-gamma".to_string(),
                     major_version: 17,
@@ -687,13 +693,7 @@ mod tests {
                 downloads: Downloads::default(),
             },
         );
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            "fabric-loader-0.14.21-1.20.1".to_string(),
-            test_loader_metadata(LoaderComponentId::Fabric, "1.20.1", "0.14.21"),
-        );
-
-        let resolved = resolve_java_version("fabric-loader-0.14.21-1.20.1", &stubs, &metadata);
+        let resolved = resolve_java_version(&loader_id, &stubs);
 
         assert_eq!(resolved.component, "java-runtime-gamma");
         assert_eq!(resolved.major_version, 17);
@@ -703,12 +703,13 @@ mod tests {
     fn scan_versions_marks_missing_parent_as_install_target() {
         let mc_dir = unique_test_dir("missing-parent-install-target");
         let versions_dir = mc_dir.join("versions");
-        let child_dir = versions_dir.join("fabric-loader-0.14.21-1.20.1");
+        let child_id = "custom-child";
+        let child_dir = versions_dir.join(child_id);
         fs::create_dir_all(&child_dir).expect("create child version dir");
         fs::write(
-            child_dir.join("fabric-loader-0.14.21-1.20.1.json"),
+            child_dir.join(format!("{child_id}.json")),
             r#"{
-                "id":"fabric-loader-0.14.21-1.20.1",
+                "id":"custom-child",
                 "inheritsFrom":"1.20.1",
                 "type":"release"
             }"#,
@@ -718,7 +719,7 @@ mod tests {
         let versions = scan_versions(&mc_dir).expect("scan versions");
         let version = versions
             .iter()
-            .find(|entry| entry.id == "fabric-loader-0.14.21-1.20.1")
+            .find(|entry| entry.id == child_id)
             .expect("child version exists");
 
         assert_eq!(version.status, "incomplete");
@@ -799,43 +800,28 @@ mod tests {
     }
 
     #[test]
-    fn scan_versions_reads_loader_lifecycle_from_installed_metadata() {
+    fn scan_versions_derives_loader_lifecycle_from_immutable_provenance() {
         let mc_dir = unique_test_dir("loader-lifecycle-metadata");
         let versions_dir = mc_dir.join("versions");
-        let forge_dir = versions_dir.join("26.1.2-forge-64.0.4");
+        let version_id =
+            installed_version_id_for(LoaderComponentId::Forge, "26.1.2", "64.0.4-beta")
+                .expect("valid loader identity");
+        let forge_dir = versions_dir.join(&version_id);
         fs::create_dir_all(&forge_dir).expect("create forge version dir");
         fs::write(
-            forge_dir.join("26.1.2-forge-64.0.4.json"),
-            r#"{
-                "id":"26.1.2-forge-64.0.4",
+            forge_dir.join(format!("{version_id}.json")),
+            format!(
+                r#"{{
+                "id":"{version_id}",
                 "inheritsFrom":"26.1.2",
+                "axialMaterialized":true,
                 "type":"release"
-            }"#,
+            }}"#
+            ),
         )
         .expect("write forge json");
 
-        let metadata = InstalledLoaderMetadata {
-            build_meta: LoaderBuildMetadata {
-                terms: vec![LoaderTerm::Beta, LoaderTerm::Latest],
-                evidence: vec![
-                    LoaderTermEvidence {
-                        term: LoaderTerm::Beta,
-                        source: LoaderTermSource::ExplicitVersionLabel,
-                    },
-                    LoaderTermEvidence {
-                        term: LoaderTerm::Latest,
-                        source: LoaderTermSource::PromotionMarker,
-                    },
-                ],
-                selection: LoaderSelectionMeta {
-                    default_rank: 650,
-                    reason: LoaderSelectionReason::LatestUnstable,
-                    source: LoaderSelectionSource::AbsenceOfRecommended,
-                },
-                display_tags: vec!["latest".to_string(), "beta".to_string()],
-            },
-            ..test_loader_metadata(LoaderComponentId::Forge, "26.1.2", "64.0.4")
-        };
+        let metadata = test_loader_metadata(LoaderComponentId::Forge, "26.1.2", "64.0.4-beta");
         fs::write(
             forge_dir.join(".axial-loader.json"),
             serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
@@ -845,17 +831,18 @@ mod tests {
         let versions = scan_versions(&mc_dir).expect("scan versions");
         let version = versions
             .iter()
-            .find(|entry| entry.id == "26.1.2-forge-64.0.4")
+            .find(|entry| entry.id == version_id)
             .expect("forge version exists");
 
         let loader = version.loader.as_ref().expect("loader lifecycle exists");
         assert_eq!(loader.component_id, LoaderComponentId::Forge);
-        assert_eq!(loader.loader_version, "64.0.4");
+        assert_eq!(loader.loader_version, "64.0.4-beta");
         assert!(loader.build_meta.terms.contains(&LoaderTerm::Beta));
         assert_eq!(
             loader.build_meta.selection.reason,
-            LoaderSelectionReason::LatestUnstable
+            LoaderSelectionReason::Unstable
         );
+        assert_eq!(loader.build_meta.display_tags, vec!["beta"]);
 
         fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
     }
@@ -879,15 +866,21 @@ mod tests {
         .expect("write base json");
         fs::write(base_dir.join("1.21.5.jar"), b"client").expect("write base jar");
 
-        let fabric_dir = versions_dir.join("fabric-loader-0.19.3-1.21.5");
+        let version_id = installed_version_id_for(LoaderComponentId::Fabric, "1.21.5", "0.19.3")
+            .expect("valid loader identity");
+        let fabric_dir = versions_dir.join(&version_id);
         fs::create_dir_all(&fabric_dir).expect("create fabric version dir");
         fs::write(
-            fabric_dir.join("fabric-loader-0.19.3-1.21.5.json"),
-            r#"{
-                "id":"fabric-loader-0.19.3-1.21.5",
+            fabric_dir.join(format!("{version_id}.json")),
+            format!(
+                r#"{{
+                "id":"{version_id}",
+                "inheritsFrom":"1.21.5",
+                "axialMaterialized":true,
                 "mainClass":"net.fabricmc.loader.impl.launch.knot.KnotClient",
                 "libraries":[]
-            }"#,
+            }}"#
+            ),
         )
         .expect("write fabric json");
         fs::write(
@@ -904,7 +897,7 @@ mod tests {
         let versions = scan_versions(&mc_dir).expect("scan versions");
         let version = versions
             .iter()
-            .find(|entry| entry.id == "fabric-loader-0.19.3-1.21.5")
+            .find(|entry| entry.id == version_id)
             .expect("fabric version exists");
 
         assert_eq!(version.inherits_from, "1.21.5");
@@ -916,24 +909,62 @@ mod tests {
         fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
     }
 
+    #[test]
+    fn scan_versions_rejects_loader_metadata_for_a_different_declared_parent() {
+        let mc_dir = unique_test_dir("loader-parent-mismatch");
+        let version_id = installed_version_id_for(LoaderComponentId::NeoForge, "1.21.5", "21.5.75")
+            .expect("valid loader identity");
+        let version_dir = mc_dir.join("versions").join(&version_id);
+        fs::create_dir_all(&version_dir).expect("create loader version dir");
+        fs::write(
+            version_dir.join(format!("{version_id}.json")),
+            format!(
+                r#"{{
+                    "id":"{version_id}",
+                    "inheritsFrom":"1.21.4",
+                    "axialMaterialized":true,
+                    "type":"release"
+                }}"#
+            ),
+        )
+        .expect("write loader json");
+        fs::write(
+            version_dir.join(".axial-loader.json"),
+            serde_json::to_vec_pretty(&test_loader_metadata(
+                LoaderComponentId::NeoForge,
+                "1.21.5",
+                "21.5.75",
+            ))
+            .expect("serialize metadata"),
+        )
+        .expect("write loader metadata");
+
+        let report = scan_versions_report(&mc_dir).expect("scan versions");
+        let version = report
+            .versions
+            .iter()
+            .find(|entry| entry.id == version_id)
+            .expect("loader version exists");
+
+        assert!(version.loader.is_none());
+        assert!(report.issues.iter().any(|issue| {
+            issue.kind == VersionScanIssueKind::LoaderMetadataMalformed
+                && issue.version_id.as_deref() == Some(version_id.as_str())
+        }));
+
+        fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
+    }
+
     fn test_loader_metadata(
         component_id: LoaderComponentId,
         minecraft_version: &str,
         loader_version: &str,
     ) -> InstalledLoaderMetadata {
         InstalledLoaderMetadata {
-            schema_version: INSTALLED_LOADER_METADATA_SCHEMA_VERSION,
+            schema_version: 2,
             component_id,
-            component_name: component_id.display_name().to_string(),
-            build_id: format!(
-                "{}:{}:{}",
-                component_id.short_key(),
-                minecraft_version,
-                loader_version
-            ),
             minecraft_version: minecraft_version.to_string(),
             loader_version: loader_version.to_string(),
-            build_meta: LoaderBuildMetadata::default(),
         }
     }
 

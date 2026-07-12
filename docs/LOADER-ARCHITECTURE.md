@@ -61,6 +61,8 @@ Important fields:
 
 `version_id` is the installed local version id written into `versions/`.
 
+Installed loader ids use a current-only `loader-v2-<base64url>` encoding. The encoded payload contains a domain/version marker, an explicit component byte, and length-prefixed exact UTF-8 Minecraft and loader versions. Construction is fallible: empty, non-canonical, control-bearing, or filesystem-oversized coordinates are rejected. The 123-byte id ceiling is shared with the known-good 128-byte path-segment ceiling so `<id>.json` is always representable. Every component, including NeoForge, is bound to both the Minecraft target and loader version. Code recomputes this identity; it does not parse the display shape as authority and there are no compatibility ids.
+
 ## Loader build metadata
 
 Loader builds use `LoaderBuildMetadata`, not generic `LifecycleMeta`.
@@ -178,7 +180,7 @@ Responsibility:
 - choose behavior from `LoaderInstallStrategy`
 - keep loader-family and era-specific work local to the selected strategy
 
-Profile-based loaders, currently Fabric and Quilt, download libraries declared by trusted upstream profile JSON. Those profile libraries may omit SHA-1 metadata. The loader strategy passes an explicit checksumless planning policy only at its typed install boundary; vanilla planning stays strict, and no provider-serializable field can grant that authority. Missing-checksum `.jar` profile libraries are not trusted solely because a file exists: existing and freshly downloaded jars must be structurally readable so stale bad cache entries are replaced. Later launch readiness permits the same structural contract only when the installed version has valid launcher-authored loader metadata; malformed or absent metadata restores strict checksum handling. Loader strategies also validate base Minecraft dependencies before treating a base version as already installed: the base JSON, client jar, incomplete marker, and selected base libraries must be ready so a partially-installed vanilla base cannot produce a finalized loader profile with missing inherited libraries.
+Profile-based loaders, currently Fabric and Quilt, download libraries declared by trusted upstream profile JSON. Those profile libraries may omit SHA-1 metadata. The loader strategy passes an explicit checksumless planning policy only at its typed install boundary; vanilla planning and launch readiness stay strict, and no provider payload or mutable installed metadata can grant checksum authority. Missing-checksum `.jar` profile libraries are not trusted solely because a file exists: existing and freshly downloaded jars must be structurally readable so stale bad cache entries are replaced. R1 currently has a temporary wiring gap: strict readiness blocks checksumless loader libraries until the sealed known-good inventory authorizes their exact paths and structural integrity contracts. `.axial-loader.json` never grants that authority. Loader strategies also validate base Minecraft dependencies before treating a base version as already installed: the base JSON, client jar, incomplete marker, and selected base libraries must be ready so a partially-installed vanilla base cannot produce a finalized loader profile with missing inherited libraries.
 
 ### 4. Helper layers
 
@@ -254,6 +256,14 @@ Route code does not inspect raw upstream payloads.
 
 ## Installed versions
 
+An installed loader profile is a materialized launch model that still declares its exact base through `inheritsFrom`. `axialMaterialized = true` is honored only when the strict current sidecar validates; it is not standalone authority. Install writes the sidecar while the directory is still incomplete and before verification, so any failed validation removes the incomplete install. The scanner attaches loader identity only when all of these agree exactly:
+
+- the version directory and profile id equal the recomputed `loader-v2` id
+- `.axial-loader.json` is the private current schema and contains only component id, Minecraft target, and loader version
+- the profile's declared `inheritsFrom` equals the metadata Minecraft target
+
+Metadata with an old shape, extra fields, a mismatched target, a false materialized marker, or an unrelated folder/profile id is malformed and grants no loader attachment. Materialized resolution also fails closed when that provenance is absent or invalid. Display metadata and `build_id` are derived locally; they are not persisted as mutable provenance. Core exposes a read-only validated provenance query for base-version policy such as legacy Forge signature checks; it grants no checksum authority.
+
 When a loader build is installed, the resulting `VersionEntry` carries:
 
 - Minecraft `minecraft_meta`
@@ -270,9 +280,9 @@ The loader attachment carries:
 
 That keeps Minecraft-version lifecycle and loader-build terms separate in the UI.
 
-Install strategies also write `versions/<id>/.axial-loader.json` beside the composed version JSON. Version scanning reads that file as the authoritative installed-loader attachment source, so routes do not infer loader identity, Minecraft version, or loader version from composite local version ids.
+Install strategies also write `versions/<id>/.axial-loader.json` beside the composed version JSON. Version scanning reads that file as the authoritative installed-loader attachment source, so routes do not infer loader identity, Minecraft version, or loader version from opaque local version ids.
 
-The installed-version scanner also anchors Minecraft metadata for loader versions to the inherited/base Minecraft id from the version JSON or `.axial-loader.json`. Composite loader ids remain install identities, not Minecraft-version labels or lifecycle inputs.
+The installed-version scanner anchors Minecraft metadata for loader versions to the exact inherited/base Minecraft id declared by the version JSON and validated by `.axial-loader.json`. Opaque loader ids remain install identities, not Minecraft-version labels or lifecycle inputs.
 
 ## Maintenance rules
 

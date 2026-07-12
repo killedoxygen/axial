@@ -1,6 +1,6 @@
-use super::common::{FABRIC_META_BASE, infer_loader_build_metadata};
+use super::common::{FABRIC_META_BASE, infer_loader_build_metadata, provider_installed_version_id};
 use crate::lifecycle::LifecycleMeta;
-use crate::loaders::api::{build_id_for, installed_version_id_for};
+use crate::loaders::api::build_id_for;
 use crate::loaders::http::fetch_json;
 use crate::loaders::types::{
     LoaderArtifactKind, LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId,
@@ -57,35 +57,38 @@ pub async fn fetch_builds(
         component_id,
         builds: raw
             .into_iter()
-            .map(|entry| LoaderBuildRecord {
-                subject_kind: LoaderBuildSubjectKind::LoaderBuild,
-                component_id,
-                component_name: component_id.display_name().to_string(),
-                build_id: build_id_for(component_id, minecraft_version, &entry.loader.version),
-                minecraft_version: minecraft_version.to_string(),
-                loader_version: entry.loader.version.clone(),
-                version_id: installed_version_id_for(
+            .map(|entry| {
+                let version_id = provider_installed_version_id(
                     component_id,
                     minecraft_version,
                     &entry.loader.version,
-                ),
-                build_meta: infer_loader_build_metadata(
-                    &entry.loader.version,
-                    &[],
-                    false,
-                    false,
-                    Some(entry.loader.stable),
-                ),
-                strategy: LoaderInstallStrategy::FabricProfile,
-                artifact_kind: LoaderArtifactKind::ProfileJson,
-                installability: LoaderInstallability::Installable,
-                install_source: LoaderInstallSource::ProfileJson {
-                    url: format!(
-                        "{FABRIC_META_BASE}/loader/{minecraft_version}/{}/profile/json",
-                        entry.loader.version
+                )?;
+                Ok(LoaderBuildRecord {
+                    subject_kind: LoaderBuildSubjectKind::LoaderBuild,
+                    component_id,
+                    component_name: component_id.display_name().to_string(),
+                    build_id: build_id_for(component_id, minecraft_version, &entry.loader.version),
+                    minecraft_version: minecraft_version.to_string(),
+                    loader_version: entry.loader.version.clone(),
+                    version_id,
+                    build_meta: infer_loader_build_metadata(
+                        &entry.loader.version,
+                        &[],
+                        false,
+                        false,
+                        Some(entry.loader.stable),
                     ),
-                },
+                    strategy: LoaderInstallStrategy::FabricProfile,
+                    artifact_kind: LoaderArtifactKind::ProfileJson,
+                    installability: LoaderInstallability::Installable,
+                    install_source: LoaderInstallSource::ProfileJson {
+                        url: format!(
+                            "{FABRIC_META_BASE}/loader/{minecraft_version}/{}/profile/json",
+                            entry.loader.version
+                        ),
+                    },
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, crate::loaders::types::LoaderError>>()?,
     })
 }
