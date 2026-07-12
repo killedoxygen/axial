@@ -885,16 +885,16 @@ pub(crate) fn guardian_summary_with_intervention(
     silent: bool,
 ) -> GuardianSummary {
     let mut details = Vec::new();
-    for detail in &current.details {
-        if !current.guidance.iter().any(|guidance| guidance == detail) {
+    for intervention in &current.interventions {
+        if !intervention.silent.unwrap_or(false)
+            && let Some(detail) = &intervention.public_detail
+        {
             push_unique_copy_line(&mut details, detail);
         }
     }
+    let public_detail = guardian_intervention_public_detail(directive);
     if !silent {
-        push_unique_copy_line(
-            &mut details,
-            &guardian_intervention_public_detail(directive),
-        );
+        push_unique_copy_line(&mut details, &public_detail);
     }
     for detail in &current.guidance {
         push_unique_copy_line(&mut details, detail);
@@ -908,6 +908,7 @@ pub(crate) fn guardian_summary_with_intervention(
     interventions.push(GuardianIntervention {
         kind: guardian_intervention_kind(directive),
         detail: Some(guardian_directive_description(directive)),
+        public_detail: Some(public_detail),
         silent: Some(silent),
     });
     GuardianSummary {
@@ -3336,6 +3337,10 @@ mod tests {
             assert_eq!(summary.interventions.len(), 1);
             assert_eq!(summary.interventions[0].kind, kind);
             assert_eq!(summary.interventions[0].detail.as_deref(), Some(raw_detail));
+            assert_eq!(
+                summary.interventions[0].public_detail.as_deref(),
+                Some(public_detail)
+            );
             assert_eq!(summary.interventions[0].silent, Some(false));
         }
     }
@@ -3371,6 +3376,42 @@ mod tests {
         assert_eq!(
             silent.interventions[0].detail.as_deref(),
             Some("Guardian switched to managed Java before launch")
+        );
+        assert_eq!(
+            silent.interventions[0].public_detail.as_deref(),
+            Some("Guardian used the managed Java runtime for this launch.")
+        );
+    }
+
+    #[test]
+    fn intervention_projection_discards_unrepresented_details_before_bounded_composition() {
+        let mut current = warning_summary();
+        current.details = vec![
+            "Runtime repair-only detail one.".to_string(),
+            "Runtime repair-only detail two.".to_string(),
+            "Runtime repair-only detail three.".to_string(),
+            "Runtime repair-only detail four.".to_string(),
+            "Runtime repair-only detail five.".to_string(),
+            "Runtime repair-only detail six.".to_string(),
+        ];
+        let directive = crate::guardian::GuardianDirective::StripJvmArgs {
+            reason: GuardianStripJvmArgsReason::PrepareFailure,
+        };
+
+        let projected = super::guardian_summary_with_intervention(&current, &directive, false);
+
+        assert_eq!(
+            projected.details,
+            [
+                "Explicit JVM args were removed before launch because they were incompatible.",
+                "Keep existing launch guidance.",
+            ]
+        );
+        assert!(
+            projected
+                .details
+                .iter()
+                .all(|detail| !detail.contains("Runtime repair-only"))
         );
     }
 

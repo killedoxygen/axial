@@ -193,6 +193,7 @@ fn render_output(input: &GuardianProjectionCopyInput) -> GuardianProjectionCopyO
                     .cloned()
                     .map(|detail| GuardianIntervention {
                         kind: GuardianInterventionKind::SwitchManagedRuntime,
+                        public_detail: Some(detail.clone()),
                         detail: Some(detail),
                         silent: Some(false),
                     })

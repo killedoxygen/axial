@@ -882,6 +882,10 @@ fn sanitized_guardian(value: &Value) -> Option<GuardianSummary> {
                 .detail
                 .as_deref()
                 .and_then(sanitized_bounded_text);
+            intervention.public_detail = intervention
+                .public_detail
+                .as_deref()
+                .and_then(sanitized_bounded_text);
             intervention
         })
         .take(MAX_EXPORT_DETAILS)

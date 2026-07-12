@@ -87,6 +87,8 @@ pub struct GuardianIntervention {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub silent: Option<bool>,
 }
 
