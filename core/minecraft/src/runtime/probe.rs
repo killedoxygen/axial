@@ -24,6 +24,7 @@ struct JavaExecutableFingerprint {
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct JavaExecutableTargetFingerprint {
     requested_path: PathBuf,
+    selected_executable_path: PathBuf,
     requested: JavaExecutableFingerprint,
     probe: Option<JavaExecutableFingerprint>,
 }
@@ -60,6 +61,20 @@ pub struct JavaRuntimeProbeResolutionError {
 }
 
 impl JavaRuntimeProbeReceipt {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the typed processor executor cutover")
+    )]
+    pub(crate) fn revalidate_cli_executable(&self) -> Result<PathBuf, JavaRuntimeLookupError> {
+        let current = fingerprint_java_targets(&self.fingerprint.requested_path)?;
+        if current != self.fingerprint {
+            return Err(JavaRuntimeLookupError::Probe(
+                "java executable changed after the authenticated probe".to_string(),
+            ));
+        }
+        Ok(self.fingerprint.selected_executable_path.clone())
+    }
+
     pub(super) fn into_info(self) -> JavaRuntimeInfo {
         self.info
     }
@@ -269,6 +284,7 @@ fn fingerprint_java_targets(
     };
     Ok(JavaExecutableTargetFingerprint {
         requested_path,
+        selected_executable_path: probe_path,
         requested,
         probe,
     })
@@ -535,6 +551,76 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn receipt_revalidation_returns_the_fingerprinted_cli_sibling() {
+        use crate::runtime::JavaRuntimeInfo;
+
+        let root = std::env::temp_dir().join(format!(
+            "axial-java-probe-cli-sibling-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("CLI sibling root");
+        let javaw = root.join("javaw.exe");
+        let java = root.join("java.exe");
+        fs::write(&javaw, b"windowed executable").expect("javaw");
+        fs::write(&java, b"console executable").expect("java");
+        let receipt = super::JavaRuntimeProbeReceipt {
+            fingerprint: super::fingerprint_java_targets(&javaw).expect("fingerprinted siblings"),
+            info: JavaRuntimeInfo {
+                id: String::new(),
+                major: 21,
+                update: 0,
+                distribution: String::new(),
+                path: javaw.to_string_lossy().to_string(),
+            },
+        };
+
+        assert_eq!(
+            receipt
+                .revalidate_cli_executable()
+                .expect("revalidated CLI"),
+            java
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn receipt_revalidation_never_reselects_a_raced_in_cli_sibling() {
+        use crate::runtime::JavaRuntimeInfo;
+
+        let root =
+            std::env::temp_dir().join(format!("axial-java-probe-cli-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("CLI race root");
+        let javaw = root.join("javaw.exe");
+        let java = root.join("java.exe");
+        fs::write(&javaw, b"windowed executable").expect("javaw");
+        let receipt = super::JavaRuntimeProbeReceipt {
+            fingerprint: super::fingerprint_java_targets(&javaw)
+                .expect("fingerprinted windowed executable"),
+            info: JavaRuntimeInfo {
+                id: String::new(),
+                major: 21,
+                update: 0,
+                distribution: String::new(),
+                path: javaw.to_string_lossy().to_string(),
+            },
+        };
+        assert_eq!(
+            receipt
+                .revalidate_cli_executable()
+                .expect("windowed CLI remains selected"),
+            javaw
+        );
+
+        fs::write(&java, b"raced console executable").expect("raced java");
+        assert!(receipt.revalidate_cli_executable().is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn java_probe_command_output_is_bounded_by_timeout() {
@@ -610,8 +696,15 @@ mod tests {
         );
 
         let receipt = probe_java_runtime_receipt(&first_alias, None).expect("probe receipt");
+        assert_eq!(
+            receipt
+                .revalidate_cli_executable()
+                .expect("revalidated CLI executable"),
+            first_alias
+        );
         fs::remove_file(&first_alias).expect("remove old alias");
         symlink(&second, &first_alias).expect("retarget alias");
+        assert!(receipt.revalidate_cli_executable().is_err());
         let resolution = resolve_java_runtime_probe(
             snapshot_java_runtime(&first_alias).expect("retargeted alias snapshot"),
             Some(receipt),

@@ -1,7 +1,7 @@
 use crate::artifact_path::{ArtifactRelativePath, validate_artifact_path_segment};
 use crate::loaders::types::LoaderError;
 use sha1::{Digest as _, Sha1};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,10 @@ const TEMP_PREFIX: &str = ".axial-loader-tmp-";
 const MAX_TEMP_SWEEP_ENTRIES: usize = 128;
 const MAX_MANAGED_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_MANAGED_READ_BYTES: u64 = 512 << 20;
+const MAX_MANAGED_TREE_ENTRIES: usize = MAX_MANAGED_DIRECTORY_ENTRIES;
+const MAX_MANAGED_TREE_DEPTH: usize = 16;
+const MAX_MANAGED_TREE_FILE_BYTES: u64 = 128 << 20;
+const MAX_MANAGED_TREE_TOTAL_BYTES: u64 = 512 << 20;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_TEMPS: OnceLock<Mutex<HashSet<ActiveTempKey>>> = OnceLock::new();
 
@@ -56,6 +60,175 @@ enum EntryKind {
     Other,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ManagedTreeLimits {
+    max_entries: usize,
+    max_depth: usize,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+}
+
+impl ManagedTreeLimits {
+    pub(crate) fn processor_stage() -> Self {
+        Self {
+            max_entries: MAX_MANAGED_TREE_ENTRIES,
+            max_depth: MAX_MANAGED_TREE_DEPTH,
+            max_file_bytes: MAX_MANAGED_TREE_FILE_BYTES,
+            max_total_bytes: MAX_MANAGED_TREE_TOTAL_BYTES,
+        }
+    }
+
+    #[cfg(test)]
+    fn bounded_test(
+        max_entries: usize,
+        max_depth: usize,
+        max_file_bytes: u64,
+        max_total_bytes: u64,
+    ) -> Self {
+        assert!(max_entries <= MAX_MANAGED_TREE_ENTRIES);
+        assert!(max_depth <= MAX_MANAGED_TREE_DEPTH);
+        assert!(max_file_bytes <= MAX_MANAGED_TREE_FILE_BYTES);
+        assert!(max_total_bytes <= MAX_MANAGED_TREE_TOTAL_BYTES);
+        Self {
+            max_entries,
+            max_depth,
+            max_file_bytes,
+            max_total_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedFileFact {
+    size: u64,
+    sha1: [u8; 20],
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the typed processor executor cutover")
+)]
+impl ManagedFileFact {
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) fn sha1(&self) -> &[u8; 20] {
+        &self.sha1
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ManagedTreeSnapshot {
+    files: BTreeMap<ArtifactRelativePath, ManagedFileFact>,
+    directories: BTreeSet<ArtifactRelativePath>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the typed processor executor cutover")
+)]
+impl ManagedTreeSnapshot {
+    pub(crate) fn files(&self) -> &BTreeMap<ArtifactRelativePath, ManagedFileFact> {
+        &self.files
+    }
+
+    pub(crate) fn directories(&self) -> &BTreeSet<ArtifactRelativePath> {
+        &self.directories
+    }
+
+    pub(crate) fn diff(&self, after: &Self) -> ManagedTreeDiff {
+        let added_files = after
+            .files
+            .iter()
+            .filter(|(path, _)| !self.files.contains_key(*path))
+            .map(|(path, fact)| (path.clone(), fact.clone()))
+            .collect();
+        let removed_files = self
+            .files
+            .iter()
+            .filter(|(path, _)| !after.files.contains_key(*path))
+            .map(|(path, fact)| (path.clone(), fact.clone()))
+            .collect();
+        let modified_files = self
+            .files
+            .iter()
+            .filter_map(|(path, before)| {
+                after
+                    .files
+                    .get(path)
+                    .filter(|after| *after != before)
+                    .map(|after| (path.clone(), (before.clone(), after.clone())))
+            })
+            .collect();
+        ManagedTreeDiff {
+            added_files,
+            removed_files,
+            modified_files,
+            added_directories: after
+                .directories
+                .difference(&self.directories)
+                .cloned()
+                .collect(),
+            removed_directories: self
+                .directories
+                .difference(&after.directories)
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ManagedTreeDiff {
+    added_files: BTreeMap<ArtifactRelativePath, ManagedFileFact>,
+    removed_files: BTreeMap<ArtifactRelativePath, ManagedFileFact>,
+    modified_files: BTreeMap<ArtifactRelativePath, (ManagedFileFact, ManagedFileFact)>,
+    added_directories: BTreeSet<ArtifactRelativePath>,
+    removed_directories: BTreeSet<ArtifactRelativePath>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the typed processor executor cutover")
+)]
+impl ManagedTreeDiff {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.added_files.is_empty()
+            && self.removed_files.is_empty()
+            && self.modified_files.is_empty()
+            && self.added_directories.is_empty()
+            && self.removed_directories.is_empty()
+    }
+
+    pub(crate) fn added_files(&self) -> &BTreeMap<ArtifactRelativePath, ManagedFileFact> {
+        &self.added_files
+    }
+
+    pub(crate) fn removed_files(&self) -> &BTreeMap<ArtifactRelativePath, ManagedFileFact> {
+        &self.removed_files
+    }
+
+    pub(crate) fn modified_files(
+        &self,
+    ) -> &BTreeMap<ArtifactRelativePath, (ManagedFileFact, ManagedFileFact)> {
+        &self.modified_files
+    }
+
+    pub(crate) fn added_directories(&self) -> &BTreeSet<ArtifactRelativePath> {
+        &self.added_directories
+    }
+
+    pub(crate) fn removed_directories(&self) -> &BTreeSet<ArtifactRelativePath> {
+        &self.removed_directories
+    }
+}
+
+struct TreeCaptureBudget {
+    remaining_entries: usize,
+    remaining_bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ActiveTempKey {
     directory: platform::DirectoryIdentity,
@@ -64,6 +237,13 @@ struct ActiveTempKey {
 
 struct ActiveTemp {
     key: ActiveTempKey,
+}
+
+struct PendingTemp {
+    directory: ManagedDir,
+    name: OsString,
+    _active: ActiveTemp,
+    armed: bool,
 }
 
 struct CleanupPlan {
@@ -117,6 +297,33 @@ impl Drop for ActiveTemp {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.key);
+    }
+}
+
+impl PendingTemp {
+    fn arm(directory: ManagedDir, name: &str, active: ActiveTemp) -> Self {
+        Self {
+            _active: active,
+            directory,
+            name: OsString::from(name),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingTemp {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = platform::remove_file(
+                &self.directory.inner.handle,
+                &self.directory.inner.path,
+                &self.name,
+            );
+        }
     }
 }
 
@@ -231,13 +438,14 @@ impl ManagedDir {
     pub(crate) async fn write_exact(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
         validate_segment(name)?;
         let temp_name = temp_name();
-        let _active = ActiveTemp::register(self.inner.identity, &temp_name);
         self.sweep_orphan_temps()?;
+        let active = ActiveTemp::register(self.inner.identity, &temp_name);
         let file = platform::create_new_file(
             &self.inner.handle,
             &self.inner.path,
             OsStr::new(&temp_name),
         )?;
+        let mut pending = PendingTemp::arm(self.clone(), &temp_name, active);
         let mut file = tokio::fs::File::from_std(file);
         let write_result = async {
             file.write_all(bytes).await?;
@@ -257,8 +465,6 @@ impl ManagedDir {
         .await;
         drop(file);
         if let Err(error) = write_result {
-            let _ =
-                platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(&temp_name));
             return Err(LoaderError::Io(error));
         }
         if platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))?.is_some() {
@@ -272,10 +478,9 @@ impl ManagedDir {
             &self.inner.path,
             OsStr::new(name),
         ) {
-            let _ =
-                platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(&temp_name));
             return Err(LoaderError::Io(error));
         }
+        pending.disarm();
         if self.read_bounded(name, bytes.len() as u64, true)? != bytes {
             let _ = platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name));
             return Err(LoaderError::Verify(
@@ -314,6 +519,211 @@ impl ManagedDir {
         Ok(bytes)
     }
 
+    pub(crate) fn read_relative_authenticated(
+        &self,
+        relative: &ArtifactRelativePath,
+        expected_size: Option<u64>,
+        expected_sha1: &[u8; 20],
+    ) -> Result<Vec<u8>, LoaderError> {
+        if expected_size.is_some_and(|size| size > MAX_MANAGED_READ_BYTES) {
+            return Err(LoaderError::Verify(
+                "managed relative read exceeds the admitted size bound".to_string(),
+            ));
+        }
+        self.revalidate()?;
+        let mut segments = relative.as_str().split('/').peekable();
+        let mut directory = self.clone();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_none() {
+                let bytes = directory.read_bounded(
+                    segment,
+                    expected_size.unwrap_or(MAX_MANAGED_READ_BYTES),
+                    expected_size.is_some(),
+                )?;
+                let actual_sha1: [u8; 20] = Sha1::digest(&bytes).into();
+                if &actual_sha1 != expected_sha1 {
+                    return Err(LoaderError::Verify(
+                        "managed relative read failed authenticated integrity".to_string(),
+                    ));
+                }
+                directory.revalidate()?;
+                self.revalidate()?;
+                return Ok(bytes);
+            }
+            directory = directory.open_child(segment)?;
+        }
+        Err(LoaderError::Verify(
+            "managed relative read has no final file".to_string(),
+        ))
+    }
+
+    pub(crate) fn snapshot_tree(
+        &self,
+        limits: ManagedTreeLimits,
+    ) -> Result<ManagedTreeSnapshot, LoaderError> {
+        self.snapshot_tree_with(limits, || Ok(()))
+    }
+
+    fn snapshot_tree_with(
+        &self,
+        limits: ManagedTreeLimits,
+        between_captures: impl FnOnce() -> Result<(), LoaderError>,
+    ) -> Result<ManagedTreeSnapshot, LoaderError> {
+        self.revalidate()?;
+        let first = self.capture_tree_once(limits)?;
+        between_captures()?;
+        self.revalidate()?;
+        let second = self.capture_tree_once(limits)?;
+        self.revalidate()?;
+        if first != second {
+            return Err(LoaderError::Verify(
+                "managed tree changed during bounded snapshot".to_string(),
+            ));
+        }
+        Ok(second)
+    }
+
+    fn capture_tree_once(
+        &self,
+        limits: ManagedTreeLimits,
+    ) -> Result<ManagedTreeSnapshot, LoaderError> {
+        let mut snapshot = ManagedTreeSnapshot::default();
+        let mut aliases = HashMap::new();
+        let mut budget = TreeCaptureBudget {
+            remaining_entries: limits.max_entries,
+            remaining_bytes: limits.max_total_bytes,
+        };
+        self.capture_tree_directory(None, 0, limits, &mut budget, &mut aliases, &mut snapshot)?;
+        Ok(snapshot)
+    }
+
+    fn capture_tree_directory(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        limits: ManagedTreeLimits,
+        budget: &mut TreeCaptureBudget,
+        aliases: &mut HashMap<String, String>,
+        snapshot: &mut ManagedTreeSnapshot,
+    ) -> Result<(), LoaderError> {
+        self.revalidate()?;
+        let entries = platform::entry_names(
+            &self.inner.handle,
+            &self.inner.path,
+            budget.remaining_entries.saturating_add(1),
+        )?;
+        if entries.len() > budget.remaining_entries {
+            return Err(LoaderError::Verify(
+                "managed tree exceeds the aggregate entry bound".to_string(),
+            ));
+        }
+        budget.remaining_entries -= entries.len();
+        let mut names = entries;
+        names.sort();
+        for name in names {
+            let name = name.to_str().ok_or_else(|| {
+                LoaderError::Verify("managed tree contains a non-UTF-8 entry".to_string())
+            })?;
+            validate_segment(name)?;
+            let authored = match prefix {
+                Some(prefix) => format!("{prefix}/{name}"),
+                None => name.to_string(),
+            };
+            let relative = ArtifactRelativePath::new(&authored).map_err(|_| {
+                LoaderError::Verify("managed tree path is not canonical".to_string())
+            })?;
+            insert_tree_alias(aliases, &relative)?;
+            match platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))? {
+                Some(EntryKind::File) => {
+                    let fact = self.capture_file_fact(name, limits, budget)?;
+                    snapshot.files.insert(relative, fact);
+                }
+                Some(EntryKind::Directory) => {
+                    if depth >= limits.max_depth {
+                        return Err(LoaderError::Verify(
+                            "managed tree exceeds the depth bound".to_string(),
+                        ));
+                    }
+                    let child = self.open_child(name)?;
+                    snapshot.directories.insert(relative);
+                    child.capture_tree_directory(
+                        Some(&authored),
+                        depth + 1,
+                        limits,
+                        budget,
+                        aliases,
+                        snapshot,
+                    )?;
+                }
+                Some(EntryKind::Link) | None => {
+                    return Err(LoaderError::Verify(
+                        "managed tree contains a link or replaced entry".to_string(),
+                    ));
+                }
+                #[cfg(unix)]
+                Some(EntryKind::Other) => {
+                    return Err(LoaderError::Verify(
+                        "managed tree contains an unsupported entry".to_string(),
+                    ));
+                }
+            }
+        }
+        self.revalidate()
+    }
+
+    fn capture_file_fact(
+        &self,
+        name: &str,
+        limits: ManagedTreeLimits,
+        budget: &mut TreeCaptureBudget,
+    ) -> Result<ManagedFileFact, LoaderError> {
+        let mut file =
+            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        let identity = platform::file_identity(&file)?;
+        let metadata = file.metadata()?;
+        let size = metadata.len();
+        if size > limits.max_file_bytes || size > budget.remaining_bytes {
+            return Err(LoaderError::Verify(
+                "managed tree file exceeds its admitted byte bound".to_string(),
+            ));
+        }
+        let mut hasher = Sha1::new();
+        let mut observed = 0_u64;
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            observed = observed.checked_add(read as u64).ok_or_else(|| {
+                LoaderError::Verify("managed tree byte count overflowed".to_string())
+            })?;
+            if observed > size {
+                return Err(LoaderError::Verify(
+                    "managed tree file changed during snapshot".to_string(),
+                ));
+            }
+            hasher.update(&chunk[..read]);
+        }
+        if observed != size || file.metadata()?.len() != size {
+            return Err(LoaderError::Verify(
+                "managed tree file changed during snapshot".to_string(),
+            ));
+        }
+        let current =
+            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        if platform::file_identity(&current)? != identity || current.metadata()?.len() != size {
+            return Err(LoaderError::Verify(
+                "managed tree file identity changed during snapshot".to_string(),
+            ));
+        }
+        budget.remaining_bytes -= size;
+        Ok(ManagedFileFact {
+            size,
+            sha1: hasher.finalize().into(),
+        })
+    }
+
     fn read_bounded(
         &self,
         name: &str,
@@ -321,8 +731,10 @@ impl ManagedDir {
         require_exact_len: bool,
     ) -> Result<Vec<u8>, LoaderError> {
         validate_segment(name)?;
+        self.revalidate()?;
         let mut file =
             platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        let identity = platform::file_identity(&file)?;
         let metadata = file.metadata()?;
         if metadata.len() > limit || (require_exact_len && metadata.len() != limit) {
             return Err(LoaderError::Verify(
@@ -341,6 +753,21 @@ impl ManagedDir {
                 "managed loader artifact changed during bounded read".to_string(),
             ));
         }
+        if file.metadata()?.len() != metadata.len() {
+            return Err(LoaderError::Verify(
+                "managed loader artifact changed during bounded read".to_string(),
+            ));
+        }
+        let current =
+            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        if platform::file_identity(&current)? != identity
+            || current.metadata()?.len() != metadata.len()
+        {
+            return Err(LoaderError::Verify(
+                "managed loader artifact identity changed during bounded read".to_string(),
+            ));
+        }
+        self.revalidate()?;
         Ok(bytes)
     }
 
@@ -567,7 +994,7 @@ impl ManagedDir {
             {
                 continue;
             }
-            if owner_is_live(owner_pid) {
+            if owner_pid != std::process::id() && owner_is_live(owner_pid) {
                 continue;
             }
             match platform::entry_kind(&self.inner.handle, &self.inner.path, &name)? {
@@ -596,6 +1023,27 @@ fn validate_segment(name: &str) -> Result<(), LoaderError> {
     validate_artifact_path_segment(name).map_err(|_| {
         LoaderError::Verify("managed loader path segment is not canonical".to_string())
     })
+}
+
+fn insert_tree_alias(
+    aliases: &mut HashMap<String, String>,
+    path: &ArtifactRelativePath,
+) -> Result<(), LoaderError> {
+    let portable = path
+        .as_str()
+        .chars()
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    match aliases.get(&portable) {
+        Some(existing) if existing != path.as_str() => Err(LoaderError::Verify(
+            "managed tree contains a portable case-fold alias".to_string(),
+        )),
+        Some(_) => Ok(()),
+        None => {
+            aliases.insert(portable, path.as_str().to_string());
+            Ok(())
+        }
+    }
 }
 
 fn temp_name() -> String {
@@ -646,6 +1094,7 @@ mod platform {
     use std::path::Path;
 
     pub(super) type DirectoryHandle = OwnedFd;
+    pub(super) type FileIdentity = DirectoryIdentity;
 
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     pub(super) struct DirectoryIdentity {
@@ -716,6 +1165,10 @@ mod platform {
             ));
         }
         Ok(fs::File::from(fd))
+    }
+
+    pub(super) fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
+        Ok(identity_from_stat(rfs::fstat(file)?))
     }
 
     pub(super) fn rename_entry(
@@ -852,6 +1305,215 @@ mod tests {
             .read_exact("artifact.jar")
             .expect_err("oversized file");
         assert!(matches!(error, LoaderError::Verify(_)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_authenticated_read_uses_canonical_held_capabilities() {
+        let root = test_root("nested-authenticated-read");
+        fs::create_dir_all(root.join("one/two")).expect("nested root");
+        fs::write(root.join("one/two/artifact"), b"authenticated").expect("artifact");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let relative = ArtifactRelativePath::new("one/two/artifact").expect("relative path");
+        let sha1: [u8; 20] = Sha1::digest(b"authenticated").into();
+
+        assert_eq!(
+            directory
+                .read_relative_authenticated(&relative, Some(13), &sha1)
+                .expect("authenticated nested read"),
+            b"authenticated"
+        );
+        assert_eq!(
+            directory
+                .read_relative_authenticated(&relative, None, &sha1)
+                .expect("SHA-only authenticated nested read"),
+            b"authenticated"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_authenticated_read_rejects_ancestor_and_final_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("nested-authenticated-links");
+        let outside = test_root("nested-authenticated-links-outside");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(outside.join("artifact"), b"outside").expect("outside artifact");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let sha1: [u8; 20] = Sha1::digest(b"outside").into();
+
+        symlink(&outside, root.join("ancestor")).expect("ancestor link");
+        let ancestor = ArtifactRelativePath::new("ancestor/artifact").expect("ancestor path");
+        assert!(
+            directory
+                .read_relative_authenticated(&ancestor, Some(7), &sha1)
+                .is_err()
+        );
+        fs::create_dir(root.join("real")).expect("real directory");
+        symlink(outside.join("artifact"), root.join("real/final")).expect("final link");
+        let final_path = ArtifactRelativePath::new("real/final").expect("final path");
+        assert!(
+            directory
+                .read_relative_authenticated(&final_path, Some(7), &sha1)
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn bounded_snapshot_records_exact_facts_and_diffs() {
+        let root = test_root("tree-snapshot-diff");
+        fs::create_dir_all(root.join("nested")).expect("nested");
+        fs::write(root.join("nested/first"), b"first").expect("first");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let limits = ManagedTreeLimits::bounded_test(8, 4, 32, 64);
+        let before = directory.snapshot_tree(limits).expect("before");
+        let first = ArtifactRelativePath::new("nested/first").expect("first path");
+        assert_eq!(before.files()[&first].size(), 5);
+        assert_eq!(
+            before.files()[&first].sha1(),
+            &<[u8; 20]>::from(Sha1::digest(b"first"))
+        );
+
+        fs::write(root.join("nested/first"), b"changed").expect("changed");
+        fs::write(root.join("added"), b"added").expect("added");
+        let after = directory.snapshot_tree(limits).expect("after");
+        let diff = before.diff(&after);
+        assert!(!diff.is_empty());
+        assert!(diff.modified_files().contains_key(&first));
+        assert!(
+            diff.added_files()
+                .contains_key(&ArtifactRelativePath::new("added").expect("added path"))
+        );
+        assert!(diff.removed_files().is_empty());
+        assert!(diff.added_directories().is_empty());
+        assert!(diff.removed_directories().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bounded_snapshot_rejects_entry_depth_and_byte_overflow() {
+        let root = test_root("tree-snapshot-bounds");
+        fs::create_dir_all(root.join("a/b")).expect("nested");
+        fs::write(root.join("one"), b"1234").expect("one");
+        fs::write(root.join("two"), b"1234").expect("two");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+
+        for limits in [
+            ManagedTreeLimits::bounded_test(3, 4, 8, 16),
+            ManagedTreeLimits::bounded_test(8, 1, 8, 16),
+            ManagedTreeLimits::bounded_test(8, 4, 3, 16),
+            ManagedTreeLimits::bounded_test(8, 4, 8, 7),
+        ] {
+            assert!(directory.snapshot_tree(limits).is_err());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn processor_stage_snapshot_entry_bound_is_cleanup_reusable() {
+        let limits = ManagedTreeLimits::processor_stage();
+        assert!(limits.max_entries <= MAX_MANAGED_DIRECTORY_ENTRIES);
+    }
+
+    #[test]
+    fn bounded_snapshot_rejects_post_capture_replacement() {
+        let root = test_root("tree-snapshot-replacement");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("artifact"), b"before").expect("artifact");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let limits = ManagedTreeLimits::bounded_test(4, 2, 32, 32);
+
+        let error = directory
+            .snapshot_tree_with(limits, || {
+                fs::write(root.join("artifact"), b"after").map_err(LoaderError::Io)
+            })
+            .expect_err("replacement between captures");
+
+        assert!(matches!(error, LoaderError::Verify(_)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_snapshot_rejects_aliases_links_and_unexpected_kinds() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let limits = ManagedTreeLimits::bounded_test(8, 2, 32, 64);
+        let alias_root = test_root("tree-snapshot-alias");
+        fs::create_dir_all(&alias_root).expect("alias root");
+        fs::write(alias_root.join("Name"), b"one").expect("first alias");
+        fs::write(alias_root.join("name"), b"two").expect("second alias");
+        assert!(
+            ManagedDir::open_root(&alias_root)
+                .expect("managed alias root")
+                .snapshot_tree(limits)
+                .is_err()
+        );
+
+        let link_root = test_root("tree-snapshot-link");
+        fs::create_dir_all(&link_root).expect("link root");
+        symlink(&alias_root, link_root.join("link")).expect("link");
+        assert!(
+            ManagedDir::open_root(&link_root)
+                .expect("managed link root")
+                .snapshot_tree(limits)
+                .is_err()
+        );
+
+        let kind_root = test_root("tree-snapshot-kind");
+        fs::create_dir_all(&kind_root).expect("kind root");
+        let _listener = UnixListener::bind(kind_root.join("socket")).expect("socket");
+        assert!(
+            ManagedDir::open_root(&kind_root)
+                .expect("managed kind root")
+                .snapshot_tree(limits)
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(alias_root);
+        let _ = fs::remove_dir_all(link_root);
+        let _ = fs::remove_dir_all(kind_root);
+    }
+
+    #[test]
+    fn inactive_current_process_temp_is_swept() {
+        let root = test_root("inactive-current-temp");
+        fs::create_dir_all(&root).expect("root");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let name = temp_name();
+        fs::write(root.join(&name), b"cancelled").expect("cancelled temp");
+
+        directory
+            .sweep_orphan_temps_with(|_| true)
+            .expect("inactive current-process sweep");
+
+        assert!(!root.join(name).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_temp_drop_unlinks_while_file_handle_is_still_open() {
+        let root = test_root("pending-temp-open-handle");
+        fs::create_dir_all(&root).expect("root");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let name = temp_name();
+        let active = ActiveTemp::register(directory.inner.identity, &name);
+        let file = platform::create_new_file(
+            &directory.inner.handle,
+            &directory.inner.path,
+            OsStr::new(&name),
+        )
+        .expect("pending temp");
+        let pending = PendingTemp::arm(directory.clone(), &name, active);
+
+        drop(pending);
+        assert!(!root.join(&name).exists());
+        drop(file);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1264,12 +1926,13 @@ mod platform {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
-        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FILE_STANDARD_INFO, FileBasicInfo, FileIdInfo, FileStandardInfo,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileBasicInfo, FileIdInfo, FileStandardInfo,
         GetFileInformationByHandleEx,
     };
 
     pub(super) type DirectoryHandle = fs::File;
+    pub(super) type FileIdentity = DirectoryIdentity;
 
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     pub(super) struct DirectoryIdentity {
@@ -1322,7 +1985,7 @@ mod platform {
             .read(true)
             .write(true)
             .create_new(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         options.open(parent_path.join(name))
     }
@@ -1348,6 +2011,10 @@ mod platform {
             ));
         }
         Ok(file)
+    }
+
+    pub(super) fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
+        directory_identity(file)
     }
 
     pub(super) fn rename_entry(
