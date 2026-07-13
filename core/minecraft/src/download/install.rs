@@ -243,6 +243,13 @@ impl Downloader {
                     ))
                 })?
                 .into_parts();
+        let (pending_library_declarations, library_jobs) = library_declarations
+            .classify_jobs(&libraries_dir(&self.mc_dir), self.library_jobs(&version)?)
+            .map_err(|error| {
+                DownloadError::ResolveManifest(format!(
+                    "library declaration classification failed: {error:?}"
+                ))
+            })?;
         let asset_index_source = self
             .fetch_asset_index_source(&version, send, plan, fact_tx, descriptor_tx)
             .await?;
@@ -331,13 +338,6 @@ impl Downloader {
                 )
             });
 
-            let (pending_library_declarations, library_jobs) = library_declarations
-                .classify_jobs(&libraries_dir(&self.mc_dir), self.library_jobs(&version)?)
-                .map_err(|error| {
-                    DownloadError::ResolveManifest(format!(
-                        "library declaration classification failed: {error:?}"
-                    ))
-                })?;
             plan.contribute_total(
                 library_jobs
                     .iter()

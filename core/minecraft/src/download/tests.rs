@@ -40,7 +40,7 @@ use super::*;
 use crate::artifact_path::ArtifactRelativePath;
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
 use crate::manifest::VersionManifest;
-use crate::paths::{libraries_dir, versions_dir};
+use crate::paths::{assets_dir, libraries_dir, runtime_dirs, versions_dir};
 use crate::rules::Environment;
 use crate::runtime::{RuntimeEnsureEvent, RuntimeSourceReceipt};
 use sha1::{Digest as _, Sha1};
@@ -84,6 +84,46 @@ async fn install_version_emits_terminal_error_when_setup_fails() {
     assert!(event.done);
 
     let _ = fs::remove_file(root.join("versions"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn invalid_library_preflight_precedes_asset_runtime_and_client_effects() {
+    let root = temp_dir("library-preflight-before-effects");
+    let client_path = versions_dir(&root).join("preflight").join("preflight.jar");
+    let asset_index_path = assets_dir(&root)
+        .join("indexes")
+        .join("preflight-assets.json");
+    let runtime_sentinel = runtime_dirs(&root)[0]
+        .join("jre-legacy")
+        .join("preflight-sentinel");
+    for path in [&client_path, &asset_index_path, &runtime_sentinel] {
+        fs::create_dir_all(path.parent().expect("sentinel parent")).expect("sentinel parent");
+        fs::write(path, b"untouched").expect("sentinel");
+    }
+    let (version_url, version_sha1, mut requests) = spawn_preflight_failure_server().await;
+    let downloader = test_manifest_downloader(&root, "preflight", &version_url, &version_sha1);
+    let mut events = Vec::new();
+
+    let error = downloader
+        .install_version("preflight", |progress| events.push(progress))
+        .await
+        .expect_err("URL-less exact library must not install");
+
+    assert!(error.to_string().contains("no download source"));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let request_paths = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(request_paths, vec!["/version.json"]);
+    assert!(events.iter().all(|event| {
+        !matches!(
+            event.phase.as_str(),
+            "asset_index" | "java_runtime" | "java_runtime_ready" | "client_jar" | "libraries"
+        )
+    }));
+    for path in [&client_path, &asset_index_path, &runtime_sentinel] {
+        assert_eq!(fs::read(path).expect("unchanged sentinel"), b"untouched");
+    }
+
     let _ = fs::remove_dir_all(root);
 }
 
@@ -2327,6 +2367,74 @@ async fn spawn_overlapped_install_server() -> (
         request_rx,
         release_library_tx,
     )
+}
+
+async fn spawn_preflight_failure_server() -> (String, String, mpsc::UnboundedReceiver<String>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind preflight server");
+    let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let (request_tx, request_rx) = mpsc::unbounded_channel();
+    let client_body = b"client".to_vec();
+    let asset_index_body = br#"{"objects":{}}"#.to_vec();
+    let version_body = serde_json::json!({
+        "id": "preflight",
+        "downloads": {
+            "client": {
+                "url": format!("{base_url}/client.jar"),
+                "sha1": sha1_hex(&client_body),
+                "size": client_body.len()
+            }
+        },
+        "assetIndex": {
+            "id": "preflight-assets",
+            "sha1": sha1_hex(&asset_index_body),
+            "size": asset_index_body.len(),
+            "url": format!("{base_url}/asset-index.json")
+        },
+        "javaVersion": {
+            "component": "jre-legacy",
+            "majorVersion": 8
+        },
+        "libraries": [{
+            "name": "org.example:url-less:1.0.0",
+            "downloads": {
+                "artifact": {
+                    "path": "org/example/url-less/1.0.0/url-less-1.0.0.jar",
+                    "sha1": "0101010101010101010101010101010101010101",
+                    "size": 7,
+                    "url": ""
+                }
+            }
+        }]
+    })
+    .to_string()
+    .into_bytes();
+    let version_sha1 = sha1_hex(&version_body);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let Some(path) = read_request_path(&mut socket).await else {
+                return;
+            };
+            let _ = request_tx.send(path.clone());
+            let body = match path.as_str() {
+                "/version.json" => &version_body,
+                "/asset-index.json" => &asset_index_body,
+                "/client.jar" => &client_body,
+                _ => {
+                    write_raw_response(&mut socket, "404 Not Found", b"not found").await;
+                    continue;
+                }
+            };
+            write_raw_response(&mut socket, "200 OK", body).await;
+        }
+    });
+
+    (format!("{base_url}/version.json"), version_sha1, request_rx)
 }
 
 fn test_manifest_downloader(
