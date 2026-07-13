@@ -3551,6 +3551,10 @@ impl RouteTestFixture {
             .await
             .expect("close instance registry before reload");
         self.state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store before reload");
+        self.state
             .close_performance_rules()
             .await
             .expect("close performance rules before reload");
