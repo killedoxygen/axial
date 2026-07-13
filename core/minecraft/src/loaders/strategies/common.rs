@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::download::download_libraries_with_facts_and_descriptors;
 use crate::download::{
     DownloadProgress, Downloader, ExactLibraryDownloadProof,
     download_installer_libraries_with_authority_and_facts_and_descriptors,
@@ -629,30 +627,6 @@ fn base_version_install_lock_from_map(
         .clone()
 }
 
-#[cfg(test)]
-async fn download_loader_libraries_with_evidence<F>(
-    library_dir: &Path,
-    libraries: &[crate::launch::Library],
-    phase: &str,
-    send: &mut F,
-) -> Result<(), LoaderError>
-where
-    F: FnMut(DownloadProgress),
-{
-    let mut facts = Vec::new();
-    let mut descriptors = Vec::new();
-    download_libraries_with_facts_and_descriptors(
-        library_dir,
-        libraries,
-        phase,
-        &mut *send,
-        |fact| facts.push(fact),
-        |descriptor| descriptors.push(descriptor),
-    )
-    .await
-    .map_err(|_| LoaderError::ArtifactDownloadFailed { facts, descriptors })
-}
-
 async fn download_profile_loader_libraries_with_evidence<F>(
     library_dir: &Path,
     libraries: &[crate::launch::Library],
@@ -1101,7 +1075,7 @@ fn done() -> DownloadProgress {
 mod tests {
     use super::{
         base_version_install_lock_from_map, cleanup_on_error,
-        download_installer_libraries_with_evidence, download_loader_libraries_with_evidence,
+        download_installer_libraries_with_evidence,
         download_profile_loader_libraries_with_evidence, ensure_base_version,
         fetch_sha1_verified_source, finish_supported_installer_install,
         install_from_installer_source, install_from_legacy_archive, install_from_profile_source,
@@ -1109,10 +1083,7 @@ mod tests {
         install_profile_source_after_authenticated_base, overlay_legacy_archive_bytes,
         validate_and_enrich_profile_source, validate_installer_record_authority,
     };
-    use crate::download::{
-        DownloadProgress, ExecutionDownloadFactKind, ExpectedIntegrity,
-        SelectedDownloadArtifactKind,
-    };
+    use crate::download::{DownloadProgress, ExpectedIntegrity};
     use crate::known_good::{KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity};
     use crate::launch::{
         AssetIndex, Downloads, JavaVersion, Library, LibraryArtifact, LibraryDownload, LoggingConf,
@@ -1354,58 +1325,6 @@ mod tests {
         let recovered_lock = base_version_install_lock_from_map(&locks, &root, "1.21.5");
 
         assert!(Arc::ptr_eq(&recovered_lock, &seeded_install_lock));
-    }
-
-    #[tokio::test]
-    async fn loader_library_download_failure_carries_artifact_evidence() {
-        let root = temp_dir("loader-library-evidence");
-        let server = TestByteServer::start(b"wrong".to_vec());
-        let expected = b"fresh";
-        let library = Library {
-            name: "com.example:loader-lib:1.0.0".to_string(),
-            downloads: Some(LibraryDownload {
-                artifact: Some(LibraryArtifact {
-                    path: "com/example/loader-lib/1.0.0/loader-lib-1.0.0.jar".to_string(),
-                    sha1: sha1_hex(expected),
-                    size: expected.len() as i64,
-                    url: server.url.clone(),
-                }),
-                ..LibraryDownload::default()
-            }),
-            ..Library::default()
-        };
-
-        let error = download_loader_libraries_with_evidence(
-            &root,
-            &[library],
-            "loader_libraries",
-            &mut |_progress| {},
-        )
-        .await
-        .expect_err("checksum mismatch should carry evidence");
-
-        match error {
-            LoaderError::ArtifactDownloadFailed { facts, descriptors } => {
-                assert!(
-                    facts
-                        .iter()
-                        .any(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactMissing)
-                );
-                assert!(
-                    facts
-                        .iter()
-                        .any(|fact| fact.kind == ExecutionDownloadFactKind::ChecksumMismatch)
-                );
-                assert!(descriptors.iter().any(|descriptor| {
-                    descriptor.kind == SelectedDownloadArtifactKind::Library
-                        && descriptor.target == "minecraft_library_loader-lib-1.0.0"
-                }));
-            }
-            other => panic!("expected artifact download evidence, got {other:?}"),
-        }
-
-        server.stop();
-        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

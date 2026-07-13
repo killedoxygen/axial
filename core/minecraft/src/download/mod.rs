@@ -4,6 +4,7 @@ mod facts;
 mod install;
 mod integrity;
 mod libraries;
+mod library_source;
 mod model;
 mod path_safety;
 mod plan;
@@ -29,8 +30,7 @@ pub(crate) use libraries::{
     library_artifact_plans_for,
 };
 pub use libraries::{
-    LibraryVerificationIntegrity, LibraryVerificationPlan, download_libraries,
-    download_libraries_with_facts_and_descriptors, library_verification_plans_for,
+    LibraryVerificationIntegrity, LibraryVerificationPlan, library_verification_plans_for,
 };
 pub(crate) use model::ExactLibraryDownloadProof;
 pub use model::{

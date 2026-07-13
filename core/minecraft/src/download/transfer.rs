@@ -5,14 +5,15 @@ use super::facts::{
     size_mismatch_fact,
 };
 use super::integrity::{
-    ExistingArtifactIntegrity, checksumless_jar_file_is_readable, download_size_mismatch,
-    existing_artifact_integrity, existing_content_addressed_asset_integrity, is_sha1_hex,
-    verify_download_integrity,
+    ExistingArtifactIntegrity, download_size_mismatch, existing_artifact_integrity,
+    existing_content_addressed_asset_integrity, is_sha1_hex, verify_download_integrity,
 };
+use super::library_source::AuthenticatedLibrarySource;
 use super::model::{
-    ActualIntegrity, DownloadError, DownloadIntegrityError, ExecutionDownloadError,
-    ExecutionDownloadFact, ExecutionDownloadFactKind, ExecutionDownloadReport, ExpectedIntegrity,
-    SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind,
+    ActualIntegrity, DownloadError, DownloadIntegrityError, ExactLibraryDownloadProof,
+    ExecutionDownloadError, ExecutionDownloadFact, ExecutionDownloadFactKind,
+    ExecutionDownloadReport, ExpectedIntegrity, SelectedDownloadArtifactDescriptor,
+    SelectedDownloadArtifactKind,
 };
 use super::path_safety::{
     bounded_download_file_label, filesystem_path, safe_download_target_label,
@@ -25,6 +26,8 @@ use super::transfer_failure::{
     finish_execution_error, finish_execution_error_after_temp_discard,
     finish_io_failure_after_temp_discard, record_io_failure_fact_pair,
 };
+use crate::artifact_path::ArtifactRelativePath;
+use crate::paths::libraries_dir;
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
 use std::ffi::OsStr;
@@ -33,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs as async_fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 const DOWNLOAD_RETRY_DELAY_MILLIS: [u64; 3] = [500, 1_500, 4_000];
@@ -58,11 +61,6 @@ struct SelectedArtifactDownload<'a> {
     expected: &'a ExpectedIntegrity,
     fact_tx: Option<&'a mpsc::UnboundedSender<ExecutionDownloadFact>>,
     descriptor_tx: Option<&'a mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-}
-
-pub(super) struct AuthenticatedArtifactDownload {
-    pub(super) report: ExecutionDownloadReport,
-    pub(super) sha1: [u8; 20],
 }
 
 pub(super) struct AuthenticatedSelectedArtifactSource {
@@ -95,6 +93,25 @@ pub(super) struct PreparedSelectedArtifactInstall {
     target: String,
 }
 
+pub(super) struct PreparedLibraryPublication {
+    relative_path: ArtifactRelativePath,
+    selected: PreparedSelectedArtifactInstall,
+    provider_url: String,
+    descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+}
+
+impl PreparedLibraryPublication {
+    #[cfg(test)]
+    pub(super) fn expected(&self) -> &ExpectedIntegrity {
+        &self.selected.expected
+    }
+
+    #[cfg(test)]
+    pub(super) fn target(&self) -> &str {
+        &self.selected.target
+    }
+}
+
 impl PreparedSelectedArtifactInstall {
     pub(super) fn target(&self) -> &str {
         &self.target
@@ -103,6 +120,44 @@ impl PreparedSelectedArtifactInstall {
 
 pub(super) struct MaterializedSelectedArtifactSource {
     source: AuthenticatedSelectedArtifactSource,
+}
+
+struct PreparedExactPublication {
+    source: RetainedExactSource,
+    destination: PathBuf,
+    target: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExactPublicationOutcome {
+    AlreadyExact,
+    Promoted,
+}
+
+struct RetainedExactSource {
+    file: std::fs::File,
+    observed_size: u64,
+    observed_sha1: [u8; 20],
+    _lifetime_guard: Box<dyn Send + 'static>,
+}
+
+impl RetainedExactSource {
+    fn new<G>(
+        file: std::fs::File,
+        observed_size: u64,
+        observed_sha1: [u8; 20],
+        lifetime_guard: G,
+    ) -> Self
+    where
+        G: Send + 'static,
+    {
+        Self {
+            file,
+            observed_size,
+            observed_sha1,
+            _lifetime_guard: Box::new(lifetime_guard),
+        }
+    }
 }
 
 impl MaterializedSelectedArtifactSource {
@@ -203,6 +258,113 @@ pub(super) async fn prepare_selected_artifact_install(
     })
 }
 
+pub(super) async fn prepare_library_publication(
+    mc_dir: &Path,
+    relative_path: ArtifactRelativePath,
+    url: &str,
+    expected: &ExpectedIntegrity,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+) -> Result<PreparedLibraryPublication, DownloadError> {
+    let destination = relative_path.join_under(&libraries_dir(mc_dir));
+    guard_existing_unsupported_selected_artifact(
+        SelectedDownloadArtifactKind::Library,
+        &destination,
+        url,
+        expected,
+        fact_tx,
+        None,
+    )
+    .await?;
+    let selected = PreparedSelectedArtifactInstall {
+        target: selected_download_target_label(SelectedDownloadArtifactKind::Library, &destination),
+        destination,
+        expected: expected.clone(),
+    };
+    Ok(PreparedLibraryPublication {
+        relative_path,
+        selected,
+        provider_url: url.to_string(),
+        descriptor_tx: descriptor_tx.cloned(),
+    })
+}
+
+pub(super) async fn materialize_authenticated_library_source(
+    prepared: PreparedLibraryPublication,
+    source: AuthenticatedLibrarySource,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+) -> Result<(ExactLibraryDownloadProof, ExactPublicationOutcome), DownloadError> {
+    if source.relative_path() != &prepared.relative_path
+        || source.target() != prepared.selected.target
+        || source.expected() != &prepared.selected.expected
+        || source.provider_url() != prepared.provider_url
+    {
+        return Err(DownloadError::Integrity(
+            "authenticated library source does not match its prepared publication contract"
+                .to_string(),
+        ));
+    }
+    let (
+        file,
+        source_relative_path,
+        observed_size,
+        observed_sha1,
+        expected,
+        source_target,
+        source_provider_url,
+        permit,
+    ) = source.into_parts();
+    if source_relative_path != prepared.relative_path
+        || source_target != prepared.selected.target
+        || expected != prepared.selected.expected
+        || source_provider_url != prepared.provider_url
+    {
+        return Err(DownloadError::Integrity(
+            "authenticated library source changed while consuming its publication contract"
+                .to_string(),
+        ));
+    }
+    let exact_expected = ExpectedIntegrity {
+        size: Some(observed_size),
+        sha1: Some(hex_sha1(&observed_sha1)),
+    };
+    emit_selected_download_descriptor(
+        prepared.descriptor_tx.as_ref(),
+        SelectedDownloadArtifactKind::Library,
+        &prepared.selected.destination,
+        &prepared.provider_url,
+        &exact_expected,
+    );
+    emit_selected_artifact_missing_fact_if_absent(
+        fact_tx,
+        SelectedDownloadArtifactKind::Library,
+        &prepared.selected.destination,
+        &exact_expected,
+    )
+    .await;
+    let target = prepared.selected.target;
+    let outcome = publish_authenticated_retained_file(
+        RetainedExactSource::new(file, observed_size, observed_sha1, permit),
+        prepared.selected.destination,
+        target.clone(),
+        fact_tx.cloned(),
+        #[cfg(test)]
+        None,
+    )
+    .await?;
+    let mut facts = metadata_facts(&exact_expected, &target);
+    facts.push(execution_download_fact(
+        ExecutionDownloadFactKind::ArtifactVerified,
+        &target,
+        no_download_fact_fields(),
+    ));
+    emit_execution_download_facts(fact_tx, &facts);
+    Ok((
+        ExactLibraryDownloadProof::new(prepared.relative_path, observed_size, observed_sha1),
+        outcome,
+    ))
+}
+
 pub(super) async fn materialize_authenticated_selected_artifact_source(
     prepared: PreparedSelectedArtifactInstall,
     source: AuthenticatedSelectedArtifactSource,
@@ -271,7 +433,6 @@ async fn materialize_authenticated_selected_artifact_source_owned(
     #[cfg(test)] mut control: Option<SelectedPromotionTestControl>,
 ) -> Result<MaterializedSelectedArtifactSource, DownloadError> {
     let target = source.target.clone();
-    let temp_path = selected_promotion_temp_path(&prepared.destination);
     let mut facts = Vec::new();
     if matches!(
         async_fs::symlink_metadata(filesystem_path(&prepared.destination).as_ref()).await,
@@ -300,7 +461,131 @@ async fn materialize_authenticated_selected_artifact_source_owned(
             return Ok(MaterializedSelectedArtifactSource { source });
         }
     }
-    if let Some(parent) = prepared.destination.parent()
+    let bytes = Arc::clone(&source.bytes);
+    let expected_size = source.observed_size;
+    let expected_sha1 = source.observed_sha1;
+    let retained = tokio::task::spawn_blocking(move || {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        let mut file = tempfile::tempfile()?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        file.sync_data()?;
+        file.seek(SeekFrom::Start(0))?;
+        if !open_file_matches_source(&file, expected_size, &expected_sha1)? {
+            return Err(io::Error::other(
+                "selected source changed while preparing retained publication",
+            ));
+        }
+        Ok::<_, io::Error>(file)
+    })
+    .await
+    .map_err(|error| DownloadError::FileOperation(io::Error::other(error.to_string())))??;
+
+    publish_authenticated_retained_file(
+        RetainedExactSource::new(retained, expected_size, expected_sha1, ()),
+        prepared.destination.clone(),
+        target.clone(),
+        fact_tx.clone(),
+        #[cfg(test)]
+        control.take(),
+    )
+    .await?;
+    facts.extend(metadata_facts(&source.expected, &target));
+    facts.push(execution_download_fact(
+        ExecutionDownloadFactKind::ArtifactVerified,
+        &target,
+        no_download_fact_fields(),
+    ));
+    emit_execution_download_facts(fact_tx.as_ref(), &facts);
+    Ok(MaterializedSelectedArtifactSource { source })
+}
+
+async fn publish_authenticated_retained_file(
+    source: RetainedExactSource,
+    destination: PathBuf,
+    target: String,
+    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    #[cfg(test)] control: Option<SelectedPromotionTestControl>,
+) -> Result<ExactPublicationOutcome, DownloadError> {
+    let publication = PreparedExactPublication {
+        source,
+        destination,
+        target,
+    };
+    tokio::spawn(async move {
+        publish_authenticated_retained_file_owned(
+            publication,
+            fact_tx,
+            #[cfg(test)]
+            control,
+        )
+        .await
+    })
+    .await
+    .map_err(|error| {
+        DownloadError::FileOperation(io::Error::other(format!(
+            "authenticated publication task failed: {error}"
+        )))
+    })?
+}
+
+#[cfg(test)]
+pub(super) async fn publish_authenticated_retained_file_for_test(
+    source: std::fs::File,
+    destination: PathBuf,
+    observed_size: u64,
+    observed_sha1: [u8; 20],
+    target: String,
+    control: Option<SelectedPromotionTestControl>,
+) -> Result<ExactPublicationOutcome, DownloadError> {
+    publish_authenticated_retained_file(
+        RetainedExactSource::new(source, observed_size, observed_sha1, ()),
+        destination,
+        target,
+        None,
+        control,
+    )
+    .await
+}
+
+async fn publish_authenticated_retained_file_owned(
+    publication: PreparedExactPublication,
+    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    #[cfg(test)] mut control: Option<SelectedPromotionTestControl>,
+) -> Result<ExactPublicationOutcome, DownloadError> {
+    let mut facts = Vec::new();
+    let PreparedExactPublication {
+        source,
+        destination,
+        target,
+    } = publication;
+    let RetainedExactSource {
+        file: source,
+        observed_size,
+        observed_sha1,
+        _lifetime_guard: lifetime_guard,
+    } = source;
+    let source = validate_retained_source(source, observed_size, observed_sha1).await?;
+    if matches!(
+        async_fs::symlink_metadata(filesystem_path(&destination).as_ref()).await,
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink()
+    ) {
+        let existing_destination = destination.clone();
+        let existing =
+            tokio::task::spawn_blocking(move || open_regular_nofollow(&existing_destination))
+                .await
+                .map_err(|error| {
+                    DownloadError::FileOperation(io::Error::other(error.to_string()))
+                })??;
+        if validate_open_source_at_path(&existing, &destination, observed_size, observed_sha1)
+            .await?
+            == OpenSourceValidation::Exact
+        {
+            return Ok(ExactPublicationOutcome::AlreadyExact);
+        }
+    }
+    if let Some(parent) = destination.parent()
         && let Err(error) = async_fs::create_dir_all(filesystem_path(parent).as_ref()).await
     {
         record_io_failure_fact_pair(
@@ -312,7 +597,9 @@ async fn materialize_authenticated_selected_artifact_source_owned(
         emit_execution_download_facts(fact_tx.as_ref(), &facts);
         return Err(DownloadError::FileOperation(error));
     }
-    sweep_stale_selected_promotion_temps(&prepared.destination).await?;
+
+    let temp_path = selected_promotion_temp_path(&destination);
+    sweep_stale_selected_promotion_temps(&destination).await?;
     match async_fs::symlink_metadata(filesystem_path(&temp_path).as_ref()).await {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Ok(_) => {
@@ -323,11 +610,13 @@ async fn materialize_authenticated_selected_artifact_source_owned(
             ));
             emit_execution_download_facts(fact_tx.as_ref(), &facts);
             return Err(DownloadError::Integrity(
-                "selected artifact has an unsettled retained temp obligation".to_string(),
+                "artifact has an unsettled retained publication obligation".to_string(),
             ));
         }
         Err(error) => return Err(DownloadError::FileOperation(error)),
     }
+
+    let mut input = async_fs::File::from_std(source);
     let mut output = async_fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -344,19 +633,48 @@ async fn materialize_authenticated_selected_artifact_source_owned(
             emit_execution_download_facts(fact_tx.as_ref(), &facts);
             DownloadError::FileOperation(error)
         })?;
-    if let Err(error) = output.write_all(source.bytes()).await {
-        drop(output);
-        record_io_failure_fact_pair(
-            &mut facts,
-            &target,
-            error.kind(),
-            ExecutionDownloadFactKind::TempWriteFailed,
-        );
-        emit_execution_download_facts(fact_tx.as_ref(), &facts);
-        return Err(DownloadError::FileOperation(error));
+    let mut hasher = Sha1::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer).await.map_err(|error| {
+            record_io_failure_fact_pair(
+                &mut facts,
+                &target,
+                error.kind(),
+                ExecutionDownloadFactKind::TempWriteFailed,
+            );
+            emit_execution_download_facts(fact_tx.as_ref(), &facts);
+            DownloadError::FileOperation(error)
+        })?;
+        if read == 0 {
+            break;
+        }
+        copied = copied.saturating_add(read as u64);
+        if copied > observed_size {
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::ChecksumMismatch,
+                &target,
+                vec![("algorithm", "sha1")],
+            ));
+            emit_execution_download_facts(fact_tx.as_ref(), &facts);
+            return Err(DownloadError::Integrity(
+                "retained publication source exceeded its authenticated size".to_string(),
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        output.write_all(&buffer[..read]).await.map_err(|error| {
+            record_io_failure_fact_pair(
+                &mut facts,
+                &target,
+                error.kind(),
+                ExecutionDownloadFactKind::TempWriteFailed,
+            );
+            emit_execution_download_facts(fact_tx.as_ref(), &facts);
+            DownloadError::FileOperation(error)
+        })?;
     }
     if let Err(error) = output.flush().await {
-        drop(output);
         record_io_failure_fact_pair(
             &mut facts,
             &target,
@@ -367,7 +685,6 @@ async fn materialize_authenticated_selected_artifact_source_owned(
         return Err(DownloadError::FileOperation(error));
     }
     if let Err(error) = output.sync_data().await {
-        drop(output);
         record_io_failure_fact_pair(
             &mut facts,
             &target,
@@ -377,10 +694,25 @@ async fn materialize_authenticated_selected_artifact_source_owned(
         emit_execution_download_facts(fact_tx.as_ref(), &facts);
         return Err(DownloadError::FileOperation(error));
     }
+    let copied_sha1: [u8; 20] = hasher.finalize().into();
+    if copied != observed_size || copied_sha1 != observed_sha1 {
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::ChecksumMismatch,
+            &target,
+            vec![("algorithm", "sha1")],
+        ));
+        emit_execution_download_facts(fact_tx.as_ref(), &facts);
+        return Err(DownloadError::Integrity(
+            "retained publication copy does not match authenticated source".to_string(),
+        ));
+    }
+    let source = input.into_std().await;
+    validate_retained_source(source, observed_size, observed_sha1).await?;
+
     facts.push(execution_download_fact(
         ExecutionDownloadFactKind::WrittenToTemp,
         &target,
-        vec![("bytes", source.observed_size.to_string())],
+        vec![("bytes", observed_size.to_string())],
     ));
     let output = output.into_std().await;
     #[cfg(test)]
@@ -389,20 +721,93 @@ async fn materialize_authenticated_selected_artifact_source_owned(
             .reach(
                 SelectedPromotionTestStage::TempWritten,
                 &temp_path,
-                &prepared.destination,
+                &destination,
             )
             .await;
     }
-    let expected_size = source.observed_size;
-    let expected_sha1 = source.observed_sha1;
-    let temp_path_for_validation = temp_path.clone();
+    let output = validate_publication_temp(
+        output,
+        &temp_path,
+        observed_size,
+        observed_sha1,
+        &mut facts,
+        fact_tx.as_ref(),
+        &target,
+    )
+    .await?;
+    #[cfg(test)]
+    if let Some(control) = control.as_mut() {
+        control
+            .reach(
+                SelectedPromotionTestStage::TempValidated,
+                &temp_path,
+                &destination,
+            )
+            .await;
+    }
+
+    publish_authenticated_temp(
+        output,
+        &temp_path,
+        &destination,
+        observed_size,
+        observed_sha1,
+        #[cfg(test)]
+        control.as_mut(),
+    )
+    .await
+    .map_err(|error| {
+        facts.push(execution_download_fact(
+            ExecutionDownloadFactKind::PromoteFailed,
+            &target,
+            no_download_fact_fields(),
+        ));
+        emit_execution_download_facts(fact_tx.as_ref(), &facts);
+        DownloadError::FileOperation(error)
+    })?;
+    facts.push(execution_download_fact(
+        ExecutionDownloadFactKind::Promoted,
+        &target,
+        no_download_fact_fields(),
+    ));
+    emit_execution_download_facts(fact_tx.as_ref(), &facts);
+    drop(lifetime_guard);
+    Ok(ExactPublicationOutcome::Promoted)
+}
+
+async fn validate_retained_source(
+    mut source: std::fs::File,
+    expected_size: u64,
+    expected_sha1: [u8; 20],
+) -> Result<std::fs::File, DownloadError> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Seek as _, SeekFrom};
+
+        if !open_file_matches_source(&source, expected_size, &expected_sha1)? {
+            return Err(io::Error::other(
+                "retained publication source no longer matches authenticated bytes",
+            ));
+        }
+        source.seek(SeekFrom::Start(0))?;
+        Ok(source)
+    })
+    .await
+    .map_err(|error| DownloadError::FileOperation(io::Error::other(error.to_string())))?
+    .map_err(DownloadError::FileOperation)
+}
+
+async fn validate_publication_temp(
+    output: std::fs::File,
+    temp_path: &Path,
+    expected_size: u64,
+    expected_sha1: [u8; 20],
+    facts: &mut Vec<ExecutionDownloadFact>,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    target: &str,
+) -> Result<std::fs::File, DownloadError> {
+    let path = temp_path.to_path_buf();
     let validation = tokio::task::spawn_blocking(move || {
-        let valid = validate_open_source_sync(
-            &output,
-            &temp_path_for_validation,
-            expected_size,
-            &expected_sha1,
-        );
+        let valid = validate_open_source_sync(&output, &path, expected_size, &expected_sha1);
         (output, valid)
     })
     .await;
@@ -411,19 +816,19 @@ async fn materialize_authenticated_selected_artifact_source_owned(
         Ok((_output, Err(error))) => {
             facts.push(execution_download_fact(
                 ExecutionDownloadFactKind::TempWriteFailed,
-                &target,
+                target,
                 no_download_fact_fields(),
             ));
-            emit_execution_download_facts(fact_tx.as_ref(), &facts);
+            emit_execution_download_facts(fact_tx, facts);
             return Err(DownloadError::FileOperation(error));
         }
         Err(error) => {
             facts.push(execution_download_fact(
                 ExecutionDownloadFactKind::TempWriteFailed,
-                &target,
+                target,
                 no_download_fact_fields(),
             ));
-            emit_execution_download_facts(fact_tx.as_ref(), &facts);
+            emit_execution_download_facts(fact_tx, facts);
             return Err(DownloadError::FileOperation(io::Error::other(
                 error.to_string(),
             )));
@@ -433,71 +838,25 @@ async fn materialize_authenticated_selected_artifact_source_owned(
         facts.push(match valid {
             OpenSourceValidation::ContentMismatch => execution_download_fact(
                 ExecutionDownloadFactKind::ChecksumMismatch,
-                &target,
+                target,
                 vec![("algorithm", "sha1")],
             ),
             OpenSourceValidation::IdentityMismatch => execution_download_fact(
                 ExecutionDownloadFactKind::PromoteFailed,
-                &target,
+                target,
                 no_download_fact_fields(),
             ),
             OpenSourceValidation::Exact => unreachable!(),
         });
-        emit_execution_download_facts(fact_tx.as_ref(), &facts);
+        emit_execution_download_facts(fact_tx, facts);
         return Err(DownloadError::Integrity(
-            "selected artifact temp does not match authenticated source".to_string(),
+            "publication temp does not match authenticated source".to_string(),
         ));
     }
-    #[cfg(test)]
-    if let Some(control) = control.as_mut() {
-        control
-            .reach(
-                SelectedPromotionTestStage::TempValidated,
-                &temp_path,
-                &prepared.destination,
-            )
-            .await;
-    }
-
-    let publish = publish_authenticated_selected_artifact(
-        output,
-        &temp_path,
-        &prepared.destination,
-        expected_size,
-        expected_sha1,
-        #[cfg(test)]
-        control.as_mut(),
-    )
-    .await;
-    match publish {
-        Ok(()) => {
-            facts.push(execution_download_fact(
-                ExecutionDownloadFactKind::Promoted,
-                &target,
-                no_download_fact_fields(),
-            ));
-            facts.extend(metadata_facts(&source.expected, &target));
-            facts.push(execution_download_fact(
-                ExecutionDownloadFactKind::ArtifactVerified,
-                &target,
-                no_download_fact_fields(),
-            ));
-            emit_execution_download_facts(fact_tx.as_ref(), &facts);
-            Ok(MaterializedSelectedArtifactSource { source })
-        }
-        Err(error) => {
-            facts.push(execution_download_fact(
-                ExecutionDownloadFactKind::PromoteFailed,
-                &target,
-                no_download_fact_fields(),
-            ));
-            emit_execution_download_facts(fact_tx.as_ref(), &facts);
-            Err(DownloadError::FileOperation(error))
-        }
-    }
+    Ok(output)
 }
 
-async fn publish_authenticated_selected_artifact(
+async fn publish_authenticated_temp(
     output: std::fs::File,
     temp_path: &Path,
     destination: &Path,
@@ -527,7 +886,7 @@ async fn publish_authenticated_selected_artifact(
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "selected artifact destination identity is unsupported",
+                "authenticated artifact destination identity is unsupported",
             ));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -538,7 +897,7 @@ async fn publish_authenticated_selected_artifact(
         rename_no_replace(destination, &backup_path).await?;
         if !validate_open_identity_at_path(&existing, &backup_path, existing_size).await? {
             return Err(io::Error::other(
-                "selected artifact backup identity changed during promotion",
+                "authenticated artifact backup identity changed during promotion",
             ));
         }
         #[cfg(test)]
@@ -574,7 +933,7 @@ async fn publish_authenticated_selected_artifact(
         .as_deref()
         .is_some_and(|control| control.fail_publish_rename)
     {
-        Err(io::Error::other("forced selected publication failure"))
+        Err(io::Error::other("forced authenticated publication failure"))
     } else {
         rename_no_replace(temp_path, destination).await
     };
@@ -598,7 +957,7 @@ async fn publish_authenticated_selected_artifact(
     let publication_validation =
         validate_open_source_at_path(&output, destination, expected_size, expected_sha1).await;
     if !matches!(publication_validation, Ok(OpenSourceValidation::Exact)) {
-        let rollback = rollback_selected_publication(
+        let rollback = rollback_authenticated_publication(
             &output,
             expected_size,
             destination,
@@ -609,9 +968,7 @@ async fn publish_authenticated_selected_artifact(
         .await;
         rollback?;
         return Err(match publication_validation {
-            Ok(_) => {
-                io::Error::other("published selected artifact does not match authenticated source")
-            }
+            Ok(_) => io::Error::other("published artifact does not match authenticated source"),
             Err(error) => error,
         });
     }
@@ -652,13 +1009,13 @@ async fn restore_unpublished_backup(
     rename_no_replace(backup_path, destination).await?;
     if !validate_open_identity_at_path(backup, destination, *size).await? {
         return Err(io::Error::other(
-            "restored selected artifact backup identity does not match",
+            "restored artifact backup identity does not match",
         ));
     }
     Ok(())
 }
 
-async fn rollback_selected_publication(
+async fn rollback_authenticated_publication(
     output: &std::fs::File,
     expected_size: u64,
     destination: &Path,
@@ -682,7 +1039,7 @@ async fn rollback_selected_publication(
     rename_no_replace(destination, rejected_path).await?;
     if !validate_open_identity_at_path(output, rejected_path, expected_size).await? {
         return Err(io::Error::other(
-            "rejected selected artifact identity changed during rollback",
+            "rejected artifact identity changed during rollback",
         ));
     }
     restore_unpublished_backup(backup, backup_path, destination).await?;
@@ -1125,75 +1482,6 @@ fn source_artifact_metadata_error(target: &str, status: &str) -> DownloadError {
     DownloadError::Integrity(format!("{target} integrity metadata is {status}"))
 }
 
-#[derive(Clone, Copy)]
-enum DownloadChecksumRequirement {
-    Required,
-    AllowMissing,
-}
-
-impl DownloadChecksumRequirement {
-    fn request<'a>(
-        self,
-        url: &'a str,
-        destination: &'a Path,
-        expected: &'a ExpectedIntegrity,
-    ) -> ExecutionDownloadRequest<'a> {
-        match self {
-            Self::Required => {
-                ExecutionDownloadRequest::launcher_managed(url, destination, expected)
-            }
-            Self::AllowMissing => {
-                ExecutionDownloadRequest::launcher_managed_best_effort(url, destination, expected)
-            }
-        }
-    }
-}
-
-pub(super) async fn download_file_with_client_and_fact_sender_allowing_missing_checksum_with_authority(
-    kind: SelectedDownloadArtifactKind,
-    client: &reqwest::Client,
-    url: &str,
-    destination: &Path,
-    expected: &ExpectedIntegrity,
-    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-) -> Result<AuthenticatedArtifactDownload, DownloadError> {
-    guard_existing_unsupported_selected_artifact(
-        kind,
-        destination,
-        url,
-        expected,
-        fact_tx,
-        descriptor_tx,
-    )
-    .await?;
-    emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
-    emit_selected_artifact_missing_fact_if_absent(fact_tx, kind, destination, expected).await;
-    let retry_delays = default_download_retry_delays();
-    match download_launcher_managed_with_transient_retries_with_authority(
-        client,
-        url,
-        destination,
-        expected,
-        DownloadChecksumRequirement::AllowMissing,
-        &retry_delays,
-    )
-    .await
-    {
-        Ok(download) => {
-            let facts =
-                selected_execution_download_facts(kind, destination, &download.report.facts);
-            emit_execution_download_facts(fact_tx, &facts);
-            Ok(download)
-        }
-        Err(error) => {
-            let facts = selected_execution_download_facts(kind, destination, &error.facts);
-            emit_execution_download_facts(fact_tx, &facts);
-            Err(error.into_download_error())
-        }
-    }
-}
-
 pub(super) async fn ensure_selected_artifact_with_client(
     kind: SelectedDownloadArtifactKind,
     client: &reqwest::Client,
@@ -1447,13 +1735,6 @@ fn selected_artifact_metadata_error(destination: &Path, status: &str) -> Downloa
     ))
 }
 
-fn checksumless_artifact_structure_error(destination: &Path) -> DownloadError {
-    DownloadError::Integrity(format!(
-        "{} could not be validated as a usable checksumless artifact",
-        bounded_download_file_label(destination)
-    ))
-}
-
 async fn emit_selected_artifact_missing_fact_if_absent(
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
     kind: SelectedDownloadArtifactKind,
@@ -1503,7 +1784,6 @@ pub async fn download_file_with_client_report(
         url,
         destination,
         expected,
-        DownloadChecksumRequirement::Required,
         &retry_delays,
     )
     .await
@@ -1522,7 +1802,6 @@ pub(super) async fn download_file_with_client_report_with_retry_delays(
         url,
         destination,
         expected,
-        DownloadChecksumRequirement::Required,
         retry_delays,
     )
     .await
@@ -1537,34 +1816,13 @@ async fn download_launcher_managed_with_transient_retries(
     url: &str,
     destination: &Path,
     expected: &ExpectedIntegrity,
-    checksum_requirement: DownloadChecksumRequirement,
     retry_delays: &[Duration],
 ) -> Result<ExecutionDownloadReport, ExecutionDownloadError> {
-    download_launcher_managed_with_transient_retries_with_authority(
-        client,
-        url,
-        destination,
-        expected,
-        checksum_requirement,
-        retry_delays,
-    )
-    .await
-    .map(|download| download.report)
-}
-
-async fn download_launcher_managed_with_transient_retries_with_authority(
-    client: &reqwest::Client,
-    url: &str,
-    destination: &Path,
-    expected: &ExpectedIntegrity,
-    checksum_requirement: DownloadChecksumRequirement,
-    retry_delays: &[Duration],
-) -> Result<AuthenticatedArtifactDownload, ExecutionDownloadError> {
     let mut next_delay = 0_usize;
     loop {
-        match execute_download_to_temp_with_authority(
+        match execute_download_to_temp_inner(
             client,
-            checksum_requirement.request(url, destination, expected),
+            ExecutionDownloadRequest::launcher_managed(url, destination, expected),
         )
         .await
         {
@@ -1746,36 +2004,13 @@ pub(super) async fn execute_download_to_temp(
     client: &reqwest::Client,
     request: ExecutionDownloadRequest<'_>,
 ) -> Result<ExecutionDownloadReport, ExecutionDownloadError> {
-    execute_download_to_temp_with_authority(client, request)
-        .await
-        .map(|download| download.report)
+    execute_download_to_temp_inner(client, request).await
 }
 
-async fn execute_download_to_temp_with_authority(
+async fn execute_download_to_temp_inner(
     client: &reqwest::Client,
     request: ExecutionDownloadRequest<'_>,
-) -> Result<AuthenticatedArtifactDownload, ExecutionDownloadError> {
-    execute_download_to_temp_with_authority_and_hook(client, request, None).await
-}
-
-#[cfg(test)]
-pub(super) async fn execute_download_to_temp_with_pre_promote_hook(
-    client: &reqwest::Client,
-    request: ExecutionDownloadRequest<'_>,
-    hook: impl FnOnce(&Path, &Path) + Send + 'static,
 ) -> Result<ExecutionDownloadReport, ExecutionDownloadError> {
-    execute_download_to_temp_with_authority_and_hook(client, request, Some(Box::new(hook)))
-        .await
-        .map(|download| download.report)
-}
-
-type PrePromoteHook = Box<dyn FnOnce(&Path, &Path) + Send>;
-
-async fn execute_download_to_temp_with_authority_and_hook(
-    client: &reqwest::Client,
-    request: ExecutionDownloadRequest<'_>,
-    pre_promote: Option<PrePromoteHook>,
-) -> Result<AuthenticatedArtifactDownload, ExecutionDownloadError> {
     let target = safe_download_target_label(request.destination);
     let mut facts = metadata_facts(request.expected, &target);
     if !request.ownership.allows_managed_mutation() {
@@ -1810,7 +2045,7 @@ async fn execute_download_to_temp_with_authority_and_hook(
             )),
         ));
     }
-    if request.require_checksum && request.expected.sha1.is_none() {
+    if request.expected.sha1.is_none() {
         facts.push(execution_download_fact(
             ExecutionDownloadFactKind::MetadataMissing,
             &target,
@@ -2041,94 +2276,15 @@ async fn execute_download_to_temp_with_authority_and_hook(
         )
         .await);
     }
-    if request.expected.has_evidence() {
-        facts.push(execution_download_fact(
-            ExecutionDownloadFactKind::ArtifactVerified,
-            &target,
-            no_download_fact_fields(),
-        ));
-    }
-
-    let mut validated_temp = if request.expected.sha1.is_none() {
-        let destination = request.destination.to_path_buf();
-        let validation_task = tokio::task::spawn_blocking(move || {
-            let usable = written > 0
-                && (!destination
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
-                    || checksumless_jar_file_is_readable(&output)?);
-            Ok::<_, io::Error>((output, usable))
-        })
-        .await;
-        let validation = match validation_task {
-            Ok(validation) => validation,
-            Err(error) => {
-                return Err(finish_execution_error_after_temp_discard(
-                    &tmp_path,
-                    &target,
-                    &mut facts,
-                    ExecutionDownloadFactKind::TempWriteFailed,
-                    DownloadError::FileOperation(io::Error::other(format!(
-                        "checksumless validation worker failed: {error}"
-                    ))),
-                )
-                .await);
-            }
-        };
-        match validation {
-            Ok((file, true)) => Some(file),
-            Ok((file, false)) => {
-                drop(file);
-                return Err(finish_execution_error_after_temp_discard(
-                    &tmp_path,
-                    &target,
-                    &mut facts,
-                    ExecutionDownloadFactKind::ChecksumMismatch,
-                    checksumless_artifact_structure_error(request.destination),
-                )
-                .await);
-            }
-            Err(error) => {
-                return Err(finish_execution_error_after_temp_discard(
-                    &tmp_path,
-                    &target,
-                    &mut facts,
-                    ExecutionDownloadFactKind::TempWriteFailed,
-                    DownloadError::FileOperation(error),
-                )
-                .await);
-            }
-        }
-    } else {
-        drop(output);
-        None
-    };
-
-    if let Some(hook) = pre_promote {
-        hook(&tmp_path, request.destination);
-    }
-    if let Some(file) = validated_temp.as_ref()
-        && !path_matches_open_file(file, &tmp_path, written).unwrap_or(false)
-    {
-        validated_temp.take();
-        return Err(finish_execution_error_after_temp_discard(
-            &tmp_path,
-            &target,
-            &mut facts,
-            ExecutionDownloadFactKind::PromoteFailed,
-            DownloadError::Integrity("validated download temp identity changed".to_string()),
-        )
-        .await);
-    }
-
-    let promotion = if let Some(file) = validated_temp.as_ref() {
-        promote_validated_artifact_temp(file, &tmp_path, request.destination, written).await
-    } else {
+    facts.push(execution_download_fact(
+        ExecutionDownloadFactKind::ArtifactVerified,
+        &target,
+        no_download_fact_fields(),
+    ));
+    drop(output);
+    if let Err(error) =
         promote_launcher_managed_artifact_temp_once(&tmp_path, request.destination).await
-    };
-    if let Err(error) = promotion {
-        validated_temp.take();
+    {
         return Err(finish_io_failure_after_temp_discard(
             &tmp_path,
             &target,
@@ -2139,31 +2295,15 @@ async fn execute_download_to_temp_with_authority_and_hook(
         )
         .await);
     }
-    if let Some(file) = validated_temp.as_ref()
-        && !path_matches_open_file(file, request.destination, written).unwrap_or(false)
-    {
-        return Err(execution_download_error(
-            ExecutionDownloadFactKind::PromoteFailed,
-            facts,
-            DownloadError::Integrity(
-                "promoted download identity does not match validated bytes".to_string(),
-            ),
-        ));
-    }
     facts.push(execution_download_fact(
         ExecutionDownloadFactKind::Promoted,
         &target,
         no_download_fact_fields(),
     ));
-    drop(validated_temp);
-
-    Ok(AuthenticatedArtifactDownload {
-        report: ExecutionDownloadReport {
-            target,
-            bytes_written: written,
-            facts,
-        },
-        sha1,
+    Ok(ExecutionDownloadReport {
+        target,
+        bytes_written: written,
+        facts,
     })
 }
 
@@ -2318,69 +2458,6 @@ pub(crate) async fn promote_launcher_managed_artifact_temp_once(
             .await
         }
     }
-}
-
-async fn promote_validated_artifact_temp(
-    file: &std::fs::File,
-    temp_path: &Path,
-    destination: &Path,
-    size: u64,
-) -> io::Result<()> {
-    sweep_stale_promotion_backups(destination).await?;
-    let existing = async_fs::symlink_metadata(filesystem_path(destination).as_ref()).await;
-    let backup = if matches!(&existing, Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink())
-    {
-        let backup = promotion_backup_path(destination);
-        async_fs::rename(
-            filesystem_path(destination).as_ref(),
-            filesystem_path(&backup).as_ref(),
-        )
-        .await?;
-        Some(backup)
-    } else {
-        None
-    };
-
-    if let Err(error) = async_fs::rename(
-        filesystem_path(temp_path).as_ref(),
-        filesystem_path(destination).as_ref(),
-    )
-    .await
-    {
-        if let Some(backup) = backup.as_ref() {
-            async_fs::rename(
-                filesystem_path(backup).as_ref(),
-                filesystem_path(destination).as_ref(),
-            )
-            .await?;
-        }
-        return Err(error);
-    }
-
-    if !path_matches_open_file(file, destination, size).unwrap_or(false) {
-        if let Some(backup) = backup.as_ref() {
-            let rejected = download_temp_path(destination);
-            let _ = async_fs::rename(
-                filesystem_path(destination).as_ref(),
-                filesystem_path(&rejected).as_ref(),
-            )
-            .await;
-            async_fs::rename(
-                filesystem_path(backup).as_ref(),
-                filesystem_path(destination).as_ref(),
-            )
-            .await?;
-            let _ = async_fs::remove_file(filesystem_path(&rejected).as_ref()).await;
-        }
-        return Err(io::Error::other(
-            "promoted artifact identity does not match validated temp",
-        ));
-    }
-
-    if let Some(backup) = backup {
-        async_fs::remove_file(filesystem_path(&backup).as_ref()).await?;
-    }
-    Ok(())
 }
 
 pub(super) async fn remove_stale_download_temp(temp_path: &Path) -> Result<(), DownloadError> {

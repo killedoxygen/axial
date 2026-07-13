@@ -161,22 +161,6 @@ pub fn signed_jar_metadata_entry_name(name: &str) -> bool {
             && (upper.ends_with(".SF") || upper.ends_with(".RSA") || upper.ends_with(".DSA")))
 }
 
-pub(super) fn checksumless_jar_file_is_readable(file: &std::fs::File) -> io::Result<bool> {
-    let file = file.try_clone()?;
-    let Ok(mut archive) = zip::ZipArchive::new(file) else {
-        return Ok(false);
-    };
-    for index in 0..archive.len() {
-        let Ok(entry) = archive.by_index(index) else {
-            return Ok(false);
-        };
-        if !entry.is_dir() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 #[cfg(test)]
 pub(super) async fn existing_file_satisfies(
     path: &Path,

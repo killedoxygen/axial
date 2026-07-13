@@ -10,33 +10,37 @@ use super::integrity::{
     observe_hash_file_calls, verify_download_integrity,
 };
 use super::libraries::{library_jobs_for, library_verification_plans_for};
+use super::library_source::{
+    LibrarySourcePool, LibrarySourceRequest, acquire_authenticated_library_source,
+};
 use super::model::{ActualIntegrity, DownloadIntegrityError};
 use super::path_safety::{
     bounded_download_file_label, safe_download_target_label, windows_verbatim_path_string,
 };
 use super::promotion::{
-    selected_promotion_temp_path, sweep_stale_promotion_backups,
+    promotion_backup_path, selected_promotion_temp_path, sweep_stale_promotion_backups,
     sweep_stale_selected_promotion_temps,
 };
 use super::runtime::{
     RuntimeEnsurePipeline, finish_runtime_pipeline_after_artifacts, runtime_ensure_progress,
 };
 use super::transfer::{
-    AuthenticatedSelectedArtifactSource, PreparedSelectedArtifactInstall,
+    AuthenticatedSelectedArtifactSource, ExactPublicationOutcome, PreparedSelectedArtifactInstall,
     SelectedArtifactSourceRequest, SelectedPromotionTestControl, SelectedPromotionTestStage,
     acquire_authenticated_selected_artifact_source,
     acquire_authenticated_selected_artifact_source_with_retry_delays_for_test,
     download_file_with_client, download_file_with_client_report_with_retry_delays,
     download_temp_path, ensure_selected_artifact_with_client, execute_download_to_temp,
-    execute_download_to_temp_with_pre_promote_hook,
-    materialize_authenticated_selected_artifact_source,
-    materialize_authenticated_selected_artifact_source_with_control,
-    prepare_selected_artifact_install, remove_stale_download_temp,
+    materialize_authenticated_library_source, materialize_authenticated_selected_artifact_source,
+    materialize_authenticated_selected_artifact_source_with_control, prepare_library_publication,
+    prepare_selected_artifact_install, publish_authenticated_retained_file_for_test,
+    remove_stale_download_temp,
 };
 use super::*;
+use crate::artifact_path::ArtifactRelativePath;
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
 use crate::manifest::VersionManifest;
-use crate::paths::versions_dir;
+use crate::paths::{libraries_dir, versions_dir};
 use crate::rules::Environment;
 use crate::runtime::{RuntimeEnsureEvent, RuntimeSourceReceipt};
 use sha1::{Digest as _, Sha1};
@@ -1055,41 +1059,6 @@ async fn execute_download_to_temp_reports_successful_integrity() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn checksumless_proof_rejects_temp_path_substitution_after_handle_validation() {
-    let root = temp_dir("checksumless-temp-identity-race");
-    fs::create_dir_all(&root).expect("create root");
-    let destination = root.join("artifact.jar");
-    let body = checksumless_test_jar();
-    let url = spawn_download_response_server(
-        "200 OK",
-        vec![(
-            "Content-Type".to_string(),
-            "application/octet-stream".to_string(),
-        )],
-        body,
-        1,
-    )
-    .await;
-    let client = build_http_client(Duration::from_secs(1));
-    let expected = ExpectedIntegrity::default();
-    let request =
-        ExecutionDownloadRequest::launcher_managed_best_effort(&url, &destination, &expected);
-
-    let error =
-        execute_download_to_temp_with_pre_promote_hook(&client, request, |temp, _destination| {
-            let retained = temp.with_extension("validated-retained");
-            fs::rename(temp, retained).expect("substitute validated temp path");
-            fs::write(temp, checksumless_test_jar()).expect("write replacement temp");
-        })
-        .await
-        .expect_err("replacement pathname cannot consume validated authority");
-
-    assert_eq!(error.kind, ExecutionDownloadFactKind::PromoteFailed);
-    assert!(!destination.exists());
-    let _ = fs::remove_dir_all(root);
-}
-
 fn checksumless_test_jar() -> Vec<u8> {
     let cursor = std::io::Cursor::new(Vec::new());
     let mut archive = zip::ZipWriter::new(cursor);
@@ -1318,7 +1287,6 @@ async fn execute_download_to_temp_refuses_non_launcher_owned_targets() {
                 destination: &destination,
                 expected: &expected,
                 ownership,
-                require_checksum: true,
             },
         )
         .await
@@ -3262,6 +3230,297 @@ async fn authenticated_source_cancellation_after_backup_still_settles_publicatio
         fs::read(&backups[0]).expect("retained backup"),
         b"old-source"
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn retained_file_publisher_owns_publication_after_caller_cancellation() {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let root = temp_dir("retained-publisher-cancel-after-backup");
+    let destination = root.join("library.jar");
+    let body = b"authenticated-library-source";
+    fs::create_dir_all(&root).expect("source root");
+    fs::write(&destination, b"old-library").expect("old destination");
+    let mut source = tempfile::tempfile().expect("anonymous retained source");
+    source.write_all(body).expect("write retained source");
+    source.flush().expect("flush retained source");
+    source.sync_data().expect("sync retained source");
+    source.seek(SeekFrom::Start(0)).expect("rewind source");
+    let observed_sha1: [u8; 20] = Sha1::digest(body).into();
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    let control = SelectedPromotionTestControl {
+        hook: None,
+        pause_at: Some(SelectedPromotionTestStage::BackupOwned),
+        reached: Some(reached_tx),
+        resume: Some(resume_rx),
+        fail_publish_rename: false,
+    };
+    let destination_for_task = destination.clone();
+    let publisher = tokio::spawn(async move {
+        publish_authenticated_retained_file_for_test(
+            source,
+            destination_for_task,
+            body.len() as u64,
+            observed_sha1,
+            "minecraft_library_test".to_string(),
+            Some(control),
+        )
+        .await
+    });
+    reached_rx.await.expect("backup-owned boundary");
+    publisher.abort();
+    let _ = resume_tx.send(());
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if fs::read(&destination).ok().as_deref() == Some(body.as_slice())
+                && !selected_promotion_temp_path(&destination).exists()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("owned publisher must settle after caller cancellation");
+    assert_eq!(selected_reserved_backups(&destination).len(), 1);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn prepared_library_publication_reuses_exact_destination_with_occupied_backup() {
+    let root = temp_dir("prepared-library-publication-noop");
+    let relative_path =
+        ArtifactRelativePath::from_path(Path::new("org/example/demo/1.0.0/demo-1.0.0.jar"))
+            .expect("safe relative path");
+    let destination = relative_path.join_under(&libraries_dir(&root));
+    let body = checksumless_test_jar();
+    let expected = ExpectedIntegrity {
+        size: Some(body.len() as u64),
+        sha1: None,
+    };
+    let (url, _) = spawn_scripted_download_server(vec![
+        ScriptedDownloadResponse::full("200 OK", body.clone()),
+        ScriptedDownloadResponse::full("200 OK", body.clone()),
+    ])
+    .await;
+    let client = build_http_client(Duration::from_secs(5));
+    let pool = LibrarySourcePool::new();
+    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
+    let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
+
+    let prepared = prepare_library_publication(
+        &root,
+        relative_path.clone(),
+        &url,
+        &expected,
+        Some(&fact_tx),
+        Some(&descriptor_tx),
+    )
+    .await
+    .expect("prepare first publication");
+    let source = acquire_authenticated_library_source(LibrarySourceRequest {
+        client: &client,
+        url: &url,
+        expected: prepared.expected(),
+        relative_path: &relative_path,
+        max_bytes: 1024 * 1024,
+        target: prepared.target(),
+        pool: &pool,
+        fact_tx: None,
+    })
+    .await
+    .expect("first authenticated source");
+    let (proof, outcome) =
+        materialize_authenticated_library_source(prepared, source, Some(&fact_tx))
+            .await
+            .expect("publish first source");
+    assert_eq!(outcome, ExactPublicationOutcome::Promoted);
+    assert_eq!(proof.into_parts().0, relative_path);
+    assert_eq!(fs::read(&destination).expect("published library"), body);
+
+    let occupied_backup = promotion_backup_path(&destination);
+    fs::write(&occupied_backup, b"occupied-backup").expect("occupied retained backup");
+    let prepared = prepare_library_publication(
+        &root,
+        relative_path.clone(),
+        &url,
+        &expected,
+        Some(&fact_tx),
+        Some(&descriptor_tx),
+    )
+    .await
+    .expect("prepare repeated publication");
+    let source = acquire_authenticated_library_source(LibrarySourceRequest {
+        client: &client,
+        url: &url,
+        expected: prepared.expected(),
+        relative_path: &relative_path,
+        max_bytes: 1024 * 1024,
+        target: prepared.target(),
+        pool: &pool,
+        fact_tx: None,
+    })
+    .await
+    .expect("repeated authenticated source");
+    let (_, outcome) = materialize_authenticated_library_source(prepared, source, Some(&fact_tx))
+        .await
+        .expect("reuse exact destination");
+    assert_eq!(outcome, ExactPublicationOutcome::AlreadyExact);
+    assert_eq!(
+        fs::read(&occupied_backup).expect("untouched backup"),
+        b"occupied-backup"
+    );
+    let facts = std::iter::from_fn(|| fact_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
+            .count(),
+        1
+    );
+    let descriptors = std::iter::from_fn(|| descriptor_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(descriptors.len(), 2);
+    assert!(descriptors.iter().all(|descriptor| {
+        descriptor.expected_size == Some(body.len() as u64) && descriptor.sha1() == sha1_hex(&body)
+    }));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn prepared_library_publication_rejects_mismatched_source_contract() {
+    let root = temp_dir("prepared-library-publication-mismatch");
+    let relative_path =
+        ArtifactRelativePath::from_path(Path::new("org/example/demo/1.0.0/demo-1.0.0.jar"))
+            .expect("safe relative path");
+    let destination = relative_path.join_under(&libraries_dir(&root));
+    let body = checksumless_test_jar();
+    let prepared_expected = ExpectedIntegrity::default();
+    let source_expected = ExpectedIntegrity {
+        size: Some(body.len() as u64),
+        sha1: None,
+    };
+    let (url, _) =
+        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
+    let client = build_http_client(Duration::from_secs(5));
+    let pool = LibrarySourcePool::new();
+    let prepared = prepare_library_publication(
+        &root,
+        relative_path.clone(),
+        &url,
+        &prepared_expected,
+        None,
+        None,
+    )
+    .await
+    .expect("prepare destination contract");
+    let source = acquire_authenticated_library_source(LibrarySourceRequest {
+        client: &client,
+        url: &url,
+        expected: &source_expected,
+        relative_path: &relative_path,
+        max_bytes: 1024 * 1024,
+        target: prepared.target(),
+        pool: &pool,
+        fact_tx: None,
+    })
+    .await
+    .expect("authenticated mismatched source");
+
+    materialize_authenticated_library_source(prepared, source, None)
+        .await
+        .err()
+        .expect("mismatched expected contract must fail");
+    assert!(!destination.exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn prepared_library_publication_rejects_colliding_relative_path() {
+    let root = temp_dir("prepared-library-relative-path-mismatch");
+    let prepared_path =
+        ArtifactRelativePath::from_path(Path::new("org/example/first/1.0.0/shared.jar"))
+            .expect("safe prepared path");
+    let source_path =
+        ArtifactRelativePath::from_path(Path::new("org/example/second/1.0.0/shared.jar"))
+            .expect("safe source path");
+    let destination = prepared_path.join_under(&libraries_dir(&root));
+    let body = checksumless_test_jar();
+    let expected = ExpectedIntegrity {
+        size: Some(body.len() as u64),
+        sha1: None,
+    };
+    let (url, _) =
+        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
+    let client = build_http_client(Duration::from_secs(5));
+    let pool = LibrarySourcePool::new();
+    let prepared = prepare_library_publication(&root, prepared_path, &url, &expected, None, None)
+        .await
+        .expect("prepare destination contract");
+    let source = acquire_authenticated_library_source(LibrarySourceRequest {
+        client: &client,
+        url: &url,
+        expected: &expected,
+        relative_path: &source_path,
+        max_bytes: 1024 * 1024,
+        target: prepared.target(),
+        pool: &pool,
+        fact_tx: None,
+    })
+    .await
+    .expect("authenticated colliding source");
+
+    materialize_authenticated_library_source(prepared, source, None)
+        .await
+        .err()
+        .expect("colliding target label must not replace the logical path key");
+    assert!(!destination.exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn prepared_library_publication_rejects_provider_url_substitution() {
+    let root = temp_dir("prepared-library-provider-mismatch");
+    let relative_path =
+        ArtifactRelativePath::from_path(Path::new("org/example/provider/1.0.0/provider.jar"))
+            .expect("safe relative path");
+    let destination = relative_path.join_under(&libraries_dir(&root));
+    let body = checksumless_test_jar();
+    let expected = ExpectedIntegrity::default();
+    let (source_url, _) =
+        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
+    let prepared = prepare_library_publication(
+        &root,
+        relative_path.clone(),
+        "https://provider-b.invalid/library.jar",
+        &expected,
+        None,
+        None,
+    )
+    .await
+    .expect("prepare provider-bound contract");
+    let client = build_http_client(Duration::from_secs(5));
+    let pool = LibrarySourcePool::new();
+    let source = acquire_authenticated_library_source(LibrarySourceRequest {
+        client: &client,
+        url: &source_url,
+        expected: &expected,
+        relative_path: &relative_path,
+        max_bytes: 1024 * 1024,
+        target: prepared.target(),
+        pool: &pool,
+        fact_tx: None,
+    })
+    .await
+    .expect("authenticated provider-A source");
+
+    materialize_authenticated_library_source(prepared, source, None)
+        .await
+        .err()
+        .expect("provider substitution must fail");
+    assert!(!destination.exists());
     let _ = fs::remove_dir_all(root);
 }
 

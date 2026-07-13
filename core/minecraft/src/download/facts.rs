@@ -16,7 +16,6 @@ pub(super) struct ExecutionDownloadRequest<'a> {
     pub(super) destination: &'a Path,
     pub(super) expected: &'a ExpectedIntegrity,
     pub(super) ownership: ExecutionDownloadOwnership,
-    pub(super) require_checksum: bool,
 }
 
 impl<'a> ExecutionDownloadRequest<'a> {
@@ -30,21 +29,6 @@ impl<'a> ExecutionDownloadRequest<'a> {
             destination,
             expected,
             ownership: ExecutionDownloadOwnership::LauncherManaged,
-            require_checksum: true,
-        }
-    }
-
-    pub(super) fn launcher_managed_best_effort(
-        url: &'a str,
-        destination: &'a Path,
-        expected: &'a ExpectedIntegrity,
-    ) -> Self {
-        Self {
-            url,
-            destination,
-            expected,
-            ownership: ExecutionDownloadOwnership::LauncherManaged,
-            require_checksum: false,
         }
     }
 }

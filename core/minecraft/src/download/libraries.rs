@@ -1,13 +1,18 @@
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
+use super::facts::selected_download_target_label;
 use super::integrity::is_sha1_hex;
+use super::library_source::{
+    LIBRARY_SOURCE_MAX_BYTES, LibrarySourcePool, LibrarySourceRequest,
+    acquire_authenticated_library_source,
+};
 use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
     ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactDescriptor,
     SelectedDownloadArtifactKind, progress,
 };
 use super::transfer::{
-    download_file_with_client_and_fact_sender_allowing_missing_checksum_with_authority,
-    ensure_selected_artifact_with_client, ensure_selected_artifact_with_client_and_observed_size,
+    ensure_selected_artifact_with_client_and_observed_size,
+    materialize_authenticated_library_source, prepare_library_publication,
 };
 use crate::artifact_path::ArtifactRelativePath;
 use crate::launch::{Library, maven_to_path};
@@ -77,47 +82,6 @@ impl LibraryArtifactPlan {
     }
 }
 
-pub async fn download_libraries<F>(
-    mc_dir: &Path,
-    libraries: &[Library],
-    phase: &str,
-    send: F,
-) -> Result<(), DownloadError>
-where
-    F: FnMut(DownloadProgress),
-{
-    let env = default_environment();
-    let jobs = library_jobs_for(mc_dir, libraries, &env)?;
-    download_library_jobs(jobs, phase, send, None, None).await
-}
-
-pub async fn download_libraries_with_facts_and_descriptors<F, G, H>(
-    mc_dir: &Path,
-    libraries: &[Library],
-    phase: &str,
-    send: F,
-    mut send_fact: G,
-    mut send_descriptor: H,
-) -> Result<(), DownloadError>
-where
-    F: FnMut(DownloadProgress),
-    G: FnMut(ExecutionDownloadFact),
-    H: FnMut(SelectedDownloadArtifactDescriptor),
-{
-    let env = default_environment();
-    let jobs = library_jobs_for(mc_dir, libraries, &env)?;
-    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-    let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
-    let result = download_library_jobs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx)).await;
-    while let Ok(fact) = fact_rx.try_recv() {
-        send_fact(fact);
-    }
-    while let Ok(descriptor) = descriptor_rx.try_recv() {
-        send_descriptor(descriptor);
-    }
-    result
-}
-
 pub(crate) async fn download_profile_libraries_with_proofs_and_facts_and_descriptors<F, G, H>(
     mc_dir: &Path,
     libraries: &[Library],
@@ -135,9 +99,15 @@ where
     let jobs = library_jobs_for(mc_dir, libraries, &env)?;
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
-    let result =
-        download_library_jobs_with_proofs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx))
-            .await;
+    let result = download_library_jobs_with_proofs(
+        mc_dir,
+        jobs,
+        phase,
+        send,
+        Some(fact_tx),
+        Some(descriptor_tx),
+    )
+    .await;
     while let Ok(fact) = fact_rx.try_recv() {
         send_fact(fact);
     }
@@ -165,9 +135,15 @@ where
     let jobs = installer_library_jobs_for(mc_dir, libraries, &env, excluded_paths)?;
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
-    let result =
-        download_library_jobs_with_proofs(jobs, phase, send, Some(fact_tx), Some(descriptor_tx))
-            .await;
+    let result = download_library_jobs_with_proofs(
+        mc_dir,
+        jobs,
+        phase,
+        send,
+        Some(fact_tx),
+        Some(descriptor_tx),
+    )
+    .await;
     while let Ok(fact) = fact_rx.try_recv() {
         send_fact(fact);
     }
@@ -177,48 +153,8 @@ where
     result
 }
 
-async fn download_library_jobs<F>(
-    jobs: Vec<DownloadJob>,
-    phase: &str,
-    mut send: F,
-    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-) -> Result<(), DownloadError>
-where
-    F: FnMut(DownloadProgress),
-{
-    let client = standard_minecraft_download_client();
-    send(progress(phase, 0, jobs.len() as i32, None));
-    let total_jobs = jobs.len() as i32;
-    let mut completed_jobs = 0;
-    let mut downloads = futures_util::stream::iter(jobs.into_iter().map(|job| {
-        let client = client.clone();
-        let fact_tx = fact_tx.clone();
-        let descriptor_tx = descriptor_tx.clone();
-        async move {
-            ensure_selected_artifact_with_client(
-                SelectedDownloadArtifactKind::Library,
-                &client,
-                &job.url,
-                &job.path,
-                &job.expected,
-                fact_tx.as_ref(),
-                descriptor_tx.as_ref(),
-            )
-            .await?;
-            Ok::<String, DownloadError>(job.name)
-        }
-    }))
-    .buffer_unordered(library_download_concurrency());
-    while let Some(result) = downloads.next().await {
-        let name = result?;
-        completed_jobs += 1;
-        send(progress(phase, completed_jobs, total_jobs, Some(name)));
-    }
-    Ok(())
-}
-
 async fn download_library_jobs_with_proofs<F>(
+    mc_dir: &Path,
     jobs: Vec<DownloadJob>,
     phase: &str,
     mut send: F,
@@ -229,6 +165,8 @@ where
     F: FnMut(DownloadProgress),
 {
     let client = standard_minecraft_download_client();
+    let source_pool = LibrarySourcePool::new();
+    let mc_dir = mc_dir.to_path_buf();
     send(progress(phase, 0, jobs.len() as i32, None));
     let total_jobs = jobs.len() as i32;
     let mut completed_jobs = 0;
@@ -237,8 +175,10 @@ where
         let client = client.clone();
         let fact_tx = fact_tx.clone();
         let descriptor_tx = descriptor_tx.clone();
+        let source_pool = source_pool.clone();
+        let mc_dir = mc_dir.clone();
         async move {
-            let (size, sha1) = if job.expected.sha1.is_some() {
+            let (authority, path) = if job.expected.sha1.is_some() && job.expected.size.is_some() {
                 let (_, observed_size) = ensure_selected_artifact_with_client_and_observed_size(
                     SelectedDownloadArtifactKind::Library,
                     &client,
@@ -256,27 +196,41 @@ where
                         .ok_or(LibraryPlanError::InvalidChecksum)?,
                 )
                 .ok_or(LibraryPlanError::InvalidChecksum)?;
-                (observed_size, sha1)
+                (
+                    ExactLibraryDownloadProof::new(job.relative_path.clone(), observed_size, sha1),
+                    job.relative_path,
+                )
             } else {
-                let download =
-                    download_file_with_client_and_fact_sender_allowing_missing_checksum_with_authority(
-                        SelectedDownloadArtifactKind::Library,
-                        &client,
-                        &job.url,
-                        &job.path,
-                        &job.expected,
-                        fact_tx.as_ref(),
-                        descriptor_tx.as_ref(),
-                    )
-                    .await?;
-                (download.report.bytes_written, download.sha1)
+                let target = selected_download_target_label(
+                    SelectedDownloadArtifactKind::Library,
+                    Path::new(job.relative_path.as_str()),
+                );
+                let source = acquire_authenticated_library_source(LibrarySourceRequest {
+                    client: &client,
+                    url: &job.url,
+                    expected: &job.expected,
+                    relative_path: &job.relative_path,
+                    max_bytes: LIBRARY_SOURCE_MAX_BYTES,
+                    target: &target,
+                    pool: &source_pool,
+                    fact_tx: fact_tx.as_ref(),
+                })
+                .await?;
+                let prepared = prepare_library_publication(
+                    &mc_dir,
+                    job.relative_path.clone(),
+                    &job.url,
+                    &job.expected,
+                    fact_tx.as_ref(),
+                    descriptor_tx.as_ref(),
+                )
+                .await?;
+                let (authority, _) =
+                    materialize_authenticated_library_source(prepared, source, fact_tx.as_ref())
+                        .await?;
+                (authority, job.relative_path)
             };
-            let authority = ExactLibraryDownloadProof::new(
-                job.relative_path.clone(),
-                size,
-                sha1,
-            );
-            Ok::<_, DownloadError>((job.relative_path, job.name, authority))
+            Ok::<_, DownloadError>((path, job.name, authority))
         }
     }))
     .buffer_unordered(library_download_concurrency());
@@ -621,13 +575,14 @@ fn native_name_matches_env(name: &str, env: &crate::rules::Environment) -> bool 
 
 #[cfg(test)]
 mod exact_library_proof_tests {
+    use super::super::promotion::selected_promotion_temp_path;
     use super::{
         download_installer_libraries_with_authority_and_facts_and_descriptors,
         download_profile_libraries_with_proofs_and_facts_and_descriptors,
         installer_library_jobs_for, library_artifact_plans_for,
     };
     use crate::artifact_path::ArtifactRelativePath;
-    use crate::download::LibraryPlanError;
+    use crate::download::{ExecutionDownloadFactKind, LibraryPlanError};
     use crate::launch::{Library, LibraryArtifact, LibraryDownload};
     use sha1::{Digest as _, Sha1};
     use std::collections::{BTreeSet, HashMap};
@@ -672,21 +627,18 @@ mod exact_library_proof_tests {
     }
 
     #[tokio::test]
-    async fn checksummed_installer_authority_reuses_verified_bytes() {
-        let root = temp_dir("checksummed-reuse");
-        let relative = "org/example/reused/1/reused-1.jar";
-        let body = jar_bytes(b"reused");
-        let sha1 = format!("{:x}", Sha1::digest(&body));
+    async fn sha_only_installer_authority_forces_fresh_stream() {
+        let root = temp_dir("sha-only-fresh");
+        let relative = "org/example/sha-only/1/sha-only-1.jar";
+        let stale = jar_bytes(b"stale");
+        let fresh = jar_bytes(b"fresh");
+        let sha1 = format!("{:x}", Sha1::digest(&fresh));
         let destination = root.join("libraries").join(relative);
         std::fs::create_dir_all(destination.parent().expect("library parent"))
             .expect("library parent");
-        std::fs::write(&destination, &body).expect("existing library");
-        let library = direct_library(
-            relative,
-            "http://127.0.0.1:9/should-not-be-requested",
-            &sha1,
-            0,
-        );
+        std::fs::write(&destination, stale).expect("existing library");
+        let url = spawn_response(fresh.clone()).await;
+        let library = direct_library(relative, &url, &sha1, 0);
 
         let authorities = download_installer_libraries_with_authority_and_facts_and_descriptors(
             &root,
@@ -698,16 +650,20 @@ mod exact_library_proof_tests {
             |_| {},
         )
         .await
-        .expect("verified reuse");
+        .expect("fresh SHA-only source");
         let (path, size, digest) = authorities
             .into_iter()
             .next()
             .expect("authority")
             .into_parts();
         assert_eq!(path.as_str(), relative);
-        assert_eq!(size, body.len() as u64);
-        let expected_digest: [u8; 20] = Sha1::digest(&body).into();
+        assert_eq!(size, fresh.len() as u64);
+        let expected_digest: [u8; 20] = Sha1::digest(&fresh).into();
         assert_eq!(digest, expected_digest);
+        assert_eq!(
+            std::fs::read(destination).expect("published library"),
+            fresh
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -759,8 +715,10 @@ mod exact_library_proof_tests {
             .expect("library parent");
         std::fs::write(&destination, jar_bytes(b"readable stale")).expect("readable stale library");
         let fresh = jar_bytes(b"authenticated fresh");
+        let fresh_sha1 = format!("{:x}", Sha1::digest(&fresh));
         let url = spawn_response(fresh.clone()).await;
         let library = direct_library(relative, &url, "", 0);
+        let mut descriptors = Vec::new();
 
         let proofs = download_profile_libraries_with_proofs_and_facts_and_descriptors(
             &root,
@@ -768,7 +726,7 @@ mod exact_library_proof_tests {
             "libraries",
             |_| {},
             |_| {},
-            |_| {},
+            |descriptor| descriptors.push(descriptor),
         )
         .await
         .expect("fresh profile proof");
@@ -779,6 +737,44 @@ mod exact_library_proof_tests {
             .into_parts();
 
         assert_eq!(path.as_str(), relative);
+        assert_eq!(size, fresh.len() as u64);
+        assert_eq!(digest, <[u8; 20]>::from(Sha1::digest(&fresh)));
+        assert_eq!(std::fs::read(destination).expect("promoted library"), fresh);
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].expected_size, Some(size));
+        assert_eq!(descriptors[0].sha1(), fresh_sha1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn size_only_profile_proof_forces_fresh_stream() {
+        let root = temp_dir("profile-size-only-fresh");
+        let relative = "org/example/size-only/1/size-only-1.jar";
+        let destination = root.join("libraries").join(relative);
+        std::fs::create_dir_all(destination.parent().expect("library parent"))
+            .expect("library parent");
+        let fresh = jar_bytes(b"fresh-size-only");
+        let stale = jar_bytes(b"stale-size-only");
+        assert_eq!(stale.len(), fresh.len());
+        std::fs::write(&destination, stale).expect("readable stale library");
+        let url = spawn_response(fresh.clone()).await;
+        let library = direct_library(relative, &url, "", fresh.len() as i64);
+
+        let proofs = download_profile_libraries_with_proofs_and_facts_and_descriptors(
+            &root,
+            &[library],
+            "libraries",
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .await
+        .expect("fresh size-only proof");
+        let (_, size, digest) = proofs
+            .into_iter()
+            .next()
+            .expect("profile proof")
+            .into_parts();
         assert_eq!(size, fresh.len() as u64);
         assert_eq!(digest, <[u8; 20]>::from(Sha1::digest(&fresh)));
         assert_eq!(std::fs::read(destination).expect("promoted library"), fresh);
@@ -793,6 +789,44 @@ mod exact_library_proof_tests {
         let invalid = b"not a jar".to_vec();
         let url = spawn_response(invalid).await;
         let library = direct_library(relative, &url, "", 0);
+        let mut facts = Vec::new();
+
+        assert!(
+            download_profile_libraries_with_proofs_and_facts_and_descriptors(
+                &root,
+                &[library],
+                "libraries",
+                |_| {},
+                |fact| facts.push(fact),
+                |_| {},
+            )
+            .await
+            .is_err()
+        );
+        assert!(!destination.exists());
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.kind == ExecutionDownloadFactKind::ChecksumMismatch)
+        );
+        assert!(!root.join("libraries").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn source_failure_preserves_destination_temp_and_parent_sentinels() {
+        let root = temp_dir("profile-source-failure-sentinels");
+        let relative = "org/example/profile/1/profile-1.jar";
+        let destination = root.join("libraries").join(relative);
+        let parent = destination.parent().expect("library parent");
+        std::fs::create_dir_all(parent).expect("library parent");
+        std::fs::write(&destination, b"destination-sentinel").expect("destination sentinel");
+        let temp = selected_promotion_temp_path(&destination);
+        std::fs::write(&temp, b"temp-sentinel").expect("temp sentinel");
+        let marker = parent.join("parent-sentinel");
+        std::fs::write(&marker, b"parent-sentinel").expect("parent sentinel");
+        let url = spawn_response(b"invalid jar source".to_vec()).await;
+        let library = direct_library(relative, &url, "", 0);
 
         assert!(
             download_profile_libraries_with_proofs_and_facts_and_descriptors(
@@ -806,8 +840,78 @@ mod exact_library_proof_tests {
             .await
             .is_err()
         );
-        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read(destination).expect("destination sentinel"),
+            b"destination-sentinel"
+        );
+        assert_eq!(
+            std::fs::read(temp).expect("temp sentinel"),
+            b"temp-sentinel"
+        );
+        assert_eq!(
+            std::fs::read(marker).expect("parent sentinel"),
+            b"parent-sentinel"
+        );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn profile_and_installer_proofs_preserve_native_classifier_identity() {
+        let profile_root = temp_dir("profile-native-proof");
+        let installer_root = temp_dir("installer-native-proof");
+        let relative = "org/example/native/1/native-1-platform.jar";
+        let profile_body = jar_bytes(b"profile native");
+        let installer_body = jar_bytes(b"installer native");
+        let profile_url = spawn_response(profile_body).await;
+        let installer_url = spawn_response(installer_body).await;
+
+        let profile_proofs = download_profile_libraries_with_proofs_and_facts_and_descriptors(
+            &profile_root,
+            &[native_library(relative, &profile_url)],
+            "libraries",
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .await
+        .expect("profile native proof");
+        let installer_proofs =
+            download_installer_libraries_with_authority_and_facts_and_descriptors(
+                &installer_root,
+                &[native_library(relative, &installer_url)],
+                &BTreeSet::new(),
+                "libraries",
+                |_| {},
+                |_| {},
+                |_| {},
+            )
+            .await
+            .expect("installer native proof");
+
+        assert_eq!(profile_proofs.len(), 1);
+        assert_eq!(installer_proofs.len(), 1);
+        assert_eq!(
+            profile_proofs
+                .into_iter()
+                .next()
+                .unwrap()
+                .into_parts()
+                .0
+                .as_str(),
+            relative
+        );
+        assert_eq!(
+            installer_proofs
+                .into_iter()
+                .next()
+                .unwrap()
+                .into_parts()
+                .0
+                .as_str(),
+            relative
+        );
+        let _ = std::fs::remove_dir_all(profile_root);
+        let _ = std::fs::remove_dir_all(installer_root);
     }
 
     fn direct_library(path: &str, url: &str, sha1: &str, size: i64) -> Library {
@@ -822,6 +926,27 @@ mod exact_library_proof_tests {
                 }),
                 classifiers: HashMap::new(),
             }),
+            ..Library::default()
+        }
+    }
+
+    fn native_library(path: &str, url: &str) -> Library {
+        let env = crate::rules::default_environment();
+        Library {
+            name: "org.example:native:1".to_string(),
+            downloads: Some(LibraryDownload {
+                artifact: None,
+                classifiers: HashMap::from([(
+                    "native-test".to_string(),
+                    LibraryArtifact {
+                        path: path.to_string(),
+                        url: url.to_string(),
+                        sha1: String::new(),
+                        size: 0,
+                    },
+                )]),
+            }),
+            natives: HashMap::from([(env.os_name, "native-test".to_string())]),
             ..Library::default()
         }
     }
