@@ -107,7 +107,7 @@ impl KnownGoodEntry {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct KnownGoodInventory {
     entries: Vec<KnownGoodEntry>,
 }
@@ -124,6 +124,12 @@ pub struct KnownGoodInstallReceipt {
     inventory: KnownGoodInventory,
     effective_version: VersionJson,
     environment: Environment,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct KnownGoodActivationSource {
+    version_id: KnownGoodId,
+    inventory: KnownGoodInventory,
 }
 
 pub(crate) struct PendingInstallerReceipt {
@@ -180,8 +186,11 @@ impl KnownGoodInstallReceipt {
         self.version_id.as_str()
     }
 
-    pub fn into_inventory(self) -> KnownGoodInventory {
-        self.inventory
+    pub fn into_activation_source(self) -> KnownGoodActivationSource {
+        KnownGoodActivationSource {
+            version_id: self.version_id,
+            inventory: self.inventory,
+        }
     }
 
     pub(crate) fn effective_version(&self) -> &VersionJson {
@@ -695,6 +704,12 @@ impl KnownGoodInstallReceipt {
     }
 }
 
+impl KnownGoodActivationSource {
+    pub fn into_parts(self) -> (String, KnownGoodInventory) {
+        (self.version_id.0, self.inventory)
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct KnownGoodRelativePath(String);
 
@@ -761,11 +776,11 @@ pub(crate) struct RuntimeInventoryInput<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct KnownGoodInstallShape<'a> {
+pub(crate) struct KnownGoodInstallShape<'a> {
     pub(crate) version_manifest: &'a ManifestEntry,
 }
 
-pub struct KnownGoodInventoryInput<'a> {
+pub(crate) struct KnownGoodInventoryInput<'a> {
     pub(crate) resolved_version: &'a VersionJson,
     pub(crate) version_metadata_size: u64,
     pub(crate) client_size: u64,
@@ -811,7 +826,7 @@ pub enum KnownGoodInventoryError {
     TooManyEntries,
 }
 
-pub fn derive_known_good_inventory(
+pub(crate) fn derive_known_good_inventory(
     input: KnownGoodInventoryInput<'_>,
 ) -> Result<KnownGoodInventory, KnownGoodInventoryError> {
     let version_id = KnownGoodId::new(&input.resolved_version.id)?;
@@ -1514,7 +1529,9 @@ mod tests {
             declarations,
         )
         .expect("profile receipt")
-        .into_inventory();
+        .into_activation_source()
+        .into_parts()
+        .1;
         assert_eq!(
             inventory
                 .entries()
@@ -1663,7 +1680,7 @@ mod tests {
             child_client_bytes,
         )
         .expect("legacy receipt");
-        let inventory = receipt.into_inventory();
+        let inventory = receipt.into_activation_source().into_parts().1;
 
         assert_entry(
             &inventory,
@@ -2614,5 +2631,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn activation_source_is_the_only_public_receipt_inventory_transition() {
+        let source = include_str!("known_good.rs");
+        assert!(!source.contains(concat!("pub fn into_", "inventory")));
+        assert!(!source.contains(concat!("pub fn derive_known_good_", "inventory")));
+        assert!(!source.contains(concat!("pub struct KnownGoodInventory", "Input")));
+        assert!(!source.contains(concat!("pub struct KnownGoodInstall", "Shape")));
     }
 }

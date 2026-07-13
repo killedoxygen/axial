@@ -26,7 +26,7 @@ mod shutdown;
 pub mod skins;
 
 use axial_config::{
-    AppConfig, ConfigStore as StartupConfigStore, ConfigStoreError,
+    AppConfig, ConfigStore as StartupConfigStore, ConfigStoreError, INSTANCE_REGISTRY_MAX_ENTRIES,
     InstanceStore as StartupInstanceStore, InstanceStoreError, find_flag, is_canonical_instance_id,
 };
 pub use axial_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
@@ -135,6 +135,33 @@ pub struct AppStateInit {
     pub performance: Arc<PerformanceManager>,
     pub startup_warnings: Vec<String>,
     pub frontend_dir: PathBuf,
+}
+
+struct KnownGoodCandidateAdmission {
+    _lifecycle: tokio::sync::OwnedMutexGuard<()>,
+    instance_id: String,
+    version_id: String,
+    library_root: PathBuf,
+}
+
+impl KnownGoodCandidateAdmission {
+    fn revalidate(&self, state: &AppState) -> std::io::Result<bool> {
+        if !matches_known_good_identity(
+            state.instances.get(&self.instance_id).as_ref(),
+            &self.instance_id,
+            &self.version_id,
+        ) {
+            return Ok(false);
+        }
+        require_matching_known_good_library_root(state.library_dir(), &self.library_root)
+            .map(|root| root == self.library_root)
+    }
+
+    fn deactivate(&self, state: &AppState) {
+        state
+            .known_good
+            .deactivate_exact(&self.instance_id, &self.version_id, &self.library_root);
+    }
 }
 
 impl AppState {
@@ -426,10 +453,18 @@ impl AppState {
         installed_library_root: &Path,
         receipt: axial_minecraft::known_good::KnownGoodInstallReceipt,
     ) -> std::io::Result<()> {
+        self.activate_known_good_source(installed_library_root, receipt.into_activation_source())
+            .await
+    }
+
+    async fn activate_known_good_source(
+        &self,
+        installed_library_root: &Path,
+        source: axial_minecraft::KnownGoodActivationSource,
+    ) -> std::io::Result<()> {
         let installed_library_root =
             require_matching_known_good_library_root(self.library_dir(), installed_library_root)?;
-        let version_id = receipt.version_id().to_string();
-        let inventory = Arc::new(receipt.into_inventory());
+        let (version_id, inventory) = source.into_parts();
         let candidates = self
             .instances
             .list()
@@ -438,27 +473,98 @@ impl AppState {
                 matches_known_good_identity(Some(instance), &instance.id, &version_id)
             })
             .map(|instance| instance.id)
+            .take(INSTANCE_REGISTRY_MAX_ENTRIES + 1)
             .collect::<Vec<_>>();
-        for instance_id in candidates {
-            self.reconcile_registered_known_good_instance(
-                &instance_id,
-                &version_id,
-                &installed_library_root,
-                inventory.clone(),
-            )
-            .await?;
+        if candidates.len() > INSTANCE_REGISTRY_MAX_ENTRIES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "known-good activation candidate count exceeds the instance registry limit",
+            ));
         }
-        Ok(())
+        let inventory = Arc::new(inventory);
+        let version_id = version_id.as_str();
+        let installed_library_root = installed_library_root.as_path();
+        complete_independent_known_good_fanout(candidates, |instance_id| {
+            let inventory = inventory.clone();
+            async move {
+                self.reconcile_known_good_instance(
+                    &instance_id,
+                    version_id,
+                    installed_library_root,
+                    inventory,
+                )
+                .await
+            }
+        })
+        .await
     }
 
-    pub(crate) async fn reconcile_registered_known_good_instance(
+    async fn reconcile_known_good_instance(
         &self,
         instance_id: &str,
         version_id: &str,
         installed_library_root: &Path,
-        inventory: Arc<axial_minecraft::KnownGoodInventory>,
+        inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
     ) -> std::io::Result<()> {
-        let _lifecycle = self.acquire_instance_lifecycle(instance_id).await;
+        let admission = match self
+            .admit_known_good_candidate(instance_id, version_id, installed_library_root)
+            .await
+        {
+            Ok(Some(admission)) => admission,
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+
+        if let Err(error) = self
+            .known_good
+            .reconcile(
+                &admission.instance_id,
+                &admission.version_id,
+                &admission.library_root,
+                inventory,
+            )
+            .await
+        {
+            admission.deactivate(self);
+            return Err(error);
+        }
+
+        match admission.revalidate(self) {
+            Ok(true) => {}
+            Ok(false) => {
+                admission.deactivate(self);
+                return Ok(());
+            }
+            Err(error) => {
+                admission.deactivate(self);
+                return Err(error);
+            }
+        }
+        if self
+            .known_good
+            .active_inventory(
+                &admission.instance_id,
+                &admission.version_id,
+                &admission.library_root,
+            )
+            .is_none()
+        {
+            admission.deactivate(self);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "known-good live authority was not activated",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn admit_known_good_candidate(
+        &self,
+        instance_id: &str,
+        version_id: &str,
+        installed_library_root: &Path,
+    ) -> std::io::Result<Option<KnownGoodCandidateAdmission>> {
+        let lifecycle = self.acquire_instance_lifecycle(instance_id).await;
         if !matches_known_good_identity(
             self.instances.get(instance_id).as_ref(),
             instance_id,
@@ -466,10 +572,9 @@ impl AppState {
         ) {
             self.known_good
                 .deactivate_exact(instance_id, version_id, installed_library_root);
-            return Ok(());
+            return Ok(None);
         }
-
-        let installed_library_root = match require_matching_known_good_library_root(
+        let library_root = match require_matching_known_good_library_root(
             self.library_dir(),
             installed_library_root,
         ) {
@@ -480,51 +585,12 @@ impl AppState {
                 return Err(error);
             }
         };
-
-        if let Err(error) = self
-            .known_good
-            .reconcile(instance_id, version_id, &installed_library_root, inventory)
-            .await
-        {
-            self.known_good
-                .deactivate_exact(instance_id, version_id, &installed_library_root);
-            return Err(error);
-        }
-
-        let current_identity_matches = matches_known_good_identity(
-            self.instances.get(instance_id).as_ref(),
-            instance_id,
-            version_id,
-        );
-        let current_root_matches =
-            require_matching_known_good_library_root(self.library_dir(), &installed_library_root)
-                .is_ok_and(|root| root == installed_library_root);
-        if !current_identity_matches {
-            self.known_good
-                .deactivate_exact(instance_id, version_id, &installed_library_root);
-            return Ok(());
-        }
-        if !current_root_matches {
-            self.known_good
-                .deactivate_exact(instance_id, version_id, &installed_library_root);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "known-good library root changed during installation",
-            ));
-        }
-        if self
-            .known_good
-            .active_inventory(instance_id, version_id, &installed_library_root)
-            .is_none()
-        {
-            self.known_good
-                .deactivate_exact(instance_id, version_id, &installed_library_root);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "known-good live authority was not activated",
-            ));
-        }
-        Ok(())
+        Ok(Some(KnownGoodCandidateAdmission {
+            _lifecycle: lifecycle,
+            instance_id: instance_id.to_string(),
+            version_id: version_id.to_string(),
+            library_root,
+        }))
     }
 
     pub fn performance(&self) -> &Arc<AppPerformanceStore> {
@@ -980,6 +1046,25 @@ fn bound_startup_warnings(warnings: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+async fn complete_independent_known_good_fanout<F, Fut>(
+    candidates: Vec<String>,
+    mut activate: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
+    let mut first_error = None;
+    for candidate in candidates {
+        if let Err(error) = activate(candidate).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 fn matches_known_good_identity(
     instance: Option<&axial_config::Instance>,
     instance_id: &str,
@@ -1016,7 +1101,298 @@ fn require_matching_known_good_library_root(
 #[cfg(test)]
 mod known_good_identity_tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn known_good_state_fixture(root: &Path) -> AppState {
+        let config_dir = root.join("config");
+        let paths = axial_config::AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: root.join("instances"),
+            music_dir: root.join("music"),
+            library_dir: root.join("library"),
+            config_dir,
+        };
+        let config = Arc::new(
+            axial_config::ConfigStore::load_from(paths.clone()).expect("load test config"),
+        );
+        let instances = Arc::new(
+            axial_config::InstanceStore::from_snapshot(
+                paths.clone(),
+                axial_config::InstanceRegistrySnapshot::default(),
+            )
+            .expect("load test instances"),
+        );
+        AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("load test performance state"),
+            ),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        })
+    }
+
+    #[tokio::test]
+    async fn lifecycle_queued_identity_drift_isolated_from_an_exact_candidate() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-known-good-identity-drift-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let library_root = root.join("library");
+        std::fs::create_dir_all(&library_root).expect("library root");
+        state.set_library_dir_for_test(library_root.to_string_lossy().into_owned());
+        let exact = state
+            .instances()
+            .insert_for_test("Exact", "1.21.5")
+            .expect("exact instance");
+        let drifted = state
+            .instances()
+            .insert_for_test("Drifted", "1.21.5")
+            .expect("drifted instance");
+        let exact_id = exact.id.clone();
+        let drifted_id = drifted.id.clone();
+        let fanout_candidates = vec![exact_id.clone(), drifted_id.clone()];
+        let lifecycle = state.acquire_instance_lifecycle(&drifted.id).await;
+        let activated = Arc::new(Mutex::new(Vec::new()));
+        let first_activated = Arc::new(tokio::sync::Notify::new());
+        let fanout_state = state.clone();
+        let fanout_root = library_root.clone();
+        let fanout_activated = activated.clone();
+        let fanout_first_activated = first_activated.clone();
+        let fanout = tokio::spawn(async move {
+            complete_independent_known_good_fanout(fanout_candidates, |instance_id| {
+                let state = fanout_state.clone();
+                let library_root = fanout_root.clone();
+                let activated = fanout_activated.clone();
+                let first_activated = fanout_first_activated.clone();
+                async move {
+                    if let Some(admission) = state
+                        .admit_known_good_candidate(&instance_id, "1.21.5", &library_root)
+                        .await?
+                    {
+                        activated
+                            .lock()
+                            .expect("activated candidates")
+                            .push(admission.instance_id.clone());
+                        first_activated.notify_one();
+                    }
+                    Ok(())
+                }
+            })
+            .await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            first_activated.notified(),
+        )
+        .await
+        .expect("first exact candidate should activate before blocked drift candidate");
+
+        let mut replacement = state
+            .instances()
+            .get(&drifted_id)
+            .expect("drifted instance remains registered");
+        replacement.version_id = "1.21.6".to_string();
+        state
+            .instances()
+            .replace_for_test(replacement)
+            .expect("replace drifted identity");
+        drop(lifecycle);
+
+        fanout
+            .await
+            .expect("fanout task")
+            .expect("identity drift is an isolated skip");
+        assert_eq!(
+            *activated.lock().expect("activated candidates"),
+            vec![exact_id],
+            "the exact candidate remains activated and the drifted candidate is skipped"
+        );
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_queued_root_drift_rejects_candidate_admission() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-known-good-root-drift-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let installed_root = root.join("library");
+        let changed_root = root.join("changed-library");
+        std::fs::create_dir_all(&installed_root).expect("installed library root");
+        std::fs::create_dir_all(&changed_root).expect("changed library root");
+        state.set_library_dir_for_test(installed_root.to_string_lossy().into_owned());
+        let instance = state
+            .instances()
+            .insert_for_test("Root drift", "1.21.5")
+            .expect("root-drift instance");
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let admission_state = state.clone();
+        let admission_id = instance.id.clone();
+        let admission_root = installed_root.clone();
+        let admission = tokio::spawn(async move {
+            admission_state
+                .admit_known_good_candidate(&admission_id, "1.21.5", &admission_root)
+                .await
+        });
+
+        state.set_library_dir_for_test(changed_root.to_string_lossy().into_owned());
+        drop(lifecycle);
+        let error = match admission.await.expect("queued root admission") {
+            Err(error) => error,
+            Ok(_) => panic!("root drift must reject admission"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn admitted_candidate_revalidation_rejects_later_root_drift() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-known-good-post-admission-root-drift-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let installed_root = root.join("library");
+        let changed_root = root.join("changed-library");
+        std::fs::create_dir_all(&installed_root).expect("installed library root");
+        std::fs::create_dir_all(&changed_root).expect("changed library root");
+        state.set_library_dir_for_test(installed_root.to_string_lossy().into_owned());
+        let instance = state
+            .instances()
+            .insert_for_test("Post-admission root drift", "1.21.5")
+            .expect("post-admission instance");
+        let admission = state
+            .admit_known_good_candidate(&instance.id, "1.21.5", &installed_root)
+            .await
+            .expect("admit exact root")
+            .expect("exact candidate admission");
+
+        state.set_library_dir_for_test(changed_root.to_string_lossy().into_owned());
+        let error = admission
+            .revalidate(&state)
+            .expect_err("post-admission root drift must fail revalidation");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        admission.deactivate(&state);
+        drop(admission);
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn first_failed_activation_does_not_block_a_later_candidate() {
+        let activated = Arc::new(Mutex::new(Vec::new()));
+        let result = complete_independent_known_good_fanout(
+            vec!["first".to_string(), "second".to_string()],
+            |candidate| {
+                let activated = activated.clone();
+                async move {
+                    if candidate == "first" {
+                        Err(std::io::Error::other("first activation failed"))
+                    } else {
+                        activated
+                            .lock()
+                            .expect("activated candidates")
+                            .push(candidate);
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result.expect_err("first error is retained").to_string(),
+            "first activation failed"
+        );
+        assert_eq!(
+            *activated.lock().expect("activated candidates"),
+            vec!["second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn later_failed_activation_does_not_undo_an_earlier_candidate() {
+        let activated = Arc::new(Mutex::new(Vec::new()));
+        let result = complete_independent_known_good_fanout(
+            vec!["first".to_string(), "second".to_string()],
+            |candidate| {
+                let activated = activated.clone();
+                async move {
+                    if candidate == "second" {
+                        Err(std::io::Error::other("second activation failed"))
+                    } else {
+                        activated
+                            .lock()
+                            .expect("activated candidates")
+                            .push(candidate);
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result.expect_err("later error is retained").to_string(),
+            "second activation failed"
+        );
+        assert_eq!(
+            *activated.lock().expect("activated candidates"),
+            vec!["first"]
+        );
+    }
+
+    #[test]
+    fn stale_raw_known_good_activation_entrypoints_are_absent() {
+        let source = include_str!("mod.rs");
+        assert!(!source.contains(concat!("reconcile_registered_", "known_good_instance")));
+        assert!(!source.contains(concat!(
+            "pub(crate) async fn reconcile_",
+            "known_good_instance"
+        )));
+        assert!(!source.contains(concat!(
+            "pub(crate) async fn activate_",
+            "known_good_source"
+        )));
+    }
 
     #[test]
     fn unrelated_instance_changes_preserve_known_good_identity() {

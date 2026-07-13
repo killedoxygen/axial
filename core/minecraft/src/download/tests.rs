@@ -179,7 +179,14 @@ async fn install_version_with_facts_emits_private_download_facts_only() {
         .expect("install should succeed");
 
     assert_eq!(receipt.version_id(), "overlap");
-    assert!(!receipt.into_inventory().entries().is_empty());
+    assert!(
+        !receipt
+            .into_activation_source()
+            .into_parts()
+            .1
+            .entries()
+            .is_empty()
+    );
 
     assert!(
         events

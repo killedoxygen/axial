@@ -1341,14 +1341,22 @@ mod tests {
             .expect("written artifact");
         assert_eq!(artifact.sha1, digest);
         assert_eq!(artifact.size, fresh.len() as i64);
-        assert!(receipt.into_inventory().entries().iter().any(|entry| {
-            entry.path().as_str() == artifact_path
-                && matches!(
-                    entry.integrity(),
-                    KnownGoodIntegrity::Sha1 { digest: receipt_digest, size }
-                        if receipt_digest.as_str() == digest && *size == fresh.len() as u64
-                )
-        }));
+        assert!(
+            receipt
+                .into_activation_source()
+                .into_parts()
+                .1
+                .entries()
+                .iter()
+                .any(|entry| {
+                    entry.path().as_str() == artifact_path
+                        && matches!(
+                            entry.integrity(),
+                            KnownGoodIntegrity::Sha1 { digest: receipt_digest, size }
+                                if receipt_digest.as_str() == digest && *size == fresh.len() as u64
+                        )
+                })
+        );
         assert_eq!(library_server.request_count(), 1);
         profile_server.stop();
         library_server.stop();
@@ -1442,7 +1450,7 @@ mod tests {
             .expect("written artifact");
         assert_eq!(artifact.sha1, digest);
         assert_eq!(artifact.size, library_bytes.len() as i64);
-        let inventory = receipt.into_inventory();
+        let inventory = receipt.into_activation_source().into_parts().1;
         assert!(inventory.entries().iter().any(|entry| {
             entry.path().as_str() == artifact_path
                 && matches!(
@@ -1669,7 +1677,9 @@ mod tests {
         assert!(root.join("libraries").join(processor_path).is_file());
         assert!(
             receipt
-                .into_inventory()
+                .into_activation_source()
+                .into_parts()
+                .1
                 .entries()
                 .iter()
                 .any(|entry| entry.path().as_str() == processor_path)
@@ -1865,7 +1875,7 @@ mod tests {
             library["name"] == "net.minecraftforge:forge:1.21.5-55.0.0:universal"
                 && library.get("axialChecksumlessAllowed").is_none()
         }));
-        let inventory = receipt.into_inventory();
+        let inventory = receipt.into_activation_source().into_parts().1;
         let entry = inventory
             .entries()
             .iter()
@@ -2116,7 +2126,9 @@ mod tests {
         .expect("derive expected child source");
         assert_eq!(installed_jar_bytes, expected_child_bytes);
         let installed_jar_receipt = receipt
-            .into_inventory()
+            .into_activation_source()
+            .into_parts()
+            .1
             .entries()
             .iter()
             .find(|entry| entry.kind() == KnownGoodArtifactKind::ClientJar)

@@ -18,7 +18,7 @@ pub mod version_meta;
 
 pub use asset_index::{AssetIndexFlagsError, asset_index_requires_virtual_repair};
 pub use download::{DownloadError, DownloadProgress, Downloader};
-pub use known_good::{KnownGoodInstallReceipt, KnownGoodInventory};
+pub use known_good::{KnownGoodActivationSource, KnownGoodInstallReceipt};
 pub use launch::{
     JavaVersion, LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath,
     client_jar_path, effective_java_version_for, java_component_for_major,
