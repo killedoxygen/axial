@@ -640,7 +640,7 @@ async fn install_foreground_activity_releases_and_reacquires_without_overlap() {
 
     activity.release();
     assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
-    assert!(retain_install_foreground(&state, &activity).await);
+    assert!(retain_install_foreground(&state, &activity).await.is_some());
     assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
 
     drop(activity);
@@ -752,7 +752,11 @@ async fn failed_progress_journal_task_keeps_foreground_and_queue_active() {
             assert!(!finish_install_progress_task(progress_task).await);
         },
         move |progress| async move {
-            assert!(retain_install_foreground(&interrupted_state, &interrupted_foreground).await);
+            assert!(
+                retain_install_foreground(&interrupted_state, &interrupted_foreground)
+                    .await
+                    .is_some()
+            );
             let _ = handler_started_tx.send(());
             handler_release_rx
                 .await
@@ -2765,13 +2769,122 @@ fn loader_install_done_progress_marks_session_terminal() {
 }
 
 #[tokio::test]
-async fn loader_receipt_acceptance_completes_before_terminal_success_is_published() {
+async fn vanilla_receipt_acceptance_blocks_terminal_success_and_foreground_release() {
+    let root = temp_root("vanilla-receipt-acceptance-order");
+    let state = build_test_state(&root);
+    let install_id = "vanilla-receipt-acceptance";
+    state.installs().insert(install_id.to_string()).await;
+    let foreground = register_install_foreground(&state)
+        .expect("register install foreground")
+        .wait_for_settlement()
+        .await;
+    let foreground = InstallForegroundActivity::new(foreground);
+    spawn_install_foreground_retention(
+        state.clone(),
+        install_id.to_string(),
+        state
+            .try_claim_producer()
+            .expect("claim foreground retention producer"),
+        foreground.clone(),
+    );
+    drop(foreground);
+
     let events = Arc::new(Mutex::new(Vec::new()));
     let acceptance_events = Arc::clone(&events);
     let publication_events = Arc::clone(&events);
+    let (acceptance_started_tx, acceptance_started_rx) = tokio::sync::oneshot::channel();
+    let (acceptance_release_tx, acceptance_release_rx) = tokio::sync::oneshot::channel();
+    let (terminal_tx, mut terminal_rx) = tokio_mpsc::unbounded_channel();
+    let terminal_store = state.installs().clone();
+    let terminal_store_task = tokio::spawn(async move {
+        let progress = terminal_rx.recv().await.expect("terminal publication");
+        terminal_store.emit(install_id, progress).await;
+    });
+    let publication = tokio::spawn(async move {
+        let acceptance = async move {
+            let _ = acceptance_started_tx.send(());
+            acceptance_release_rx
+                .await
+                .expect("release State receipt acceptance");
+            acceptance_events
+                .lock()
+                .expect("events lock")
+                .push("accepted");
+            Ok::<(), io::Error>(())
+        };
+        acceptance.await.expect("State receipt acceptance");
+        publication_events
+            .lock()
+            .expect("events lock")
+            .push("published");
+        terminal_tx
+            .send(vanilla_install_done_progress())
+            .expect("publish terminal success");
+    });
 
-    let publication = publish_known_good_loader_terminal(
+    acceptance_started_rx
+        .await
+        .expect("State receipt acceptance should start");
+    assert!(!publication.is_finished());
+    assert!(!state.installs().snapshot(install_id).await.unwrap().done);
+    assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+    assert!(events.lock().expect("events lock").is_empty());
+
+    acceptance_release_tx
+        .send(())
+        .expect("release State receipt acceptance");
+    publication.await.expect("terminal publication owner");
+    terminal_store_task.await.expect("terminal store owner");
+    wait_for_integrity_idle(&state).await;
+
+    assert!(state.installs().snapshot(install_id).await.unwrap().done);
+    assert_eq!(
+        events.lock().expect("events lock").as_slice(),
+        ["accepted", "published"]
+    );
+    state.installs().remove(install_id).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn loader_receipt_acceptance_blocks_terminal_success_and_foreground_release() {
+    let root = temp_root("loader-receipt-acceptance-order");
+    let state = build_test_state(&root);
+    let install_id = "loader-receipt-acceptance";
+    state.installs().insert(install_id.to_string()).await;
+    let foreground = register_install_foreground(&state)
+        .expect("register install foreground")
+        .wait_for_settlement()
+        .await;
+    let foreground = InstallForegroundActivity::new(foreground);
+    spawn_install_foreground_retention(
+        state.clone(),
+        install_id.to_string(),
+        state
+            .try_claim_producer()
+            .expect("claim foreground retention producer"),
+        foreground.clone(),
+    );
+    drop(foreground);
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let acceptance_events = Arc::clone(&events);
+    let publication_events = Arc::clone(&events);
+    let (acceptance_started_tx, acceptance_started_rx) = tokio::sync::oneshot::channel();
+    let (acceptance_release_tx, acceptance_release_rx) = tokio::sync::oneshot::channel();
+    let (terminal_tx, mut terminal_rx) = tokio_mpsc::unbounded_channel();
+    let terminal_store = state.installs().clone();
+    let terminal_store_task = tokio::spawn(async move {
+        let progress = terminal_rx.recv().await.expect("terminal publication");
+        terminal_store.emit(install_id, progress).await;
+    });
+
+    let publication = tokio::spawn(publish_known_good_loader_terminal(
         async move {
+            let _ = acceptance_started_tx.send(());
+            acceptance_release_rx
+                .await
+                .expect("release State receipt acceptance");
             acceptance_events
                 .lock()
                 .expect("events lock")
@@ -2786,16 +2899,36 @@ async fn loader_receipt_acceptance_completes_before_terminal_success_is_publishe
                 .lock()
                 .expect("events lock")
                 .push("published");
+            terminal_tx
+                .send(progress)
+                .expect("publish terminal success");
         },
-    )
-    .await;
+    ));
+
+    acceptance_started_rx
+        .await
+        .expect("State receipt acceptance should start");
+    assert!(!publication.is_finished());
+    assert!(!state.installs().snapshot(install_id).await.unwrap().done);
+    assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+    assert!(events.lock().expect("events lock").is_empty());
+
+    acceptance_release_tx
+        .send(())
+        .expect("release State receipt acceptance");
+    let publication = publication.await.expect("terminal publication owner");
+    terminal_store_task.await.expect("terminal store owner");
+    wait_for_integrity_idle(&state).await;
 
     assert!(!publication.acceptance_failed);
     assert!(publication.failure_summary.is_none());
+    assert!(state.installs().snapshot(install_id).await.unwrap().done);
     assert_eq!(
         events.lock().expect("events lock").as_slice(),
         ["accepted", "published"]
     );
+    state.installs().remove(install_id).await;
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -2973,16 +3106,19 @@ async fn loader_install_events_return_bounded_not_found_for_unknown_install() {
 }
 
 #[tokio::test]
-async fn wait_for_active_vanilla_base_install_waits_and_forwards_progress() {
+async fn observed_vanilla_base_install_waits_and_forwards_progress() {
     let store = Arc::new(InstallStore::new());
     store
         .insert_or_existing_vanilla("vanilla-install".to_string(), "1.21.5".to_string())
         .await;
     let (progress_tx, mut progress_rx) = tokio_mpsc::unbounded_channel();
 
-    let wait_store = store.clone();
+    let observed = observe_active_vanilla_base_install(&store, "1.21.5")
+        .await
+        .expect("observe active base")
+        .expect("active base");
     let waiter = tokio::spawn(async move {
-        wait_for_active_vanilla_base_install(wait_store.as_ref(), "1.21.5", &progress_tx).await
+        wait_for_observed_vanilla_base_install(observed, &progress_tx).await
     });
 
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3012,76 +3148,57 @@ async fn wait_for_active_vanilla_base_install_waits_and_forwards_progress() {
 }
 
 #[tokio::test]
-async fn wait_for_active_vanilla_base_install_does_not_block_done_removed_or_failed_sessions() {
-    let store = InstallStore::new();
-    let (progress_tx, _progress_rx) = tokio_mpsc::unbounded_channel();
+async fn observing_vanilla_base_install_ignores_done_removed_or_failed_sessions() {
+    let store = Arc::new(InstallStore::new());
 
     store
         .insert_or_existing_vanilla("done-install".to_string(), "1.21.5".to_string())
         .await;
     store.emit("done-install", done_progress()).await;
-    timeout(
-        Duration::from_secs(1),
-        wait_for_active_vanilla_base_install(&store, "1.21.5", &progress_tx),
-    )
-    .await
-    .expect("done session should not block")
-    .expect("done session should not fail loader wait");
+    assert!(
+        observe_active_vanilla_base_install(&store, "1.21.5")
+            .await
+            .expect("observe done session")
+            .is_none()
+    );
 
     store
         .insert_or_existing_vanilla("failed-install".to_string(), "1.21.5".to_string())
         .await;
     store.emit("failed-install", failed_progress()).await;
-    timeout(
-        Duration::from_secs(1),
-        wait_for_active_vanilla_base_install(&store, "1.21.5", &progress_tx),
-    )
-    .await
-    .expect("failed session should not block")
-    .expect("already failed session should not fail loader wait");
+    assert!(
+        observe_active_vanilla_base_install(&store, "1.21.5")
+            .await
+            .expect("observe failed session")
+            .is_none()
+    );
 
     store
         .insert_or_existing_vanilla("removed-install".to_string(), "1.21.5".to_string())
         .await;
     store.remove("removed-install").await;
-    timeout(
-        Duration::from_secs(1),
-        wait_for_active_vanilla_base_install(&store, "1.21.5", &progress_tx),
-    )
-    .await
-    .expect("removed session should not block")
-    .expect("removed session should not fail loader wait");
+    assert!(
+        observe_active_vanilla_base_install(&store, "1.21.5")
+            .await
+            .expect("observe removed session")
+            .is_none()
+    );
 }
 
 #[tokio::test]
-async fn wait_for_observed_vanilla_base_install_fails_when_subscription_is_missing() {
-    let store = InstallStore::new();
-    let install_id = "removed-after-observation";
-    store
-        .insert_or_existing_vanilla(install_id.to_string(), "1.21.5".to_string())
-        .await;
-    store.remove(install_id).await;
-    let (progress_tx, _progress_rx) = tokio_mpsc::unbounded_channel();
-
-    let progress = wait_for_observed_vanilla_base_install(&store, install_id, &progress_tx)
-        .await
-        .expect_err("an observed base cannot disappear successfully");
-
-    assert_eq!(progress.error.as_deref(), Some(BASE_INSTALL_FAILED_MESSAGE));
-    assert!(progress.done);
-}
-
-#[tokio::test]
-async fn wait_for_active_vanilla_base_install_fails_when_observed_channel_closes() {
+async fn observed_vanilla_base_install_fails_when_observed_channel_closes() {
     let store = Arc::new(InstallStore::new());
     let install_id = "closed-base-install";
     store
         .insert_or_existing_vanilla(install_id.to_string(), "1.21.5".to_string())
         .await;
     let (progress_tx, mut progress_rx) = tokio_mpsc::unbounded_channel();
-    let wait_store = store.clone();
+    let observed = observe_active_vanilla_base_install(&store, "1.21.5")
+        .await
+        .expect("observe active base")
+        .expect("active base");
     let waiter = tokio::spawn(async move {
-        wait_for_active_vanilla_base_install(wait_store.as_ref(), "1.21.5", &progress_tx).await
+        wait_for_observed_vanilla_base_install(observed, &progress_tx).await
     });
 
     let progress = base_progress("client");
@@ -3104,16 +3221,19 @@ async fn wait_for_active_vanilla_base_install_fails_when_observed_channel_closes
 }
 
 #[tokio::test]
-async fn wait_for_active_vanilla_base_install_fails_loader_when_base_fails_while_waiting() {
+async fn observed_vanilla_base_install_fails_loader_when_base_fails_while_waiting() {
     let store = Arc::new(InstallStore::new());
     store
         .insert_or_existing_vanilla("vanilla-install".to_string(), "1.21.5".to_string())
         .await;
     let (progress_tx, mut progress_rx) = tokio_mpsc::unbounded_channel();
 
-    let wait_store = store.clone();
+    let observed = observe_active_vanilla_base_install(&store, "1.21.5")
+        .await
+        .expect("observe active base")
+        .expect("active base");
     let waiter = tokio::spawn(async move {
-        wait_for_active_vanilla_base_install(wait_store.as_ref(), "1.21.5", &progress_tx).await
+        wait_for_observed_vanilla_base_install(observed, &progress_tx).await
     });
 
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3137,6 +3257,232 @@ async fn wait_for_active_vanilla_base_install_fails_loader_when_base_fails_while
             .expect("progress sender should close"),
         None
     );
+}
+
+#[tokio::test]
+async fn loader_base_failure_reacquires_after_sweep_before_failure_mutation() {
+    let root = temp_root("loader-base-failure-reacquire");
+    let state = build_test_state(&root);
+    let base_install_id = "loader-base-failure-base";
+    let loader_install_id = "loader-base-failure-loader";
+    let operation_id = install_operation_id(loader_install_id);
+    state
+        .installs()
+        .insert_or_existing_vanilla(base_install_id.to_string(), "1.21.5".to_string())
+        .await;
+    assert!(state.installs().mark_initialized(base_install_id).await);
+    state.installs().insert(loader_install_id.to_string()).await;
+    begin_install_operation_journal(state.journals(), &operation_id, "loader-test")
+        .await
+        .expect("begin loader install journal");
+
+    let base_foreground = register_install_foreground(&state)
+        .expect("register base foreground")
+        .wait_for_settlement()
+        .await;
+    let base_foreground = InstallForegroundActivity::new(base_foreground);
+    spawn_install_foreground_retention(
+        state.clone(),
+        base_install_id.to_string(),
+        state
+            .try_claim_producer()
+            .expect("claim base foreground retention producer"),
+        base_foreground.clone(),
+    );
+    drop(base_foreground);
+    let loader_foreground = register_install_foreground(&state)
+        .expect("register loader foreground")
+        .wait_for_settlement()
+        .await;
+    let loader_foreground = InstallForegroundActivity::new(loader_foreground);
+    let observed = observe_active_vanilla_base_install(state.installs(), "1.21.5")
+        .await
+        .expect("observe active base")
+        .expect("active base");
+    loader_foreground.release();
+    assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+
+    let (progress_tx, _progress_rx) = tokio_mpsc::unbounded_channel();
+    let (wait_finished_tx, wait_finished_rx) = tokio::sync::oneshot::channel();
+    let (reacquire_tx, reacquire_rx) = tokio::sync::oneshot::channel();
+    let worker_state = state.clone();
+    let worker_foreground = loader_foreground.clone();
+    let worker_operation_id = operation_id.clone();
+    let worker = tokio::spawn(async move {
+        let base_install = wait_for_observed_vanilla_base_install(observed, &progress_tx).await;
+        let _ = wait_finished_tx.send(());
+        reacquire_rx.await.expect("start loader reacquisition");
+        let _foreground = retain_install_foreground(&worker_state, &worker_foreground)
+            .await
+            .expect("reacquire loader foreground");
+        let progress = base_install.expect_err("base install should fail");
+        record_loader_base_install_dependency_guardian_failure_outcome(
+            worker_state.journals(),
+            &worker_operation_id,
+            "loader_fabric_test",
+            "1.21.5",
+        )
+        .await
+        .expect("record dependency failure");
+        worker_state
+            .installs()
+            .emit(loader_install_id, progress)
+            .await;
+    });
+    drop(loader_foreground);
+
+    state
+        .installs()
+        .emit(base_install_id, failed_progress())
+        .await;
+    wait_finished_rx.await.expect("base wait should finish");
+    wait_for_integrity_idle(&state).await;
+    let epoch = state.subscribe_integrity_idle().borrow().epoch();
+    let reservation = state
+        .try_reserve_idle_sweep(
+            epoch,
+            state.try_claim_producer().expect("claim sweep producer"),
+        )
+        .expect("reserve intervening sweep");
+    let cancellation = reservation.cancellation();
+    reacquire_tx.send(()).expect("release loader reacquisition");
+    timeout(Duration::from_secs(1), async {
+        while !cancellation.is_cancelled() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("loader reacquisition should cancel sweep");
+
+    assert!(!worker.is_finished());
+    assert!(
+        state
+            .journals()
+            .get(&operation_id)
+            .expect("loader journal")
+            .completed_steps
+            .is_empty()
+    );
+    assert!(
+        !state
+            .installs()
+            .snapshot(loader_install_id)
+            .await
+            .unwrap()
+            .done
+    );
+
+    drop(reservation);
+    worker.await.expect("loader dependency failure worker");
+    assert!(
+        !state
+            .journals()
+            .get(&operation_id)
+            .expect("loader journal")
+            .completed_steps
+            .is_empty()
+    );
+    assert!(
+        state
+            .installs()
+            .snapshot(loader_install_id)
+            .await
+            .unwrap()
+            .done
+    );
+    wait_for_integrity_idle(&state).await;
+    state.installs().remove(base_install_id).await;
+    state.installs().remove(loader_install_id).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn loader_base_success_reacquires_after_sweep_before_loader_work() {
+    let root = temp_root("loader-base-success-reacquire");
+    let state = build_test_state(&root);
+    let base_install_id = "loader-base-success-base";
+    state
+        .installs()
+        .insert_or_existing_vanilla(base_install_id.to_string(), "1.21.5".to_string())
+        .await;
+    assert!(state.installs().mark_initialized(base_install_id).await);
+    let base_foreground = register_install_foreground(&state)
+        .expect("register base foreground")
+        .wait_for_settlement()
+        .await;
+    let base_foreground = InstallForegroundActivity::new(base_foreground);
+    spawn_install_foreground_retention(
+        state.clone(),
+        base_install_id.to_string(),
+        state
+            .try_claim_producer()
+            .expect("claim base foreground retention producer"),
+        base_foreground.clone(),
+    );
+    drop(base_foreground);
+    let loader_foreground = register_install_foreground(&state)
+        .expect("register loader foreground")
+        .wait_for_settlement()
+        .await;
+    let loader_foreground = InstallForegroundActivity::new(loader_foreground);
+    let observed = observe_active_vanilla_base_install(state.installs(), "1.21.5")
+        .await
+        .expect("observe active base")
+        .expect("active base");
+    loader_foreground.release();
+    assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+
+    let loader_work = Arc::new(AtomicUsize::new(0));
+    let worker_loader_work = Arc::clone(&loader_work);
+    let (progress_tx, _progress_rx) = tokio_mpsc::unbounded_channel();
+    let (wait_finished_tx, wait_finished_rx) = tokio::sync::oneshot::channel();
+    let (reacquire_tx, reacquire_rx) = tokio::sync::oneshot::channel();
+    let worker_state = state.clone();
+    let worker_foreground = loader_foreground.clone();
+    let worker = tokio::spawn(async move {
+        wait_for_observed_vanilla_base_install(observed, &progress_tx)
+            .await
+            .expect("base install should succeed");
+        let _ = wait_finished_tx.send(());
+        reacquire_rx.await.expect("start loader reacquisition");
+        let _foreground = retain_install_foreground(&worker_state, &worker_foreground)
+            .await
+            .expect("reacquire loader foreground");
+        worker_loader_work.fetch_add(1, Ordering::SeqCst);
+    });
+    drop(loader_foreground);
+
+    state
+        .installs()
+        .emit(base_install_id, done_progress())
+        .await;
+    wait_finished_rx.await.expect("base wait should finish");
+    wait_for_integrity_idle(&state).await;
+    let epoch = state.subscribe_integrity_idle().borrow().epoch();
+    let reservation = state
+        .try_reserve_idle_sweep(
+            epoch,
+            state.try_claim_producer().expect("claim sweep producer"),
+        )
+        .expect("reserve intervening sweep");
+    let cancellation = reservation.cancellation();
+    reacquire_tx.send(()).expect("release loader reacquisition");
+    timeout(Duration::from_secs(1), async {
+        while !cancellation.is_cancelled() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("loader reacquisition should cancel sweep");
+    assert!(!worker.is_finished());
+    assert_eq!(loader_work.load(Ordering::SeqCst), 0);
+
+    drop(reservation);
+    worker.await.expect("loader work owner");
+    assert_eq!(loader_work.load(Ordering::SeqCst), 1);
+    wait_for_integrity_idle(&state).await;
+    state.installs().remove(base_install_id).await;
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]

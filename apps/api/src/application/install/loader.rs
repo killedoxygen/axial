@@ -18,8 +18,10 @@ use crate::application::{InstallVersionCommand, instances::invalidate_create_vie
 use crate::dto::loaders::{
     LoaderBuildsResponse, LoaderComponentsResponse, LoaderGameVersionsResponse,
 };
-use crate::state::InstallInitializationStatus;
-use crate::state::{AppState, InstallStore, ProducerLease};
+use crate::state::{
+    AppState, InstallInitializationStatus, InstallProgressRecord, InstallSnapshot, InstallStore,
+    ProducerLease,
+};
 use axial_minecraft::loaders::LoaderActiveInstallFailure;
 use axial_minecraft::{
     DownloadProgress, LoaderComponentId, LoaderError, LoaderInstallError, LoaderInstallFailureKind,
@@ -190,15 +192,39 @@ pub(super) async fn start_loader_install_owned(
                 build.component_id.short_key(),
                 build.build_id
             );
-            worker_foreground.release();
-            let base_install =
-                wait_for_active_vanilla_base_install(&worker_store, &base_version_id, &progress_tx)
-                    .await;
-            if !retain_install_foreground(&worker_state, &worker_foreground).await {
-                drop(progress_tx);
-                let _ = finish_install_progress_task(store_task).await;
-                return;
-            }
+            let observed_base =
+                observe_active_vanilla_base_install(&worker_store, &base_version_id).await;
+            let (loader_foreground, base_install) = match observed_base {
+                Ok(Some(observed)) => {
+                    worker_foreground.release();
+                    let base_install =
+                        wait_for_observed_vanilla_base_install(observed, &progress_tx).await;
+                    let Some(foreground) =
+                        retain_install_foreground(&worker_state, &worker_foreground).await
+                    else {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(store_task).await;
+                        return;
+                    };
+                    (foreground, base_install)
+                }
+                Ok(None) => {
+                    let Some(foreground) = worker_foreground.retained() else {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(store_task).await;
+                        return;
+                    };
+                    (foreground, Ok(()))
+                }
+                Err(progress) => {
+                    let Some(foreground) = worker_foreground.retained() else {
+                        drop(progress_tx);
+                        let _ = finish_install_progress_task(store_task).await;
+                        return;
+                    };
+                    (foreground, Err(progress))
+                }
+            };
             if let Err(progress) = base_install {
                 record_loader_base_install_dependency_guardian_failure_outcome(
                     worker_journals.as_ref(),
@@ -294,7 +320,11 @@ pub(super) async fn start_loader_install_owned(
                                     receipt.version_id(),
                                 )?;
                                 worker_state
-                                    .accept_known_good_install_receipt(&library_dir, receipt)
+                                    .accept_known_good_install_receipt(
+                                        &loader_foreground,
+                                        &library_dir,
+                                        receipt,
+                                    )
                                     .await
                             },
                             captured_terminal,
@@ -322,7 +352,8 @@ pub(super) async fn start_loader_install_owned(
             }
         },
         move |progress| async move {
-            let _ = retain_install_foreground(&interrupted_state, &interrupted_foreground).await;
+            let _foreground =
+                retain_install_foreground(&interrupted_state, &interrupted_foreground).await;
             if record_install_operation_interrupted(
                 journals.as_ref(),
                 &operation_id_task,
@@ -516,35 +547,52 @@ pub async fn loader_game_versions(
         .map_err(loader_pre_operation_error_response)
 }
 
-pub(crate) async fn wait_for_active_vanilla_base_install(
-    store: &InstallStore,
-    version_id: &str,
-    progress_tx: &mpsc::UnboundedSender<DownloadProgress>,
-) -> Result<(), DownloadProgress> {
-    let Some(install_id) = store.active_vanilla_install(version_id).await else {
-        return Ok(());
-    };
-
-    wait_for_observed_vanilla_base_install(store, &install_id, progress_tx).await
+pub(super) struct ObservedVanillaBaseInstall {
+    store: Arc<InstallStore>,
+    install_id: String,
+    snapshot: InstallSnapshot,
+    receiver: tokio::sync::broadcast::Receiver<InstallProgressRecord>,
 }
 
-pub(crate) async fn wait_for_observed_vanilla_base_install(
-    store: &InstallStore,
-    install_id: &str,
-    progress_tx: &mpsc::UnboundedSender<DownloadProgress>,
-) -> Result<(), DownloadProgress> {
-    let Some((snapshot, mut receiver)) = store.subscribe_records(install_id).await else {
+pub(super) async fn observe_active_vanilla_base_install(
+    store: &Arc<InstallStore>,
+    version_id: &str,
+) -> Result<Option<ObservedVanillaBaseInstall>, DownloadProgress> {
+    let Some(install_id) = store.active_vanilla_install(version_id).await else {
+        return Ok(None);
+    };
+    let Some((snapshot, receiver)) = store.subscribe_records(&install_id).await else {
         return Err(base_install_failed_progress());
     };
-
-    if let Some(record) = snapshot.latest.as_ref() {
-        if let Some(terminal) = explicit_base_install_terminal(&record.progress) {
-            return terminal;
-        }
-        let _ = progress_tx.send(record.progress.clone());
+    if let Some(record) = snapshot.latest.as_ref()
+        && let Some(terminal) = explicit_base_install_terminal(&record.progress)
+    {
+        return terminal.map(|()| None);
     }
     if snapshot.done {
         return Err(base_install_failed_progress());
+    }
+    Ok(Some(ObservedVanillaBaseInstall {
+        store: store.clone(),
+        install_id,
+        snapshot,
+        receiver,
+    }))
+}
+
+pub(super) async fn wait_for_observed_vanilla_base_install(
+    observed: ObservedVanillaBaseInstall,
+    progress_tx: &mpsc::UnboundedSender<DownloadProgress>,
+) -> Result<(), DownloadProgress> {
+    let ObservedVanillaBaseInstall {
+        store,
+        install_id,
+        snapshot,
+        mut receiver,
+    } = observed;
+    debug_assert!(!snapshot.done);
+    if let Some(record) = snapshot.latest {
+        let _ = progress_tx.send(record.progress);
     }
 
     loop {
@@ -557,7 +605,7 @@ pub(crate) async fn wait_for_observed_vanilla_base_install(
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                let Some(snapshot) = store.snapshot(install_id).await else {
+                let Some(snapshot) = store.snapshot(&install_id).await else {
                     return Err(base_install_failed_progress());
                 };
                 let Some(progress) = snapshot.latest.as_ref().map(|record| &record.progress) else {

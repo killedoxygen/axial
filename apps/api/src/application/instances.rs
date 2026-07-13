@@ -451,8 +451,8 @@ pub(crate) async fn handle_duplicate_instance_owned(
         &producer,
         id,
         payload,
-        |state, instance_id| async move {
-            crate::application::rebuild_registered_known_good(&state, &instance_id).await
+        |state, producer, instance_id| async move {
+            crate::application::rebuild_registered_known_good(&state, &producer, &instance_id).await
         },
     )
     .await
@@ -466,11 +466,12 @@ async fn complete_duplicate_instance_with_rebuild<Rebuild, RebuildFuture>(
     rebuild: Rebuild,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)>
 where
-    Rebuild: FnOnce(AppState, String) -> RebuildFuture + Send + 'static,
+    Rebuild: FnOnce(AppState, ProducerLease, String) -> RebuildFuture + Send + 'static,
     RebuildFuture: Future<Output = Result<(), KnownGoodRebuildError>> + Send + 'static,
 {
     let payload = payload.unwrap_or_default();
     let continuation = producer.claim_child();
+    let rebuild_owner = producer.claim_child();
     let rollback_owner = producer.claim_child();
     let continuation_state = state.clone();
     let source_id = id.to_string();
@@ -486,7 +487,13 @@ where
                 instance_write_error_response(InstanceWriteOperation::Duplicate, error)
             })?;
         let instance_id = instance.id.clone();
-        match rebuild(continuation_state.clone(), instance_id.clone()).await {
+        match rebuild(
+            continuation_state.clone(),
+            rebuild_owner,
+            instance_id.clone(),
+        )
+        .await
+        {
             Ok(()) => Ok(instance),
             Err(error) => {
                 if let Err(rollback_error) =
@@ -521,8 +528,10 @@ pub(crate) async fn handle_duplicate_instance(
     id: &str,
     payload: Option<DuplicateInstanceRequest>,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
-    complete_duplicate_instance_with_rebuild(state, producer, id, payload, |_, _| async { Ok(()) })
-        .await
+    complete_duplicate_instance_with_rebuild(state, producer, id, payload, |_, _, _| async {
+        Ok(())
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -534,7 +543,7 @@ async fn handle_duplicate_instance_with_rebuild<Rebuild, RebuildFuture>(
     rebuild: Rebuild,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)>
 where
-    Rebuild: FnOnce(AppState, String) -> RebuildFuture + Send + 'static,
+    Rebuild: FnOnce(AppState, ProducerLease, String) -> RebuildFuture + Send + 'static,
     RebuildFuture: Future<Output = Result<(), KnownGoodRebuildError>> + Send + 'static,
 {
     complete_duplicate_instance_with_rebuild(state, producer, id, payload, rebuild).await

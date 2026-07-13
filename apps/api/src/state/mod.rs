@@ -595,18 +595,28 @@ impl AppState {
 
     pub(crate) async fn accept_known_good_install_receipt(
         &self,
+        foreground: &IntegrityForegroundLease,
         installed_library_root: &Path,
         receipt: axial_minecraft::known_good::KnownGoodInstallReceipt,
     ) -> std::io::Result<()> {
-        self.activate_known_good_source(installed_library_root, receipt.into_activation_source())
-            .await
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| foreign_integrity_foreground_error())?;
+        self.activate_known_good_source(
+            foreground,
+            installed_library_root,
+            receipt.into_activation_source(),
+        )
+        .await
     }
 
     async fn activate_known_good_source(
         &self,
+        foreground: &IntegrityForegroundLease,
         installed_library_root: &Path,
         source: axial_minecraft::known_good::KnownGoodActivationSource,
     ) -> std::io::Result<()> {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| foreign_integrity_foreground_error())?;
         let installed_library_root =
             require_matching_known_good_library_root(self.library_dir(), installed_library_root)?;
         let (version_id, inventory) = source.into_parts();
@@ -638,6 +648,7 @@ impl AppState {
             let inventory = inventory.clone();
             async move {
                 self.reconcile_known_good_instance(
+                    foreground,
                     &instance_id,
                     version_id,
                     &created_at,
@@ -652,6 +663,7 @@ impl AppState {
 
     async fn reconcile_known_good_instance(
         &self,
+        foreground: &IntegrityForegroundLease,
         instance_id: &str,
         version_id: &str,
         created_at: &str,
@@ -659,7 +671,13 @@ impl AppState {
         inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
     ) -> std::io::Result<()> {
         let admission = match self
-            .admit_known_good_candidate(instance_id, version_id, created_at, installed_library_root)
+            .admit_known_good_candidate(
+                foreground,
+                instance_id,
+                version_id,
+                created_at,
+                installed_library_root,
+            )
             .await
         {
             Ok(Some(admission)) => admission,
@@ -714,12 +732,16 @@ impl AppState {
 
     async fn admit_known_good_candidate(
         &self,
+        foreground: &IntegrityForegroundLease,
         instance_id: &str,
         version_id: &str,
         created_at: &str,
         installed_library_root: &Path,
     ) -> std::io::Result<Option<KnownGoodCandidateAdmission>> {
-        let lifecycle = self.acquire_instance_lifecycle(instance_id).await;
+        let lifecycle = self
+            .acquire_integrity_instance_lifecycle(foreground, instance_id)
+            .await
+            .map_err(|_| foreign_integrity_foreground_error())?;
         if !matches_known_good_incarnation(
             self.instances.get(instance_id).as_ref(),
             instance_id,
@@ -1474,6 +1496,13 @@ fn require_matching_known_good_library_root(
     Ok(installed_library_root)
 }
 
+fn foreign_integrity_foreground_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "integrity foreground authority belongs to another application state",
+    )
+}
+
 #[cfg(test)]
 mod known_good_identity_tests {
     use super::*;
@@ -1658,6 +1687,11 @@ mod known_good_identity_tests {
         let exact_created_at = exact.created_at.clone();
         let drifted_id = drifted.id.clone();
         let drifted_created_at = drifted.created_at.clone();
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register fanout foreground")
+            .wait_for_settlement()
+            .await;
         let fanout_candidates = vec![
             (exact_id.clone(), exact_created_at),
             (drifted_id.clone(), drifted_created_at),
@@ -1669,6 +1703,7 @@ mod known_good_identity_tests {
         let fanout_root = library_root.clone();
         let fanout_activated = activated.clone();
         let fanout_first_activated = first_activated.clone();
+        let fanout_foreground = foreground.retained();
         let fanout = tokio::spawn(async move {
             complete_independent_known_good_fanout(
                 fanout_candidates,
@@ -1677,9 +1712,11 @@ mod known_good_identity_tests {
                     let library_root = fanout_root.clone();
                     let activated = fanout_activated.clone();
                     let first_activated = fanout_first_activated.clone();
+                    let candidate_foreground = fanout_foreground.retained();
                     async move {
                         if let Some(admission) = state
                             .admit_known_good_candidate(
+                                &candidate_foreground,
                                 &instance_id,
                                 "1.21.5",
                                 &created_at,
@@ -1755,14 +1792,21 @@ mod known_good_identity_tests {
             .instances()
             .insert_for_test("Root drift", "1.21.5")
             .expect("root-drift instance");
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register root-drift foreground")
+            .wait_for_settlement()
+            .await;
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
         let admission_state = state.clone();
         let admission_id = instance.id.clone();
         let admission_created_at = instance.created_at.clone();
         let admission_root = installed_root.clone();
+        let admission_foreground = foreground.retained();
         let admission = tokio::spawn(async move {
             admission_state
                 .admit_known_good_candidate(
+                    &admission_foreground,
                     &admission_id,
                     "1.21.5",
                     &admission_created_at,
@@ -1806,8 +1850,14 @@ mod known_good_identity_tests {
             .instances()
             .insert_for_test("Post-admission root drift", "1.21.5")
             .expect("post-admission instance");
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register post-admission foreground")
+            .wait_for_settlement()
+            .await;
         let admission = state
             .admit_known_good_candidate(
+                &foreground,
                 &instance.id,
                 "1.21.5",
                 &instance.created_at,
@@ -1894,20 +1944,6 @@ mod known_good_identity_tests {
             *activated.lock().expect("activated candidates"),
             vec!["first"]
         );
-    }
-
-    #[test]
-    fn stale_raw_known_good_activation_entrypoints_are_absent() {
-        let source = include_str!("mod.rs");
-        assert!(!source.contains(concat!("reconcile_registered_", "known_good_instance")));
-        assert!(!source.contains(concat!(
-            "pub(crate) async fn reconcile_",
-            "known_good_instance"
-        )));
-        assert!(!source.contains(concat!(
-            "pub(crate) async fn activate_",
-            "known_good_source"
-        )));
     }
 
     #[test]

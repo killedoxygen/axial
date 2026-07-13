@@ -237,13 +237,6 @@ impl InstallForegroundActivity {
         }
     }
 
-    fn is_active(&self) -> bool {
-        self.lease
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    }
-
     fn release(&self) {
         drop(
             self.lease
@@ -264,6 +257,14 @@ impl InstallForegroundActivity {
             "install foreground activity retained more than one lease"
         );
     }
+
+    fn retained(&self) -> Option<IntegrityForegroundLease> {
+        self.lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(IntegrityForegroundLease::retained)
+    }
 }
 
 fn register_install_foreground(
@@ -277,15 +278,17 @@ fn register_install_foreground(
 async fn retain_install_foreground(
     state: &AppState,
     foreground: &InstallForegroundActivity,
-) -> bool {
-    if foreground.is_active() {
-        return true;
+) -> Option<IntegrityForegroundLease> {
+    if let Some(retained) = foreground.retained() {
+        return Some(retained);
     }
     let Ok(registration) = register_install_foreground(state) else {
-        return false;
+        return None;
     };
-    foreground.retain(registration.wait_for_settlement().await);
-    true
+    let lease = registration.wait_for_settlement().await;
+    let retained = lease.retained();
+    foreground.retain(lease);
+    Some(retained)
 }
 
 fn spawn_install_foreground_retention(
@@ -314,8 +317,8 @@ use loader::start_loader_install_owned;
 #[cfg(test)]
 use loader::{
     dispatch_loader_install_failure, loader_install_done_progress, loader_install_error_progress,
-    publish_known_good_loader_terminal, require_exact_loader_receipt_version,
-    wait_for_active_vanilla_base_install, wait_for_observed_vanilla_base_install,
+    observe_active_vanilla_base_install, publish_known_good_loader_terminal,
+    require_exact_loader_receipt_version, wait_for_observed_vanilla_base_install,
 };
 pub use loader::{
     loader_builds, loader_components, loader_game_versions, loader_pre_operation_error_response,
@@ -438,6 +441,7 @@ pub(crate) async fn start_install_version_owned(
     let worker_runtime_cache = state.managed_runtime_cache().clone();
     let progress_owner = producer.claim_child();
     let foreground = InstallForegroundActivity::new(reservation.hand_off());
+    let worker_foreground = foreground.clone();
     let interrupted_foreground = foreground.clone();
     let interrupted_state = state.clone();
     spawn_install_foreground_retention(
@@ -545,10 +549,21 @@ pub(crate) async fn start_install_version_owned(
                     .and_then(|mut progress| progress.take());
                 let install_error = match install_result {
                     Ok(receipt) => {
-                        match worker_state
-                            .accept_known_good_install_receipt(&installed_library_root, receipt)
-                            .await
-                        {
+                        let acceptance = match worker_foreground.retained() {
+                            Some(foreground) => {
+                                worker_state
+                                    .accept_known_good_install_receipt(
+                                        &foreground,
+                                        &installed_library_root,
+                                        receipt,
+                                    )
+                                    .await
+                            }
+                            None => Err(std::io::Error::other(
+                                "install foreground authority ended before receipt activation",
+                            )),
+                        };
+                        match acceptance {
                             Ok(()) => break (true, attempt_terminal_progress),
                             Err(error) => {
                                 tracing::warn!(
@@ -623,7 +638,8 @@ pub(crate) async fn start_install_version_owned(
             }
         },
         move |progress| async move {
-            let _ = retain_install_foreground(&interrupted_state, &interrupted_foreground).await;
+            let _foreground =
+                retain_install_foreground(&interrupted_state, &interrupted_foreground).await;
             if record_install_operation_interrupted(
                 journals.as_ref(),
                 &operation_id_task,

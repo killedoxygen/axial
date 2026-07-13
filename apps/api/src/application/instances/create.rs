@@ -436,8 +436,8 @@ pub(crate) async fn handle_create_instance_owned(
         state,
         payload,
         handoff,
-        |state, instance_id| async move {
-            rebuild_registered_known_good(&state, &instance_id).await
+        |state, producer, instance_id| async move {
+            rebuild_registered_known_good(&state, &producer, &instance_id).await
         },
     )
     .await
@@ -450,7 +450,7 @@ async fn handle_create_instance_owned_with_rebuild<Rebuild, RebuildFuture>(
     rebuild: Rebuild,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)>
 where
-    Rebuild: FnOnce(AppState, String) -> RebuildFuture + Send + 'static,
+    Rebuild: FnOnce(AppState, ProducerLease, String) -> RebuildFuture + Send + 'static,
     RebuildFuture:
         Future<Output = Result<(), crate::state::KnownGoodRebuildError>> + Send + 'static,
 {
@@ -479,6 +479,7 @@ where
     let queued_install_request = install_request.clone();
     let instance = build_created_instance(&payload, &selection, &preset)?;
     let continuation = producer.claim_child();
+    let rebuild_owner = producer.claim_child();
     let rollback_owner = producer.claim_child();
     let queue_owner = install_request.as_ref().map(|_| producer.claim_child());
     let continuation_state = state.clone();
@@ -511,12 +512,16 @@ where
                 }
                 Err(error) => Err(error),
             },
-            None => rebuild(continuation_state.clone(), instance_id.clone())
-                .await
-                .map(|()| None)
-                .map_err(|error| {
-                    known_good_rebuild_error_response(InstanceWriteOperation::Create, error)
-                }),
+            None => rebuild(
+                continuation_state.clone(),
+                rebuild_owner,
+                instance_id.clone(),
+            )
+            .await
+            .map(|()| None)
+            .map_err(|error| {
+                known_good_rebuild_error_response(InstanceWriteOperation::Create, error)
+            }),
         };
         match completion {
             Ok(install_queue) => Ok((instance, install_queue)),
@@ -851,7 +856,7 @@ pub(crate) async fn handle_create_instance(
     state: &AppState,
     payload: CreateInstanceRequest,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
-    handle_create_instance_with_rebuild(state, payload, |_, _| async { Ok(()) }).await
+    handle_create_instance_with_rebuild(state, payload, |_, _, _| async { Ok(()) }).await
 }
 
 #[cfg(test)]
@@ -861,7 +866,7 @@ pub(super) async fn handle_create_instance_with_rebuild<Rebuild, RebuildFuture>(
     rebuild: Rebuild,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)>
 where
-    Rebuild: FnOnce(AppState, String) -> RebuildFuture + Send + 'static,
+    Rebuild: FnOnce(AppState, ProducerLease, String) -> RebuildFuture + Send + 'static,
     RebuildFuture:
         Future<Output = Result<(), crate::state::KnownGoodRebuildError>> + Send + 'static,
 {

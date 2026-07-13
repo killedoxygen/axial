@@ -1466,7 +1466,7 @@ async fn create_ready_instance_rebuilds_known_good_once() {
                 selection_id: "vanilla|1.21.1".to_string(),
                 ..CreateInstanceRequest::default()
             },
-            move |_, _| async move {
+            move |_, _, _| async move {
                 observed_rebuilds.fetch_add(1, Ordering::SeqCst);
                 entered_tx.send(()).expect("signal rebuild entry");
                 release_rx.await.expect("release rebuild");
@@ -1532,7 +1532,7 @@ async fn create_queued_instance_does_not_rebuild_known_good() {
             selection_id: "vanilla|1.21.2".to_string(),
             ..CreateInstanceRequest::default()
         },
-        move |_, _| async move {
+        move |_, _, _| async move {
             observed_rebuilds.fetch_add(1, Ordering::SeqCst);
             Ok(())
         },
@@ -1572,7 +1572,7 @@ async fn create_missed_active_install_receipt_rolls_back_new_instance() {
             selection_id: "vanilla|1.21.2".to_string(),
             ..CreateInstanceRequest::default()
         },
-        |_, _| async { panic!("queued create must not reconstruct") },
+        |_, _, _| async { panic!("queued create must not reconstruct") },
     )
     .await
     .expect_err("instance absent from active receipt fanout must roll back");
@@ -1605,7 +1605,7 @@ async fn create_rebuild_failure_rolls_back_the_new_instance() {
             selection_id: "vanilla|1.21.1".to_string(),
             ..CreateInstanceRequest::default()
         },
-        move |_, instance_id| async move {
+        move |_, _, instance_id| async move {
             *observed_id.lock().expect("capture created id") = Some(instance_id);
             Err(crate::state::KnownGoodRebuildError::ReconstructionFailed)
         },
@@ -1651,7 +1651,7 @@ async fn duplicate_instance_rebuilds_known_good_once() {
             &producer,
             &source_id,
             None,
-            move |_, _| async move {
+            move |_, _, _| async move {
                 observed_rebuilds.fetch_add(1, Ordering::SeqCst);
                 entered_tx.send(()).expect("signal rebuild entry");
                 release_rx.await.expect("release rebuild");
@@ -1691,7 +1691,7 @@ async fn duplicate_rebuild_failure_rolls_back_only_the_copy() {
         &fixture.producer,
         &source.id,
         None,
-        move |_, instance_id| async move {
+        move |_, _, instance_id| async move {
             *observed_id.lock().expect("capture duplicate id") = Some(instance_id);
             Err(crate::state::KnownGoodRebuildError::ReconstructionFailed)
         },
@@ -1734,7 +1734,7 @@ async fn dropped_create_caller_keeps_rebuild_rollback_owned_until_quiescence() {
                 selection_id: "vanilla|1.21.1".to_string(),
                 ..CreateInstanceRequest::default()
             },
-            move |_, instance_id| async move {
+            move |_, _, instance_id| async move {
                 *observed_id.lock().expect("capture created id") = Some(instance_id);
                 entered_tx.send(()).expect("signal rebuild entry");
                 release_rx.await.expect("release rebuild");

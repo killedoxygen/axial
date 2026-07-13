@@ -9,18 +9,31 @@ const MAX_STARTUP_REBUILD_GROUPS: usize = 2;
 
 pub(crate) async fn rebuild_registered_known_good(
     state: &AppState,
+    producer: &ProducerLease,
     instance_id: &str,
 ) -> Result<(), KnownGoodRebuildError> {
+    let foreground = state
+        .register_integrity_foreground()
+        .map_err(|_| KnownGoodRebuildError::OwnerStopped)?
+        .wait_for_settlement()
+        .await;
     state
-        .rebuild_known_good_for_registered_instance(instance_id, |version_id| async move {
-            axial_minecraft::reconstruct_known_good(&version_id).await
-        })
+        .rebuild_known_good_for_registered_instance(
+            &foreground,
+            producer,
+            instance_id,
+            |version_id| async move { axial_minecraft::reconstruct_known_good(&version_id).await },
+        )
         .await
 }
 
 pub(crate) async fn registered_known_good_is_live(state: &AppState, instance_id: &str) -> bool {
+    let Ok(foreground) = state.register_integrity_foreground() else {
+        return false;
+    };
+    let foreground = foreground.wait_for_settlement().await;
     state
-        .registered_instance_has_live_known_good(instance_id)
+        .registered_instance_has_live_known_good(&foreground, instance_id)
         .await
         .unwrap_or(false)
 }
@@ -41,15 +54,28 @@ fn spawn_startup_known_good_rebuilds_with<Reconstruct, ReconstructFuture>(
         + Send
         + 'static,
 {
-    let groups = startup_rebuild_groups(state);
-    let state = state.clone();
     let shutdown = state.subscribe_shutdown();
+    if *shutdown.borrow() {
+        return;
+    }
+    let groups = startup_rebuild_groups(state);
+    if groups.is_empty() {
+        return;
+    }
+    let Ok(foreground) = state.register_integrity_foreground() else {
+        return;
+    };
+    let state = state.clone();
+    let rebuild_owner = producer.claim_child();
     producer.spawn(async move {
+        let foreground = foreground.wait_for_settlement().await;
         stream::iter(groups)
             .for_each_concurrent(MAX_STARTUP_REBUILD_GROUPS, |instance_ids| {
                 let state = state.clone();
                 let shutdown = shutdown.clone();
                 let reconstruct = reconstruct.clone();
+                let foreground = &foreground;
+                let rebuild_owner = &rebuild_owner;
                 async move {
                     if *shutdown.borrow() {
                         return;
@@ -60,6 +86,8 @@ fn spawn_startup_known_good_rebuilds_with<Reconstruct, ReconstructFuture>(
                         async move {
                             let _ = state
                                 .rebuild_known_good_for_registered_instance(
+                                    foreground,
+                                    rebuild_owner,
                                     &instance_id,
                                     reconstruct,
                                 )
@@ -168,6 +196,129 @@ mod tests {
             .expect("close instance registry");
         drop(state);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn startup_foreground_waits_for_cancelled_sweep_settlement_before_source_entry() {
+        let (state, root) = state_fixture("sweep-settlement");
+        state
+            .instances()
+            .insert_for_test("Sweep", "1.21.1")
+            .expect("register instance");
+        let idle = state.subscribe_integrity_idle();
+        let epoch = idle.borrow().epoch();
+        let reservation = state
+            .try_reserve_idle_sweep(
+                epoch,
+                state.try_claim_producer().expect("claim sweep producer"),
+            )
+            .expect("reserve active sweep");
+        let cancellation = reservation.cancellation();
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        spawn_startup_known_good_rebuilds_with(
+            &state,
+            state.try_claim_producer().expect("claim startup producer"),
+            {
+                let calls = calls.clone();
+                move |_| {
+                    let entered_tx = entered_tx.clone();
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        entered_tx.send(()).expect("record source entry");
+                        Err(KnownGoodReconstructionError::Vanilla)
+                    }
+                }
+            },
+        );
+
+        assert!(cancellation.is_cancelled());
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+            assert!(entered_rx.try_recv().is_err());
+        }
+        drop(reservation);
+        timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("source enters after settlement")
+            .expect("source entry");
+        state.quiesce().await.expect("startup source drains");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn empty_and_pre_shutdown_startup_do_not_register_or_enter_a_source() {
+        let (empty_state, empty_root) = state_fixture("empty-admission");
+        let empty_idle = empty_state.subscribe_integrity_idle();
+        let empty_before = *empty_idle.borrow();
+        let empty_calls = Arc::new(AtomicUsize::new(0));
+        spawn_startup_known_good_rebuilds_with(
+            &empty_state,
+            empty_state
+                .try_claim_producer()
+                .expect("claim empty startup producer"),
+            {
+                let empty_calls = empty_calls.clone();
+                move |_| {
+                    let empty_calls = empty_calls.clone();
+                    async move {
+                        empty_calls.fetch_add(1, Ordering::SeqCst);
+                        Err(KnownGoodReconstructionError::Vanilla)
+                    }
+                }
+            },
+        );
+        assert_eq!(*empty_idle.borrow(), empty_before);
+        assert_eq!(empty_calls.load(Ordering::SeqCst), 0);
+        close_fixture(empty_state, &empty_root).await;
+
+        let (closing_state, closing_root) = state_fixture("closing-admission");
+        closing_state
+            .instances()
+            .insert_for_test("Closing", "1.21.1")
+            .expect("register closing instance");
+        let closing_idle = closing_state.subscribe_integrity_idle();
+        let closing_epoch = closing_idle.borrow().epoch();
+        let producer = closing_state
+            .try_claim_producer()
+            .expect("claim closing startup producer");
+        let mut shutdown = closing_state.subscribe_shutdown();
+        let quiesce_state = closing_state.clone();
+        let quiesce = tokio::spawn(async move { quiesce_state.quiesce().await });
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if *shutdown.borrow_and_update() {
+                    return;
+                }
+                shutdown
+                    .changed()
+                    .await
+                    .expect("shutdown signal remains live");
+            }
+        })
+        .await
+        .expect("shutdown starts");
+        let closing_calls = Arc::new(AtomicUsize::new(0));
+        spawn_startup_known_good_rebuilds_with(&closing_state, producer, {
+            let closing_calls = closing_calls.clone();
+            move |_| {
+                let closing_calls = closing_calls.clone();
+                async move {
+                    closing_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(KnownGoodReconstructionError::Vanilla)
+                }
+            }
+        });
+        assert_eq!(closing_idle.borrow().epoch(), closing_epoch);
+        assert_eq!(closing_calls.load(Ordering::SeqCst), 0);
+        timeout(Duration::from_secs(5), quiesce)
+            .await
+            .expect("closing producer releases")
+            .expect("quiesce task")
+            .expect("quiesce succeeds");
+        close_fixture(closing_state, &closing_root).await;
     }
 
     #[tokio::test]
