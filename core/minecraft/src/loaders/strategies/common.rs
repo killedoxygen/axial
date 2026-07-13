@@ -1439,6 +1439,11 @@ fn done() -> DownloadProgress {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::{
+        AuthenticatedProcessorSources, materialize_retained_installer_libraries,
+        read_installed_base_client, spawn_bound_processor_execution,
+    };
     use super::{
         base_version_install_lock_from_map, cleanup_on_error,
         download_installer_libraries_with_evidence, ensure_base_version,
@@ -1460,6 +1465,8 @@ mod tests {
         BoundForgeInstallExecution, BoundForgeInstallerPlan, bind_authenticated_installer_plan,
         plan_authenticated_installer,
     };
+    #[cfg(unix)]
+    use crate::loaders::managed_fs::ManagedDir;
     use crate::loaders::providers::{ProfileInstallProof, ProfileLibraryProof};
     use crate::loaders::source::VerifiedLoaderSource;
     use crate::loaders::types::LoaderError;
@@ -1473,7 +1480,7 @@ mod tests {
     use crate::paths::versions_dir;
     use crate::rules::default_environment;
     #[cfg(unix)]
-    use crate::runtime::{RuntimeId, TestRuntimeSourceDescriptor};
+    use crate::runtime::{RuntimeId, TestRuntimeSourceDescriptor, acquire_test_runtime_source};
     use sha1::{Digest as _, Sha1};
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
@@ -1487,6 +1494,7 @@ mod tests {
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    const TEST_PROCESSOR_COORDINATE: &str = "x:p:1";
     const TEST_PROCESSOR_TERMINAL_BYTES: &[u8] = b"processor-terminal";
 
     #[tokio::test]
@@ -1886,9 +1894,17 @@ mod tests {
         );
         let fresh_library = zip_entries(&[("example/Fresh.class", b"processor-fresh".as_slice())]);
         let fresh_server = TestByteServer::start(fresh_library);
-        let installer_server = TestByteServer::start_with_sha1(
-            runnable_forge_installer_jar_with_terminal(&record, None, Some(&fresh_server.url)),
-        );
+        let installer_server =
+            TestByteServer::start_with_sha1(single_step_processor_installer_jar_with_libraries(
+                &record,
+                vec![serde_json::json!({
+                    "name": "example:processor-fresh:1.0",
+                    "downloads": {"artifact": {
+                        "path": "example/processor-fresh/1.0/processor-fresh-1.0.jar",
+                        "url": fresh_server.url.clone()
+                    }}
+                })],
+            ));
         record.install_source = LoaderInstallSource::InstallerJar {
             url: installer_server.url.clone(),
         };
@@ -2038,6 +2054,24 @@ printf '%s' 'processor-terminal' > "$last"
             server.stop();
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_size_processor_reconstruction_matches_install_for_supported_shapes() {
+        for shape in [
+            ProcessorFixtureShape::ForgeSpecZero,
+            ProcessorFixtureShape::ForgeModern,
+            ProcessorFixtureShape::NeoModern,
+        ] {
+            assert_processor_reconstruction_parity(shape).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn processor_reconstruction_executes_two_step_source_union_exactly() {
+        assert_two_step_processor_source_union().await;
     }
 
     #[tokio::test]
@@ -3987,135 +4021,695 @@ printf '%s' 'processor-terminal' > "$last"
         ])
     }
 
-    fn runnable_forge_installer_jar(record: &LoaderBuildRecord) -> Vec<u8> {
-        runnable_forge_installer_jar_with_terminal(record, None, None)
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum ProcessorFixtureShape {
+        ForgeSpecZero,
+        ForgeModern,
+        NeoModern,
     }
 
-    fn runnable_forge_installer_jar_with_terminal(
+    struct ProcessorFixtureLayout {
+        version_id: String,
+        profile: &'static str,
+        spec: i32,
+        root_coordinate: String,
+        root_entry: String,
+        root_bytes: Vec<u8>,
+        terminal_coordinate: String,
+        install_path: Option<String>,
+        additional_install_library: Option<(String, String, Vec<u8>)>,
+    }
+
+    #[cfg(unix)]
+    fn processor_fixture_record(shape: ProcessorFixtureShape) -> LoaderBuildRecord {
+        let mut record = installer_record();
+        match shape {
+            ProcessorFixtureShape::ForgeSpecZero => {
+                record.minecraft_version = "1.12.2".to_string();
+                record.loader_version = "14.23.5.2859".to_string();
+                record.strategy = LoaderInstallStrategy::ForgeLegacyInstaller;
+            }
+            ProcessorFixtureShape::ForgeModern => {}
+            ProcessorFixtureShape::NeoModern => {
+                record.component_id = LoaderComponentId::NeoForge;
+                record.component_name = record.component_id.display_name().to_string();
+                record.loader_version = "21.5.74".to_string();
+                record.strategy = LoaderInstallStrategy::NeoForgeModern;
+            }
+        }
+        canonicalize_record_identity(&mut record);
+        record
+    }
+
+    fn processor_fixture_layout(record: &LoaderBuildRecord) -> ProcessorFixtureLayout {
+        let root_bytes = zip_entries(&[("example/Root.class", b"root")]);
+        match (record.component_id, record.strategy) {
+            (LoaderComponentId::Forge, LoaderInstallStrategy::ForgeModern) => {
+                let forge_version =
+                    format!("{}-{}", record.minecraft_version, record.loader_version);
+                let root_coordinate = format!("net.minecraftforge:forge:{forge_version}:universal");
+                let shim_coordinate = format!("net.minecraftforge:forge:{forge_version}:shim");
+                ProcessorFixtureLayout {
+                    version_id: format!(
+                        "{}-forge-{}",
+                        record.minecraft_version, record.loader_version
+                    ),
+                    profile: "forge",
+                    spec: 1,
+                    root_coordinate,
+                    root_entry: format!(
+                        "maven/net/minecraftforge/forge/{forge_version}/forge-{forge_version}-universal.jar"
+                    ),
+                    root_bytes,
+                    terminal_coordinate: format!("net.minecraftforge:forge:{forge_version}:client"),
+                    install_path: Some(shim_coordinate.clone()),
+                    additional_install_library: Some((
+                        shim_coordinate,
+                        format!(
+                            "maven/net/minecraftforge/forge/{forge_version}/forge-{forge_version}-shim.jar"
+                        ),
+                        zip_entries(&[("example/Shim.class", b"shim")]),
+                    )),
+                }
+            }
+            (LoaderComponentId::Forge, LoaderInstallStrategy::ForgeLegacyInstaller) => {
+                let forge_version =
+                    format!("{}-{}", record.minecraft_version, record.loader_version);
+                let root_coordinate = format!("net.minecraftforge:forge:{forge_version}");
+                ProcessorFixtureLayout {
+                    version_id: format!(
+                        "{}-forge-{}",
+                        record.minecraft_version, record.loader_version
+                    ),
+                    profile: "forge",
+                    spec: 0,
+                    root_coordinate: root_coordinate.clone(),
+                    root_entry: format!(
+                        "maven/net/minecraftforge/forge/{forge_version}/forge-{forge_version}.jar"
+                    ),
+                    root_bytes,
+                    terminal_coordinate: format!("net.minecraftforge:forge:{forge_version}:client"),
+                    install_path: Some(root_coordinate),
+                    additional_install_library: None,
+                }
+            }
+            (LoaderComponentId::NeoForge, LoaderInstallStrategy::NeoForgeModern) => {
+                let root_coordinate =
+                    format!("net.neoforged:neoforge:{}:universal", record.loader_version);
+                ProcessorFixtureLayout {
+                    version_id: format!("neoforge-{}", record.loader_version),
+                    profile: "NeoForge",
+                    spec: 1,
+                    root_coordinate,
+                    root_entry: format!(
+                        "maven/net/neoforged/neoforge/{0}/neoforge-{0}-universal.jar",
+                        record.loader_version
+                    ),
+                    root_bytes,
+                    terminal_coordinate: format!(
+                        "net.neoforged:neoforge:{}:client",
+                        record.loader_version
+                    ),
+                    install_path: None,
+                    additional_install_library: None,
+                }
+            }
+            _ => panic!("unsupported processor fixture shape"),
+        }
+    }
+
+    fn runnable_forge_installer_jar(record: &LoaderBuildRecord) -> Vec<u8> {
+        single_step_processor_installer_jar(record)
+    }
+
+    fn single_step_processor_installer_jar(record: &LoaderBuildRecord) -> Vec<u8> {
+        single_step_processor_installer_jar_with_libraries(record, Vec::new())
+    }
+
+    fn single_step_processor_installer_jar_with_libraries(
         record: &LoaderBuildRecord,
-        terminal_size: Option<usize>,
-        fresh_url: Option<&str>,
+        extra_version_libraries: Vec<serde_json::Value>,
+    ) -> Vec<u8> {
+        let layout = processor_fixture_layout(record);
+        processor_installer_jar(
+            record,
+            &layout,
+            sha1_hex(TEST_PROCESSOR_TERMINAL_BYTES),
+            extra_version_libraries,
+            serde_json::json!({
+                "PATCHED": {"client": format!("[{}]", layout.terminal_coordinate)},
+                "PATCHED_SHA": {
+                    "client": format!("'{}'", sha1_hex(TEST_PROCESSOR_TERMINAL_BYTES))
+                }
+            }),
+            serde_json::json!([{
+                "jar": TEST_PROCESSOR_COORDINATE,
+                "args": ["single", "{PATCHED}"],
+                "sides": ["client"],
+                "outputs": {"{PATCHED}": "{PATCHED_SHA}"}
+            }]),
+        )
+    }
+
+    fn processor_installer_jar(
+        record: &LoaderBuildRecord,
+        layout: &ProcessorFixtureLayout,
+        terminal_sha1: String,
+        extra_version_libraries: Vec<serde_json::Value>,
+        data: serde_json::Value,
+        processors: serde_json::Value,
     ) -> Vec<u8> {
         use zip::write::SimpleFileOptions;
 
-        let forge_version = format!("{}-{}", record.minecraft_version, record.loader_version);
-        let universal = zip_entries(&[("example/Universal.class", b"universal")]);
-        let shim = zip_entries(&[("example/Shim.class", b"shim")]);
         let processor = zip_entries(&[
             ("META-INF/MANIFEST.MF", b"Main-Class: example.Processor\n\n"),
             ("example/Processor.class", b"processor"),
         ]);
-        let universal_coordinate = format!("net.minecraftforge:forge:{}:universal", forge_version);
-        let client_coordinate = format!("net.minecraftforge:forge:{}:client", forge_version);
-        let shim_coordinate = format!("net.minecraftforge:forge:{}:shim", forge_version);
-        let version_id = format!(
-            "{}-forge-{}",
-            record.minecraft_version, record.loader_version
-        );
-        let terminal_sha1 = sha1_hex(TEST_PROCESSOR_TERMINAL_BYTES);
-        let mut terminal_library = serde_json::json!({
-            "name": client_coordinate,
-            "sha1": terminal_sha1
-        });
-        if let Some(size) = terminal_size {
-            terminal_library["size"] = size.into();
-        }
         let mut version_libraries = vec![
             serde_json::json!({
-                "name": universal_coordinate,
-                "sha1": sha1_hex(&universal),
-                "size": universal.len()
+                "name": layout.root_coordinate.clone(),
+                "sha1": sha1_hex(&layout.root_bytes),
+                "size": layout.root_bytes.len()
             }),
-            terminal_library,
+            serde_json::json!({
+            "name": layout.terminal_coordinate.clone(),
+            "sha1": terminal_sha1
+            }),
         ];
-        if let Some(url) = fresh_url {
-            version_libraries.push(serde_json::json!({
-                "name": "example:processor-fresh:1.0",
-                "downloads": {"artifact": {
-                    "path": "example/processor-fresh/1.0/processor-fresh-1.0.jar",
-                    "url": url
-                }}
-            }));
-        }
+        version_libraries.extend(extra_version_libraries);
         let version_json = serde_json::to_vec(&serde_json::json!({
-            "id": version_id,
+            "id": layout.version_id.clone(),
             "inheritsFrom": record.minecraft_version,
             "type": "release",
             "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
             "logging": {},
             "libraries": version_libraries
         }))
-        .expect("serialize runnable Forge version profile");
-        let install_profile = serde_json::to_vec(&serde_json::json!({
-            "spec": 1,
-            "profile": "forge",
-            "version": version_id,
-            "path": shim_coordinate,
+        .expect("serialize processor version profile");
+        let mut install_libraries = vec![
+            serde_json::json!({
+                "name": layout.root_coordinate.clone(),
+                "sha1": sha1_hex(&layout.root_bytes),
+                "size": layout.root_bytes.len()
+            }),
+            serde_json::json!({
+                "name": TEST_PROCESSOR_COORDINATE,
+                "sha1": sha1_hex(&processor),
+                "size": processor.len()
+            }),
+        ];
+        if let Some((coordinate, _, bytes)) = &layout.additional_install_library {
+            install_libraries.push(serde_json::json!({
+                "name": coordinate,
+                "sha1": sha1_hex(bytes),
+                "size": bytes.len()
+            }));
+        }
+        let mut install_profile = serde_json::json!({
+            "spec": layout.spec,
+            "profile": layout.profile,
+            "version": layout.version_id.clone(),
             "minecraft": record.minecraft_version,
-            "libraries": [
-                {
-                    "name": universal_coordinate,
-                    "sha1": sha1_hex(&universal),
-                    "size": universal.len()
-                },
-                {
-                    "name": shim_coordinate,
-                    "sha1": sha1_hex(&shim),
-                    "size": shim.len()
-                },
-                {
-                    "name": "example:processor:1.0",
-                    "sha1": sha1_hex(&processor),
-                    "size": processor.len()
-                }
-            ],
-            "data": {
-                "PATCHED": {"client": format!("[{}]", client_coordinate)},
-                "PATCHED_SHA": {
-                    "client": format!("'{terminal_sha1}'")
-                }
-            },
-            "processors": [{
-                "jar": "example:processor:1.0",
-                "args": ["{PATCHED}"],
-                "sides": ["client"],
-                "outputs": {"{PATCHED}": "{PATCHED_SHA}"}
-            }]
-        }))
-        .expect("serialize runnable Forge install profile");
+            "libraries": install_libraries,
+            "data": data,
+            "processors": processors
+        });
+        if let Some(path) = &layout.install_path {
+            install_profile["path"] = path.clone().into();
+        }
+        let install_profile =
+            serde_json::to_vec(&install_profile).expect("serialize processor install profile");
         let mut cursor = std::io::Cursor::new(Vec::new());
         let mut archive = zip::ZipWriter::new(&mut cursor);
-        for (name, bytes) in [
+        let mut entries = vec![
             ("version.json".to_string(), version_json),
             ("install_profile.json".to_string(), install_profile),
-            (
-                format!(
-                    "maven/net/minecraftforge/forge/{0}/forge-{0}-universal.jar",
-                    forge_version
-                ),
-                universal,
-            ),
-            (
-                format!(
-                    "maven/net/minecraftforge/forge/{0}/forge-{0}-shim.jar",
-                    forge_version
-                ),
-                shim,
-            ),
-            (
-                "maven/example/processor/1.0/processor-1.0.jar".to_string(),
-                processor,
-            ),
-        ] {
+            (layout.root_entry.clone(), layout.root_bytes.clone()),
+            ("maven/x/p/1/p-1.jar".to_string(), processor),
+        ];
+        if let Some((_, path, bytes)) = &layout.additional_install_library {
+            entries.push((path.clone(), bytes.clone()));
+        }
+        for (name, bytes) in entries {
             archive
                 .start_file(name, SimpleFileOptions::default())
-                .expect("start runnable Forge entry");
+                .expect("start processor fixture entry");
             archive
                 .write_all(&bytes)
-                .expect("write runnable Forge entry");
+                .expect("write processor fixture entry");
         }
-        archive.finish().expect("finish runnable Forge installer");
+        archive.finish().expect("finish processor installer");
         cursor.into_inner()
+    }
+
+    #[cfg(unix)]
+    struct TestProcessorRuntime {
+        descriptor: TestRuntimeSourceDescriptor,
+        manifest_server: TestByteServer,
+        file_server: TestByteServer,
+    }
+
+    #[cfg(unix)]
+    impl TestProcessorRuntime {
+        fn start() -> Self {
+            let fake_java = br#"#!/bin/sh
+case "$*" in
+  *-version*) printf '%s\n' 'openjdk version "17.0.1"' >&2; exit 0 ;;
+esac
+case "$4" in
+  single) printf '%s' 'processor-terminal' > "$5" ;;
+  step-one) cat "$5" "$6" > "$7" ;;
+  step-two) cat "$5" > "$6" ;;
+  *) exit 9 ;;
+esac
+"#
+            .to_vec();
+            let file_server = TestByteServer::start(fake_java.clone());
+            let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+                "files": {
+                    "bin": {"type": "directory"},
+                    "bin/java": {
+                        "type": "file",
+                        "executable": true,
+                        "downloads": {"raw": {
+                            "url": file_server.url.clone(),
+                            "sha1": sha1_hex(&fake_java),
+                            "size": fake_java.len()
+                        }}
+                    }
+                }
+            }))
+            .expect("runtime manifest");
+            let manifest_server = TestByteServer::start(manifest_bytes.clone());
+            let descriptor = TestRuntimeSourceDescriptor {
+                component: RuntimeId::from("java-runtime-delta"),
+                url: manifest_server.url.clone(),
+                sha1: sha1_hex(&manifest_bytes),
+                size: manifest_bytes.len() as u64,
+            };
+            Self {
+                descriptor,
+                manifest_server,
+                file_server,
+            }
+        }
+
+        fn stop(self) {
+            self.manifest_server.stop();
+            self.file_server.stop();
+        }
+    }
+
+    #[cfg(unix)]
+    async fn install_test_processor_base(
+        root: &Path,
+        record: &LoaderBuildRecord,
+        runtime: &TestRuntimeSourceDescriptor,
+    ) -> (
+        KnownGoodInstallReceipt,
+        VersionManifest,
+        TestByteServer,
+        TestByteServer,
+    ) {
+        let base_client = zip_entries(&[("net/minecraft/client/Main.class", b"base")]);
+        let client_server = TestByteServer::start(base_client.clone());
+        let mut version: serde_json::Value = serde_json::from_slice(&vanilla_version_bytes(
+            &record.minecraft_version,
+            &client_server.url,
+            &base_client,
+        ))
+        .expect("base version");
+        version["javaVersion"] = serde_json::json!({
+            "component": "java-runtime-delta",
+            "majorVersion": 17
+        });
+        let version_bytes = serde_json::to_vec(&version).expect("base version bytes");
+        let version_server = TestByteServer::start(version_bytes.clone());
+        let manifest = test_install_manifest(
+            &record.minecraft_version,
+            &version_server.url,
+            &version_bytes,
+        );
+        let receipt = Downloader::with_test_install_manifest(root, manifest.clone())
+            .with_test_runtime_source(runtime.clone())
+            .install_version(&record.minecraft_version, |_| {})
+            .await
+            .expect("install processor fixture base");
+        (receipt, manifest, client_server, version_server)
+    }
+
+    #[cfg(unix)]
+    async fn finish_test_processor_installer_with_runtime(
+        root: &Path,
+        plan: &LoaderInstallPlan,
+        installer_plan: BoundForgeInstallerPlan,
+        base_receipt: KnownGoodInstallReceipt,
+        runtime: &TestRuntimeSourceDescriptor,
+    ) -> KnownGoodInstallReceipt {
+        let execution = materialize_test_installer_network(
+            root,
+            installer_plan,
+            &mut |_progress: DownloadProgress| {},
+        )
+        .await;
+        let BoundForgeInstallExecution::Run(execution) = execution else {
+            panic!("processor fixture must retain executable work");
+        };
+        let base_client_bytes =
+            read_installed_base_client(root, &base_receipt).expect("authenticated base client");
+        let runtime_source =
+            acquire_test_runtime_source(&base_receipt.effective_version().java_version, runtime)
+                .await
+                .expect("authenticated processor runtime source");
+        let processor_sources = AuthenticatedProcessorSources::from_installed(
+            base_receipt.effective_version().clone(),
+            base_client_bytes,
+            runtime_source,
+            ManagedDir::open_root(root).expect("managed install root"),
+        )
+        .expect("authenticated installed processor sources");
+        let result = spawn_bound_processor_execution(
+            *execution,
+            plan.record.version_id.clone(),
+            plan.record.minecraft_version.clone(),
+            processor_sources,
+        )
+        .finish(|_| {})
+        .await
+        .expect("execute installed processor graph");
+        let (base_client_bytes, _runtime_source) = result
+            .sources
+            .into_installed_parts()
+            .expect("recover installed processor sources");
+        let receipt_input = result
+            .continuation
+            .into_observed_receipt_input(result.outputs)
+            .expect("seal installed processor outputs");
+        let mut version = super::compose_loader_version(
+            base_receipt.effective_version(),
+            &plan.record.minecraft_version,
+            &plan.record.version_id,
+            receipt_input.version(),
+        )
+        .expect("compose installed processor version");
+        let child_client = receipt_input
+            .derive_child_client_bytes(&base_client_bytes)
+            .expect("derive installed processor client");
+        let client = version
+            .downloads
+            .client
+            .as_mut()
+            .expect("installed processor client declaration");
+        client.sha1 = sha1_hex(child_client.bytes());
+        client.size =
+            i64::try_from(child_client.bytes().len()).expect("installed processor client size");
+        client.url.clear();
+        let version_bytes =
+            serde_json::to_vec_pretty(&version).expect("serialize installed processor version");
+        let pending = KnownGoodInstallReceipt::from_verified_installer_source(
+            base_receipt,
+            &plan.record,
+            receipt_input,
+            version,
+            &version_bytes,
+            &base_client_bytes,
+            &child_client,
+        )
+        .expect("derive installed processor receipt");
+        let (pending, retained_sources) = pending.into_publications();
+        let materialized = materialize_retained_installer_libraries(root, retained_sources)
+            .await
+            .expect("publish installed processor outputs");
+        pending
+            .complete(materialized)
+            .expect("complete installed processor receipt")
+    }
+
+    #[cfg(unix)]
+    async fn assert_processor_reconstruction_parity(shape: ProcessorFixtureShape) {
+        let root = temp_dir(&format!("processor-parity-{shape:?}"));
+        let runtime = TestProcessorRuntime::start();
+        let mut record = processor_fixture_record(shape);
+        let (base_receipt, manifest, client_server, version_server) =
+            install_test_processor_base(&root, &record, &runtime.descriptor).await;
+        let installer_server =
+            TestByteServer::start_with_sha1(single_step_processor_installer_jar(&record));
+        record.install_source = LoaderInstallSource::InstallerJar {
+            url: installer_server.url.clone(),
+        };
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+        };
+        let installer_source = verified_test_source_for(
+            &installer_server.url,
+            "loader installer",
+            &record.version_id,
+        )
+        .await;
+        let install_receipt = finish_test_processor_installer_with_runtime(
+            &root,
+            &plan,
+            bind_test_installer(installer_source, &record),
+            base_receipt,
+            &runtime.descriptor,
+        )
+        .await;
+        seed_reconstruction_sentinels(&root);
+        let before = snapshot_tree(&root);
+        let installer_path = reqwest::Url::parse(&installer_server.url)
+            .expect("installer URL")
+            .path()
+            .to_string();
+        let installer_sidecar_path = format!("{installer_path}.sha1");
+        let counts = (
+            version_server.request_count(),
+            client_server.request_count(),
+            installer_server.request_count_for(&installer_path),
+            installer_server.request_count_for(&installer_sidecar_path),
+            runtime.manifest_server.request_count(),
+            runtime.file_server.request_count(),
+        );
+        let reconstructed = reconstruct_installer_with_downloader(
+            &plan,
+            &Downloader::with_test_install_manifest(&root, manifest)
+                .with_test_runtime_source(runtime.descriptor.clone()),
+        )
+        .await
+        .expect("reconstruct processor fixture");
+
+        assert_eq!(snapshot_tree(&root), before);
+        assert_eq!(version_server.request_count(), counts.0 + 1);
+        assert_eq!(client_server.request_count(), counts.1 + 1);
+        assert_eq!(
+            installer_server.request_count_for(&installer_path),
+            counts.2 + 1
+        );
+        assert_eq!(
+            installer_server.request_count_for(&installer_sidecar_path),
+            counts.3 + 1
+        );
+        assert_eq!(runtime.manifest_server.request_count(), counts.4 + 1);
+        assert_eq!(runtime.file_server.request_count(), counts.5 + 1);
+        let installed = install_receipt.into_activation_source().into_parts();
+        let reconstructed = reconstructed.into_activation_source().into_parts();
+        assert_eq!(installed, reconstructed);
+        let terminal_path =
+            crate::launch::maven_to_path(&processor_fixture_layout(&record).terminal_coordinate)
+                .to_string_lossy()
+                .replace('\\', "/");
+        let terminal = reconstructed
+            .1
+            .entries()
+            .iter()
+            .find(|entry| entry.path().as_str() == terminal_path)
+            .expect("observed processor terminal");
+        assert!(matches!(
+            terminal.integrity(),
+            KnownGoodIntegrity::Sha1 { digest, size }
+                if digest.as_str() == sha1_hex(TEST_PROCESSOR_TERMINAL_BYTES)
+                    && *size == TEST_PROCESSOR_TERMINAL_BYTES.len() as u64
+        ));
+
+        client_server.stop();
+        version_server.stop();
+        installer_server.stop();
+        runtime.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    async fn assert_two_step_processor_source_union() {
+        let root = temp_dir("processor-two-step-source-union");
+        let runtime = TestProcessorRuntime::start();
+        let mut record = processor_fixture_record(ProcessorFixtureShape::ForgeModern);
+        let (base_receipt, manifest, client_server, version_server) =
+            install_test_processor_base(&root, &record, &runtime.descriptor).await;
+        let exact_input = zip_entries(&[("x/ExactInput.class", b"exact-input")]);
+        let exact_non_input = zip_entries(&[("x/ExactNonInput.class", b"exact-non-input")]);
+        let fresh_input = zip_entries(&[("x/FreshInput.class", b"fresh-input")]);
+        let fresh_non_input = zip_entries(&[("x/FreshNonInput.class", b"fresh-non-input")]);
+        let terminal_bytes = [exact_input.as_slice(), fresh_input.as_slice()].concat();
+        let intermediate_sha1 = sha1_hex(&terminal_bytes);
+        let terminal_sha1 = intermediate_sha1.clone();
+        let exact_input_server = TestByteServer::start(exact_input.clone());
+        let exact_non_input_server = TestByteServer::start(exact_non_input.clone());
+        let fresh_input_server = TestByteServer::start(fresh_input.clone());
+        let fresh_non_input_server = TestByteServer::start(fresh_non_input.clone());
+        let mut layout = processor_fixture_layout(&record);
+        layout.terminal_coordinate = "x:t:1".to_string();
+        let installer = processor_installer_jar(
+            &record,
+            &layout,
+            terminal_sha1.clone(),
+            vec![
+                serde_json::json!({
+                    "name": "x:e:1",
+                    "url": exact_input_server.url.clone(),
+                    "sha1": sha1_hex(&exact_input),
+                    "size": exact_input.len()
+                }),
+                serde_json::json!({
+                    "name": "x:n:1",
+                    "url": exact_non_input_server.url.clone(),
+                    "sha1": sha1_hex(&exact_non_input),
+                    "size": exact_non_input.len()
+                }),
+                serde_json::json!({
+                    "name": "x:f:1",
+                    "url": fresh_input_server.url.clone(),
+                    "sha1": sha1_hex(&fresh_input)
+                }),
+                serde_json::json!({
+                    "name": "x:g:1",
+                    "url": fresh_non_input_server.url.clone()
+                }),
+            ],
+            serde_json::json!({}),
+            serde_json::json!([
+                {
+                    "jar": TEST_PROCESSOR_COORDINATE,
+                    "args": [
+                        "step-one",
+                        "[x:e:1]",
+                        "[x:f:1]",
+                        "[x:i:1]"
+                    ],
+                    "outputs": {"[x:i:1]": format!("'{intermediate_sha1}'")}
+                },
+                {
+                    "jar": TEST_PROCESSOR_COORDINATE,
+                    "args": ["step-two", "[x:i:1]", "[x:t:1]"],
+                    "outputs": {"[x:t:1]": format!("'{terminal_sha1}'")}
+                }
+            ]),
+        );
+        let installer_server = TestByteServer::start_with_sha1(installer);
+        record.install_source = LoaderInstallSource::InstallerJar {
+            url: installer_server.url.clone(),
+        };
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+        };
+        let installer_source = verified_test_source_for(
+            &installer_server.url,
+            "loader installer",
+            &record.version_id,
+        )
+        .await;
+        let install_receipt = finish_test_processor_installer_with_runtime(
+            &root,
+            &plan,
+            bind_test_installer(installer_source, &record),
+            base_receipt,
+            &runtime.descriptor,
+        )
+        .await;
+        assert_eq!(exact_input_server.request_count(), 1);
+        assert_eq!(exact_non_input_server.request_count(), 1);
+        assert_eq!(fresh_input_server.request_count(), 1);
+        assert_eq!(fresh_non_input_server.request_count(), 1);
+        seed_reconstruction_sentinels(&root);
+        let before = snapshot_tree(&root);
+        let installer_path = reqwest::Url::parse(&installer_server.url)
+            .expect("installer URL")
+            .path()
+            .to_string();
+        let installer_sidecar_path = format!("{installer_path}.sha1");
+        let fixed_counts = (
+            version_server.request_count(),
+            client_server.request_count(),
+            installer_server.request_count_for(&installer_path),
+            installer_server.request_count_for(&installer_sidecar_path),
+            runtime.manifest_server.request_count(),
+            runtime.file_server.request_count(),
+        );
+        let reconstructed = reconstruct_installer_with_downloader(
+            &plan,
+            &Downloader::with_test_install_manifest(&root, manifest)
+                .with_test_runtime_source(runtime.descriptor.clone()),
+        )
+        .await
+        .expect("reconstruct two-step processor graph");
+
+        assert_eq!(snapshot_tree(&root), before);
+        assert_eq!(exact_input_server.request_count(), 2);
+        assert_eq!(exact_non_input_server.request_count(), 1);
+        assert_eq!(fresh_input_server.request_count(), 2);
+        assert_eq!(fresh_non_input_server.request_count(), 2);
+        assert_eq!(version_server.request_count(), fixed_counts.0 + 1);
+        assert_eq!(client_server.request_count(), fixed_counts.1 + 1);
+        assert_eq!(
+            installer_server.request_count_for(&installer_path),
+            fixed_counts.2 + 1
+        );
+        assert_eq!(
+            installer_server.request_count_for(&installer_sidecar_path),
+            fixed_counts.3 + 1
+        );
+        assert_eq!(runtime.manifest_server.request_count(), fixed_counts.4 + 1);
+        assert_eq!(runtime.file_server.request_count(), fixed_counts.5 + 1);
+        let installed = install_receipt.into_activation_source().into_parts();
+        let reconstructed = reconstructed.into_activation_source().into_parts();
+        assert_eq!(installed, reconstructed);
+        let terminal_path = crate::launch::maven_to_path(&layout.terminal_coordinate)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let intermediate_path = crate::launch::maven_to_path("x:i:1")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            reconstructed
+                .1
+                .entries()
+                .iter()
+                .all(|entry| entry.path().as_str() != intermediate_path)
+        );
+        let terminal = reconstructed
+            .1
+            .entries()
+            .iter()
+            .find(|entry| entry.path().as_str() == terminal_path)
+            .expect("two-step terminal output");
+        assert!(matches!(
+            terminal.integrity(),
+            KnownGoodIntegrity::Sha1 { digest, size }
+                if digest.as_str() == terminal_sha1 && *size == terminal_bytes.len() as u64
+        ));
+
+        for server in [
+            client_server,
+            version_server,
+            installer_server,
+            exact_input_server,
+            exact_non_input_server,
+            fresh_input_server,
+            fresh_non_input_server,
+        ] {
+            server.stop();
+        }
+        runtime.stop();
+        let _ = fs::remove_dir_all(root);
     }
 
     fn bind_test_installer(
