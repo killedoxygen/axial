@@ -110,8 +110,29 @@ export function Pill({
   );
 }
 
-export function Toggle({ on, onChange }: { on: boolean; onChange: () => void }): JSX.Element {
-  return <button type="button" class="cp-toggle" data-on={on} role="switch" aria-checked={on} onClick={onChange} />;
+export function Toggle({
+  on,
+  onChange,
+  disabled,
+  ariaLabel,
+}: {
+  on: boolean;
+  onChange: () => void;
+  disabled?: boolean;
+  ariaLabel?: string;
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      class="cp-toggle"
+      data-on={on}
+      role="switch"
+      aria-checked={on}
+      aria-label={ariaLabel}
+      disabled={disabled}
+      onClick={onChange}
+    />
+  );
 }
 
 export function Kbd({ children }: { children: ComponentChildren }): JSX.Element {

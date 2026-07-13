@@ -13,6 +13,7 @@ export interface Config {
   jvm_preset?: string;
   performance_mode?: PerformanceMode;
   guardian_mode?: GuardianMode;
+  guardian_idle_integrity_enabled: boolean;
   theme?: string;
   custom_hue?: number;
   custom_vibrancy?: number;

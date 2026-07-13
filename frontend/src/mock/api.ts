@@ -180,6 +180,7 @@ let configFixture: Config = {
   jvm_preset: '',
   performance_mode: 'managed',
   guardian_mode: 'managed',
+  guardian_idle_integrity_enabled: true,
   theme: 'obsidian',
   custom_hue: 140,
   custom_vibrancy: 100,

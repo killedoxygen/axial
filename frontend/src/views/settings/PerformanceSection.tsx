@@ -1,5 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
+import { Toggle } from '../../ui/Atoms';
 import { ChoicePills, type ChoicePillOption } from '../../ui/ChoicePills';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
 import { useAutoSave } from '../../hooks/use-autosave';
@@ -37,13 +38,16 @@ export function PerformanceSection(): JSX.Element {
   const cfg = config.value;
   const savedPerformance = performanceModeFrom(cfg?.performance_mode);
   const savedGuardian = guardianModeFrom(cfg?.guardian_mode);
+  const savedIdleIntegrity = cfg?.guardian_idle_integrity_enabled ?? true;
   const [performanceMode, setPerformanceMode] = useState<PerformanceMode>(savedPerformance);
   const [guardianMode, setGuardianMode] = useState<GuardianMode>(savedGuardian);
+  const [idleIntegrityEnabled, setIdleIntegrityEnabled] = useState(savedIdleIntegrity);
 
   useEffect(() => {
     setPerformanceMode(savedPerformance);
     setGuardianMode(savedGuardian);
-  }, [savedPerformance, savedGuardian]);
+    setIdleIntegrityEnabled(savedIdleIntegrity);
+  }, [savedPerformance, savedGuardian, savedIdleIntegrity]);
 
   const { commit, saving } = useAutoSave<Config & { error?: string }>({
     send: (patch) => api('PUT', '/config', patch),
@@ -91,6 +95,28 @@ export function PerformanceSection(): JSX.Element {
               commit(
                 { guardian_mode: next },
                 { label: 'Guardian settings', revert: () => setGuardianMode(savedGuardian) },
+              );
+            }}
+          />
+        }
+      />
+      <SettingRow
+        title="Idle integrity checks"
+        description="When Guardian is Managed, verifies managed instance files while Axial is idle."
+        control={
+          <Toggle
+            on={idleIntegrityEnabled}
+            disabled={saving}
+            ariaLabel="Idle integrity checks"
+            onChange={() => {
+              const next = !idleIntegrityEnabled;
+              setIdleIntegrityEnabled(next);
+              commit(
+                { guardian_idle_integrity_enabled: next },
+                {
+                  label: 'idle integrity checks',
+                  revert: () => setIdleIntegrityEnabled(savedIdleIntegrity),
+                },
               );
             }}
           />

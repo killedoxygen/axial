@@ -298,6 +298,10 @@
   outline: none;
   box-shadow: var(--focus-ring);
 }
+.cp-toggle:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
 .cp-toggle[data-on='true'] {
   background: var(--accent-fill);
 }
