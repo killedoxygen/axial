@@ -66,6 +66,23 @@ pub struct AppInstanceStore {
     persistence: InstanceRegistryPersistence,
 }
 
+#[derive(Default)]
+pub(crate) struct InstanceUpdate {
+    pub(crate) name: Option<String>,
+    pub(crate) expected_version_id: Option<String>,
+    pub(crate) art_seed: Option<u32>,
+    pub(crate) max_memory_mb: Option<i32>,
+    pub(crate) min_memory_mb: Option<i32>,
+    pub(crate) java_path: Option<String>,
+    pub(crate) window_width: Option<i32>,
+    pub(crate) window_height: Option<i32>,
+    pub(crate) jvm_preset: Option<String>,
+    pub(crate) performance_mode: Option<String>,
+    pub(crate) extra_jvm_args: Option<String>,
+    pub(crate) icon: Option<String>,
+    pub(crate) accent: Option<String>,
+}
+
 impl AppInstanceStore {
     pub(crate) fn claim(source: &InstanceStore) -> Result<Self, InstanceStoreError> {
         let paths = source.paths().clone();
@@ -182,20 +199,6 @@ impl AppInstanceStore {
             + 'static,
     {
         let gate = self.acquire_mutation().await?;
-        self.mutate_with_gate(mutation, gate).await
-    }
-
-    pub(crate) async fn mutate_with_gate<ResultValue, Mutation>(
-        &self,
-        mutation: Mutation,
-        gate: OwnedMutexGuard<()>,
-    ) -> Result<ResultValue, InstanceStoreError>
-    where
-        ResultValue: Send + 'static,
-        Mutation: FnOnce(&mut InstanceRegistrySnapshot) -> Result<ResultValue, InstanceStoreError>
-            + Send
-            + 'static,
-    {
         let gate = self.reconcile_obligations(gate).await?;
         let mut candidate = self.current();
         let result = mutation(&mut candidate)?;
@@ -205,6 +208,107 @@ impl AppInstanceStore {
             return Ok(result);
         }
         self.commit(candidate, result, gate).await
+    }
+
+    pub(crate) async fn update_with_gate(
+        &self,
+        instance_id: String,
+        update: InstanceUpdate,
+        gate: OwnedMutexGuard<()>,
+    ) -> Result<Instance, InstanceStoreError> {
+        let gate = self.reconcile_obligations(gate).await?;
+        let mut candidate = self.current();
+        let Some(index) = candidate
+            .instances
+            .iter()
+            .position(|instance| instance.id == instance_id)
+        else {
+            return Err(instance_not_found_error());
+        };
+        let mut instance = candidate.instances[index].clone();
+        if let Some(name) = update.name.filter(|value| !value.trim().is_empty()) {
+            if candidate
+                .instances
+                .iter()
+                .any(|stored| stored.id != instance.id && stored.name == name)
+            {
+                return Err(instance_name_conflict_error());
+            }
+            instance.name = name;
+        }
+        if let Some(version_id) = update
+            .expected_version_id
+            .filter(|value| !value.trim().is_empty())
+            && version_id != instance.version_id
+        {
+            return Err(InstanceStoreError::Persistence(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "direct version changes are not supported",
+            )));
+        }
+        if let Some(value) = update.art_seed {
+            instance.art_seed = value;
+        }
+        if let Some(value) = update.max_memory_mb {
+            instance.max_memory_mb = value.max(0);
+        }
+        if let Some(value) = update.min_memory_mb {
+            instance.min_memory_mb = value.max(0);
+        }
+        if let Some(value) = update.java_path {
+            instance.java_path = value;
+        }
+        if let Some(value) = update.window_width {
+            instance.window_width = value.max(0);
+        }
+        if let Some(value) = update.window_height {
+            instance.window_height = value.max(0);
+        }
+        if let Some(value) = update.jvm_preset {
+            instance.jvm_preset = value;
+        }
+        if let Some(value) = update.performance_mode {
+            instance.performance_mode = value;
+        }
+        if let Some(value) = update.extra_jvm_args {
+            instance.extra_jvm_args = value;
+        }
+        if let Some(value) = update.icon {
+            instance.icon = value;
+        }
+        if let Some(value) = update.accent {
+            instance.accent = value;
+        }
+        candidate.instances[index] = instance.clone();
+        candidate.validate()?;
+        if candidate == self.current() {
+            drop(gate);
+            return Ok(instance);
+        }
+        self.commit(candidate, instance, gate).await
+    }
+
+    pub(crate) async fn record_successful_launch_with_gate(
+        &self,
+        instance_id: String,
+        last_played_at: String,
+        gate: OwnedMutexGuard<()>,
+    ) -> Result<(), InstanceStoreError> {
+        let gate = self.reconcile_obligations(gate).await?;
+        let mut candidate = self.current();
+        let stored = candidate
+            .instances
+            .iter_mut()
+            .find(|instance| instance.id == instance_id)
+            .ok_or_else(instance_not_found_error)?;
+        stored.last_played_at = last_played_at;
+        candidate.last_instance_id = instance_id;
+        candidate.validate()?;
+        if candidate == self.current() {
+            drop(gate);
+            return Ok(());
+        }
+        self.commit(candidate, (), gate).await
     }
 
     pub(crate) async fn create_with_gate(
@@ -542,6 +646,25 @@ impl AppInstanceStore {
         candidate.validate()?;
         state.visible = candidate;
         Ok(instance)
+    }
+
+    #[cfg(test)]
+    pub fn remove_for_test(&self, instance_id: &str) -> Result<(), InstanceStoreError> {
+        let mut state = self.state.lock().expect(INSTANCE_REGISTRY_LOCK_INVARIANT);
+        let mut candidate = state.visible.clone();
+        let before = candidate.instances.len();
+        candidate
+            .instances
+            .retain(|instance| instance.id != instance_id);
+        if candidate.instances.len() == before {
+            return Err(instance_not_found_error());
+        }
+        if candidate.last_instance_id == instance_id {
+            candidate.last_instance_id.clear();
+        }
+        candidate.validate()?;
+        state.visible = candidate;
+        Ok(())
     }
 }
 

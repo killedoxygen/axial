@@ -612,7 +612,7 @@ async fn launch_session_inner_with_control(
     let LaunchSessionRunTask {
         application,
         preflight_stage_evidence,
-        mut instance,
+        instance,
         intent,
         mut guardian,
         launched_at,
@@ -1110,7 +1110,6 @@ async fn launch_session_inner_with_control(
                 )
                 .await
                 .map_err(guardian_journal_error)?;
-                drop(integrity_foreground.take());
                 emit_launch_completed(
                     &state,
                     &mut launch_completion_pending,
@@ -1137,7 +1136,10 @@ async fn launch_session_inner_with_control(
                 .await;
                 if let Err(stage) = persist_launch_metadata(
                     &state,
-                    &mut instance,
+                    integrity_foreground
+                        .as_ref()
+                        .expect("successful launch must retain foreground through metadata"),
+                    &instance.id,
                     &intent.username,
                     intent.max_memory_mb,
                     intent.min_memory_mb,
@@ -1748,54 +1750,88 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn launch_foreground_releases_only_after_boot_stable() {
-        let root = unique_test_dir("launch-foreground-boot-stable");
+    async fn launch_foreground_releases_only_after_success_metadata_settles() {
+        let root = unique_test_dir("launch-foreground-success-metadata");
         let state = test_app_state(&root);
-        let session_id = "launch-foreground-boot-stable";
+        let session_id = "launch-foreground-success-metadata";
+        let registered = state
+            .instances()
+            .insert_for_test("Launch metadata gate".to_string(), "1.21.1".to_string())
+            .expect("register launch instance");
+        let mut record = test_record(session_id);
+        record.instance_id = registered.id.clone();
         state
             .sessions()
-            .insert(test_record(session_id))
+            .insert(record)
             .await
-            .expect("insert boot-stable session");
+            .expect("insert metadata-gated session");
         let mut events = state
             .sessions()
             .subscribe(session_id)
             .await
-            .expect("subscribe boot-stable session");
+            .expect("subscribe metadata-gated session");
         let java_path = write_delayed_boot_launch_fixture(&root);
         let producer = state
             .try_claim_producer()
-            .expect("claim boot-stable producer");
+            .expect("claim metadata-gated producer");
         let mut task = test_recovery_launch_task(&state, session_id, &root).await;
+        retarget_test_launch_task(&mut task, &registered.id);
         task.instance.java_path = java_path.clone();
         task.intent.requested_java = java_path;
         task.intent.game_dir = Some(root.join("instance"));
+        task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
+        let registry = state
+            .instances()
+            .acquire_mutation()
+            .await
+            .expect("hold launch metadata registry gate");
         assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
 
         let launch = tokio::spawn(launch_session(state.clone(), task, producer));
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let LaunchEvent::Status(status) =
-                    events.recv().await.expect("boot-stable launch event")
-                    && status.state == "monitoring"
+                    events.recv().await.expect("metadata-gated launch event")
+                    && status.state == "running"
                 {
                     break;
                 }
             }
         })
         .await
-        .expect("launch reaches startup monitoring");
+        .expect("launch reaches running status");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.instance_lifecycle_is_held(&registered.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("launch metadata holds instance lifecycle");
+        assert!(
+            !launch.is_finished(),
+            "launch must wait for metadata commit"
+        );
         assert!(
             !state.subscribe_integrity_idle().borrow().is_stably_idle(),
-            "foreground lease must remain live while startup is not stable"
+            "foreground lease must remain live while metadata is blocked"
         );
 
+        drop(registry);
         let launched = tokio::time::timeout(Duration::from_secs(5), launch)
             .await
-            .expect("launch reaches boot-stable")
+            .expect("launch metadata settles")
             .expect("launch owner")
-            .unwrap_or_else(|error| panic!("boot-stable launch failed: {}", error.message));
+            .unwrap_or_else(|error| panic!("metadata-gated launch failed: {}", error.message));
         assert_eq!(launched.session_id, session_id);
+        let stored = state
+            .instances()
+            .get(&registered.id)
+            .expect("launch instance remains");
+        assert_eq!(stored.last_played_at, "2026-01-01T00:00:00.000Z");
+        assert_eq!(
+            state.instances().last_instance_id().as_deref(),
+            Some(registered.id.as_str())
+        );
         assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
         let _ = state.sessions().kill(session_id).await;
         let _ = fs::remove_dir_all(root);

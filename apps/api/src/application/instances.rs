@@ -45,7 +45,7 @@ use crate::application::version::{
 };
 use crate::guardian::normalize_create_jvm_preset;
 use crate::state::{
-    AppState, IntegrityForegroundLease, KnownGoodRebuildError, ProducerLease,
+    AppState, InstanceUpdate, IntegrityForegroundLease, KnownGoodRebuildError, ProducerLease,
     RequestProducerHandoff,
 };
 use axial_config::{EnrichedInstance, InstanceStoreError, LaunchActionState};
@@ -270,6 +270,23 @@ async fn enrich_instance_for_state_indexed(
 ) -> EnrichedInstance {
     let (scan, _, _, library_dir) = indexed_current_versions(state, producer).await;
     enrich_instance_for_scan(state, instance, &scan, library_dir.as_deref())
+}
+
+async fn enrich_instance_for_state_with_foreground(
+    state: &AppState,
+    foreground: &IntegrityForegroundLease,
+    producer: &ProducerLease,
+    instance: axial_config::Instance,
+) -> EnrichedInstance {
+    let Some(lookup) = state
+        .installed_versions_snapshot_with_foreground(producer, foreground.retained())
+        .await
+    else {
+        return enrich_instance_for_scan(state, instance, &unconfigured_versions_scan(), None);
+    };
+    let library_dir = lookup.library_dir().to_path_buf();
+    let scan = installed_versions_scan(&lookup.snapshot);
+    enrich_instance_for_scan(state, instance, &scan, Some(&library_dir))
 }
 
 fn enrich_instances_for_state(
@@ -509,12 +526,13 @@ where
         )
         .await
         {
-            Ok(()) => {
-                Ok(
-                    enrich_instance_for_state_indexed(&transaction_state, &enrich_owner, instance)
-                        .await,
-                )
-            }
+            Ok(()) => Ok(enrich_instance_for_state_with_foreground(
+                &transaction_state,
+                &foreground,
+                &enrich_owner,
+                instance,
+            )
+            .await),
             Err(error) => {
                 if let Err(rollback_error) =
                     rollback_new_instance(&transaction_state, &foreground, &instance_id).await
@@ -593,85 +611,62 @@ pub(crate) struct InstancePatch {
     pub accent: Option<String>,
 }
 
-pub(crate) async fn handle_update_instance(
+pub(crate) async fn handle_update_instance_owned(
     state: &AppState,
-    producer: &ProducerLease,
     id: &str,
     patch: InstancePatch,
+    handoff: RequestProducerHandoff,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
-    let id = id.to_string();
-    let instance = state
-        .mutate_instances(move |registry| {
-            let Some(index) = registry.instances.iter().position(|stored| stored.id == id) else {
-                return Err(InstanceStoreError::Persistence(std::io::Error::new(
-                    ErrorKind::NotFound,
-                    "instance not found",
-                )));
-            };
-            let mut instance = registry.instances[index].clone();
-            if let Some(name) = patch.name.filter(|value| !value.trim().is_empty()) {
-                if registry
-                    .instances
-                    .iter()
-                    .enumerate()
-                    .any(|(stored_index, stored)| stored_index != index && stored.name == name)
-                {
-                    return Err(InstanceStoreError::Persistence(std::io::Error::new(
-                        ErrorKind::AlreadyExists,
-                        "an instance with this name already exists",
-                    )));
-                }
-                instance.name = name;
-            }
-            if let Some(version_id) = patch.version_id.filter(|value| !value.trim().is_empty())
-                && version_id != instance.version_id
-            {
-                return Err(InstanceStoreError::Persistence(std::io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "direct version changes are not supported",
-                )));
-            }
-            if let Some(value) = patch.art_seed {
-                instance.art_seed = value;
-            }
-            if let Some(value) = patch.max_memory_mb {
-                instance.max_memory_mb = value.max(0);
-            }
-            if let Some(value) = patch.min_memory_mb {
-                instance.min_memory_mb = value.max(0);
-            }
-            if let Some(value) = patch.java_path {
-                instance.java_path = value;
-            }
-            if let Some(value) = patch.window_width {
-                instance.window_width = value.max(0);
-            }
-            if let Some(value) = patch.window_height {
-                instance.window_height = value.max(0);
-            }
-            if let Some(value) = patch.jvm_preset {
-                instance.jvm_preset = normalize_create_jvm_preset(Some(&value))
-                    .stored_preset()
-                    .to_string();
-            }
-            if let Some(value) = patch.performance_mode {
-                instance.performance_mode = value;
-            }
-            if let Some(value) = patch.extra_jvm_args {
-                instance.extra_jvm_args = value;
-            }
-            if let Some(value) = patch.icon {
-                instance.icon = value;
-            }
-            if let Some(value) = patch.accent {
-                instance.accent = value;
-            }
-            registry.instances[index] = instance.clone();
-            Ok(instance)
+    let producer = handoff
+        .try_claim()
+        .map_err(instance_shutdown_error_response)?;
+    let foreground = state
+        .register_integrity_foreground()
+        .map_err(instance_shutdown_error_response)?;
+    let update = InstanceUpdate {
+        name: patch.name,
+        expected_version_id: patch.version_id,
+        art_seed: patch.art_seed,
+        max_memory_mb: patch.max_memory_mb,
+        min_memory_mb: patch.min_memory_mb,
+        java_path: patch.java_path,
+        window_width: patch.window_width,
+        window_height: patch.window_height,
+        jvm_preset: patch.jvm_preset.map(|value| {
+            normalize_create_jvm_preset(Some(&value))
+                .stored_preset()
+                .to_string()
+        }),
+        performance_mode: patch.performance_mode,
+        extra_jvm_args: patch.extra_jvm_args,
+        icon: patch.icon,
+        accent: patch.accent,
+    };
+    let transaction = producer.claim_child();
+    let enrich_owner = producer.claim_child();
+    let transaction_state = state.clone();
+    let instance_id = id.to_string();
+    transaction
+        .spawn_joinable(async move {
+            let foreground = foreground.wait_for_settlement().await;
+            let instance = transaction_state
+                .update_instance(&foreground, instance_id, update)
+                .await
+                .map_err(|error| {
+                    instance_write_error_response(InstanceWriteOperation::Update, error)
+                })?;
+            let enriched = enrich_instance_for_state_with_foreground(
+                &transaction_state,
+                &foreground,
+                &enrich_owner,
+                instance,
+            )
+            .await;
+            drop(foreground);
+            Ok(enriched)
         })
         .await
-        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Update, error))?;
-    Ok(enrich_instance_for_state_indexed(state, producer, instance).await)
+        .map_err(|_| instance_internal_error_response(InstanceWriteOperation::Update))?
 }
 
 fn redact_runtime_overrides(mut instance: EnrichedInstance) -> EnrichedInstance {

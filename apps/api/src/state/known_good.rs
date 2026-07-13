@@ -419,33 +419,6 @@ impl KnownGoodInventoryStore {
         self.active.lock().expect(STORE_LOCK_INVARIANT).clear();
     }
 
-    pub(super) fn retain_active(
-        &self,
-        library_root: &Path,
-        instances: impl IntoIterator<Item = (String, String, String)>,
-    ) {
-        let Ok(library_root) = normalize_library_root(library_root) else {
-            self.clear_active();
-            return;
-        };
-        let instances = instances
-            .into_iter()
-            .map(|(instance_id, version_id, created_at)| (instance_id, (version_id, created_at)))
-            .collect::<HashMap<_, _>>();
-        self.active
-            .lock()
-            .expect(STORE_LOCK_INVARIANT)
-            .by_instance
-            .retain(|instance_id, active| {
-                active.library_root == library_root
-                    && instances
-                        .get(instance_id)
-                        .is_some_and(|(version_id, created_at)| {
-                            version_id == &active.version_id && created_at == &active.created_at
-                        })
-            });
-    }
-
     pub(super) fn reserve_retirement(
         self: &Arc<Self>,
         instance_id: &str,

@@ -1109,15 +1109,9 @@ mod tests {
             .capture_known_good_rebuild_target(&foreground, &instance.id)
             .await
             .expect("deleted target");
-        let deleted_id = instance.id.clone();
         state
-            .mutate_instances(move |snapshot| {
-                snapshot
-                    .instances
-                    .retain(|candidate| candidate.id != deleted_id);
-                Ok(())
-            })
-            .await
+            .instances()
+            .remove_for_test(&instance.id)
             .expect("delete registration");
         assert_eq!(
             state

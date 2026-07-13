@@ -76,7 +76,7 @@ pub use installs::{
     QueuedInstallEntry,
 };
 pub use instance_registry::AppInstanceStore;
-pub(crate) use instance_registry::new_instance;
+pub(crate) use instance_registry::{InstanceUpdate, new_instance};
 pub(crate) use instance_registry::{ensure_instance_layout, instance_not_found_error};
 #[cfg(test)]
 pub(crate) use integrity_activity::IdleSweepTerminal;
@@ -930,36 +930,6 @@ impl AppState {
         self.config.close(self.config_commit_observer()).await
     }
 
-    pub async fn mutate_instances<ResultValue, Mutation>(
-        &self,
-        mutation: Mutation,
-    ) -> Result<ResultValue, InstanceStoreError>
-    where
-        ResultValue: Send + 'static,
-        Mutation: FnOnce(
-                &mut axial_config::InstanceRegistrySnapshot,
-            ) -> Result<ResultValue, InstanceStoreError>
-            + Send
-            + 'static,
-    {
-        let instances = self.instances.clone();
-        let gate = instances.acquire_mutation().await?;
-        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = instances.mutate_with_gate(mutation, gate).await;
-            let _ = completed_tx.send(result);
-        });
-        let result = completed_rx.await.map_err(|_| {
-            InstanceStoreError::Persistence(std::io::Error::other(
-                "instance registry mutation owner stopped before reporting completion",
-            ))
-        })?;
-        if result.is_ok() {
-            self.prune_known_good_inventories();
-        }
-        result
-    }
-
     pub(crate) async fn create_instance(
         &self,
         foreground: &IntegrityForegroundLease,
@@ -1079,6 +1049,42 @@ impl AppState {
         result
     }
 
+    pub(crate) async fn update_instance(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: String,
+        update: InstanceUpdate,
+    ) -> Result<axial_config::Instance, InstanceStoreError> {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        let _lifecycle = self
+            .acquire_integrity_instance_lifecycle(foreground, &instance_id)
+            .await
+            .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        let instances = self.instances.clone();
+        let gate = instances.acquire_mutation().await?;
+        instances.update_with_gate(instance_id, update, gate).await
+    }
+
+    pub(crate) async fn record_successful_launch_metadata(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: String,
+        last_played_at: String,
+    ) -> Result<(), InstanceStoreError> {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        let _lifecycle = self
+            .acquire_integrity_instance_lifecycle(foreground, &instance_id)
+            .await
+            .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        let instances = self.instances.clone();
+        let gate = instances.acquire_mutation().await?;
+        instances
+            .record_successful_launch_with_gate(instance_id, last_played_at, gate)
+            .await
+    }
+
     pub(crate) async fn acquire_integrity_instance_lifecycle(
         &self,
         foreground: &IntegrityForegroundLease,
@@ -1115,6 +1121,11 @@ impl AppState {
             instance_id,
             self.instance_lifecycle_gates.acquire(instance_id).await,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn instance_lifecycle_is_held(&self, instance_id: &str) -> bool {
+        self.instance_lifecycle_gates.is_held(instance_id).await
     }
 
     pub(crate) fn mint_known_good_verification_lease(
@@ -1364,21 +1375,6 @@ impl AppState {
             }
             let _ = changes.send(());
         })
-    }
-
-    fn prune_known_good_inventories(&self) {
-        let Some(library_root) = self.library_dir().map(PathBuf::from) else {
-            self.known_good.clear_active();
-            return;
-        };
-        self.known_good.retain_active(
-            &library_root,
-            self.instances
-                .list()
-                .into_iter()
-                .filter(|instance| is_canonical_instance_id(&instance.id))
-                .map(|instance| (instance.id, instance.version_id, instance.created_at)),
-        );
     }
 
     pub fn flag_enabled(&self, key: &str) -> bool {

@@ -23,4 +23,15 @@ impl InstanceLifecycleGates {
         };
         gate.lock_owned().await
     }
+
+    #[cfg(test)]
+    pub(super) async fn is_held(&self, instance_id: &str) -> bool {
+        let gate = self
+            .gates
+            .lock()
+            .await
+            .get(instance_id)
+            .and_then(Weak::upgrade);
+        gate.is_some_and(|gate| gate.try_lock_owned().is_err())
+    }
 }

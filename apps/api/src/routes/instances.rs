@@ -184,10 +184,7 @@ async fn handle_update_instance(
     Path(id): Path<String>,
     Json(patch): Json<InstancePatch>,
 ) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
-        .map_err(super::producer_claim_error_response)?;
-    instances::handle_update_instance(&state, &producer, &id, patch)
+    instances::handle_update_instance_owned(&state, &id, patch, handoff)
         .await
         .map(Json)
 }

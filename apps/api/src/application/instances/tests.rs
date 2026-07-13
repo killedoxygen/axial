@@ -977,15 +977,15 @@ async fn update_instance_allows_unchanged_name_and_maps_name_collision_to_confli
         .insert_for_test("Beta".to_string(), "1.21.1".to_string())
         .expect("add beta");
 
-    let updated = handle_update_instance(
+    let updated = handle_update_instance_owned(
         &fixture.state,
-        &fixture.producer,
         &alpha.id,
         InstancePatch {
             name: Some(alpha.name.clone()),
             max_memory_mb: Some(3072),
             ..InstancePatch::default()
         },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect("unchanged name update should succeed");
@@ -993,14 +993,14 @@ async fn update_instance_allows_unchanged_name_and_maps_name_collision_to_confli
     assert_eq!(updated.version_id, "1.21.1");
     assert_eq!(updated.max_memory_mb, 3072);
 
-    let (status, Json(body)) = handle_update_instance(
+    let (status, Json(body)) = handle_update_instance_owned(
         &fixture.state,
-        &fixture.producer,
         &alpha.id,
         InstancePatch {
             name: Some(beta.name.clone()),
             ..InstancePatch::default()
         },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect_err("duplicate name update should fail");
@@ -1030,14 +1030,14 @@ async fn update_instance_unknown_jvm_preset_resets_to_auto_without_echoing_raw_v
         .insert_for_test("Preset tamper".to_string(), "1.21.1".to_string())
         .expect("add instance");
 
-    let updated = handle_update_instance(
+    let updated = handle_update_instance_owned(
         &fixture.state,
-        &fixture.producer,
         &instance.id,
         InstancePatch {
             jvm_preset: Some(r"C:\Users\Alice\java.exe --accessToken raw-secret-token".to_string()),
             ..InstancePatch::default()
         },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect("unknown preset update should normalize");
@@ -1072,15 +1072,15 @@ async fn update_instance_response_redacts_java_path_and_jvm_args() {
 
     let raw_java = r"C:\Users\Alice\.jdks\bad\bin\java.exe";
     let raw_args = "-Dtoken=raw-secret-token -javaagent:C:\\Users\\Alice\\agent.jar";
-    let updated = handle_update_instance(
+    let updated = handle_update_instance_owned(
         &fixture.state,
-        &fixture.producer,
         &instance.id,
         InstancePatch {
             java_path: Some(raw_java.to_string()),
             extra_jvm_args: Some(raw_args.to_string()),
             ..InstancePatch::default()
         },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect("update runtime overrides");
@@ -1109,6 +1109,57 @@ async fn update_instance_response_redacts_java_path_and_jvm_args() {
             "{leaked:?} leaked in update response: {public}"
         );
     }
+}
+
+#[tokio::test]
+async fn update_waits_for_cancelled_sweep_settlement_before_registry_effect() {
+    let fixture = TestFixture::new("update-sweep-settlement");
+    let instance = add_test_instance(&fixture, "Before sweep", "1.21.1");
+    let (reservation, cancellation) = reserve_instance_sweep(&fixture.state);
+    let state = fixture.state.clone();
+    let instance_id = instance.id.clone();
+    let handoff = fixture._request.producer_handoff();
+    let update = tokio::spawn(async move {
+        handle_update_instance_owned(
+            &state,
+            &instance_id,
+            InstancePatch {
+                name: Some("After sweep".to_string()),
+                ..InstancePatch::default()
+            },
+            handoff,
+        )
+        .await
+    });
+
+    wait_for_sweep_cancellation(&cancellation).await;
+    assert_eq!(
+        fixture
+            .state
+            .instances()
+            .get(&instance.id)
+            .expect("instance remains before settlement")
+            .name,
+        "Before sweep"
+    );
+    assert!(!update.is_finished());
+
+    reservation.settle(IdleSweepTerminal::Cancelled);
+    let updated = tokio::time::timeout(std::time::Duration::from_secs(5), update)
+        .await
+        .expect("update settles after sweep")
+        .expect("update task")
+        .expect("update succeeds");
+    assert_eq!(updated.name, "After sweep");
+    assert_eq!(
+        fixture
+            .state
+            .instances()
+            .get(&instance.id)
+            .expect("updated instance")
+            .name,
+        "After sweep"
+    );
 }
 
 #[tokio::test]
@@ -1216,9 +1267,8 @@ async fn instance_crud_handlers_create_list_get_update_and_delete() {
         .expect("get instance");
     assert_eq!(fetched.instance, created.instance.instance);
 
-    let updated = handle_update_instance(
+    let updated = handle_update_instance_owned(
         &fixture.state,
-        &fixture.producer,
         &created.instance.id,
         InstancePatch {
             name: Some("Skyblock".to_string()),
@@ -1226,6 +1276,7 @@ async fn instance_crud_handlers_create_list_get_update_and_delete() {
             icon: Some("cloud".to_string()),
             ..InstancePatch::default()
         },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect("update instance");
@@ -1423,14 +1474,14 @@ async fn update_instance_rejects_raw_bad_version_id_change() {
     let fixture = TestFixture::new("update-rejects-raw-version");
     let instance = add_test_instance(&fixture, "Stable", "1.21.1");
 
-    let (status, Json(body)) = handle_update_instance(
+    let (status, Json(body)) = handle_update_instance_owned(
         &fixture.state,
-        &fixture.producer,
         &instance.id,
         InstancePatch {
             version_id: Some("bad-version".to_string()),
             ..InstancePatch::default()
         },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect_err("raw version retarget should fail");
@@ -3171,14 +3222,14 @@ async fn missing_instance_crud_handlers_return_not_found_json_error() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_bounded_error_body(&body, "instance not found");
 
-    let (status, Json(body)) = handle_update_instance(
+    let (status, Json(body)) = handle_update_instance_owned(
         &fixture.state,
-        &fixture.producer,
         "missing",
         InstancePatch {
             name: Some("Nope".to_string()),
             ..InstancePatch::default()
         },
+        fixture._request.producer_handoff(),
     )
     .await
     .expect_err("missing update should fail");
@@ -3327,8 +3378,205 @@ async fn state_instance_transactions_reject_foreign_foreground_before_effects() 
         .await
         .expect_err("foreign delete foreground rejected");
     assert_foreign_foreground_error(error);
-    assert_eq!(target.state.instances().get(&source.id), Some(source));
+    assert_eq!(
+        target.state.instances().get(&source.id),
+        Some(source.clone())
+    );
     assert!(source_marker.is_file());
+
+    let error = target
+        .state
+        .update_instance(
+            &foreground,
+            source.id.clone(),
+            crate::state::InstanceUpdate {
+                name: Some("Foreign update".to_string()),
+                ..crate::state::InstanceUpdate::default()
+            },
+        )
+        .await
+        .expect_err("foreign update foreground rejected");
+    assert_foreign_foreground_error(error);
+    assert_eq!(
+        target.state.instances().get(&source.id),
+        Some(source.clone())
+    );
+
+    let error = target
+        .state
+        .record_successful_launch_metadata(
+            &foreground,
+            source.id.clone(),
+            "2026-01-01T00:00:00Z".to_string(),
+        )
+        .await
+        .expect_err("foreign launch metadata foreground rejected");
+    assert_foreign_foreground_error(error);
+    assert_eq!(target.state.instances().get(&source.id), Some(source));
+    assert_eq!(target.state.instances().last_instance_id(), None);
+}
+
+#[tokio::test]
+async fn update_and_duplicate_serialize_on_the_source_lifecycle() {
+    let fixture = TestFixture::new("update-duplicate-lifecycle");
+    let source = add_test_instance(&fixture, "Lifecycle source", "1.21.1");
+    let registry = fixture
+        .state
+        .instances()
+        .acquire_mutation()
+        .await
+        .expect("hold registry mutation");
+    let update_state = fixture.state.clone();
+    let update_id = source.id.clone();
+    let update_foreground = instance_foreground(&fixture.state).await;
+    let update = tokio::spawn(async move {
+        update_state
+            .update_instance(
+                &update_foreground,
+                update_id,
+                crate::state::InstanceUpdate {
+                    max_memory_mb: Some(8192),
+                    ..crate::state::InstanceUpdate::default()
+                },
+            )
+            .await
+    });
+    wait_for_instance_lifecycle(&fixture.state, &source.id).await;
+
+    let duplicate_foreground = instance_foreground(&fixture.state).await;
+    let mut duplicate = Box::pin(fixture.state.duplicate_instance(
+        &duplicate_foreground,
+        source.id.clone(),
+        Some("Lifecycle copy".to_string()),
+        None,
+    ));
+    {
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(duplicate.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+    }
+
+    drop(registry);
+    let updated = update.await.expect("update task").expect("update succeeds");
+    assert_eq!(updated.max_memory_mb, 8192);
+    let duplicated = duplicate.await.expect("duplicate succeeds after update");
+    assert_eq!(duplicated.max_memory_mb, 8192);
+}
+
+#[tokio::test]
+async fn cancelled_update_caller_cannot_cancel_lifecycle_waiting_owner() {
+    let (state, root) = test_state("update-cancel-lifecycle");
+    let instance = state
+        .instances()
+        .insert_for_test("Cancel update lifecycle".to_string(), "1.21.1".to_string())
+        .expect("register instance");
+    let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+    let request = state.try_admit_request().expect("admit update request");
+    let mut update = Box::pin(handle_update_instance_owned(
+        &state,
+        &instance.id,
+        InstancePatch {
+            name: Some("Lifecycle update completed".to_string()),
+            ..InstancePatch::default()
+        },
+        request.producer_handoff(),
+    ));
+    {
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(update.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+    }
+    drop(update);
+    drop(request);
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    wait_for_producer_quiescence(&state).await;
+    assert!(!quiesce.is_finished());
+    assert_eq!(
+        state.instances().get(&instance.id).expect("instance").name,
+        "Cancel update lifecycle"
+    );
+    drop(lifecycle);
+    tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+        .await
+        .expect("update lifecycle owner drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
+    assert_eq!(
+        state.instances().get(&instance.id).expect("instance").name,
+        "Lifecycle update completed"
+    );
+    state
+        .close_instance_registry()
+        .await
+        .expect("close instance registry");
+    drop(state);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cancelled_update_caller_cannot_cancel_registry_waiting_owner() {
+    let (state, root) = test_state("update-cancel-registry");
+    let instance = state
+        .instances()
+        .insert_for_test("Cancel update registry".to_string(), "1.21.1".to_string())
+        .expect("register instance");
+    let registry = state
+        .instances()
+        .acquire_mutation()
+        .await
+        .expect("hold registry mutation");
+    let request = state.try_admit_request().expect("admit update request");
+    let mut update = Box::pin(handle_update_instance_owned(
+        &state,
+        &instance.id,
+        InstancePatch {
+            name: Some("Registry update completed".to_string()),
+            ..InstancePatch::default()
+        },
+        request.producer_handoff(),
+    ));
+    {
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(update.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+    }
+    drop(update);
+    wait_for_instance_lifecycle(&state, &instance.id).await;
+    drop(request);
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    wait_for_producer_quiescence(&state).await;
+    assert!(!quiesce.is_finished());
+    assert_eq!(
+        state.instances().get(&instance.id).expect("instance").name,
+        "Cancel update registry"
+    );
+    drop(registry);
+    tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+        .await
+        .expect("update registry owner drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
+    assert_eq!(
+        state.instances().get(&instance.id).expect("instance").name,
+        "Registry update completed"
+    );
+    state
+        .close_instance_registry()
+        .await
+        .expect("close instance registry");
+    drop(state);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -3705,6 +3953,16 @@ async fn wait_for_producer_quiescence(state: &AppState) {
     })
     .await
     .expect("request drain reaches producer quiescence");
+}
+
+async fn wait_for_instance_lifecycle(state: &AppState, instance_id: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !state.instance_lifecycle_is_held(instance_id).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("instance lifecycle becomes held");
 }
 
 fn instance_directory_names(root: &FsPath) -> Vec<String> {

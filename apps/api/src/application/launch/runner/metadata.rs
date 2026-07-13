@@ -1,5 +1,4 @@
-use crate::state::{AppState, instance_not_found_error};
-use axial_config::Instance;
+use crate::state::{AppState, IntegrityForegroundLease};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LaunchMetadataPersistenceError {
@@ -9,26 +8,19 @@ pub(super) enum LaunchMetadataPersistenceError {
 
 pub(super) async fn persist_launch_metadata(
     state: &AppState,
-    instance: &mut Instance,
+    foreground: &IntegrityForegroundLease,
+    instance_id: &str,
     username: &str,
     max_memory_mb: i32,
     min_memory_mb: i32,
     launched_at: &str,
 ) -> Result<(), LaunchMetadataPersistenceError> {
-    instance.last_played_at = launched_at.to_string();
-    let instance_id = instance.id.clone();
-    let last_played_at = instance.last_played_at.clone();
     let mut first_error = state
-        .mutate_instances(move |latest| {
-            let stored = latest
-                .instances
-                .iter_mut()
-                .find(|stored| stored.id == instance_id)
-                .ok_or_else(instance_not_found_error)?;
-            stored.last_played_at = last_played_at;
-            latest.last_instance_id = instance_id;
-            Ok(())
-        })
+        .record_successful_launch_metadata(
+            foreground,
+            instance_id.to_string(),
+            launched_at.to_string(),
+        )
         .await
         .err()
         .map(|_| LaunchMetadataPersistenceError::InstanceHistory);
@@ -69,7 +61,7 @@ mod tests {
     async fn persist_launch_metadata_updates_instance_last_played_last_instance_and_config() {
         let root = unique_test_dir("launch-metadata-persistence");
         let state = test_app_state(&root);
-        let mut instance = state
+        let instance = state
             .instances()
             .insert_for_test("Launch Metadata".to_string(), "1.21.1".to_string())
             .expect("add instance");
@@ -86,7 +78,8 @@ mod tests {
 
         persist_launch_metadata(
             &state,
-            &mut instance,
+            &foreground(&state).await,
+            &instance.id,
             "AfterLaunch",
             6144,
             1024,
@@ -99,7 +92,6 @@ mod tests {
             .instances()
             .get(&instance.id)
             .expect("stored instance");
-        assert_eq!(instance.last_played_at, "2026-01-01T00:00:00.000Z");
         assert_eq!(stored.last_played_at, "2026-01-01T00:00:00.000Z");
         assert_eq!(
             state.instances().last_instance_id().as_deref(),
@@ -119,7 +111,7 @@ mod tests {
     async fn persist_launch_metadata_keeps_existing_memory_when_new_values_are_not_positive() {
         let root = unique_test_dir("launch-metadata-non-positive-memory");
         let state = test_app_state(&root);
-        let mut instance = state
+        let instance = state
             .instances()
             .insert_for_test("Launch Metadata".to_string(), "1.21.1".to_string())
             .expect("add instance");
@@ -134,7 +126,8 @@ mod tests {
 
         persist_launch_metadata(
             &state,
-            &mut instance,
+            &foreground(&state).await,
+            &instance.id,
             "MemoryKept",
             0,
             -1,
@@ -156,7 +149,7 @@ mod tests {
         let root = unique_test_dir("launch-metadata-instance-failure");
         let paths = test_paths(&root);
         let state = test_app_state(&root);
-        let mut instance = state
+        let instance = state
             .instances()
             .insert_for_test("Launch Metadata Failure".to_string(), "1.21.1".to_string())
             .expect("add instance");
@@ -164,7 +157,8 @@ mod tests {
 
         let result = persist_launch_metadata(
             &state,
-            &mut instance,
+            &foreground(&state).await,
+            &instance.id,
             "ConfigStillRuns",
             5120,
             768,
@@ -185,6 +179,14 @@ mod tests {
         assert_eq!(config.min_memory_mb, 768);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    async fn foreground(state: &AppState) -> IntegrityForegroundLease {
+        state
+            .register_integrity_foreground()
+            .expect("register launch metadata foreground")
+            .wait_for_settlement()
+            .await
     }
 
     fn test_app_state(root: &Path) -> AppState {
