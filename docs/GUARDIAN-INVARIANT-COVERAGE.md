@@ -17,7 +17,7 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | I5 | launch_failure_surfaces_bounded_and_redacted |
 | I6 | implemented_memory_trigger_rules_registered |
 | I7 | typed_loader_worker_delegated_dispatch_and_named_boundary_single_assessment_complete |
-| I8 | preflight_costs_declared_measurement_pending_phase_4 |
+| I8 | preflight_costs_declared_reviewed_warm_cache_tier0_rotational_measurement |
 | I9 | reserved_facts_unused_agent_demo_pending_phase_5 |
 
 ## Coverage Summary
@@ -52,7 +52,7 @@ The complete kernel matrix remains in the JSON artifact.
 | installed_versions | content_io | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
 | overrides | external_probe | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
 | resources | metadata_io | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
-| integrity_tier0 | metadata_io | launch_preflight_sense_timing | pending_i8_rotational_measurement | 9 | ignored rotational-fixture harness; candidate evidence requires review |
+| integrity_tier0 | metadata_io | launch_preflight_sense_timing | reviewed_warm_metadata_cache_rotational_measurement | 9 | 30bc856d; native Windows MSVC release; NTFS healthy SATA HDD; 512 entries; 1 warmup + 101 hot; warm metadata cache without flush; p50/p95/max 5.862/7.348/8.421 ms; cold cache not measured |
 | readiness | content_io | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
 | guardian_policy | in_process | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
 
@@ -66,5 +66,4 @@ The complete kernel matrix remains in the JSON artifact.
 ## Deferred Demonstrations
 | Invariant | Phase | Status |
 | --- | --- | --- |
-| I8 | phase_4 | integrity_hot_path_timing_pending |
 | I9 | phase_5 | agent_fallback_execution_pending |

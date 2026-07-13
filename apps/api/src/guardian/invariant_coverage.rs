@@ -225,7 +225,10 @@ fn generate_coverage() -> InvariantCoverage {
                 "I7",
                 "typed_loader_worker_delegated_dispatch_and_named_boundary_single_assessment_complete",
             ),
-            invariant("I8", "preflight_costs_declared_measurement_pending_phase_4"),
+            invariant(
+                "I8",
+                "preflight_costs_declared_reviewed_warm_cache_tier0_rotational_measurement",
+            ),
             invariant("I9", "reserved_facts_unused_agent_demo_pending_phase_5"),
         ],
         axes: CoverageAxes {
@@ -255,18 +258,11 @@ fn generate_coverage() -> InvariantCoverage {
                 max_attempts,
             })
             .collect(),
-        deferred_demonstrations: vec![
-            DeferredDemonstration {
-                invariant: "I8".to_string(),
-                phase: "phase_4".to_string(),
-                status: "integrity_hot_path_timing_pending".to_string(),
-            },
-            DeferredDemonstration {
-                invariant: "I9".to_string(),
-                phase: "phase_5".to_string(),
-                status: "agent_fallback_execution_pending".to_string(),
-            },
-        ],
+        deferred_demonstrations: vec![DeferredDemonstration {
+            invariant: "I9".to_string(),
+            phase: "phase_5".to_string(),
+            status: "agent_fallback_execution_pending".to_string(),
+        }],
     }
 }
 
@@ -523,7 +519,7 @@ fn preflight_sense_coverage() -> Vec<PreflightSenseCoverage> {
             declared_cost_class: sense.declared_cost_class().as_str().to_string(),
             timing_signal: LAUNCH_PREFLIGHT_SENSE_TIMING_SIGNAL.to_string(),
             measurement_status: if *sense == LaunchPreflightSenseId::IntegrityTier0 {
-                "pending_i8_rotational_measurement"
+                "reviewed_warm_metadata_cache_rotational_measurement"
             } else {
                 "pending_phase_4"
             }
@@ -531,7 +527,7 @@ fn preflight_sense_coverage() -> Vec<PreflightSenseCoverage> {
             ceiling_ms: (*sense == LaunchPreflightSenseId::IntegrityTier0)
                 .then_some(INTEGRITY_TIER0_CEILING_MS),
             evidence: (*sense == LaunchPreflightSenseId::IntegrityTier0).then(|| {
-                "ignored rotational-fixture harness; candidate evidence requires review".to_string()
+                "30bc856d; native Windows MSVC release; NTFS healthy SATA HDD; 512 entries; 1 warmup + 101 hot; warm metadata cache without flush; p50/p95/max 5.862/7.348/8.421 ms; cold cache not measured".to_string()
             }),
         })
         .collect()

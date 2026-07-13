@@ -31,7 +31,7 @@
     },
     {
       "id": "I8",
-      "status": "preflight_costs_declared_measurement_pending_phase_4"
+      "status": "preflight_costs_declared_reviewed_warm_cache_tier0_rotational_measurement"
     },
     {
       "id": "I9",
@@ -6029,9 +6029,9 @@
       "id": "integrity_tier0",
       "declared_cost_class": "metadata_io",
       "timing_signal": "launch_preflight_sense_timing",
-      "measurement_status": "pending_i8_rotational_measurement",
+      "measurement_status": "reviewed_warm_metadata_cache_rotational_measurement",
       "ceiling_ms": 9,
-      "evidence": "ignored rotational-fixture harness; candidate evidence requires review"
+      "evidence": "30bc856d; native Windows MSVC release; NTFS healthy SATA HDD; 512 entries; 1 warmup + 101 hot; warm metadata cache without flush; p50/p95/max 5.862/7.348/8.421 ms; cold cache not measured"
     },
     {
       "id": "readiness",
@@ -6740,11 +6740,6 @@
     }
   ],
   "deferred_demonstrations": [
-    {
-      "invariant": "I8",
-      "phase": "phase_4",
-      "status": "integrity_hot_path_timing_pending"
-    },
     {
       "invariant": "I9",
       "phase": "phase_5",

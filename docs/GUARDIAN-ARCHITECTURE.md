@@ -243,7 +243,7 @@ Evidence tiers are:
 
 Current code has local evidence and exportable proof records. The config contains `telemetry_enabled` as a disabled-by-default consent flag only; there is no current upload pipeline or remote diagnostics channel. Any future telemetry must export sanitized evidence and cannot be required for local Guardian behavior.
 
-`IntegrityTier0` is a declared Metadata I/O timing sense with a 9 ms ceiling. The ignored rotational-fixture harness measures the whole sense, including live-lease minting, root normalization, bounded observations, and final currency validation, and reports p50, p95, max, filesystem, device, and cache mode. I8 remains pending until evidence from a reviewed rotational fixture exists.
+`IntegrityTier0` is a declared Metadata I/O timing sense with a 9 ms ceiling. The ignored rotational-fixture harness measures the whole sense, including live-lease minting, root normalization, bounded observations, joined handle close, and final currency validation. At committed source `30bc856d4544315fc0f02172297bde150f0ed916`, a native Windows MSVC release run on Windows 10.0.26200 measured 512 entries on the NTFS `G:` volume backed by healthy SATA HDD `ST2000DM008-2FR102`: 1 warmup plus 101 hot samples produced p50/p95/max of 5.862/7.348/8.421 ms. This closes I8 only for the measured warm metadata-cache condition without a cache flush; cold-cache behavior was not measured and is not claimed.
 
 Public and exportable output must not expose raw:
 - tokens
@@ -297,7 +297,6 @@ It must not:
 - Automatic install repair is currently specific to selected launcher-managed checksum/size/missing-artifact cases.
 - Performance artifact publisher signature verification is not implemented.
 - Optional telemetry upload is not implemented.
-- I8 rotational Tier 0 timing evidence is pending; the harness and declared 9 ms ceiling exist, but no reviewed physical rotational-fixture result has been accepted.
 
 ## Change Rule
 If Guardian behavior, authority boundaries, self-healing, redaction, launch/session safety, install repair, performance safety, or frontend safety rendering changes, update:
