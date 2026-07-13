@@ -2683,6 +2683,42 @@ async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
     assert!(keep_marker.exists());
 }
 
+#[tokio::test]
+async fn delete_instance_conflicts_with_an_active_content_mutation() {
+    let fixture = TestFixture::new("delete-content-race");
+    let instance = fixture
+        .state
+        .instances()
+        .add(
+            "Content mutation".to_string(),
+            "1.21.1".to_string(),
+            String::new(),
+            String::new(),
+            None,
+        )
+        .expect("add instance");
+    let guard = fixture
+        .state
+        .sessions()
+        .try_lock_instance_lifecycle(&instance.id)
+        .expect("content lifecycle guard");
+
+    let (status, Json(body)) = handle_delete_instance(&fixture.state, &instance.id, HashMap::new())
+        .await
+        .expect_err("delete must not race content mutation");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_bounded_error_body(
+        &body,
+        "cannot delete an instance while another launch or content operation is using it",
+    );
+    assert!(fixture.state.instances().get(&instance.id).is_some());
+
+    drop(guard);
+    handle_delete_instance(&fixture.state, &instance.id, HashMap::new())
+        .await
+        .expect("delete after mutation completes");
+}
+
 fn assert_bounded_error_body(body: &serde_json::Value, expected: &str) {
     let object = body.as_object().expect("error body should be an object");
     assert_eq!(object.len(), 1);

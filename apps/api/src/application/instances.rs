@@ -466,6 +466,17 @@ pub(crate) async fn handle_delete_instance(
     id: &str,
     query: std::collections::HashMap<String, String>,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let _lifecycle_guard = state
+        .sessions()
+        .try_lock_instance_lifecycle(id)
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "cannot delete an instance while another launch or content operation is using it"
+                })),
+            )
+        })?;
     if state.instances().get(id).is_none() {
         return Err((
             StatusCode::NOT_FOUND,

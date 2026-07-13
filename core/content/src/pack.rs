@@ -336,6 +336,7 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
             if relative.is_empty() {
                 continue;
             }
+            let relative = normalize_relative_path(&relative)?;
             if applied.len() >= MAX_OVERRIDE_FILES {
                 return Err(ContentError::Invalid(
                     "modpack contains too many override files".to_string(),
@@ -372,16 +373,32 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
 
 /// Resolve `relative` under `root`, refusing anything that would escape it.
 fn contained_path(root: &Path, relative: &str) -> ContentResult<PathBuf> {
+    let relative = normalize_relative_path(relative)?;
+    let mut resolved = root.to_path_buf();
+    for part in relative.split('/') {
+        resolved.push(part);
+    }
+    Ok(resolved)
+}
+
+/// Canonicalize an archive path lexically so aliases such as `mods/./x.jar`
+/// compare equal before any collision or ownership decision is made.
+fn normalize_relative_path(relative: &str) -> ContentResult<String> {
+    if relative.contains('\\') {
+        return Err(ContentError::Invalid(format!(
+            "modpack file uses a non-portable path: {relative}"
+        )));
+    }
     let candidate = Path::new(relative);
     if candidate.is_absolute() {
         return Err(ContentError::Invalid(format!(
             "modpack file escapes the instance: {relative}"
         )));
     }
-    let mut resolved = root.to_path_buf();
+    let mut parts = Vec::new();
     for component in candidate.components() {
         match component {
-            Component::Normal(part) => resolved.push(part),
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(ContentError::Invalid(format!(
@@ -390,12 +407,12 @@ fn contained_path(root: &Path, relative: &str) -> ContentResult<PathBuf> {
             }
         }
     }
-    if !resolved.starts_with(root) {
+    if parts.is_empty() {
         return Err(ContentError::Invalid(format!(
-            "modpack file escapes the instance: {relative}"
+            "modpack file path is empty: {relative}"
         )));
     }
-    Ok(resolved)
+    Ok(parts.join("/"))
 }
 
 pub fn parse_pack_index(raw: &str) -> ContentResult<PackIndex> {
@@ -425,6 +442,12 @@ pub fn parse_pack_index(raw: &str) -> ContentResult<PackIndex> {
         .filter(|file| file.included_on_client())
         .map(pack_file)
         .collect::<ContentResult<Vec<PackFile>>>()?;
+    let unique_paths: HashSet<&str> = files.iter().map(|file| file.path.as_str()).collect();
+    if unique_paths.len() != files.len() {
+        return Err(ContentError::Invalid(
+            "modpack contains duplicate file destinations".to_string(),
+        ));
+    }
 
     Ok(PackIndex {
         name: dto.name,
@@ -436,6 +459,7 @@ pub fn parse_pack_index(raw: &str) -> ContentResult<PackIndex> {
 }
 
 fn pack_file(file: dto::IndexFile) -> ContentResult<PackFile> {
+    let path = normalize_relative_path(&file.path)?;
     let url = file
         .downloads
         .into_iter()
@@ -444,7 +468,7 @@ fn pack_file(file: dto::IndexFile) -> ContentResult<PackFile> {
             ContentError::Invalid(format!("modpack file has no download: {}", file.path))
         })?;
     Ok(PackFile {
-        path: file.path,
+        path,
         url,
         sha1: file.hashes.sha1,
         sha512: file.hashes.sha512,
@@ -625,6 +649,30 @@ mod tests {
     }
 
     #[test]
+    fn pack_paths_are_normalized_before_collision_checks() {
+        let raw = r#"{
+            "formatVersion": 1,
+            "dependencies": { "minecraft": "1.21.6" },
+            "files": [{
+                "path": "mods/./example.jar",
+                "downloads": ["https://cdn.modrinth.com/example.jar"]
+            }]
+        }"#;
+        let index = parse_pack_index(raw).expect("normalized index");
+        assert_eq!(index.files[0].path, "mods/example.jar");
+
+        let duplicate = r#"{
+            "formatVersion": 1,
+            "dependencies": { "minecraft": "1.21.6" },
+            "files": [
+                { "path": "mods/example.jar", "downloads": ["https://cdn.modrinth.com/a.jar"] },
+                { "path": "mods/./example.jar", "downloads": ["https://cdn.modrinth.com/b.jar"] }
+            ]
+        }"#;
+        assert!(parse_pack_index(duplicate).is_err());
+    }
+
+    #[test]
     fn a_pack_without_a_minecraft_version_is_rejected() {
         let raw = r#"{ "formatVersion": 1, "dependencies": {}, "files": [] }"#;
         assert!(parse_pack_index(raw).is_err());
@@ -678,6 +726,7 @@ mod tests {
             "../../../etc/passwd",
             "mods/../../outside.jar",
             "/etc/passwd",
+            "mods\\..\\outside.jar",
         ] {
             assert!(
                 contained_path(root, escape).is_err(),
@@ -756,6 +805,32 @@ mod tests {
         );
 
         assert!(apply_overrides(&root, &archive).is_err());
+
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn override_paths_return_the_same_normal_form_as_index_paths() {
+        let root = std::env::temp_dir().join("axial-pack-override-normalized-path");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let archive = override_archive(
+            "normalized-path",
+            &[("overrides/mods/./example.jar", b"override".to_vec())],
+        );
+
+        let applied = apply_overrides(&root, &archive).expect("apply override");
+        assert_eq!(applied, ["mods/example.jar"]);
+        let indexed = HashSet::from(["mods/example.jar"]);
+        assert!(
+            applied.iter().any(|path| indexed.contains(path.as_str())),
+            "normalized override must collide with the indexed destination"
+        );
+        assert_eq!(
+            std::fs::read(root.join("mods/example.jar")).expect("override file"),
+            b"override"
+        );
 
         let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(root);

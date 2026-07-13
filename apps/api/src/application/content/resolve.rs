@@ -201,6 +201,11 @@ fn validate_selected_kinds(
     Ok(())
 }
 
+struct ResolvePass {
+    resolution: Resolution,
+    retry_with_exact: Option<(CanonicalId, String)>,
+}
+
 pub async fn resolve(
     state: &AppState,
     target: &ResolveTarget,
@@ -210,6 +215,51 @@ pub async fn resolve(
     if selections.is_empty() {
         return Err(json_error(StatusCode::BAD_REQUEST, "no content selected"));
     }
+    let mut exact_requirements = HashMap::new();
+    for selection in selections {
+        let Some(version_id) = selection.version_id.as_ref() else {
+            continue;
+        };
+        let canonical_id = CanonicalId(selection.canonical_id.clone());
+        if let Some(existing) = exact_requirements.insert(canonical_id.clone(), version_id.clone())
+            && existing != *version_id
+        {
+            return Ok(Resolution {
+                items: Vec::new(),
+                conflicts: vec![exact_dependency_conflict(
+                    &canonical_id,
+                    &existing,
+                    version_id,
+                )],
+            });
+        }
+    }
+
+    for _ in 0..MAX_RESOLVE_ITEMS {
+        let pass = resolve_pass(state, target, selections, manifest, &exact_requirements).await?;
+        let Some((canonical_id, required_version)) = pass.retry_with_exact else {
+            return Ok(pass.resolution);
+        };
+        exact_requirements.insert(canonical_id, required_version);
+    }
+
+    Ok(Resolution {
+        items: Vec::new(),
+        conflicts: vec![PlanConflict {
+            canonical_id: None,
+            kind: ConflictKind::Unavailable,
+            detail: "could not stabilize exact dependency requirements".to_string(),
+        }],
+    })
+}
+
+async fn resolve_pass(
+    state: &AppState,
+    target: &ResolveTarget,
+    selections: &[ContentSelection],
+    manifest: &ContentManifest,
+    exact_requirements: &HashMap<CanonicalId, String>,
+) -> Result<ResolvePass, ContentApiError> {
     let selected_ids: Vec<CanonicalId> = selections
         .iter()
         .map(|selection| CanonicalId(selection.canonical_id.clone()))
@@ -229,11 +279,12 @@ pub async fn resolve(
     let mut queue: VecDeque<(CanonicalId, Option<String>, PlanReason)> = selections
         .iter()
         .map(|selection| {
-            (
-                CanonicalId(selection.canonical_id.clone()),
-                selection.version_id.clone(),
-                PlanReason::Selected,
-            )
+            let canonical_id = CanonicalId(selection.canonical_id.clone());
+            let version_id = selection
+                .version_id
+                .clone()
+                .or_else(|| exact_requirements.get(&canonical_id).cloned());
+            (canonical_id, version_id, PlanReason::Selected)
         })
         .collect();
 
@@ -242,6 +293,12 @@ pub async fn resolve(
             if let Some(required_version) = forced_version.as_deref()
                 && required_version != chosen_version
             {
+                if exact_requirement_needs_retry(exact_requirements, &canonical_id) {
+                    return Ok(ResolvePass {
+                        resolution: Resolution { items, conflicts },
+                        retry_with_exact: Some((canonical_id, required_version.to_string())),
+                    });
+                }
                 conflicts.push(exact_dependency_conflict(
                     &canonical_id,
                     chosen_version,
@@ -370,7 +427,17 @@ pub async fn resolve(
     conflicts.extend(selected_incompatibility_conflicts(&items));
 
     apply_metadata_titles(&metadata, &mut conflicts);
-    Ok(Resolution { items, conflicts })
+    Ok(ResolvePass {
+        resolution: Resolution { items, conflicts },
+        retry_with_exact: None,
+    })
+}
+
+fn exact_requirement_needs_retry(
+    exact_requirements: &HashMap<CanonicalId, String>,
+    canonical_id: &CanonicalId,
+) -> bool {
+    !exact_requirements.contains_key(canonical_id)
 }
 
 fn resolved_install_state(
@@ -792,6 +859,18 @@ mod tests {
         assert_eq!(conflict.canonical_id, Some(dependency));
         assert!(conflict.detail.contains("version-a"));
         assert!(conflict.detail.contains("version-b"));
+    }
+
+    #[test]
+    fn newly_discovered_exact_requirement_replans_only_unpinned_content() {
+        let dependency = CanonicalId::for_project(ProviderId::Modrinth, "dependency");
+        assert!(exact_requirement_needs_retry(&HashMap::new(), &dependency));
+
+        let pinned = HashMap::from([(dependency.clone(), "version-a".to_string())]);
+        assert!(
+            !exact_requirement_needs_retry(&pinned, &dependency),
+            "a second exact requirement must be reported as a conflict"
+        );
     }
 
     #[test]

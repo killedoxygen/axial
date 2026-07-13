@@ -85,6 +85,7 @@ impl ManifestEntry {
             version_id,
             dependencies,
             title,
+            ..
         } = identity;
         Self {
             canonical_id: CanonicalId::for_project(provider, &project_id),
@@ -254,15 +255,11 @@ pub struct UnmanagedFile {
 /// up (it needs a provider).
 pub fn reconcile(game_dir: &Path, manifest: &ContentManifest) -> ReconcileReport {
     let mut report = ReconcileReport::default();
-    let recorded: HashSet<(ContentKind, String)> = manifest
-        .entries
-        .iter()
-        .filter(|entry| entry_file_present(game_dir, entry))
-        .map(|entry| (entry.kind, entry.filename.clone()))
-        .collect();
-
+    let mut recorded = HashSet::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
-        if !entry_file_present(game_dir, entry) {
+        if entry_file_present(game_dir, entry) {
+            recorded.insert((entry.kind, entry.filename.clone()));
+        } else {
             report.missing.push(entry.canonical_id.clone());
         }
     }
@@ -479,6 +476,8 @@ mod tests {
                 provider: ProviderId::Modrinth,
                 project_id: "project-a".to_string(),
                 version_id: "version-a".to_string(),
+                game_versions: vec!["1.21.6".to_string()],
+                loaders: vec!["fabric".to_string()],
                 dependencies: vec![ContentDependency {
                     project_id: Some("project-b".to_string()),
                     version_id: None,

@@ -10,6 +10,7 @@ use crate::provider::{ContentProvider, ContentQuery, LoaderGameFilter, Page, Sor
 use std::collections::HashMap;
 
 const DEFAULT_BASE_URL: &str = "https://api.modrinth.com/v2";
+const MAX_BULK_IDS: usize = 100;
 const USER_AGENT: &str = concat!(
     "mateoltd/axial/",
     env!("CARGO_PKG_VERSION"),
@@ -144,15 +145,15 @@ impl ContentProvider for ModrinthProvider {
         if project_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let projects: Vec<dto::Project> = self
-            .get_json(
-                &self.endpoint("/projects"),
-                &[("ids", json_string_array(&project_ids))],
-            )
-            .await?;
-        Ok(projects
-            .into_iter()
-            .filter_map(|project| {
+        let mut metadata = HashMap::new();
+        for chunk in project_ids.chunks(MAX_BULK_IDS) {
+            let projects: Vec<dto::Project> = self
+                .get_json(
+                    &self.endpoint("/projects"),
+                    &[("ids", json_string_array(chunk))],
+                )
+                .await?;
+            metadata.extend(projects.into_iter().filter_map(|project| {
                 let kind = kind_from_project_type(&project.project_type)?;
                 Some((
                     CanonicalId::for_project(ProviderId::Modrinth, &project.id),
@@ -161,8 +162,9 @@ impl ContentProvider for ModrinthProvider {
                         title: project.title,
                     },
                 ))
-            })
-            .collect())
+            }));
+        }
+        Ok(metadata)
     }
 
     async fn identify(
@@ -172,24 +174,27 @@ impl ContentProvider for ModrinthProvider {
         if sha512_hashes.is_empty() {
             return Ok(HashMap::new());
         }
-        let body = serde_json::json!({
-            "hashes": sha512_hashes,
-            "algorithm": "sha512",
-        });
         let url = self.endpoint("/version_files");
-        let response = self
-            .client
-            .post(&url)
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .json(&body)
-            .send()
-            .await?;
-        let resolved: HashMap<String, dto::Version> = parse_response(response, &url).await?;
-        Ok(resolved
-            .into_iter()
-            .filter_map(|(hash, version)| map_identity(version).map(|identity| (hash, identity)))
-            .collect())
+        let mut identities = HashMap::new();
+        for chunk in sha512_hashes.chunks(MAX_BULK_IDS) {
+            let body = serde_json::json!({
+                "hashes": chunk,
+                "algorithm": "sha512",
+            });
+            let response = self
+                .client
+                .post(&url)
+                .header(reqwest::header::USER_AGENT, USER_AGENT)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .json(&body)
+                .send()
+                .await?;
+            let resolved: HashMap<String, dto::Version> = parse_response(response, &url).await?;
+            identities.extend(resolved.into_iter().filter_map(|(hash, version)| {
+                map_identity(version).map(|identity| (hash, identity))
+            }));
+        }
+        Ok(identities)
     }
 }
 
@@ -396,6 +401,8 @@ fn map_dependency(dependency: dto::Dependency) -> Option<ContentDependency> {
 }
 
 fn map_identity(version: dto::Version) -> Option<VersionIdentity> {
+    let game_versions = version.game_versions;
+    let loaders = version.loaders;
     let dependencies = version
         .dependencies
         .into_iter()
@@ -405,6 +412,8 @@ fn map_identity(version: dto::Version) -> Option<VersionIdentity> {
         provider: ProviderId::Modrinth,
         project_id: version.project_id,
         version_id: version.id,
+        game_versions,
+        loaders,
         dependencies,
         title: Some(version.name),
     })
@@ -423,12 +432,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hash_identity_preserves_version_dependencies() {
+    fn hash_identity_preserves_compatibility_and_dependencies() {
         let version: dto::Version = serde_json::from_value(serde_json::json!({
             "id": "version-a",
             "project_id": "project-a",
             "name": "Project A",
             "version_number": "1.0.0",
+            "game_versions": ["1.21.6"],
+            "loaders": ["fabric"],
             "dependencies": [{
                 "project_id": "project-b",
                 "dependency_type": "incompatible"
@@ -438,6 +449,8 @@ mod tests {
 
         let identity = map_identity(version).expect("identity");
 
+        assert_eq!(identity.game_versions, ["1.21.6"]);
+        assert_eq!(identity.loaders, ["fabric"]);
         assert_eq!(identity.dependencies.len(), 1);
         assert_eq!(
             identity.dependencies[0].project_id.as_deref(),

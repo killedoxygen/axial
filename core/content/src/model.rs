@@ -229,6 +229,10 @@ pub struct VersionIdentity {
     pub project_id: String,
     pub version_id: String,
     #[serde(default)]
+    pub game_versions: Vec<String>,
+    #[serde(default)]
+    pub loaders: Vec<String>,
+    #[serde(default)]
     pub dependencies: Vec<ContentDependency>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,

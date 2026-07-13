@@ -19,7 +19,6 @@ use axial_content::{
     ProviderId, VersionIdentity, install_pack_files_with_finalize, read_pack_index,
 };
 use axum::http::StatusCode;
-use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -238,7 +237,7 @@ pub async fn modpack_files(
     })?;
     let archive = download_archive(state, &archive_file).await?;
     let index = read_pack_index(archive.path()).map_err(content_error_response)?;
-    let identities = identify_modpack_files(state, &index).await;
+    let identities = identify_modpack_files(state, &index).await?;
     let files = classify_modpack_files(state, &target, &game_dir, &index, &identities).await;
 
     Ok(ModpackFilesPlan {
@@ -258,50 +257,40 @@ async fn classify_modpack_files(
     index: &PackIndex,
     identities: &HashMap<String, VersionIdentity>,
 ) -> Vec<ModpackFileOption> {
-    let identity_versions: HashMap<(String, String), Option<(bool, bool, String)>> = stream::iter(
-        identities
-            .values()
-            .map(|identity| {
-                (
-                    CanonicalId::for_project(identity.provider, &identity.project_id),
-                    identity.version_id.clone(),
-                )
-            })
-            .collect::<std::collections::HashSet<_>>(),
-    )
-    .map(|(project_id, version_id)| {
-        let state = state.clone();
-        let game_version = target.game_version.clone();
-        let loader = target.loader.clone();
-        async move {
-            let key = (project_id.as_str().to_string(), version_id.clone());
-            let compatible = state
-                .content()
-                .detail(&project_id)
-                .await
-                .ok()
-                .and_then(|detail| {
-                    let title = detail.content.title;
-                    detail
-                        .versions
-                        .into_iter()
-                        .find(|version| version.id == version_id)
-                        .map(|version| {
-                            let game = version
-                                .game_versions
-                                .iter()
-                                .any(|game| game == &game_version);
-                            let loader =
-                                version.loaders.iter().any(|candidate| candidate == &loader);
-                            (game, loader, title)
-                        })
-                });
-            (key, compatible)
-        }
-    })
-    .buffer_unordered(8)
-    .collect()
-    .await;
+    let project_ids: Vec<CanonicalId> = identities
+        .values()
+        .map(|identity| CanonicalId::for_project(identity.provider, &identity.project_id))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let metadata = state
+        .content()
+        .metadata(&project_ids)
+        .await
+        .unwrap_or_default();
+    let identity_versions: HashMap<(String, String), Option<(bool, bool, String)>> = identities
+        .values()
+        .map(|identity| {
+            let project_id = CanonicalId::for_project(identity.provider, &identity.project_id);
+            let game = identity
+                .game_versions
+                .iter()
+                .any(|game| game == &target.game_version);
+            let loader = identity
+                .loaders
+                .iter()
+                .any(|candidate| candidate == &target.loader);
+            let title = metadata
+                .get(&project_id)
+                .map(|project| project.title.clone())
+                .or_else(|| identity.title.clone())
+                .unwrap_or_else(|| identity.project_id.clone());
+            (
+                (project_id.as_str().to_string(), identity.version_id.clone()),
+                Some((game, loader, title)),
+            )
+        })
+        .collect();
 
     classify_modpack_file_options(game_dir, index, identities, &identity_versions)
 }
@@ -309,16 +298,20 @@ async fn classify_modpack_files(
 async fn identify_modpack_files(
     state: &AppState,
     index: &PackIndex,
-) -> HashMap<String, VersionIdentity> {
+) -> Result<HashMap<String, VersionIdentity>, ContentApiError> {
     let hashes: Vec<String> = index
         .files
         .iter()
         .filter_map(|file| file.sha512.clone())
         .collect();
     if hashes.is_empty() {
-        HashMap::new()
+        Ok(HashMap::new())
     } else {
-        state.content().identify(&hashes).await.unwrap_or_default()
+        state
+            .content()
+            .identify(&hashes)
+            .await
+            .map_err(content_error_response)
     }
 }
 
@@ -482,7 +475,7 @@ where
     let archive = download_archive(state, &archive_file).await?;
     let preview = read_pack_index(archive.path()).map_err(content_error_response)?;
     if !request.selected_paths.is_empty() {
-        let identities = identify_modpack_files(state, &preview).await;
+        let identities = identify_modpack_files(state, &preview).await?;
         let classified =
             classify_modpack_files(state, &target, &game_dir, &preview, &identities).await;
         validate_cherry_pick_files(&request.selected_paths, &classified)?;
