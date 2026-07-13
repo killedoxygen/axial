@@ -1,35 +1,34 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useState } from 'preact/hooks';
-import { Button } from '../../ui/Atoms';
+import { Button, IconButton, Pill } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { Modal, ModalContent } from '../../ui/Modal';
-import { SelectField } from '../../ui/Select';
+import { SelectField, type SelectFieldOption } from '../../ui/Select';
 import { navigate, route } from '../../ui-state';
 import { getContentDetail } from '../../content';
+import { formatAge, formatBytes, formatCount, formatDate, plural } from '../../format';
 import { errMessage } from '../../utils';
-import type { ContentDetail, ContentSelection, ContentVersion, ResolutionPlan } from '../../types-content';
+import type { ContentDetail, ContentVersion, GalleryImage, ReleaseChannel } from '../../types-content';
 import type { EnrichedInstance } from '../../types-instance';
-import { addToInstance, commitInstall, createFromModpack } from './actions';
-import { ConflictSheet } from './Tray';
+import { setUpModpack } from './actions';
+import { Tray } from './Tray';
 import { TargetBar } from './TargetBar';
-import { contentTargets, isStaged, stage, targetInstance, unstage } from './state';
+import { InstallConflictSheet, useInstallFlow, type InstallFlow } from './install-flow';
+import { ModpackPicker } from './ModpackPicker';
+import { isStaged, stageContent, stagedItem, targetInstance, unstage } from './state';
 import { ProjectBody, ExternalLink } from './markdown';
 import {
+  compareMcDesc,
   ContentIcon,
-  formatAge,
-  formatBytes,
-  formatCount,
-  formatDate,
+  InstanceTargetPicker,
   isAddable,
   KIND_NOUN,
-  plural,
   Spinner,
-  Stat,
   tagLabel,
   versionFits,
 } from './shared';
 
-const VERSIONS_SHOWN = 6;
+type Tab = 'about' | 'gallery' | 'versions';
 
 export function ContentDetailView(): JSX.Element {
   const current = route.value;
@@ -38,11 +37,14 @@ export function ContentDetailView(): JSX.Element {
 
   const [detail, setDetail] = useState<ContentDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [tab, setTab] = useState<Tab>('about');
+  const flow = useInstallFlow(instance?.id);
 
   useEffect(() => {
     let active = true;
     setDetail(null);
     setError(null);
+    setTab('about');
     getContentDetail(canonicalId)
       .then((resolved) => {
         if (active) setDetail(resolved);
@@ -59,436 +61,562 @@ export function ContentDetailView(): JSX.Element {
 
   if (error) {
     return (
-      <div class="cp-view-page cp-content">
+      <div class="cp-view-page">
         <BackLink onClick={back} />
-        <div class="cp-discover-empty cp-discover-empty--pad">
-          <Icon name="alert" size={22} />
-          <div>{error}</div>
-          <Button variant="secondary" onClick={back}>
-            Back to Discover
-          </Button>
+        <div class="cp-resource-empty">
+          <span>
+            <Icon name="alert" size={20} />
+          </span>
+          <strong>Could not load this page</strong>
+          <p>{error}</p>
         </div>
+        <Tray />
       </div>
     );
   }
 
-  if (!detail) return <DetailSkeleton onBack={back} />;
+  if (!detail) {
+    return (
+      <div class="cp-view-page">
+        <BackLink onClick={back} />
+        <div class="cp-content-hero">
+          <div class="cp-content-hero-icon cp-skeleton" />
+          <div class="cp-content-hero-id">
+            <div class="cp-skeleton cp-skeleton-line" style={{ width: 120 }} />
+            <div class="cp-skeleton cp-skeleton-line" style={{ width: 280, height: 30, marginTop: 12 }} />
+            <div class="cp-skeleton cp-skeleton-line" style={{ width: 360, marginTop: 14 }} />
+          </div>
+        </div>
+        <Tray />
+      </div>
+    );
+  }
 
-  const latest = detail.versions[0];
-  const projectUrl = detail.slug ? `https://modrinth.com/project/${detail.slug}` : '';
+  const gallery = detail.gallery ?? [];
+  const versions = detail.versions ?? [];
+  const latest = versions[0];
+  const tabs: Array<{ id: Tab; icon: string; label: string; count?: number }> = [
+    { id: 'about', icon: 'info', label: 'About' },
+    ...(gallery.length > 0 ? [{ id: 'gallery' as Tab, icon: 'image', label: 'Gallery', count: gallery.length }] : []),
+    ...(versions.length > 0
+      ? [{ id: 'versions' as Tab, icon: 'archive', label: 'Versions', count: versions.length }]
+      : []),
+  ];
+  const activeTab = tabs.some((entry) => entry.id === tab) ? tab : 'about';
 
   return (
-    <div class="cp-view-page cp-content">
-      <BackLink onClick={back} />
-      {instance && <TargetBar instance={instance} />}
+    <div class="cp-view-page">
+      <div class="cp-content-back-row">
+        <BackLink onClick={back} />
+        {instance && <TargetBar instance={instance} />}
+      </div>
 
       <header class="cp-content-hero">
-        <div class="cp-content-icon" aria-hidden="true">
-          <ContentIcon url={detail.icon_url} kind={detail.kind} size={34} />
+        <div class="cp-content-hero-icon">
+          <ContentIcon url={detail.icon_url} kind={detail.kind} size={40} />
         </div>
-        <div class="cp-content-headings">
-          <div class="cp-content-kicker">
-            <span class="cp-content-kind">{KIND_NOUN[detail.kind]}</span>
+        <div class="cp-content-hero-id">
+          <div class="cp-content-hero-kicker">
+            <Pill icon={detail.kind === 'modpack' ? 'stack' : 'tag'}>{KIND_NOUN[detail.kind]}</Pill>
             {detail.categories.slice(0, 3).map((category) => (
-              <span key={category} class="cp-discover-tag">
+              <span key={category} class="cp-content-hero-cat">
                 {tagLabel(category)}
               </span>
             ))}
           </div>
-          <h1 class="cp-content-title">{detail.title}</h1>
-          <div class="cp-content-author">{detail.author ? `by ${detail.author}` : 'Modrinth'}</div>
-          <div class="cp-content-stats">
-            <Stat icon="download" label="downloads" value={formatCount(detail.downloads)} />
-            <Stat icon="user" label="followers" value={formatCount(detail.follows)} />
-            <Stat icon="clock" label="updated" value={formatAge(detail.updated)} />
-            {latest && <Stat icon="tag" label="latest" value={latest.version_number} />}
+          <h1 class="cp-content-hero-title">{detail.title}</h1>
+          <div class="cp-content-hero-meta">
+            {detail.author && (
+              <span class="cp-content-hero-by">
+                by <b>{detail.author}</b>
+              </span>
+            )}
+            <span class="cp-content-stat" title={`${detail.downloads.toLocaleString()} downloads`}>
+              <Icon name="download" size={13} />
+              <b>{formatCount(detail.downloads)}</b>
+            </span>
+            <span class="cp-content-stat" title={`${detail.follows.toLocaleString()} followers`}>
+              <Icon name="user" size={13} />
+              <b>{formatCount(detail.follows)}</b>
+            </span>
+            {detail.updated && (
+              <span class="cp-content-stat" title={`Updated ${formatAge(detail.updated)}`}>
+                <Icon name="clock" size={13} />
+                {formatAge(detail.updated)}
+              </span>
+            )}
+            {latest && (
+              <span class="cp-content-stat" title={`Latest version ${latest.version_number}`}>
+                <Icon name="tag" size={13} />
+                {latest.version_number}
+              </span>
+            )}
           </div>
         </div>
-        {projectUrl && (
-          <ExternalLink href={projectUrl} class="cp-content-hero-link">
-            <Icon name="globe" size={13} />
-            Modrinth
-          </ExternalLink>
-        )}
+        <div class="cp-content-hero-actions">
+          <InstallAction detail={detail} instance={instance} flow={flow} />
+          {detail.slug && (
+            <ExternalLink href={`https://modrinth.com/project/${detail.slug}`} class="cp-content-out">
+              <IconButton icon="expand" tooltip="Open on Modrinth" />
+            </ExternalLink>
+          )}
+        </div>
       </header>
 
-      <div class="cp-content-layout">
-        <div class="cp-content-main">
-          <About detail={detail} />
-          {detail.gallery.length > 0 && <Gallery detail={detail} />}
-          <Versions detail={detail} instance={instance} />
+      {tabs.length > 1 && (
+        <div class="cp-tabs" role="tablist">
+          {tabs.map((entry) => (
+            <button
+              key={entry.id}
+              type="button"
+              role="tab"
+              aria-selected={entry.id === activeTab}
+              data-active={entry.id === activeTab}
+              onClick={() => setTab(entry.id)}
+            >
+              <span class="cp-tab-icon">
+                <Icon name={entry.icon} size={15} />
+              </span>
+              <span class="cp-tab-label">{entry.label}</span>
+              {entry.count != null && <span class="cp-tab-count">{entry.count}</span>}
+            </button>
+          ))}
         </div>
+      )}
 
-        <aside class="cp-content-rail">
-          <InstallRail detail={detail} instance={instance} />
-          <Facts detail={detail} />
-        </aside>
-      </div>
+      {activeTab === 'about' && <AboutPane detail={detail} />}
+      {activeTab === 'gallery' && <GalleryPane detail={detail} />}
+      {activeTab === 'versions' && <VersionsPane detail={detail} instance={instance} flow={flow} />}
+
+      <InstallConflictSheet flow={flow} />
+      <Tray />
     </div>
   );
 }
 
 function BackLink({ onClick }: { onClick: () => void }): JSX.Element {
   return (
-    <button class="cp-content-back" onClick={onClick}>
-      <Icon name="arrow-left" size={13} /> Discover
+    <div class="cp-content-back">
+      <Button variant="ghost" size="sm" icon="chevron-left" onClick={onClick}>
+        Discover
+      </Button>
+    </div>
+  );
+}
+
+function InstallAction({
+  detail,
+  instance,
+  flow,
+}: {
+  detail: ContentDetail;
+  instance: EnrichedInstance | null;
+  flow: InstallFlow;
+}): JSX.Element | null {
+  const [busy, setBusy] = useState(false);
+  const [pickingPack, setPickingPack] = useState(false);
+  const staged = isStaged(detail.canonical_id);
+  const versions = detail.versions ?? [];
+  const fits = versions.length === 0 || versions.some((version) => versionFits(version, detail.kind, instance));
+
+  if (detail.kind === 'modpack') {
+    if (instance) {
+      return (
+        <>
+          <Button size="lg" icon="plus" onClick={() => setPickingPack(true)}>
+            Choose files
+          </Button>
+          <ModpackPicker
+            open={pickingPack}
+            instanceId={instance.id}
+            canonicalId={detail.canonical_id}
+            onClose={() => setPickingPack(false)}
+          />
+        </>
+      );
+    }
+    return (
+      <Button
+        size="lg"
+        icon="stack"
+        disabled={busy}
+        onClick={() => {
+          setBusy(true);
+          void setUpModpack(detail.canonical_id, undefined, detail.icon_url).finally(() => setBusy(false));
+        }}
+      >
+        {busy ? 'Setting up…' : 'Set up an instance'}
+      </Button>
+    );
+  }
+
+  if (!isAddable(detail.kind)) return null;
+
+  if (instance) {
+    return (
+      <>
+        {!fits && (
+          <span class="cp-content-blocked" title={`No version supports ${instance.version_display.summary_label}`}>
+            <Icon name="alert" size={13} />
+            No version fits
+          </span>
+        )}
+        <Button
+          size="lg"
+          icon="download"
+          disabled={flow.busy || !fits}
+          onClick={() => void flow.add([{ canonical_id: detail.canonical_id, kind: detail.kind }], detail.title)}
+        >
+          {flow.busy ? 'Adding…' : `Add to ${instance.name}`}
+        </Button>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <InstanceTargetPicker
+        placeholder="Add to…"
+        width={170}
+        onPick={(id) => navigate({ name: 'content', id: detail.canonical_id, target: id })}
+      />
+      <Button
+        size="lg"
+        variant={staged ? 'secondary' : 'primary'}
+        icon={staged ? 'check' : 'plus'}
+        onClick={() => {
+          if (staged) unstage(detail.canonical_id);
+          else stageContent(detail);
+        }}
+      >
+        {staged ? 'Staged' : 'Stage'}
+      </Button>
+    </>
+  );
+}
+
+function AboutPane({ detail }: { detail: ContentDetail }): JSX.Element {
+  const body = detail.body?.trim();
+  return <div class="cp-content-pane">{body ? <ProjectBody body={body} /> : <p>{detail.summary}</p>}</div>;
+}
+
+function GalleryShot({
+  image,
+  index,
+  onOpen,
+}: {
+  image: GalleryImage;
+  index: number;
+  onOpen: () => void;
+}): JSX.Element {
+  const [loaded, setLoaded] = useState(false);
+
+  return (
+    <button
+      type="button"
+      class="cp-content-shot"
+      data-loaded={loaded}
+      onClick={onOpen}
+      aria-label={image.title ?? `Screenshot ${index + 1}`}
+      title={image.title}
+    >
+      <img
+        src={image.url}
+        alt={image.title ?? ''}
+        loading="lazy"
+        decoding="async"
+        onLoad={() => setLoaded(true)}
+        onError={() => setLoaded(true)}
+      />
+      {image.title && <span class="cp-content-shot-cap">{image.title}</span>}
     </button>
   );
 }
 
-function DetailSkeleton({ onBack }: { onBack: () => void }): JSX.Element {
-  return (
-    <div class="cp-view-page cp-content" aria-busy="true">
-      <BackLink onClick={onBack} />
-      <header class="cp-content-hero">
-        <div class="cp-content-icon cp-skeleton" />
-        <div class="cp-content-headings">
-          <div class="cp-skeleton cp-skeleton-line" style={{ width: 120, height: 14 }} />
-          <div class="cp-skeleton cp-skeleton-line" style={{ width: '38%', height: 24, marginTop: 10 }} />
-          <div class="cp-skeleton cp-skeleton-line" style={{ width: '22%', marginTop: 10 }} />
-          <div class="cp-skeleton cp-skeleton-line" style={{ width: '55%', height: 14, marginTop: 14 }} />
-        </div>
-      </header>
-      <div class="cp-content-layout">
-        <div class="cp-content-main">
-          <div class="cp-skeleton cp-skeleton-line" style={{ width: '100%' }} />
-          <div class="cp-skeleton cp-skeleton-line" style={{ width: '92%' }} />
-          <div class="cp-skeleton cp-skeleton-line" style={{ width: '78%' }} />
-        </div>
-        <aside class="cp-content-rail">
-          <div class="cp-skeleton" style={{ height: 148, borderRadius: 'var(--r-md)' }} />
-        </aside>
-      </div>
-    </div>
-  );
-}
-
-function About({ detail }: { detail: ContentDetail }): JSX.Element {
-  const [expanded, setExpanded] = useState(false);
-  const body = detail.body.trim();
-  const long = body.length > 900;
-
-  return (
-    <section class="cp-content-section">
-      <h2 class="cp-content-section-title">About</h2>
-      <p class="cp-content-summary">{detail.summary}</p>
-      {body && body !== detail.summary && (
-        <div class="cp-content-body-wrap" data-clamped={long && !expanded}>
-          <ProjectBody body={body} />
-          {long && !expanded && (
-            <button class="cp-content-more" onClick={() => setExpanded(true)}>
-              Read more <Icon name="chevron-down" size={13} />
-            </button>
-          )}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function Gallery({ detail }: { detail: ContentDetail }): JSX.Element {
+function GalleryPane({ detail }: { detail: ContentDetail }): JSX.Element {
+  const gallery = detail.gallery ?? [];
   const [open, setOpen] = useState<number | null>(null);
-  const image = open === null ? null : detail.gallery[open];
+  const shot = open != null ? gallery[open] : null;
 
   return (
-    <section class="cp-content-section">
-      <h2 class="cp-content-section-title">Gallery</h2>
+    <>
       <div class="cp-content-gallery">
-        {detail.gallery.slice(0, 9).map((entry, index) => (
-          <button
-            key={entry.url}
-            class="cp-content-shot"
-            onClick={() => setOpen(index)}
-            aria-label={entry.title ?? `Screenshot ${index + 1}`}
-          >
-            <img src={entry.url} alt={entry.title ?? ''} loading="lazy" />
-            {entry.title && <span class="cp-content-shot-caption">{entry.title}</span>}
-          </button>
+        {gallery.map((image, index) => (
+          <GalleryShot key={image.url} image={image} index={index} onOpen={() => setOpen(index)} />
         ))}
       </div>
 
-      {image && (
+      {shot && (
         <Modal open onOpenChange={(next) => !next && setOpen(null)}>
-          <ModalContent className="cp-content-lightbox" aria-label={image.title ?? 'Screenshot'}>
-            <img src={image.url} alt={image.title ?? ''} />
-            {image.title && <div class="cp-content-lightbox-caption">{image.title}</div>}
+          <ModalContent className="cp-content-lightbox" aria-label={shot.title ?? 'Screenshot'}>
+            <img src={shot.url} alt={shot.title ?? ''} />
+            {shot.title && <div class="cp-content-lightbox-cap">{shot.title}</div>}
           </ModalContent>
         </Modal>
       )}
-    </section>
+    </>
   );
 }
 
-function Versions({
-  detail,
-  instance,
-}: {
-  detail: ContentDetail;
-  instance: EnrichedInstance | null;
-}): JSX.Element | null {
-  const [showAll, setShowAll] = useState(false);
-  if (detail.versions.length === 0) return null;
+const CHANNEL_FILTERS: Array<{ value: '' | ReleaseChannel; label: string }> = [
+  { value: '', label: 'All channels' },
+  { value: 'release', label: 'Release' },
+  { value: 'beta', label: 'Beta' },
+  { value: 'alpha', label: 'Alpha' },
+];
 
-  const shown = showAll ? detail.versions : detail.versions.slice(0, VERSIONS_SHOWN);
-  const hidden = detail.versions.length - shown.length;
-
-  return (
-    <section class="cp-content-section">
-      <h2 class="cp-content-section-title">
-        Versions
-        <span class="cp-content-section-count">{detail.versions.length}</span>
-      </h2>
-      <div class="cp-content-versions">
-        {shown.map((version) => (
-          <VersionRow key={version.id} detail={detail} version={version} instance={instance} />
-        ))}
-      </div>
-      {hidden > 0 && (
-        <button class="cp-content-more cp-content-more--flush" onClick={() => setShowAll(true)}>
-          Show {plural(hidden, 'more version', 'more versions')} <Icon name="chevron-down" size={13} />
-        </button>
-      )}
-    </section>
-  );
-}
-
-function VersionRow({
+function VersionRowAction({
   detail,
   version,
   instance,
+  busy,
+  onInstall,
 }: {
   detail: ContentDetail;
   version: ContentVersion;
   instance: EnrichedInstance | null;
-}): JSX.Element {
-  const [busy, setBusy] = useState(false);
-  const fits = versionFits(version, detail.kind, instance);
-  const size = version.files.find((file) => file.primary)?.size ?? version.files[0]?.size;
-  const canAdd = !!instance && isAddable(detail.kind) && fits;
-
-  const add = async (): Promise<void> => {
-    if (!instance || busy) return;
-    setBusy(true);
-    await addToInstance(
-      instance.id,
-      [{ canonical_id: detail.canonical_id, kind: detail.kind, version_id: version.id }],
-      `${detail.title} ${version.version_number}`,
-    );
-    setBusy(false);
-  };
-
-  return (
-    <div
-      class="cp-content-version"
-      data-fits={fits}
-      title={fits ? undefined : `Does not fit ${instance?.version_display.summary_label}`}
-    >
-      <span class="cp-content-version-channel" data-channel={version.channel} title={version.channel} />
-      <div class="cp-content-version-main">
-        <span class="cp-content-version-number">{version.version_number}</span>
-        <span class="cp-content-version-name">{version.name}</span>
-      </div>
-      <div class="cp-content-version-tags">
-        {version.loaders.slice(0, 2).map((loader) => (
-          <span key={loader} class="cp-discover-tag">
-            {tagLabel(loader)}
-          </span>
-        ))}
-        <span class="cp-discover-tag">{version.game_versions[0] ?? '—'}</span>
-      </div>
-      <span class="cp-content-version-meta">
-        {formatDate(version.published) || formatAge(version.published)}
-        {size ? ` · ${formatBytes(size)}` : ''}
-        {version.downloads ? ` · ${formatCount(version.downloads)} downloads` : ''}
-      </span>
-      {canAdd && (
-        <button
-          class="cp-content-version-add"
-          onClick={add}
-          disabled={busy}
-          title={`Add this version to ${instance?.name}`}
-        >
-          {busy ? <Spinner size={12} /> : <Icon name="plus" size={13} />}
-          {busy ? 'Adding…' : 'Add'}
-        </button>
-      )}
-    </div>
-  );
-}
-
-function Facts({ detail }: { detail: ContentDetail }): JSX.Element {
-  const loaders = detail.loaders.slice(0, 6);
-  const games = useMemo(() => detail.game_versions.slice(-6).reverse(), [detail.game_versions]);
-
-  return (
-    <div class="cp-content-facts">
-      <div class="cp-content-facts-row">
-        <span>Updated</span>
-        <b>{formatAge(detail.updated)}</b>
-      </div>
-      <div class="cp-content-facts-row">
-        <span>Downloads</span>
-        <b>{detail.downloads.toLocaleString()}</b>
-      </div>
-      <div class="cp-content-facts-row">
-        <span>Followers</span>
-        <b>{detail.follows.toLocaleString()}</b>
-      </div>
-      {loaders.length > 0 && (
-        <div class="cp-content-facts-block">
-          <span>Loaders</span>
-          <div class="cp-content-facts-tags">
-            {loaders.map((loader) => (
-              <span key={loader} class="cp-discover-tag">
-                {tagLabel(loader)}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-      {games.length > 0 && (
-        <div class="cp-content-facts-block">
-          <span>Minecraft</span>
-          <div class="cp-content-facts-tags">
-            {games.map((game) => (
-              <span key={game} class="cp-discover-tag">
-                {game}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function InstallRail({ detail, instance }: { detail: ContentDetail; instance: EnrichedInstance | null }): JSX.Element {
-  const [busy, setBusy] = useState(false);
-  const [conflictPlan, setConflictPlan] = useState<ResolutionPlan | null>(null);
-  const staged = isStaged(detail.canonical_id);
-  const selections: ContentSelection[] = [{ canonical_id: detail.canonical_id, kind: detail.kind }];
-  const latest = detail.versions[0];
+  busy: string;
+  onInstall: (version: ContentVersion) => void;
+}): JSX.Element | null {
+  const [working, setWorking] = useState(false);
+  const [pickingPack, setPickingPack] = useState(false);
 
   if (detail.kind === 'modpack') {
+    if (instance) {
+      return (
+        <>
+          <Button variant="secondary" size="sm" icon="plus" onClick={() => setPickingPack(true)}>
+            Choose files
+          </Button>
+          <ModpackPicker
+            open={pickingPack}
+            instanceId={instance.id}
+            canonicalId={detail.canonical_id}
+            versionId={version.id}
+            onClose={() => setPickingPack(false)}
+          />
+        </>
+      );
+    }
     return (
-      <div class="cp-content-rail-card">
-        <div class="cp-content-rail-head">
-          <Icon name="stack" size={15} />
-          <div class="cp-content-rail-title">This is a modpack</div>
-        </div>
-        <p class="cp-content-rail-note">
-          A pack is a whole instance, so it gets set up as its own. Nothing in your existing instances is touched.
-        </p>
-        <Button
-          icon="plus"
-          full
-          disabled={busy}
-          onClick={async () => {
-            setBusy(true);
-            await createFromModpack(detail.canonical_id);
-            setBusy(false);
-          }}
-        >
-          {busy ? 'Setting up…' : 'Set up an instance'}
-        </Button>
-        {latest && (
-          <div class="cp-content-rail-foot">
-            {latest.version_number} · {latest.game_versions[0] ?? 'unknown'}
-          </div>
-        )}
-      </div>
+      <Button
+        variant="secondary"
+        size="sm"
+        icon="stack"
+        disabled={working}
+        title={`Create an instance from ${version.version_number}`}
+        onClick={() => {
+          setWorking(true);
+          void setUpModpack(detail.canonical_id, version.id, detail.icon_url).finally(() => setWorking(false));
+        }}
+      >
+        {working ? <Spinner size={12} /> : 'Set up'}
+      </Button>
     );
   }
 
-  const fitting = instance ? detail.versions.find((version) => versionFits(version, detail.kind, instance)) : latest;
-  const blocked = !!instance && !fitting;
+  if (!isAddable(detail.kind)) return null;
 
-  const add = async (): Promise<void> => {
-    if (!instance || busy) return;
-    setBusy(true);
-    const outcome = await addToInstance(instance.id, selections, detail.title);
-    setBusy(false);
-    if (outcome.status === 'needs-confirmation' && outcome.plan) setConflictPlan(outcome.plan);
-  };
+  if (instance) {
+    const fits = versionFits(version, detail.kind, instance);
+    if (!fits) {
+      return (
+        <span class="cp-content-version-no" title={`Does not fit ${instance.version_display.summary_label}`}>
+          Does not fit
+        </span>
+      );
+    }
+    return (
+      <Button
+        variant="secondary"
+        size="sm"
+        icon="plus"
+        disabled={!!busy}
+        title={`Add ${version.version_number} to ${instance.name}`}
+        onClick={() => onInstall(version)}
+      >
+        {busy === version.id ? <Spinner size={12} /> : 'Add'}
+      </Button>
+    );
+  }
 
-  const confirm = async (): Promise<void> => {
-    if (!instance) return;
-    setBusy(true);
-    await commitInstall(instance.id, selections, detail.title, conflictPlan ?? undefined);
-    setBusy(false);
-    setConflictPlan(null);
-  };
-
+  const stagedEntry = stagedItem(detail.canonical_id);
+  const stagedThis = stagedEntry?.version_id === version.id;
   return (
-    <div class="cp-content-rail-card">
-      {instance ? (
-        <>
-          <div class="cp-content-rail-head">
-            <Icon name="download" size={15} />
-            <div class="cp-content-rail-title">Add to {instance.name}</div>
-          </div>
-          <p class="cp-content-rail-note">
-            {blocked
-              ? `No release of this ${KIND_NOUN[detail.kind]} fits ${instance.version_display.summary_label}.`
-              : `${instance.version_display.summary_label} · ${fitting?.version_number ?? 'latest'}`}
-          </p>
-          <Button icon="download" full onClick={add} disabled={busy || blocked}>
-            {busy ? 'Adding…' : blocked ? 'Nothing to add' : `Add to ${instance.name}`}
-          </Button>
-        </>
-      ) : (
-        <>
-          <div class="cp-content-rail-head">
-            <Icon name="compass" size={15} />
-            <div class="cp-content-rail-title">Where should this go?</div>
-          </div>
-          <p class="cp-content-rail-note">
-            Pick an instance to add it now, or stage it with a few more and build one that fits them all.
-          </p>
-          <InstancePicker />
-          <Button
-            icon={staged ? 'check' : 'plus'}
-            variant={staged ? 'secondary' : 'primary'}
-            full
-            onClick={() =>
-              staged
-                ? unstage(detail.canonical_id)
-                : stage({
-                    canonical_id: detail.canonical_id,
-                    kind: detail.kind,
-                    title: detail.title,
-                    icon_url: detail.icon_url,
-                  })
-            }
-          >
-            {staged ? 'Staged — remove' : 'Stage this'}
-          </Button>
-        </>
-      )}
-
-      {conflictPlan && (
-        <ConflictSheet plan={conflictPlan} busy={busy} onCancel={() => setConflictPlan(null)} onConfirm={confirm} />
-      )}
-    </div>
+    <Button
+      variant={stagedThis ? 'primary' : 'secondary'}
+      size="sm"
+      icon={stagedThis ? 'check' : 'plus'}
+      title={
+        stagedThis
+          ? 'Remove from selection'
+          : stagedEntry
+            ? `Switch the staged version to ${version.version_number}`
+            : `Stage ${version.version_number}`
+      }
+      onClick={() => {
+        if (stagedThis) unstage(detail.canonical_id);
+        else stageContent(detail, version);
+      }}
+    >
+      {stagedThis ? 'Staged' : 'Stage'}
+    </Button>
   );
 }
 
-function InstancePicker(): JSX.Element | null {
-  const current = route.value;
-  const id = current.name === 'content' ? current.id : '';
-  const options = contentTargets.value.map((instance) => ({
-    value: instance.id,
-    label: `${instance.name} · ${instance.version_display.summary_label}`,
-  }));
-  if (options.length === 0) return null;
+function VersionsPane({
+  detail,
+  instance,
+  flow,
+}: {
+  detail: ContentDetail;
+  instance: EnrichedInstance | null;
+  flow: InstallFlow;
+}): JSX.Element {
+  const [busy, setBusy] = useState('');
+  const [showAll, setShowAll] = useState(false);
+  const [channel, setChannel] = useState<'' | ReleaseChannel>('');
+  const [mcFilter, setMcFilter] = useState('');
+  const [loaderFilter, setLoaderFilter] = useState('');
+  const versions = detail.versions ?? [];
+
+  const channelOptions = useMemo<SelectFieldOption<'' | ReleaseChannel>[]>(() => {
+    const present = new Set(versions.map((version) => version.channel));
+    return CHANNEL_FILTERS.filter((option) => option.value === '' || present.has(option.value));
+  }, [versions]);
+
+  const mcOptions = useMemo<SelectFieldOption<string>[]>(() => {
+    const set = new Set<string>();
+    for (const version of versions) for (const value of version.game_versions) set.add(value);
+    const list = [...set].sort(compareMcDesc);
+    return [{ value: '', label: 'Any version' }, ...list.map((value) => ({ value, label: value }))];
+  }, [versions]);
+
+  const loaderOptions = useMemo<SelectFieldOption<string>[]>(() => {
+    const set = new Set<string>();
+    for (const version of versions) for (const value of version.loaders) set.add(value);
+    const list = [...set].sort();
+    return [{ value: '', label: 'Any loader' }, ...list.map((value) => ({ value, label: tagLabel(value) }))];
+  }, [versions]);
+
+  const filtered = useMemo(
+    () =>
+      versions.filter(
+        (version) =>
+          (!channel || version.channel === channel) &&
+          (!mcFilter || version.game_versions.includes(mcFilter)) &&
+          (!loaderFilter || version.loaders.includes(loaderFilter)),
+      ),
+    [versions, channel, mcFilter, loaderFilter],
+  );
+  const shown = showAll ? filtered : filtered.slice(0, 10);
+  const isFiltered = Boolean(channel || mcFilter || loaderFilter);
+
+  const install = async (version: ContentVersion): Promise<void> => {
+    if (!instance || busy) return;
+    setBusy(version.id);
+    await flow.add(
+      [{ canonical_id: detail.canonical_id, kind: detail.kind, version_id: version.id }],
+      `${detail.title} ${version.version_number}`,
+    );
+    setBusy('');
+  };
 
   return (
-    <SelectField
-      value=""
-      onChange={(target) => navigate({ name: 'content', id, target })}
-      options={[{ value: '', label: 'Choose an instance…' }, ...options]}
-      ariaLabel="Choose an instance"
-      width="100%"
-    />
+    <div class="cp-content-versions">
+      <div class="cp-content-version-bar">
+        {channelOptions.length > 2 && (
+          <SelectField value={channel} onChange={setChannel} options={channelOptions} ariaLabel="Channel" width={130} />
+        )}
+        {mcOptions.length > 1 && (
+          <SelectField
+            value={mcFilter}
+            onChange={setMcFilter}
+            options={mcOptions}
+            ariaLabel="Minecraft version"
+            width={130}
+          />
+        )}
+        {loaderOptions.length > 2 && (
+          <SelectField
+            value={loaderFilter}
+            onChange={setLoaderFilter}
+            options={loaderOptions}
+            ariaLabel="Loader"
+            width={130}
+          />
+        )}
+        <span class="cp-content-version-bar-count" aria-live="polite">
+          {plural(filtered.length, 'version', 'versions')}
+        </span>
+      </div>
+      <div class="cp-content-version-head" aria-hidden="true">
+        <span>Version</span>
+        <span>Supports</span>
+        <span>Published</span>
+        <span>Downloads</span>
+        <span>Size</span>
+        <span />
+      </div>
+      {filtered.length === 0 && (
+        <div class="cp-content-version-empty">
+          <span>Nothing matches these filters.</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setChannel('');
+              setMcFilter('');
+              setLoaderFilter('');
+            }}
+          >
+            Clear filters
+          </Button>
+        </div>
+      )}
+      {shown.map((version) => {
+        const fits = versionFits(version, detail.kind, instance);
+        const file = version.files.find((entry) => entry.primary) ?? version.files[0];
+        return (
+          <div key={version.id} class="cp-content-version" data-fits={fits}>
+            <span class="cp-content-version-id">
+              <span class="cp-content-version-name" title={version.name}>
+                {version.version_number}
+              </span>
+              {version.channel !== 'release' && (
+                <Pill tone={version.channel === 'beta' ? 'warn' : 'err'}>{version.channel}</Pill>
+              )}
+            </span>
+            <span class="cp-content-version-tags">
+              {version.loaders.map((entry) => (
+                <span key={entry}>{entry}</span>
+              ))}
+              {version.game_versions.slice(0, 3).map((entry) => (
+                <span key={entry}>{entry}</span>
+              ))}
+              {version.game_versions.length > 3 && <span>+{version.game_versions.length - 3}</span>}
+            </span>
+            <span class="cp-content-version-cell">{formatDate(version.published)}</span>
+            <span class="cp-content-version-cell">{formatCount(version.downloads)}</span>
+            <span class="cp-content-version-cell">{file?.size ? formatBytes(file.size) : ''}</span>
+            <span class="cp-content-version-act">
+              <VersionRowAction
+                detail={detail}
+                version={version}
+                instance={instance}
+                busy={busy}
+                onInstall={(entry) => void install(entry)}
+              />
+            </span>
+          </div>
+        );
+      })}
+      {filtered.length > shown.length && (
+        <button type="button" class="cp-content-version-more" onClick={() => setShowAll(true)}>
+          Show {plural(filtered.length - shown.length, 'older version', 'older versions')}
+          {isFiltered ? ' matching these filters' : ''}
+        </button>
+      )}
+    </div>
   );
 }

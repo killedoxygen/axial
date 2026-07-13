@@ -94,12 +94,6 @@
   font-size: 12px;
   font-weight: 600;
 }
-.cp-shortcut-hud-label {
-  padding: 0 4px 0 12px;
-  font-size: 13px;
-  font-weight: 700;
-  white-space: nowrap;
-}
 .cp-shortcut-hud-combo {
   display: inline-flex;
   align-items: center;

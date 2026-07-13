@@ -3,10 +3,10 @@ import { useCallback } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
 import { Button } from '../../../ui/Atoms';
 import { openContextMenu } from '../../../ui/ContextMenu';
-import { SelectionActionPill, SelectionCheckbox } from '../../../ui/SelectionActionPill';
+import { SelectionActionTray, SelectionCheckbox } from '../../../ui/SelectionActionTray';
 import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../../ui/selection';
+import { formatBytes, fmtRelative } from '../../../format';
 import type { EnrichedInstance } from '../../../types-instance';
-import { fmtBytes, fmtRelative } from '../format';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
 import { ResourceRow, ResourceStatus, ResourceToolbar } from '../components/resource-bits';
@@ -70,7 +70,7 @@ export function WorldsPane({
               key={world.name}
               icon="globe"
               name={world.name}
-              meta={`${fmtBytes(world.size)} · changed ${fmtRelative(world.modified_at)}`}
+              meta={`${formatBytes(world.size)}, changed ${fmtRelative(world.modified_at)}`}
               selected={selection.isSelected(world.name)}
               leading={
                 <SelectionCheckbox
@@ -97,7 +97,7 @@ export function WorldsPane({
           ))}
         </div>
       )}
-      <SelectionActionPill
+      <SelectionActionTray
         selection={selection}
         itemLabel="world"
         actions={[{ label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() }]}

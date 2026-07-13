@@ -1,11 +1,3 @@
-.cp-selection-count {
-  padding: 0 10px;
-  font-size: 13px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
 .cp-selection-row[data-selected='true'] {
   background: color-mix(in oklab, var(--surface-3) 72%, var(--surface));
   color: var(--text);

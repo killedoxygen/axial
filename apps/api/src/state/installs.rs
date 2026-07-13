@@ -1,3 +1,4 @@
+use axial_content::ContentKind;
 use axial_minecraft::{LoaderComponentId, download::DownloadProgress};
 use std::{
     collections::{HashMap, VecDeque},
@@ -61,6 +62,32 @@ impl InstallProgressRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedContentSelection {
+    pub canonical_id: String,
+    pub kind: ContentKind,
+    pub version_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContentQueueAction {
+    Install {
+        selections: Vec<QueuedContentSelection>,
+        allow_incompatible: bool,
+        remove_instance_on_failure: bool,
+    },
+    Uninstall {
+        canonical_id: String,
+    },
+    Modpack {
+        canonical_id: String,
+        version_id: String,
+        selected_paths: Vec<String>,
+        include_overrides: bool,
+        remove_instance_on_failure: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallQueueSpec {
     Vanilla {
         version_id: String,
@@ -72,6 +99,12 @@ pub enum InstallQueueSpec {
         target_version_id: String,
         minecraft_version: String,
         loader_version: String,
+    },
+    Content {
+        instance_id: String,
+        label: String,
+        action: ContentQueueAction,
+        prerequisite_queue_id: Option<String>,
     },
 }
 
@@ -105,11 +138,16 @@ impl InstallQueueSpec {
             Self::Loader {
                 target_version_id, ..
             } => target_version_id,
+            Self::Content { instance_id, .. } => instance_id,
         }
     }
 
     pub fn is_loader(&self) -> bool {
         matches!(self, Self::Loader { .. })
+    }
+
+    pub fn is_content(&self) -> bool {
+        matches!(self, Self::Content { .. })
     }
 }
 
@@ -154,7 +192,11 @@ pub enum InstallQueueEnqueueOutcome {
 struct InstallQueueInner {
     active: Option<ActiveQueuedInstallEntry>,
     pending: VecDeque<QueuedInstallEntry>,
+    completed: HashMap<String, bool>,
+    completed_order: VecDeque<String>,
 }
+
+const MAX_COMPLETED_QUEUE_OUTCOMES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstallKey {
@@ -489,6 +531,43 @@ impl InstallStore {
         queue.active.take()
     }
 
+    pub async fn complete_active_queued_install(
+        &self,
+        install_id: &str,
+        succeeded: bool,
+    ) -> Option<ActiveQueuedInstallEntry> {
+        let mut queue = self.queue.write().await;
+        if queue
+            .active
+            .as_ref()
+            .and_then(|active| active.install_id.as_deref())
+            != Some(install_id)
+        {
+            return None;
+        }
+        let completed = queue.active.take()?;
+        record_queue_outcome(&mut queue, &completed.queue_id, succeeded);
+        Some(completed)
+    }
+
+    pub async fn complete_reserved_queued_install(
+        &self,
+        queue_id: &str,
+        succeeded: bool,
+    ) -> Option<ActiveQueuedInstallEntry> {
+        let mut queue = self.queue.write().await;
+        if queue.active.as_ref().map(|active| active.queue_id.as_str()) != Some(queue_id) {
+            return None;
+        }
+        let completed = queue.active.take()?;
+        record_queue_outcome(&mut queue, &completed.queue_id, succeeded);
+        Some(completed)
+    }
+
+    pub async fn queued_install_succeeded(&self, queue_id: &str) -> Option<bool> {
+        self.queue.read().await.completed.get(queue_id).copied()
+    }
+
     pub async fn release_active_queued_install_to_front(&self, queue_id: &str) -> bool {
         let mut queue = self.queue.write().await;
         if queue.active.as_ref().map(|active| active.queue_id.as_str()) != Some(queue_id) {
@@ -562,6 +641,16 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or_default()
+}
+
+fn record_queue_outcome(queue: &mut InstallQueueInner, queue_id: &str, succeeded: bool) {
+    queue.completed.insert(queue_id.to_string(), succeeded);
+    queue.completed_order.push_back(queue_id.to_string());
+    while queue.completed_order.len() > MAX_COMPLETED_QUEUE_OUTCOMES {
+        if let Some(expired) = queue.completed_order.pop_front() {
+            queue.completed.remove(&expired);
+        }
+    }
 }
 
 impl Default for InstallStore {

@@ -1,5 +1,6 @@
+import { modBaseName } from '../utils';
 import type { Config, SystemInfo } from '../types-settings';
-import type { EnrichedInstance } from '../types-instance';
+import type { EnrichedInstance, InstanceMod, InstanceResourceSummary } from '../types-instance';
 import type { InstallQueueStateResponse } from '../types-install';
 import type { FeatureFlagViewModel, FlagsResponse } from '../types-flags';
 import type { UpdateFlowState, UpdateInfo } from '../types-update';
@@ -11,9 +12,10 @@ import type {
   ContentKind,
   ContentPage,
   ContentSelection,
+  ContentUpdatesResponse,
   InstanceContentEntry,
   InstanceContentResponse,
-  ModpackInstallResponse,
+  ModpackFilesPlan,
   ModpackTarget,
   ResolutionPlan,
   SearchHit,
@@ -128,6 +130,7 @@ interface CreateLoaderBuildsViewResponse {
 }
 
 interface CreateInstanceResponse extends EnrichedInstance {
+  install_queue?: InstallQueueStateResponse;
   result: {
     command: 'CreateInstance';
     operation_id: null;
@@ -174,13 +177,14 @@ interface FlagDefinition {
   default_enabled: boolean;
 }
 
-console.info('Axial mock API active — data is fake, no backend running');
+console.info('Axial mock API active: data is fake, no backend running');
 
 const missingHandlers = new Set<string>();
 const flagOverrides = new Map<string, boolean>();
 
 const FABRIC_COMPONENT_ID = 'net.fabricmc.fabric-loader';
 const MOCK_FABRIC_MC_VERSION = '1.21.5';
+const MOCK_FABRIC_MC_ALT = '1.21.4';
 const MOCK_FABRIC_BUILD_ID = 'fabric-loader-0.16.14-1.21.5';
 const MOCK_FABRIC_LOADER_VERSION = '0.16.14';
 
@@ -222,36 +226,6 @@ function daysAgo(days: number): string {
   return new Date(Date.now() - days * 86_400_000).toISOString();
 }
 
-function svgDataUri(svg: string): string {
-  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
-}
-
-function mockIcon(hue: number, glyph: string): string {
-  return svgDataUri(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">` +
-      `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">` +
-      `<stop offset="0" stop-color="hsl(${hue} 62% 46%)"/><stop offset="1" stop-color="hsl(${hue + 40} 58% 28%)"/>` +
-      `</linearGradient></defs>` +
-      `<rect width="96" height="96" rx="20" fill="url(#g)"/>` +
-      `<text x="48" y="62" font-family="Manrope, sans-serif" font-size="42" font-weight="700" fill="white" fill-opacity="0.92" text-anchor="middle">${glyph}</text>` +
-      `</svg>`,
-  );
-}
-
-function mockShot(hue: number, label: string): string {
-  return svgDataUri(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="270" viewBox="0 0 480 270">` +
-      `<defs><linearGradient id="s" x1="0" y1="0" x2="0" y2="1">` +
-      `<stop offset="0" stop-color="hsl(${hue} 55% 32%)"/><stop offset="1" stop-color="hsl(${hue + 30} 45% 14%)"/>` +
-      `</linearGradient></defs>` +
-      `<rect width="480" height="270" fill="url(#s)"/>` +
-      `<circle cx="380" cy="62" r="26" fill="white" fill-opacity="0.18"/>` +
-      `<path d="M0 200 L110 140 L200 190 L300 120 L400 175 L480 140 L480 270 L0 270 Z" fill="black" fill-opacity="0.32"/>` +
-      `<text x="24" y="248" font-family="Manrope, sans-serif" font-size="16" fill="white" fill-opacity="0.72">${label}</text>` +
-      `</svg>`,
-  );
-}
-
 interface MockVersionSeed {
   number: string;
   channel: 'release' | 'beta' | 'alpha';
@@ -268,12 +242,10 @@ interface MockSeed {
   summary: string;
   downloads: number;
   categories: string[];
-  hue: number;
   loaders?: string[];
   games?: string[];
   updatedDays: number;
   body: string;
-  gallery?: string[];
   versions: MockVersionSeed[];
 }
 
@@ -286,7 +258,6 @@ const MOCK_SEEDS: MockSeed[] = [
     summary: 'A modern rendering engine that dramatically improves frame rates.',
     downloads: 182_000_000,
     categories: ['optimization', 'utility'],
-    hue: 210,
     updatedDays: 6,
     body:
       '## What it does\n' +
@@ -297,7 +268,6 @@ const MOCK_SEEDS: MockSeed[] = [
       '- Fewer stalls when loading terrain\n' +
       '- Works alongside `Iris` for shader support\n\n' +
       '> Requires Fabric API. Not compatible with OptiFine.\n',
-    gallery: ['Before: 60 fps', 'After: 180 fps', 'Chunk debug view'],
     versions: [
       { number: '0.7.3', channel: 'release', days: 6, games: ['1.21.6', '1.21.5'], size: 1_240_000 },
       { number: '0.7.2', channel: 'release', days: 41, games: ['1.21.5', '1.21.4'], size: 1_210_000 },
@@ -313,12 +283,11 @@ const MOCK_SEEDS: MockSeed[] = [
     summary: 'Core hooks and interoperability utilities most Fabric mods depend on.',
     downloads: 210_000_000,
     categories: ['library'],
-    hue: 32,
     updatedDays: 3,
     body:
       'Fabric API is the shared library nearly every Fabric mod builds on. It provides the event hooks, registries ' +
       'and networking helpers the vanilla game does not expose.\n\n' +
-      'You rarely install it on purpose — it comes along as a dependency of the mods that need it.\n',
+      'You rarely install it on purpose; it comes along as a dependency of the mods that need it.\n',
     versions: [
       { number: '0.130.0', channel: 'release', days: 3, games: ['1.21.6'], size: 2_400_000 },
       { number: '0.129.0', channel: 'release', days: 24, games: ['1.21.5'], size: 2_380_000 },
@@ -333,10 +302,9 @@ const MOCK_SEEDS: MockSeed[] = [
     summary: 'General-purpose optimization mod that improves server tick performance.',
     downloads: 90_000_000,
     categories: ['optimization'],
-    hue: 145,
     updatedDays: 15,
     body:
-      'Lithium optimizes the game logic itself — mob AI, block ticking, physics and chunk saving — without changing ' +
+      'Lithium optimizes the game logic itself, from mob AI and block ticking to physics and chunk saving, without changing ' +
       'behaviour. Worlds tick faster and hitches on busy farms get shorter.\n\n' +
       '- No config needed\n' +
       '- Safe on servers and singleplayer\n' +
@@ -354,12 +322,10 @@ const MOCK_SEEDS: MockSeed[] = [
     summary: 'Run OptiFine-style shader packs on Fabric, with Sodium support.',
     downloads: 64_000_000,
     categories: ['optimization', 'decoration'],
-    hue: 270,
     updatedDays: 9,
     body:
       'Iris loads the shader packs you already have and runs them on top of Sodium, so you keep the frame rate and ' +
       'get the lighting.\n\n### Notes\n- Pairs with any pack in the Shaders tab\n- Toggle shaders in-game without a restart\n',
-    gallery: ['Sunset with BSL', 'Underwater caustics'],
     versions: [
       { number: '1.9.1', channel: 'release', days: 9, games: ['1.21.6'], size: 3_100_000 },
       { number: '1.8.8', channel: 'release', days: 70, games: ['1.21.4'], size: 3_020_000 },
@@ -373,7 +339,6 @@ const MOCK_SEEDS: MockSeed[] = [
     summary: 'Adds an in-game screen listing every mod you have, with their settings.',
     downloads: 48_000_000,
     categories: ['utility'],
-    hue: 340,
     updatedDays: 21,
     body: 'A menu that lists the mods you have installed and opens their config screens. Most config-capable mods look for it.\n',
     versions: [
@@ -389,7 +354,6 @@ const MOCK_SEEDS: MockSeed[] = [
     summary: 'Proximity voice chat for vanilla-friendly servers, with no extra client needed.',
     downloads: 31_000_000,
     categories: ['social', 'utility'],
-    hue: 190,
     updatedDays: 34,
     body: 'Adds distance-based voice chat. Players nearby are loud, players far away are faint, and groups get their own channel.\n',
     versions: [
@@ -404,13 +368,11 @@ const MOCK_SEEDS: MockSeed[] = [
     summary: 'A performance-first pack that keeps the vanilla feel and adds quality-of-life polish.',
     downloads: 12_000_000,
     categories: ['optimization', 'lightweight'],
-    hue: 48,
     updatedDays: 11,
     body:
       'Fabulously Optimized keeps Minecraft looking like Minecraft, but faster. It bundles the usual performance ' +
       'mods, sane defaults, and a handful of interface improvements.\n\n' +
       '### Included\n- Sodium, Lithium and friends\n- Iris for shader support\n- Zoom, better screenshots, fixed bugs\n',
-    gallery: ['Main menu', 'Village at dawn', 'F3 overlay'],
     versions: [
       { number: '6.6.0', channel: 'release', days: 11, games: ['1.21.6'], size: 24_000_000 },
       { number: '6.5.1', channel: 'release', days: 62, games: ['1.21.5'], size: 23_400_000 },
@@ -424,10 +386,8 @@ const MOCK_SEEDS: MockSeed[] = [
     summary: 'A creature-collecting adventure pack, built for Fabric.',
     downloads: 8_400_000,
     categories: ['adventure', 'multiplayer'],
-    hue: 355,
     updatedDays: 28,
     body: 'Catch, train and battle creatures across the overworld. The pack ships with the mod, its models and a tuned world generator.\n',
-    gallery: ['Starter selection', 'A battle'],
     versions: [{ number: '1.6.1', channel: 'release', days: 28, games: ['1.21.1'], size: 41_000_000 }],
   },
   {
@@ -438,10 +398,8 @@ const MOCK_SEEDS: MockSeed[] = [
     summary: 'A higher-resolution take on the vanilla textures that keeps every shape intact.',
     downloads: 40_000_000,
     categories: ['32x', 'vanilla-like'],
-    hue: 96,
     updatedDays: 19,
-    body: 'Every vanilla texture, redrawn at double the resolution. Nothing is restyled — blocks stay recognizable.\n',
-    gallery: ['Oak forest', 'Nether fortress', 'Item bar'],
+    body: 'Every vanilla texture, redrawn at double the resolution. Nothing is restyled, so blocks stay recognizable.\n',
     versions: [
       { number: '1.21.6a', channel: 'release', days: 19, games: ['1.21.6', '1.21.5'], size: 18_000_000 },
       { number: '1.21.4a', channel: 'release', days: 88, games: ['1.21.4', '1.21.1'], size: 17_600_000 },
@@ -455,10 +413,8 @@ const MOCK_SEEDS: MockSeed[] = [
     summary: 'Flat, trailer-style textures with no noise and heavy saturation.',
     downloads: 9_200_000,
     categories: ['16x', 'simplistic'],
-    hue: 20,
     updatedDays: 44,
     body: 'The look of the official trailers: flat colours, no grain, strong silhouettes.\n',
-    gallery: ['Plains', 'Cave'],
     versions: [
       { number: '1.21', channel: 'release', days: 44, games: ['1.21.6', '1.21.4', '1.20.1'], size: 4_100_000 },
     ],
@@ -471,12 +427,10 @@ const MOCK_SEEDS: MockSeed[] = [
     summary: 'A well-balanced shader pack with strong performance and a huge settings menu.',
     downloads: 25_000_000,
     categories: ['fantasy', 'reimagined'],
-    hue: 250,
     updatedDays: 13,
     body:
       'Complementary aims for beauty that still runs. Volumetric light, soft shadows and water that reflects, with ' +
       'presets from potato to ultra.\n\nNeeds Iris or OptiFine to load.\n',
-    gallery: ['Sunrise', 'Rain', 'Nether'],
     versions: [
       { number: 'r5.5.1', channel: 'release', days: 13, games: ['1.21.6', '1.21.5', '1.21.1'], size: 6_800_000 },
       { number: 'r5.4.0', channel: 'release', days: 105, games: ['1.21.4'], size: 6_500_000 },
@@ -490,10 +444,8 @@ const MOCK_SEEDS: MockSeed[] = [
     summary: 'Warm, cinematic lighting with tone-mapped colour and soft reflections.',
     downloads: 21_500_000,
     categories: ['cartoon', 'semi-realistic'],
-    hue: 30,
     updatedDays: 52,
     body: 'A long-running pack known for its warm palette and its bloom. Heavier than Complementary, prettier at sunset.\n',
-    gallery: ['Golden hour', 'Ocean'],
     versions: [{ number: 'v8.4.01', channel: 'release', days: 52, games: ['1.21.6', '1.21.1'], size: 5_200_000 }],
   },
 ];
@@ -510,7 +462,6 @@ function seedContent(seed: MockSeed): CanonicalContent {
     title: seed.title,
     author: seed.author,
     summary: seed.summary,
-    icon_url: mockIcon(seed.hue, seed.title.slice(0, 1)),
     downloads: seed.downloads,
     follows: Math.round(seed.downloads / 90),
     categories: seed.categories,
@@ -535,6 +486,24 @@ const mockDependencies: Record<string, string[]> = {
   'modrinth:mOgUt4GM': ['modrinth:P7dR8mSH'],
 };
 
+const mockIncompatibilities: Record<string, string[]> = {
+  'modrinth:9eGKb6K1': ['modrinth:gvQqBUqZ'],
+};
+
+function mockConflictsFor(canonicalIds: string[], installed: InstanceContentEntry[]) {
+  return canonicalIds.flatMap((id) =>
+    (mockIncompatibilities[id] ?? [])
+      .filter((other) => installed.some((entry) => entry.canonical_id === other))
+      .map((other) => ({
+        canonical_id: id,
+        kind: 'incompatible' as const,
+        detail: `${mockCatalogItem(id)?.title ?? id} is incompatible with ${
+          mockCatalogItem(other)?.title ?? other
+        }, which is already installed`,
+      })),
+  );
+}
+
 const mockInstanceContent: Record<string, InstanceContentEntry[]> = {
   'mock-fabric-lab': [
     {
@@ -551,6 +520,13 @@ const mockInstanceContent: Record<string, InstanceContentEntry[]> = {
   ],
 };
 
+const mockLocalMods: Record<string, InstanceMod[]> = {
+  'mock-fabric-lab': [
+    { name: 'localcraft-tweaks-1.2.3.jar', size: 182_000, modified_at: daysAgo(30), enabled: true },
+    { name: 'handmade-patch.jar.disabled', size: 96_000, modified_at: daysAgo(45), enabled: false },
+  ],
+};
+
 function mockCatalogItem(canonicalId: string): CanonicalContent | undefined {
   return Object.values(mockContentCatalog)
     .flat()
@@ -560,10 +536,12 @@ function mockCatalogItem(canonicalId: string): CanonicalContent | undefined {
 function mockContentSearch(request: MockRequest | undefined): ContentPage {
   const kind = (request?.searchParams.get('kind') as ContentKind | null) ?? 'mod';
   const query = (request?.searchParams.get('query') ?? '').toLowerCase();
+  const categoryFilter = request?.searchParams.get('category') ?? '';
   const instanceId = request?.searchParams.get('instance_id') ?? '';
   const installed = new Set((mockInstanceContent[instanceId] ?? []).map((entry) => entry.canonical_id));
   const items: SearchHit[] = (mockContentCatalog[kind] ?? [])
     .filter((item) => !query || item.title.toLowerCase().includes(query) || item.summary.toLowerCase().includes(query))
+    .filter((item) => !categoryFilter || item.categories.includes(categoryFilter))
     .map((item) => (installed.has(item.canonical_id) ? { ...item, install_state: 'installed' as const } : item));
   return { items, offset: 0, limit: items.length, total: items.length };
 }
@@ -583,10 +561,7 @@ function mockContentDetail(request: MockRequest | undefined): ContentDetail {
   return {
     ...item,
     body: seed.body,
-    gallery: (seed.gallery ?? []).map((title, index) => ({
-      url: mockShot(seed.hue + index * 18, title),
-      title,
-    })),
+    gallery: [],
     versions: seed.versions.map((version, index) => ({
       id: `${item.project_id}-${version.number}`,
       name: `${seed.title} ${version.number}`,
@@ -640,6 +615,7 @@ function mockResolvePlan(instanceId: string | undefined, selections: ContentSele
         version_number: latest?.number ?? '1.0.0',
         filename: `${projectId}-${latest?.number ?? '1.0.0'}.${extension}`,
         size: latest?.size ?? 512_000,
+        dependencies: [],
         reason: entry.dependency ? ('dependency' as const) : ('selected' as const),
         already_installed: already,
         update: false,
@@ -653,7 +629,10 @@ function mockResolvePlan(instanceId: string | undefined, selections: ContentSele
     loader: 'fabric',
     game_version: '1.21.6',
     items,
-    conflicts: [],
+    conflicts: mockConflictsFor(
+      items.map((item) => item.canonical_id),
+      installed,
+    ),
     total_download_bytes: totalBytes,
   };
 }
@@ -666,8 +645,8 @@ function mockContentCompatibility(selections: ContentSelection[]): ContentCompat
       {
         loader: 'fabric',
         loader_label: 'Fabric',
-        game_version: '1.21.6',
-        selection_id: 'loader_version|fabric|1.21.6',
+        game_version: MOCK_FABRIC_MC_VERSION,
+        selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${MOCK_FABRIC_MC_VERSION}`,
         summary: total === 1 ? 'Works here' : `All ${total} work here`,
         supported_count: total,
         total_count: total,
@@ -677,8 +656,8 @@ function mockContentCompatibility(selections: ContentSelection[]): ContentCompat
       {
         loader: 'fabric',
         loader_label: 'Fabric',
-        game_version: '1.21.4',
-        selection_id: 'loader_version|fabric|1.21.4',
+        game_version: MOCK_FABRIC_MC_ALT,
+        selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${MOCK_FABRIC_MC_ALT}`,
         summary: `${Math.max(1, total - 1)} of ${total} work here`,
         supported_count: Math.max(1, total - 1),
         total_count: total,
@@ -704,39 +683,41 @@ function mockModpackTarget(canonicalId: string): ModpackTarget {
     canonical_id: canonicalId,
     version_id: `${item.project_id}-v1`,
     name: item.title,
-    minecraft: '1.21.6',
+    minecraft: MOCK_FABRIC_MC_VERSION,
     loader: 'fabric',
     loader_label: 'Fabric',
-    selection_id: 'loader_version|fabric|1.21.6',
+    selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${MOCK_FABRIC_MC_VERSION}`,
   };
 }
 
-function mockModpackInstall(body: unknown): ModpackInstallResponse {
+function mockModpackInstall(body: unknown): InstallQueueStateResponse {
   if (!isRecord(body) || typeof body.instance_id !== 'string' || typeof body.canonical_id !== 'string') {
     throw apiError(400, 'Bad Request', { error: 'invalid modpack install request' });
   }
-  const item = mockCatalogItem(body.canonical_id);
-  return {
-    instance_id: body.instance_id,
-    name: item?.title ?? 'Modpack',
-    version: '1.0.0',
-    minecraft: '1.21.6',
-    loader: 'fabric',
-    file_count: 42,
-    overrides_applied: 25,
-    identified_count: 40,
-  };
+  return mockEmptyInstallQueue('Content queued', 'Modpack files');
 }
 
-function mockContentInstall(body: unknown): InstanceContentResponse {
+function mockContentInstall(body: unknown): InstallQueueStateResponse {
   if (!isRecord(body) || typeof body.instance_id !== 'string' || !Array.isArray(body.selections)) {
     throw apiError(400, 'Bad Request', { error: 'invalid install request' });
   }
   const instanceId = body.instance_id;
   const plan = mockResolvePlan(instanceId, body.selections as ContentSelection[]);
+  const hasUnavailable = plan.conflicts.some((conflict) => conflict.kind === 'unavailable');
+  if (plan.conflicts.length > 0 && (hasUnavailable || body.allow_incompatible !== true)) {
+    throw apiError(409, 'Conflict', {
+      error: plan.conflicts.map((conflict) => conflict.detail).join('; '),
+      conflicts: plan.conflicts,
+    });
+  }
   const current = mockInstanceContent[instanceId] ?? (mockInstanceContent[instanceId] = []);
   for (const item of plan.items) {
-    if (current.some((entry) => entry.canonical_id === item.canonical_id)) continue;
+    const existing = current.find((entry) => entry.canonical_id === item.canonical_id);
+    if (existing) {
+      existing.version_id = item.version_id;
+      existing.filename = item.filename;
+      continue;
+    }
     current.push({
       canonical_id: item.canonical_id,
       title: item.title,
@@ -749,17 +730,145 @@ function mockContentInstall(body: unknown): InstanceContentResponse {
       source: 'managed',
     });
   }
-  return { entries: current };
+  return mockEmptyInstallQueue('Content queued', `${plan.items.length} items`);
 }
 
 function mockInstanceContentList(instanceId: string): InstanceContentResponse {
   return { entries: mockInstanceContent[instanceId] ?? [] };
 }
 
-function mockContentUninstall(instanceId: string, canonicalId: string): InstanceContentResponse {
+function mockContentUninstall(instanceId: string, canonicalId: string): InstallQueueStateResponse {
   const current = mockInstanceContent[instanceId] ?? [];
   mockInstanceContent[instanceId] = current.filter((entry) => entry.canonical_id !== canonicalId);
-  return { entries: mockInstanceContent[instanceId] };
+  return mockEmptyInstallQueue('Content queued', 'Removal');
+}
+
+function mockEmptyInstallQueue(message?: string, detail?: string): InstallQueueStateResponse {
+  return {
+    active: null,
+    items: [],
+    view_model: {
+      state_id: 'idle',
+      status_label: 'Idle',
+      title: 'Install queue',
+      summary: 'No installs are queued.',
+      queued_count: 0,
+      queued_count_label: '0 queued',
+      queued_item_label: 'No queued installs',
+      next_label: null,
+      active_queued_count_label: null,
+      section_title: 'Queue',
+      empty_title: 'No installs queued',
+      empty_summary: 'Install requests will appear here.',
+    },
+    notice: message ? { state_id: 'queued', tone: 'info', message, detail } : null,
+    started_install: null,
+  };
+}
+
+function mockModpackFiles(_instanceId: string, canonicalId: string): ModpackFilesPlan {
+  const item = mockCatalogItem(canonicalId);
+  if (!item) throw apiError(404, 'Not Found', { error: 'content not found' });
+  return {
+    canonical_id: canonicalId,
+    version_id: `${item.project_id}-v1`,
+    name: item.title,
+    minecraft: MOCK_FABRIC_MC_VERSION,
+    loader: 'fabric',
+    files: [
+      {
+        path: 'mods/sodium.jar',
+        filename: 'sodium.jar',
+        kind: 'mod',
+        size: 1_250_000,
+        title: 'Sodium',
+        identified: true,
+        compatible: true,
+        installed: false,
+      },
+      {
+        path: 'mods/lithium.jar',
+        filename: 'lithium.jar',
+        kind: 'mod',
+        size: 740_000,
+        title: 'Lithium',
+        identified: true,
+        compatible: true,
+        installed: false,
+      },
+    ],
+  };
+}
+
+function mockContentUpdates(instanceId: string): ContentUpdatesResponse {
+  const installed = mockInstanceContent[instanceId] ?? [];
+  const updates = installed.flatMap((entry) => {
+    if (entry.kind === 'modpack') return [];
+    const seed = MOCK_SEEDS.find((candidate) => candidate.id === entry.canonical_id);
+    const latest = seed?.versions[0];
+    if (!latest) return [];
+    if (mockConflictsFor([entry.canonical_id], installed).length > 0) return [];
+    const latestId = `${entry.project_id}-${latest.number}`;
+    if (latestId === entry.version_id) return [];
+    return [
+      {
+        canonical_id: entry.canonical_id,
+        title: entry.title,
+        kind: entry.kind,
+        current_version_id: entry.version_id,
+        latest_version_id: latestId,
+        latest_version_number: latest.number,
+      },
+    ];
+  });
+  return { updates };
+}
+
+function mockInstanceResources(instanceId: string): InstanceResourceSummary {
+  findInstance(instanceId);
+  const contentMods = (mockInstanceContent[instanceId] ?? [])
+    .filter((entry) => entry.kind === 'mod')
+    .map((entry, index) => ({
+      name: entry.enabled ? entry.filename : `${entry.filename}.disabled`,
+      size: 240_000 + index * 87_000,
+      modified_at: daysAgo(index + 2),
+      enabled: entry.enabled,
+    }));
+  const mods = [...contentMods, ...(mockLocalMods[instanceId] ?? [])].sort((a, b) =>
+    a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
+  );
+  return {
+    worlds: [],
+    mods,
+    screenshots: [],
+    logs: [],
+    worlds_count: 0,
+    mods_count: mods.length,
+    screenshots_count: 0,
+    logs_count: 0,
+  };
+}
+
+function mockSetModEnabled(instanceId: string, name: string, body: unknown): unknown {
+  const enabled = isRecord(body) && body.enabled === true;
+  const base = modBaseName(name);
+  const entry = (mockInstanceContent[instanceId] ?? []).find((candidate) => candidate.filename === base);
+  if (entry) {
+    entry.enabled = enabled;
+    return { status: 'ok', name: enabled ? base : `${base}.disabled`, enabled };
+  }
+  const local = (mockLocalMods[instanceId] ?? []).find((mod) => modBaseName(mod.name) === base);
+  if (!local) throw apiError(404, 'Not Found', { error: 'unknown mod' });
+  local.enabled = enabled;
+  local.name = enabled ? base : `${base}.disabled`;
+  return { status: 'ok', name: local.name, enabled };
+}
+
+function mockDeleteMod(instanceId: string, name: string): unknown {
+  const base = modBaseName(name);
+  mockInstanceContent[instanceId] = (mockInstanceContent[instanceId] ?? []).filter((entry) => entry.filename !== base);
+  mockLocalMods[instanceId] = (mockLocalMods[instanceId] ?? []).filter((mod) => modBaseName(mod.name) !== base);
+  return { status: 'ok' };
 }
 
 const flagRegistry: FlagDefinition[] = [
@@ -772,6 +881,8 @@ const flagRegistry: FlagDefinition[] = [
     default_enabled: false,
   },
 ];
+
+const mockSetupPlans = new Map<string, ContentSelection[]>();
 
 const handlers: Record<string, Handler> = {
   'GET /config': () => configFixture,
@@ -814,26 +925,45 @@ const handlers: Record<string, Handler> = {
   'GET /instances/create-view/loader-builds': (_body, _path, request): CreateLoaderBuildsViewResponse =>
     createLoaderBuildsView(request),
   'POST /instances': (body): CreateInstanceResponse => createInstance(body),
-  'GET /install/queue': (): InstallQueueStateResponse => ({
-    active: null,
-    items: [],
-    view_model: {
-      state_id: 'empty',
-      status_label: 'Idle',
-      title: 'Install queue',
-      summary: 'No installs are queued.',
-      queued_count: 0,
-      queued_count_label: '0 queued',
-      queued_item_label: 'No queued installs',
-      next_label: null,
-      active_queued_count_label: null,
-      section_title: 'Queue',
-      empty_title: 'No installs queued',
-      empty_summary: 'Install requests will appear here.',
-    },
-    notice: null,
-    started_install: null,
-  }),
+  'POST /instances/modpack': (body): CreateInstanceResponse => {
+    const created = createInstance(body);
+    return {
+      ...created,
+      install_queue: mockEmptyInstallQueue('Content queued', 'Modpack setup'),
+    };
+  },
+  'POST /instances/setup/plan': (body) => {
+    if (
+      !isRecord(body) ||
+      typeof body.selection_id !== 'string' ||
+      !isRecord(body.target) ||
+      !Array.isArray(body.selections)
+    ) {
+      throw apiError(400, 'Bad Request', { error: 'invalid setup plan request' });
+    }
+    const selections = body.selections as ContentSelection[];
+    const plan = mockResolvePlan(undefined, selections);
+    const planId = plan.conflicts.length === 0 ? `mock-setup-${Date.now()}` : undefined;
+    if (planId) mockSetupPlans.set(planId, selections);
+    return {
+      ...(planId ? { plan_id: planId } : {}),
+      expires_at_ms: Date.now() + 5 * 60_000,
+      selection_id: body.selection_id,
+      plan,
+    };
+  },
+  'POST /instances/setup': (body): CreateInstanceResponse => {
+    if (!isRecord(body) || typeof body.plan_id !== 'string') {
+      throw apiError(400, 'Bad Request', { error: 'invalid setup request' });
+    }
+    const selections = mockSetupPlans.get(body.plan_id);
+    if (!selections) throw apiError(409, 'Conflict', { error: 'Setup plan is missing or expired.' });
+    mockSetupPlans.delete(body.plan_id);
+    const created = createInstance(body);
+    mockContentInstall({ instance_id: created.id, selections, allow_incompatible: false });
+    return created;
+  },
+  'GET /install/queue': (): InstallQueueStateResponse => mockEmptyInstallQueue(),
   'GET /flags': () => flagsResponse(),
   'PUT /flags/{key}': (body, path) => updateFlag(path?.slice('/flags/'.length) ?? '', body),
   'POST /telemetry/frontend-error': () => null,
@@ -868,8 +998,16 @@ const handlers: Record<string, Handler> = {
     return mockContentCompatibility(body.selections as ContentSelection[]);
   },
   'GET /content/modpack/target': (_body, _path, request) => mockModpackTarget(request?.searchParams.get('id') ?? ''),
+  'GET /content/modpack/files': (_body, _path, request) =>
+    mockModpackFiles(request?.searchParams.get('instance_id') ?? '', request?.searchParams.get('id') ?? ''),
   'POST /content/modpack/install': (body) => mockModpackInstall(body),
   'GET /instances/{id}/content': (_body, path) => mockInstanceContentList(instanceIdFromContentPath(path)),
+  'GET /instances/{id}/content/updates': (_body, path) => mockContentUpdates(instanceIdFromSubPath(path)),
+  'GET /instances/{id}/resources': (_body, path) => mockInstanceResources(instanceIdFromSubPath(path)),
+  'PUT /instances/{id}/mods/{name}': (body, path) =>
+    mockSetModEnabled(instanceIdFromSubPath(path), modNameFromPath(path), body),
+  'DELETE /instances/{id}/mods/{name}': (_body, path) =>
+    mockDeleteMod(instanceIdFromSubPath(path), modNameFromPath(path)),
   'DELETE /instances/{id}/content': (_body, path, request) =>
     mockContentUninstall(instanceIdFromContentPath(path), request?.searchParams.get('id') ?? ''),
 };
@@ -1032,8 +1170,13 @@ export async function mockApi<T>(method: string, path: string, body?: unknown): 
 }
 
 function handlerKey(method: string, path: string): string {
+  const exact = `${method} ${path}`;
+  if (Object.prototype.hasOwnProperty.call(handlers, exact)) return exact;
   if (method === 'PUT' && path.startsWith('/flags/')) return 'PUT /flags/{key}';
   if (/^\/instances\/[^/]+\/content$/.test(path)) return `${method} /instances/{id}/content`;
+  if (/^\/instances\/[^/]+\/content\/updates$/.test(path)) return `${method} /instances/{id}/content/updates`;
+  if (/^\/instances\/[^/]+\/resources$/.test(path)) return `${method} /instances/{id}/resources`;
+  if (/^\/instances\/[^/]+\/mods\/[^/]+$/.test(path)) return `${method} /instances/{id}/mods/{name}`;
   if (/^\/instances\/[^/]+$/.test(path) && path !== '/instances/create-view') return `${method} /instances/{id}`;
   return `${method} ${path}`;
 }
@@ -1044,6 +1187,16 @@ function instanceIdFromPath(path: string | undefined): string {
 
 function instanceIdFromContentPath(path: string | undefined): string {
   const match = /^\/instances\/([^/]+)\/content$/.exec(path ?? '');
+  return match ? decodeURIComponent(match[1]) : '';
+}
+
+function instanceIdFromSubPath(path: string | undefined): string {
+  const match = /^\/instances\/([^/]+)\//.exec(path ?? '');
+  return match ? decodeURIComponent(match[1]) : '';
+}
+
+function modNameFromPath(path: string | undefined): string {
+  const match = /^\/instances\/[^/]+\/mods\/([^/]+)$/.exec(path ?? '');
   return match ? decodeURIComponent(match[1]) : '';
 }
 
@@ -1120,14 +1273,14 @@ function createLoaderBuildsView(request: MockRequest | undefined): CreateLoaderB
   if (sourceId !== FABRIC_COMPONENT_ID) {
     throw apiError(404, 'Not Found', { error: 'unknown loader component' });
   }
-  if (minecraftVersion !== MOCK_FABRIC_MC_VERSION) {
+  if (minecraftVersion !== MOCK_FABRIC_MC_VERSION && minecraftVersion !== MOCK_FABRIC_MC_ALT) {
     throw apiError(404, 'Not Found', { error: 'no mock loader builds for this Minecraft version' });
   }
   return {
     source_id: FABRIC_COMPONENT_ID,
-    minecraft_version_id: MOCK_FABRIC_MC_VERSION,
+    minecraft_version_id: minecraftVersion,
     auto: {
-      selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${MOCK_FABRIC_MC_VERSION}`,
+      selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${minecraftVersion}`,
       label: 'Automatic',
       detail: 'Axial picks the newest stable Fabric build.',
     },
@@ -1264,6 +1417,18 @@ function createVersionRows(): CreateVersionRow[] {
       create_enabled: true,
       disabled_reason: null,
     },
+    {
+      source_id: FABRIC_COMPONENT_ID,
+      selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${MOCK_FABRIC_MC_ALT}`,
+      minecraft_version_id: MOCK_FABRIC_MC_ALT,
+      display_name: MOCK_FABRIC_MC_ALT,
+      hint: null,
+      channel: 'release',
+      tags: [{ id: 'stable', label: 'Stable' }],
+      download_state: 'none',
+      create_enabled: true,
+      disabled_reason: null,
+    },
   ];
 }
 
@@ -1298,7 +1463,8 @@ function createSelection(selectionId: string): {
   versionDisplay: EnrichedInstance['version_display'];
   supportsMods: boolean;
 } {
-  const [kind, componentId, value] = selectionId.split('|');
+  const [kind, rawComponentId, value] = selectionId.split('|');
+  const componentId = rawComponentId === 'fabric' ? FABRIC_COMPONENT_ID : rawComponentId;
   if (kind === 'vanilla') {
     const versionId = componentId ?? '';
     const version = versionFixtures.find((fixture) => !fixture.loader && fixture.id === versionId);
@@ -1310,15 +1476,18 @@ function createSelection(selectionId: string): {
     };
   }
   if (
-    (kind === 'loader_version' && componentId === FABRIC_COMPONENT_ID && value === MOCK_FABRIC_MC_VERSION) ||
+    (kind === 'loader_version' &&
+      componentId === FABRIC_COMPONENT_ID &&
+      (value === MOCK_FABRIC_MC_VERSION || value === MOCK_FABRIC_MC_ALT)) ||
     (kind === 'loader_build' && componentId === FABRIC_COMPONENT_ID && value === MOCK_FABRIC_BUILD_ID)
   ) {
+    const minecraft = kind === 'loader_version' ? value : MOCK_FABRIC_MC_VERSION;
     return {
       versionId: MOCK_FABRIC_BUILD_ID,
       versionDisplay: versionDisplay(
         'fabric',
         'Fabric',
-        MOCK_FABRIC_MC_VERSION,
+        minecraft,
         MOCK_FABRIC_LOADER_VERSION,
         `Fabric - ${MOCK_FABRIC_LOADER_VERSION}`,
         true,

@@ -98,7 +98,10 @@ export interface PlanItem {
   version_id: string;
   version_number: string;
   filename: string;
+  sha1?: string;
+  sha512?: string;
   size?: number;
+  dependencies: ContentDependency[];
   reason: PlanReason;
   already_installed: boolean;
   update: boolean;
@@ -145,6 +148,14 @@ export interface CompatCandidate {
 
 export interface ContentCompatResponse {
   candidates: CompatCandidate[];
+  create_view?: unknown;
+}
+
+export interface InstanceSetupPlanResponse {
+  plan_id?: string;
+  expires_at_ms: number;
+  selection_id: string;
+  plan: ResolutionPlan;
 }
 
 export interface ModpackTarget {
@@ -157,16 +168,24 @@ export interface ModpackTarget {
   selection_id: string;
 }
 
-export interface ModpackInstallResponse {
-  instance_id: string;
+export interface ModpackFileOption {
+  path: string;
+  filename: string;
+  kind: Exclude<ContentKind, 'modpack'>;
+  size?: number | null;
+  title: string;
+  identified: boolean;
+  compatible: boolean;
+  installed: boolean;
+}
+
+export interface ModpackFilesPlan {
+  canonical_id: string;
+  version_id: string;
   name: string;
-  version: string;
   minecraft: string;
-  loader?: string;
-  file_count: number;
-  overrides_applied: number;
-  identified_count: number;
-  mismatch?: string;
+  loader?: string | null;
+  files: ModpackFileOption[];
 }
 
 export type EntrySource = 'managed' | 'imported';
@@ -185,4 +204,17 @@ export interface InstanceContentEntry {
 
 export interface InstanceContentResponse {
   entries: InstanceContentEntry[];
+}
+
+export interface ContentUpdate {
+  canonical_id: string;
+  title?: string;
+  kind: ContentKind;
+  current_version_id: string;
+  latest_version_id: string;
+  latest_version_number: string;
+}
+
+export interface ContentUpdatesResponse {
+  updates: ContentUpdate[];
 }

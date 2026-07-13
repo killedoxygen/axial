@@ -491,7 +491,7 @@ fn display_hint_for(parsed: &ParsedVersionId, family: &str, effective_version: &
         hints.push(variant_display_label(&parsed.variant_kind));
     }
 
-    hints.join(" · ")
+    hints.join(", ")
 }
 
 fn uses_estimated_target_release(family: &str) -> bool {
@@ -804,7 +804,7 @@ mod tests {
         assert_eq!(analysis.minecraft_meta.display_name, "25w46a");
         assert_eq!(
             analysis.minecraft_meta.display_hint,
-            "~ 1.21.11 · Unobfuscated"
+            "~ 1.21.11, Unobfuscated"
         );
     }
 

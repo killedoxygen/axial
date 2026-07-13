@@ -5,6 +5,7 @@ import { hasNativeDesktopRuntime, openExternalURL } from '../../native';
 import { appVersion, updateCheckState, updateInfo } from '../../store';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
+import { formatBytes } from '../../format';
 import {
   applyUpdateAndRestart,
   canInstallUpdateInApp,
@@ -21,7 +22,6 @@ import {
   updateFlow,
   updateRestartRequested,
 } from '../../updater';
-import { formatBytes } from '../../utils';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
 
 function displayReleaseVersion(version: string): string {
@@ -125,7 +125,7 @@ export function AboutSettingsSection(): JSX.Element {
             {flowState.phase === 'applying'
               ? 'Installing...'
               : flowState.total_bytes
-                ? `${flowState.percent ?? 0}% · ${formatBytes(flowState.received_bytes)} of ${formatBytes(flowState.total_bytes)}`
+                ? `${flowState.percent ?? 0}%, ${formatBytes(flowState.received_bytes)} of ${formatBytes(flowState.total_bytes)}`
                 : formatBytes(flowState.received_bytes)}
           </div>
         )}

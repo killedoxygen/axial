@@ -12,10 +12,9 @@ import { jvmPresetSelectLabel, normalizeJvmPreset, useJvmPresets } from '../../.
 import { api } from '../../../api';
 import { config, systemInfo } from '../../../store';
 import { updateInstanceInList } from '../../../actions';
-import { fmtMem } from '../../../utils';
+import { fmtMem, memoryGb } from '../../../format';
 import type { InstancePerformanceMode } from '../../../types-performance';
 import type { EnrichedInstance } from '../../../types-instance';
-import { memoryGb } from '../format';
 import {
   fetchPerformanceHealth,
   globalPerformanceMode,

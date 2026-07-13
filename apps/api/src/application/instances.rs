@@ -2,6 +2,7 @@ mod create;
 mod create_cache;
 mod create_policy;
 mod resources;
+mod setup;
 
 pub(crate) use create::{
     CreateInstanceRequest, CreateInstanceResponse, CreateInstanceViewResponse,
@@ -11,6 +12,11 @@ pub(crate) use create::{
 pub(crate) use create_cache::{
     invalidate_create_view_cache, invalidate_create_view_installed_scan,
     invalidate_create_view_source,
+};
+pub(crate) use setup::{
+    InstanceSetupExecuteRequest, InstanceSetupPlanRequest, InstanceSetupPlanResponse,
+    ModpackInstanceSetupRequest, execute_instance_setup, execute_modpack_instance_setup,
+    plan_instance_setup,
 };
 
 #[cfg(test)]
@@ -168,6 +174,20 @@ pub(super) fn scan_current_versions(state: &AppState) -> InstalledVersionsScan {
                 degraded: false,
                 detail: None,
             },
+        })
+}
+
+pub(crate) fn instance_version_is_installed_and_launchable(
+    state: &AppState,
+    instance_id: &str,
+) -> bool {
+    let Some(instance) = state.instances().get(instance_id) else {
+        return false;
+    };
+    let scan = scan_current_versions(state);
+    !scan.is_degraded()
+        && scan.versions.iter().any(|version| {
+            version.id == instance.version_id && version.installed && version.launchable
         })
 }
 

@@ -9,11 +9,12 @@
 
 use crate::error::{ContentError, ContentResult};
 use crate::model::{ContentKind, FileRef};
+use crate::transaction::{FileTransaction, StagingGuard};
 use axial_minecraft::download::{
     DownloadProgress, ExpectedIntegrity, download_file_with_client_report,
 };
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -93,17 +94,72 @@ pub async fn install_pack<F>(
     client: &reqwest::Client,
     game_dir: &Path,
     archive: &Path,
-    mut on_progress: F,
+    on_progress: F,
 ) -> ContentResult<PackInstallReport>
 where
     F: FnMut(DownloadProgress),
 {
-    let index = read_pack_index(archive)?;
-    let total = index.files.len() as i32;
-    let mut installed = Vec::with_capacity(index.files.len());
+    install_pack_files(client, game_dir, archive, &[], true, on_progress).await
+}
 
-    for (position, file) in index.files.iter().enumerate() {
-        let destination = contained_path(game_dir, &file.path)?;
+/// Install either the full pack or an explicit set of indexed paths. Overrides
+/// are opt-in so cherry-picking files into an existing instance never silently
+/// replaces its configuration.
+pub async fn install_pack_files<F>(
+    client: &reqwest::Client,
+    game_dir: &Path,
+    archive: &Path,
+    selected_paths: &[String],
+    include_overrides: bool,
+    on_progress: F,
+) -> ContentResult<PackInstallReport>
+where
+    F: FnMut(DownloadProgress),
+{
+    install_pack_files_with_finalize(
+        client,
+        game_dir,
+        archive,
+        selected_paths,
+        include_overrides,
+        on_progress,
+        |_| Ok(()),
+    )
+    .await
+}
+
+pub async fn install_pack_files_with_finalize<F, P>(
+    client: &reqwest::Client,
+    game_dir: &Path,
+    archive: &Path,
+    selected_paths: &[String],
+    include_overrides: bool,
+    mut on_progress: F,
+    finalize: P,
+) -> ContentResult<PackInstallReport>
+where
+    F: FnMut(DownloadProgress),
+    P: FnOnce(&PackInstallReport) -> ContentResult<()>,
+{
+    let index = read_pack_index(archive)?;
+    let selected: HashSet<&str> = selected_paths.iter().map(String::as_str).collect();
+    let files: Vec<&PackFile> = index
+        .files
+        .iter()
+        .filter(|file| selected.is_empty() || selected.contains(file.path.as_str()))
+        .collect();
+    if !selected.is_empty() && files.len() != selected.len() {
+        return Err(ContentError::Invalid(
+            "the selected modpack files changed; review the pack again".to_string(),
+        ));
+    }
+    let total = files.len() as i32;
+    let mut installed = Vec::with_capacity(files.len());
+    let staging = StagingGuard::create(game_dir, "axial-pack-stage")?;
+    let mut relative_paths = Vec::with_capacity(files.len());
+
+    for (position, file) in files.into_iter().enumerate() {
+        let destination = contained_path(staging.path(), &file.path)?;
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -123,25 +179,53 @@ where
             .await
             .map_err(|error| ContentError::Download(error.into_download_error().to_string()))?;
         installed.push(file.clone());
+        relative_paths.push(file.path.clone());
     }
 
-    on_progress(progress("overrides", total, total, None));
-    let overrides_applied = apply_overrides(game_dir, archive)?;
+    let overrides_applied = if include_overrides {
+        on_progress(progress("overrides", total, total, None));
+        let overrides = apply_overrides(staging.path(), archive)?;
+        let indexed: HashSet<&str> = relative_paths.iter().map(String::as_str).collect();
+        if overrides
+            .iter()
+            .any(|relative| indexed.contains(relative.as_str()))
+        {
+            return Err(ContentError::Invalid(
+                "modpack override replaces an indexed content file".to_string(),
+            ));
+        }
+        let count = overrides.len();
+        relative_paths.extend(overrides);
+        count
+    } else {
+        0
+    };
 
-    on_progress(done(total));
-    Ok(PackInstallReport {
+    relative_paths.sort();
+    relative_paths.dedup();
+    on_progress(progress("commit", total, total, None));
+    let transaction = FileTransaction::apply(game_dir, staging.transfer(), &relative_paths)?;
+    let report = PackInstallReport {
         index,
         installed,
         overrides_applied,
-    })
+    };
+    if let Err(error) = finalize(&report) {
+        transaction.rollback();
+        return Err(error);
+    }
+    transaction.commit();
+
+    on_progress(done(total));
+    Ok(report)
 }
 
-fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<usize> {
+fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>> {
     let file = fs::File::open(archive)?;
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|error| ContentError::Invalid(format!("not a readable modpack: {error}")))?;
 
-    let mut applied = 0;
+    let mut applied = Vec::new();
     // Client overrides go last: where both define a file, the client copy wins.
     for root in [OVERRIDES, CLIENT_OVERRIDES] {
         let prefix = format!("{root}/");
@@ -172,7 +256,7 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<usize> {
             }
             let mut sink = fs::File::create(&destination)?;
             io::copy(&mut entry, &mut sink)?;
-            applied += 1;
+            applied.push(relative);
         }
     }
     Ok(applied)

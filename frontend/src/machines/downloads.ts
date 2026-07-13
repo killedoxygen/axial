@@ -12,6 +12,7 @@ import {
   startNativeLoaderInstallEvents,
 } from '../native';
 import { catalog, instances, lastInstanceId, versions } from '../store';
+import { markContentChanged } from '../content-activity';
 import {
   cloneInstallItem,
   installItemFromQueueInstallItem,
@@ -43,7 +44,7 @@ export type ActiveDownload = {
   queueId: string;
   installId?: string;
   operationId?: string;
-  kind: 'vanilla' | 'loader';
+  kind: 'vanilla' | 'loader' | 'content';
   item: InstallItem;
   displayName: string;
   pct: number;
@@ -494,10 +495,15 @@ const STREAM_COPY = {
     invalid: 'Loader install progress data was invalid. Refreshed backend status.',
     stopped: 'Loader install progress stopped unexpectedly. Refreshed backend status.',
   },
+  content: {
+    unavailable: 'Desktop content progress is unavailable.',
+    invalid: 'Content progress data was invalid. Refreshed backend status.',
+    stopped: 'Content progress stopped unexpectedly. Refreshed backend status.',
+  },
 } as const;
 
 async function connectInstallEvents(
-  kind: 'vanilla' | 'loader',
+  kind: 'vanilla' | 'loader' | 'content',
   installId: string,
   item: InstallItem,
   displayName: string,
@@ -699,6 +705,7 @@ async function onInstallDone(completedItem?: InstallItem): Promise<void> {
   connectedInstallId = null;
   completeActiveDownload();
   if (completedItem) clearDownloadFailureForItem(completedItem);
+  if (completedItem?.content) markContentChanged();
 
   try {
     const [versionsRes, instancesRes] = await Promise.all([api('GET', '/versions'), api('GET', '/instances')]);

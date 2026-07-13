@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 import { guardedInstanceHue, InstanceTile } from './InstanceVisual';
 import { useTheme } from '../hooks/use-theme';
 import { Icon } from './Icons';
-import { SelectionCheckbox } from './SelectionActionPill';
+import { SelectionCheckbox } from './SelectionActionTray';
 import { selectionToggleLabel } from './selection';
 import { navigate } from '../ui-state';
 import { runningSessions, versionById } from '../store';
@@ -89,7 +89,7 @@ export function InstanceCard({
           {inst.name}
         </div>
         <div class="cp-icard-sub">
-          {installing ? `${installBadge} · ` : ''}
+          {installing ? `${installBadge}, ` : ''}
           {inst.version_display.summary_label}
         </div>
       </div>

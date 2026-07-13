@@ -84,6 +84,150 @@ fn effective_install_fields_trims_version_id_and_manifest_url() {
 }
 
 #[test]
+fn content_queue_view_model_retains_semantic_intent_without_download_urls() {
+    let spec = InstallQueueSpec::Content {
+        instance_id: "instance-1".to_string(),
+        label: "Updating Sodium".to_string(),
+        prerequisite_queue_id: None,
+        action: ContentQueueAction::Install {
+            selections: vec![QueuedContentSelection {
+                canonical_id: "modrinth:sodium".to_string(),
+                kind: axial_content::ContentKind::Mod,
+                version_id: Some("version-2".to_string()),
+            }],
+            allow_incompatible: false,
+            remove_instance_on_failure: false,
+        },
+    };
+
+    let item = install_queue_install_item(&spec);
+    let content = item.content.expect("content queue item");
+    assert_eq!(content.instance_id, "instance-1");
+    let encoded = serde_json::to_string(&content).expect("serialize content item");
+    assert!(encoded.contains("modrinth:sodium"));
+    assert!(!encoded.contains("https://"));
+}
+
+#[test]
+fn setup_owned_content_actions_are_identified_for_cleanup() {
+    let action = ContentQueueAction::Install {
+        selections: Vec::new(),
+        allow_incompatible: false,
+        remove_instance_on_failure: true,
+    };
+
+    assert!(content_action_owns_instance(&action));
+}
+
+#[tokio::test]
+async fn setup_owned_content_does_not_run_after_its_base_install_failed() {
+    let root = temp_root("setup-content-prerequisite");
+    let state = build_test_state(&root);
+    configure_library_dir(&state, &root.join("library"));
+    let instance = state
+        .instances()
+        .add(
+            "Incomplete setup".to_string(),
+            "missing-loader-version".to_string(),
+            String::new(),
+            String::new(),
+            None,
+        )
+        .expect("create setup instance");
+    let action = ContentQueueAction::Install {
+        selections: vec![QueuedContentSelection {
+            canonical_id: "modrinth:test".to_string(),
+            kind: axial_content::ContentKind::Mod,
+            version_id: Some("version-1".to_string()),
+        }],
+        allow_incompatible: false,
+        remove_instance_on_failure: true,
+    };
+
+    let started = start_content_operation(&state, &instance.id, "Setup content", &action)
+        .await
+        .expect("start content operation");
+    wait_for_install_terminal(&state, &started.install_id).await;
+
+    assert!(state.instances().get(&instance.id).is_none());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn failed_queue_prerequisite_discards_setup_content_and_its_instance() {
+    let root = temp_root("setup-content-queue-dependency");
+    let state = build_test_state(&root);
+    configure_library_dir(&state, &root.join("library"));
+    let instance = state
+        .instances()
+        .add(
+            "Dependent setup".to_string(),
+            "1.21.1".to_string(),
+            String::new(),
+            String::new(),
+            None,
+        )
+        .expect("create setup instance");
+    state
+        .installs()
+        .enqueue_queued_install(
+            "base-queue".to_string(),
+            InstallQueueSpec::vanilla("1.21.1".to_string(), String::new()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .expect("reserve base install");
+    state.installs().insert("base-install".to_string()).await;
+    assert!(
+        state
+            .installs()
+            .mark_queued_install_started("base-queue", "base-install".to_string())
+            .await
+    );
+
+    enqueue_install_with_dependency(
+        &state,
+        InstallQueueRequest {
+            kind: "content".to_string(),
+            instance_id: instance.id.clone(),
+            label: "Setup content".to_string(),
+            content_action: Some(InstallQueueContentActionRequest::Install {
+                selections: vec![InstallQueueContentSelection {
+                    canonical_id: "modrinth:test".to_string(),
+                    kind: axial_content::ContentKind::Mod,
+                    version_id: Some("version-1".to_string()),
+                }],
+                allow_incompatible: false,
+                remove_instance_on_failure: true,
+            }),
+            ..InstallQueueRequest::default()
+        },
+        Some("base-queue".to_string()),
+    )
+    .await
+    .expect("queue dependent content");
+    state
+        .installs()
+        .complete_active_queued_install("base-install", false)
+        .await
+        .expect("complete failed base install");
+
+    assert!(
+        maybe_start_next_queued_install(&state)
+            .await
+            .expect("advance queue")
+            .is_none()
+    );
+    assert!(state.instances().get(&instance.id).is_none());
+    assert!(state.installs().queue_snapshot().await.pending.is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn effective_install_fields_preserves_explicit_manifest_url() {
     let normal = InstallVersionStartRequest {
         version_id: "1.21.5".to_string(),
@@ -650,6 +794,7 @@ async fn enqueue_prestart_failure_does_not_insert_pending_queue_item() {
             manifest_url: String::new(),
             component_id: String::new(),
             build_id: String::new(),
+            ..InstallQueueRequest::default()
         },
     )
     .await

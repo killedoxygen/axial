@@ -84,7 +84,7 @@ export function DownloadsView(): JSX.Element {
             <div class="cp-dl-live-step">
               <span class="cp-dl-live-step-label">{step.label}</span>
               <span class="cp-dl-live-step-count cp-dl-num">
-                {ratio ? `${ratio} · ` : ''}
+                {ratio ? `${ratio}, ` : ''}
                 {stepPct}%
               </span>
               <div class="cp-dl-live-step-meter">

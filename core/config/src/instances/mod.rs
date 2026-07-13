@@ -122,12 +122,12 @@ impl InstanceVersionDisplay {
         let loader_detail_label = if loader_version_label.trim().is_empty() {
             loader_label.clone()
         } else {
-            format!("{loader_label} · {loader_version_label}")
+            format!("{loader_label} {loader_version_label}")
         };
         let supports_mods = loader.is_some();
 
         Self {
-            summary_label: format!("{loader_label} · {minecraft_label}"),
+            summary_label: format!("{loader_label} {minecraft_label}"),
             loader_key,
             loader_label,
             minecraft_label,
@@ -1016,7 +1016,7 @@ mod tests {
         assert_eq!(enriched.version_display.loader_label, "Vanilla");
         assert_eq!(enriched.version_display.loader_key, "vanilla");
         assert_eq!(enriched.version_display.minecraft_label, "1.21.1");
-        assert_eq!(enriched.version_display.summary_label, "Vanilla · 1.21.1");
+        assert_eq!(enriched.version_display.summary_label, "Vanilla 1.21.1");
         assert_eq!(enriched.version_display.loader_version_label, "");
         assert_eq!(enriched.version_display.loader_detail_label, "Vanilla");
         assert!(!enriched.version_display.supports_mods);
@@ -1045,14 +1045,14 @@ mod tests {
         assert_eq!(enriched.version_display.loader_label, "Quilt");
         assert_eq!(enriched.version_display.loader_key, "quilt");
         assert_eq!(enriched.version_display.minecraft_label, "1.21.1");
-        assert_eq!(enriched.version_display.summary_label, "Quilt · 1.21.1");
+        assert_eq!(enriched.version_display.summary_label, "Quilt 1.21.1");
         assert_eq!(
             enriched.version_display.loader_version_label,
             "0.30.0-beta.8 (beta)"
         );
         assert_eq!(
             enriched.version_display.loader_detail_label,
-            "Quilt · 0.30.0-beta.8 (beta)"
+            "Quilt 0.30.0-beta.8 (beta)"
         );
         assert!(enriched.version_display.supports_mods);
     }
@@ -1128,10 +1128,7 @@ mod tests {
 
         assert_eq!(enriched.version_display.loader_key, "quilt");
         assert_eq!(enriched.version_display.loader_version_label, "0.30.0");
-        assert_eq!(
-            enriched.version_display.loader_detail_label,
-            "Quilt · 0.30.0"
-        );
+        assert_eq!(enriched.version_display.loader_detail_label, "Quilt 0.30.0");
     }
 
     #[test]

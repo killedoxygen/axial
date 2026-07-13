@@ -95,8 +95,8 @@ function StatusPill(): JSX.Element {
       <button
         class="cp-status-pill cp-status-pill--running cp-nodrag"
         onClick={() => navigate({ name: 'instance', id: inst.id })}
-        title={`${label} · ${inst.name}`}
-        aria-label={`Open running instance. ${label} · ${inst.name}`}
+        title={`${label}: ${inst.name}`}
+        aria-label={`Open running instance. ${label}: ${inst.name}`}
       >
         <StatusMark icon="play" />
         <span class="cp-status-pill-label">{label}</span>
@@ -110,7 +110,7 @@ function StatusPill(): JSX.Element {
     const installPct = Math.round(Math.max(0, Math.min(100, install.pct)));
     const installName = install.displayName || install.item.versionId;
     const installTag = install.item.loader?.minecraftVersion || versionTag(install.item.versionId);
-    const installTitle = `${installName}: ${install.label} · ${installPct}%${queueView.active_queued_count_label || ''}`;
+    const installTitle = `${installName}: ${install.label}, ${installPct}%${queueView.active_queued_count_label || ''}`;
     const installStyle = { '--cp-install-ratio': String(installPct / 100) } as JSX.CSSProperties;
 
     return (
@@ -136,7 +136,7 @@ function StatusPill(): JSX.Element {
     return (
       <span
         class="cp-status-pill cp-status-pill--preparing cp-nodrag"
-        title={`${launch.label} · ${li?.name || 'launch'}`}
+        title={`${launch.label}: ${li?.name || 'launch'}`}
       >
         <StatusMark icon="clock" />
         <span class="cp-status-pill-label">{launch.label}</span>

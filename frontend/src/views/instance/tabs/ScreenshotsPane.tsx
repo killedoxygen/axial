@@ -3,10 +3,10 @@ import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
 import { Button } from '../../../ui/Atoms';
 import { openContextMenu } from '../../../ui/ContextMenu';
-import { SelectionActionPill, SelectionCheckbox } from '../../../ui/SelectionActionPill';
+import { SelectionActionTray, SelectionCheckbox } from '../../../ui/SelectionActionTray';
 import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../../ui/selection';
+import { formatBytes, fmtDayLabel, fmtRelative } from '../../../format';
 import type { EnrichedInstance, InstanceScreenshot } from '../../../types-instance';
-import { fmtBytes, fmtDayLabel, fmtRelative } from '../format';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
 import { ResourceEmpty, ResourceStatus } from '../components/resource-bits';
@@ -113,7 +113,7 @@ export function ScreenshotsPane({
           <strong>
             {screenshots.length} screenshot{screenshots.length === 1 ? '' : 's'}
           </strong>
-          {totalBytes > 0 ? <span>{fmtBytes(totalBytes)}</span> : null}
+          {totalBytes > 0 ? <span>{formatBytes(totalBytes)}</span> : null}
         </div>
         <div class="cp-screenshots-tools">
           <div class="cp-mini-seg" role="tablist" aria-label="Sort screenshots">
@@ -192,7 +192,7 @@ export function ScreenshotsPane({
                           {shot.name}
                         </div>
                         <div class="cp-screenshot-meta">
-                          <span>{fmtBytes(shot.size)}</span>
+                          <span>{formatBytes(shot.size)}</span>
                           <span>{fmtRelative(shot.modified_at)}</span>
                         </div>
                       </div>
@@ -223,7 +223,7 @@ export function ScreenshotsPane({
           onRefresh={onRefresh}
         />
       ) : null}
-      <SelectionActionPill
+      <SelectionActionTray
         selection={selection}
         itemLabel="screenshot"
         actions={[{ label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() }]}

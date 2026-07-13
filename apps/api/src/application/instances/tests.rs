@@ -1546,6 +1546,7 @@ async fn create_queue_failure_rolls_back_created_instance() {
             manifest_url: String::new(),
             component_id: String::new(),
             build_id: String::new(),
+            ..crate::application::InstallQueueRequest::default()
         }),
     )
     .await

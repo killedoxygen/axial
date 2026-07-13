@@ -52,7 +52,7 @@ use std::{
 
 const MAX_CREATE_NAME_COLLISION_RETRIES: usize = 9;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct CreateInstanceRequest {
     pub name: String,
     #[serde(default)]
@@ -437,11 +437,24 @@ pub(crate) async fn handle_create_instance(
     state: &AppState,
     payload: CreateInstanceRequest,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
+    let prepared = prepare_instance_create(state, payload).await?;
+    finalize_instance_create(state, prepared).await
+}
+
+struct PreparedInstanceCreate {
+    preset: GuardianJvmPresetResolution,
+    install_request: Option<InstallQueueRequest>,
+    instance: Instance,
+}
+
+async fn prepare_instance_create(
+    state: &AppState,
+    payload: CreateInstanceRequest,
+) -> Result<PreparedInstanceCreate, (StatusCode, Json<serde_json::Value>)> {
     let selection = resolve_create_selection(state, &payload).await?;
     let preset = normalize_create_jvm_preset(payload.jvm_preset_id.as_deref());
     let mc_dir = state.library_dir().map(PathBuf::from);
     let install_request = create_install_queue_request_if_needed(state, &selection)?;
-    let queued_install_request = install_request.clone();
     let instance =
         create_instance_with_unique_name(state, &payload, &selection, mc_dir.as_deref())?;
     let created_instance_id = instance.id.clone();
@@ -453,6 +466,24 @@ pub(crate) async fn handle_create_instance(
                 return Err(error);
             }
         };
+    Ok(PreparedInstanceCreate {
+        preset,
+        install_request,
+        instance,
+    })
+}
+
+async fn finalize_instance_create(
+    state: &AppState,
+    prepared: PreparedInstanceCreate,
+) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
+    let PreparedInstanceCreate {
+        preset,
+        install_request,
+        instance,
+    } = prepared;
+    let queued_install_request = install_request.clone();
+    let created_instance_id = instance.id.clone();
     let install_queue =
         queue_create_install_or_rollback(state, &created_instance_id, install_request).await?;
     let enriched = enrich_instance_for_state(state, instance);
@@ -508,7 +539,7 @@ impl CreateSelection {
 
     /// The Minecraft version behind the selection, which for vanilla is the
     /// version id itself.
-    fn minecraft_version(&self) -> &str {
+    pub(super) fn minecraft_version(&self) -> &str {
         match self {
             Self::Vanilla { version_id } => version_id,
             Self::Loader {
@@ -525,6 +556,7 @@ impl CreateSelection {
                 manifest_url: String::new(),
                 component_id: String::new(),
                 build_id: String::new(),
+                ..InstallQueueRequest::default()
             }),
             Self::Loader {
                 component_id,
@@ -536,12 +568,24 @@ impl CreateSelection {
                 manifest_url: String::new(),
                 component_id: component_id.as_str().to_string(),
                 build_id: build_id.clone(),
+                ..InstallQueueRequest::default()
             }),
+        }
+    }
+
+    pub(super) fn exact_selection_id(&self) -> String {
+        match self {
+            Self::Vanilla { version_id } => format!("vanilla|{version_id}"),
+            Self::Loader {
+                component_id,
+                build_id,
+                ..
+            } => format!("loader_build|{}|{build_id}", component_id.as_str()),
         }
     }
 }
 
-async fn resolve_create_selection(
+pub(super) async fn resolve_create_selection(
     state: &AppState,
     payload: &CreateInstanceRequest,
 ) -> Result<CreateSelection, (StatusCode, Json<serde_json::Value>)> {

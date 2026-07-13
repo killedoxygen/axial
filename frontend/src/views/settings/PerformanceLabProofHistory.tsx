@@ -4,7 +4,8 @@ import { api } from '../../api';
 import { Button, Pill } from '../../ui/Atoms';
 import { toast } from '../../toast';
 import { versionById } from '../../store';
-import { errMessage, fmtMem } from '../../utils';
+import { fmtMem } from '../../format';
+import { errMessage } from '../../utils';
 import { minecraftVersionLabel } from '../../version-display';
 import type { LaunchReportsState } from './PerformanceLabTypes';
 import { formatDurationMs, formatProofDate, labelFromToken } from './PerformanceLabFormat';
@@ -119,12 +120,12 @@ export function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }
                     <span>Recorded {formatProofDate(record.recorded_at)}</span>
                     {bootDuration && <span>{bootDuration}</span>}
                     {memory && <span>{memory} requested</span>}
-                    {benchmarkParts.length > 0 && <span>{benchmarkParts.join(' · ')}</span>}
+                    {benchmarkParts.length > 0 && <span>{benchmarkParts.join(', ')}</span>}
                   </div>
                   {budgetSummary && (
                     <div class="cp-settings-proof-budget" data-pressure={budgetSummary.pressure ? 'true' : 'false'}>
                       <strong>{budgetSummary.pressure_label}</strong>
-                      {budgetSummary.details.length > 0 && <span>{budgetSummary.details.join(' · ')}</span>}
+                      {budgetSummary.details.length > 0 && <span>{budgetSummary.details.join(', ')}</span>}
                     </div>
                   )}
                   {evidenceSummary && (

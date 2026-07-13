@@ -1,19 +1,24 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { Button, Input } from '../../ui/Atoms';
+import { Button, Input, Pill } from '../../ui/Atoms';
 import { Segmented } from '../../ui/Segmented';
 import { SelectField, type SelectFieldOption } from '../../ui/Select';
 import { Icon } from '../../ui/Icons';
 import { versions } from '../../store';
 import { navigate } from '../../ui-state';
-import { searchContent } from '../../content';
+import { searchContent, type ContentSearchInput } from '../../content';
+import { formatAge, formatCount } from '../../format';
+import { contentRevision } from '../../content-activity';
 import { errMessage } from '../../utils';
 import type { ContentKind, ContentSort, SearchHit } from '../../types-content';
 import type { EnrichedInstance } from '../../types-instance';
 import { TargetBar } from './TargetBar';
 import { Tray } from './Tray';
-import { addToInstance, createFromModpack } from './actions';
+import { ModpackPicker } from './ModpackPicker';
+import { setUpModpack } from './actions';
+import { InstallConflictSheet, useInstallFlow, type InstallFlow } from './install-flow';
 import {
+  category,
   gameVersion,
   isStaged,
   kind,
@@ -24,17 +29,14 @@ import {
   results,
   searchError,
   sort,
-  stage,
+  stageContent,
   targetInstance,
   total,
-  tray,
   unstage,
 } from './state';
 import {
   compareMcDesc,
   ContentIcon,
-  formatAge,
-  formatCount,
   isAddable,
   KIND_TABS,
   SkeletonCard,
@@ -59,119 +61,235 @@ const LOADER_OPTIONS: SelectFieldOption<string>[] = [
   { value: 'quilt', label: 'Quilt' },
 ];
 
+const KIND_CATEGORIES: Record<ContentKind, string[]> = {
+  mod: [
+    'adventure',
+    'decoration',
+    'economy',
+    'equipment',
+    'food',
+    'game-mechanics',
+    'library',
+    'magic',
+    'management',
+    'minigame',
+    'mobs',
+    'optimization',
+    'social',
+    'storage',
+    'technology',
+    'transportation',
+    'utility',
+    'worldgen',
+  ],
+  modpack: [
+    'adventure',
+    'challenging',
+    'combat',
+    'kitchen-sink',
+    'lightweight',
+    'magic',
+    'multiplayer',
+    'optimization',
+    'quests',
+    'technology',
+  ],
+  resource_pack: [
+    'combat',
+    'decoration',
+    'modded',
+    'realistic',
+    'simplistic',
+    'themed',
+    'tweaks',
+    'utility',
+    'vanilla-like',
+  ],
+  shader_pack: [
+    'atmosphere',
+    'bloom',
+    'colored-lighting',
+    'foliage',
+    'pbr',
+    'reflections',
+    'shadows',
+    'potato',
+    'low',
+    'medium',
+    'high',
+  ],
+};
+
 const RECENT_MC = ['1.21.6', '1.21.5', '1.21.4', '1.21.3', '1.21.1', '1.21', '1.20.6', '1.20.4', '1.20.1'];
 const PAGE_SIZE = 40;
 const SEARCH_DEBOUNCE_MS = 220;
 
-/**
- * The action on a card. With an instance targeted it installs straight away —
- * that is the "I just want this one mod in this game" case, and it should cost
- * one click. With nothing targeted it stages instead, because there is nowhere
- * to install to yet and picking a set is how you get somewhere to put it.
- */
-function CardAction({ item, instance }: { item: SearchHit; instance: EnrichedInstance | null }): JSX.Element {
+function CardAction({
+  item,
+  instance,
+  flow,
+}: {
+  item: SearchHit;
+  instance: EnrichedInstance | null;
+  flow: InstallFlow;
+}): JSX.Element | null {
   const [busy, setBusy] = useState(false);
+  const [pickingPack, setPickingPack] = useState(false);
   const staged = isStaged(item.canonical_id);
-  const installed = item.install_state === 'installed';
 
-  const act = async (event: MouseEvent): Promise<void> => {
-    event.stopPropagation();
-    if (busy || installed) return;
-
-    if (item.kind === 'modpack') {
-      setBusy(true);
-      await createFromModpack(item.canonical_id);
-      setBusy(false);
-      return;
-    }
-
-    if (instance) {
-      setBusy(true);
-      await addToInstance(instance.id, [{ canonical_id: item.canonical_id, kind: item.kind }], item.title);
-      setBusy(false);
-      return;
-    }
-
-    if (staged) unstage(item.canonical_id);
-    else stage({ canonical_id: item.canonical_id, kind: item.kind, title: item.title, icon_url: item.icon_url });
-  };
-
-  if (installed) {
+  if (item.install_state === 'installed') {
     return (
-      <span class="cp-discover-card-action cp-discover-card-action--done" title="Already in this instance">
-        <Icon name="check" size={13} /> Installed
+      <span class="cp-discover-installed" title="Already in this instance">
+        <Icon name="download" size={13} />
+        Installed
       </span>
     );
   }
 
-  const label =
-    item.kind === 'modpack' ? 'Set up an instance' : instance ? `Add to ${instance.name}` : staged ? 'Staged' : 'Stage';
+  if (item.kind === 'modpack') {
+    if (instance) {
+      return (
+        <>
+          <Button
+            variant="secondary"
+            size="sm"
+            icon="plus"
+            title={`Choose files for ${instance.name}`}
+            onClick={(event) => {
+              event.stopPropagation();
+              setPickingPack(true);
+            }}
+          >
+            Choose
+          </Button>
+          <ModpackPicker
+            open={pickingPack}
+            instanceId={instance.id}
+            canonicalId={item.canonical_id}
+            onClose={() => setPickingPack(false)}
+          />
+        </>
+      );
+    }
+    return (
+      <Button
+        variant="secondary"
+        size="sm"
+        icon="stack"
+        disabled={busy}
+        title="Create an instance from this pack"
+        onClick={(event) => {
+          event.stopPropagation();
+          setBusy(true);
+          void setUpModpack(item.canonical_id, undefined, item.icon_url).finally(() => setBusy(false));
+        }}
+      >
+        {busy ? 'Working…' : 'Set up'}
+      </Button>
+    );
+  }
+
+  if (!isAddable(item.kind)) return null;
+
+  if (instance) {
+    return (
+      <Button
+        variant="secondary"
+        size="sm"
+        icon={busy ? undefined : 'plus'}
+        disabled={busy}
+        title={`Add to ${instance.name}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          setBusy(true);
+          void flow
+            .add([{ canonical_id: item.canonical_id, kind: item.kind }], item.title)
+            .finally(() => setBusy(false));
+        }}
+      >
+        {busy ? <Spinner size={12} /> : 'Add'}
+      </Button>
+    );
+  }
 
   return (
-    <button
-      class="cp-discover-card-action"
-      data-staged={staged}
-      onClick={act}
-      disabled={busy}
-      title={
-        item.kind === 'modpack'
-          ? 'Create an instance from this pack'
-          : instance
-            ? `Add to ${instance.name}`
-            : staged
-              ? 'Remove from selection'
-              : 'Add to selection'
-      }
+    <Button
+      variant={staged ? 'primary' : 'secondary'}
+      size="sm"
+      icon={staged ? 'check' : 'plus'}
+      title={staged ? 'Remove from selection' : 'Add to selection'}
+      onClick={(event) => {
+        event.stopPropagation();
+        if (staged) unstage(item.canonical_id);
+        else stageContent(item);
+      }}
     >
-      {busy ? <Spinner size={12} /> : <Icon name={staged ? 'check' : 'plus'} size={13} />}
-      <span class="cp-discover-card-action-label">{busy ? 'Working…' : label}</span>
-    </button>
+      {staged ? 'Staged' : 'Stage'}
+    </Button>
   );
 }
 
-function ContentCard({ item, instance }: { item: SearchHit; instance: EnrichedInstance | null }): JSX.Element {
-  const open = (): void => {
-    navigate({ name: 'content', id: item.canonical_id, target: instance?.id });
-  };
+function ContentCard({
+  item,
+  instance,
+  flow,
+}: {
+  item: SearchHit;
+  instance: EnrichedInstance | null;
+  flow: InstallFlow;
+}): JSX.Element {
+  const open = (): void => navigate({ name: 'content', id: item.canonical_id, target: instance?.id });
 
   return (
-    <article class="cp-discover-card" data-staged={isStaged(item.canonical_id)}>
-      <button class="cp-discover-card-open" onClick={open} aria-label={`Open ${item.title}`}>
-        <div class="cp-discover-card-icon" aria-hidden="true">
-          <ContentIcon url={item.icon_url} kind={item.kind} />
+    <article
+      class="cp-discover-card"
+      data-staged={isStaged(item.canonical_id)}
+      role="button"
+      tabIndex={0}
+      aria-label={item.title}
+      onClick={open}
+      onKeyDown={(event: KeyboardEvent) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          open();
+        }
+      }}
+    >
+      <div class="cp-discover-card-icon" aria-hidden="true">
+        <ContentIcon url={item.icon_url} kind={item.kind} />
+      </div>
+      <div class="cp-discover-card-main">
+        <div class="cp-discover-card-head">
+          <h3 class="cp-discover-card-title" title={item.title}>
+            {item.title}
+          </h3>
+          {item.author && <span class="cp-discover-card-author">by {item.author}</span>}
         </div>
-        <div class="cp-discover-card-body">
-          <div class="cp-discover-card-head">
-            <span class="cp-discover-card-title" title={item.title}>
-              {item.title}
-            </span>
-            {item.author && <span class="cp-discover-card-author">by {item.author}</span>}
-          </div>
-          <p class="cp-discover-card-summary">{item.summary}</p>
-          <div class="cp-discover-card-tags">
-            {item.categories.slice(0, 3).map((category) => (
-              <span key={category} class="cp-discover-tag">
-                {tagLabel(category)}
-              </span>
-            ))}
-          </div>
-          <div class="cp-discover-card-meta">
-            <span title={`${item.downloads.toLocaleString()} downloads`}>
-              <Icon name="download" size={12} /> {formatCount(item.downloads)}
-            </span>
-            <span title={`${item.follows.toLocaleString()} followers`}>
-              <Icon name="user" size={12} /> {formatCount(item.follows)}
-            </span>
-            {item.updated && (
-              <span title={`Updated ${formatAge(item.updated)}`}>
-                <Icon name="clock" size={12} /> {formatAge(item.updated)}
-              </span>
-            )}
-          </div>
+        <p class="cp-discover-card-summary">{item.summary}</p>
+        <div class="cp-discover-card-tags">
+          {item.categories.slice(0, 3).map((category) => (
+            <Pill key={category}>{tagLabel(category)}</Pill>
+          ))}
         </div>
-      </button>
-      <div class="cp-discover-card-foot">
-        {(isAddable(item.kind) || item.kind === 'modpack') && <CardAction item={item} instance={instance} />}
+        <div class="cp-discover-card-stats">
+          <span class="cp-discover-stat" title={`${item.downloads.toLocaleString()} downloads`}>
+            <Icon name="download" size={12} />
+            {formatCount(item.downloads)}
+          </span>
+          <span class="cp-discover-stat" title={`${item.follows.toLocaleString()} followers`}>
+            <Icon name="user" size={12} />
+            {formatCount(item.follows)}
+          </span>
+          {item.updated && (
+            <span class="cp-discover-stat" title={`Updated ${formatAge(item.updated)}`}>
+              <Icon name="clock" size={12} />
+              {formatAge(item.updated)}
+            </span>
+          )}
+        </div>
+      </div>
+      <div class="cp-discover-card-action">
+        <CardAction item={item} instance={instance} flow={flow} />
       </div>
     </article>
   );
@@ -181,9 +299,8 @@ export function DiscoverView(): JSX.Element {
   const instance = targetInstance.value;
   const requestId = useRef(0);
   const [attempt, setAttempt] = useState(0);
+  const flow = useInstallFlow(instance?.id);
 
-  // A targeted instance dictates the filters; they are facts about where the
-  // content is going, not preferences.
   const activeLoader = instance
     ? instance.version_display.supports_mods
       ? instance.version_display.loader_key
@@ -193,14 +310,9 @@ export function DiscoverView(): JSX.Element {
       : '';
   const activeVersion = instance ? instance.version_display.minecraft_label : gameVersion.value;
 
-  // Do not offer what the target cannot take: a vanilla instance has nowhere to
-  // put a mod, and a modpack is an instance rather than something added to one.
   const tabs = useMemo(() => {
     if (!instance) return KIND_TABS;
     return KIND_TABS.map((tab) => {
-      if (tab.value === 'modpack') {
-        return { ...tab, disabled: true, title: 'A modpack is set up as its own instance' };
-      }
       if (tab.value === 'mod' && !instance.version_display.supports_mods) {
         return { ...tab, disabled: true, title: `${instance.name} has no mod loader` };
       }
@@ -225,21 +337,28 @@ export function DiscoverView(): JSX.Element {
   const currentKind = kind.value;
   const currentQuery = query.value;
   const currentSort = sort.value;
+  const currentCategory = category.value;
+  const currentContentRevision = contentRevision.value;
+  const [filtersOpen, setFiltersOpen] = useState(false);
+
+  const searchInput = (offset?: number): ContentSearchInput => ({
+    kind: currentKind,
+    query: currentQuery.trim() || undefined,
+    loader: usesLoaderFilter(currentKind) ? activeLoader || undefined : undefined,
+    gameVersion: activeVersion || undefined,
+    category: currentCategory || undefined,
+    sort: currentSort,
+    offset,
+    limit: PAGE_SIZE,
+    instanceId: instance?.id,
+  });
 
   useEffect(() => {
     const id = ++requestId.current;
     loading.value = true;
     searchError.value = null;
     const timer = window.setTimeout(() => {
-      searchContent({
-        kind: currentKind,
-        query: currentQuery.trim() || undefined,
-        loader: usesLoaderFilter(currentKind) ? activeLoader || undefined : undefined,
-        gameVersion: activeVersion || undefined,
-        sort: currentSort,
-        limit: PAGE_SIZE,
-        instanceId: instance?.id,
-      })
+      searchContent(searchInput())
         .then((page) => {
           if (id !== requestId.current) return;
           results.value = page.items;
@@ -253,22 +372,23 @@ export function DiscoverView(): JSX.Element {
         });
     }, SEARCH_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [currentKind, currentQuery, activeLoader, activeVersion, currentSort, instance?.id, attempt]);
+  }, [
+    currentKind,
+    currentQuery,
+    activeLoader,
+    activeVersion,
+    currentCategory,
+    currentSort,
+    instance?.id,
+    attempt,
+    currentContentRevision,
+  ]);
 
   const loadMore = (): void => {
     if (loadingMore.value || loading.value || results.value.length >= total.value) return;
     const id = requestId.current;
     loadingMore.value = true;
-    searchContent({
-      kind: currentKind,
-      query: currentQuery.trim() || undefined,
-      loader: usesLoaderFilter(currentKind) ? activeLoader || undefined : undefined,
-      gameVersion: activeVersion || undefined,
-      sort: currentSort,
-      offset: results.value.length,
-      limit: PAGE_SIZE,
-      instanceId: instance?.id,
-    })
+    searchContent(searchInput(results.value.length))
       .then((page) => {
         if (id !== requestId.current) return;
         results.value = [...results.value, ...page.items];
@@ -283,6 +403,7 @@ export function DiscoverView(): JSX.Element {
   const changeKind = (next: ContentKind): void => {
     kind.value = next;
     if (!usesLoaderFilter(next)) loader.value = '';
+    category.value = '';
   };
 
   const items = results.value;
@@ -290,30 +411,41 @@ export function DiscoverView(): JSX.Element {
   const error = searchError.value;
   const hasMore = items.length < total.value;
   const kindLabel = KIND_TABS.find((tab) => tab.value === currentKind)?.label.toLowerCase() ?? 'content';
+  const filtered = Boolean(currentQuery || loader.value || gameVersion.value || currentCategory);
+  const categories = KIND_CATEGORIES[currentKind];
 
   return (
-    <div class="cp-view-page cp-discover" data-tray={tray.value.length > 0}>
+    <div class="cp-view-page">
       <div class="cp-page-header">
         <div>
           <h1>Discover</h1>
-          <div class="cp-page-sub">
-            {instance
-              ? `Showing ${kindLabel} that work with ${instance.version_display.summary_label}.`
-              : 'Browse mods, packs, and shaders from Modrinth.'}
+          <div class="cp-page-sub" aria-live="polite">
+            {isLoading && items.length === 0
+              ? `Searching ${kindLabel}…`
+              : error
+                ? 'Search is unavailable.'
+                : total.value > 0
+                  ? `${total.value.toLocaleString()} ${kindLabel}${
+                      instance ? ` that fit ${instance.version_display.summary_label}` : ' on Modrinth'
+                    }`
+                  : `Browse ${kindLabel} from Modrinth.`}
           </div>
         </div>
+        {instance && (
+          <div class="cp-page-header-side">
+            <TargetBar instance={instance} />
+          </div>
+        )}
       </div>
 
-      {instance && <TargetBar instance={instance} />}
-
-      <div class="cp-discover-toolbar">
+      <div class="cp-discover-controls">
         <Input
           value={currentQuery}
           onChange={(value) => {
             query.value = value;
           }}
           icon="search"
-          placeholder={`Search ${kindLabel} on Modrinth`}
+          placeholder={`Search ${kindLabel}`}
           trailing={
             isLoading ? (
               <Spinner />
@@ -340,10 +472,12 @@ export function DiscoverView(): JSX.Element {
             ariaLabel="Content type"
             role="tablist"
           />
-          <div class="cp-discover-filters-spacer" />
+
+          <div class="cp-discover-bar-spacer" />
+
           {instance ? (
             <span class="cp-discover-locked" title="Set by the instance you are adding to">
-              <Icon name="shield-check" size={11} />
+              <Icon name="cube" size={12} />
               {instance.version_display.summary_label}
             </span>
           ) : (
@@ -356,7 +490,7 @@ export function DiscoverView(): JSX.Element {
                   }}
                   options={LOADER_OPTIONS}
                   ariaLabel="Loader"
-                  width={140}
+                  width={108}
                 />
               )}
               <SelectField
@@ -366,7 +500,7 @@ export function DiscoverView(): JSX.Element {
                 }}
                 options={gameVersionOptions}
                 ariaLabel="Minecraft version"
-                width={150}
+                width={116}
               />
             </>
           )}
@@ -377,66 +511,109 @@ export function DiscoverView(): JSX.Element {
             }}
             options={SORT_OPTIONS}
             ariaLabel="Sort by"
-            width={165}
+            width={136}
           />
+          <button
+            type="button"
+            class="cp-discover-more-filters"
+            data-active={filtersOpen || Boolean(currentCategory)}
+            aria-expanded={filtersOpen}
+            title="More filters"
+            onClick={() => setFiltersOpen((open) => !open)}
+          >
+            <Icon name="sliders" size={14} stroke={2} />
+            Filters
+            {currentCategory && <span class="cp-discover-more-filters-dot" aria-hidden="true" />}
+          </button>
         </div>
+
+        {filtersOpen && (
+          <div class="cp-discover-categories" role="radiogroup" aria-label="Category">
+            <button
+              type="button"
+              class="cp-discover-cat"
+              role="radio"
+              aria-checked={!currentCategory}
+              data-active={!currentCategory}
+              onClick={() => {
+                category.value = '';
+              }}
+            >
+              All
+            </button>
+            {categories.map((slug) => (
+              <button
+                key={slug}
+                type="button"
+                class="cp-discover-cat"
+                role="radio"
+                aria-checked={currentCategory === slug}
+                data-active={currentCategory === slug}
+                onClick={() => {
+                  category.value = currentCategory === slug ? '' : slug;
+                }}
+              >
+                {tagLabel(slug)}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
-      <div class="cp-discover-count" aria-live="polite">
-        {isLoading && items.length === 0
-          ? `Searching ${kindLabel}…`
-          : !error && total.value > 0
-            ? `${total.value.toLocaleString()} ${total.value === 1 ? 'result' : 'results'}`
-            : ''}
-      </div>
-
-      {error && (
-        <div class="cp-discover-empty cp-discover-empty--pad">
-          <Icon name="alert" size={22} />
-          <div>{error}</div>
-          <Button variant="secondary" onClick={() => setAttempt((value) => value + 1)}>
-            Try again
-          </Button>
+      {error ? (
+        <div class="cp-resource-empty">
+          <span>
+            <Icon name="alert" size={20} />
+          </span>
+          <strong>Could not reach Modrinth</strong>
+          <p>{error}</p>
+          <div class="cp-mods-empty-actions">
+            <Button variant="secondary" size="sm" icon="refresh" onClick={() => setAttempt((value) => value + 1)}>
+              Try again
+            </Button>
+          </div>
         </div>
-      )}
-
-      {!error && isLoading && items.length === 0 && (
+      ) : isLoading && items.length === 0 ? (
         <div class="cp-discover-grid">
-          {Array.from({ length: 8 }, (_, index) => (
+          {Array.from({ length: 6 }, (_, index) => (
             <SkeletonCard key={index} />
           ))}
         </div>
-      )}
-
-      {!error && !isLoading && items.length === 0 && (
-        <div class="cp-discover-empty cp-discover-empty--pad">
-          <Icon name="search" size={22} />
-          <div class="cp-discover-empty-title">Nothing matched</div>
-          <div>
+      ) : items.length === 0 ? (
+        <div class="cp-resource-empty">
+          <span>
+            <Icon name="search" size={20} />
+          </span>
+          <strong>Nothing matched</strong>
+          <p>
             {currentQuery
-              ? `No ${kindLabel} named “${currentQuery}”${instance ? ` fit ${instance.version_display.summary_label}` : ''}.`
+              ? `No ${kindLabel} named “${currentQuery}”${
+                  instance ? ` fit ${instance.version_display.summary_label}` : ''
+                }.`
               : `No ${kindLabel} to show here.`}
-          </div>
-          {(currentQuery || loader.value || gameVersion.value) && (
-            <Button
-              variant="secondary"
-              onClick={() => {
-                query.value = '';
-                loader.value = '';
-                gameVersion.value = '';
-              }}
-            >
-              Clear filters
-            </Button>
+          </p>
+          {filtered && (
+            <div class="cp-mods-empty-actions">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => {
+                  query.value = '';
+                  loader.value = '';
+                  gameVersion.value = '';
+                  category.value = '';
+                }}
+              >
+                Clear filters
+              </Button>
+            </div>
           )}
         </div>
-      )}
-
-      {items.length > 0 && (
+      ) : (
         <>
           <div class="cp-discover-grid" data-loading={isLoading}>
             {items.map((item) => (
-              <ContentCard key={item.canonical_id} item={item} instance={instance} />
+              <ContentCard key={item.canonical_id} item={item} instance={instance} flow={flow} />
             ))}
           </div>
           {hasMore && (
@@ -449,6 +626,7 @@ export function DiscoverView(): JSX.Element {
         </>
       )}
 
+      <InstallConflictSheet flow={flow} />
       <Tray />
     </div>
   );

@@ -5,13 +5,16 @@ import type {
   ContentKind,
   ContentPage,
   ContentSelection,
+  ContentUpdatesResponse,
   ContentSort,
   InstanceContentResponse,
-  ModpackInstallResponse,
+  InstanceSetupPlanResponse,
   ModpackTarget,
+  ModpackFilesPlan,
   ResolutionPlan,
   TargetRef,
 } from './types-content';
+import type { InstallQueueStateResponse } from './types-install';
 
 export interface ContentSearchInput {
   kind: ContentKind;
@@ -48,8 +51,28 @@ export function planContent(target: TargetRef, selections: ContentSelection[]): 
   return api<ResolutionPlan>('POST', '/content/plan', { target, selections });
 }
 
-export function installContent(instanceId: string, selections: ContentSelection[]): Promise<InstanceContentResponse> {
-  return api<InstanceContentResponse>('POST', '/content/install', { instance_id: instanceId, selections });
+export function planInstanceSetup(
+  selectionId: string,
+  target: TargetRef,
+  selections: ContentSelection[],
+): Promise<InstanceSetupPlanResponse> {
+  return api<InstanceSetupPlanResponse>('POST', '/instances/setup/plan', {
+    selection_id: selectionId,
+    target,
+    selections,
+  });
+}
+
+export function installContent(
+  instanceId: string,
+  selections: ContentSelection[],
+  allowIncompatible = false,
+): Promise<InstallQueueStateResponse> {
+  return api<InstallQueueStateResponse>('POST', '/content/install', {
+    instance_id: instanceId,
+    selections,
+    allow_incompatible: allowIncompatible,
+  });
 }
 
 /** Which instances a staged set could live in, ranked by how little each one drops. */
@@ -64,15 +87,33 @@ export function getModpackTarget(canonicalId: string, versionId?: string): Promi
   return api<ModpackTarget>('GET', `/content/modpack/target?${params.toString()}`);
 }
 
+export function getModpackFiles(
+  instanceId: string,
+  canonicalId: string,
+  versionId?: string,
+): Promise<ModpackFilesPlan> {
+  const params = new URLSearchParams({ instance_id: instanceId, id: canonicalId });
+  if (versionId) params.set('version_id', versionId);
+  return api<ModpackFilesPlan>('GET', `/content/modpack/files?${params.toString()}`);
+}
+
 export function installModpack(
   instanceId: string,
   canonicalId: string,
   versionId?: string,
-): Promise<ModpackInstallResponse> {
-  return api<ModpackInstallResponse>('POST', '/content/modpack/install', {
+  options: {
+    selectedPaths?: string[];
+    includeOverrides?: boolean;
+    removeInstanceOnFailure?: boolean;
+  } = {},
+): Promise<InstallQueueStateResponse> {
+  return api<InstallQueueStateResponse>('POST', '/content/modpack/install', {
     instance_id: instanceId,
     canonical_id: canonicalId,
     version_id: versionId,
+    selected_paths: options.selectedPaths ?? [],
+    include_overrides: options.includeOverrides ?? true,
+    remove_instance_on_failure: options.removeInstanceOnFailure ?? false,
   });
 }
 
@@ -80,8 +121,12 @@ export function listInstanceContent(instanceId: string): Promise<InstanceContent
   return api<InstanceContentResponse>('GET', `/instances/${encodeURIComponent(instanceId)}/content`);
 }
 
-export function uninstallContent(instanceId: string, canonicalId: string): Promise<InstanceContentResponse> {
-  return api<InstanceContentResponse>(
+export function checkContentUpdates(instanceId: string): Promise<ContentUpdatesResponse> {
+  return api<ContentUpdatesResponse>('GET', `/instances/${encodeURIComponent(instanceId)}/content/updates`);
+}
+
+export function uninstallContent(instanceId: string, canonicalId: string): Promise<InstallQueueStateResponse> {
+  return api<InstallQueueStateResponse>(
     'DELETE',
     `/instances/${encodeURIComponent(instanceId)}/content?id=${encodeURIComponent(canonicalId)}`,
   );

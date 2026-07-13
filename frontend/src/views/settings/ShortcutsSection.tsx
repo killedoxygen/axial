@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { Button, Kbd } from '../../ui/Atoms';
-import { FloatingPill, FloatingPillDivider } from '../../ui/FloatingPill';
+import { FloatingTray, FloatingTrayDivider, FloatingTrayLabel } from '../../ui/FloatingTray';
 import { OverrideChip, SettingRow, SettingsSection } from '../../ui/SettingsSheet';
 import {
   SHORTCUTS,
@@ -111,9 +111,9 @@ export function ShortcutsSection(): JSX.Element {
         })}
       </SettingsSection>
       {recordingDef && (
-        <FloatingPill ariaLabel={`Recording a shortcut for ${recordingDef.label}`}>
-          <span class="cp-shortcut-hud-label">{recordingDef.label}</span>
-          <FloatingPillDivider />
+        <FloatingTray ariaLabel={`Recording a shortcut for ${recordingDef.label}`}>
+          <FloatingTrayLabel>{recordingDef.label}</FloatingTrayLabel>
+          <FloatingTrayDivider />
           <span class="cp-shortcut-hud-combo">
             {preview.length > 0 ? (
               preview.map((part) => <Kbd key={part}>{part}</Kbd>)
@@ -121,12 +121,12 @@ export function ShortcutsSection(): JSX.Element {
               <span class="cp-shortcut-hud-hint">Press the new key combo</span>
             )}
           </span>
-          <FloatingPillDivider />
+          <FloatingTrayDivider />
           <span class="cp-shortcut-hud-hint">Esc cancels</span>
           <Button variant="ghost" size="sm" onClick={() => setRecording(null)}>
             Cancel
           </Button>
-        </FloatingPill>
+        </FloatingTray>
       )}
     </>
   );

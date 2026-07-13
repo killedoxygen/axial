@@ -1,4 +1,5 @@
 import type { JSX } from 'preact';
+import { createPortal } from 'preact/compat';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Button, IconButton, Input, Pill, Toggle } from '../../ui/Atoms';
 import { Segmented } from '../../ui/Segmented';
@@ -9,9 +10,15 @@ import { InstanceTile, nextArtSeed } from '../../ui/InstanceVisual';
 import { harmoniousTilePalette, seedForTileHue } from '../../ui/look-guardian';
 import { useTheme } from '../../hooks/use-theme';
 import { config, systemInfo } from '../../store';
-import { closeCreate, createOpen } from '../../ui-state';
+import { closeCreate, createDraft, createModpack, createOpen, type CreateDraftItem } from '../../ui-state';
 import { api } from '../../api';
-import { errMessage, fmtMem, getMemoryRecommendation } from '../../utils';
+import { contentCompatibility, planInstanceSetup } from '../../content';
+import { toast } from '../../toast';
+import type { CompatCandidate, ContentSelection } from '../../types-content';
+import { clearTray } from '../discover/state';
+import { KIND_ICON } from '../discover/shared';
+import { fmtMem } from '../../format';
+import { errMessage, getMemoryRecommendation } from '../../utils';
 import { hashStr } from '../../tokens';
 import { Sound } from '../../sound';
 import { createInstance } from '../../instance-create';
@@ -19,6 +26,7 @@ import type { LoaderComponentId } from '../../types-loader';
 import {
   defaultIconFor,
   defaultNameFor,
+  LOADER_COMPONENT_IDS,
   LOADER_LABELS,
   LOADER_TAGLINES,
   loaderKeyFromComponentId,
@@ -187,6 +195,10 @@ function loaderKeyFromSourceId(sourceId: string): LoaderKey {
   return loaderKeyFromComponentId(sourceId as LoaderComponentId);
 }
 
+function sourceIdFromLoaderKey(loader: LoaderKey): string {
+  return loader === 'vanilla' ? 'vanilla' : LOADER_COMPONENT_IDS[loader];
+}
+
 function normalizeChannel(value: string | undefined): Channel {
   return CHANNEL_ORDER.includes(value as Channel) ? (value as Channel) : 'unknown';
 }
@@ -224,19 +236,164 @@ function rowSearchText(row: VersionRowModel): string {
   return [row.id, row.displayName, row.hint ?? '', row.tags.map((tag) => tag.label).join(' ')].join(' ').toLowerCase();
 }
 
+function CompatibilityPreview({
+  candidate,
+  draft,
+}: {
+  candidate: CompatCandidate;
+  draft: CreateDraftItem[];
+}): JSX.Element | null {
+  const [open, setOpen] = useState(false);
+  const [hovered, setHovered] = useState<{ label: string; rect: DOMRect } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const dropped = new Set(candidate.drops.map((item) => item.canonical_id));
+  const working = draft.filter((item) => !dropped.has(item.canonical_id));
+  const notWorking = draft.filter((item) => dropped.has(item.canonical_id));
+  const showingFits = working.length < notWorking.length;
+  const items = showingFits ? working : notWorking;
+  const visible = items.slice(0, 3);
+  const overflow = items.slice(visible.length);
+  const tone = showingFits ? 'fits' : 'misses';
+  const label = showingFits ? 'Works' : "Doesn't work";
+  const rect = open ? triggerRef.current?.getBoundingClientRect() : null;
+  const popoverTop = rect
+    ? rect.bottom + 250 > window.innerHeight
+      ? Math.max(8, rect.top - 246)
+      : rect.bottom + 6
+    : 0;
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (): void => setOpen(false);
+    const closeOutside = (event: PointerEvent): void => {
+      const target = event.target as Node;
+      if (triggerRef.current?.contains(target) || popoverRef.current?.contains(target)) return;
+      close();
+    };
+    window.addEventListener('resize', close);
+    window.addEventListener('scroll', close, true);
+    document.addEventListener('pointerdown', closeOutside);
+    return () => {
+      window.removeEventListener('resize', close);
+      window.removeEventListener('scroll', close, true);
+      document.removeEventListener('pointerdown', closeOutside);
+    };
+  }, [open]);
+
+  if (notWorking.length === 0) return null;
+
+  return (
+    <span class="cp-cr-compat" data-tone={tone} aria-label={`${label}: ${items.map((item) => item.title).join(', ')}`}>
+      {visible.map((item) => (
+        <span
+          key={item.canonical_id}
+          class="cp-cr-compat-icon"
+          aria-label={`${item.title}: ${label.toLowerCase()}`}
+          tabIndex={0}
+          onMouseEnter={(event) =>
+            setHovered({ label: `${item.title}: ${label}`, rect: event.currentTarget.getBoundingClientRect() })
+          }
+          onMouseLeave={() => setHovered(null)}
+          onFocus={(event) =>
+            setHovered({ label: `${item.title}: ${label}`, rect: event.currentTarget.getBoundingClientRect() })
+          }
+          onBlur={() => setHovered(null)}
+        >
+          {item.icon_url ? (
+            <img src={item.icon_url} alt="" />
+          ) : (
+            <Icon name={KIND_ICON[item.kind]} size={12} stroke={2} />
+          )}
+          {!showingFits && (
+            <span class="cp-cr-compat-unavailable" aria-hidden="true">
+              <Icon name="x" size={8} stroke={2.5} />
+            </span>
+          )}
+        </span>
+      ))}
+      {overflow.length > 0 && (
+        <button
+          ref={triggerRef}
+          type="button"
+          class="cp-cr-compat-more"
+          aria-expanded={open}
+          title={`Show all ${items.length}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            setOpen((value) => !value);
+          }}
+        >
+          +{overflow.length}
+        </button>
+      )}
+      {open && rect
+        ? createPortal(
+            <div
+              ref={popoverRef}
+              class="cp-cr-compat-popover"
+              data-tone={tone}
+              role="tooltip"
+              style={{ top: `${popoverTop}px`, right: `${window.innerWidth - rect.right}px` }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <strong>{label}</strong>
+              {items.map((item) => (
+                <span key={item.canonical_id} class="cp-cr-compat-popover-item">
+                  <span class="cp-cr-compat-popover-icon">
+                    {item.icon_url ? (
+                      <img src={item.icon_url} alt="" />
+                    ) : (
+                      <Icon name={KIND_ICON[item.kind]} size={13} stroke={2} />
+                    )}
+                    {!showingFits && (
+                      <span class="cp-cr-compat-unavailable" aria-hidden="true">
+                        <Icon name="x" size={8} stroke={2.5} />
+                      </span>
+                    )}
+                  </span>
+                  {item.title}
+                </span>
+              ))}
+            </div>,
+            document.body,
+          )
+        : null}
+      {hovered
+        ? createPortal(
+            <span
+              class="cp-cr-compat-tooltip"
+              data-placement={hovered.rect.top > 48 ? 'above' : 'below'}
+              role="tooltip"
+              style={{
+                left: `${hovered.rect.left + hovered.rect.width / 2}px`,
+                top: `${hovered.rect.top > 48 ? hovered.rect.top - 7 : hovered.rect.bottom + 7}px`,
+              }}
+            >
+              {hovered.label}
+            </span>,
+            document.body,
+          )
+        : null}
+    </span>
+  );
+}
+
 function CreateCard(): JSX.Element {
-  const [step, setStep] = useState<CreateStep>('version');
+  const pack = createModpack.value;
+  const [step, setStep] = useState<CreateStep>(pack ? 'details' : 'version');
   const [sourceId, setSourceId] = useState('vanilla');
   const [selectedSelectionId, setSelectedSelectionId] = useState<string | null>(null);
   const [channel, setChannel] = useState<Channel>('release');
   const [query, setQuery] = useState('');
   const [nameOverride, setNameOverride] = useState<string | null>(null);
   const [viewError, setViewError] = useState<string | null>(null);
-  const [viewLoading, setViewLoading] = useState(false);
+  const [viewLoading, setViewLoading] = useState(Boolean(createDraft.value));
   const [backendView, setBackendView] = useState<CreateBackendViewResponse | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const versionWellRef = useRef<HTMLDivElement | null>(null);
   const loadRequestRef = useRef(0);
+  const loadedCreateViewSourceRef = useRef<string | null>(null);
   const versionListKey = `${sourceId}:${channel}:${query.trim().toLowerCase()}`;
 
   const totalGB = systemInfo.value?.total_memory_mb ? Math.floor(systemInfo.value.total_memory_mb / 1024) : 16;
@@ -252,6 +409,56 @@ function CreateCard(): JSX.Element {
   const [loaderBuildsError, setLoaderBuildsError] = useState<string | null>(null);
   const theme = useTheme();
   const sourceKey = loaderKeyFromSourceId(sourceId);
+
+  const draft = createDraft.value;
+  const [draftCandidates, setDraftCandidates] = useState<CompatCandidate[] | null>(null);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const [draftAutoPicked, setDraftAutoPicked] = useState(false);
+  const [draftExpanded, setDraftExpanded] = useState(false);
+  const draftSelections = useMemo<ContentSelection[]>(
+    () =>
+      (draft ?? []).map((item: CreateDraftItem) => ({
+        canonical_id: item.canonical_id,
+        kind: item.kind,
+        ...(item.version_id ? { version_id: item.version_id } : {}),
+      })),
+    [draft],
+  );
+
+  useEffect(() => {
+    if (!draft) return;
+    let cancelled = false;
+    contentCompatibility(draftSelections)
+      .then((response) => {
+        if (cancelled) return;
+        const best = response.candidates[0];
+        if (best) {
+          const source = sourceIdFromLoaderKey((best.loader || 'vanilla') as LoaderKey);
+          setSourceId(source);
+          if (response.create_view) {
+            void loadCreateView(source, response.create_view as CreateBackendViewResponse);
+          }
+        }
+        setDraftCandidates(response.candidates);
+        if (!best) setViewLoading(false);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setDraftError(errMessage(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [draft, draftSelections]);
+
+  const draftCandidateFor = (loader: LoaderKey, mcVersion: string): CompatCandidate | null =>
+    draftCandidates?.find(
+      (candidate) => ((candidate.loader || 'vanilla') as LoaderKey) === loader && candidate.game_version === mcVersion,
+    ) ?? null;
+
+  const draftLoaders = useMemo(() => {
+    if (!draft || !draftCandidates) return null;
+    return new Set(draftCandidates.map((candidate) => (candidate.loader || 'vanilla') as LoaderKey));
+  }, [draft, draftCandidates]);
 
   const [screenMax, setScreenMax] = useState<ScreenSize>(() => ({
     w: typeof window !== 'undefined' && window.screen ? window.screen.width : 1920,
@@ -290,18 +497,21 @@ function CreateCard(): JSX.Element {
     if (next) setJvmPreset(next.id);
   };
 
-  const loadCreateView = async (source = sourceId): Promise<void> => {
+  const loadCreateView = async (source = sourceId, providedView?: CreateBackendViewResponse): Promise<void> => {
     const requestId = loadRequestRef.current + 1;
     loadRequestRef.current = requestId;
     setViewLoading(true);
     setViewError(null);
     try {
-      const res = (await api(
-        'GET',
-        `/instances/create-view?source=${encodeURIComponent(source)}`,
-      )) as CreateBackendViewResponse & { error?: string };
+      const res: CreateBackendViewResponse & { error?: string } = providedView
+        ? providedView
+        : ((await api(
+            'GET',
+            `/instances/create-view?source=${encodeURIComponent(source)}`,
+          )) as CreateBackendViewResponse & { error?: string });
       if (requestId !== loadRequestRef.current) return;
       if (res.error) throw new Error(res.error);
+      loadedCreateViewSourceRef.current = source;
       setBackendView(res);
       const options = Array.isArray(res.preset_options)
         ? res.preset_options.filter(
@@ -349,6 +559,7 @@ function CreateCard(): JSX.Element {
       setChannel((current) => (CHANNEL_ORDER.includes(current) ? current : defaultChannel));
     } catch (err: unknown) {
       if (requestId !== loadRequestRef.current) return;
+      if (loadedCreateViewSourceRef.current === source) loadedCreateViewSourceRef.current = null;
       setBackendView(null);
       setPresetOptions([]);
       setViewError(errMessage(err));
@@ -358,9 +569,12 @@ function CreateCard(): JSX.Element {
   };
 
   useEffect(() => {
+    if (draft && draftCandidates === null && !draftError) return;
+    if (draft && draftCandidates?.length === 0) return;
+    if (draft && loadedCreateViewSourceRef.current === sourceId) return;
     void loadCreateView(sourceId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sourceId]);
+  }, [sourceId, draftCandidates, draftError]);
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -420,11 +634,22 @@ function CreateCard(): JSX.Element {
     [backendRows, sourceId],
   );
 
+  const compatibleForSource = useMemo(() => {
+    if (!draft || !draftCandidates) return availableForSource;
+    return availableForSource.filter((row) =>
+      draftCandidates.some(
+        (candidate) =>
+          ((candidate.loader || 'vanilla') as LoaderKey) === sourceKey &&
+          candidate.game_version === row.minecraft_version_id,
+      ),
+    );
+  }, [availableForSource, draft, draftCandidates, sourceKey]);
+
   const availableChannels = useMemo<Channel[]>(() => {
     const has: Record<Channel, boolean> = { release: false, snapshot: false, legacy: false, unknown: false };
-    for (const row of availableForSource) has[normalizeChannel(row.channel)] = true;
+    for (const row of compatibleForSource) has[normalizeChannel(row.channel)] = true;
     return CHANNEL_ORDER.filter((c) => has[c]);
-  }, [availableForSource]);
+  }, [compatibleForSource]);
 
   useEffect(() => {
     if (availableChannels.length === 0) return;
@@ -434,32 +659,65 @@ function CreateCard(): JSX.Element {
 
   const versionRows: VersionRowModel[] = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return availableForSource
-      .map((row) => ({
-        id: row.minecraft_version_id,
-        selectionId: row.selection_id,
-        displayName: row.display_name,
-        hint: row.hint ?? null,
-        channel: normalizeChannel(row.channel),
-        tags: normalizeVersionTags(row.tags),
-        downloadState: normalizeDownloadState(row.download_state),
-        createEnabled: row.create_enabled,
-        disabledReason: row.disabled_reason ?? null,
-      }))
+    return compatibleForSource
+      .map((row) => {
+        const candidate =
+          draft && draftCandidates
+            ? (draftCandidates.find(
+                (entry) =>
+                  ((entry.loader || 'vanilla') as LoaderKey) === sourceKey &&
+                  entry.game_version === row.minecraft_version_id,
+              ) ?? null)
+            : null;
+        const tags = normalizeVersionTags(row.tags);
+        return {
+          id: row.minecraft_version_id,
+          selectionId: row.selection_id,
+          displayName: row.display_name,
+          hint: row.hint ?? null,
+          channel: normalizeChannel(row.channel),
+          tags,
+          downloadState: normalizeDownloadState(row.download_state),
+          createEnabled: row.create_enabled,
+          disabledReason: row.disabled_reason ?? null,
+        };
+      })
       .filter((row) => row.channel === channel)
       .filter((row) => !q || rowSearchText(row).includes(q));
-  }, [channel, query, availableForSource]);
+  }, [channel, query, compatibleForSource, draft, draftCandidates, sourceKey]);
   const selectedVersionRow = selectedSelectionId
     ? (versionRows.find((row) => row.selectionId === selectedSelectionId) ?? null)
     : null;
-  const mcVersionId = selectedVersionRow?.id ?? null;
+  const mcVersionId = pack ? pack.minecraft : (selectedVersionRow?.id ?? null);
+  const packKey = pack ? ((pack.loader || 'vanilla') as LoaderKey) : null;
+  const identityKey = packKey ?? sourceKey;
 
-  const selectionId = selectedVersionRow?.selectionId ?? '';
+  const selectionId = pack ? pack.selection_id : (selectedVersionRow?.selectionId ?? '');
+
+  useEffect(() => {
+    if (!draft || !draftCandidates || draftAutoPicked) return;
+    const best = draftCandidates[0];
+    if (!best) return;
+    const bestKey = (best.loader || 'vanilla') as LoaderKey;
+    if (sourceKey !== bestKey) return;
+    const row = versionRows.find((entry) => entry.id === best.game_version && entry.createEnabled);
+    if (row) {
+      setSelectedSelectionId(row.selectionId);
+      setDraftAutoPicked(true);
+    }
+  }, [draft, draftCandidates, draftAutoPicked, sourceKey, versionRows]);
+
+  const draftCandidate = draft && selectedVersionRow ? draftCandidateFor(sourceKey, selectedVersionRow.id) : null;
+  const draftDropped = useMemo(
+    () => new Set((draftCandidate?.drops ?? []).map((drop) => drop.canonical_id)),
+    [draftCandidate],
+  );
 
   const suggestedName = useMemo(() => {
+    if (pack) return pack.name;
     if (!mcVersionId) return '';
     return defaultNameFor(sourceKey, mcVersionId);
-  }, [sourceKey, mcVersionId]);
+  }, [pack, sourceKey, mcVersionId]);
 
   const name = nameOverride ?? suggestedName;
   const displayName = name.trim() || suggestedName || 'New instance';
@@ -498,8 +756,13 @@ function CreateCard(): JSX.Element {
     setSelectedSelectionId(null);
   }, [versionRows, selectedSelectionId]);
 
-  const versionReady = Boolean(selectionId && selectedVersionRow?.createEnabled !== false);
-  const createSelectionId = sourceKey === 'vanilla' ? selectionId : (loaderChoice ?? selectionId);
+  const draftReady = !draft || draftCandidates !== null;
+  const versionReady = pack ? true : Boolean(selectionId && selectedVersionRow?.createEnabled !== false) && draftReady;
+  const createSelectionId = pack
+    ? pack.selection_id
+    : sourceKey === 'vanilla'
+      ? selectionId
+      : (loaderChoice ?? selectionId);
   const canCreate = versionReady && name.trim().length > 0 && !submitting;
 
   useEffect(() => {
@@ -510,7 +773,7 @@ function CreateCard(): JSX.Element {
     setLoaderBuilds(null);
     setLoaderBuildsError(null);
     setLoaderChoice(null);
-    if (sourceKey === 'vanilla' || !mcVersionId) return;
+    if (pack || sourceKey === 'vanilla' || !mcVersionId) return;
     let cancelled = false;
     api(
       'GET',
@@ -540,17 +803,47 @@ function CreateCard(): JSX.Element {
   const submit = async (): Promise<void> => {
     if (submitting || !canCreate) return;
     const trimmed = name.trim();
-    if (!trimmed || !selectionId) return;
+    if (!trimmed || !createSelectionId) return;
     setSubmitting(true);
     try {
+      const keptSelections = draft
+        ? draftSelections.filter((selection) => !draftDropped.has(selection.canonical_id))
+        : [];
+      let setupPlanId: string | undefined;
+      let setupSelectionId: string | undefined;
+      if (draft && mcVersionId && keptSelections.length > 0) {
+        try {
+          const setup = await planInstanceSetup(
+            createSelectionId,
+            {
+              kind: 'draft',
+              ...(sourceKey === 'vanilla' ? {} : { loader: sourceKey }),
+              game_version: mcVersionId,
+            },
+            keptSelections,
+          );
+          if (setup.plan.conflicts.length > 0 || !setup.plan_id) {
+            const detail = setup.plan.conflicts[0]?.detail ?? 'No installable setup is available.';
+            toast(`Cannot create this setup: ${detail}`, 'error');
+            return;
+          }
+          setupPlanId = setup.plan_id;
+          setupSelectionId = setup.selection_id;
+        } catch (error) {
+          toast(`Could not validate this setup: ${errMessage(error)}`, 'error');
+          return;
+        }
+      }
       const accentLabel = config.value?.theme ?? '';
       const winSpec = windowPresets.find((p) => p.id === windowPresetId);
       const dims = winSpec && winSpec.id !== 'default' ? { w: winSpec.w, h: winSpec.h } : null;
       const result = await createInstance({
         name: trimmed,
-        selectionId: createSelectionId,
-        icon: defaultIconFor(sourceKey),
+        selectionId: setupSelectionId ?? createSelectionId,
+        icon: defaultIconFor(identityKey),
         accent: accentLabel,
+        setupPlanId,
+        ...(pack ? { modpack: { canonicalId: pack.canonical_id, versionId: pack.version_id } } : {}),
         initialSettings: {
           max_memory_mb: Math.round(memoryGB * 1024),
           art_seed: previewSeed,
@@ -559,7 +852,15 @@ function CreateCard(): JSX.Element {
           ...(optimizeOption ? { auto_optimize: autoOptimize } : {}),
         },
       });
-      if (result.ok) closeCreate();
+      if (!result.ok) return;
+      if (pack && result.instance) {
+        closeCreate();
+        return;
+      }
+      if (draft && result.instance) {
+        clearTray();
+      }
+      closeCreate();
     } finally {
       setSubmitting(false);
     }
@@ -612,6 +913,10 @@ function CreateCard(): JSX.Element {
     autoOptimize,
     step,
     versionReady,
+    pack,
+    draft,
+    draftSelections,
+    draftDropped,
   ]);
 
   const availableChannelSet = new Set(availableChannels);
@@ -627,24 +932,26 @@ function CreateCard(): JSX.Element {
   const winSubtitle = winSpec.id === 'default' ? 'Game default' : `${winSpec.w} × ${winSpec.h}`;
   const selectedPresetOption =
     presetOptions.find((option) => option.id === jvmPreset) ?? presetOptions.find((option) => option.default) ?? null;
-  const currentSourceLabel = sourceOptions.find((option) => option.id === sourceId)?.label ?? LOADER_LABELS[sourceKey];
+  const currentSourceLabel = pack
+    ? pack.loader_label
+    : (sourceOptions.find((option) => option.id === sourceId)?.label ?? LOADER_LABELS[sourceKey]);
   const loaderSelection = loaderChoice ?? loaderBuilds?.auto.selection_id ?? '';
   const loaderOptions = useMemo(() => {
     if (!loaderBuilds) return [];
     return [
       { value: loaderBuilds.auto.selection_id, label: loaderBuilds.auto.label },
-      ...loaderBuilds.builds.map((build) => ({
-        value: build.selection_id,
-        label: [
-          build.label,
+      ...loaderBuilds.builds.map((build) => {
+        const extras = [
           build.channel_label,
           build.recommended ? 'Recommended' : null,
           build.installed ? 'Installed' : null,
-        ]
-          .filter(Boolean)
-          .join(' · '),
-        disabled: !build.enabled,
-      })),
+        ].filter(Boolean);
+        return {
+          value: build.selection_id,
+          label: extras.length > 0 ? `${build.label} (${extras.join(', ')})` : build.label,
+          disabled: !build.enabled,
+        };
+      }),
     ];
   }, [loaderBuilds]);
 
@@ -652,19 +959,21 @@ function CreateCard(): JSX.Element {
     <>
       <header class="cp-cr-card-head">
         <div>
-          <h1>Create instance</h1>
+          <h1>{pack ? 'Set up modpack' : 'Create instance'}</h1>
         </div>
         <IconButton icon="x" tooltip="Close (Esc)" onClick={closeCreate} />
-        <div
-          class="cp-cr-progress"
-          data-step={step}
-          role="status"
-          aria-label={`Create step: ${step === 'version' ? 'Version' : 'Details'}`}
-        >
-          <span data-active={step === 'version'}>Version</span>
-          <i aria-hidden="true" />
-          <span data-active={step === 'details'}>Details</span>
-        </div>
+        {!pack && (
+          <div
+            class="cp-cr-progress"
+            data-step={step}
+            role="status"
+            aria-label={`Create step: ${step === 'version' ? 'Version' : 'Details'}`}
+          >
+            <span data-active={step === 'version'}>Version</span>
+            <i aria-hidden="true" />
+            <span data-active={step === 'details'}>Details</span>
+          </div>
+        )}
       </header>
 
       <div class="cp-cr-card-body" data-step={step}>
@@ -673,6 +982,8 @@ function CreateCard(): JSX.Element {
             <div class="cp-seg cp-cr-sources" role="radiogroup" aria-label="Instance source">
               {sourceOptions.map((option) => {
                 const key = loaderKeyFromSourceId(option.id);
+                const unsupported = draftLoaders !== null && !draftLoaders.has(key);
+                const enabled = option.enabled && !unsupported;
                 return (
                   <button
                     key={option.id}
@@ -681,10 +992,14 @@ function CreateCard(): JSX.Element {
                     data-active={sourceId === option.id}
                     role="radio"
                     aria-checked={sourceId === option.id}
-                    title={option.disabled_reason ?? LOADER_TAGLINES[key]}
-                    disabled={!option.enabled}
+                    title={
+                      unsupported
+                        ? 'Your staged picks have no builds for this loader'
+                        : (option.disabled_reason ?? LOADER_TAGLINES[key])
+                    }
+                    disabled={!enabled}
                     onClick={() => {
-                      if (!option.enabled) return;
+                      if (!enabled) return;
                       setSourceId(option.id);
                       setSelectedSelectionId(null);
                     }}
@@ -695,6 +1010,91 @@ function CreateCard(): JSX.Element {
                 );
               })}
             </div>
+
+            {draft &&
+              (() => {
+                const visible = draftExpanded ? draft : draft.slice(0, 1);
+                const hidden = draft.slice(visible.length);
+                return (
+                  <div class="cp-cr-draft" role="group" aria-label="Staged content" data-expanded={draftExpanded}>
+                    <span class="cp-cr-draft-label">
+                      <Icon name="download" size={13} stroke={2} />
+                      Installs after create
+                    </span>
+                    <div class="cp-cr-draft-items">
+                      {visible.map((item) => {
+                        const dropped = draftDropped.has(item.canonical_id);
+                        return (
+                          <span
+                            key={item.canonical_id}
+                            class="cp-cr-draft-item"
+                            data-dropped={dropped}
+                            title={
+                              dropped ? `${item.title} has no build for this version and will be skipped` : item.title
+                            }
+                          >
+                            {item.icon_url ? (
+                              <img src={item.icon_url} alt="" />
+                            ) : (
+                              <Icon name={KIND_ICON[item.kind]} size={12} stroke={2} />
+                            )}
+                            <span class="cp-cr-draft-item-name">{item.title}</span>
+                            {item.version_label && <span class="cp-cr-draft-item-pin">{item.version_label}</span>}
+                          </span>
+                        );
+                      })}
+                      {hidden.length > 0 && (
+                        <button
+                          type="button"
+                          class="cp-cr-draft-more"
+                          title={hidden.map((item) => item.title).join(', ')}
+                          onClick={() => setDraftExpanded(true)}
+                        >
+                          +{hidden.length}
+                        </button>
+                      )}
+                      {draftExpanded && draft.length > 1 && (
+                        <button type="button" class="cp-cr-draft-more" onClick={() => setDraftExpanded(false)}>
+                          Less
+                        </button>
+                      )}
+                    </div>
+                    {draftDropped.size > 0 && (
+                      <span
+                        class="cp-cr-draft-skips"
+                        title={(draftCandidate?.drops ?? []).map((drop) => drop.title).join(', ')}
+                      >
+                        <Icon name="alert" size={12} stroke={2.2} />
+                        {draftDropped.size} skipped
+                      </span>
+                    )}
+                  </div>
+                );
+              })()}
+
+            {draft && draftError && (
+              <section class="cp-notice" data-tone="error" role="alert">
+                <span class="cp-notice-mark" aria-hidden="true">
+                  <Icon name="alert" size={15} stroke={2.2} />
+                </span>
+                <div class="cp-notice-copy">
+                  <strong>Could not check what your picks support</strong>
+                  <p>{draftError}</p>
+                </div>
+              </section>
+            )}
+
+            {draft && draftCandidates?.length === 0 && (
+              <section class="cp-notice" data-tone="warned" role="alert">
+                <span class="cp-notice-mark" aria-hidden="true">
+                  <Icon name="alert" size={15} stroke={2.2} />
+                </span>
+                <div class="cp-notice-copy">
+                  <strong>These picks share no common version</strong>
+                  <p>Unstage one of them and try again.</p>
+                </div>
+              </section>
+            )}
 
             {createNotices.length > 0 && (
               <div class="cp-cr-notices" aria-live="polite">
@@ -797,6 +1197,9 @@ function CreateCard(): JSX.Element {
                           {tag.label}
                         </span>
                       ))}
+                      {draft && draftCandidates && draftCandidateFor(sourceKey, row.id) && (
+                        <CompatibilityPreview candidate={draftCandidateFor(sourceKey, row.id)!} draft={draft} />
+                      )}
                       <span class="cp-cr-vrow-spacer" />
                       {row.downloadState !== 'none' && (
                         <span
@@ -856,9 +1259,14 @@ function CreateCard(): JSX.Element {
               </div>
               <div class="cp-cr-id-col">
                 <div class="cp-cr-kicker">
+                  {pack && <Pill icon="stack">Modpack</Pill>}
                   <Pill>{currentSourceLabel}</Pill>
                   <span class="cp-cr-kicker-mc">
-                    {selectedVersionRow ? `Minecraft ${selectedVersionRow.displayName}` : 'No version yet'}
+                    {pack
+                      ? `Minecraft ${pack.minecraft}`
+                      : selectedVersionRow
+                        ? `Minecraft ${selectedVersionRow.displayName}`
+                        : 'No version yet'}
                   </span>
                 </div>
                 <Input
@@ -971,15 +1379,19 @@ function CreateCard(): JSX.Element {
 
       <footer class="cp-cr-card-foot">
         <span class="cp-cr-footnote" aria-live="polite">
-          {step === 'version'
-            ? !versionReady
-              ? 'Pick a Minecraft version to continue.'
-              : 'Continue to name and settings.'
-            : !versionReady
-              ? 'Pick a Minecraft version to continue.'
-              : canCreate
-                ? 'Enter creates the instance.'
-                : 'Name your instance to create it.'}
+          {pack
+            ? canCreate
+              ? `${pack.name} installs right after.`
+              : 'Name your instance to create it.'
+            : step === 'version'
+              ? !versionReady
+                ? 'Pick a Minecraft version to continue.'
+                : 'Continue to name and settings.'
+              : !versionReady
+                ? 'Pick a Minecraft version to continue.'
+                : canCreate
+                  ? 'Enter creates the instance.'
+                  : 'Name your instance to create it.'}
         </span>
         <div class="cp-cr-foot-actions">
           {step === 'version' ? (
@@ -997,9 +1409,15 @@ function CreateCard(): JSX.Element {
             </>
           ) : (
             <>
-              <Button variant="ghost" icon="arrow-left" onClick={() => setStep('version')} disabled={submitting}>
-                Back
-              </Button>
+              {pack ? (
+                <Button variant="ghost" onClick={closeCreate} disabled={submitting}>
+                  Cancel
+                </Button>
+              ) : (
+                <Button variant="ghost" icon="arrow-left" onClick={() => setStep('version')} disabled={submitting}>
+                  Back
+                </Button>
+              )}
               <Button
                 icon="plus"
                 onClick={() => {
@@ -1008,7 +1426,7 @@ function CreateCard(): JSX.Element {
                 disabled={!canCreate}
                 sound="affirm"
               >
-                {submitting ? 'Creating…' : 'Create instance'}
+                {submitting ? 'Creating…' : pack ? 'Create and install' : 'Create instance'}
               </Button>
             </>
           )}

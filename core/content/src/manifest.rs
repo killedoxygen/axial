@@ -96,12 +96,25 @@ impl ManifestEntry {
     }
 }
 
+/// A file we hashed and asked the provider about that came back unknown.
+/// Remembering its hash avoids repeating provider requests while still letting
+/// callers detect same-size replacements reliably.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnidentifiedRecord {
+    pub kind: ContentKind,
+    pub filename: String,
+    pub size: u64,
+    pub sha512: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentManifest {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     #[serde(default)]
     pub entries: Vec<ManifestEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unidentified: Vec<UnidentifiedRecord>,
 }
 
 impl Default for ContentManifest {
@@ -109,6 +122,7 @@ impl Default for ContentManifest {
         Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
             entries: Vec::new(),
+            unidentified: Vec::new(),
         }
     }
 }
@@ -161,6 +175,47 @@ impl ContentManifest {
             .iter()
             .position(|entry| &entry.canonical_id == canonical_id)
             .map(|index| self.entries.remove(index))
+    }
+
+    pub fn known_unidentified(
+        &self,
+        kind: ContentKind,
+        filename: &str,
+        size: u64,
+        sha512: &str,
+    ) -> bool {
+        self.unidentified.iter().any(|record| {
+            record.kind == kind
+                && record.filename == filename
+                && record.size == size
+                && record.sha512 == sha512
+        })
+    }
+
+    pub fn record_unidentified(&mut self, record: UnidentifiedRecord) {
+        self.unidentified.retain(|existing| {
+            !(existing.kind == record.kind && existing.filename == record.filename)
+        });
+        self.unidentified.push(record);
+    }
+
+    pub fn forget_unidentified(&mut self, kind: ContentKind, filename: &str) {
+        self.unidentified
+            .retain(|record| !(record.kind == kind && record.filename == filename));
+    }
+
+    /// Drop cached negatives whose file is no longer sitting unmanaged on disk,
+    /// so a removed or later-identified file does not leave a stale record.
+    /// Returns whether anything was dropped.
+    pub fn prune_unidentified(&mut self, unmanaged: &[UnmanagedFile]) -> bool {
+        let live: HashSet<(ContentKind, &str)> = unmanaged
+            .iter()
+            .map(|file| (file.kind, file.filename.as_str()))
+            .collect();
+        let before = self.unidentified.len();
+        self.unidentified
+            .retain(|record| live.contains(&(record.kind, record.filename.as_str())));
+        self.unidentified.len() != before
     }
 }
 
@@ -375,6 +430,58 @@ mod tests {
         assert_eq!(report.unmanaged.len(), 1);
         assert_eq!(report.unmanaged[0].filename, "dropped.jar");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unidentified_records_roundtrip_and_match_on_size_and_hash() {
+        let dir = temp_game_dir("unidentified");
+        let mut manifest = ContentManifest::default();
+        manifest.record_unidentified(UnidentifiedRecord {
+            kind: ContentKind::Mod,
+            filename: "mystery.jar".to_string(),
+            size: 42,
+            sha512: "c".repeat(128),
+        });
+        manifest.save(&dir).expect("save");
+
+        let loaded = ContentManifest::load(&dir).expect("load");
+        assert!(loaded.known_unidentified(ContentKind::Mod, "mystery.jar", 42, &"c".repeat(128)));
+        assert!(!loaded.known_unidentified(ContentKind::Mod, "mystery.jar", 42, &"d".repeat(128)));
+        assert!(!loaded.known_unidentified(ContentKind::Mod, "mystery.jar", 43, &"c".repeat(128)));
+        assert!(!loaded.known_unidentified(
+            ContentKind::ResourcePack,
+            "mystery.jar",
+            42,
+            &"c".repeat(128)
+        ));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prune_unidentified_drops_records_for_files_no_longer_unmanaged() {
+        let mut manifest = ContentManifest::default();
+        manifest.record_unidentified(UnidentifiedRecord {
+            kind: ContentKind::Mod,
+            filename: "still-here.jar".to_string(),
+            size: 1,
+            sha512: "d".repeat(128),
+        });
+        manifest.record_unidentified(UnidentifiedRecord {
+            kind: ContentKind::Mod,
+            filename: "gone.jar".to_string(),
+            size: 2,
+            sha512: "e".repeat(128),
+        });
+
+        let unmanaged = vec![UnmanagedFile {
+            kind: ContentKind::Mod,
+            filename: "still-here.jar".to_string(),
+            path: PathBuf::from("mods/still-here.jar"),
+        }];
+        assert!(manifest.prune_unidentified(&unmanaged));
+        assert_eq!(manifest.unidentified.len(), 1);
+        assert_eq!(manifest.unidentified[0].filename, "still-here.jar");
+        assert!(!manifest.prune_unidentified(&unmanaged));
     }
 
     #[test]

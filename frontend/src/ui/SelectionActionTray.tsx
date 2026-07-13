@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { Button } from './Atoms';
-import { FloatingPill, FloatingPillDivider } from './FloatingPill';
+import { FloatingTray, FloatingTrayDivider, FloatingTrayLabel } from './FloatingTray';
 import { Icon } from './Icons';
 import type { SelectionState } from './selection';
 
@@ -12,7 +12,7 @@ export interface SelectionAction {
   onClick: () => void;
 }
 
-export function SelectionActionPill({
+export function SelectionActionTray({
   shown,
   count,
   itemLabel = 'item',
@@ -42,11 +42,11 @@ export function SelectionActionPill({
   const noun = effectiveCount === 1 ? itemLabel : `${itemLabel}s`;
 
   return (
-    <FloatingPill ariaLabel={ariaLabel ?? `${effectiveCount} selected ${noun}`}>
-      <span class="cp-selection-count">
+    <FloatingTray ariaLabel={ariaLabel ?? `${effectiveCount} selected ${noun}`} reserveSpace>
+      <FloatingTrayLabel>
         {effectiveCount} {noun} selected
-      </span>
-      <FloatingPillDivider />
+      </FloatingTrayLabel>
+      <FloatingTrayDivider />
       {selectAll && !effectiveAllSelected && (
         <Button variant="ghost" size="sm" onClick={selectAll}>
           Select all
@@ -55,7 +55,7 @@ export function SelectionActionPill({
       <Button variant="ghost" size="sm" icon="x" onClick={clear}>
         Clear
       </Button>
-      {actions.length > 0 && <FloatingPillDivider />}
+      {actions.length > 0 && <FloatingTrayDivider />}
       {actions.map((action) => (
         <Button
           key={action.label}
@@ -68,7 +68,7 @@ export function SelectionActionPill({
           {action.label}
         </Button>
       ))}
-    </FloatingPill>
+    </FloatingTray>
   );
 }
 

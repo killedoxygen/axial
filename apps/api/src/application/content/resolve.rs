@@ -7,7 +7,7 @@ use super::target::ResolveTarget;
 use super::{ContentApiError, ContentSelection, content_error_response, json_error};
 use axial_content::{
     CanonicalId, ContentDependency, ContentError, ContentKind, ContentManifest, ContentVersion,
-    DependencyKind, FileRef, PlannedFile, ProviderId, ReleaseChannel,
+    DependencyKind, FileRef, ManifestEntry, PlannedFile, ProviderId, ReleaseChannel,
 };
 use axum::http::StatusCode;
 use serde::Serialize;
@@ -34,7 +34,13 @@ pub struct PlanItem {
     pub version_number: String,
     pub filename: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha512: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<ContentDependency>,
     pub reason: PlanReason,
     pub already_installed: bool,
     pub update: bool,
@@ -130,7 +136,10 @@ impl Resolution {
                 version_id: item.version_id,
                 version_number: item.version_number,
                 filename: item.file.filename,
+                sha1: item.file.sha1,
+                sha512: item.file.sha512,
                 size: item.file.size,
+                dependencies: item.dependencies,
                 reason: item.reason,
                 already_installed: item.already_installed,
                 update: item.update,
@@ -205,6 +214,12 @@ pub async fn resolve(
             continue;
         }
         if items.len() >= MAX_RESOLVE_ITEMS {
+            conflicts.push(PlanConflict {
+                canonical_id: Some(canonical_id),
+                kind: ConflictKind::Unavailable,
+                detail: "could not be resolved because the dependency graph is too large"
+                    .to_string(),
+            });
             break;
         }
 
@@ -239,14 +254,21 @@ pub async fn resolve(
                             dependency.version_id.clone(),
                             PlanReason::Dependency,
                         ));
+                    } else {
+                        conflicts.push(PlanConflict {
+                            canonical_id: Some(canonical_id.clone()),
+                            kind: ConflictKind::Unavailable,
+                            detail: "has a required dependency that could not be identified"
+                                .to_string(),
+                        });
                     }
                 }
                 DependencyKind::Incompatible => {
                     if let Some(project_id) = &dependency.project_id {
                         let incompatible =
                             CanonicalId::for_project(ProviderId::Modrinth, project_id);
-                        if manifest.find(&incompatible).is_some() {
-                            conflicts.push(incompatible_conflict(&incompatible));
+                        if let Some(entry) = manifest.find(&incompatible) {
+                            conflicts.push(incompatible_conflict(&canonical_id, entry));
                         }
                     }
                 }
@@ -278,25 +300,132 @@ pub async fn resolve(
         });
     }
 
-    apply_project_titles(state, &mut items).await;
+    conflicts.extend(selected_incompatibility_conflicts(&items));
+
+    apply_project_titles(state, &mut items, &mut conflicts).await;
     Ok(Resolution { items, conflicts })
 }
 
-/// Replace version names with project names in one round trip. Best-effort: if
-/// the lookup fails the plan still stands, it just reads worse.
-async fn apply_project_titles(state: &AppState, items: &mut [ResolvedItem]) {
-    if items.is_empty() {
+fn selected_incompatibility_conflicts(items: &[ResolvedItem]) -> Vec<PlanConflict> {
+    let resolved_projects: HashSet<String> =
+        items.iter().map(|item| item.project_id.clone()).collect();
+    let mut selected_incompatibilities = HashSet::new();
+    let mut conflicts = Vec::new();
+    for item in items {
+        for dependency in &item.dependencies {
+            if dependency.kind != DependencyKind::Incompatible {
+                continue;
+            }
+            let Some(project_id) = dependency.project_id.as_deref() else {
+                continue;
+            };
+            if !resolved_projects.contains(project_id) {
+                continue;
+            }
+            let key = (item.project_id.clone(), project_id.to_string());
+            if selected_incompatibilities.insert(key) {
+                conflicts.push(PlanConflict {
+                    canonical_id: Some(item.canonical_id.clone()),
+                    kind: ConflictKind::Incompatible,
+                    detail: format!("is incompatible with selected project {project_id}"),
+                });
+            }
+        }
+    }
+    conflicts
+}
+
+/// Replace version names with project names in one round trip, and give every
+/// conflict a subject so "has no compatible version" becomes "Sodium has no
+/// compatible version". Best-effort: if the lookup fails the plan still stands,
+/// conflicts fall back to the raw project id.
+async fn apply_project_titles(
+    state: &AppState,
+    items: &mut [ResolvedItem],
+    conflicts: &mut [PlanConflict],
+) {
+    if items.is_empty() && conflicts.is_empty() {
         return;
     }
-    let ids: Vec<CanonicalId> = items.iter().map(|item| item.canonical_id.clone()).collect();
-    let Ok(titles) = state.content().titles(&ids).await else {
-        return;
-    };
+    let ids: Vec<CanonicalId> = items
+        .iter()
+        .map(|item| item.canonical_id.clone())
+        .chain(
+            conflicts
+                .iter()
+                .filter_map(|conflict| conflict.canonical_id.clone()),
+        )
+        .collect();
+    let titles = state.content().titles(&ids).await.unwrap_or_default();
     for item in items {
         if let Some(title) = titles.get(&item.canonical_id) {
             item.title = title.clone();
         }
     }
+    for conflict in conflicts {
+        if let Some(id) = &conflict.canonical_id {
+            let label = titles
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| id.project_id().to_string());
+            conflict.detail = format!("{label} {}", conflict.detail);
+        }
+    }
+}
+
+/// The version an installed entry should move to, if any. Versions arrive
+/// newest-first from the provider, so "newer" is "earlier in the list"; an
+/// installed version that no longer appears (a loader or Minecraft change
+/// filtered it out) always yields to the best compatible pick.
+pub fn newer_version<'a>(
+    versions: &'a [ContentVersion],
+    current_version_id: &str,
+) -> Option<&'a ContentVersion> {
+    let picked = pick_version(versions, None)?;
+    if picked.id == current_version_id {
+        return None;
+    }
+    let picked_index = versions
+        .iter()
+        .position(|version| version.id == picked.id)?;
+    match versions
+        .iter()
+        .position(|version| version.id == current_version_id)
+    {
+        Some(current_index) => (picked_index < current_index).then_some(picked),
+        None => Some(picked),
+    }
+}
+
+/// Whether moving to this version would introduce a declared incompatibility
+/// with something the instance already has. The entry being updated is exempt:
+/// it is being replaced, not conflicted with.
+pub fn version_conflicts_with_installed(
+    version: &ContentVersion,
+    own_id: &CanonicalId,
+    installed: &[ManifestEntry],
+) -> bool {
+    let candidate_declares_conflict = version.dependencies.iter().any(|dependency| {
+        dependency.kind == DependencyKind::Incompatible
+            && dependency.project_id.as_deref().is_some_and(|project_id| {
+                let id = CanonicalId::for_project(ProviderId::Modrinth, project_id);
+                id != *own_id && installed.iter().any(|entry| entry.canonical_id == id)
+            })
+    });
+    if candidate_declares_conflict {
+        return true;
+    }
+
+    installed.iter().any(|entry| {
+        entry.canonical_id != *own_id
+            && entry.dependencies.iter().any(|dependency| {
+                dependency.kind == DependencyKind::Incompatible
+                    && dependency
+                        .project_id
+                        .as_deref()
+                        .is_some_and(|project_id| project_id == own_id.project_id())
+            })
+    })
 }
 
 pub fn pick_version<'a>(
@@ -322,15 +451,19 @@ fn unavailable_conflict(canonical_id: &CanonicalId) -> PlanConflict {
     PlanConflict {
         canonical_id: Some(canonical_id.clone()),
         kind: ConflictKind::Unavailable,
-        detail: "no compatible version for this loader and Minecraft version".to_string(),
+        detail: "has no compatible version for this loader and Minecraft version".to_string(),
     }
 }
 
-fn incompatible_conflict(canonical_id: &CanonicalId) -> PlanConflict {
+fn incompatible_conflict(canonical_id: &CanonicalId, installed: &ManifestEntry) -> PlanConflict {
+    let installed_label = installed
+        .title
+        .clone()
+        .unwrap_or_else(|| installed.project_id.clone());
     PlanConflict {
         canonical_id: Some(canonical_id.clone()),
         kind: ConflictKind::Incompatible,
-        detail: "conflicts with content already installed in this instance".to_string(),
+        detail: format!("is incompatible with {installed_label}, which is already installed"),
     }
 }
 
@@ -369,6 +502,31 @@ mod tests {
             canonical_id: id.to_string(),
             kind,
             version_id: None,
+        }
+    }
+
+    fn resolved_item(project_id: &str, incompatible_with: Option<&str>) -> ResolvedItem {
+        ResolvedItem {
+            canonical_id: CanonicalId::for_project(ProviderId::Modrinth, project_id),
+            provider: ProviderId::Modrinth,
+            project_id: project_id.to_string(),
+            kind: ContentKind::Mod,
+            version_id: "v1".to_string(),
+            version_number: "1".to_string(),
+            title: project_id.to_string(),
+            file: file(&format!("{project_id}.jar"), None),
+            dependencies: incompatible_with
+                .map(|other| {
+                    vec![ContentDependency {
+                        project_id: Some(other.to_string()),
+                        version_id: None,
+                        kind: DependencyKind::Incompatible,
+                    }]
+                })
+                .unwrap_or_default(),
+            reason: PlanReason::Selected,
+            already_installed: false,
+            update: false,
         }
     }
 
@@ -418,6 +576,127 @@ mod tests {
             version("beta-1", ReleaseChannel::Beta, vec![file("beta.jar", None)]),
         ];
         assert_eq!(pick_version(&versions, None).unwrap().id, "beta-1");
+    }
+
+    #[test]
+    fn newer_version_flags_only_strictly_newer_picks() {
+        let versions = vec![
+            version(
+                "rel-2",
+                ReleaseChannel::Release,
+                vec![file("rel2.jar", None)],
+            ),
+            version(
+                "rel-1",
+                ReleaseChannel::Release,
+                vec![file("rel1.jar", None)],
+            ),
+        ];
+        assert_eq!(newer_version(&versions, "rel-1").unwrap().id, "rel-2");
+        assert!(newer_version(&versions, "rel-2").is_none());
+    }
+
+    #[test]
+    fn newer_version_leaves_a_beta_ahead_of_the_latest_release_alone() {
+        let versions = vec![
+            version(
+                "beta-2",
+                ReleaseChannel::Beta,
+                vec![file("beta2.jar", None)],
+            ),
+            version(
+                "rel-1",
+                ReleaseChannel::Release,
+                vec![file("rel1.jar", None)],
+            ),
+        ];
+        assert!(newer_version(&versions, "beta-2").is_none());
+    }
+
+    #[test]
+    fn newer_version_offers_the_best_pick_when_current_is_not_compatible() {
+        let versions = vec![version(
+            "rel-1",
+            ReleaseChannel::Release,
+            vec![file("rel1.jar", None)],
+        )];
+        assert_eq!(newer_version(&versions, "old-gone").unwrap().id, "rel-1");
+        assert!(newer_version(&[], "old-gone").is_none());
+    }
+
+    #[test]
+    fn a_version_conflicts_only_with_other_installed_content() {
+        let mut update = version("v1", ReleaseChannel::Release, vec![file("a.jar", None)]);
+        update.dependencies.push(ContentDependency {
+            project_id: Some("XXX".to_string()),
+            version_id: None,
+            kind: DependencyKind::Incompatible,
+        });
+        let own = CanonicalId::for_project(ProviderId::Modrinth, "SELF");
+        let other = CanonicalId::for_project(ProviderId::Modrinth, "XXX");
+        let installed = vec![ManifestEntry::managed(
+            other.clone(),
+            ProviderId::Modrinth,
+            "XXX".to_string(),
+            "v1".to_string(),
+            ContentKind::Mod,
+            &file("other.jar", None),
+            Vec::new(),
+            Some("Other".to_string()),
+        )];
+
+        assert!(version_conflicts_with_installed(&update, &own, &installed));
+        assert!(
+            !version_conflicts_with_installed(&update, &other, &installed),
+            "the entry being replaced is exempt"
+        );
+        assert!(!version_conflicts_with_installed(&update, &own, &[]));
+    }
+
+    #[test]
+    fn installed_content_can_declare_the_candidate_incompatible() {
+        let candidate = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
+        let installed_id = CanonicalId::for_project(ProviderId::Modrinth, "installed");
+        let installed = vec![ManifestEntry::managed(
+            installed_id,
+            ProviderId::Modrinth,
+            "installed".to_string(),
+            "v1".to_string(),
+            ContentKind::Mod,
+            &file("installed.jar", None),
+            vec![ContentDependency {
+                project_id: Some("candidate".to_string()),
+                version_id: None,
+                kind: DependencyKind::Incompatible,
+            }],
+            Some("Installed".to_string()),
+        )];
+        let update = version(
+            "candidate-v2",
+            ReleaseChannel::Release,
+            vec![file("candidate.jar", None)],
+        );
+
+        assert!(version_conflicts_with_installed(
+            &update, &candidate, &installed
+        ));
+    }
+
+    #[test]
+    fn selected_content_is_checked_for_mutual_incompatibility() {
+        let items = vec![
+            resolved_item("first", Some("second")),
+            resolved_item("second", None),
+        ];
+
+        let conflicts = selected_incompatibility_conflicts(&items);
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].kind, ConflictKind::Incompatible);
+        assert_eq!(
+            conflicts[0].canonical_id.as_ref().map(CanonicalId::as_str),
+            Some("modrinth:first")
+        );
     }
 
     #[test]

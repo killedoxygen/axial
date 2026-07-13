@@ -46,6 +46,15 @@ pub fn router() -> Router<AppState> {
             get(handle_create_loader_builds_view),
         )
         .route(
+            "/api/v1/instances/setup/plan",
+            post(handle_instance_setup_plan),
+        )
+        .route("/api/v1/instances/setup", post(handle_instance_setup))
+        .route(
+            "/api/v1/instances/modpack",
+            post(handle_modpack_instance_setup),
+        )
+        .route(
             "/api/v1/instances/{id}",
             get(handle_get_instance)
                 .put(handle_update_instance)
@@ -102,6 +111,15 @@ async fn handle_list_instances(
     Json(instances::handle_list_instances(&state).await)
 }
 
+async fn handle_modpack_instance_setup(
+    State(state): State<AppState>,
+    Json(payload): Json<instances::ModpackInstanceSetupRequest>,
+) -> Result<Json<CreateInstanceResponse>, (StatusCode, Json<serde_json::Value>)> {
+    instances::execute_modpack_instance_setup(&state, payload)
+        .await
+        .map(Json)
+}
+
 async fn handle_get_instance(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -121,6 +139,24 @@ async fn handle_create_loader_builds_view(
     Query(query): Query<CreateLoaderBuildsViewQuery>,
 ) -> Result<Json<CreateLoaderBuildsViewResponse>, (StatusCode, Json<serde_json::Value>)> {
     instances::handle_create_loader_builds_view(&state, &query.source, &query.minecraft_version)
+        .await
+        .map(Json)
+}
+
+async fn handle_instance_setup_plan(
+    State(state): State<AppState>,
+    Json(payload): Json<instances::InstanceSetupPlanRequest>,
+) -> Result<Json<instances::InstanceSetupPlanResponse>, (StatusCode, Json<serde_json::Value>)> {
+    instances::plan_instance_setup(&state, payload)
+        .await
+        .map(Json)
+}
+
+async fn handle_instance_setup(
+    State(state): State<AppState>,
+    Json(payload): Json<instances::InstanceSetupExecuteRequest>,
+) -> Result<Json<CreateInstanceResponse>, (StatusCode, Json<serde_json::Value>)> {
+    instances::execute_instance_setup(&state, payload)
         .await
         .map(Json)
 }

@@ -190,7 +190,7 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
                   openInstanceContextMenu(e, inst);
                 }}
                 aria-label={installing ? `${inst.name}: ${installLabel}` : inst.name}
-                {...railTipAttrs(installing ? `${inst.name} · ${installLabel}` : inst.name, tooltip)}
+                {...railTipAttrs(installing ? `${inst.name}: ${installLabel}` : inst.name, tooltip)}
               >
                 <InstanceTile inst={inst} radius={12} className="cp-rail-tile-art" />
                 {installing && (

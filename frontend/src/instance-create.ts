@@ -23,6 +23,8 @@ export interface CreateInstanceArgs {
   icon: string;
   accent: string;
   initialSettings?: InitialInstanceSettings;
+  setupPlanId?: string;
+  modpack?: { canonicalId: string; versionId: string };
 }
 
 export interface CreateInstanceResult {
@@ -116,7 +118,10 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
 
   let res: CreateResponse & Partial<Instance>;
   try {
-    res = (await api('POST', '/instances', {
+    const endpoint = args.modpack ? '/instances/modpack' : args.setupPlanId ? '/instances/setup' : '/instances';
+    res = (await api('POST', endpoint, {
+      ...(args.setupPlanId ? { plan_id: args.setupPlanId } : {}),
+      ...(args.modpack ? { canonical_id: args.modpack.canonicalId, version_id: args.modpack.versionId } : {}),
       name: baseName,
       selection_id: selectionId,
       icon,

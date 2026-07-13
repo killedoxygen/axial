@@ -42,9 +42,9 @@ pub use auth_logins::{
 };
 pub use failure_memory::GuardianFailureMemoryStore;
 pub use installs::{
-    ActiveQueuedInstallEntry, InstallProgressRecord, InstallQueueEnqueueOutcome,
-    InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec, InstallSnapshot, InstallStore,
-    QueuedInstallEntry,
+    ActiveQueuedInstallEntry, ContentQueueAction, InstallProgressRecord,
+    InstallQueueEnqueueOutcome, InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec,
+    InstallSnapshot, InstallStore, QueuedContentSelection, QueuedInstallEntry,
 };
 pub use journals::OperationJournalStore;
 pub use remote_flags::{RemoteFlagRefreshOutcome, RemoteFlagStore};

@@ -4,44 +4,40 @@ import { InstanceTile } from '../../ui/InstanceVisual';
 import { navigate, route } from '../../ui-state';
 import type { EnrichedInstance } from '../../types-instance';
 
-/**
- * The standing answer to "where is this going?". Whenever Discover is entered
- * from an instance, this stays on screen: results are filtered to what fits, and
- * every action goes here. Clearing it drops back to plain browsing rather than
- * to some other page.
- */
 export function TargetBar({ instance }: { instance: EnrichedInstance }): JSX.Element {
-  const display = instance.version_display;
-
   const browseAll = (): void => {
     const current = route.value;
     if (current.name === 'content') navigate({ name: 'content', id: current.id });
     else navigate({ name: 'discover' });
   };
 
+  const summary = instance.version_display.summary_label;
+  const redundant = summary.trim().toLowerCase() === instance.name.trim().toLowerCase();
+
   return (
     <div class="cp-discover-target" role="status">
-      <InstanceTile inst={instance} radius={9} className="cp-discover-target-tile" />
-      <div class="cp-discover-target-text">
-        <div class="cp-discover-target-label">Adding to</div>
-        <div class="cp-discover-target-name" title={instance.name}>
-          {instance.name}
-        </div>
-      </div>
-      <span class="cp-discover-target-chip">
-        <Icon name="cube" size={12} />
-        {display.summary_label}
-      </span>
-      <div class="cp-discover-target-spacer" />
       <button
-        class="cp-discover-target-action"
-        onClick={() => navigate({ name: 'instance', id: instance.id })}
+        type="button"
+        class="cp-discover-target-who"
         title={`Open ${instance.name}`}
+        onClick={() => navigate({ name: 'instance', id: instance.id })}
       >
-        Open instance
+        <span class="cp-discover-target-tile">
+          <InstanceTile inst={instance} radius={999} />
+        </span>
+        <span class="cp-discover-target-text">
+          Adding to <b>{instance.name}</b>
+          {!redundant && <span class="cp-discover-target-sub">({summary})</span>}
+        </span>
       </button>
-      <button class="cp-discover-target-action" onClick={browseAll} title="Browse everything, not just what fits">
-        <Icon name="x" size={12} />
+      <span class="cp-discover-target-div" aria-hidden="true" />
+      <button
+        type="button"
+        class="cp-discover-target-leave"
+        onClick={browseAll}
+        title="Stop adding to this instance and browse everything"
+      >
+        <Icon name="x" size={13} stroke={2.2} />
         Browse all
       </button>
     </div>

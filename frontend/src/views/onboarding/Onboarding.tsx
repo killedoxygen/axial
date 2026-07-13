@@ -15,7 +15,8 @@ import { showOnboardingOverlay } from '../../ui-state';
 import { toast } from '../../toast';
 import { clampPlayerNameInput } from '../../player-name';
 import { refreshAccountSkin } from '../../player-skin';
-import { errMessage, fmtMem, getMemoryRecommendation, validateUsername } from '../../utils';
+import { fmtMem } from '../../format';
+import { errMessage, getMemoryRecommendation, validateUsername } from '../../utils';
 import { hasNativeDesktopRuntime } from '../../native';
 import { authStatusResponse, isRecord } from '../accounts/api';
 import type { AuthStatusRecord, AuthStatusState } from '../accounts/types';
@@ -494,7 +495,7 @@ export function Onboarding(): JSX.Element | null {
     headline = 'Mind if Axial keeps count?';
     subline = (
       <p class="cp-ob-subline">
-        Axial counts which features get used and whether launches succeed — always anonymous. Never your name, your
+        Axial counts which features get used and whether launches succeed, always anonymously. Never your name, your
         files, or the servers you join. Off means nothing is ever sent.
       </p>
     );

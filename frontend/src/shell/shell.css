@@ -871,6 +871,15 @@ button.cp-status-pill:active {
   transition: right 280ms cubic-bezier(0.22, 1, 0.36, 1);
   pointer-events: none;
 }
+.cp-status-pill--content {
+  --cp-status-color: color-mix(in oklab, var(--accent) 74%, var(--text));
+  --cp-status-bg: color-mix(in oklab, var(--surface) 92%, var(--accent));
+  --cp-status-accent: color-mix(in oklab, var(--accent) 66%, var(--text));
+  --cp-status-accent-soft: color-mix(in oklab, var(--accent) 16%, transparent);
+}
+button.cp-status-pill--content {
+  cursor: pointer;
+}
 .cp-status-pill--preparing {
   --cp-status-color: color-mix(in oklab, var(--accent) 56%, var(--text));
   --cp-status-bg: color-mix(in oklab, var(--surface) 90%, var(--accent));

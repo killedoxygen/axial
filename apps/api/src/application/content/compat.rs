@@ -7,8 +7,6 @@ use axial_content::{CanonicalId, ContentKind};
 use axial_minecraft::LoaderComponentId;
 use serde::Serialize;
 
-const MAX_CANDIDATES: usize = 8;
-
 /// Preference between candidates that are otherwise tied. Fabric first because
 /// it is where most of Modrinth lives.
 const LOADER_RANK: [LoaderComponentId; 4] = [
@@ -22,8 +20,13 @@ pub struct CompatItem {
     pub canonical_id: CanonicalId,
     pub title: String,
     pub kind: ContentKind,
+    pub versions: Vec<CompatVersion>,
+}
+
+pub struct CompatVersion {
     pub loaders: Vec<String>,
     pub game_versions: Vec<String>,
+    pub installable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -85,7 +88,6 @@ pub fn rank_candidates(items: &[CompatItem]) -> Vec<CompatCandidate> {
             .then_with(|| version_key(&b.game_version).cmp(&version_key(&a.game_version)))
             .then_with(|| loader_rank(&a.loader).cmp(&loader_rank(&b.loader)))
     });
-    candidates.truncate(MAX_CANDIDATES);
     candidates
 }
 
@@ -125,20 +127,29 @@ fn build_candidate(
 }
 
 fn item_supports(item: &CompatItem, loader: Option<LoaderComponentId>, game_version: &str) -> bool {
-    if !item.game_versions.iter().any(|value| value == game_version) {
-        return false;
-    }
-    if !item.kind.filters_by_loader() {
-        return true;
-    }
-    match loader {
-        Some(loader) => item
-            .loaders
+    item.versions.iter().any(|version| {
+        if !version.installable {
+            return false;
+        }
+        if !version
+            .game_versions
             .iter()
-            .filter_map(|value| LoaderComponentId::parse(value))
-            .any(|value| value == loader),
-        None => false,
-    }
+            .any(|value| value == game_version)
+        {
+            return false;
+        }
+        if !item.kind.filters_by_loader() {
+            return true;
+        }
+        match loader {
+            Some(loader) => version
+                .loaders
+                .iter()
+                .filter_map(|value| LoaderComponentId::parse(value))
+                .any(|value| value == loader),
+            None => false,
+        }
+    })
 }
 
 /// The loaders worth considering: those the picks actually ship for. When
@@ -155,8 +166,10 @@ fn candidate_loaders(items: &[CompatItem]) -> Vec<Option<LoaderComponentId>> {
             items.iter().any(|item| {
                 item.kind.filters_by_loader()
                     && item
-                        .loaders
+                        .versions
                         .iter()
+                        .filter(|version| version.installable)
+                        .flat_map(|version| version.loaders.iter())
                         .filter_map(|value| LoaderComponentId::parse(value))
                         .any(|value| value == *loader)
             })
@@ -172,7 +185,9 @@ fn candidate_loaders(items: &[CompatItem]) -> Vec<Option<LoaderComponentId>> {
 fn candidate_game_versions(items: &[CompatItem]) -> Vec<String> {
     let mut versions: Vec<String> = items
         .iter()
-        .flat_map(|item| item.game_versions.iter())
+        .flat_map(|item| item.versions.iter())
+        .filter(|version| version.installable)
+        .flat_map(|version| version.game_versions.iter())
         .filter(|value| is_release_version(value))
         .cloned()
         .collect();
@@ -212,10 +227,13 @@ mod tests {
             canonical_id: CanonicalId(format!("modrinth:{id}")),
             title: id.to_string(),
             kind,
-            loaders: loaders.iter().map(|value| value.to_string()).collect(),
-            game_versions: game_versions
+            versions: game_versions
                 .iter()
-                .map(|value| value.to_string())
+                .map(|game_version| CompatVersion {
+                    loaders: loaders.iter().map(|value| value.to_string()).collect(),
+                    game_versions: vec![game_version.to_string()],
+                    installable: true,
+                })
                 .collect(),
         }
     }
@@ -330,6 +348,84 @@ mod tests {
 
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].game_version, "1.21.6");
+    }
+
+    #[test]
+    fn loader_and_game_version_must_exist_on_the_same_published_version() {
+        let items = vec![CompatItem {
+            canonical_id: CanonicalId("modrinth:split-support".to_string()),
+            title: "split-support".to_string(),
+            kind: ContentKind::Mod,
+            versions: vec![
+                CompatVersion {
+                    loaders: vec!["fabric".to_string()],
+                    game_versions: vec!["26.2".to_string()],
+                    installable: true,
+                },
+                CompatVersion {
+                    loaders: vec!["forge".to_string()],
+                    game_versions: vec!["1.20.1".to_string()],
+                    installable: true,
+                },
+            ],
+        }];
+
+        let ranked = rank_candidates(&items);
+
+        assert!(
+            ranked.iter().any(|candidate| {
+                candidate.loader == "fabric" && candidate.game_version == "26.2"
+            })
+        );
+        assert!(ranked.iter().any(|candidate| {
+            candidate.loader == "forge" && candidate.game_version == "1.20.1"
+        }));
+        assert!(
+            !ranked.iter().any(|candidate| {
+                candidate.loader == "forge" && candidate.game_version == "26.2"
+            })
+        );
+        assert!(!ranked.iter().any(|candidate| {
+            candidate.loader == "fabric" && candidate.game_version == "1.20.1"
+        }));
+    }
+
+    #[test]
+    fn versions_without_downloadable_files_are_not_compatible() {
+        let items = vec![CompatItem {
+            canonical_id: CanonicalId("modrinth:no-file".to_string()),
+            title: "no-file".to_string(),
+            kind: ContentKind::Mod,
+            versions: vec![CompatVersion {
+                loaders: vec!["forge".to_string()],
+                game_versions: vec!["26.2".to_string()],
+                installable: false,
+            }],
+        }];
+
+        assert!(rank_candidates(&items).is_empty());
+    }
+
+    #[test]
+    fn every_compatible_release_is_returned_for_the_create_picker() {
+        let items = vec![item(
+            "wide-support",
+            ContentKind::Mod,
+            &["fabric"],
+            &[
+                "26.1", "1.21.11", "1.21.10", "1.21.9", "1.21.8", "1.21.7", "1.21.6", "1.21.5",
+                "1.21.4", "1.20.1", "1.19.4", "1.16.5",
+            ],
+        )];
+
+        let ranked = rank_candidates(&items);
+
+        assert_eq!(ranked.len(), 12);
+        assert!(
+            ranked
+                .iter()
+                .any(|candidate| candidate.game_version == "1.16.5")
+        );
     }
 
     #[test]

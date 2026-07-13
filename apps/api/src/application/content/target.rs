@@ -7,10 +7,10 @@ use super::{ContentApiError, json_error};
 use crate::state::AppState;
 use axial_content::{ContentKind, LoaderGameFilter};
 use axum::http::StatusCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TargetRef {
     Instance {
@@ -31,6 +31,24 @@ pub struct ResolveTarget {
     pub loader: String,
     pub game_version: String,
     pub supports_mods: bool,
+}
+
+fn target_from_stored_metadata(
+    loader: &str,
+    game_version: &str,
+    game_dir: PathBuf,
+) -> Option<ResolveTarget> {
+    let game_version = game_version.trim();
+    if game_version.is_empty() {
+        return None;
+    }
+    let loader = loader.trim();
+    Some(ResolveTarget {
+        game_dir: Some(game_dir),
+        loader: loader.to_string(),
+        game_version: game_version.to_string(),
+        supports_mods: !loader.is_empty() && loader != "vanilla",
+    })
 }
 
 impl ResolveTarget {
@@ -86,6 +104,13 @@ pub async fn instance_target(
         .instances()
         .get(instance_id)
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "instance not found"))?;
+    if let Some(target) = target_from_stored_metadata(
+        &instance.loader_key,
+        &instance.minecraft_version,
+        state.instances().game_dir(&instance.id),
+    ) {
+        return Ok(target);
+    }
     let versions = crate::application::version::installed_versions(state)
         .await?
         .versions;
@@ -149,5 +174,15 @@ mod tests {
         let vanilla = target("vanilla", false);
         assert_eq!(vanilla.filter_for(ContentKind::Mod).loader, None);
         assert_eq!(vanilla.filter_for(ContentKind::ResourcePack).loader, None);
+    }
+
+    #[test]
+    fn stored_loader_metadata_is_usable_before_the_loader_finishes_installing() {
+        let target = target_from_stored_metadata(" forge ", " 26.2 ", PathBuf::from("/instance"))
+            .expect("stored target");
+
+        assert_eq!(target.loader, "forge");
+        assert_eq!(target.game_version, "26.2");
+        assert!(target.supports_mods);
     }
 }

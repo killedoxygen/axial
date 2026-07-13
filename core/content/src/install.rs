@@ -1,6 +1,7 @@
 use crate::error::{ContentError, ContentResult};
 use crate::manifest::{ContentManifest, ManifestEntry};
 use crate::model::{CanonicalId, ContentDependency, ContentKind, FileRef, ProviderId};
+use crate::transaction::{FileTransaction, StagingGuard, contained_path};
 use axial_minecraft::download::{
     DownloadProgress, ExpectedIntegrity, download_file_with_client_report,
 };
@@ -36,6 +37,8 @@ where
 {
     let mut manifest = ContentManifest::load(game_dir)?;
     let total = files.len() as i32;
+    let staging = StagingGuard::create(game_dir, "axial-content-stage")?;
+    let mut relative_paths = Vec::with_capacity(files.len());
 
     for (index, planned) in files.iter().enumerate() {
         let Some(kind_dir) = planned.kind.install_subdir() else {
@@ -44,9 +47,11 @@ where
                 planned.kind.as_str()
             )));
         };
-        let subdir = game_dir.join(kind_dir);
-        fs::create_dir_all(&subdir)?;
-        let destination = subdir.join(&planned.file.filename);
+        let relative = format!("{kind_dir}/{}", planned.file.filename);
+        let destination = contained_path(staging.path(), &relative)?;
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
 
         on_progress(progress(
             "download",
@@ -63,6 +68,21 @@ where
             .await
             .map_err(|error| ContentError::Download(error.into_download_error().to_string()))?;
 
+        relative_paths.push(relative);
+    }
+
+    on_progress(progress("commit", total, total, None));
+    let transaction = FileTransaction::apply(game_dir, staging.transfer(), &relative_paths)?;
+    let mut stale_files = Vec::new();
+
+    for planned in files {
+        let kind_dir = planned.kind.install_subdir().ok_or_else(|| {
+            ContentError::Invalid(format!(
+                "{} is not installable as a single file",
+                planned.kind.as_str()
+            ))
+        })?;
+        let subdir = game_dir.join(kind_dir);
         let entry = ManifestEntry::managed(
             planned.canonical_id.clone(),
             planned.provider,
@@ -74,11 +94,18 @@ where
             planned.title.clone(),
         );
         if let Some(stale) = manifest.upsert(entry) {
-            remove_content_file(&subdir, &stale);
+            stale_files.push((subdir, stale));
         }
     }
 
-    manifest.save(game_dir)?;
+    if let Err(error) = manifest.save(game_dir) {
+        transaction.rollback();
+        return Err(error);
+    }
+    transaction.commit();
+    for (subdir, stale) in stale_files {
+        remove_content_file(&subdir, &stale);
+    }
     on_progress(done(total));
     Ok(manifest)
 }

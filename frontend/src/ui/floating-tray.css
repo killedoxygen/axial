@@ -1,4 +1,4 @@
-.cp-fpill-float {
+.cp-floating-tray-position {
   position: fixed;
   left: 68px;
   right: 0;
@@ -10,7 +10,7 @@
   padding: 0 24px;
 }
 
-.cp-fpill {
+.cp-floating-tray {
   pointer-events: auto;
   max-width: min(720px, 100%);
   min-height: 48px;
@@ -26,7 +26,15 @@
     0 0 0 1px var(--line);
 }
 
-.cp-fpill-divider {
+.cp-floating-tray-label {
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.cp-floating-tray-divider {
   width: 1px;
   height: 24px;
   margin: 0 2px;
@@ -34,8 +42,15 @@
   flex: 0 0 auto;
 }
 
+.cp-floating-tray-reserve {
+  flex: 0 0 auto;
+  width: 100%;
+  pointer-events: none;
+  animation: none !important;
+}
+
 @media (max-width: 820px) {
-  .cp-fpill {
+  .cp-floating-tray {
     flex-wrap: wrap;
     justify-content: center;
   }

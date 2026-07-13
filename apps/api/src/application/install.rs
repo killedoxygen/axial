@@ -13,7 +13,9 @@ mod repair;
 mod stream;
 
 use super::InstallVersionCommand;
-use crate::application::instances::invalidate_create_view_installed_scan;
+use crate::application::instances::{
+    instance_version_is_installed_and_launchable, invalidate_create_view_installed_scan,
+};
 use crate::guardian::{GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus};
 use crate::observability::{
     operation_journal_proof_record,
@@ -24,9 +26,9 @@ use crate::observability::{
 use crate::state::AppState;
 use crate::state::contracts::OperationId;
 use crate::state::{
-    ActiveQueuedInstallEntry, InstallQueueEnqueueOutcome, InstallQueuePlacement,
-    InstallQueueSnapshot, InstallQueueSpec, InstallStore, OperationJournalStore,
-    QueuedInstallEntry,
+    ActiveQueuedInstallEntry, ContentQueueAction, InstallQueueEnqueueOutcome,
+    InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec, InstallStore,
+    OperationJournalStore, QueuedContentSelection, QueuedInstallEntry,
 };
 use axial_minecraft::{
     DownloadError, DownloadProgress, Downloader, LoaderComponentId,
@@ -60,11 +62,12 @@ pub use loader::{loader_builds, loader_components, loader_error_response, loader
 pub use model::{
     InstallActionViewModel, InstallFailureViewModel, InstallGuardianOutcomeSummary,
     InstallGuardianRepairSummary, InstallProgressStepViewModel, InstallProgressViewModel,
-    InstallQueueActiveViewModel, InstallQueueInstallItemViewModel, InstallQueueLoaderItemViewModel,
-    InstallQueueNoticeViewModel, InstallQueueRequest, InstallQueueStateResponse,
-    InstallQueueViewModel, InstallQueuedItemViewModel, InstallStartResponse, InstallStatusResponse,
-    InstallVersionStaging, InstallVersionStartRequest, LoaderBuildsRequest,
-    LoaderInstallStartRequest,
+    InstallQueueActiveViewModel, InstallQueueContentActionRequest,
+    InstallQueueContentItemViewModel, InstallQueueContentSelection,
+    InstallQueueInstallItemViewModel, InstallQueueLoaderItemViewModel, InstallQueueNoticeViewModel,
+    InstallQueueRequest, InstallQueueStateResponse, InstallQueueViewModel,
+    InstallQueuedItemViewModel, InstallStartResponse, InstallStatusResponse, InstallVersionStaging,
+    InstallVersionStartRequest, LoaderBuildsRequest, LoaderInstallStartRequest,
 };
 use operation::{
     InstallProgressCoalescer, install_failure_point_from_journal, install_journal_is_terminal,
@@ -501,14 +504,28 @@ pub async fn enqueue_install(
     state: &AppState,
     request: InstallQueueRequest,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    enqueue_install_with_placement(state, request, InstallQueuePlacement::Back).await
+    enqueue_install_with_dependency(state, request, None).await
+}
+
+pub(crate) async fn enqueue_install_with_dependency(
+    state: &AppState,
+    request: InstallQueueRequest,
+    prerequisite_queue_id: Option<String>,
+) -> Result<InstallQueueStateResponse, InstallApplicationError> {
+    enqueue_install_with_placement(
+        state,
+        request,
+        InstallQueuePlacement::Back,
+        prerequisite_queue_id,
+    )
+    .await
 }
 
 pub async fn retry_install(
     state: &AppState,
     request: InstallQueueRequest,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    enqueue_install_with_placement(state, request, InstallQueuePlacement::Front).await
+    enqueue_install_with_placement(state, request, InstallQueuePlacement::Front, None).await
 }
 
 pub async fn remove_queued_install(
@@ -516,6 +533,19 @@ pub async fn remove_queued_install(
     queue_id: &str,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
     let removed = state.installs().remove_queued_install(queue_id).await;
+    if let Some(QueuedInstallEntry {
+        spec:
+            InstallQueueSpec::Content {
+                instance_id,
+                action,
+                ..
+            },
+        ..
+    }) = removed.as_ref()
+        && content_action_owns_instance(action)
+    {
+        let _ = state.instances().remove(instance_id, true);
+    }
     let notice = removed
         .as_ref()
         .map(|entry| {
@@ -537,12 +567,26 @@ pub async fn remove_queued_install(
     Ok(install_queue_state_response(state, notice, None).await)
 }
 
+fn content_action_owns_instance(action: &ContentQueueAction) -> bool {
+    matches!(
+        action,
+        ContentQueueAction::Install {
+            remove_instance_on_failure: true,
+            ..
+        } | ContentQueueAction::Modpack {
+            remove_instance_on_failure: true,
+            ..
+        }
+    )
+}
+
 async fn enqueue_install_with_placement(
     state: &AppState,
     request: InstallQueueRequest,
     placement: InstallQueuePlacement,
+    prerequisite_queue_id: Option<String>,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    let spec = install_queue_spec_from_request(state, request).await?;
+    let spec = install_queue_spec_from_request(state, request, prerequisite_queue_id).await?;
     let queue_id = generate_install_id("install-queue");
     let outcome = state
         .installs()
@@ -558,6 +602,7 @@ async fn enqueue_install_with_placement(
 async fn install_queue_spec_from_request(
     state: &AppState,
     request: InstallQueueRequest,
+    prerequisite_queue_id: Option<String>,
 ) -> Result<InstallQueueSpec, InstallApplicationError> {
     match request.kind.trim() {
         "vanilla" | "minecraft" => {
@@ -616,6 +661,98 @@ async fn install_queue_spec_from_request(
                 build.loader_version,
             ))
         }
+        "content" => {
+            let instance_id = request.instance_id.trim().to_string();
+            if instance_id.is_empty() || state.instances().get(&instance_id).is_none() {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "instance not found" })),
+                ));
+            }
+            let action = match request.content_action.ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "content_action is required" })),
+                )
+            })? {
+                InstallQueueContentActionRequest::Install {
+                    selections,
+                    allow_incompatible,
+                    remove_instance_on_failure,
+                } => {
+                    if selections.is_empty() || selections.len() > 40 {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "content selections must contain between 1 and 40 items"
+                            })),
+                        ));
+                    }
+                    ContentQueueAction::Install {
+                        selections: selections
+                            .into_iter()
+                            .map(|selection| QueuedContentSelection {
+                                canonical_id: selection.canonical_id.trim().to_string(),
+                                kind: selection.kind,
+                                version_id: selection
+                                    .version_id
+                                    .filter(|value| !value.trim().is_empty()),
+                            })
+                            .collect(),
+                        allow_incompatible,
+                        remove_instance_on_failure,
+                    }
+                }
+                InstallQueueContentActionRequest::Uninstall { canonical_id } => {
+                    let canonical_id = canonical_id.trim().to_string();
+                    if canonical_id.is_empty() {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": "canonical_id is required" })),
+                        ));
+                    }
+                    ContentQueueAction::Uninstall { canonical_id }
+                }
+                InstallQueueContentActionRequest::Modpack {
+                    canonical_id,
+                    version_id,
+                    selected_paths,
+                    include_overrides,
+                    remove_instance_on_failure,
+                } => {
+                    let canonical_id = canonical_id.trim().to_string();
+                    let version_id = version_id.trim().to_string();
+                    if canonical_id.is_empty()
+                        || version_id.is_empty()
+                        || selected_paths.len() > 500
+                    {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": "invalid modpack operation" })),
+                        ));
+                    }
+                    ContentQueueAction::Modpack {
+                        canonical_id,
+                        version_id,
+                        selected_paths,
+                        include_overrides,
+                        remove_instance_on_failure,
+                    }
+                }
+            };
+            let label = request.label.trim();
+            let label = if label.is_empty() {
+                "Instance content".to_string()
+            } else {
+                label.chars().take(120).collect()
+            };
+            Ok(InstallQueueSpec::Content {
+                instance_id,
+                label,
+                action,
+                prerequisite_queue_id,
+            })
+        }
         _ => Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "install kind is required" })),
@@ -626,15 +763,43 @@ async fn install_queue_spec_from_request(
 async fn maybe_start_next_queued_install(
     state: &AppState,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError> {
-    let Some(entry) = state.installs().reserve_next_queued_install().await else {
-        return Ok(None);
+    let entry = loop {
+        let Some(entry) = state.installs().reserve_next_queued_install().await else {
+            return Ok(None);
+        };
+        let dependency = match &entry.spec {
+            InstallQueueSpec::Content {
+                prerequisite_queue_id,
+                ..
+            } => prerequisite_queue_id.as_deref(),
+            _ => None,
+        };
+        if let Some(dependency) = dependency
+            && state.installs().queued_install_succeeded(dependency).await != Some(true)
+        {
+            state
+                .installs()
+                .complete_reserved_queued_install(&entry.queue_id, false)
+                .await;
+            if let InstallQueueSpec::Content {
+                instance_id,
+                action,
+                ..
+            } = &entry.spec
+                && content_action_owns_instance(action)
+            {
+                let _ = state.instances().remove(instance_id, true);
+            }
+            continue;
+        }
+        break entry;
     };
     let started = match start_queued_install(state, &entry.spec).await {
         Ok(started) => started,
         Err(error) => {
             state
                 .installs()
-                .discard_active_queued_install(&entry.queue_id)
+                .complete_reserved_queued_install(&entry.queue_id, false)
                 .await;
             return Err(error);
         }
@@ -678,19 +843,207 @@ async fn start_queued_install(
             )
             .await
         }
+        InstallQueueSpec::Content {
+            instance_id,
+            label,
+            action,
+            ..
+        } => start_content_operation(state, instance_id, label, action).await,
     }
+}
+
+async fn start_content_operation(
+    state: &AppState,
+    instance_id: &str,
+    label: &str,
+    action: &ContentQueueAction,
+) -> Result<InstallStartResponse, InstallApplicationError> {
+    let install_id = generate_install_id("content");
+    state.installs().insert(install_id.clone()).await;
+    let operation_id = install_operation_id(&install_id);
+    let worker_state = state.clone();
+    let worker_store = state.installs().clone();
+    let worker_install_id = install_id.clone();
+    let worker_instance_id = instance_id.to_string();
+    let worker_action = action.clone();
+    let interrupted_state = state.clone();
+    let interrupted_instance_id = instance_id.to_string();
+    let remove_instance_if_interrupted = content_action_owns_instance(action);
+
+    InstallStore::spawn_tracked_worker_with_interrupt_handler(
+        state.installs().clone(),
+        install_id.clone(),
+        content_interrupted_progress(),
+        async move {
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+            let progress_store = worker_store.clone();
+            let progress_install_id = worker_install_id.clone();
+            let progress_task = tokio::spawn(async move {
+                while let Some(progress) = progress_rx.recv().await {
+                    progress_store
+                        .emit(&progress_install_id, sanitize_install_progress(progress))
+                        .await;
+                }
+            });
+
+            let result = if content_action_owns_instance(&worker_action)
+                && !instance_version_is_installed_and_launchable(&worker_state, &worker_instance_id)
+            {
+                Err((
+                    StatusCode::PRECONDITION_FAILED,
+                    Json(serde_json::json!({
+                        "error": "Minecraft or the selected mod loader did not finish installing. The incomplete instance was removed."
+                    })),
+                ))
+            } else {
+                match &worker_action {
+                    ContentQueueAction::Install {
+                        selections,
+                        allow_incompatible,
+                        ..
+                    } => {
+                        let request = crate::application::content::ContentInstallRequest {
+                            instance_id: worker_instance_id.clone(),
+                            selections: selections
+                                .iter()
+                                .map(|selection| crate::application::content::ContentSelection {
+                                    canonical_id: selection.canonical_id.clone(),
+                                    kind: selection.kind,
+                                    version_id: selection.version_id.clone(),
+                                })
+                                .collect(),
+                            allow_incompatible: *allow_incompatible,
+                        };
+                        crate::application::content::execute_content_install(
+                            &worker_state,
+                            request,
+                            |progress| {
+                                let _ = progress_tx.send(progress);
+                            },
+                        )
+                        .await
+                    }
+                    ContentQueueAction::Uninstall { canonical_id } => {
+                        let _ = progress_tx.send(content_progress("removing", 0, 1, false, None));
+                        crate::application::content::execute_content_uninstall(
+                            &worker_state,
+                            &worker_instance_id,
+                            canonical_id,
+                        )
+                        .await
+                    }
+                    ContentQueueAction::Modpack {
+                        canonical_id,
+                        version_id,
+                        selected_paths,
+                        include_overrides,
+                        ..
+                    } => crate::application::content::execute_modpack_install(
+                        &worker_state,
+                        crate::application::content::ModpackInstallRequest {
+                            instance_id: worker_instance_id.clone(),
+                            canonical_id: canonical_id.clone(),
+                            version_id: Some(version_id.clone()),
+                            selected_paths: selected_paths.clone(),
+                            include_overrides: *include_overrides,
+                            remove_instance_on_failure: false,
+                        },
+                        |progress| {
+                            let _ = progress_tx.send(progress);
+                        },
+                    )
+                    .await
+                    .map(|_| ()),
+                }
+            };
+
+            let terminal = match result {
+                Ok(()) => content_progress("done", 1, 1, true, None),
+                Err((_, Json(body))) => {
+                    if content_action_owns_instance(&worker_action) {
+                        let _ = worker_state.instances().remove(&worker_instance_id, true);
+                    }
+                    let message = body
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(INSTALL_FAILURE_MESSAGE)
+                        .to_string();
+                    content_progress("error", 0, 1, true, Some(message))
+                }
+            };
+            let _ = progress_tx.send(terminal);
+            drop(progress_tx);
+            let _ = progress_task.await;
+        },
+        move |_| {
+            if remove_instance_if_interrupted {
+                let _ = interrupted_state
+                    .instances()
+                    .remove(&interrupted_instance_id, true);
+            }
+        },
+    );
+
+    Ok(InstallStartResponse {
+        install_id,
+        operation_id,
+        view_model: InstallProgressViewModel {
+            phase_id: "starting".to_string(),
+            label: format!("Preparing {label}"),
+            progress_pct: 0,
+            terminal: false,
+            failed: false,
+            active_step: None,
+        },
+    })
+}
+
+fn content_progress(
+    phase: &str,
+    current: i32,
+    total: i32,
+    done: bool,
+    error: Option<String>,
+) -> DownloadProgress {
+    DownloadProgress {
+        phase: phase.to_string(),
+        current,
+        total,
+        file: None,
+        error,
+        done,
+        bytes_done: None,
+        bytes_total: None,
+    }
+}
+
+fn content_interrupted_progress() -> DownloadProgress {
+    content_progress(
+        "error",
+        0,
+        1,
+        true,
+        Some("Content operation stopped before completing. Try again.".to_string()),
+    )
 }
 
 fn spawn_install_queue_monitor(state: AppState, install_id: String) {
     tokio::spawn(async move {
-        wait_for_install_terminal(&state, &install_id).await;
+        let succeeded = wait_for_install_terminal(&state, &install_id).await;
         invalidate_create_view_installed_scan();
         state
             .installs()
-            .clear_active_queued_install(&install_id)
+            .complete_active_queued_install(&install_id, succeeded)
             .await;
-        if let Ok(Some(started_install)) = maybe_start_next_queued_install(&state).await {
-            spawn_install_queue_monitor(state.clone(), started_install.install_id);
+        loop {
+            match maybe_start_next_queued_install(&state).await {
+                Ok(Some(started_install)) => {
+                    spawn_install_queue_monitor(state.clone(), started_install.install_id);
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => continue,
+            }
         }
     });
 }
@@ -704,10 +1057,10 @@ fn spawn_install_queue_monitor_for_started(
     }
 }
 
-async fn wait_for_install_terminal(state: &AppState, install_id: &str) {
+async fn wait_for_install_terminal(state: &AppState, install_id: &str) -> bool {
     let Some((snapshot, mut receiver)) = state.installs().subscribe_records(install_id).await
     else {
-        return;
+        return false;
     };
     if snapshot.done
         || snapshot
@@ -715,14 +1068,17 @@ async fn wait_for_install_terminal(state: &AppState, install_id: &str) {
             .as_ref()
             .is_some_and(|record| record.progress.done)
     {
-        return;
+        return snapshot
+            .latest
+            .as_ref()
+            .is_some_and(|record| record.progress.error.is_none());
     }
     loop {
         match receiver.recv().await {
-            Ok(record) if record.progress.done => return,
+            Ok(record) if record.progress.done => return record.progress.error.is_none(),
             Ok(_) => {}
             Err(RecvError::Lagged(_)) => {}
-            Err(RecvError::Closed) => return,
+            Err(RecvError::Closed) => return false,
         }
     }
 }
@@ -893,7 +1249,7 @@ fn install_queue_view_model(
         "Launch an instance that needs a download, or install a new Minecraft version, and it will show up here."
             .to_string()
     };
-    let active_queued_count_label = (queued_count > 0).then(|| format!(" · {queued_count_label}"));
+    let active_queued_count_label = (queued_count > 0).then(|| format!(", {queued_count_label}"));
     InstallQueueViewModel {
         state_id: state_id.to_string(),
         status_label: if active.is_some() {
@@ -971,6 +1327,7 @@ fn install_queue_kind(spec: &InstallQueueSpec) -> &'static str {
     match spec {
         InstallQueueSpec::Vanilla { .. } => "vanilla",
         InstallQueueSpec::Loader { .. } => "loader",
+        InstallQueueSpec::Content { .. } => "content",
     }
 }
 
@@ -1001,6 +1358,7 @@ fn install_queue_label(spec: &InstallQueueSpec) -> String {
                 format!("{label} for Minecraft {}", minecraft_version.trim())
             }
         }
+        InstallQueueSpec::Content { label, .. } => label.clone(),
     }
 }
 
@@ -1009,6 +1367,7 @@ fn install_queue_install_item(spec: &InstallQueueSpec) -> InstallQueueInstallIte
         InstallQueueSpec::Vanilla { version_id, .. } => InstallQueueInstallItemViewModel {
             version_id: version_id.clone(),
             loader: None,
+            content: None,
         },
         InstallQueueSpec::Loader {
             component_id,
@@ -1024,6 +1383,58 @@ fn install_queue_install_item(spec: &InstallQueueSpec) -> InstallQueueInstallIte
                 minecraft_version: minecraft_version.clone(),
                 loader_version: loader_version.clone(),
             }),
+            content: None,
+        },
+        InstallQueueSpec::Content {
+            instance_id,
+            action,
+            ..
+        } => InstallQueueInstallItemViewModel {
+            version_id: instance_id.clone(),
+            loader: None,
+            content: Some(InstallQueueContentItemViewModel {
+                instance_id: instance_id.clone(),
+                action: content_action_request(action),
+            }),
+        },
+    }
+}
+
+fn content_action_request(action: &ContentQueueAction) -> InstallQueueContentActionRequest {
+    match action {
+        ContentQueueAction::Install {
+            selections,
+            allow_incompatible,
+            remove_instance_on_failure,
+        } => InstallQueueContentActionRequest::Install {
+            selections: selections
+                .iter()
+                .map(|selection| InstallQueueContentSelection {
+                    canonical_id: selection.canonical_id.clone(),
+                    kind: selection.kind,
+                    version_id: selection.version_id.clone(),
+                })
+                .collect(),
+            allow_incompatible: *allow_incompatible,
+            remove_instance_on_failure: *remove_instance_on_failure,
+        },
+        ContentQueueAction::Uninstall { canonical_id } => {
+            InstallQueueContentActionRequest::Uninstall {
+                canonical_id: canonical_id.clone(),
+            }
+        }
+        ContentQueueAction::Modpack {
+            canonical_id,
+            version_id,
+            selected_paths,
+            include_overrides,
+            remove_instance_on_failure,
+        } => InstallQueueContentActionRequest::Modpack {
+            canonical_id: canonical_id.clone(),
+            version_id: version_id.clone(),
+            selected_paths: selected_paths.clone(),
+            include_overrides: *include_overrides,
+            remove_instance_on_failure: *remove_instance_on_failure,
         },
     }
 }

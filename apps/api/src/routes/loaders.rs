@@ -86,6 +86,7 @@ async fn handle_loader_install(
             manifest_url: String::new(),
             component_id: payload.component_id,
             build_id: payload.build_id,
+            ..InstallQueueRequest::default()
         },
     )
     .await

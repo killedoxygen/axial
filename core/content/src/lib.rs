@@ -6,12 +6,13 @@ pub mod modrinth;
 pub mod pack;
 pub mod provider;
 pub mod registry;
+mod transaction;
 
 pub use error::{ContentError, ContentResult};
 pub use install::{PlannedFile, install_and_record, uninstall};
 pub use manifest::{
-    ContentManifest, EntrySource, ManifestEntry, ReconcileReport, UnmanagedFile, reconcile,
-    sha512_file,
+    ContentManifest, EntrySource, ManifestEntry, ReconcileReport, UnidentifiedRecord,
+    UnmanagedFile, reconcile, sha512_file,
 };
 pub use model::{
     CanonicalContent, CanonicalId, ContentDependency, ContentDetail, ContentKind, ContentVersion,
@@ -19,6 +20,9 @@ pub use model::{
     VersionIdentity,
 };
 pub use modrinth::ModrinthProvider;
-pub use pack::{PackFile, PackIndex, PackInstallReport, PackLoader, install_pack, read_pack_index};
+pub use pack::{
+    PackFile, PackIndex, PackInstallReport, PackLoader, install_pack, install_pack_files,
+    install_pack_files_with_finalize, read_pack_index,
+};
 pub use provider::{ContentProvider, ContentQuery, LoaderGameFilter, Page, SortOrder};
 pub use registry::ContentRegistry;

@@ -17,7 +17,7 @@ import {
   updateFlow,
   updateRestartRequested,
 } from '../updater';
-import { formatBytes } from '../utils';
+import { formatBytes } from '../format';
 
 function displayVersion(version: string): string {
   if (!version) return '';
@@ -97,8 +97,8 @@ function UpdateCard({ latest, onClose }: { latest: string; onClose: () => void }
   let subTone: 'default' | 'error' = 'default';
   if (phase === 'downloading') {
     sub = flow.total_bytes
-      ? `${formatBytes(flow.received_bytes)} of ${formatBytes(flow.total_bytes)} · then restarts`
-      : `${formatBytes(flow.received_bytes)} · then restarts`;
+      ? `${formatBytes(flow.received_bytes)} of ${formatBytes(flow.total_bytes)}, then restarts`
+      : `${formatBytes(flow.received_bytes)}, then restarts`;
   } else if (phase === 'applying') {
     sub = 'Finishing up. Axial will restart.';
   } else if (phase === 'ready') {

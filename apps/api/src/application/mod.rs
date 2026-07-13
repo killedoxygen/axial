@@ -64,20 +64,23 @@ pub use commands::{
 pub use config::{ConfigPatch, current_config, update_config};
 pub use content::{
     ContentApiError, ContentCompatRequest, ContentCompatResponse, ContentInstallRequest,
-    ContentPlanRequest, ContentSearchParams, InstanceContentResponse, ModpackInstallRequest,
-    ModpackInstallResponse, ModpackTarget, ResolutionPlan, SearchHit, content_compatibility,
-    content_detail, content_install, content_plan, content_search, content_uninstall,
-    instance_content,
-    pack::{modpack_install, modpack_target},
+    ContentPlanRequest, ContentSearchParams, ContentUpdatesResponse, InstanceContentResponse,
+    ModpackFilesPlan, ModpackInstallRequest, ModpackInstallResponse, ModpackTarget, ResolutionPlan,
+    SearchHit, content_compatibility, content_detail, content_plan, content_search,
+    instance_content, instance_content_updates,
+    pack::{modpack_files, modpack_target, queue_modpack_install},
+    queue_content_install, queue_content_uninstall,
 };
 pub use dev::{DevCleanupResponse, DevFlushResponse, dev_cleanup_versions, dev_flush};
 pub use flags::{
     FlagOverridePatch, FlagSource, FlagViewModel, FlagsResponse, list_flags, update_flag,
 };
+pub(crate) use install::enqueue_install_with_dependency;
 pub use install::{
     InstallApplicationError, InstallGuardianRepairSummary, InstallProgressStepViewModel,
-    InstallProgressViewModel, InstallQueueRequest, InstallQueueStateResponse, InstallStartResponse,
-    InstallStatusResponse, InstallVersionStaging, InstallVersionStartRequest, LoaderBuildsRequest,
+    InstallProgressViewModel, InstallQueueContentActionRequest, InstallQueueContentSelection,
+    InstallQueueRequest, InstallQueueStateResponse, InstallStartResponse, InstallStatusResponse,
+    InstallVersionStaging, InstallVersionStartRequest, LoaderBuildsRequest,
     LoaderInstallStartRequest, begin_install_operation_journal, enqueue_install,
     install_events_stream, install_guardian_repair_summary_from_journal, install_operation_id,
     install_queue_status, install_status, loader_builds, loader_components, loader_error_response,
