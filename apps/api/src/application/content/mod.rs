@@ -22,8 +22,9 @@ use crate::application::{
 use crate::state::AppState;
 use axial_content::{
     CanonicalContent, CanonicalId, ContentDetail, ContentError, ContentKind, ContentManifest,
-    ContentQuery, EntrySource, ManifestEntry, Page, ProviderId, SortOrder, UnidentifiedRecord,
-    UnmanagedFile, entry_file_present, install_and_record, reconcile, sha512_file, uninstall,
+    ContentQuery, ContentVersion, EntrySource, ManifestEntry, Page, ProviderId, SortOrder,
+    UnidentifiedRecord, UnmanagedFile, entry_file_present, install_and_record, reconcile,
+    sha512_file, uninstall,
 };
 use axial_minecraft::DownloadProgress;
 use axum::{Json, http::StatusCode};
@@ -42,7 +43,10 @@ pub use resolve::{ConflictKind, PlanConflict, PlanItem, PlanReason, ResolutionPl
 pub use target::TargetRef;
 
 use futures_util::{StreamExt, stream};
-use resolve::{newer_version, resolve, version_conflicts_with_installed};
+use resolve::{
+    canonicalize_version_only_dependencies, has_unresolved_version_only_incompatibility,
+    newer_version, resolve, version_conflicts_with_installed,
+};
 use target::{require_instance_game_dir, resolve_target};
 
 pub type ContentApiError = (StatusCode, Json<serde_json::Value>);
@@ -574,7 +578,7 @@ pub async fn instance_content_updates(
     let installed = manifest.entries.clone();
     let installed = &installed;
 
-    let mut updates: Vec<ContentUpdate> = stream::iter(
+    let candidates: Vec<(ManifestEntry, ContentVersion)> = stream::iter(
         manifest
             .entries
             .into_iter()
@@ -587,18 +591,8 @@ pub async fn instance_content_updates(
                         .versions(&entry.canonical_id, &filter)
                         .await
                         .ok()?;
-                    let latest = newer_version(&versions, &entry.version_id)?;
-                    if version_conflicts_with_installed(latest, &entry.canonical_id, installed) {
-                        return None;
-                    }
-                    Some(ContentUpdate {
-                        canonical_id: entry.canonical_id,
-                        title: entry.title,
-                        kind: entry.kind,
-                        current_version_id: entry.version_id,
-                        latest_version_id: latest.id.clone(),
-                        latest_version_number: latest.version_number.clone(),
-                    })
+                    let latest = newer_version(&versions, &entry.version_id)?.clone();
+                    Some((entry, latest))
                 }
             }),
     )
@@ -606,6 +600,45 @@ pub async fn instance_content_updates(
     .filter_map(|update| async move { update })
     .collect()
     .await;
+
+    let version_only_dependency_ids: Vec<String> = candidates
+        .iter()
+        .flat_map(|(_, version)| version.dependencies.iter())
+        .filter(|dependency| dependency.project_id.is_none())
+        .filter_map(|dependency| dependency.version_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let dependency_versions = if version_only_dependency_ids.is_empty() {
+        HashMap::new()
+    } else {
+        state
+            .content()
+            .version_identities(&version_only_dependency_ids)
+            .await
+            .unwrap_or_default()
+    };
+
+    let mut updates: Vec<ContentUpdate> = candidates
+        .into_iter()
+        .filter_map(|(entry, mut latest)| {
+            latest.dependencies =
+                canonicalize_version_only_dependencies(&latest.dependencies, &dependency_versions);
+            if has_unresolved_version_only_incompatibility(&latest.dependencies)
+                || version_conflicts_with_installed(&latest, &entry.canonical_id, installed)
+            {
+                return None;
+            }
+            Some(ContentUpdate {
+                canonical_id: entry.canonical_id,
+                title: entry.title,
+                kind: entry.kind,
+                current_version_id: entry.version_id,
+                latest_version_id: latest.id,
+                latest_version_number: latest.version_number,
+            })
+        })
+        .collect();
 
     updates.sort_by(|a, b| {
         a.title

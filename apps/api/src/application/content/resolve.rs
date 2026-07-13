@@ -407,10 +407,11 @@ async fn resolve_pass(
                             CanonicalId::for_project(ProviderId::Modrinth, project_id);
                         if let Some(entry) = manifest.find(&incompatible)
                             && installed_entry_present(entry, target.game_dir.as_deref())
-                            && dependency
-                                .version_id
-                                .as_deref()
-                                .is_none_or(|version_id| entry.version_id == version_id)
+                            && incompatible_dependency_matches(
+                                dependency,
+                                &entry.project_id,
+                                &entry.version_id,
+                            )
                             && incompatibilities
                                 .insert((canonical_id.clone(), entry.canonical_id.clone()))
                         {
@@ -422,9 +423,12 @@ async fn resolve_pass(
             }
         }
 
-        for entry in
-            installed_entries_incompatible_with(manifest, &canonical_id, target.game_dir.as_deref())
-        {
+        for entry in installed_entries_incompatible_with(
+            manifest,
+            &canonical_id,
+            &version.id,
+            target.game_dir.as_deref(),
+        ) {
             if incompatibilities.insert((canonical_id.clone(), entry.canonical_id.clone())) {
                 conflicts.push(incompatible_conflict(&canonical_id, entry));
             }
@@ -464,7 +468,7 @@ async fn resolve_pass(
     })
 }
 
-fn canonicalize_version_only_dependencies(
+pub(super) fn canonicalize_version_only_dependencies(
     dependencies: &[ContentDependency],
     versions: &HashMap<String, VersionIdentity>,
 ) -> Vec<ContentDependency> {
@@ -483,6 +487,29 @@ fn canonicalize_version_only_dependencies(
             dependency
         })
         .collect()
+}
+
+pub(super) fn has_unresolved_version_only_incompatibility(
+    dependencies: &[ContentDependency],
+) -> bool {
+    dependencies.iter().any(|dependency| {
+        dependency.kind == DependencyKind::Incompatible
+            && dependency.project_id.is_none()
+            && dependency.version_id.is_some()
+    })
+}
+
+fn incompatible_dependency_matches(
+    dependency: &ContentDependency,
+    project_id: &str,
+    version_id: &str,
+) -> bool {
+    dependency.kind == DependencyKind::Incompatible
+        && dependency.project_id.as_deref() == Some(project_id)
+        && dependency
+            .version_id
+            .as_deref()
+            .is_none_or(|exact_version| exact_version == version_id)
 }
 
 fn exact_requirement_needs_retry(
@@ -514,20 +541,19 @@ fn selected_incompatibility_conflicts(items: &[ResolvedItem]) -> Vec<PlanConflic
     let mut conflicts = Vec::new();
     for item in items {
         for dependency in &item.dependencies {
-            if dependency.kind != DependencyKind::Incompatible {
-                continue;
-            }
             let Some(project_id) = dependency.project_id.as_deref() else {
                 continue;
             };
             if !resolved_projects.contains(project_id) {
                 continue;
             }
-            if let Some(version_id) = dependency.version_id.as_deref()
-                && !items.iter().any(|candidate| {
-                    candidate.project_id == project_id && candidate.version_id == version_id
-                })
-            {
+            if !items.iter().any(|candidate| {
+                incompatible_dependency_matches(
+                    dependency,
+                    &candidate.project_id,
+                    &candidate.version_id,
+                )
+            }) {
                 continue;
             }
             let key = (item.project_id.clone(), project_id.to_string());
@@ -593,11 +619,10 @@ pub fn version_conflicts_with_installed(
     installed: &[ManifestEntry],
 ) -> bool {
     let candidate_declares_conflict = version.dependencies.iter().any(|dependency| {
-        dependency.kind == DependencyKind::Incompatible
-            && dependency.project_id.as_deref().is_some_and(|project_id| {
-                let id = CanonicalId::for_project(ProviderId::Modrinth, project_id);
-                id != *own_id && installed.iter().any(|entry| entry.canonical_id == id)
-            })
+        installed.iter().any(|entry| {
+            entry.canonical_id != *own_id
+                && incompatible_dependency_matches(dependency, &entry.project_id, &entry.version_id)
+        })
     });
     if candidate_declares_conflict {
         return true;
@@ -606,11 +631,7 @@ pub fn version_conflicts_with_installed(
     installed.iter().any(|entry| {
         entry.canonical_id != *own_id
             && entry.dependencies.iter().any(|dependency| {
-                dependency.kind == DependencyKind::Incompatible
-                    && dependency
-                        .project_id
-                        .as_deref()
-                        .is_some_and(|project_id| project_id == own_id.project_id())
+                incompatible_dependency_matches(dependency, own_id.project_id(), &version.id)
             })
     })
 }
@@ -659,6 +680,7 @@ fn exact_dependency_conflict(
 fn installed_entries_incompatible_with<'a>(
     manifest: &'a ContentManifest,
     candidate: &CanonicalId,
+    candidate_version_id: &str,
     game_dir: Option<&std::path::Path>,
 ) -> Vec<&'a ManifestEntry> {
     manifest
@@ -668,11 +690,11 @@ fn installed_entries_incompatible_with<'a>(
         .filter(|entry| installed_entry_present(entry, game_dir))
         .filter(|entry| {
             entry.dependencies.iter().any(|dependency| {
-                dependency.kind == DependencyKind::Incompatible
-                    && dependency
-                        .project_id
-                        .as_deref()
-                        .is_some_and(|project_id| project_id == candidate.project_id())
+                incompatible_dependency_matches(
+                    dependency,
+                    candidate.project_id(),
+                    candidate_version_id,
+                )
             })
         })
         .collect()
@@ -909,8 +931,60 @@ mod tests {
             ..ContentManifest::default()
         };
         assert_eq!(
-            installed_entries_incompatible_with(&manifest, &candidate, None).len(),
+            installed_entries_incompatible_with(&manifest, &candidate, &update.id, None).len(),
             1
+        );
+    }
+
+    #[test]
+    fn reverse_incompatibilities_honor_the_candidate_version() {
+        let candidate = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
+        let installed = ManifestEntry::managed(
+            CanonicalId::for_project(ProviderId::Modrinth, "installed"),
+            ProviderId::Modrinth,
+            "installed".to_string(),
+            "installed-v1".to_string(),
+            ContentKind::Mod,
+            &file("installed.jar", None),
+            vec![ContentDependency {
+                project_id: Some("candidate".to_string()),
+                version_id: Some("candidate-v1".to_string()),
+                kind: DependencyKind::Incompatible,
+            }],
+            Some("Installed".to_string()),
+        );
+        let manifest = ContentManifest {
+            entries: vec![installed.clone()],
+            ..ContentManifest::default()
+        };
+        let candidate_v1 = version(
+            "candidate-v1",
+            ReleaseChannel::Release,
+            vec![file("candidate.jar", None)],
+        );
+        let candidate_v2 = version(
+            "candidate-v2",
+            ReleaseChannel::Release,
+            vec![file("candidate.jar", None)],
+        );
+
+        assert!(version_conflicts_with_installed(
+            &candidate_v1,
+            &candidate,
+            std::slice::from_ref(&installed),
+        ));
+        assert!(!version_conflicts_with_installed(
+            &candidate_v2,
+            &candidate,
+            std::slice::from_ref(&installed),
+        ));
+        assert_eq!(
+            installed_entries_incompatible_with(&manifest, &candidate, "candidate-v1", None,).len(),
+            1
+        );
+        assert!(
+            installed_entries_incompatible_with(&manifest, &candidate, "candidate-v2", None,)
+                .is_empty()
         );
     }
 
@@ -949,14 +1023,36 @@ mod tests {
         };
 
         assert_eq!(
-            installed_entries_incompatible_with(&manifest, &candidate, Some(&root)).len(),
+            installed_entries_incompatible_with(
+                &manifest,
+                &candidate,
+                "candidate-v1",
+                Some(&root),
+            )
+            .len(),
             1
         );
         std::fs::write(&path, b"user replacement").expect("replacement");
-        assert!(installed_entries_incompatible_with(&manifest, &candidate, Some(&root)).is_empty());
+        assert!(
+            installed_entries_incompatible_with(
+                &manifest,
+                &candidate,
+                "candidate-v1",
+                Some(&root),
+            )
+            .is_empty()
+        );
         assert!(!installed_entry_present(&entry, Some(&root)));
         std::fs::remove_file(&path).expect("remove replacement");
-        assert!(installed_entries_incompatible_with(&manifest, &candidate, Some(&root)).is_empty());
+        assert!(
+            installed_entries_incompatible_with(
+                &manifest,
+                &candidate,
+                "candidate-v1",
+                Some(&root),
+            )
+            .is_empty()
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1026,6 +1122,63 @@ mod tests {
             Some("incompatible-project")
         );
         assert_eq!(canonical[0].version_id.as_deref(), Some("required-version"));
+    }
+
+    #[test]
+    fn version_only_update_incompatibilities_are_canonicalized_and_exact() {
+        let dependency = ContentDependency {
+            project_id: None,
+            version_id: Some("installed-v1".to_string()),
+            kind: DependencyKind::Incompatible,
+        };
+        assert!(has_unresolved_version_only_incompatibility(
+            std::slice::from_ref(&dependency)
+        ));
+        let identity = VersionIdentity {
+            provider: ProviderId::Modrinth,
+            project_id: "installed".to_string(),
+            version_id: "installed-v1".to_string(),
+            game_versions: Vec::new(),
+            loaders: Vec::new(),
+            dependencies: Vec::new(),
+            title: None,
+        };
+        let dependencies = canonicalize_version_only_dependencies(
+            &[dependency],
+            &HashMap::from([("installed-v1".to_string(), identity)]),
+        );
+        assert!(!has_unresolved_version_only_incompatibility(&dependencies));
+
+        let own = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
+        let installed = |version_id: &str| {
+            ManifestEntry::managed(
+                CanonicalId::for_project(ProviderId::Modrinth, "installed"),
+                ProviderId::Modrinth,
+                "installed".to_string(),
+                version_id.to_string(),
+                ContentKind::Mod,
+                &file("installed.jar", None),
+                Vec::new(),
+                None,
+            )
+        };
+        let mut update = version(
+            "candidate-v2",
+            ReleaseChannel::Release,
+            vec![file("candidate.jar", None)],
+        );
+        update.dependencies = dependencies;
+
+        assert!(version_conflicts_with_installed(
+            &update,
+            &own,
+            &[installed("installed-v1")],
+        ));
+        assert!(!version_conflicts_with_installed(
+            &update,
+            &own,
+            &[installed("installed-v2")],
+        ));
     }
 
     #[test]
