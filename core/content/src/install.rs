@@ -79,12 +79,10 @@ where
         &relative_paths,
         &must_be_absent,
     )?;
-    let mut stale_files = Vec::new();
+    let mut stale_entries = Vec::new();
 
     for (planned, planned_destination) in files.iter().zip(&destinations) {
-        let previous_filename = manifest
-            .find(&planned.canonical_id)
-            .map(|entry| entry.filename.clone());
+        let previous = manifest.find(&planned.canonical_id).cloned();
         let mut entry = ManifestEntry::managed(
             planned.canonical_id.clone(),
             planned.provider,
@@ -96,12 +94,21 @@ where
             planned.title.clone(),
         );
         entry.enabled = planned_destination.enabled;
-        manifest.upsert(entry);
-        if let Some(previous_filename) = previous_filename {
-            stale_files.extend(managed_file_variants(planned.kind, &previous_filename));
+        if manifest.upsert(entry).is_some()
+            && let Some(previous) = previous
+        {
+            stale_entries.push(previous);
         }
     }
 
+    let mut stale_files = Vec::new();
+    for entry in &stale_entries {
+        stale_files.extend(verified_removable_variants(
+            game_dir,
+            entry,
+            &relative_paths,
+        )?);
+    }
     stale_files.sort();
     stale_files.dedup();
     transaction.stage_removals(&stale_files)?;
@@ -205,7 +212,9 @@ fn prepare_install_destinations(
             let path = contained_path(game_dir, variant)?;
             match fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.is_file() && !owners.is_empty() => {
-                    if owners.iter().any(|owner| !entry_path_matches(&path, owner)) {
+                    if owners.iter().any(|owner| {
+                        !entry_has_checksum(owner) || !entry_path_matches(&path, owner)
+                    }) {
                         return Err(ContentError::Invalid(
                             "a content destination is occupied by a file no longer owned by the manifest"
                                 .to_string(),
@@ -240,17 +249,62 @@ fn prepare_install_destinations(
 /// entry. Saves the manifest when an entry was actually removed.
 pub fn uninstall(game_dir: &Path, canonical_id: &CanonicalId) -> ContentResult<bool> {
     let mut manifest = ContentManifest::load(game_dir)?;
-    let Some(entry) = manifest.remove(canonical_id) else {
+    let Some(entry) = manifest.find(canonical_id).cloned() else {
         return Ok(false);
     };
+    let removable = verified_removable_variants(game_dir, &entry, &[])?;
+    manifest.remove(canonical_id);
     let mut transaction = FileTransaction::empty(game_dir)?;
-    transaction.stage_removals(&managed_file_variants(entry.kind, &entry.filename))?;
+    transaction.stage_removals(&removable)?;
     if let Err(error) = manifest.save(game_dir) {
         transaction.rollback();
         return Err(error);
     }
     transaction.commit();
     Ok(true)
+}
+
+/// Return only manifest-owned variants that are still safe to remove. A live
+/// path whose bytes no longer match provenance is user-owned and aborts the
+/// whole cleanup. Destinations installed by the same transaction are protected
+/// from stale cleanup without being compared against the superseded entry.
+pub fn verified_removable_variants(
+    game_dir: &Path,
+    entry: &ManifestEntry,
+    protected_paths: &[String],
+) -> ContentResult<Vec<String>> {
+    let mut removable = Vec::new();
+    for relative in managed_file_variants(entry.kind, &entry.filename) {
+        if protected_paths
+            .iter()
+            .any(|protected| protected == &relative)
+        {
+            continue;
+        }
+        let path = contained_path(game_dir, &relative)?;
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ContentError::Io(error)),
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(ContentError::Invalid(
+                    "a managed content path is no longer a regular file".to_string(),
+                ));
+            }
+            Ok(_) if entry_has_checksum(entry) && entry_path_matches(&path, entry) => {
+                removable.push(relative);
+            }
+            Ok(_) => {
+                return Err(ContentError::Invalid(
+                    "a managed content file changed outside the launcher".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(removable)
+}
+
+fn entry_has_checksum(entry: &ManifestEntry) -> bool {
+    entry.sha512.is_some() || entry.sha1.is_some()
 }
 
 /// Relative enabled and disabled paths owned by one manifest entry.
@@ -513,6 +567,36 @@ mod tests {
         assert!(uninstall(&root, &id).is_err());
         let persisted = ContentManifest::load(&root).expect("reload manifest");
         assert!(persisted.find(&id).is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_preserves_a_same_name_manual_replacement_and_provenance() {
+        let root = test_root("uninstall-user-replacement");
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let path = root.join("mods/managed.jar");
+        fs::write(&path, b"managed bytes").expect("managed file");
+        let id = CanonicalId::for_project(ProviderId::Modrinth, "project");
+        let mut entry = recorded("project", "managed.jar");
+        entry.sha512 = Some(crate::manifest::sha512_file(&path).expect("managed hash"));
+        entry.size = Some(b"managed bytes".len() as u64);
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(entry);
+        manifest.save(&root).expect("save manifest");
+
+        fs::write(&path, b"user replacement").expect("replace managed file");
+        assert!(uninstall(&root, &id).is_err());
+
+        assert_eq!(
+            fs::read(&path).expect("preserved replacement"),
+            b"user replacement"
+        );
+        assert!(
+            ContentManifest::load(&root)
+                .expect("reload manifest")
+                .find(&id)
+                .is_some()
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

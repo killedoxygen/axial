@@ -8,7 +8,7 @@ use super::{ContentApiError, ContentSelection, content_error_response, json_erro
 use axial_content::{
     CanonicalId, ContentDependency, ContentError, ContentKind, ContentManifest, ContentVersion,
     DependencyKind, FileRef, ManifestEntry, PlannedFile, ProjectMetadata, ProviderId,
-    ReleaseChannel, entry_file_present,
+    ReleaseChannel, VersionIdentity, entry_file_present,
 };
 use axum::http::StatusCode;
 use serde::Serialize;
@@ -275,6 +275,8 @@ async fn resolve_pass(
     let mut items: Vec<ResolvedItem> = Vec::new();
     let mut conflicts: Vec<PlanConflict> = Vec::new();
     let mut incompatibilities: HashSet<(CanonicalId, CanonicalId)> = HashSet::new();
+    let mut dependency_versions: HashMap<String, VersionIdentity> = HashMap::new();
+    let mut dependency_versions_requested: HashSet<String> = HashSet::new();
 
     let mut queue: VecDeque<(CanonicalId, Option<String>, PlanReason)> = selections
         .iter()
@@ -359,7 +361,26 @@ async fn resolve_pass(
         };
         resolved_versions.insert(canonical_id.clone(), version.id.clone());
 
-        for dependency in &version.dependencies {
+        let missing_dependency_versions: Vec<String> = version
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.project_id.is_none())
+            .filter_map(|dependency| dependency.version_id.clone())
+            .filter(|version_id| dependency_versions_requested.insert(version_id.clone()))
+            .collect();
+        if !missing_dependency_versions.is_empty() {
+            dependency_versions.extend(
+                state
+                    .content()
+                    .version_identities(&missing_dependency_versions)
+                    .await
+                    .map_err(content_error_response)?,
+            );
+        }
+        let dependencies =
+            canonicalize_version_only_dependencies(&version.dependencies, &dependency_versions);
+
+        for dependency in &dependencies {
             match dependency.kind {
                 DependencyKind::Required => {
                     if let Some(project_id) = &dependency.project_id {
@@ -383,6 +404,10 @@ async fn resolve_pass(
                             CanonicalId::for_project(ProviderId::Modrinth, project_id);
                         if let Some(entry) = manifest.find(&incompatible)
                             && installed_entry_present(entry, target.game_dir.as_deref())
+                            && dependency
+                                .version_id
+                                .as_deref()
+                                .is_none_or(|version_id| entry.version_id == version_id)
                             && incompatibilities
                                 .insert((canonical_id.clone(), entry.canonical_id.clone()))
                         {
@@ -420,7 +445,7 @@ async fn resolve_pass(
                 project.title
             },
             file,
-            dependencies: version.dependencies.clone(),
+            dependencies,
             reason,
             already_installed,
             update,
@@ -434,6 +459,27 @@ async fn resolve_pass(
         resolution: Resolution { items, conflicts },
         retry_with_exact: None,
     })
+}
+
+fn canonicalize_version_only_dependencies(
+    dependencies: &[ContentDependency],
+    versions: &HashMap<String, VersionIdentity>,
+) -> Vec<ContentDependency> {
+    dependencies
+        .iter()
+        .cloned()
+        .map(|mut dependency| {
+            if dependency.project_id.is_none()
+                && let Some(identity) = dependency
+                    .version_id
+                    .as_ref()
+                    .and_then(|version_id| versions.get(version_id))
+            {
+                dependency.project_id = Some(identity.project_id.clone());
+            }
+            dependency
+        })
+        .collect()
 }
 
 fn exact_requirement_needs_retry(
@@ -472,6 +518,13 @@ fn selected_incompatibility_conflicts(items: &[ResolvedItem]) -> Vec<PlanConflic
                 continue;
             };
             if !resolved_projects.contains(project_id) {
+                continue;
+            }
+            if let Some(version_id) = dependency.version_id.as_deref()
+                && !items.iter().any(|candidate| {
+                    candidate.project_id == project_id && candidate.version_id == version_id
+                })
+            {
                 continue;
             }
             let key = (item.project_id.clone(), project_id.to_string());
@@ -929,6 +982,50 @@ mod tests {
     }
 
     #[test]
+    fn version_only_dependencies_are_canonicalized_to_their_projects() {
+        let dependencies = vec![
+            ContentDependency {
+                project_id: None,
+                version_id: Some("required-version".to_string()),
+                kind: DependencyKind::Required,
+            },
+            ContentDependency {
+                project_id: None,
+                version_id: Some("incompatible-version".to_string()),
+                kind: DependencyKind::Incompatible,
+            },
+        ];
+        let identity = |project_id: &str, version_id: &str| VersionIdentity {
+            provider: ProviderId::Modrinth,
+            project_id: project_id.to_string(),
+            version_id: version_id.to_string(),
+            game_versions: Vec::new(),
+            loaders: Vec::new(),
+            dependencies: Vec::new(),
+            title: None,
+        };
+        let versions = HashMap::from([
+            (
+                "required-version".to_string(),
+                identity("required-project", "required-version"),
+            ),
+            (
+                "incompatible-version".to_string(),
+                identity("incompatible-project", "incompatible-version"),
+            ),
+        ]);
+
+        let canonical = canonicalize_version_only_dependencies(&dependencies, &versions);
+
+        assert_eq!(canonical[0].project_id.as_deref(), Some("required-project"));
+        assert_eq!(
+            canonical[1].project_id.as_deref(),
+            Some("incompatible-project")
+        );
+        assert_eq!(canonical[0].version_id.as_deref(), Some("required-version"));
+    }
+
+    #[test]
     fn selected_content_is_checked_for_mutual_incompatibility() {
         let items = vec![
             resolved_item("first", Some("second")),
@@ -942,6 +1039,23 @@ mod tests {
         assert_eq!(
             conflicts[0].canonical_id.as_ref().map(CanonicalId::as_str),
             Some("modrinth:first")
+        );
+    }
+
+    #[test]
+    fn selected_incompatibilities_honor_exact_version_ids() {
+        let mut nonmatching = resolved_item("first", Some("second"));
+        nonmatching.dependencies[0].version_id = Some("different-version".to_string());
+        assert!(
+            selected_incompatibility_conflicts(&[nonmatching, resolved_item("second", None),])
+                .is_empty()
+        );
+
+        let mut matching = resolved_item("first", Some("second"));
+        matching.dependencies[0].version_id = Some("v1".to_string());
+        assert_eq!(
+            selected_incompatibility_conflicts(&[matching, resolved_item("second", None)]).len(),
+            1
         );
     }
 

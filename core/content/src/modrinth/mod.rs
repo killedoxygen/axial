@@ -196,6 +196,26 @@ impl ContentProvider for ModrinthProvider {
         }
         Ok(identities)
     }
+
+    async fn version_identities(
+        &self,
+        version_ids: &[String],
+    ) -> ContentResult<HashMap<String, VersionIdentity>> {
+        let mut identities = HashMap::new();
+        for chunk in version_ids.chunks(MAX_BULK_IDS) {
+            let versions: Vec<dto::Version> = self
+                .get_json(
+                    &self.endpoint("/versions"),
+                    &[("ids", json_string_array(chunk))],
+                )
+                .await?;
+            identities.extend(versions.into_iter().filter_map(|version| {
+                let identity = map_identity(version)?;
+                Some((identity.version_id.clone(), identity))
+            }));
+        }
+        Ok(identities)
+    }
 }
 
 async fn parse_response<T: serde::de::DeserializeOwned>(
@@ -440,10 +460,16 @@ mod tests {
             "version_number": "1.0.0",
             "game_versions": ["1.21.6"],
             "loaders": ["fabric"],
-            "dependencies": [{
-                "project_id": "project-b",
-                "dependency_type": "incompatible"
-            }]
+            "dependencies": [
+                {
+                    "project_id": "project-b",
+                    "dependency_type": "incompatible"
+                },
+                {
+                    "version_id": "version-c",
+                    "dependency_type": "required"
+                }
+            ]
         }))
         .expect("version payload");
 
@@ -451,11 +477,17 @@ mod tests {
 
         assert_eq!(identity.game_versions, ["1.21.6"]);
         assert_eq!(identity.loaders, ["fabric"]);
-        assert_eq!(identity.dependencies.len(), 1);
+        assert_eq!(identity.dependencies.len(), 2);
         assert_eq!(
             identity.dependencies[0].project_id.as_deref(),
             Some("project-b")
         );
         assert_eq!(identity.dependencies[0].kind, DependencyKind::Incompatible);
+        assert_eq!(identity.dependencies[1].project_id, None);
+        assert_eq!(
+            identity.dependencies[1].version_id.as_deref(),
+            Some("version-c")
+        );
+        assert_eq!(identity.dependencies[1].kind, DependencyKind::Required);
     }
 }

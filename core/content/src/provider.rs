@@ -94,6 +94,14 @@ pub trait ContentProvider: Send + Sync {
         sha512_hashes: &[String],
     ) -> impl std::future::Future<Output = ContentResult<HashMap<String, VersionIdentity>>> + Send;
 
+    /// Resolve provider-local version IDs to their owning projects in a batch.
+    /// Dependency records may omit project_id when an exact version_id is
+    /// present, so resolution must canonicalize those records server-side.
+    fn version_identities(
+        &self,
+        version_ids: &[String],
+    ) -> impl std::future::Future<Output = ContentResult<HashMap<String, VersionIdentity>>> + Send;
+
     /// Trusted project type and title metadata, fetched in a batch so
     /// resolution never needs to rely on client-authored content kinds.
     fn metadata(

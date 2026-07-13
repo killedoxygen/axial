@@ -59,6 +59,13 @@ impl ContentRegistry {
         self.modrinth.identify(sha512_hashes).await
     }
 
+    pub async fn version_identities(
+        &self,
+        version_ids: &[String],
+    ) -> ContentResult<HashMap<String, VersionIdentity>> {
+        self.modrinth.version_identities(version_ids).await
+    }
+
     /// Project titles for a batch of ids, in one round trip.
     pub async fn titles(&self, ids: &[CanonicalId]) -> ContentResult<HashMap<CanonicalId, String>> {
         Ok(self

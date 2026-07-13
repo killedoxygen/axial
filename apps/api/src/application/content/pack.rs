@@ -17,6 +17,7 @@ use crate::state::AppState;
 use axial_content::{
     CanonicalId, ContentKind, ContentManifest, EntrySource, FileRef, ManifestEntry, PackIndex,
     ProviderId, VersionIdentity, install_pack_files_with_finalize, read_pack_index,
+    verified_removable_variants,
 };
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -498,7 +499,7 @@ where
         })
         .cloned()
         .collect();
-    let (manifest, identified, stale_files) = build_pack_manifest(
+    let (manifest, identified, stale_entries) = build_pack_manifest(
         state,
         &game_dir,
         &preview_files,
@@ -515,7 +516,14 @@ where
         &request.selected_paths,
         request.include_overrides,
         &mut on_progress,
-        |_, transaction| {
+        |report, transaction| {
+            let protected_paths: Vec<String> = report
+                .installed
+                .iter()
+                .map(|file| file.path.clone())
+                .collect();
+            let stale_files =
+                verified_stale_pack_files(&game_dir, &stale_entries, &protected_paths)?;
             transaction.stage_removals(&stale_files)?;
             manifest.save(&game_dir)
         },
@@ -685,9 +693,9 @@ async fn build_pack_manifest(
     pack_title: &str,
     version: &axial_content::ContentVersion,
     record_pack_root: bool,
-) -> Result<(ContentManifest, usize, Vec<String>), ContentApiError> {
+) -> Result<(ContentManifest, usize, Vec<ManifestEntry>), ContentApiError> {
     let mut manifest = ContentManifest::load(game_dir).map_err(content_error_response)?;
-    let mut stale_files = Vec::new();
+    let mut stale_entries = Vec::new();
 
     // The pack itself: what this instance was built from, so an update knows
     // where it came from.
@@ -733,14 +741,12 @@ async fn build_pack_manifest(
                 let Some(kind) = file.kind() else { continue };
                 let canonical_id =
                     CanonicalId::for_project(identity.provider, &identity.project_id);
-                let previous_filename = manifest
-                    .find(&canonical_id)
-                    .map(|entry| entry.filename.clone());
+                let previous = manifest.find(&canonical_id).cloned();
                 let title = titles
                     .get(&canonical_id)
                     .cloned()
                     .or(identity.title.clone());
-                manifest.upsert(ManifestEntry {
+                let stale_filename = manifest.upsert(ManifestEntry {
                     canonical_id,
                     provider: identity.provider,
                     project_id: identity.project_id,
@@ -756,20 +762,35 @@ async fn build_pack_manifest(
                     installed_at: chrono::Utc::now().to_rfc3339(),
                     title,
                 });
-                if let Some(previous_filename) = previous_filename {
-                    stale_files.extend(axial_content::managed_file_variants(
-                        kind,
-                        &previous_filename,
-                    ));
+                if stale_filename.is_some()
+                    && let Some(previous) = previous
+                {
+                    stale_entries.push(previous);
                 }
                 identified += 1;
             }
         }
     }
 
-    stale_files.sort();
-    stale_files.dedup();
-    Ok((manifest, identified, stale_files))
+    Ok((manifest, identified, stale_entries))
+}
+
+fn verified_stale_pack_files(
+    game_dir: &Path,
+    stale_entries: &[ManifestEntry],
+    protected_paths: &[String],
+) -> axial_content::ContentResult<Vec<String>> {
+    let mut files = Vec::new();
+    for entry in stale_entries {
+        files.extend(verified_removable_variants(
+            game_dir,
+            entry,
+            protected_paths,
+        )?);
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
 }
 
 fn mismatch_notice(
@@ -847,6 +868,45 @@ mod tests {
         }
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn stale_pack_cleanup_preserves_a_manual_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-pack-stale-replacement-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("mods")).expect("mods");
+        let path = root.join("mods/old.jar");
+        std::fs::write(&path, b"tracked bytes").expect("tracked file");
+        let mut entry = ManifestEntry::managed(
+            CanonicalId::for_project(ProviderId::Modrinth, "project"),
+            ProviderId::Modrinth,
+            "project".to_string(),
+            "old-version".to_string(),
+            ContentKind::Mod,
+            &FileRef {
+                url: "https://example.invalid/old.jar".to_string(),
+                filename: "old.jar".to_string(),
+                sha1: None,
+                sha512: None,
+                size: Some(b"tracked bytes".len() as u64),
+                primary: true,
+            },
+            Vec::new(),
+            None,
+        );
+        entry.sha512 = Some(axial_content::sha512_file(&path).expect("tracked hash"));
+
+        std::fs::write(&path, b"user replacement").expect("replace tracked file");
+        assert!(verified_stale_pack_files(&root, &[entry], &[]).is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("preserved replacement"),
+            b"user replacement"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
