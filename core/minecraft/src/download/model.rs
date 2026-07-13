@@ -66,22 +66,85 @@ pub enum LibraryPlanError {
 
 pub(crate) struct ExactLibraryDownloadProof {
     path: ArtifactRelativePath,
+    is_native: bool,
+    provider_url: String,
+    expected: ExpectedIntegrity,
     size: u64,
     sha1: [u8; 20],
 }
 
 impl ExactLibraryDownloadProof {
-    pub(super) fn new(path: ArtifactRelativePath, size: u64, sha1: [u8; 20]) -> Self {
-        Self { path, size, sha1 }
+    pub(super) fn observed_size(&self) -> u64 {
+        self.size
     }
 
-    pub(crate) fn into_parts(self) -> (ArtifactRelativePath, u64, [u8; 20]) {
-        (self.path, self.size, self.sha1)
+    pub(super) fn new(
+        path: ArtifactRelativePath,
+        is_native: bool,
+        provider_url: String,
+        expected: ExpectedIntegrity,
+        size: u64,
+        sha1: [u8; 20],
+    ) -> Self {
+        Self {
+            path,
+            is_native,
+            provider_url,
+            expected,
+            size,
+            sha1,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ArtifactRelativePath,
+        bool,
+        String,
+        ExpectedIntegrity,
+        u64,
+        [u8; 20],
+    ) {
+        (
+            self.path,
+            self.is_native,
+            self.provider_url,
+            self.expected,
+            self.size,
+            self.sha1,
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test(path: ArtifactRelativePath, size: u64, sha1: [u8; 20]) -> Self {
-        Self::new(path, size, sha1)
+        Self::new(
+            path,
+            false,
+            "https://example.invalid/library.jar".to_string(),
+            ExpectedIntegrity {
+                size: Some(size),
+                sha1: Some(
+                    sha1.iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                ),
+            },
+            size,
+            sha1,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_bound_for_test(
+        path: ArtifactRelativePath,
+        is_native: bool,
+        provider_url: String,
+        expected: ExpectedIntegrity,
+        size: u64,
+        sha1: [u8; 20],
+    ) -> Self {
+        Self::new(path, is_native, provider_url, expected, size, sha1)
     }
 }
 

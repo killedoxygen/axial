@@ -30,6 +30,7 @@ pub(crate) struct DownloadJob {
     pub(crate) url: String,
     pub(crate) name: String,
     pub(crate) expected: ExpectedIntegrity,
+    pub(crate) is_native: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +79,7 @@ impl LibraryArtifactPlan {
             url,
             name: self.name,
             expected: self.expected,
+            is_native: self.is_native,
         })
     }
 }
@@ -197,7 +199,14 @@ where
                 )
                 .ok_or(LibraryPlanError::InvalidChecksum)?;
                 (
-                    ExactLibraryDownloadProof::new(job.relative_path.clone(), observed_size, sha1),
+                    ExactLibraryDownloadProof::new(
+                        job.relative_path.clone(),
+                        job.is_native,
+                        job.url.clone(),
+                        job.expected.clone(),
+                        observed_size,
+                        sha1,
+                    ),
                     job.relative_path,
                 )
             } else {
@@ -221,6 +230,7 @@ where
                     job.relative_path.clone(),
                     &job.url,
                     &job.expected,
+                    job.is_native,
                     fact_tx.as_ref(),
                     descriptor_tx.as_ref(),
                 )
@@ -651,7 +661,7 @@ mod exact_library_proof_tests {
         )
         .await
         .expect("fresh SHA-only source");
-        let (path, size, digest) = authorities
+        let (path, _, _, _, size, digest) = authorities
             .into_iter()
             .next()
             .expect("authority")
@@ -692,7 +702,7 @@ mod exact_library_proof_tests {
         )
         .await
         .expect("fresh checksumless transfer");
-        let (path, size, digest) = authorities
+        let (path, _, _, _, size, digest) = authorities
             .into_iter()
             .next()
             .expect("authority")
@@ -730,7 +740,7 @@ mod exact_library_proof_tests {
         )
         .await
         .expect("fresh profile proof");
-        let (path, size, digest) = proofs
+        let (path, _, _, _, size, digest) = proofs
             .into_iter()
             .next()
             .expect("profile proof")
@@ -770,7 +780,7 @@ mod exact_library_proof_tests {
         )
         .await
         .expect("fresh size-only proof");
-        let (_, size, digest) = proofs
+        let (_, _, _, _, size, digest) = proofs
             .into_iter()
             .next()
             .expect("profile proof")

@@ -95,6 +95,7 @@ pub(super) struct PreparedSelectedArtifactInstall {
 
 pub(super) struct PreparedLibraryPublication {
     relative_path: ArtifactRelativePath,
+    is_native: bool,
     selected: PreparedSelectedArtifactInstall,
     provider_url: String,
     descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
@@ -118,7 +119,7 @@ impl PreparedSelectedArtifactInstall {
     }
 }
 
-pub(super) struct MaterializedSelectedArtifactSource {
+pub(crate) struct MaterializedSelectedArtifactSource {
     source: AuthenticatedSelectedArtifactSource,
 }
 
@@ -161,7 +162,7 @@ impl RetainedExactSource {
 }
 
 impl MaterializedSelectedArtifactSource {
-    pub(super) fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         self.source.bytes()
     }
 
@@ -169,7 +170,7 @@ impl MaterializedSelectedArtifactSource {
         Arc::clone(&self.source.bytes)
     }
 
-    pub(super) fn into_parts(self) -> (Arc<[u8]>, u64, [u8; 20]) {
+    pub(crate) fn into_parts(self) -> (Arc<[u8]>, u64, [u8; 20]) {
         (
             self.source.bytes,
             self.source.observed_size,
@@ -263,6 +264,7 @@ pub(super) async fn prepare_library_publication(
     relative_path: ArtifactRelativePath,
     url: &str,
     expected: &ExpectedIntegrity,
+    is_native: bool,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
     descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 ) -> Result<PreparedLibraryPublication, DownloadError> {
@@ -283,6 +285,7 @@ pub(super) async fn prepare_library_publication(
     };
     Ok(PreparedLibraryPublication {
         relative_path,
+        is_native,
         selected,
         provider_url: url.to_string(),
         descriptor_tx: descriptor_tx.cloned(),
@@ -360,7 +363,14 @@ pub(super) async fn materialize_authenticated_library_source(
     ));
     emit_execution_download_facts(fact_tx, &facts);
     Ok((
-        ExactLibraryDownloadProof::new(prepared.relative_path, observed_size, observed_sha1),
+        ExactLibraryDownloadProof::new(
+            prepared.relative_path,
+            prepared.is_native,
+            prepared.provider_url,
+            expected,
+            observed_size,
+            observed_sha1,
+        ),
         outcome,
     ))
 }

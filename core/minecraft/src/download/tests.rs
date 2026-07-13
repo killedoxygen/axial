@@ -3316,6 +3316,7 @@ async fn prepared_library_publication_reuses_exact_destination_with_occupied_bac
         relative_path.clone(),
         &url,
         &expected,
+        false,
         Some(&fact_tx),
         Some(&descriptor_tx),
     )
@@ -3348,6 +3349,7 @@ async fn prepared_library_publication_reuses_exact_destination_with_occupied_bac
         relative_path.clone(),
         &url,
         &expected,
+        false,
         Some(&fact_tx),
         Some(&descriptor_tx),
     )
@@ -3411,6 +3413,7 @@ async fn prepared_library_publication_rejects_mismatched_source_contract() {
         relative_path.clone(),
         &url,
         &prepared_expected,
+        false,
         None,
         None,
     )
@@ -3456,9 +3459,10 @@ async fn prepared_library_publication_rejects_colliding_relative_path() {
         spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
     let client = build_http_client(Duration::from_secs(5));
     let pool = LibrarySourcePool::new();
-    let prepared = prepare_library_publication(&root, prepared_path, &url, &expected, None, None)
-        .await
-        .expect("prepare destination contract");
+    let prepared =
+        prepare_library_publication(&root, prepared_path, &url, &expected, false, None, None)
+            .await
+            .expect("prepare destination contract");
     let source = acquire_authenticated_library_source(LibrarySourceRequest {
         client: &client,
         url: &url,
@@ -3496,6 +3500,7 @@ async fn prepared_library_publication_rejects_provider_url_substitution() {
         relative_path.clone(),
         "https://provider-b.invalid/library.jar",
         &expected,
+        false,
         None,
         None,
     )

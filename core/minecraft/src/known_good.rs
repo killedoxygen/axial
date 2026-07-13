@@ -5,7 +5,10 @@ use crate::download::{
     ExactLibraryDownloadProof, ExpectedIntegrity, LibraryArtifactPlan, library_artifact_plans_for,
     parse_asset_index,
 };
-use crate::launch::{Library, VersionJson, merge_libraries_prefer_first};
+use crate::known_good_libraries::{SealedExactLibraryDeclarations, SealedLibraryKind};
+use crate::launch::{
+    Library, VersionJson, effective_java_version_for, merge_libraries_prefer_first,
+};
 use crate::loaders::{
     LoaderBuildRecord, LoaderComponentId, LoaderInstallStrategy, VerifiedInstallerClientBytes,
     VerifiedInstallerReceiptSource, VerifiedProcessorOutputs, compose_loader_version,
@@ -128,11 +131,6 @@ pub(crate) struct VerifiedInstallerLibraryAuthority {
     entries: BTreeMap<ArtifactRelativePath, VerifiedInstallerLibraryFact>,
 }
 
-pub(crate) struct VerifiedVanillaLibraryAuthority {
-    libraries: Vec<Library>,
-    entries: BTreeMap<ArtifactRelativePath, VerifiedVanillaLibraryFact>,
-}
-
 pub(crate) struct VerifiedProfileLibraryAuthority {
     libraries: Vec<Library>,
     entries: BTreeMap<ArtifactRelativePath, VerifiedProfileLibraryFact>,
@@ -142,60 +140,6 @@ struct VerifiedProfileLibraryFact {
     size: u64,
     sha1: [u8; 20],
     is_native: bool,
-}
-
-struct VerifiedVanillaLibraryFact {
-    size: u64,
-    sha1: [u8; 20],
-    is_native: bool,
-}
-
-pub(crate) fn seal_verified_vanilla_library_authority(
-    libraries: &[Library],
-    environment: &Environment,
-    downloads: Vec<ExactLibraryDownloadProof>,
-) -> Result<VerifiedVanillaLibraryAuthority, KnownGoodInventoryError> {
-    let plans = library_artifact_plans_for(libraries, environment)
-        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-    let expected = plans
-        .into_iter()
-        .map(|plan| (plan.relative_path.clone(), plan))
-        .collect::<BTreeMap<_, _>>();
-    let mut entries = BTreeMap::new();
-    for download in downloads {
-        let (path, size, sha1) = download.into_parts();
-        let plan = expected
-            .get(&path)
-            .ok_or(KnownGoodInventoryError::VanillaLibraryProofMismatch)?;
-        let expected_sha1 = plan
-            .expected
-            .sha1
-            .as_deref()
-            .ok_or(KnownGoodInventoryError::MissingChecksum)?;
-        if plan.expected.size.is_some_and(|expected| expected != size)
-            || !Sha1Digest::from_metadata(expected_sha1)
-                .is_ok_and(|expected| expected == sha1_array_digest(&sha1))
-            || entries
-                .insert(
-                    path,
-                    VerifiedVanillaLibraryFact {
-                        size,
-                        sha1,
-                        is_native: plan.is_native,
-                    },
-                )
-                .is_some()
-        {
-            return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
-        }
-    }
-    if entries.len() != expected.len() {
-        return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
-    }
-    Ok(VerifiedVanillaLibraryAuthority {
-        libraries: libraries.to_vec(),
-        entries,
-    })
 }
 
 pub(crate) fn seal_verified_profile_library_authority(
@@ -211,7 +155,7 @@ pub(crate) fn seal_verified_profile_library_authority(
         .collect::<BTreeMap<_, _>>();
     let mut entries = BTreeMap::new();
     for download in downloads {
-        let (path, size, sha1) = download.into_parts();
+        let (path, _is_native, _provider_url, _proof_expected, size, sha1) = download.into_parts();
         let plan = expected
             .get(&path)
             .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
@@ -350,7 +294,7 @@ pub(crate) fn seal_verified_installer_library_authority(
     let mut entries = BTreeMap::new();
 
     for download in downloads {
-        let (path, size, sha1) = download.into_parts();
+        let (path, _is_native, _provider_url, _proof_expected, size, sha1) = download.into_parts();
         insert_installer_library_fact(
             &mut entries,
             path,
@@ -922,6 +866,22 @@ impl KnownGoodInstallReceipt {
             &ExpectedIntegrity::from_sha1(&input.shape.version_manifest.sha1),
         )
         .map_err(|_| KnownGoodInventoryError::VersionMetadataIntegrity)?;
+        let mut authenticated = serde_json::from_slice::<VersionJson>(version_json_bytes)
+            .map_err(|_| KnownGoodInventoryError::VersionMetadataIntegrity)?;
+        if authenticated.asset_index.id.is_empty() && !authenticated.assets.is_empty() {
+            authenticated
+                .asset_index
+                .id
+                .clone_from(&authenticated.assets);
+        }
+        authenticated.java_version = effective_java_version_for(
+            &authenticated.id,
+            &authenticated.kind,
+            &authenticated.java_version,
+        );
+        if authenticated != *input.resolved_version {
+            return Err(KnownGoodInventoryError::VersionIdentityMismatch);
+        }
         let version_id = KnownGoodId::new(&input.resolved_version.id)?;
         let effective_version = input.resolved_version.clone();
         let environment = input.environment.clone();
@@ -1009,7 +969,7 @@ pub struct KnownGoodInventoryInput<'a> {
     pub(crate) resolved_version: &'a VersionJson,
     pub(crate) version_metadata_size: u64,
     pub(crate) client_size: u64,
-    pub(crate) libraries: &'a VerifiedVanillaLibraryAuthority,
+    pub(crate) libraries: &'a SealedExactLibraryDeclarations,
     pub(crate) log_config_size: Option<u64>,
     pub(crate) asset_index_bytes: Option<&'a [u8]>,
     pub(crate) runtime: Option<RuntimeInventoryInput<'a>>,
@@ -1088,7 +1048,7 @@ pub fn derive_known_good_inventory(
     if input.resolved_version.libraries.len() > MAX_KNOWN_GOOD_ENTRIES {
         return Err(KnownGoodInventoryError::InputTooLarge);
     }
-    add_verified_vanilla_libraries(
+    add_sealed_libraries(
         &mut builder,
         input.resolved_version,
         input.environment,
@@ -1148,30 +1108,34 @@ fn version_metadata_integrity(
     )
 }
 
-fn add_verified_vanilla_libraries(
+fn add_sealed_libraries(
     builder: &mut InventoryBuilder,
     version: &VersionJson,
     environment: &Environment,
-    authority: &VerifiedVanillaLibraryAuthority,
+    authority: &SealedExactLibraryDeclarations,
 ) -> Result<(), KnownGoodInventoryError> {
     let plans = library_artifact_plans_for(&version.libraries, environment)
         .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-    if version.libraries != authority.libraries {
+    if !authority.matches_version(version) {
         return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
     }
-    if plans.len() != authority.entries.len() {
+    if plans.len() != authority.len() {
         return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
     }
     for plan in plans {
-        let proof = authority
-            .entries
+        let (kind, observed_sha1, size) = authority
             .get(&plan.relative_path)
             .ok_or(KnownGoodInventoryError::VanillaLibraryProofMismatch)?;
-        if proof.is_native != plan.is_native
-            || plan.expected.size.is_some_and(|size| size != proof.size)
-            || plan.expected.sha1.as_deref().is_none_or(|sha1| {
-                !Sha1Digest::from_metadata(sha1)
-                    .is_ok_and(|digest| digest == sha1_array_digest(&proof.sha1))
+        let expected_kind = if plan.is_native {
+            SealedLibraryKind::Native
+        } else {
+            SealedLibraryKind::Library
+        };
+        if kind != expected_kind
+            || plan.expected.size.is_some_and(|expected| expected != size)
+            || plan.expected.sha1.as_deref().is_some_and(|expected_sha1| {
+                !Sha1Digest::from_metadata(expected_sha1)
+                    .is_ok_and(|digest| digest == sha1_array_digest(&observed_sha1))
             })
         {
             return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
@@ -1185,8 +1149,8 @@ fn add_verified_vanilla_libraries(
                 KnownGoodArtifactKind::Library
             },
             integrity: KnownGoodIntegrity::Sha1 {
-                digest: sha1_array_digest(&proof.sha1),
-                size: proof.size,
+                digest: sha1_array_digest(&observed_sha1),
+                size,
             },
         })?;
     }
@@ -1575,6 +1539,7 @@ impl InventoryBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::known_good_libraries::seal_vanilla_library_declarations_for_test;
     use crate::launch::{
         ArgumentsSection, AssetIndex, Downloads, JavaVersion, LibraryArtifact, LibraryDownload,
         LoggingConf, LoggingEntry, LoggingFile,
@@ -2545,12 +2510,18 @@ mod tests {
             .and_then(|downloads| downloads.artifact.as_mut())
             .expect("fixture artifact")
             .size = 0;
-        fixture.library_authority = seal_verified_vanilla_library_authority(
-            &fixture.version.libraries,
+        fixture.library_authority = seal_vanilla_library_declarations_for_test(
+            &fixture.version,
             &fixture.environment,
-            vec![ExactLibraryDownloadProof::new_for_test(
+            vec![ExactLibraryDownloadProof::new_bound_for_test(
                 ArtifactRelativePath::new("com/mojang/strict/1.0/strict-1.0.jar")
                     .expect("library path"),
+                false,
+                "https://example.invalid/library".to_string(),
+                ExpectedIntegrity {
+                    size: None,
+                    sha1: Some(SHA_A.to_string()),
+                },
                 10,
                 [0xaa; 20],
             )],
@@ -2571,22 +2542,8 @@ mod tests {
     }
 
     #[test]
-    fn vanilla_declared_and_observed_size_drift_fails_closed() {
+    fn vanilla_client_declared_and_observed_size_drift_fails_closed() {
         let fixture = fixture(FixtureShape::Vanilla, false);
-        let Err(error) = seal_verified_vanilla_library_authority(
-            &fixture.version.libraries,
-            &fixture.environment,
-            vec![ExactLibraryDownloadProof::new_for_test(
-                ArtifactRelativePath::new("com/mojang/strict/1.0/strict-1.0.jar")
-                    .expect("library path"),
-                11,
-                [0xaa; 20],
-            )],
-        ) else {
-            panic!("declared size drift must fail");
-        };
-        assert_eq!(error, KnownGoodInventoryError::VanillaLibraryProofMismatch);
-
         let mut input = fixture.input();
         input.client_size = 39;
         assert_eq!(
@@ -2659,37 +2616,6 @@ mod tests {
             assert_eq!(
                 derive_known_good_inventory(input),
                 Err(KnownGoodInventoryError::VanillaLibraryProofMismatch)
-            );
-        }
-    }
-
-    #[test]
-    fn vanilla_authority_rejects_missing_extra_and_duplicate_proofs() {
-        let fixture = fixture(FixtureShape::Vanilla, false);
-        let proof = || {
-            ExactLibraryDownloadProof::new_for_test(
-                ArtifactRelativePath::new("com/mojang/strict/1.0/strict-1.0.jar")
-                    .expect("library path"),
-                10,
-                [0xaa; 20],
-            )
-        };
-        let extra = || {
-            ExactLibraryDownloadProof::new_for_test(
-                ArtifactRelativePath::new("com/mojang/extra/1.0/extra-1.0.jar")
-                    .expect("extra path"),
-                10,
-                [0xaa; 20],
-            )
-        };
-        for proofs in [vec![], vec![proof(), extra()], vec![proof(), proof()]] {
-            assert!(
-                seal_verified_vanilla_library_authority(
-                    &fixture.version.libraries,
-                    &fixture.environment,
-                    proofs,
-                )
-                .is_err()
             );
         }
     }
@@ -2867,17 +2793,28 @@ mod tests {
     }
 
     #[test]
-    fn vanilla_missing_library_checksum_fails_closed() {
+    fn vanilla_missing_library_checksum_uses_fresh_streamed_identity() {
         let mut fixture = fixture(FixtureShape::Vanilla, false);
         fixture
             .version
             .libraries
             .push(checksumless_loader_library());
+        fixture.library_authority =
+            fixture_library_authority(&fixture.version, &fixture.environment)
+                .expect("streamed checksumless declaration");
 
-        let Err(error) = fixture_library_authority(&fixture.version, &fixture.environment) else {
-            panic!("missing checksum must fail");
-        };
-        assert_eq!(error, KnownGoodInventoryError::MissingChecksum);
+        let inventory = derive_known_good_inventory(fixture.input()).expect("streamed inventory");
+        let bytes = vec![b'x'; 12];
+        assert_entry(
+            &inventory,
+            &KnownGoodRoot::Libraries,
+            "net/loader/loader-unverified/1.0/loader-unverified-1.0.jar",
+            KnownGoodArtifactKind::Library,
+            &KnownGoodIntegrity::Sha1 {
+                digest: sha1_digest(&bytes),
+                size: bytes.len() as u64,
+            },
+        );
     }
 
     #[test]
@@ -2886,6 +2823,30 @@ mod tests {
         fixture.version_manifest.id = "different-version".to_string();
 
         let error = derive_known_good_inventory(fixture.input()).expect_err("version mismatch");
+        assert_eq!(error, KnownGoodInventoryError::VersionIdentityMismatch);
+    }
+
+    #[test]
+    fn vanilla_receipt_rejects_recombined_same_plan_version_metadata() {
+        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let version_bytes = serde_json::to_vec(&fixture.version).expect("version bytes");
+        fixture.version_manifest.sha1 = sha1_digest(&version_bytes).as_str().to_string();
+        fixture.version_metadata_size = version_bytes.len() as u64;
+        fixture.library_authority =
+            fixture_library_authority(&fixture.version, &fixture.environment)
+                .expect("bound library declarations");
+        let mut drift = fixture.version.clone();
+        drift.libraries[0].rules = vec![Rule {
+            action: "allow".to_string(),
+            os: None,
+            features: None,
+        }];
+        let mut input = fixture.input();
+        input.resolved_version = &drift;
+
+        let error = KnownGoodInstallReceipt::from_verified_vanilla_source(input, &version_bytes)
+            .expect_err("authenticated bytes must equal the full resolved version");
+
         assert_eq!(error, KnownGoodInventoryError::VersionIdentityMismatch);
     }
 
@@ -2999,7 +2960,7 @@ mod tests {
         version: VersionJson,
         version_manifest: ManifestEntry,
         version_metadata_size: u64,
-        library_authority: VerifiedVanillaLibraryAuthority,
+        library_authority: SealedExactLibraryDeclarations,
         asset_index: Vec<u8>,
         runtime_manifest_bytes: Vec<u8>,
         runtime_manifest_expected: ExpectedIntegrity,
@@ -3116,14 +3077,8 @@ mod tests {
             os_version: String::new(),
             features: HashMap::new(),
         };
-        let library_authority = if shape == FixtureShape::Vanilla {
-            fixture_library_authority(&version, &environment).expect("fixture library authority")
-        } else {
-            VerifiedVanillaLibraryAuthority {
-                libraries: Vec::new(),
-                entries: BTreeMap::new(),
-            }
-        };
+        let library_authority = fixture_library_authority(&version, &environment)
+            .expect("fixture library declarations");
         let runtime_manifest_bytes = runtime_manifest_bytes(shuffled);
         let runtime_manifest_expected = expected_for(&runtime_manifest_bytes);
         Fixture {
@@ -3151,25 +3106,34 @@ mod tests {
     fn fixture_library_authority(
         version: &VersionJson,
         environment: &Environment,
-    ) -> Result<VerifiedVanillaLibraryAuthority, KnownGoodInventoryError> {
-        let proofs = library_artifact_plans_for(&version.libraries, environment)
-            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?
+    ) -> Result<SealedExactLibraryDeclarations, KnownGoodInventoryError> {
+        let plans = library_artifact_plans_for(&version.libraries, environment)
+            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+        let streamed = plans
             .into_iter()
+            .filter(|plan| plan.expected.size.is_none() || plan.expected.sha1.is_none())
             .map(|plan| {
-                let sha1 = plan
-                    .expected
-                    .sha1
-                    .as_deref()
-                    .and_then(crate::download::decode_sha1)
-                    .ok_or(KnownGoodInventoryError::MissingChecksum)?;
-                Ok(ExactLibraryDownloadProof::new_for_test(
+                let bytes = match plan.expected.size {
+                    Some(size) => vec![b'x'; usize::try_from(size).expect("fixture size")],
+                    None => format!(
+                        "authenticated fixture bytes for {}",
+                        plan.relative_path.as_str()
+                    )
+                    .into_bytes(),
+                };
+                let sha1: [u8; 20] = Sha1::digest(&bytes).into();
+                ExactLibraryDownloadProof::new_bound_for_test(
                     plan.relative_path,
-                    plan.expected.size.unwrap_or(12),
+                    plan.is_native,
+                    plan.source_url.expect("incomplete fixture source URL"),
+                    plan.expected,
+                    bytes.len() as u64,
                     sha1,
-                ))
+                )
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        seal_verified_vanilla_library_authority(&version.libraries, environment, proofs)
+            .collect();
+        seal_vanilla_library_declarations_for_test(version, environment, streamed)
+            .map_err(|_| KnownGoodInventoryError::VanillaLibraryProofMismatch)
     }
 
     fn loader_record(shape: FixtureShape, component: LoaderComponentId) -> LoaderBuildRecord {

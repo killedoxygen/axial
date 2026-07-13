@@ -3,11 +3,15 @@ use super::assets::{
     spawn_asset_download_pipeline,
 };
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
-use super::libraries::{DownloadJob, decode_sha1, library_jobs_for};
+use super::facts::selected_download_target_label;
+use super::libraries::{DownloadJob, library_jobs_for};
+use super::library_source::{
+    LIBRARY_SOURCE_MAX_BYTES, LibrarySourcePool, LibrarySourceRequest,
+    acquire_authenticated_library_source,
+};
 use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
-    ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactDescriptor,
-    SelectedDownloadArtifactKind, progress,
+    ExpectedIntegrity, SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
 };
 use super::plan::TransferPlan;
 use super::runtime::{
@@ -17,17 +21,18 @@ use super::transfer::{
     MaterializedSelectedArtifactSource, SelectedArtifactSourceRequest,
     acquire_authenticated_selected_artifact_source,
     ensure_selected_artifact_with_client_and_observed_size,
-    materialize_authenticated_selected_artifact_source, prepare_selected_artifact_install,
+    materialize_authenticated_library_source, materialize_authenticated_selected_artifact_source,
+    prepare_library_publication, prepare_selected_artifact_install,
 };
 use crate::artifact_path::validate_artifact_path_segment;
 use crate::known_good::{
     KnownGoodInstallReceipt, KnownGoodInstallShape, KnownGoodInventoryInput,
     MAX_KNOWN_GOOD_ASSET_INDEX_BYTES, MAX_KNOWN_GOOD_VERSION_JSON_BYTES, RuntimeInventoryInput,
-    seal_verified_vanilla_library_authority,
 };
+use crate::known_good_libraries::{LibraryAcquisition, seal_vanilla_exact_library_declarations};
 use crate::launch::{VersionJson, effective_java_version_for};
 use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
-use crate::paths::{assets_dir, versions_dir};
+use crate::paths::{assets_dir, libraries_dir, versions_dir};
 use crate::rules::default_environment;
 use futures_util::StreamExt;
 use std::io;
@@ -229,6 +234,15 @@ impl Downloader {
         .await?;
 
         let version = parse_vanilla_version_source(version_json_source.bytes(), version_id)?;
+        let environment = default_environment();
+        let (library_declarations, version_json_bytes, version_metadata_size, _version_sha1) =
+            seal_vanilla_exact_library_declarations(version_json_source, &version, &environment)
+                .map_err(|error| {
+                    DownloadError::ResolveManifest(format!(
+                        "authenticated library declarations could not be sealed: {error:?}"
+                    ))
+                })?
+                .into_parts();
         let asset_index_source = self
             .fetch_asset_index_source(&version, send, plan, fact_tx, descriptor_tx)
             .await?;
@@ -317,46 +331,84 @@ impl Downloader {
                 )
             });
 
-            let library_jobs = self.library_jobs(&version)?;
+            let (pending_library_declarations, library_jobs) = library_declarations
+                .classify_jobs(&libraries_dir(&self.mc_dir), self.library_jobs(&version)?)
+                .map_err(|error| {
+                    DownloadError::ResolveManifest(format!(
+                        "library declaration classification failed: {error:?}"
+                    ))
+                })?;
             plan.contribute_total(
                 library_jobs
                     .iter()
-                    .map(|job| job.expected.size.unwrap_or(0))
+                    .map(|classified| classified.job.expected.size.unwrap_or(0))
                     .sum::<u64>(),
             );
             send(progress("libraries", 0, library_jobs.len() as i32, None));
             let client = self.client.clone();
+            let source_pool = LibrarySourcePool::new();
             let total_library_jobs = library_jobs.len() as i32;
             let mut completed_library_jobs = 0;
             let library_result = async {
                 let mut proofs = Vec::with_capacity(total_library_jobs as usize);
                 let mut library_downloads =
-                    futures_util::stream::iter(library_jobs.into_iter().map(|job| {
+                    futures_util::stream::iter(library_jobs.into_iter().map(|classified| {
+                        let job = classified.job;
+                        let needs_stream = classified.acquisition == LibraryAcquisition::FreshStream;
                         let client = client.clone();
                         let fact_tx = fact_tx.cloned();
                         let descriptor_tx = descriptor_tx.cloned();
+                        let source_pool = source_pool.clone();
                         async move {
-                            let (_, observed_size) = ensure_selected_artifact_with_client_and_observed_size(
-                                SelectedDownloadArtifactKind::Library,
-                                &client,
-                                &job.url,
-                                &job.path,
-                                &job.expected,
-                                fact_tx.as_ref(),
-                                descriptor_tx.as_ref(),
-                            )
-                            .await?;
-                            let sha1 = job
-                                .expected
-                                .sha1
-                                .as_deref()
-                                .and_then(decode_sha1)
-                                .ok_or(LibraryPlanError::InvalidChecksum)?;
-                            let proof = ExactLibraryDownloadProof::new(
-                                job.relative_path,
-                                observed_size,
-                                sha1,
-                            );
+                            let (observed_size, proof) = if needs_stream {
+                                let target = selected_download_target_label(
+                                    SelectedDownloadArtifactKind::Library,
+                                    &job.path,
+                                );
+                                let source = acquire_authenticated_library_source(
+                                    LibrarySourceRequest {
+                                        client: &client,
+                                        url: &job.url,
+                                        expected: &job.expected,
+                                        relative_path: &job.relative_path,
+                                        max_bytes: LIBRARY_SOURCE_MAX_BYTES,
+                                        target: &target,
+                                        pool: &source_pool,
+                                        fact_tx: fact_tx.as_ref(),
+                                    },
+                                )
+                                .await?;
+                                let prepared = prepare_library_publication(
+                                    &self.mc_dir,
+                                    job.relative_path.clone(),
+                                    &job.url,
+                                    &job.expected,
+                                    job.is_native,
+                                    fact_tx.as_ref(),
+                                    descriptor_tx.as_ref(),
+                                )
+                                .await?;
+                                let (proof, _) = materialize_authenticated_library_source(
+                                    prepared,
+                                    source,
+                                    fact_tx.as_ref(),
+                                )
+                                .await?;
+                                let observed_size = proof.observed_size();
+                                (observed_size, Some(proof))
+                            } else {
+                                let (_, observed_size) = ensure_selected_artifact_with_client_and_observed_size(
+                                    SelectedDownloadArtifactKind::Library,
+                                    &client,
+                                    &job.url,
+                                    &job.path,
+                                    &job.expected,
+                                    fact_tx.as_ref(),
+                                    descriptor_tx.as_ref(),
+                                )
+                                .await?;
+                                (observed_size, None)
+                            };
                             Ok::<_, DownloadError>((job.name, observed_size, proof))
                         }
                     }))
@@ -384,7 +436,9 @@ impl Downloader {
                                 break;
                             };
                             let (name, bytes, proof) = result?;
-                            proofs.push(proof);
+                            if let Some(proof) = proof {
+                                proofs.push(proof);
+                            }
                             plan.add_done(bytes);
                             completed_library_jobs += 1;
                             send(progress(
@@ -448,15 +502,18 @@ impl Downloader {
             } else {
                 None
             };
-            Ok::<_, DownloadError>(VerifiedVanillaArtifacts {
-                client_size,
-                library_proofs,
-                log_config_size,
-            })
+            Ok::<_, DownloadError>((
+                pending_library_declarations,
+                VerifiedVanillaArtifacts {
+                    client_size,
+                    library_proofs,
+                    log_config_size,
+                },
+            ))
         }
         .await;
 
-        let (runtime_receipt, verified_artifacts) =
+        let (runtime_receipt, (pending_library_declarations, verified_artifacts)) =
             finish_runtime_pipeline_after_artifacts(runtime_pipeline, artifact_result, send)
                 .await?;
 
@@ -464,26 +521,20 @@ impl Downloader {
             size: Some(receipt.expected_size()),
             sha1: Some(receipt.expected_sha1().to_string()),
         });
-        let environment = default_environment();
-        let library_authority = seal_verified_vanilla_library_authority(
-            &version.libraries,
-            &environment,
-            verified_artifacts.library_proofs,
-        )
-        .map_err(|error| {
-            DownloadError::ResolveManifest(format!(
-                "installed library authority could not be sealed: {error:?}"
-            ))
-        })?;
-        let (version_json_bytes, version_metadata_size, _version_metadata_sha1) =
-            version_json_source.into_parts();
+        let library_declarations = pending_library_declarations
+            .seal_streamed(verified_artifacts.library_proofs)
+            .map_err(|error| {
+                DownloadError::ResolveManifest(format!(
+                    "installed library declarations could not be completed: {error:?}"
+                ))
+            })?;
         let asset_index_bytes = asset_index_source.map(|source| source.into_parts().0);
         KnownGoodInstallReceipt::from_verified_vanilla_source(
             KnownGoodInventoryInput {
                 resolved_version: &version,
                 version_metadata_size,
                 client_size: verified_artifacts.client_size,
-                libraries: &library_authority,
+                libraries: &library_declarations,
                 log_config_size: verified_artifacts.log_config_size,
                 asset_index_bytes: asset_index_bytes.as_deref(),
                 runtime: runtime_receipt.as_ref().zip(runtime_expected.as_ref()).map(

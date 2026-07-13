@@ -22,9 +22,8 @@ pub use integrity::{
     LauncherManagedArtifactReadiness, jar_contains_signed_metadata,
     verify_existing_launcher_managed_artifact,
 };
+pub(crate) use libraries::DownloadJob;
 pub(crate) use libraries::download_installer_libraries_with_authority_and_facts_and_descriptors;
-#[cfg(test)]
-pub(crate) use libraries::{DownloadJob, decode_sha1};
 pub(crate) use libraries::{
     LibraryArtifactPlan, download_profile_libraries_with_proofs_and_facts_and_descriptors,
     library_artifact_plans_for,
@@ -39,6 +38,7 @@ pub use model::{
     ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactDescriptor,
     SelectedDownloadArtifactKind,
 };
+pub(crate) use transfer::MaterializedSelectedArtifactSource;
 pub use transfer::download_file_with_client_report;
 #[cfg(test)]
 pub(crate) use transfer::promote_launcher_managed_artifact_temp_once;
