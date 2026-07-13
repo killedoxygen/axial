@@ -8,6 +8,7 @@
 //! indexed downloads and the overrides go through the same containment check.
 
 use crate::error::{ContentError, ContentResult};
+use crate::manifest::sha512_file;
 use crate::model::{ContentKind, FileRef};
 use crate::transaction::{FileTransaction, StagingGuard};
 use axial_minecraft::download::{
@@ -211,6 +212,7 @@ where
         download_file_with_client_report(client, &file.url, &destination, &expected)
             .await
             .map_err(|error| ContentError::Download(error.into_download_error().to_string()))?;
+        verify_pack_sha512(&destination, file.sha512.as_deref())?;
         installed.push(file.clone());
         relative_paths.push(file.path.clone());
     }
@@ -262,6 +264,25 @@ where
 
     on_progress(done(total));
     Ok(report)
+}
+
+fn verify_pack_sha512(path: &Path, expected: Option<&str>) -> ContentResult<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if expected.len() != 128 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ContentError::Invalid(
+            "modpack file has an invalid sha512 checksum".to_string(),
+        ));
+    }
+    let actual = sha512_file(path)?;
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(ContentError::Download(
+            "modpack file failed sha512 verification".to_string(),
+        ))
+    }
 }
 
 fn reject_occupied_pack_destinations<'a>(
@@ -693,6 +714,22 @@ mod tests {
             "files": [{ "path": "mods/x.jar", "downloads": ["http://insecure/x.jar"] }]
         }"#;
         assert!(parse_pack_index(raw).is_err());
+    }
+
+    #[test]
+    fn sha512_only_pack_files_are_verified() {
+        let root = std::env::temp_dir().join("axial-pack-sha512-verification");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("payload.jar");
+        fs::write(&path, b"verified payload").expect("payload");
+        let expected = sha512_file(&path).expect("sha512");
+
+        verify_pack_sha512(&path, Some(&expected)).expect("matching checksum");
+        assert!(verify_pack_sha512(&path, Some(&"0".repeat(128))).is_err());
+        assert!(verify_pack_sha512(&path, Some("not-a-sha512")).is_err());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

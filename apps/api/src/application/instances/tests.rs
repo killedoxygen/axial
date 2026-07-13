@@ -718,6 +718,30 @@ async fn instance_mod_update_reports_not_found_conflict_and_success() {
     assert!(mods_dir.join("source.jar.disabled").is_file());
 
     fs::write(mods_dir.join("toggle.jar"), "toggle").expect("write enabled mod");
+    let tracked_id = axial_content::CanonicalId::for_project(
+        axial_content::ProviderId::Modrinth,
+        "toggle-project",
+    );
+    let mut manifest = axial_content::ContentManifest::default();
+    manifest.upsert(axial_content::ManifestEntry::managed(
+        tracked_id.clone(),
+        axial_content::ProviderId::Modrinth,
+        "toggle-project".to_string(),
+        "toggle-version".to_string(),
+        axial_content::ContentKind::Mod,
+        &axial_content::FileRef {
+            url: "https://example.invalid/toggle.jar".to_string(),
+            filename: "toggle.jar".to_string(),
+            sha1: None,
+            sha512: None,
+            size: None,
+            primary: true,
+        },
+        Vec::new(),
+        None,
+    ));
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    manifest.save(&game_dir).expect("save manifest");
     let body = handle_update_instance_mod(
         &fixture.state,
         &instance.id,
@@ -735,6 +759,13 @@ async fn instance_mod_update_reports_not_found_conflict_and_success() {
         fs::read_to_string(mods_dir.join("toggle.jar.disabled")).expect("read disabled mod"),
         "toggle"
     );
+    assert!(
+        !axial_content::ContentManifest::load(&game_dir)
+            .expect("load disabled manifest")
+            .find(&tracked_id)
+            .expect("tracked mod")
+            .enabled
+    );
 
     let body = handle_update_instance_mod(
         &fixture.state,
@@ -750,6 +781,13 @@ async fn instance_mod_update_reports_not_found_conflict_and_success() {
     );
     assert!(mods_dir.join("toggle.jar").is_file());
     assert!(!mods_dir.join("toggle.jar.disabled").exists());
+    assert!(
+        axial_content::ContentManifest::load(&game_dir)
+            .expect("load enabled manifest")
+            .find(&tracked_id)
+            .expect("tracked mod")
+            .enabled
+    );
 }
 
 #[tokio::test]

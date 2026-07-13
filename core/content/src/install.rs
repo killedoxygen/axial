@@ -68,7 +68,17 @@ where
         .iter()
         .map(|destination| destination.relative.clone())
         .collect();
-    let mut transaction = FileTransaction::apply(game_dir, staging.transfer(), &relative_paths)?;
+    let must_be_absent: Vec<String> = destinations
+        .iter()
+        .filter(|destination| destination.must_be_absent)
+        .map(|destination| destination.relative.clone())
+        .collect();
+    let mut transaction = FileTransaction::apply_preserving_absence(
+        game_dir,
+        staging.transfer(),
+        &relative_paths,
+        &must_be_absent,
+    )?;
     let mut stale_files = Vec::new();
 
     for (planned, planned_destination) in files.iter().zip(&destinations) {
@@ -109,6 +119,7 @@ struct InstallDestination {
     enabled: bool,
     relative: String,
     variants: Vec<String>,
+    must_be_absent: bool,
 }
 
 /// Resolve and validate every final path before downloading. A manifest entry
@@ -166,10 +177,12 @@ fn prepare_install_destinations(
             enabled,
             relative,
             variants,
+            must_be_absent: true,
         });
     }
 
-    for (planned, destination) in files.iter().zip(&destinations) {
+    for (planned, destination) in files.iter().zip(&mut destinations) {
+        let mut selected_destination_exists = false;
         for variant in &destination.variants {
             let owners = manifest_variant_owners
                 .get(variant)
@@ -191,7 +204,11 @@ fn prepare_install_destinations(
 
             let path = contained_path(game_dir, variant)?;
             match fs::symlink_metadata(path) {
-                Ok(metadata) if metadata.is_file() && !owners.is_empty() => {}
+                Ok(metadata) if metadata.is_file() && !owners.is_empty() => {
+                    if variant == &destination.relative {
+                        selected_destination_exists = true;
+                    }
+                }
                 Ok(_) if owners.is_empty() => {
                     return Err(ContentError::Invalid(
                         "a content destination is already occupied by an unmanaged file"
@@ -207,6 +224,7 @@ fn prepare_install_destinations(
                 Err(error) => return Err(ContentError::Io(error)),
             }
         }
+        destination.must_be_absent = !selected_destination_exists;
     }
 
     Ok(destinations)

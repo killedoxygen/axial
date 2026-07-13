@@ -23,12 +23,13 @@ use crate::state::AppState;
 use axial_content::{
     CanonicalContent, CanonicalId, ContentDetail, ContentError, ContentKind, ContentManifest,
     ContentQuery, EntrySource, ManifestEntry, Page, ProviderId, SortOrder, UnidentifiedRecord,
-    UnmanagedFile, install_and_record, reconcile, sha512_file, uninstall,
+    UnmanagedFile, entry_file_present, install_and_record, reconcile, sha512_file, uninstall,
 };
 use axial_minecraft::DownloadProgress;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 pub use compat::{CompatCandidate, CompatDrop};
 pub(crate) use pack::execute_modpack_install;
@@ -186,22 +187,35 @@ pub async fn content_search(
         .map_err(content_error_response)?;
 
     // Annotation is best-effort: a search still returns results for an instance
-    // whose manifest cannot be read.
-    let manifest = params
-        .instance_id
-        .as_deref()
-        .and_then(|instance_id| require_instance_game_dir(state, instance_id).ok())
-        .and_then(|game_dir| ContentManifest::load(&game_dir).ok());
+    // whose manifest cannot be read. Presence is checked under the same lock as
+    // content mutations so a stale manifest entry never hides the Add action.
+    let candidate_ids: HashSet<CanonicalId> = page
+        .items
+        .iter()
+        .map(|content| content.canonical_id.clone())
+        .collect();
+    let installed_ids = if let Some(instance_id) = params.instance_id.as_deref() {
+        if let Ok(game_dir) = require_instance_game_dir(state, instance_id) {
+            let _lifecycle_guard = state.sessions().lock_instance_lifecycle(instance_id).await;
+            ContentManifest::load(&game_dir)
+                .ok()
+                .map(|manifest| present_installed_ids(&game_dir, &manifest, &candidate_ids))
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        }
+    } else {
+        HashSet::new()
+    };
 
     Ok(Page {
         items: page
             .items
             .into_iter()
             .map(|content| SearchHit {
-                install_state: manifest
-                    .as_ref()
-                    .and_then(|manifest| manifest.find(&content.canonical_id))
-                    .map(|_| InstallState::Installed),
+                install_state: installed_ids
+                    .contains(&content.canonical_id)
+                    .then_some(InstallState::Installed),
                 content,
             })
             .collect(),
@@ -209,6 +223,21 @@ pub async fn content_search(
         limit: page.limit,
         total: page.total,
     })
+}
+
+fn present_installed_ids(
+    game_dir: &Path,
+    manifest: &ContentManifest,
+    candidate_ids: &HashSet<CanonicalId>,
+) -> HashSet<CanonicalId> {
+    manifest
+        .entries
+        .iter()
+        .filter(|entry| {
+            candidate_ids.contains(&entry.canonical_id) && entry_file_present(game_dir, entry)
+        })
+        .map(|entry| entry.canonical_id.clone())
+        .collect()
 }
 
 pub async fn content_detail(
@@ -755,6 +784,8 @@ pub fn json_error(status: StatusCode, message: &str) -> ContentApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axial_content::FileRef;
+    use std::fs;
 
     #[test]
     fn same_size_negative_cache_entries_require_the_same_hash() {
@@ -778,5 +809,45 @@ mod tests {
             42,
             "new-hash"
         ));
+    }
+
+    #[test]
+    fn search_install_state_requires_the_tracked_file_to_exist() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-content-search-presence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let id = CanonicalId::for_project(ProviderId::Modrinth, "tracked-project");
+        let file = FileRef {
+            url: "https://example.invalid/tracked.jar".to_string(),
+            filename: "tracked.jar".to_string(),
+            sha1: None,
+            sha512: None,
+            size: None,
+            primary: true,
+        };
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(ManifestEntry::managed(
+            id.clone(),
+            ProviderId::Modrinth,
+            "tracked-project".to_string(),
+            "tracked-version".to_string(),
+            ContentKind::Mod,
+            &file,
+            Vec::new(),
+            None,
+        ));
+        let candidates = HashSet::from([id.clone()]);
+
+        assert!(present_installed_ids(&root, &manifest, &candidates).is_empty());
+        fs::write(root.join("mods/tracked.jar"), b"tracked").expect("tracked file");
+        assert!(present_installed_ids(&root, &manifest, &candidates).contains(&id));
+
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -1,5 +1,7 @@
 use crate::error::{ContentError, ContentResult};
+use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -144,6 +146,7 @@ pub(crate) struct FileTransaction {
     applied: Vec<(String, bool)>,
     removed: Vec<String>,
     replace_existing: bool,
+    must_be_absent: HashSet<String>,
     finished: bool,
 }
 
@@ -153,7 +156,19 @@ impl FileTransaction {
         staging: PathBuf,
         relative_paths: &[String],
     ) -> ContentResult<Self> {
-        Self::apply_with_policy(root, staging, relative_paths, true)
+        Self::apply_with_policy(root, staging, relative_paths, true, &[])
+    }
+
+    /// Apply replacements while preserving paths that preflight observed as
+    /// absent. This closes the gap between ownership validation and commit: a
+    /// user file created while downloads are in flight is never overwritten.
+    pub(crate) fn apply_preserving_absence(
+        root: &Path,
+        staging: PathBuf,
+        relative_paths: &[String],
+        must_be_absent: &[String],
+    ) -> ContentResult<Self> {
+        Self::apply_with_policy(root, staging, relative_paths, true, must_be_absent)
     }
 
     pub(crate) fn apply_new(
@@ -161,7 +176,7 @@ impl FileTransaction {
         staging: PathBuf,
         relative_paths: &[String],
     ) -> ContentResult<Self> {
-        Self::apply_with_policy(root, staging, relative_paths, false)
+        Self::apply_with_policy(root, staging, relative_paths, false, relative_paths)
     }
 
     fn apply_with_policy(
@@ -169,6 +184,7 @@ impl FileTransaction {
         staging: PathBuf,
         relative_paths: &[String],
         replace_existing: bool,
+        must_be_absent: &[String],
     ) -> ContentResult<Self> {
         let backup = staging.join(".backup");
         let mut transaction = Self {
@@ -178,6 +194,7 @@ impl FileTransaction {
             applied: Vec::new(),
             removed: Vec::new(),
             replace_existing,
+            must_be_absent: must_be_absent.iter().cloned().collect(),
             finished: false,
         };
         for relative in relative_paths {
@@ -245,7 +262,7 @@ impl FileTransaction {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(ContentError::Io(error)),
         };
-        if existed && !self.replace_existing {
+        if existed && (!self.replace_existing || self.must_be_absent.contains(relative)) {
             return Err(ContentError::Invalid(
                 "content destination became occupied before commit".to_string(),
             ));
@@ -259,11 +276,17 @@ impl FileTransaction {
             }
             fs::rename(&destination, &backup)?;
         }
-        if let Err(error) = fs::rename(&staged, &destination) {
+        let must_remain_absent = !self.replace_existing || self.must_be_absent.contains(relative);
+        let promote_result = if must_remain_absent {
+            promote_new_file(&staged, &destination)
+        } else {
+            fs::rename(&staged, &destination).map_err(ContentError::Io)
+        };
+        if let Err(error) = promote_result {
             if existed {
                 let _ = fs::rename(&backup, &destination);
             }
-            return Err(ContentError::Io(error));
+            return Err(error);
         }
         self.applied.push((relative.to_string(), existed));
         Ok(())
@@ -304,6 +327,48 @@ impl FileTransaction {
         }
         let _ = fs::remove_dir_all(&self.staging);
     }
+}
+
+/// Promote a staged regular file without ever replacing an occupied path. A
+/// hard link provides an atomic same-volume fast path; filesystems without hard
+/// links fall back to an exclusive create and copy, which retains no-clobber
+/// semantics at the cost of another write.
+fn promote_new_file(staged: &Path, destination: &Path) -> ContentResult<()> {
+    match fs::hard_link(staged, destination) {
+        Ok(()) => {
+            let _ = fs::remove_file(staged);
+            return Ok(());
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(ContentError::Invalid(
+                "content destination became occupied before commit".to_string(),
+            ));
+        }
+        Err(_) => {}
+    }
+
+    let mut source = fs::File::open(staged)?;
+    let mut target = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+    {
+        Ok(target) => target,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(ContentError::Invalid(
+                "content destination became occupied before commit".to_string(),
+            ));
+        }
+        Err(error) => return Err(ContentError::Io(error)),
+    };
+    if let Err(error) = io::copy(&mut source, &mut target) {
+        drop(target);
+        let _ = fs::remove_file(destination);
+        return Err(ContentError::Io(error));
+    }
+    drop(target);
+    let _ = fs::remove_file(staged);
+    Ok(())
 }
 
 impl Drop for FileTransaction {
@@ -432,6 +497,40 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             fs::read(root.join("mods/example.jar")).expect("preserved"),
+            b"user file"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replacement_transaction_preserves_destinations_that_preflight_found_absent() {
+        let root = root("preflight-absence");
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        fs::write(root.join("mods/existing.jar"), b"managed old").expect("managed old");
+        let staging = StagingGuard::create(&root, "stage").expect("stage");
+        fs::create_dir_all(staging.path().join("mods")).expect("staged mods");
+        fs::write(staging.path().join("mods/existing.jar"), b"managed new")
+            .expect("managed replacement");
+        fs::write(staging.path().join("mods/new.jar"), b"downloaded").expect("new download");
+
+        // Simulate a user adding the destination after preflight but before
+        // the downloaded batch is committed.
+        fs::write(root.join("mods/new.jar"), b"user file").expect("racing user file");
+        let paths = vec!["mods/existing.jar".to_string(), "mods/new.jar".to_string()];
+        let result = FileTransaction::apply_preserving_absence(
+            &root,
+            staging.transfer(),
+            &paths,
+            &["mods/new.jar".to_string()],
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(root.join("mods/existing.jar")).expect("restored managed file"),
+            b"managed old"
+        );
+        assert_eq!(
+            fs::read(root.join("mods/new.jar")).expect("preserved user file"),
             b"user file"
         );
         let _ = fs::remove_dir_all(root);

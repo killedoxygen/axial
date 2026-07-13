@@ -1,5 +1,6 @@
 use crate::state::AppState;
 use async_stream::stream;
+use axial_content::{ContentKind, ContentManifest};
 use axum::{
     Json,
     body::{Body, Bytes},
@@ -222,6 +223,7 @@ pub(crate) async fn handle_update_instance_mod(
     name: &str,
     payload: UpdateModRequest,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let _lifecycle_guard = state.sessions().lock_instance_lifecycle(id).await;
     reject_running_instance(state, id, "mods").await?;
     validate_mod_name(name)?;
 
@@ -230,16 +232,38 @@ pub(crate) async fn handle_update_instance_mod(
     let source = mods_dir.join(name);
     require_mod_file(&source)?;
     let target_name = mod_enabled_name(name, payload.enabled)?;
-    if target_name == name {
-        return Ok(serde_json::json!({ "status": "ok", "name": name, "enabled": payload.enabled }));
-    }
-
     let target = mods_dir.join(&target_name);
-    if target_exists(&target) {
+    let renamed = target_name != name;
+    if renamed && target_exists(&target) {
         return Err(json_error(StatusCode::CONFLICT, "mod already exists"));
     }
 
-    fs::rename(source, target).map_err(mod_file_write_error_response)?;
+    let mut manifest = ContentManifest::load(&game_dir).map_err(mod_manifest_error_response)?;
+    let base_name = if name.to_ascii_lowercase().ends_with(".disabled") {
+        &name[..name.len() - ".disabled".len()]
+    } else {
+        name
+    };
+    let tracked = manifest
+        .entries
+        .iter_mut()
+        .find(|entry| entry.kind == ContentKind::Mod && entry.filename == base_name);
+    let manifest_changed = tracked
+        .as_ref()
+        .is_some_and(|entry| entry.enabled != payload.enabled);
+    if let Some(entry) = tracked {
+        entry.enabled = payload.enabled;
+    }
+
+    if renamed {
+        fs::rename(&source, &target).map_err(mod_file_write_error_response)?;
+    }
+    if manifest_changed && let Err(error) = manifest.save(&game_dir) {
+        if renamed {
+            let _ = fs::rename(&target, &source);
+        }
+        return Err(mod_manifest_error_response(error));
+    }
     Ok(serde_json::json!({ "status": "ok", "name": target_name, "enabled": payload.enabled }))
 }
 
@@ -756,6 +780,17 @@ fn mod_file_read_error_response(_error: std::io::Error) -> (StatusCode, Json<ser
 }
 
 fn mod_file_write_error_response(_error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not update mod files. Check instance folder permissions and try again."
+        })),
+    )
+}
+
+fn mod_manifest_error_response(
+    _error: axial_content::ContentError,
+) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({
