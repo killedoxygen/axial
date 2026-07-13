@@ -1099,6 +1099,46 @@ pub(crate) async fn reconstruct_profile_library_declarations(
     })
 }
 
+pub(crate) async fn reconstruct_installer_library_declarations(
+    sources: crate::loaders::PendingForgeReconstructionSources,
+) -> Result<crate::loaders::BoundForgeInstallExecution, DownloadError> {
+    let (pending, jobs) = sources.into_parts();
+    let client = standard_minecraft_download_client();
+    let source_pool = LibrarySourcePool::new();
+    let mut proofs = Vec::new();
+    for classified in jobs {
+        let (plan, acquisition) = classified.into_parts();
+        if acquisition == LibraryAcquisition::ExactDeclaration {
+            continue;
+        }
+        let target = selected_download_source_label(
+            SelectedDownloadArtifactKind::Library,
+            plan.relative_path.as_str(),
+        );
+        let source = acquire_authenticated_library_source(LibrarySourceRequest {
+            client: &client,
+            url: plan.source_url.as_deref().ok_or_else(|| {
+                DownloadError::ResolveManifest(
+                    "installer reconstruction library source is missing".to_string(),
+                )
+            })?,
+            expected: &plan.expected,
+            relative_path: &plan.relative_path,
+            max_bytes: LIBRARY_SOURCE_MAX_BYTES,
+            target: &target,
+            pool: &source_pool,
+            fact_tx: None,
+        })
+        .await?;
+        proofs.push(source.into_exact_download_proof(plan.is_native));
+    }
+    pending.complete_sources(proofs).map_err(|error| {
+        DownloadError::ResolveManifest(format!(
+            "installer library reconstruction could not be completed: {error}"
+        ))
+    })
+}
+
 fn validate_install_version_id(version_id: &str) -> Result<(), DownloadError> {
     let json_name = format!("{version_id}.json");
     if version_id != version_id.trim()

@@ -1,6 +1,6 @@
 use super::MAX_VERSION_ID_BYTES;
 use super::providers::common::{
-    forge_install_source, infer_loader_build_metadata, profile_source_url,
+    forge_install_source, infer_loader_build_metadata, neoforge_install_source, profile_source_url,
 };
 use super::types::{
     LoaderArtifactKind, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord,
@@ -69,11 +69,7 @@ pub(crate) fn loader_reconstruction_plan(
         LoaderComponentId::Forge => {
             forge_install_source(&identity.minecraft_version, &identity.loader_version)?
         }
-        LoaderComponentId::NeoForge => {
-            return Err(LoaderError::InvalidProfile(
-                "loader reconstruction strategy is not implemented".to_string(),
-            ));
-        }
+        LoaderComponentId::NeoForge => neoforge_install_source(&identity.loader_version)?,
     };
     Ok(LoaderInstallPlan {
         record: LoaderBuildRecord {
@@ -500,6 +496,45 @@ mod tests {
                     version_id
                 );
             }
+        }
+    }
+
+    #[test]
+    fn reconstruction_plan_derives_fixed_installer_sources_from_canonical_identity() {
+        let cases = [
+            (
+                LoaderComponentId::Forge,
+                "1.12.2",
+                "14.23.5.2859",
+                LoaderInstallStrategy::ForgeLegacyInstaller,
+                "https://maven.minecraftforge.net/net/minecraftforge/forge/1.12.2-14.23.5.2859/forge-1.12.2-14.23.5.2859-installer.jar",
+            ),
+            (
+                LoaderComponentId::Forge,
+                "1.21.5",
+                "55.0.0",
+                LoaderInstallStrategy::ForgeModern,
+                "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.5-55.0.0/forge-1.21.5-55.0.0-installer.jar",
+            ),
+            (
+                LoaderComponentId::NeoForge,
+                "1.21.5",
+                "21.5.74",
+                LoaderInstallStrategy::NeoForgeModern,
+                "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.5.74/neoforge-21.5.74-installer.jar",
+            ),
+        ];
+        for (component, minecraft, loader, strategy, expected_url) in cases {
+            let id = installed_version_id_for(component, minecraft, loader).expect("canonical id");
+            let plan = loader_reconstruction_plan(&id).expect("fixed reconstruction plan");
+            assert_eq!(plan.record.strategy, strategy);
+            assert_eq!(plan.record.artifact_kind, LoaderArtifactKind::InstallerJar);
+            assert_eq!(
+                plan.record.install_source,
+                LoaderInstallSource::InstallerJar {
+                    url: expected_url.to_string()
+                }
+            );
         }
     }
 

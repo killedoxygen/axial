@@ -1,14 +1,13 @@
 use super::common::{
-    NEOFORGE_MAVEN_BASE, NEOFORGE_MAVEN_META, fetch_text, infer_loader_build_metadata,
-    is_prerelease_loader_version, neoforge_to_minecraft_version, parse_maven_versions,
+    NEOFORGE_MAVEN_META, fetch_text, infer_loader_build_metadata, is_prerelease_loader_version,
+    neoforge_install_source, neoforge_to_minecraft_version, parse_maven_versions,
     provider_installed_version_id,
 };
 use crate::lifecycle::LifecycleMeta;
 use crate::loaders::api::build_id_for;
 use crate::loaders::types::{
-    LoaderArtifactKind, LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId,
-    LoaderGameVersion, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
-    LoaderVersionIndex,
+    LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId, LoaderGameVersion,
+    LoaderInstallability, LoaderVersionIndex,
 };
 use crate::types::VersionSubjectKind;
 use crate::version_meta::MinecraftVersionMeta;
@@ -61,6 +60,7 @@ pub async fn fetch_builds(
             continue;
         }
         let prerelease = is_prerelease_loader_version(&entry);
+        let (strategy, artifact_kind, install_source) = neoforge_install_source(&entry)?;
         builds.push(LoaderBuildRecord {
             subject_kind: LoaderBuildSubjectKind::LoaderBuild,
             component_id,
@@ -70,15 +70,10 @@ pub async fn fetch_builds(
             loader_version: entry.clone(),
             version_id: provider_installed_version_id(component_id, minecraft_version, &entry)?,
             build_meta: infer_loader_build_metadata(&entry, &[], false, false, Some(!prerelease)),
-            strategy: LoaderInstallStrategy::NeoForgeModern,
-            artifact_kind: LoaderArtifactKind::InstallerJar,
+            strategy,
+            artifact_kind,
             installability: LoaderInstallability::Installable,
-            install_source: LoaderInstallSource::InstallerJar {
-                url: format!(
-                    "{NEOFORGE_MAVEN_BASE}/net/neoforged/neoforge/{0}/neoforge-{0}-installer.jar",
-                    entry
-                ),
-            },
+            install_source,
         });
     }
 

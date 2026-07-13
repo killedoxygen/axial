@@ -109,6 +109,29 @@ pub(crate) fn forge_install_source(
     ))
 }
 
+pub(crate) fn neoforge_install_source(
+    loader_version: &str,
+) -> Result<
+    (
+        LoaderInstallStrategy,
+        LoaderArtifactKind,
+        LoaderInstallSource,
+    ),
+    LoaderError,
+> {
+    let filename = format!("neoforge-{loader_version}-installer.jar");
+    Ok((
+        LoaderInstallStrategy::NeoForgeModern,
+        LoaderArtifactKind::InstallerJar,
+        LoaderInstallSource::InstallerJar {
+            url: fixed_provider_url(
+                NEOFORGE_MAVEN_BASE,
+                &["net", "neoforged", "neoforge", loader_version, &filename],
+            )?,
+        },
+    ))
+}
+
 fn fixed_provider_url(base: &str, segments: &[&str]) -> Result<String, LoaderError> {
     let mut url = reqwest::Url::parse(base).map_err(|_| {
         LoaderError::InvalidProfile("fixed loader provider URL is invalid".to_string())

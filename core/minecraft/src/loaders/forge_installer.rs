@@ -8,8 +8,9 @@ use super::types::{
 use crate::artifact_path::ArtifactRelativePath;
 use crate::download::{DownloadError, library_artifact_plans_for};
 use crate::known_good_libraries::{
-    BoundInstallerLibraryDeclarations, ClassifiedLibraryDownload,
+    BoundInstallerLibraryDeclarations, ClassifiedLibraryDownload, ClassifiedLibraryReconstruction,
     PendingInstallerNetworkDeclarations, PendingInstallerPublications,
+    PendingInstallerReconstructionDeclarations, PendingInstallerReconstructionTerminalDeclarations,
     PendingInstallerTerminalDeclarations, SealedExactLibraryDeclarations,
     bind_installer_library_declarations,
 };
@@ -183,6 +184,8 @@ enum InstallerDeclarationState {
     Bound(BoundInstallerLibraryDeclarations),
     NetworkPending(PendingInstallerNetworkDeclarations),
     TerminalPending(PendingInstallerTerminalDeclarations),
+    ReconstructionPending(PendingInstallerReconstructionDeclarations),
+    ReconstructionTerminal(PendingInstallerReconstructionTerminalDeclarations),
 }
 
 pub(crate) struct PendingForgeNetworkInstall {
@@ -191,6 +194,15 @@ pub(crate) struct PendingForgeNetworkInstall {
 }
 
 pub(crate) struct PendingForgeInstallExecution {
+    execution: BoundForgeInstallExecution,
+}
+
+pub(crate) struct PendingForgeReconstructionSources {
+    execution: BoundForgeInstallExecution,
+    jobs: Vec<ClassifiedLibraryReconstruction>,
+}
+
+pub(crate) struct PendingForgeReconstructionExecution {
     execution: BoundForgeInstallExecution,
 }
 
@@ -220,6 +232,35 @@ impl BoundForgeInstallExecution {
             }
         };
         Ok(PendingForgeNetworkInstall { execution, jobs })
+    }
+
+    pub(crate) fn into_reconstruction_sources(
+        self,
+    ) -> Result<PendingForgeReconstructionSources, ForgeInstallerError> {
+        let (execution, jobs) = match self {
+            Self::Run(execution) => {
+                if !execution.has_exact_terminal_declarations() {
+                    return Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput);
+                }
+                let BoundForgeProcessorExecution { plan, continuation } = *execution;
+                let (continuation, jobs) = continuation.into_reconstruction_sources()?;
+                (
+                    Self::Run(Box::new(BoundForgeProcessorExecution {
+                        plan,
+                        continuation,
+                    })),
+                    jobs,
+                )
+            }
+            Self::Continue(continuation) => {
+                let (continuation, jobs) = continuation.into_reconstruction_sources()?;
+                (Self::Continue(Box::new(continuation)), jobs)
+            }
+            Self::UnsupportedMissingOutputs => {
+                return Err(ForgeInstallerError::MissingForgeProcessorOutputs);
+            }
+        };
+        Ok(PendingForgeReconstructionSources { execution, jobs })
     }
 }
 
@@ -260,6 +301,46 @@ impl PendingForgeInstallExecution {
     }
 }
 
+impl PendingForgeReconstructionSources {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        PendingForgeReconstructionExecution,
+        Vec<ClassifiedLibraryReconstruction>,
+    ) {
+        (
+            PendingForgeReconstructionExecution {
+                execution: self.execution,
+            },
+            self.jobs,
+        )
+    }
+}
+
+impl PendingForgeReconstructionExecution {
+    pub(crate) fn complete_sources(
+        self,
+        streamed: Vec<crate::download::ExactLibraryDownloadProof>,
+    ) -> Result<BoundForgeInstallExecution, ForgeInstallerError> {
+        match self.execution {
+            BoundForgeInstallExecution::Run(execution) => {
+                let BoundForgeProcessorExecution { plan, continuation } = *execution;
+                let continuation = continuation.complete_reconstruction_sources(streamed)?;
+                Ok(BoundForgeInstallExecution::Run(Box::new(
+                    BoundForgeProcessorExecution { plan, continuation },
+                )))
+            }
+            BoundForgeInstallExecution::Continue(continuation) => {
+                let continuation = continuation.complete_reconstruction_sources(streamed)?;
+                Ok(BoundForgeInstallExecution::Continue(Box::new(continuation)))
+            }
+            BoundForgeInstallExecution::UnsupportedMissingOutputs => {
+                Err(ForgeInstallerError::MissingForgeProcessorOutputs)
+            }
+        }
+    }
+}
+
 pub(crate) struct VerifiedInstallerReceiptSource {
     source: VerifiedLoaderSource,
     version: LoaderProfileFragment,
@@ -270,6 +351,11 @@ pub(crate) struct AuthenticatedInstallerReceiptInput {
     source: VerifiedInstallerReceiptSource,
     library_declarations: SealedExactLibraryDeclarations,
     pending_publications: PendingInstallerPublications,
+}
+
+pub(crate) struct AuthenticatedInstallerReconstructionInput {
+    source: VerifiedInstallerReceiptSource,
+    library_declarations: SealedExactLibraryDeclarations,
 }
 
 pub(crate) struct VerifiedInstallerClientBytes {
@@ -507,8 +593,33 @@ impl BoundForgeInstallerPlan {
 }
 
 impl BoundForgeProcessorExecution {
+    fn has_exact_terminal_declarations(&self) -> bool {
+        let mut saw_terminal = false;
+        for output in self.plan.steps.iter().flat_map(|step| &step.outputs) {
+            match output.role {
+                BoundProcessorOutputRole::Intermediate => {}
+                BoundProcessorOutputRole::Terminal {
+                    expected_size: Some(_),
+                } => saw_terminal = true,
+                BoundProcessorOutputRole::Terminal {
+                    expected_size: None,
+                } => return false,
+            }
+        }
+        saw_terminal
+    }
+
     pub(super) fn into_parts(self) -> (BoundForgeInstallerContinuation, BoundProcessorPlan) {
         (self.continuation, self.plan)
+    }
+
+    pub(crate) fn into_declared_reconstruction(
+        self,
+    ) -> Result<BoundForgeInstallerContinuation, ForgeInstallerError> {
+        if !self.has_exact_terminal_declarations() {
+            return Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput);
+        }
+        Ok(self.continuation)
     }
 }
 
@@ -526,6 +637,12 @@ impl BoundForgeInstallerContinuation {
                 declarations.embedded_maven_artifact(path)
             }
             InstallerDeclarationState::TerminalPending(declarations) => {
+                declarations.embedded_maven_artifact(path)
+            }
+            InstallerDeclarationState::ReconstructionPending(declarations) => {
+                declarations.embedded_maven_artifact(path)
+            }
+            InstallerDeclarationState::ReconstructionTerminal(declarations) => {
                 declarations.embedded_maven_artifact(path)
             }
             InstallerDeclarationState::Bound(_) => None,
@@ -564,6 +681,33 @@ impl BoundForgeInstallerContinuation {
         })
     }
 
+    pub(crate) fn into_reconstruction_receipt_input(
+        self,
+    ) -> Result<AuthenticatedInstallerReconstructionInput, ForgeInstallerError> {
+        let Self {
+            source,
+            version,
+            library_declarations,
+            strip_client_meta,
+        } = self;
+        let InstallerDeclarationState::ReconstructionTerminal(library_declarations) =
+            library_declarations
+        else {
+            return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
+        };
+        let library_declarations = library_declarations
+            .seal_declared_terminal_outputs()
+            .map_err(|_| ForgeInstallerError::InvalidForgeProcessorFinalOutput)?;
+        Ok(AuthenticatedInstallerReconstructionInput {
+            source: VerifiedInstallerReceiptSource {
+                source,
+                version,
+                strip_client_meta,
+            },
+            library_declarations,
+        })
+    }
+
     fn into_network_install(
         self,
         libraries_root: &Path,
@@ -594,6 +738,32 @@ impl BoundForgeInstallerContinuation {
         ))
     }
 
+    fn into_reconstruction_sources(
+        self,
+    ) -> Result<(Self, Vec<ClassifiedLibraryReconstruction>), ForgeInstallerError> {
+        let Self {
+            source,
+            version,
+            library_declarations,
+            strip_client_meta,
+        } = self;
+        let InstallerDeclarationState::Bound(library_declarations) = library_declarations else {
+            return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
+        };
+        let (library_declarations, jobs) = library_declarations.into_reconstruction_jobs();
+        Ok((
+            Self {
+                source,
+                version,
+                library_declarations: InstallerDeclarationState::ReconstructionPending(
+                    library_declarations,
+                ),
+                strip_client_meta,
+            },
+            jobs,
+        ))
+    }
+
     fn complete_network(
         self,
         materialized: Vec<crate::download::MaterializedLibraryIdentity>,
@@ -615,6 +785,34 @@ impl BoundForgeInstallerContinuation {
             source,
             version,
             library_declarations: InstallerDeclarationState::TerminalPending(library_declarations),
+            strip_client_meta,
+        })
+    }
+
+    fn complete_reconstruction_sources(
+        self,
+        streamed: Vec<crate::download::ExactLibraryDownloadProof>,
+    ) -> Result<Self, ForgeInstallerError> {
+        let Self {
+            source,
+            version,
+            library_declarations,
+            strip_client_meta,
+        } = self;
+        let InstallerDeclarationState::ReconstructionPending(library_declarations) =
+            library_declarations
+        else {
+            return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
+        };
+        let library_declarations = library_declarations
+            .complete_network(streamed)
+            .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?;
+        Ok(Self {
+            source,
+            version,
+            library_declarations: InstallerDeclarationState::ReconstructionTerminal(
+                library_declarations,
+            ),
             strip_client_meta,
         })
     }
@@ -648,6 +846,29 @@ impl AuthenticatedInstallerReceiptInput {
     }
 }
 
+impl AuthenticatedInstallerReconstructionInput {
+    pub(crate) fn version(&self) -> &LoaderProfileFragment {
+        self.source.version()
+    }
+
+    pub(crate) fn derive_child_client_bytes(
+        &self,
+        authenticated_base_bytes: &[u8],
+    ) -> Result<VerifiedInstallerClientBytes, ForgeInstallerError> {
+        self.source
+            .derive_child_client_bytes(authenticated_base_bytes)
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        VerifiedInstallerReceiptSource,
+        SealedExactLibraryDeclarations,
+    ) {
+        (self.source, self.library_declarations)
+    }
+}
+
 impl VerifiedInstallerReceiptSource {
     pub(crate) fn source_bytes(&self) -> &[u8] {
         self.source.bytes()
@@ -655,6 +876,14 @@ impl VerifiedInstallerReceiptSource {
 
     pub(crate) fn version(&self) -> &LoaderProfileFragment {
         &self.version
+    }
+
+    pub(crate) fn matches_record(&self, record: &LoaderBuildRecord) -> bool {
+        matches!(
+            &record.install_source,
+            LoaderInstallSource::InstallerJar { url }
+                if self.source.matches_contract(url, &record.version_id)
+        )
     }
 
     pub(crate) fn derive_child_client_bytes(
@@ -2605,6 +2834,9 @@ mod tests {
         bind_authenticated_installer_plan, merge_libraries_by_name, normalize_legacy_forge_library,
         normalize_legacy_forge_version_id, plan_authenticated_installer,
     };
+    use crate::artifact_path::ArtifactRelativePath;
+    use crate::download::ExactLibraryDownloadProof;
+    use crate::known_good_libraries::LibraryAcquisition;
     use crate::launch::Library;
     use crate::loaders::source::VerifiedLoaderSource;
     use crate::loaders::types::{
@@ -2850,6 +3082,84 @@ mod tests {
             bind_modern_fixture_with_entries(&record, &version, &install, &[]),
             Err(ForgeInstallerError::MissingForgeProcessorOutputs)
         ));
+    }
+
+    #[test]
+    fn reconstruction_skips_only_processors_with_exact_terminal_sizes() {
+        let (record, mut version, install) = forge_processor_fixture();
+        let bound = bind_modern_fixture_with_entries(&record, &version, &install, &[])
+            .expect("incomplete terminal authority");
+        let BoundForgeInstallExecution::Run(execution) =
+            bound.into_install_execution().expect("bound execution")
+        else {
+            panic!("typed processor execution");
+        };
+        assert!(!execution.has_exact_terminal_declarations());
+
+        version["libraries"][1]["sha1"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        version["libraries"][1]["size"] = 9.into();
+        let bound = bind_modern_fixture_with_entries(&record, &version, &install, &[])
+            .expect("exact terminal authority");
+        let BoundForgeInstallExecution::Run(execution) =
+            bound.into_install_execution().expect("bound execution")
+        else {
+            panic!("typed processor execution");
+        };
+        assert!(execution.has_exact_terminal_declarations());
+
+        let bound = bind_modern_fixture_with_entries(&record, &version, &install, &[])
+            .expect("exact reconstruction authority");
+        let sources = bound
+            .into_install_execution()
+            .expect("bound execution")
+            .into_reconstruction_sources()
+            .expect("source-only reconstruction transition");
+        let (pending, jobs) = sources.into_parts();
+        let proofs = jobs
+            .into_iter()
+            .filter_map(|job| {
+                let (plan, acquisition) = job.into_parts();
+                if acquisition == LibraryAcquisition::ExactDeclaration {
+                    return None;
+                }
+                let sha1 = if plan.expected.sha1.is_some() {
+                    [0xbb; 20]
+                } else {
+                    [5; 20]
+                };
+                Some(ExactLibraryDownloadProof::new_bound_for_test(
+                    plan.relative_path,
+                    plan.is_native,
+                    plan.source_url.expect("fresh source URL"),
+                    plan.expected.clone(),
+                    plan.expected.size.unwrap_or(7),
+                    sha1,
+                ))
+            })
+            .collect();
+        let BoundForgeInstallExecution::Run(execution) = pending
+            .complete_sources(proofs)
+            .expect("authenticated reconstruction sources")
+        else {
+            panic!("typed processor reconstruction");
+        };
+        let input = execution
+            .into_declared_reconstruction()
+            .expect("exact terminal reconstruction")
+            .into_reconstruction_receipt_input()
+            .expect("declared terminal reconstruction input");
+        assert_eq!(
+            input
+                .library_declarations
+                .get(
+                    &ArtifactRelativePath::new(
+                        "net/minecraftforge/forge/1.21.5-55.0.0/forge-1.21.5-55.0.0-client.jar",
+                    )
+                    .expect("terminal path"),
+                )
+                .map(|(_, _, size)| size),
+            Some(9)
+        );
     }
 
     #[test]

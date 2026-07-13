@@ -90,6 +90,22 @@ pub(crate) struct PendingInstallerNetworkDeclarations {
     libraries_root: PathBuf,
 }
 
+pub(crate) struct PendingInstallerReconstructionDeclarations {
+    selected: BTreeMap<ArtifactRelativePath, InstallerSelectedLibrary>,
+    entries: BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
+    embedded: BTreeMap<ArtifactRelativePath, AuthenticatedEmbeddedMavenArtifact>,
+    workspace_embedded: Vec<AuthenticatedEmbeddedMavenArtifact>,
+    structure: InstallerLibraryStructure,
+}
+
+pub(crate) struct PendingInstallerReconstructionTerminalDeclarations {
+    selected: BTreeMap<ArtifactRelativePath, InstallerSelectedLibrary>,
+    entries: BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
+    embedded: BTreeMap<ArtifactRelativePath, AuthenticatedEmbeddedMavenArtifact>,
+    workspace_embedded: Vec<AuthenticatedEmbeddedMavenArtifact>,
+    structure: InstallerLibraryStructure,
+}
+
 pub(crate) struct PendingInstallerTerminalDeclarations {
     selected: BTreeMap<ArtifactRelativePath, InstallerSelectedLibrary>,
     entries: BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
@@ -167,6 +183,11 @@ pub(crate) struct ClassifiedLibraryDownload {
     acquisition: LibraryAcquisition,
 }
 
+pub(crate) struct ClassifiedLibraryReconstruction {
+    plan: LibraryArtifactPlan,
+    acquisition: LibraryAcquisition,
+}
+
 impl ClassifiedLibraryDownload {
     pub(crate) fn job(&self) -> &DownloadJob {
         &self.job
@@ -179,6 +200,12 @@ impl ClassifiedLibraryDownload {
 
     pub(crate) fn into_parts(self) -> (DownloadJob, LibraryAcquisition) {
         (self.job, self.acquisition)
+    }
+}
+
+impl ClassifiedLibraryReconstruction {
+    pub(crate) fn into_parts(self) -> (LibraryArtifactPlan, LibraryAcquisition) {
+        (self.plan, self.acquisition)
     }
 }
 
@@ -478,6 +505,41 @@ impl BoundInstallerLibraryDeclarations {
             jobs,
         ))
     }
+
+    pub(crate) fn into_reconstruction_jobs(
+        self,
+    ) -> (
+        PendingInstallerReconstructionDeclarations,
+        Vec<ClassifiedLibraryReconstruction>,
+    ) {
+        let jobs = self
+            .selected
+            .values()
+            .filter_map(|selected| {
+                let acquisition = match selected.producer {
+                    InstallerLibraryProducer::ExactNetwork => LibraryAcquisition::ExactDeclaration,
+                    InstallerLibraryProducer::FreshNetwork => LibraryAcquisition::FreshStream,
+                    InstallerLibraryProducer::Embedded | InstallerLibraryProducer::Terminal(_) => {
+                        return None;
+                    }
+                };
+                Some(ClassifiedLibraryReconstruction {
+                    plan: selected.plan.clone(),
+                    acquisition,
+                })
+            })
+            .collect();
+        (
+            PendingInstallerReconstructionDeclarations {
+                selected: self.selected,
+                entries: self.entries,
+                embedded: self.embedded,
+                workspace_embedded: self.workspace_embedded,
+                structure: self.structure,
+            },
+            jobs,
+        )
+    }
 }
 
 impl PendingInstallerNetworkDeclarations {
@@ -558,6 +620,112 @@ impl PendingInstallerNetworkDeclarations {
     }
 }
 
+impl PendingInstallerReconstructionDeclarations {
+    pub(crate) fn embedded_maven_artifact(
+        &self,
+        path: &ArtifactRelativePath,
+    ) -> Option<&AuthenticatedEmbeddedMavenArtifact> {
+        self.embedded.get(path).or_else(|| {
+            self.workspace_embedded
+                .iter()
+                .find(|artifact| artifact.relative_path() == path)
+        })
+    }
+
+    pub(crate) fn complete_network(
+        self,
+        streamed: Vec<ExactLibraryDownloadProof>,
+    ) -> Result<PendingInstallerReconstructionTerminalDeclarations, SealedLibraryDeclarationError>
+    {
+        let mut streamed =
+            streamed
+                .into_iter()
+                .try_fold(BTreeMap::new(), |mut streamed, proof| {
+                    let (path, is_native, provider_url, expected, size, sha1) = proof.into_parts();
+                    let proof = StreamedExactLibraryProof::from_authenticated_stream(
+                        path.clone(),
+                        if is_native {
+                            SealedLibraryKind::Native
+                        } else {
+                            SealedLibraryKind::Library
+                        },
+                        provider_url,
+                        expected,
+                        sha1,
+                        size,
+                    )?;
+                    if streamed.insert(path, proof).is_some() {
+                        return Err(SealedLibraryDeclarationError::DuplicateDeclaration);
+                    }
+                    Ok(streamed)
+                })?;
+        let mut entries = self.entries;
+        for (path, selected) in &self.selected {
+            if !matches!(selected.producer, InstallerLibraryProducer::FreshNetwork) {
+                continue;
+            }
+            let proof = streamed
+                .remove(path)
+                .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?;
+            if proof.path != *path
+                || proof.kind != kind_for_plan(&selected.plan)
+                || proof.provider_url != selected.plan.source_url.as_deref().unwrap_or_default()
+                || proof.expected != selected.plan.expected
+            {
+                return Err(SealedLibraryDeclarationError::ContractDrift);
+            }
+            validate_plan_contract(&selected.plan, proof.sha1, proof.size)?;
+            insert_exact_declaration(&mut entries, &selected.plan, proof.sha1, proof.size)?;
+        }
+        if !streamed.is_empty() {
+            return Err(SealedLibraryDeclarationError::ExtraDeclaration);
+        }
+        Ok(PendingInstallerReconstructionTerminalDeclarations {
+            selected: self.selected,
+            entries,
+            embedded: self.embedded,
+            workspace_embedded: self.workspace_embedded,
+            structure: self.structure,
+        })
+    }
+}
+
+impl PendingInstallerReconstructionTerminalDeclarations {
+    pub(crate) fn embedded_maven_artifact(
+        &self,
+        path: &ArtifactRelativePath,
+    ) -> Option<&AuthenticatedEmbeddedMavenArtifact> {
+        self.embedded.get(path).or_else(|| {
+            self.workspace_embedded
+                .iter()
+                .find(|artifact| artifact.relative_path() == path)
+        })
+    }
+
+    pub(crate) fn seal_declared_terminal_outputs(
+        self,
+    ) -> Result<SealedExactLibraryDeclarations, SealedLibraryDeclarationError> {
+        let mut entries = self.entries;
+        for selected in self.selected.values() {
+            let InstallerLibraryProducer::Terminal(contract) = &selected.producer else {
+                continue;
+            };
+            let size = contract
+                .size
+                .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?;
+            validate_plan_contract(&selected.plan, contract.sha1, size)?;
+            insert_exact_declaration(&mut entries, &selected.plan, contract.sha1, size)?;
+        }
+        if entries.len() != self.selected.len() {
+            return Err(SealedLibraryDeclarationError::MissingDeclaration);
+        }
+        Ok(SealedExactLibraryDeclarations {
+            entries,
+            structure: LibraryStructure::Installer(Box::new(self.structure)),
+        })
+    }
+}
+
 impl PendingInstallerTerminalDeclarations {
     pub(crate) fn embedded_maven_artifact(
         &self,
@@ -575,6 +743,31 @@ impl PendingInstallerTerminalDeclarations {
         outputs: VerifiedProcessorOutputs,
     ) -> Result<
         (SealedExactLibraryDeclarations, PendingInstallerPublications),
+        SealedLibraryDeclarationError,
+    > {
+        let libraries_root = self.libraries_root.clone();
+        let already_materialized = self.materialized_network.clone();
+        let (declarations, sources) = self.seal_outputs(outputs)?;
+        let expected = declarations_clone_entries(&declarations);
+        Ok((
+            declarations,
+            PendingInstallerPublications {
+                expected,
+                already_materialized,
+                sources,
+                libraries_root,
+            },
+        ))
+    }
+
+    fn seal_outputs(
+        self,
+        outputs: VerifiedProcessorOutputs,
+    ) -> Result<
+        (
+            SealedExactLibraryDeclarations,
+            Vec<RetainedInstallerLibrarySource>,
+        ),
         SealedLibraryDeclarationError,
     > {
         let mut outputs = outputs
@@ -639,33 +832,34 @@ impl PendingInstallerTerminalDeclarations {
         if entries.len() != self.selected.len() {
             return Err(SealedLibraryDeclarationError::MissingDeclaration);
         }
-        let expected = entries
-            .iter()
-            .map(|(path, entry)| {
-                (
-                    path.clone(),
-                    SealedExactLibraryDeclaration {
-                        path: entry.path.clone(),
-                        kind: entry.kind,
-                        sha1: entry.sha1,
-                        size: entry.size,
-                    },
-                )
-            })
-            .collect();
         Ok((
             SealedExactLibraryDeclarations {
                 entries,
                 structure: LibraryStructure::Installer(Box::new(self.structure)),
             },
-            PendingInstallerPublications {
-                expected,
-                already_materialized: self.materialized_network,
-                sources,
-                libraries_root: self.libraries_root,
-            },
+            sources,
         ))
     }
+}
+
+fn declarations_clone_entries(
+    declarations: &SealedExactLibraryDeclarations,
+) -> BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration> {
+    declarations
+        .entries
+        .iter()
+        .map(|(path, entry)| {
+            (
+                path.clone(),
+                SealedExactLibraryDeclaration {
+                    path: entry.path.clone(),
+                    kind: entry.kind,
+                    sha1: entry.sha1,
+                    size: entry.size,
+                },
+            )
+        })
+        .collect()
 }
 
 impl PendingInstallerPublications {
@@ -2124,6 +2318,95 @@ mod tests {
         publications
             .complete(identities)
             .expect("publication completion");
+    }
+
+    #[test]
+    fn installer_reconstruction_seals_only_exact_declared_terminals_without_publications() {
+        let terminal_path = ArtifactRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
+        let terminal_sha1 = [3; 20];
+        let fresh_path = ArtifactRelativePath::new("example/fresh/1/fresh-1.jar").unwrap();
+        let libraries = vec![
+            profile_library(
+                "example:exact:1",
+                "example/exact/1/exact-1.jar",
+                &encode_sha1([1; 20]),
+                7,
+            ),
+            profile_library("example:fresh:1", fresh_path.as_str(), "", 0),
+            without_download_source(profile_library(
+                "example:terminal:1",
+                terminal_path.as_str(),
+                &encode_sha1(terminal_sha1),
+                9,
+            )),
+        ];
+        let bound = bind_installer_library_declarations(
+            AuthenticatedInstallerLibraryInputs::from_test(
+                libraries,
+                Vec::new(),
+                vec![(terminal_path.clone(), terminal_sha1, Some(9))],
+            ),
+            crate::rules::default_environment(),
+        )
+        .expect("reconstruction declarations");
+        let (pending, jobs) = bound.into_reconstruction_jobs();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(
+            jobs.iter()
+                .filter(|job| job.acquisition == LibraryAcquisition::FreshStream)
+                .count(),
+            1
+        );
+        let fresh = jobs
+            .iter()
+            .find(|job| job.plan.relative_path == fresh_path)
+            .expect("fresh source job");
+        let streamed = ExactLibraryDownloadProof::new_bound_for_test(
+            fresh_path,
+            false,
+            fresh.plan.source_url.clone().expect("fresh source URL"),
+            fresh.plan.expected.clone(),
+            8,
+            [2; 20],
+        );
+        let sealed = pending
+            .complete_network(vec![streamed])
+            .expect("fresh reconstruction source")
+            .seal_declared_terminal_outputs()
+            .expect("declared terminal seal");
+
+        assert_eq!(sealed.len(), 3);
+        assert_eq!(
+            sealed.get(&terminal_path),
+            Some((SealedLibraryKind::Library, terminal_sha1, 9))
+        );
+    }
+
+    #[test]
+    fn installer_reconstruction_requires_execution_when_terminal_size_is_missing() {
+        let terminal_path = ArtifactRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
+        let bound = bind_installer_library_declarations(
+            AuthenticatedInstallerLibraryInputs::from_test(
+                vec![without_download_source(profile_library(
+                    "example:terminal:1",
+                    terminal_path.as_str(),
+                    &encode_sha1([4; 20]),
+                    0,
+                ))],
+                Vec::new(),
+                vec![(terminal_path, [4; 20], None)],
+            ),
+            crate::rules::default_environment(),
+        )
+        .expect("incomplete terminal declaration");
+        let (pending, jobs) = bound.into_reconstruction_jobs();
+        assert!(jobs.is_empty());
+        let pending = pending.complete_network(Vec::new()).expect("no sources");
+
+        assert!(matches!(
+            pending.seal_declared_terminal_outputs(),
+            Err(SealedLibraryDeclarationError::MissingDeclaration)
+        ));
     }
 
     #[test]

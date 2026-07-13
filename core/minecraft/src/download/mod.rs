@@ -18,10 +18,12 @@ pub use assets::{
     asset_object_hash_prefix, repair_virtual_assets_from_index, virtual_asset_destination,
 };
 pub use install::Downloader;
-pub(crate) use install::reconstruct_profile_library_declarations;
 pub(crate) use install::{
     CompletedVanillaInstallAuthority, PendingVanillaInstallSourceAuthority,
     ReconstructedVanillaAuthority,
+};
+pub(crate) use install::{
+    reconstruct_installer_library_declarations, reconstruct_profile_library_declarations,
 };
 pub use integrity::{
     LauncherManagedArtifactReadiness, jar_contains_signed_metadata,

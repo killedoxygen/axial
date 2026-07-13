@@ -1,9 +1,8 @@
 mod common;
-mod forge_legacy_installer;
-mod forge_modern;
-mod neoforge_modern;
 
-pub(crate) use common::AuthenticatedLegacyOverlayAuthority;
+pub(crate) use common::{
+    AuthenticatedInstallerReconstructionAuthority, AuthenticatedLegacyOverlayAuthority,
+};
 
 use crate::download::DownloadProgress;
 use crate::known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
@@ -27,11 +26,10 @@ where
             ))
             .await
         }
-        LoaderInstallStrategy::ForgeModern => {
-            Box::pin(forge_modern::install(library_dir, plan, &mut send)).await
-        }
-        LoaderInstallStrategy::ForgeLegacyInstaller => {
-            Box::pin(forge_legacy_installer::install(
+        LoaderInstallStrategy::ForgeModern
+        | LoaderInstallStrategy::ForgeLegacyInstaller
+        | LoaderInstallStrategy::NeoForgeModern => {
+            Box::pin(common::install_from_installer_source(
                 library_dir,
                 plan,
                 &mut send,
@@ -45,9 +43,6 @@ where
                 &mut send,
             ))
             .await
-        }
-        LoaderInstallStrategy::NeoForgeModern => {
-            Box::pin(neoforge_modern::install(library_dir, plan, &mut send)).await
         }
     }
 }
@@ -64,8 +59,8 @@ pub(crate) async fn reconstruct_build(
         }
         LoaderInstallStrategy::ForgeModern
         | LoaderInstallStrategy::ForgeLegacyInstaller
-        | LoaderInstallStrategy::NeoForgeModern => Err(LoaderError::InvalidProfile(
-            "loader reconstruction strategy is not implemented".to_string(),
-        )),
+        | LoaderInstallStrategy::NeoForgeModern => {
+            Box::pin(common::reconstruct_from_installer_source(plan)).await
+        }
     }
 }

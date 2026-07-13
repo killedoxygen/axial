@@ -3,11 +3,12 @@ use crate::download::{
     MaterializedLibraryIdentity,
     download_installer_libraries_with_declarations_and_facts_and_descriptors,
     download_profile_libraries_with_declarations_and_facts_and_descriptors,
-    reconstruct_profile_library_declarations,
+    reconstruct_installer_library_declarations, reconstruct_profile_library_declarations,
 };
 use crate::known_good::{
     KnownGoodInstallReceipt, KnownGoodReconstructionReceipt, reconstructed_effective_version,
-    seal_reconstructed_legacy_archive_source, seal_reconstructed_profile_source,
+    seal_reconstructed_installer_source, seal_reconstructed_legacy_archive_source,
+    seal_reconstructed_profile_source,
 };
 use crate::known_good_libraries::{
     PendingExactLibraryDeclarations, PendingStreamedLibraryDeclarations,
@@ -20,8 +21,9 @@ use crate::loaders::compose::{
     create_managed_version_dir, finalize_version_install, write_composed_version,
 };
 use crate::loaders::forge_installer::{
-    AuthenticatedForgeInstallerPlan, BoundForgeInstallExecution, PendingForgeInstallExecution,
-    PendingForgeNetworkInstall, bind_authenticated_installer_plan, plan_authenticated_installer,
+    AuthenticatedForgeInstallerPlan, AuthenticatedInstallerReconstructionInput,
+    BoundForgeInstallExecution, PendingForgeInstallExecution, PendingForgeNetworkInstall,
+    VerifiedInstallerClientBytes, bind_authenticated_installer_plan, plan_authenticated_installer,
 };
 #[cfg(not(test))]
 use crate::loaders::http::fetch_bytes;
@@ -65,6 +67,60 @@ pub(crate) struct AuthenticatedLegacyOverlayAuthority {
     resolved_version: crate::launch::VersionJson,
     version_bytes: Vec<u8>,
     child_client_bytes: Vec<u8>,
+}
+
+pub(crate) struct AuthenticatedInstallerReconstructionAuthority {
+    base: KnownGoodReconstructionReceipt,
+    base_client_source: AuthenticatedSelectedArtifactSource,
+    record: LoaderBuildRecord,
+    input: AuthenticatedInstallerReconstructionInput,
+    resolved_version: crate::launch::VersionJson,
+    version_bytes: Vec<u8>,
+    child_client: VerifiedInstallerClientBytes,
+}
+
+impl AuthenticatedInstallerReconstructionAuthority {
+    fn new(
+        base: KnownGoodReconstructionReceipt,
+        base_client_source: AuthenticatedSelectedArtifactSource,
+        record: LoaderBuildRecord,
+        input: AuthenticatedInstallerReconstructionInput,
+        resolved_version: crate::launch::VersionJson,
+        version_bytes: Vec<u8>,
+        child_client: VerifiedInstallerClientBytes,
+    ) -> Self {
+        Self {
+            base,
+            base_client_source,
+            record,
+            input,
+            resolved_version,
+            version_bytes,
+            child_client,
+        }
+    }
+
+    pub(crate) fn consume_for_sealing(
+        self,
+    ) -> (
+        KnownGoodReconstructionReceipt,
+        AuthenticatedSelectedArtifactSource,
+        LoaderBuildRecord,
+        AuthenticatedInstallerReconstructionInput,
+        crate::launch::VersionJson,
+        Vec<u8>,
+        VerifiedInstallerClientBytes,
+    ) {
+        (
+            self.base,
+            self.base_client_source,
+            self.record,
+            self.input,
+            self.resolved_version,
+            self.version_bytes,
+            self.child_client,
+        )
+    }
 }
 
 impl AuthenticatedLegacyOverlayAuthority {
@@ -285,6 +341,100 @@ async fn derive_legacy_archive_inputs(
     client.url.clear();
     let version_bytes = serde_json::to_vec_pretty(&version)?;
     Ok((version, version_bytes, child_client_bytes))
+}
+
+pub(super) async fn reconstruct_from_installer_source(
+    plan: &LoaderInstallPlan,
+) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
+    let downloader = Downloader::new(PathBuf::new());
+    reconstruct_installer_with_downloader(plan, &downloader).await
+}
+
+async fn reconstruct_installer_with_downloader(
+    plan: &LoaderInstallPlan,
+    downloader: &Downloader,
+) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
+    let installer_url = validate_installer_record_authority(&plan.record)?;
+    let installer_source = fetch_sha1_verified_source(
+        installer_url,
+        MAX_LOADER_SOURCE_BYTES,
+        "loader installer",
+        &plan.record.version_id,
+    )
+    .await?;
+    let authenticated =
+        extract_installer_blocking(installer_source, plan.record.component_name.clone()).await?;
+    let installer_plan = bind_authenticated_installer_plan(authenticated, &plan.record)
+        .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
+    let execution = installer_plan
+        .into_install_execution()
+        .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
+    let execution = match execution {
+        BoundForgeInstallExecution::Run(execution) => {
+            let continuation = execution.into_declared_reconstruction().map_err(|_| {
+                LoaderError::InvalidProfile(
+                    "loader reconstruction requires ephemeral processor execution".to_string(),
+                )
+            })?;
+            BoundForgeInstallExecution::Continue(Box::new(continuation))
+        }
+        BoundForgeInstallExecution::Continue(continuation) => {
+            BoundForgeInstallExecution::Continue(continuation)
+        }
+        BoundForgeInstallExecution::UnsupportedMissingOutputs => {
+            return Err(LoaderError::InvalidProfile(
+                "loader installer processors do not expose authenticated client outputs"
+                    .to_string(),
+            ));
+        }
+    };
+    let sources = execution
+        .into_reconstruction_sources()
+        .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
+    let execution = reconstruct_installer_library_declarations(sources)
+        .await
+        .map_err(|error| LoaderError::Verify(error.to_string()))?;
+    let BoundForgeInstallExecution::Continue(continuation) = execution else {
+        return Err(LoaderError::InvalidProfile(
+            "loader reconstruction retained an executable processor plan".to_string(),
+        ));
+    };
+    let input = continuation
+        .into_reconstruction_receipt_input()
+        .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
+
+    let base = downloader
+        .reconstruct_version_with_client_source(&plan.record.minecraft_version)
+        .await
+        .map_err(|error| LoaderError::Verify(format!("reconstruct vanilla base: {error}")))?;
+    let (base, base_client_source) = base.consume_for_overlay();
+    let mut version = compose_loader_version(
+        reconstructed_effective_version(&base),
+        &plan.record.minecraft_version,
+        &plan.record.version_id,
+        input.version(),
+    )?;
+    let child_client = input
+        .derive_child_client_bytes(base_client_source.bytes())
+        .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
+    let client = version.downloads.client.as_mut().ok_or_else(|| {
+        LoaderError::Verify("authenticated base version has no client download".to_string())
+    })?;
+    client.sha1 = format!("{:x}", Sha1::digest(child_client.bytes()));
+    client.size = i64::try_from(child_client.bytes().len())
+        .map_err(|_| LoaderError::Verify("loader client is too large".to_string()))?;
+    client.url.clear();
+    let version_bytes = serde_json::to_vec_pretty(&version)?;
+    seal_reconstructed_installer_source(AuthenticatedInstallerReconstructionAuthority::new(
+        base,
+        base_client_source,
+        plan.record.clone(),
+        input,
+        version,
+        version_bytes,
+        child_client,
+    ))
+    .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))
 }
 
 // Profile-source loaders ship a ready version JSON and then download its libraries.
@@ -1242,9 +1392,11 @@ mod tests {
         install_from_installer_source, install_from_legacy_archive, install_from_profile_source,
         install_legacy_archive_after_authenticated_base,
         install_profile_source_after_authenticated_base, overlay_legacy_archive_bytes,
-        reconstruct_legacy_with_downloader, reconstruct_profile_with_test_sources,
-        validate_installer_record_authority, validate_profile_source_structure,
+        reconstruct_installer_with_downloader, reconstruct_legacy_with_downloader,
+        reconstruct_profile_with_test_sources, validate_installer_record_authority,
+        validate_profile_source_structure,
     };
+    use crate::artifact_path::ArtifactRelativePath;
     use crate::download::{DownloadProgress, Downloader, ExpectedIntegrity};
     use crate::known_good::{KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity};
     use crate::launch::{
@@ -1263,7 +1415,9 @@ mod tests {
         LoaderComponentId, LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy,
         LoaderInstallability,
     };
-    use crate::loaders::{build_id_for, installed_version_id_for, validate_version_id};
+    use crate::loaders::{
+        VerifiedProcessorOutputs, build_id_for, installed_version_id_for, validate_version_id,
+    };
     use crate::manifest::VersionManifest;
     use crate::paths::versions_dir;
     use crate::rules::default_environment;
@@ -1279,6 +1433,8 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TEST_PROCESSOR_TERMINAL_BYTES: &[u8] = b"processor-terminal";
 
     #[tokio::test]
     async fn profile_reconstruction_matches_install_and_leaves_all_managed_state_untouched() {
@@ -1417,6 +1573,447 @@ mod tests {
             }
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[tokio::test]
+    async fn modern_installer_reconstruction_matches_install_and_streams_only_fresh_sources() {
+        let root = temp_dir("modern-installer-reconstruction-parity");
+        let base_id = "1.21.5";
+        let base_client = zip_entries(&[("net/minecraft/client/Main.class", b"base")]);
+        let vanilla_exact = b"vanilla-exact".to_vec();
+        let installer_exact =
+            zip_entries(&[("example/Exact.class", b"installer-exact".as_slice())]);
+        let installer_fresh =
+            zip_entries(&[("example/Fresh.class", b"installer-fresh".as_slice())]);
+        let client_server = TestByteServer::start(base_client.clone());
+        let vanilla_exact_server = TestByteServer::start(vanilla_exact.clone());
+        let version_bytes = vanilla_version_bytes_with_exact_library(
+            base_id,
+            &client_server.url,
+            &base_client,
+            &vanilla_exact_server.url,
+            &vanilla_exact,
+        );
+        let version_server = TestByteServer::start(version_bytes.clone());
+        let manifest = test_install_manifest(base_id, &version_server.url, &version_bytes);
+        let installer_exact_server = TestByteServer::start(installer_exact.clone());
+        let installer_fresh_server = TestByteServer::start(installer_fresh);
+        let mut record = installer_record();
+        let installer = declarative_modern_forge_installer_jar(
+            &record,
+            &installer_exact_server.url,
+            &installer_exact,
+            &installer_fresh_server.url,
+        );
+        let installer_server = TestByteServer::start_with_sha1(installer);
+        record.install_source = LoaderInstallSource::InstallerJar {
+            url: installer_server.url.clone(),
+        };
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+        };
+
+        let install_downloader = Downloader::with_test_install_manifest(&root, manifest.clone());
+        let base_receipt = install_downloader
+            .install_version(base_id, |_| {})
+            .await
+            .expect("install authenticated vanilla base");
+        let installer_source = verified_test_source_for(
+            &installer_server.url,
+            "loader installer",
+            &record.version_id,
+        )
+        .await;
+        let installer_plan = bind_test_installer(installer_source, &record);
+        let execution = materialize_test_installer_network(
+            &root,
+            installer_plan,
+            &mut |_progress: DownloadProgress| {},
+        )
+        .await;
+        let install_receipt = finish_supported_installer_install(
+            &root,
+            &plan,
+            execution,
+            base_receipt,
+            &mut |_progress: DownloadProgress| {},
+        )
+        .await
+        .expect("install declarative Forge installer");
+        seed_reconstruction_sentinels(&root);
+        let before = snapshot_tree(&root);
+        let installer_path = reqwest::Url::parse(&installer_server.url)
+            .expect("installer URL")
+            .path()
+            .to_string();
+        let installer_sidecar_path = format!("{installer_path}.sha1");
+        let counts = (
+            version_server.request_count(),
+            client_server.request_count(),
+            vanilla_exact_server.request_count(),
+            installer_server.request_count_for(&installer_path),
+            installer_server.request_count_for(&installer_sidecar_path),
+            installer_exact_server.request_count(),
+            installer_fresh_server.request_count(),
+        );
+
+        let reconstruction_downloader = Downloader::with_test_install_manifest(&root, manifest);
+        let reconstructed =
+            reconstruct_installer_with_downloader(&plan, &reconstruction_downloader)
+                .await
+                .expect("reconstruct declarative Forge installer");
+
+        assert_eq!(snapshot_tree(&root), before);
+        assert_eq!(version_server.request_count(), counts.0 + 1);
+        assert_eq!(client_server.request_count(), counts.1 + 1);
+        assert_eq!(vanilla_exact_server.request_count(), counts.2);
+        assert_eq!(
+            installer_server.request_count_for(&installer_path),
+            counts.3 + 1
+        );
+        assert_eq!(
+            installer_server.request_count_for(&installer_sidecar_path),
+            counts.4 + 1
+        );
+        assert_eq!(installer_exact_server.request_count(), counts.5);
+        assert_eq!(installer_fresh_server.request_count(), counts.6 + 1);
+        assert_eq!(
+            install_receipt.into_activation_source().into_parts(),
+            reconstructed.into_activation_source().into_parts()
+        );
+
+        for server in [
+            client_server,
+            vanilla_exact_server,
+            version_server,
+            installer_exact_server,
+            installer_fresh_server,
+            installer_server,
+        ] {
+            server.stop();
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn true_legacy_installer_reconstruction_matches_install_without_effects() {
+        let root = temp_dir("legacy-installer-reconstruction-parity");
+        let mut record = installer_record();
+        record.minecraft_version = "1.5.2".to_string();
+        record.loader_version = "7.8.1.738".to_string();
+        record.strategy = LoaderInstallStrategy::ForgeLegacyInstaller;
+        canonicalize_record_identity(&mut record);
+        let base_client = zip_entries(&[
+            ("META-INF/MANIFEST.MF", b"signed manifest".as_slice()),
+            ("META-INF/MOJANG_C.SF", b"signature".as_slice()),
+            ("META-INF/MOJANG_C.RSA", b"signature".as_slice()),
+            (
+                "net/minecraft/client/Minecraft.class",
+                b"base client".as_slice(),
+            ),
+        ]);
+        let client_server = TestByteServer::start(base_client.clone());
+        let version_bytes =
+            vanilla_version_bytes(&record.minecraft_version, &client_server.url, &base_client);
+        let version_server = TestByteServer::start(version_bytes.clone());
+        let manifest = test_install_manifest(
+            &record.minecraft_version,
+            &version_server.url,
+            &version_bytes,
+        );
+        let installer_server =
+            TestByteServer::start_with_sha1(true_legacy_forge_installer_jar(&record, true));
+        record.install_source = LoaderInstallSource::InstallerJar {
+            url: installer_server.url.clone(),
+        };
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+        };
+
+        let install_downloader = Downloader::with_test_install_manifest(&root, manifest.clone());
+        let base_receipt = install_downloader
+            .install_version(&record.minecraft_version, |_| {})
+            .await
+            .expect("install authenticated legacy vanilla base");
+        let installer_source = verified_test_source_for(
+            &installer_server.url,
+            "loader installer",
+            &record.version_id,
+        )
+        .await;
+        let installer_plan = bind_test_installer(installer_source, &record);
+        let execution = materialize_test_installer_network(
+            &root,
+            installer_plan,
+            &mut |_progress: DownloadProgress| {},
+        )
+        .await;
+        let install_receipt = finish_supported_installer_install(
+            &root,
+            &plan,
+            execution,
+            base_receipt,
+            &mut |_progress: DownloadProgress| {},
+        )
+        .await
+        .expect("install true-legacy Forge installer");
+        seed_reconstruction_sentinels(&root);
+        let before = snapshot_tree(&root);
+        let installer_path = reqwest::Url::parse(&installer_server.url)
+            .expect("installer URL")
+            .path()
+            .to_string();
+        let installer_sidecar_path = format!("{installer_path}.sha1");
+        let counts = (
+            version_server.request_count(),
+            client_server.request_count(),
+            installer_server.request_count_for(&installer_path),
+            installer_server.request_count_for(&installer_sidecar_path),
+        );
+
+        let reconstruction_downloader = Downloader::with_test_install_manifest(&root, manifest);
+        let reconstructed =
+            reconstruct_installer_with_downloader(&plan, &reconstruction_downloader)
+                .await
+                .expect("reconstruct true-legacy Forge installer");
+
+        assert_eq!(snapshot_tree(&root), before);
+        assert_eq!(version_server.request_count(), counts.0 + 1);
+        assert_eq!(client_server.request_count(), counts.1 + 1);
+        assert_eq!(
+            installer_server.request_count_for(&installer_path),
+            counts.2 + 1
+        );
+        assert_eq!(
+            installer_server.request_count_for(&installer_sidecar_path),
+            counts.3 + 1
+        );
+        assert_eq!(
+            install_receipt.into_activation_source().into_parts(),
+            reconstructed.into_activation_source().into_parts()
+        );
+
+        for server in [client_server, version_server, installer_server] {
+            server.stop();
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn exact_terminal_installer_reconstruction_skips_processors_without_effects() {
+        let root = temp_dir("exact-terminal-installer-reconstruction");
+        let mut record = installer_record();
+        let base_client = zip_entries(&[("net/minecraft/client/Main.class", b"base")]);
+        let client_server = TestByteServer::start(base_client.clone());
+        let version_bytes =
+            vanilla_version_bytes(&record.minecraft_version, &client_server.url, &base_client);
+        let version_server = TestByteServer::start(version_bytes.clone());
+        let manifest = test_install_manifest(
+            &record.minecraft_version,
+            &version_server.url,
+            &version_bytes,
+        );
+        let fresh_library = zip_entries(&[("example/Fresh.class", b"processor-fresh".as_slice())]);
+        let fresh_server = TestByteServer::start(fresh_library);
+        let installer_server = TestByteServer::start_with_sha1(exact_terminal_forge_installer_jar(
+            &record,
+            Some(&fresh_server.url),
+        ));
+        record.install_source = LoaderInstallSource::InstallerJar {
+            url: installer_server.url.clone(),
+        };
+        let plan = LoaderInstallPlan {
+            record: record.clone(),
+        };
+        let install_downloader = Downloader::with_test_install_manifest(&root, manifest.clone());
+        let base_receipt = install_downloader
+            .install_version(&record.minecraft_version, |_| {})
+            .await
+            .expect("install exact terminal vanilla base");
+        let installer_source = verified_test_source_for(
+            &installer_server.url,
+            "loader installer",
+            &record.version_id,
+        )
+        .await;
+        let installer_plan = bind_test_installer(installer_source, &record);
+        let install_receipt = finish_test_exact_terminal_installer_without_execution(
+            &root,
+            &plan,
+            installer_plan,
+            base_receipt,
+        )
+        .await;
+        seed_reconstruction_sentinels(&root);
+        let before = snapshot_tree(&root);
+        let installer_path = reqwest::Url::parse(&installer_server.url)
+            .expect("installer URL")
+            .path()
+            .to_string();
+        let installer_sidecar_path = format!("{installer_path}.sha1");
+        let counts = (
+            version_server.request_count(),
+            client_server.request_count(),
+            fresh_server.request_count(),
+            installer_server.request_count_for(&installer_path),
+            installer_server.request_count_for(&installer_sidecar_path),
+        );
+
+        let reconstruction_downloader = Downloader::with_test_install_manifest(&root, manifest);
+        let reconstructed =
+            reconstruct_installer_with_downloader(&plan, &reconstruction_downloader)
+                .await
+                .expect("reconstruct exact terminal installer");
+
+        assert_eq!(snapshot_tree(&root), before);
+        assert_eq!(version_server.request_count(), counts.0 + 1);
+        assert_eq!(client_server.request_count(), counts.1 + 1);
+        assert_eq!(fresh_server.request_count(), counts.2 + 1);
+        assert_eq!(
+            installer_server.request_count_for(&installer_path),
+            counts.3 + 1
+        );
+        assert_eq!(
+            installer_server.request_count_for(&installer_sidecar_path),
+            counts.4 + 1
+        );
+        let installed = install_receipt.into_activation_source().into_parts();
+        let reconstructed = reconstructed.into_activation_source().into_parts();
+        assert_eq!(installed, reconstructed);
+        let (_, inventory) = reconstructed;
+        let forge_version = format!("{}-{}", record.minecraft_version, record.loader_version);
+        let terminal_path =
+            format!("net/minecraftforge/forge/{forge_version}/forge-{forge_version}-client.jar");
+        let terminal = inventory
+            .entries()
+            .iter()
+            .find(|entry| entry.path().as_str() == terminal_path)
+            .expect("declared terminal inventory entry");
+        assert!(matches!(
+            terminal.integrity(),
+            KnownGoodIntegrity::Sha1 { digest, size }
+                if digest.as_str() == sha1_hex(TEST_PROCESSOR_TERMINAL_BYTES)
+                    && *size == TEST_PROCESSOR_TERMINAL_BYTES.len() as u64
+        ));
+
+        for server in [
+            client_server,
+            version_server,
+            fresh_server,
+            installer_server,
+        ] {
+            server.stop();
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn processor_required_installer_reconstruction_fails_before_base_or_library_sources() {
+        let root = temp_dir("processor-required-installer-reconstruction");
+        seed_reconstruction_sentinels(&root);
+        let before = snapshot_tree(&root);
+        let mut record = installer_record();
+        let base_client = zip_entries(&[("net/minecraft/client/Main.class", b"base")]);
+        let client_server = TestByteServer::start(base_client.clone());
+        let version_bytes =
+            vanilla_version_bytes(&record.minecraft_version, &client_server.url, &base_client);
+        let version_server = TestByteServer::start(version_bytes.clone());
+        let manifest = test_install_manifest(
+            &record.minecraft_version,
+            &version_server.url,
+            &version_bytes,
+        );
+        let fresh_library = zip_entries(&[("example/Fresh.class", b"processor-fresh".as_slice())]);
+        let fresh_server = TestByteServer::start(fresh_library);
+        let installer_server = TestByteServer::start_with_sha1(
+            runnable_forge_installer_jar_with_terminal(&record, None, Some(&fresh_server.url)),
+        );
+        record.install_source = LoaderInstallSource::InstallerJar {
+            url: installer_server.url.clone(),
+        };
+        let plan = LoaderInstallPlan { record };
+        let downloader = Downloader::with_test_install_manifest(&root, manifest);
+        let installer_path = reqwest::Url::parse(&installer_server.url)
+            .expect("installer URL")
+            .path()
+            .to_string();
+        let installer_sidecar_path = format!("{installer_path}.sha1");
+
+        let error = match reconstruct_installer_with_downloader(&plan, &downloader).await {
+            Ok(_) => panic!("missing terminal size requires processor execution"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            LoaderError::InvalidProfile(message)
+                if message.contains("requires ephemeral processor execution")
+        ));
+        assert_eq!(snapshot_tree(&root), before);
+        assert_eq!(version_server.request_count(), 0);
+        assert_eq!(client_server.request_count(), 0);
+        assert_eq!(fresh_server.request_count(), 0);
+        assert_eq!(installer_server.request_count_for(&installer_path), 1);
+        assert_eq!(
+            installer_server.request_count_for(&installer_sidecar_path),
+            1
+        );
+
+        for server in [
+            client_server,
+            version_server,
+            fresh_server,
+            installer_server,
+        ] {
+            server.stop();
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn outputless_neoforge_reconstruction_fails_before_vanilla_sources() {
+        let root = temp_dir("outputless-neoforge-reconstruction");
+        seed_reconstruction_sentinels(&root);
+        let before = snapshot_tree(&root);
+        let mut record = installer_record();
+        record.component_id = LoaderComponentId::NeoForge;
+        record.component_name = record.component_id.display_name().to_string();
+        record.loader_version = "21.5.74".to_string();
+        record.strategy = LoaderInstallStrategy::NeoForgeModern;
+        canonicalize_record_identity(&mut record);
+        let base_client = zip_entries(&[("net/minecraft/client/Main.class", b"base")]);
+        let client_server = TestByteServer::start(base_client.clone());
+        let version_bytes =
+            vanilla_version_bytes(&record.minecraft_version, &client_server.url, &base_client);
+        let version_server = TestByteServer::start(version_bytes.clone());
+        let manifest = test_install_manifest(
+            &record.minecraft_version,
+            &version_server.url,
+            &version_bytes,
+        );
+        let installer_server =
+            TestByteServer::start_with_sha1(unsupported_neoforge_installer_jar(&record));
+        record.install_source = LoaderInstallSource::InstallerJar {
+            url: installer_server.url.clone(),
+        };
+        let plan = LoaderInstallPlan { record };
+        let downloader = Downloader::with_test_install_manifest(&root, manifest);
+
+        let error = match reconstruct_installer_with_downloader(&plan, &downloader).await {
+            Ok(_) => panic!("outputless NeoForge processor must stay unsupported"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, LoaderError::InvalidProfile(_)));
+        assert_eq!(snapshot_tree(&root), before);
+        assert_eq!(version_server.request_count(), 0);
+        assert_eq!(client_server.request_count(), 0);
+        assert_eq!(installer_server.request_count(), 2);
+
+        for server in [client_server, version_server, installer_server] {
+            server.stop();
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -3019,11 +3616,132 @@ mod tests {
         installer_jar_with_profile_json(&profile_json(version_id))
     }
 
+    fn true_legacy_forge_installer_jar(record: &LoaderBuildRecord, strip_meta: bool) -> Vec<u8> {
+        let upstream_id = format!(
+            "{}-Forge{}",
+            record.minecraft_version, record.loader_version
+        );
+        let coordinate = format!(
+            "net.minecraftforge:minecraftforge:{}",
+            record.loader_version
+        );
+        let file_name = format!(
+            "minecraftforge-universal-{}-{}.jar",
+            record.minecraft_version, record.loader_version
+        );
+        let install_profile = serde_json::to_vec(&serde_json::json!({
+            "versionInfo": {
+                "id": upstream_id,
+                "mainClass": "net.minecraft.launchwrapper.Launch",
+                "minecraftArguments": "${auth_player_name} ${auth_session}",
+                "libraries": [{"name": coordinate}]
+            },
+            "install": {
+                "path": coordinate,
+                "filePath": file_name,
+                "target": upstream_id,
+                "minecraft": record.minecraft_version,
+                "stripMeta": strip_meta
+            }
+        }))
+        .expect("serialize true-legacy Forge install profile");
+        let forge_jar = zip_entries(&[
+            ("META-INF/MANIFEST.MF", b"forge manifest".as_slice()),
+            ("META-INF/FORGE.SF", b"signature".as_slice()),
+            ("net/minecraftforge/Forge.class", b"forge".as_slice()),
+        ]);
+        zip_entries(&[
+            ("install_profile.json", install_profile.as_slice()),
+            (file_name.as_str(), forge_jar.as_slice()),
+        ])
+    }
+
     fn modern_forge_installer_jar(
         record: &LoaderBuildRecord,
         library_url: Option<&str>,
     ) -> Vec<u8> {
         modern_forge_installer_jar_with_parent(record, &record.minecraft_version, library_url)
+    }
+
+    fn declarative_modern_forge_installer_jar(
+        record: &LoaderBuildRecord,
+        exact_url: &str,
+        exact_bytes: &[u8],
+        fresh_url: &str,
+    ) -> Vec<u8> {
+        use zip::write::SimpleFileOptions;
+
+        let forge_version = format!("{}-{}", record.minecraft_version, record.loader_version);
+        let root_coordinate = format!("net.minecraftforge:forge:{forge_version}:universal");
+        let root_path = format!(
+            "maven/net/minecraftforge/forge/{0}/forge-{0}-universal.jar",
+            forge_version
+        );
+        let root = zip_entries(&[("net/minecraftforge/Forge.class", b"forge")]);
+        let processor_only = zip_entries(&[("example/Processor.class", b"processor")]);
+        let version_json = serde_json::to_vec(&serde_json::json!({
+            "id": format!("{}-forge-{}", record.minecraft_version, record.loader_version),
+            "inheritsFrom": record.minecraft_version,
+            "type": "release",
+            "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+            "logging": {},
+            "libraries": [
+                {"name": root_coordinate},
+                {
+                    "name": "example:exact:1.0",
+                    "downloads": {"artifact": {
+                        "path": "example/exact/1.0/exact-1.0.jar",
+                        "url": exact_url,
+                        "sha1": sha1_hex(exact_bytes),
+                        "size": exact_bytes.len()
+                    }}
+                },
+                {
+                    "name": "example:fresh:1.0",
+                    "downloads": {"artifact": {
+                        "path": "example/fresh/1.0/fresh-1.0.jar",
+                        "url": fresh_url
+                    }}
+                }
+            ]
+        }))
+        .expect("serialize declarative Forge version profile");
+        let install_profile = serde_json::to_vec(&serde_json::json!({
+            "spec": 1,
+            "profile": "forge",
+            "version": format!("{}-forge-{}", record.minecraft_version, record.loader_version),
+            "path": format!("net.minecraftforge:forge:{forge_version}:shim"),
+            "minecraft": record.minecraft_version,
+            "processors": [],
+            "libraries": [{
+                "name": "example:processor-only:1.0",
+                "sha1": sha1_hex(&processor_only),
+                "size": processor_only.len()
+            }]
+        }))
+        .expect("serialize declarative Forge install profile");
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut archive = zip::ZipWriter::new(&mut cursor);
+        for (name, bytes) in [
+            ("version.json".to_string(), version_json),
+            ("install_profile.json".to_string(), install_profile),
+            (root_path, root),
+            (
+                "maven/example/processor-only/1.0/processor-only-1.0.jar".to_string(),
+                processor_only,
+            ),
+        ] {
+            archive
+                .start_file(name, SimpleFileOptions::default())
+                .expect("start declarative Forge entry");
+            archive
+                .write_all(&bytes)
+                .expect("write declarative Forge entry");
+        }
+        archive
+            .finish()
+            .expect("finish declarative Forge installer");
+        cursor.into_inner()
     }
 
     fn modern_forge_installer_jar_with_parent(
@@ -3142,6 +3860,25 @@ mod tests {
     }
 
     fn runnable_forge_installer_jar(record: &LoaderBuildRecord) -> Vec<u8> {
+        runnable_forge_installer_jar_with_terminal(record, None, None)
+    }
+
+    fn exact_terminal_forge_installer_jar(
+        record: &LoaderBuildRecord,
+        fresh_url: Option<&str>,
+    ) -> Vec<u8> {
+        runnable_forge_installer_jar_with_terminal(
+            record,
+            Some(TEST_PROCESSOR_TERMINAL_BYTES.len()),
+            fresh_url,
+        )
+    }
+
+    fn runnable_forge_installer_jar_with_terminal(
+        record: &LoaderBuildRecord,
+        terminal_size: Option<usize>,
+        fresh_url: Option<&str>,
+    ) -> Vec<u8> {
         use zip::write::SimpleFileOptions;
 
         let forge_version = format!("{}-{}", record.minecraft_version, record.loader_version);
@@ -3158,23 +3895,38 @@ mod tests {
             "{}-forge-{}",
             record.minecraft_version, record.loader_version
         );
+        let terminal_sha1 = sha1_hex(TEST_PROCESSOR_TERMINAL_BYTES);
+        let mut terminal_library = serde_json::json!({
+            "name": client_coordinate,
+            "sha1": terminal_sha1
+        });
+        if let Some(size) = terminal_size {
+            terminal_library["size"] = size.into();
+        }
+        let mut version_libraries = vec![
+            serde_json::json!({
+                "name": universal_coordinate,
+                "sha1": sha1_hex(&universal),
+                "size": universal.len()
+            }),
+            terminal_library,
+        ];
+        if let Some(url) = fresh_url {
+            version_libraries.push(serde_json::json!({
+                "name": "example:processor-fresh:1.0",
+                "downloads": {"artifact": {
+                    "path": "example/processor-fresh/1.0/processor-fresh-1.0.jar",
+                    "url": url
+                }}
+            }));
+        }
         let version_json = serde_json::to_vec(&serde_json::json!({
             "id": version_id,
             "inheritsFrom": record.minecraft_version,
             "type": "release",
             "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
             "logging": {},
-            "libraries": [
-                {
-                    "name": universal_coordinate,
-                    "sha1": sha1_hex(&universal),
-                    "size": universal.len()
-                },
-                {
-                    "name": client_coordinate,
-                    "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                }
-            ]
+            "libraries": version_libraries
         }))
         .expect("serialize runnable Forge version profile");
         let install_profile = serde_json::to_vec(&serde_json::json!({
@@ -3203,7 +3955,7 @@ mod tests {
             "data": {
                 "PATCHED": {"client": format!("[{}]", client_coordinate)},
                 "PATCHED_SHA": {
-                    "client": "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
+                    "client": format!("'{terminal_sha1}'")
                 }
             },
             "processors": [{
@@ -3274,6 +4026,82 @@ mod tests {
         )
         .await
         .expect("finish installer install")
+    }
+
+    async fn finish_test_exact_terminal_installer_without_execution(
+        root: &Path,
+        plan: &LoaderInstallPlan,
+        installer_plan: BoundForgeInstallerPlan,
+        base_receipt: KnownGoodInstallReceipt,
+    ) -> KnownGoodInstallReceipt {
+        let execution = materialize_test_installer_network(
+            root,
+            installer_plan,
+            &mut |_progress: DownloadProgress| {},
+        )
+        .await;
+        let BoundForgeInstallExecution::Run(execution) = execution else {
+            panic!("exact terminal fixture must bind runnable processors");
+        };
+        let (continuation, _processor_plan) = (*execution).into_parts();
+        let forge_version = format!(
+            "{}-{}",
+            plan.record.minecraft_version, plan.record.loader_version
+        );
+        let terminal_path = ArtifactRelativePath::new(&format!(
+            "net/minecraftforge/forge/{forge_version}/forge-{forge_version}-client.jar"
+        ))
+        .expect("terminal artifact path");
+        let input = continuation
+            .into_receipt_input(VerifiedProcessorOutputs::from_test_terminal(vec![(
+                terminal_path,
+                TEST_PROCESSOR_TERMINAL_BYTES.to_vec(),
+            )]))
+            .expect("seal exact terminal processor output");
+        let base_client_path = versions_dir(root)
+            .join(&plan.record.minecraft_version)
+            .join(format!("{}.jar", plan.record.minecraft_version));
+        let base_client_bytes = fs::read(base_client_path).expect("read base client");
+        base_receipt
+            .authenticate_client_bytes(&base_client_bytes)
+            .expect("authenticate base client");
+        let mut version = super::compose_loader_version(
+            base_receipt.effective_version(),
+            &plan.record.minecraft_version,
+            &plan.record.version_id,
+            input.version(),
+        )
+        .expect("compose exact terminal version");
+        let child_client = input
+            .derive_child_client_bytes(&base_client_bytes)
+            .expect("derive exact terminal client");
+        let client = version
+            .downloads
+            .client
+            .as_mut()
+            .expect("composed client download");
+        client.sha1 = sha1_hex(child_client.bytes());
+        client.size = child_client.bytes().len() as i64;
+        client.url.clear();
+        let version_bytes =
+            serde_json::to_vec_pretty(&version).expect("serialize exact terminal version");
+        let pending = KnownGoodInstallReceipt::from_verified_installer_source(
+            base_receipt,
+            &plan.record,
+            input,
+            version,
+            &version_bytes,
+            &base_client_bytes,
+            &child_client,
+        )
+        .expect("derive exact terminal install receipt");
+        let (pending, retained) = pending.into_publications();
+        let materialized = super::materialize_retained_installer_libraries(root, retained)
+            .await
+            .expect("materialize exact terminal sources");
+        pending
+            .complete(materialized)
+            .expect("complete exact terminal install receipt")
     }
 
     async fn materialize_test_installer_network(
