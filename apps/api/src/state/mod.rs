@@ -10,6 +10,11 @@ mod installed_versions;
 mod installs;
 mod instance_lifecycle;
 mod instance_registry;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the R5 application wiring slice")
+)]
+mod integrity_activity;
 mod java_probe_failures;
 mod journals;
 mod known_good;
@@ -72,6 +77,12 @@ pub use installs::{
 pub use instance_registry::AppInstanceStore;
 pub(crate) use instance_registry::new_instance;
 pub(crate) use instance_registry::{ensure_instance_layout, instance_not_found_error};
+pub(crate) use integrity_activity::{
+    IdleSweepCancellation, IdleSweepReservation, IdleSweepReserveError, IntegrityActivityClosed,
+    IntegrityForegroundRegistration, IntegrityIdleEpoch, IntegrityIdleSnapshot,
+};
+#[cfg(test)]
+pub(crate) use integrity_activity::IdleSweepTerminal;
 pub(crate) use java_probe_failures::{
     JavaProbeFailureCache, JavaProbeFailureClaim, JavaProbeFailureKey, JavaProbeFailureKind,
     JavaProbeFailureOwner,
@@ -126,6 +137,7 @@ pub struct AppState {
     telemetry: Arc<TelemetryHub>,
     remote_flags: Arc<RemoteFlagStore>,
     launch_reports: Arc<launch_reports::LaunchReportStore>,
+    integrity_activity: integrity_activity::IntegrityActivityCoordinator,
     instance_lifecycle_gates: instance_lifecycle::InstanceLifecycleGates,
     lifecycle: AppLifecycle,
     shutdown_coordinator: AppShutdownCoordinator,
@@ -176,6 +188,7 @@ pub(crate) enum KnownGoodVerificationUnavailable {
     InstanceNotRegistered,
     LibraryRootUnavailable,
     LiveAuthorityUnavailable,
+    SweepAuthorityUnavailable,
 }
 
 impl InstanceLifecycleLease {
@@ -458,6 +471,7 @@ impl AppState {
             telemetry,
             remote_flags,
             launch_reports,
+            integrity_activity: integrity_activity::IntegrityActivityCoordinator::new(),
             instance_lifecycle_gates,
             lifecycle: AppLifecycle::new(),
             shutdown_coordinator: AppShutdownCoordinator::new(),
@@ -771,13 +785,49 @@ impl AppState {
         self.lifecycle.subscribe_shutdown()
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the R5 scheduler slice")
+    )]
+    pub(crate) fn subscribe_integrity_idle(
+        &self,
+    ) -> tokio::sync::watch::Receiver<IntegrityIdleSnapshot> {
+        self.integrity_activity.subscribe_idle()
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the R5 foreground wiring slice")
+    )]
+    pub(crate) fn register_integrity_foreground(
+        &self,
+    ) -> Result<IntegrityForegroundRegistration, IntegrityActivityClosed> {
+        self.integrity_activity.register_foreground()
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the R5 scheduler slice")
+    )]
+    pub(crate) fn try_reserve_idle_sweep(
+        &self,
+        expected_epoch: IntegrityIdleEpoch,
+        producer: ProducerLease,
+    ) -> Result<IdleSweepReservation, IdleSweepReserveError> {
+        self.integrity_activity
+            .try_reserve_idle_sweep(expected_epoch, producer)
+    }
+
     #[cfg(test)]
     pub(crate) async fn quiesce(&self) -> Result<(), LifecycleQuiesceError> {
-        self.lifecycle.quiesce().await
+        self.lifecycle.begin_quiesce();
+        self.integrity_activity.begin_shutdown();
+        self.lifecycle.wait_for_quiesced().await
     }
 
     pub async fn shutdown(&self) -> Result<(), AppShutdownError> {
         self.lifecycle.begin_quiesce();
+        self.integrity_activity.begin_shutdown();
         self.shutdown_coordinator.start(self.clone()).wait().await
     }
 

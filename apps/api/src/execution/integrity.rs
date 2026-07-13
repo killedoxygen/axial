@@ -4,8 +4,8 @@ use super::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use crate::state::{
-    AppState, InstanceLifecycleLease, KnownGoodTier2Ticket, KnownGoodVerificationLease,
-    KnownGoodVerificationUnavailable,
+    AppState, IdleSweepCancellation, IdleSweepReservation, InstanceLifecycleLease,
+    KnownGoodTier2Ticket, KnownGoodVerificationLease, KnownGoodVerificationUnavailable,
 };
 use axial_minecraft::ManagedRuntimeCache;
 #[cfg(test)]
@@ -19,7 +19,6 @@ use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1429,29 +1428,6 @@ const INTEGRITY_TIER2_ENTRIES_PER_SECOND: u64 = 64;
 const INTEGRITY_TIER2_BYTE_BURST: u64 = 64 * 1024;
 const MAX_INTEGRITY_TIER2_THROTTLE_SLEEP: Duration = Duration::from_millis(10);
 
-#[derive(Clone, Default)]
-pub(crate) struct IntegrityTier2Cancellation {
-    cancelled: Arc<AtomicBool>,
-}
-
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the R5 scheduler slice")
-)]
-impl IntegrityTier2Cancellation {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IntegrityTier2Status {
     Complete,
@@ -1524,8 +1500,14 @@ impl IntegrityTier2ProgressSink {
 pub(crate) struct IntegrityTier2OwnedWork {
     state: AppState,
     ticket: KnownGoodTier2Ticket,
-    cancellation: IntegrityTier2Cancellation,
+    reservation: IdleSweepReservation,
     progress: IntegrityTier2ProgressSink,
+}
+
+#[must_use = "Tier 2 result owns idle sweep settlement authority"]
+pub(crate) struct IntegrityTier2OwnedResult {
+    reservation: IdleSweepReservation,
+    report: IntegrityTier2Report,
 }
 
 #[cfg_attr(
@@ -1536,27 +1518,42 @@ impl IntegrityTier2OwnedWork {
     pub(crate) fn new(
         state: AppState,
         ticket: KnownGoodTier2Ticket,
-        cancellation: IntegrityTier2Cancellation,
+        reservation: IdleSweepReservation,
         progress: IntegrityTier2ProgressSink,
     ) -> Self {
         Self {
             state,
             ticket,
-            cancellation,
+            reservation,
             progress,
         }
     }
 
-    pub(crate) fn run(self) -> IntegrityTier2Report {
+    pub(crate) fn run(self) -> IntegrityTier2OwnedResult {
         let Self {
             state,
             ticket,
-            cancellation,
+            reservation,
             progress,
         } = self;
-        settle_integrity_tier2_owned(&progress, || {
+        let cancellation = reservation.cancellation();
+        let report = settle_integrity_tier2_owned(&progress, || {
             sense_integrity_tier2_owned(&state, ticket, &cancellation, &progress)
-        })
+        });
+        IntegrityTier2OwnedResult {
+            reservation,
+            report,
+        }
+    }
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the R5 scheduler slice")
+)]
+impl IntegrityTier2OwnedResult {
+    pub(crate) fn into_parts(self) -> (IdleSweepReservation, IntegrityTier2Report) {
+        (self.reservation, self.report)
     }
 }
 
@@ -1631,7 +1628,7 @@ impl IntegrityTier2Pacer for SystemIntegrityTier2Pacer {
 }
 
 struct IntegrityTier2ReadControl<'a, Pacer> {
-    cancellation: &'a IntegrityTier2Cancellation,
+    cancellation: &'a IdleSweepCancellation,
     pacer: &'a Pacer,
     last_refill: Duration,
     byte_tokens: u128,
@@ -1639,7 +1636,7 @@ struct IntegrityTier2ReadControl<'a, Pacer> {
 }
 
 impl<'a, Pacer: IntegrityTier2Pacer> IntegrityTier2ReadControl<'a, Pacer> {
-    fn new(cancellation: &'a IntegrityTier2Cancellation, pacer: &'a Pacer) -> Self {
+    fn new(cancellation: &'a IdleSweepCancellation, pacer: &'a Pacer) -> Self {
         Self {
             cancellation,
             pacer,
@@ -1713,7 +1710,7 @@ impl<Pacer: IntegrityTier2Pacer> ContentReadControl for IntegrityTier2ReadContro
 struct IntegrityTier2RunContext<'a, Pacer> {
     library_root: &'a Path,
     runtime_cache: &'a ManagedRuntimeCache,
-    cancellation: &'a IntegrityTier2Cancellation,
+    cancellation: &'a IdleSweepCancellation,
     pacer: &'a Pacer,
     progress: &'a IntegrityTier2ProgressSink,
 }
@@ -1721,7 +1718,7 @@ struct IntegrityTier2RunContext<'a, Pacer> {
 fn sense_integrity_tier2_owned(
     state: &AppState,
     ticket: KnownGoodTier2Ticket,
-    cancellation: &IntegrityTier2Cancellation,
+    cancellation: &IdleSweepCancellation,
     progress: &IntegrityTier2ProgressSink,
 ) -> IntegrityTier2Report {
     let (library_root, runtime_cache, inventory) = ticket.execution_parts();
@@ -2317,7 +2314,7 @@ fn push_bounded_fact(report: &mut IntegrityTier0Report, fact: ExecutionFact) {
 mod tests {
     use super::*;
     use crate::application::timing::INTEGRITY_TIER0_CEILING_MS;
-    use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
+    use crate::state::{AppState, AppStateInit, IdleSweepTerminal, InstallStore, SessionStore};
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_minecraft::known_good::{
         KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity, TestKnownGoodRoot,
@@ -2328,6 +2325,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
+
+    fn tier2_cancellation() -> IdleSweepCancellation {
+        IdleSweepCancellation::new_for_test()
+    }
 
     #[derive(Clone, Copy)]
     enum ScriptedMetadata {
@@ -2581,7 +2582,7 @@ mod tests {
     struct ScriptedTier2Pacer {
         elapsed: Mutex<Duration>,
         sleeps: Mutex<Vec<Duration>>,
-        cancellation: Option<IntegrityTier2Cancellation>,
+        cancellation: Option<IdleSweepCancellation>,
         cancel_on_sleep: usize,
     }
 
@@ -2595,7 +2596,7 @@ mod tests {
             }
         }
 
-        fn cancelling_on(cancellation: IntegrityTier2Cancellation, cancel_on_sleep: usize) -> Self {
+        fn cancelling_on(cancellation: IdleSweepCancellation, cancel_on_sleep: usize) -> Self {
             Self {
                 cancellation: Some(cancellation),
                 cancel_on_sleep,
@@ -2942,7 +2943,7 @@ mod tests {
                 ("bin/java-real", ScriptedContent::Hashed(ZERO_SHA1, 3)),
             ])),
         };
-        let cancellation = IntegrityTier2Cancellation::new();
+        let cancellation = tier2_cancellation();
         let pacer = ScriptedTier2Pacer::new();
         let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
 
@@ -2991,7 +2992,7 @@ mod tests {
         )])
         .expect("inventory");
         let projection = inventory.tier2_projection().expect("projection");
-        let cancellation = IntegrityTier2Cancellation::new();
+        let cancellation = tier2_cancellation();
         cancellation.cancel();
         let pacer = ScriptedTier2Pacer::new();
         let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
@@ -3038,7 +3039,7 @@ mod tests {
                 ScriptedContent::Hashed(ZERO_SHA1, content_size),
             )])),
         };
-        let cancellation = IntegrityTier2Cancellation::new();
+        let cancellation = tier2_cancellation();
         let pacer = ScriptedTier2Pacer::cancelling_on(cancellation.clone(), 1);
         let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
 
@@ -3086,7 +3087,7 @@ mod tests {
                 ScriptedContent::Hashed(ZERO_SHA1, content_size),
             )])),
         };
-        let cancellation = IntegrityTier2Cancellation::new();
+        let cancellation = tier2_cancellation();
         let pacer = ScriptedTier2Pacer::new();
         let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
 
@@ -3122,7 +3123,7 @@ mod tests {
 
     #[test]
     fn tier_two_limiter_never_accrues_more_than_one_content_chunk_of_credit() {
-        let cancellation = IntegrityTier2Cancellation::new();
+        let cancellation = tier2_cancellation();
         let pacer = ScriptedTier2Pacer::new();
         let mut control = IntegrityTier2ReadControl::new(&cancellation, &pacer);
 
@@ -3145,7 +3146,7 @@ mod tests {
 
     #[test]
     fn tier_two_limiter_caps_zero_byte_entry_iops_at_sixty_four_per_second() {
-        let cancellation = IntegrityTier2Cancellation::new();
+        let cancellation = tier2_cancellation();
         let pacer = ScriptedTier2Pacer::new();
         let mut control = IntegrityTier2ReadControl::new(&cancellation, &pacer);
 
@@ -3186,7 +3187,7 @@ mod tests {
                     .with_default(ScriptedContent::Hashed(NONZERO_SHA1, 1)),
             ),
         };
-        let cancellation = IntegrityTier2Cancellation::new();
+        let cancellation = tier2_cancellation();
         let pacer = ScriptedTier2Pacer::new();
         let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
         let reader_count = AtomicUsize::new(0);
@@ -3241,7 +3242,7 @@ mod tests {
                     .with_default(ScriptedContent::Hashed(NONZERO_SHA1, 0)),
             ),
         };
-        let cancellation = IntegrityTier2Cancellation::new();
+        let cancellation = tier2_cancellation();
         let pacer = ScriptedTier2Pacer::new();
         let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
         let current_checks = AtomicUsize::new(0);
@@ -3290,7 +3291,7 @@ mod tests {
                     .with_default(ScriptedContent::Hashed(NONZERO_SHA1, 1)),
             ),
         };
-        let cancellation = IntegrityTier2Cancellation::new();
+        let cancellation = tier2_cancellation();
         let pacer = ScriptedTier2Pacer::new();
         let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
 
@@ -3337,19 +3338,23 @@ mod tests {
         )])
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let idle_epoch = state.subscribe_integrity_idle().borrow().epoch();
+        let producer = state
+            .try_claim_producer()
+            .expect("claim idle sweep producer");
+        let reservation = state
+            .try_reserve_idle_sweep(idle_epoch, producer)
+            .expect("idle sweep reservation");
         let ticket = state
-            .mint_known_good_tier2_ticket(&instance.id)
+            .mint_known_good_tier2_ticket(&reservation, &instance.id)
             .await
             .expect("Tier 2 ticket");
         let progress = IntegrityTier2ProgressSink::new();
-        let work = IntegrityTier2OwnedWork::new(
-            state.clone(),
-            ticket,
-            IntegrityTier2Cancellation::new(),
-            progress.clone(),
-        );
+        let work =
+            IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation, progress.clone());
 
-        let report = work.run();
+        let (reservation, report) = work.run().into_parts();
+        reservation.settle(IdleSweepTerminal::Complete);
 
         assert_eq!(report.status, IntegrityTier2Status::Complete);
         assert_eq!(report.selected_entry_count, 1);
@@ -3397,11 +3402,18 @@ mod tests {
         )])
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let idle_epoch = state.subscribe_integrity_idle().borrow().epoch();
+        let producer = state
+            .try_claim_producer()
+            .expect("claim idle sweep producer");
+        let reservation = state
+            .try_reserve_idle_sweep(idle_epoch, producer)
+            .expect("idle sweep reservation");
         let ticket = state
-            .mint_known_good_tier2_ticket(&instance.id)
+            .mint_known_good_tier2_ticket(&reservation, &instance.id)
             .await
             .expect("Tier 2 ticket");
-        let cancellation = IntegrityTier2Cancellation::new();
+        let cancellation = reservation.cancellation();
         let cancel_from_thread = cancellation.clone();
         let canceller = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(2));
@@ -3410,12 +3422,13 @@ mod tests {
         let work = IntegrityTier2OwnedWork::new(
             state.clone(),
             ticket,
-            cancellation,
+            reservation,
             IntegrityTier2ProgressSink::new(),
         );
 
-        let report = work.run();
+        let (reservation, report) = work.run().into_parts();
         canceller.join().expect("cancellation thread");
+        reservation.settle(IdleSweepTerminal::Cancelled);
 
         assert_eq!(report.status, IntegrityTier2Status::Cancelled);
         assert!(report.content_read_byte_count <= 64 * 1024);

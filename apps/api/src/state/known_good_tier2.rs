@@ -1,4 +1,6 @@
-use super::{AppState, KnownGoodVerificationUnavailable};
+use super::{
+    AppState, IdleSweepReservation, InstanceLifecycleLease, KnownGoodVerificationUnavailable,
+};
 use axial_config::is_canonical_instance_id;
 use axial_minecraft::{ManagedRuntimeCache, known_good::KnownGoodInventory};
 use std::path::{Path, PathBuf};
@@ -37,12 +39,22 @@ impl KnownGoodTier2Ticket {
 impl AppState {
     pub(crate) async fn mint_known_good_tier2_ticket(
         &self,
+        reservation: &IdleSweepReservation,
         instance_id: &str,
     ) -> Result<KnownGoodTier2Ticket, KnownGoodVerificationUnavailable> {
         if !is_canonical_instance_id(instance_id) {
             return Err(KnownGoodVerificationUnavailable::InstanceNotRegistered);
         }
-        let lifecycle = self.acquire_instance_lifecycle(instance_id).await;
+        if !reservation.is_current() {
+            return Err(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable);
+        }
+        let lifecycle = InstanceLifecycleLease::bind(
+            instance_id,
+            self.instance_lifecycle_gates.acquire(instance_id).await,
+        );
+        if !reservation.is_current() {
+            return Err(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable);
+        }
         let instance = self
             .instances
             .get(instance_id)
@@ -70,6 +82,9 @@ impl AppState {
             managed_runtime_cache: self.managed_runtime_cache.clone(),
             inventory,
         };
+        if !reservation.is_current() {
+            return Err(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable);
+        }
         drop(lifecycle);
         Ok(ticket)
     }
@@ -178,6 +193,17 @@ mod tests {
             drop(self.state);
             let _ = std::fs::remove_dir_all(self.root);
         }
+
+        fn reserve_sweep(&self) -> IdleSweepReservation {
+            let epoch = self.state.subscribe_integrity_idle().borrow().epoch();
+            let producer = self
+                .state
+                .try_claim_producer()
+                .expect("claim idle sweep producer");
+            self.state
+                .try_reserve_idle_sweep(epoch, producer)
+                .expect("idle sweep reservation")
+        }
     }
 
     fn inventory(path: &str) -> KnownGoodInventory {
@@ -193,9 +219,10 @@ mod tests {
     #[tokio::test]
     async fn ticket_snapshots_exact_identity_without_retaining_instance_lifecycle() {
         let fixture = Fixture::new("identity");
+        let reservation = fixture.reserve_sweep();
         let ticket = fixture
             .state
-            .mint_known_good_tier2_ticket(&fixture.instance.id)
+            .mint_known_good_tier2_ticket(&reservation, &fixture.instance.id)
             .await
             .expect("ticket");
         let (instance_id, version_id, created_at, library_root) = ticket.exact_identity_for_test();
@@ -215,30 +242,34 @@ mod tests {
         .expect("ticket must not retain instance lifecycle");
         drop(lifecycle);
         assert!(fixture.state.known_good_tier2_ticket_is_current(&ticket));
+        drop(reservation);
         fixture.close().await;
     }
 
     #[tokio::test]
     async fn ticket_revalidation_rejects_replaced_inventory() {
         let fixture = Fixture::new("inventory-drift");
+        let reservation = fixture.reserve_sweep();
         let ticket = fixture
             .state
-            .mint_known_good_tier2_ticket(&fixture.instance.id)
+            .mint_known_good_tier2_ticket(&reservation, &fixture.instance.id)
             .await
             .expect("ticket");
         fixture
             .state
             .activate_known_good_inventory_for_test(&fixture.instance.id, inventory("other.jar"));
         assert!(!fixture.state.known_good_tier2_ticket_is_current(&ticket));
+        drop(reservation);
         fixture.close().await;
     }
 
     #[tokio::test]
     async fn ticket_revalidation_rejects_replaced_incarnation() {
         let fixture = Fixture::new("incarnation-drift");
+        let reservation = fixture.reserve_sweep();
         let ticket = fixture
             .state
-            .mint_known_good_tier2_ticket(&fixture.instance.id)
+            .mint_known_good_tier2_ticket(&reservation, &fixture.instance.id)
             .await
             .expect("ticket");
         let mut replacement = fixture.instance.clone();
@@ -249,15 +280,17 @@ mod tests {
             .replace_for_test(replacement)
             .expect("replace instance");
         assert!(!fixture.state.known_good_tier2_ticket_is_current(&ticket));
+        drop(reservation);
         fixture.close().await;
     }
 
     #[tokio::test]
     async fn ticket_revalidation_rejects_library_root_drift() {
         let fixture = Fixture::new("root-drift");
+        let reservation = fixture.reserve_sweep();
         let ticket = fixture
             .state
-            .mint_known_good_tier2_ticket(&fixture.instance.id)
+            .mint_known_good_tier2_ticket(&reservation, &fixture.instance.id)
             .await
             .expect("ticket");
         let changed_root = fixture.root.join("changed-library");
@@ -266,16 +299,18 @@ mod tests {
             .state
             .set_library_dir_for_test(changed_root.to_string_lossy().into_owned());
         assert!(!fixture.state.known_good_tier2_ticket_is_current(&ticket));
+        drop(reservation);
         fixture.close().await;
     }
 
     #[tokio::test]
     async fn ticket_mint_accepts_only_a_canonical_registered_identity() {
         let fixture = Fixture::new("identity-only-api");
+        let reservation = fixture.reserve_sweep();
         assert_eq!(
             fixture
                 .state
-                .mint_known_good_tier2_ticket("../caller/path")
+                .mint_known_good_tier2_ticket(&reservation, "../caller/path")
                 .await
                 .err(),
             Some(KnownGoodVerificationUnavailable::InstanceNotRegistered)
@@ -283,11 +318,51 @@ mod tests {
         assert_eq!(
             fixture
                 .state
-                .mint_known_good_tier2_ticket("missing-instance")
+                .mint_known_good_tier2_ticket(&reservation, "missing-instance")
                 .await
                 .err(),
             Some(KnownGoodVerificationUnavailable::InstanceNotRegistered)
         );
+        drop(reservation);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn ticket_mint_revalidates_sweep_authority_after_lifecycle_wait() {
+        let fixture = Fixture::new("sweep-cancelled-during-lifecycle-wait");
+        let lifecycle = fixture
+            .state
+            .acquire_instance_lifecycle(&fixture.instance.id)
+            .await;
+        let reservation = fixture.reserve_sweep();
+        let cancellation = reservation.cancellation();
+        let state = fixture.state.clone();
+        let instance_id = fixture.instance.id.clone();
+        let mint = tokio::spawn(async move {
+            let result = state
+                .mint_known_good_tier2_ticket(&reservation, &instance_id)
+                .await;
+            (reservation, result)
+        });
+        tokio::task::yield_now().await;
+        let foreground = fixture
+            .state
+            .register_integrity_foreground()
+            .expect("foreground registration");
+        assert!(cancellation.is_cancelled());
+
+        drop(lifecycle);
+        let (reservation, result) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), mint)
+                .await
+                .expect("ticket mint completion")
+                .expect("ticket mint owner");
+        assert_eq!(
+            result.err(),
+            Some(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable)
+        );
+        drop(reservation);
+        drop(foreground);
         fixture.close().await;
     }
 }
