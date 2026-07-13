@@ -460,7 +460,7 @@ impl AppState {
     async fn activate_known_good_source(
         &self,
         installed_library_root: &Path,
-        source: axial_minecraft::KnownGoodActivationSource,
+        source: axial_minecraft::known_good::KnownGoodActivationSource,
     ) -> std::io::Result<()> {
         let installed_library_root =
             require_matching_known_good_library_root(self.library_dir(), installed_library_root)?;

@@ -4,6 +4,7 @@ pub mod download;
 pub mod integrity;
 pub mod known_good;
 mod known_good_libraries;
+mod known_good_reconstruction;
 pub mod launch;
 pub mod lifecycle;
 pub mod loaders;
@@ -18,9 +19,8 @@ pub mod version_meta;
 
 pub use asset_index::{AssetIndexFlagsError, asset_index_requires_virtual_repair};
 pub use download::{DownloadError, DownloadProgress, Downloader};
-pub use known_good::{
-    KnownGoodActivationSource, KnownGoodInstallReceipt, KnownGoodReconstructionReceipt,
-};
+pub use known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
+pub use known_good_reconstruction::{KnownGoodReconstructionError, reconstruct_known_good};
 pub use launch::{
     JavaVersion, LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath,
     client_jar_path, effective_java_version_for, java_component_for_major,
@@ -37,7 +37,7 @@ pub use loaders::{
     LoaderSelectionReason, LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
     LoaderVersionIndex, MaterializedLoaderProfile, build_id_for, fetch_builds, fetch_cached_builds,
     fetch_components, fetch_supported_versions, install_build, installed_version_id_for,
-    loader_components, parse_build_id, reconstruct_build, resolve_build_record_for_install,
+    loader_components, parse_build_id, resolve_build_record_for_install,
     validate_materialized_loader_profile,
 };
 pub use manifest::{

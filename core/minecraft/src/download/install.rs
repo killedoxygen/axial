@@ -56,12 +56,17 @@ use tokio::fs as async_fs;
 use tokio::sync::mpsc;
 
 pub struct Downloader {
-    mc_dir: PathBuf,
+    root: DownloaderRoot,
     client: reqwest::Client,
     #[cfg(test)]
     install_manifest: Option<VersionManifest>,
     #[cfg(test)]
     runtime_source: Option<TestRuntimeSourceDescriptor>,
+}
+
+enum DownloaderRoot {
+    Managed(PathBuf),
+    SourceOnly,
 }
 
 pub(crate) struct ReconstructedVanillaClientAuthority {
@@ -261,7 +266,18 @@ impl VanillaAuthorityParts {
 impl Downloader {
     pub fn new(mc_dir: impl Into<PathBuf>) -> Self {
         Self {
-            mc_dir: mc_dir.into(),
+            root: DownloaderRoot::Managed(mc_dir.into()),
+            client: standard_minecraft_download_client(),
+            #[cfg(test)]
+            install_manifest: None,
+            #[cfg(test)]
+            runtime_source: None,
+        }
+    }
+
+    pub(crate) fn source_only() -> Self {
+        Self {
+            root: DownloaderRoot::SourceOnly,
             client: standard_minecraft_download_client(),
             #[cfg(test)]
             install_manifest: None,
@@ -276,7 +292,7 @@ impl Downloader {
         manifest: VersionManifest,
     ) -> Self {
         Self {
-            mc_dir: mc_dir.into(),
+            root: DownloaderRoot::Managed(mc_dir.into()),
             client: standard_minecraft_download_client(),
             install_manifest: Some(manifest),
             runtime_source: None,
@@ -292,6 +308,21 @@ impl Downloader {
         self
     }
 
+    fn managed_root(&self) -> &Path {
+        let DownloaderRoot::Managed(root) = &self.root else {
+            unreachable!("source-only downloader cannot materialize an installation");
+        };
+        root
+    }
+
+    fn library_plan_root(&self) -> &Path {
+        // Source-only plans bind safe relative library identities without granting a managed root.
+        match &self.root {
+            DownloaderRoot::Managed(root) => root,
+            DownloaderRoot::SourceOnly => Path::new(""),
+        }
+    }
+
     pub async fn install_version<F>(
         &self,
         version_id: &str,
@@ -303,7 +334,7 @@ impl Downloader {
         Box::pin(self.install_version_with_fact_sender(version_id, &mut send, None, None)).await
     }
 
-    pub async fn reconstruct_version(
+    pub(crate) async fn reconstruct_version(
         &self,
         version_id: &str,
     ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
@@ -511,7 +542,7 @@ impl Downloader {
     where
         F: FnMut(DownloadProgress),
     {
-        let version_dir = versions_dir(&self.mc_dir).join(version_id);
+        let version_dir = versions_dir(self.managed_root()).join(version_id);
         let marker_path = version_dir.join(".incomplete");
         let plan = TransferPlan::shared();
         let mut send = |mut progress: DownloadProgress| {
@@ -586,7 +617,7 @@ impl Downloader {
     where
         F: FnMut(DownloadProgress),
     {
-        let version_dir = versions_dir(&self.mc_dir).join(version_id);
+        let version_dir = versions_dir(self.managed_root()).join(version_id);
         let json_path = version_dir.join(format!("{version_id}.json"));
         send(progress(
             "version_json",
@@ -720,7 +751,7 @@ impl Downloader {
             });
             let mut asset_pipeline = asset_index_source.as_ref().map(|source| {
                 spawn_asset_download_pipeline(
-                    self.mc_dir.clone(),
+                    self.managed_root().to_path_buf(),
                     self.client.clone(),
                     source.shared_bytes(),
                     fact_tx.cloned(),
@@ -769,7 +800,7 @@ impl Downloader {
                                 )
                                 .await?;
                                 let prepared = prepare_library_publication(
-                                    &self.mc_dir,
+                                    self.managed_root(),
                                     job.relative_path.clone(),
                                     &job.url,
                                     &job.expected,
@@ -885,7 +916,7 @@ impl Downloader {
                 .as_ref()
                 .and_then(|logging| logging.client.as_ref())
             {
-                let log_config_path = assets_dir(&self.mc_dir)
+                let log_config_path = assets_dir(self.managed_root())
                     .join("log_configs")
                     .join(&logging.file.id);
                 send(progress("log_config", 0, 1, Some(logging.file.id.clone())));
@@ -979,8 +1010,8 @@ impl Downloader {
         let (library_declarations, version_json_source) = declaration_source.into_parts();
         let (pending_library_declarations, library_jobs) = library_declarations
             .classify_jobs(
-                &libraries_dir(&self.mc_dir),
-                library_jobs_for(&self.mc_dir, &version.libraries, &environment)?,
+                &libraries_dir(self.library_plan_root()),
+                library_jobs_for(self.library_plan_root(), &version.libraries, &environment)?,
             )
             .map_err(|error| {
                 DownloadError::ResolveManifest(format!(
@@ -1076,7 +1107,9 @@ impl Downloader {
             return Ok(None);
         };
         let index_name = format!("{}.json", version.asset_index.id);
-        let index_path = assets_dir(&self.mc_dir).join("indexes").join(index_name);
+        let index_path = assets_dir(self.managed_root())
+            .join("indexes")
+            .join(index_name);
         let expected =
             ExpectedIntegrity::from_mojang(version.asset_index.size, &version.asset_index.sha1);
         let prepared = prepare_selected_artifact_install(

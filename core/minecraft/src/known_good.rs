@@ -770,6 +770,10 @@ fn derive_profile_receipt(
 }
 
 impl KnownGoodReconstructionReceipt {
+    pub fn version_id(&self) -> &str {
+        self.authenticated.version_id.as_str()
+    }
+
     pub fn into_activation_source(self) -> KnownGoodActivationSource {
         KnownGoodActivationSource {
             version_id: self.authenticated.version_id,

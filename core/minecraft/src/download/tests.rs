@@ -242,6 +242,7 @@ async fn reconstruction_matches_install_without_touching_seeded_destinations() {
     .expect("reconstruction must not deadlock the scratch pool")
     .expect("reconstruct authenticated sources");
 
+    assert_eq!(reconstruction.version_id(), "reconstruction");
     assert_eq!(snapshot_tree(&root), before);
     let reconstruction_requests =
         std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();

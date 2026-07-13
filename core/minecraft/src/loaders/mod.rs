@@ -71,7 +71,7 @@ where
         .map_err(LoaderInstallError::from)
 }
 
-pub async fn reconstruct_build(
+pub(crate) async fn reconstruct_build(
     installed_version_id: &str,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
     let plan = api::loader_reconstruction_plan(installed_version_id)?;
@@ -214,22 +214,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconstruction_rejects_noncanonical_and_unsupported_ids_before_effects() {
-        let sentinel_root = temp_library("reconstruction-id-rejection");
+    async fn reconstruction_rejects_unsupported_strategies_before_effects() {
+        let sentinel_root = temp_library("unsupported-reconstruction-strategy");
         let sentinel = sentinel_root.join("untouched");
         fs::create_dir_all(&sentinel_root).expect("sentinel root");
         fs::write(&sentinel, b"untouched").expect("sentinel");
-
-        for invalid in ["loader-v1-obsolete", " loader-v2-invalid ", "../escape"] {
-            let Err(_) = reconstruct_build(invalid).await else {
-                panic!("noncanonical reconstruction identity");
-            };
-            assert_eq!(fs::read(&sentinel).expect("sentinel remains"), b"untouched");
-            assert_eq!(
-                fs::read_dir(&sentinel_root).expect("sentinel root").count(),
-                1
-            );
-        }
 
         for (component, loader_version) in [
             (LoaderComponentId::Forge, "55.0.0"),

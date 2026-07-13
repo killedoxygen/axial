@@ -47,7 +47,6 @@ use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::fs as async_fs;
 use zip::ZipArchive;
@@ -185,7 +184,7 @@ async fn acquire_profile_source(
 pub(super) async fn reconstruct_from_profile_source(
     plan: &LoaderInstallPlan,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
-    let downloader = Downloader::new(PathBuf::new());
+    let downloader = Downloader::source_only();
     let proof = providers::fetch_profile_install_proof(&plan.record).await?;
     Box::pin(reconstruct_profile_with_downloader(
         plan,
@@ -272,7 +271,7 @@ async fn reconstruct_profile_after_sources(
 pub(super) async fn reconstruct_from_legacy_archive(
     plan: &LoaderInstallPlan,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
-    let downloader = Downloader::new(PathBuf::new());
+    let downloader = Downloader::source_only();
     reconstruct_legacy_with_downloader(plan, &downloader).await
 }
 
@@ -349,7 +348,7 @@ async fn derive_legacy_archive_inputs(
 pub(super) async fn reconstruct_from_installer_source(
     plan: &LoaderInstallPlan,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
-    let downloader = Downloader::new(PathBuf::new());
+    let downloader = Downloader::source_only();
     reconstruct_installer_with_downloader(plan, &downloader).await
 }
 
