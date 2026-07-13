@@ -557,12 +557,22 @@ impl AppState {
         &self,
         producer: &ProducerLease,
     ) -> Option<InstalledVersionsLookup> {
-        let library_dir = self.library_dir().map(PathBuf::from)?;
         let foreground = self
             .register_integrity_foreground()
             .ok()?
             .wait_for_settlement()
             .await;
+        self.installed_versions_snapshot_with_foreground(producer, foreground)
+            .await
+    }
+
+    pub(crate) async fn installed_versions_snapshot_with_foreground(
+        &self,
+        producer: &ProducerLease,
+        foreground: IntegrityForegroundLease,
+    ) -> Option<InstalledVersionsLookup> {
+        self.validate_integrity_foreground(&foreground).ok()?;
+        let library_dir = self.library_dir().map(PathBuf::from)?;
         Some(
             self.installed_versions
                 .lookup(library_dir, producer, foreground)
@@ -800,10 +810,6 @@ impl AppState {
         self.lifecycle.subscribe_shutdown()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the R5 scheduler slice")
-    )]
     pub(crate) fn subscribe_integrity_idle(
         &self,
     ) -> tokio::sync::watch::Receiver<IntegrityIdleSnapshot> {
@@ -1214,7 +1220,29 @@ impl AppState {
             .expect("activate test known-good inventory");
     }
 
+    pub(crate) async fn admit_managed_instance_with_foreground(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: &str,
+        mutation: bool,
+    ) -> Result<AppManagedCompositionAdmission, ManagedInstanceAdmissionError> {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| ManagedInstanceAdmissionError::ForeignForegroundAuthority)?;
+        self.admit_managed_instance_inner(instance_id, mutation)
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn admit_managed_instance(
+        &self,
+        instance_id: &str,
+        mutation: bool,
+    ) -> Result<AppManagedCompositionAdmission, ManagedInstanceAdmissionError> {
+        self.admit_managed_instance_inner(instance_id, mutation)
+            .await
+    }
+
+    async fn admit_managed_instance_inner(
         &self,
         instance_id: &str,
         mutation: bool,
@@ -1255,7 +1283,9 @@ impl AppState {
         instance_id: &str,
         plan: Option<axial_performance::CompositionPlan>,
     ) -> Result<axial_performance::ManagedCompositionInspection, ManagedInspectionError> {
-        let admitted = self.admit_managed_instance(instance_id, false).await?;
+        let admitted = self
+            .admit_managed_instance_inner(instance_id, false)
+            .await?;
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let result = admitted.inspect(plan.as_ref()).await;
@@ -1272,7 +1302,9 @@ impl AppState {
         instance_id: &str,
         request: axial_performance::ResolutionRequest,
     ) -> Result<axial_performance::ManagedResolvedInspection, ManagedInspectionError> {
-        let admitted = self.admit_managed_instance(instance_id, false).await?;
+        let admitted = self
+            .admit_managed_instance_inner(instance_id, false)
+            .await?;
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let result = admitted.resolve_and_inspect(request).await;

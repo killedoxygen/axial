@@ -60,6 +60,10 @@ impl IntegrityIdleSnapshot {
     pub(crate) const fn is_stably_idle(self) -> bool {
         self.running && self.foreground_count == 0 && !self.sweep_active
     }
+
+    pub(crate) const fn is_running(self) -> bool {
+        self.running
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]

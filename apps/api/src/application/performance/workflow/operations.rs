@@ -18,12 +18,17 @@ use crate::state::performance_operations::{
     PerformanceOperationStoreError, normalized_operation_timestamp, sanitize_operation_error,
 };
 use crate::state::{
-    AppState, DownloadProgress, InstalledVersionsSnapshot, OperationJournalStoreError,
-    ProducerLease, RequestProducerHandoff,
+    AppState, DownloadProgress, InstalledVersionsSnapshot, IntegrityForegroundLease,
+    IntegrityForegroundRegistration, OperationJournalStoreError, ProducerLease,
+    RequestProducerHandoff,
 };
 use axum::{Json, http::StatusCode};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    future::Future,
+    sync::{Arc, Mutex},
+};
 
 const INVALID_PERSISTED_OPERATION_ERROR: &str = "invalid persisted performance operation payload";
 pub(super) const PERFORMANCE_JOURNAL_ERROR: &str =
@@ -35,6 +40,8 @@ const PERFORMANCE_TERMINAL_FAILURE_FACT: &str = "performance_terminal_failure_v1
 const PERFORMANCE_INVALID_JOURNAL_FAILURE_POINT: &str = "performance_journal_invalid";
 const PERFORMANCE_RECONCILIATION_FAILURE: &str =
     "performance operation outcome could not be confirmed after restart";
+const PERFORMANCE_WORKER_INTERRUPTED_FAILURE: &str =
+    "performance operation stopped before its result could be confirmed";
 const PERFORMANCE_RETRY_INITIAL_DELAY_MS: u64 = 20;
 const PERFORMANCE_RETRY_MAX_DELAY_MS: u64 = 1_000;
 
@@ -365,6 +372,164 @@ pub(super) enum PerformanceInstallAction {
     Rollback,
 }
 
+#[derive(Clone, Default)]
+pub(super) struct PerformanceWorkerIdentity {
+    operation_id: Arc<Mutex<Option<String>>>,
+}
+
+impl PerformanceWorkerIdentity {
+    pub(super) fn set(&self, operation_id: &str) {
+        *self
+            .operation_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(operation_id.to_string());
+    }
+
+    fn get(&self) -> Option<String> {
+        self.operation_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+fn register_performance_foreground(
+    state: &AppState,
+) -> Result<IntegrityForegroundRegistration, PerformanceApplicationError> {
+    state
+        .register_integrity_foreground()
+        .map_err(|_| performance_shutdown_error())
+}
+
+pub(super) async fn supervise_performance_worker<F, Fut>(
+    state: AppState,
+    action: PerformanceInstallAction,
+    identity: PerformanceWorkerIdentity,
+    supervisor_owner: ProducerLease,
+    foreground: IntegrityForegroundLease,
+    worker: F,
+) where
+    F: FnOnce(ProducerLease, IntegrityForegroundLease) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let worker_owner = supervisor_owner.claim_child();
+    let runtime_owner = worker_owner.claim_child();
+    let worker_foreground = foreground.retained();
+    let worker = worker_owner.spawn_joinable(worker(runtime_owner, worker_foreground));
+    let worker_result = worker.await;
+    let interrupted = worker_result.is_err();
+    if let Err(error) = worker_result {
+        tracing::error!(
+            worker_cancelled = error.is_cancelled(),
+            worker_panicked = error.is_panic(),
+            "performance operation worker stopped before settlement"
+        );
+    }
+
+    let Some(install_id) = identity.get() else {
+        return;
+    };
+    if !state
+        .performance_operations()
+        .has_reconciliation_obligation(&install_id)
+    {
+        return;
+    }
+    let status = state.performance_operations().get(&install_id).await;
+    if !interrupted
+        && status
+            .as_ref()
+            .is_some_and(|status| performance_status_is_terminal(&status.state))
+    {
+        return;
+    }
+
+    let mut shutdown = state.subscribe_shutdown();
+    let mut integrity = state.subscribe_integrity_idle();
+    let mut delay_ms = PERFORMANCE_RETRY_INITIAL_DELAY_MS;
+    loop {
+        if !state
+            .performance_operations()
+            .has_reconciliation_obligation(&install_id)
+        {
+            return;
+        }
+        if state
+            .performance_operations()
+            .get(&install_id)
+            .await
+            .is_none()
+            && state
+                .performance_operations()
+                .has_retry_candidate(&install_id)
+        {
+            let operation_id = OperationId::new(install_id.clone());
+            let _ = retry_performance_status_transition(
+                &state,
+                &operation_id,
+                "queued",
+                None,
+                Err(PerformanceOperationStoreError::RetryRequired),
+                None,
+            )
+            .await;
+        }
+        state.installs().insert(install_id.clone()).await;
+        let store = state.installs().clone();
+        let terminalization = terminalize_uncertain_performance_operation(
+            &state,
+            &store,
+            &install_id,
+            Some(action),
+            PERFORMANCE_WORKER_INTERRUPTED_FAILURE,
+            None,
+        );
+        tokio::pin!(terminalization);
+        let published = loop {
+            tokio::select! {
+                published = &mut terminalization => break published,
+                _ = shutdown.changed() => {},
+                _ = integrity.changed() => {},
+            }
+            if *shutdown.borrow_and_update() && !integrity.borrow_and_update().is_running() {
+                tracing::warn!(
+                    operation_id = install_id,
+                    "performance terminal supervision stopped after integrity shutdown"
+                );
+                return;
+            }
+        };
+        let terminal = state
+            .performance_operations()
+            .get(&install_id)
+            .await
+            .is_some_and(|status| performance_status_is_terminal(&status.state));
+        if terminal {
+            return;
+        }
+        tracing::error!(
+            operation_id = install_id,
+            published,
+            "performance worker supervision is retaining authority for terminal retry"
+        );
+        if *shutdown.borrow_and_update() && !integrity.borrow_and_update().is_running() {
+            tracing::warn!(
+                operation_id = install_id,
+                "performance terminal supervision stopped after integrity shutdown"
+            );
+            return;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+            _ = shutdown.changed() => {}
+            _ = integrity.changed() => {}
+        }
+        delay_ms = delay_ms
+            .saturating_mul(2)
+            .min(PERFORMANCE_RETRY_MAX_DELAY_MS);
+    }
+}
+
 pub(crate) fn spawn_pending_performance_operations(state: &AppState, producer: ProducerLease) {
     let state = state.clone();
     let child_owner = producer.claim_child();
@@ -419,84 +584,99 @@ pub async fn performance_instance_operation(
 
 pub(super) async fn queue_performance_operation(
     state: AppState,
-    mut operation: PerformanceOperation,
+    operation: PerformanceOperation,
     handoff: RequestProducerHandoff,
 ) -> Result<PerformanceInstallResponse, (StatusCode, Json<serde_json::Value>)> {
     let (ownership_tx, ownership_rx) = tokio::sync::oneshot::channel();
     let producer = handoff
         .try_claim()
         .map_err(|_| performance_shutdown_error())?;
-    operation.installed_versions =
-        stage_performance_installed_versions(&state, &operation, &producer).await;
+    let foreground = register_performance_foreground(&state)?;
+    let worker_owner = producer.claim_child();
+    let operation_id = state.performance_operations().reserve_operation_id();
+    let worker_identity = PerformanceWorkerIdentity::default();
+    worker_identity.set(operation_id.operation_id());
+    let supervisor_identity = worker_identity.clone();
+    let action = operation.action;
+    let supervisor_state = state.clone();
     producer.spawn(async move {
-        let mut operation = operation;
-        let journal_identity = durable_performance_operation_identity(&state, &operation).await;
-        let status = match state
-            .performance_operations()
-            .start_with_identity(
-                operation.instance_id.clone(),
-                operation_action_name(operation.action).to_string(),
-                operation_payload(&operation),
-                journal_identity,
-            )
-            .await
-        {
-            Ok(status) => status,
-            Err(error) => {
-                let retry_operation_id = error.operation_id().and_then(|operation_id| {
-                    state
-                        .performance_operations()
-                        .has_retry_candidate(operation_id)
-                        .then(|| operation_id.to_string())
-                });
-                let _ = ownership_tx.send(Err(performance_operation_start_error(error)));
-                if let Some(install_id) = retry_operation_id {
-                    let operation_id = OperationId::new(install_id.clone());
-                    if retry_performance_status_transition(
-                        &state,
-                        &operation_id,
-                        "queued",
-                        None,
-                        Err(PerformanceOperationStoreError::RetryRequired),
-                        None,
+        let foreground = foreground.wait_for_settlement().await;
+        supervise_performance_worker(
+            supervisor_state,
+            action,
+            supervisor_identity,
+            worker_owner,
+            foreground,
+            move |runtime_owner, worker_foreground| async move {
+                let mut operation = operation;
+                operation.installed_versions = stage_performance_installed_versions(
+                    &state,
+                    &operation,
+                    &runtime_owner,
+                    &worker_foreground,
+                )
+                .await;
+                let journal_identity =
+                    durable_performance_operation_identity(&state, &operation, &worker_foreground)
+                        .await;
+                let status = match state
+                    .performance_operations()
+                    .start_reserved_with_identity(
+                        operation_id,
+                        operation.instance_id.clone(),
+                        operation_action_name(operation.action).to_string(),
+                        operation_payload(&operation),
+                        journal_identity,
                     )
                     .await
-                    .is_ok()
-                    {
-                        state.installs().insert(install_id.clone()).await;
-                        let store = state.installs().clone();
-                        terminalize_uncertain_performance_operation(
-                            &state,
-                            &store,
-                            &install_id,
-                            Some(operation.action),
-                            PERFORMANCE_JOURNAL_ERROR,
-                            None,
-                        )
-                        .await;
+                {
+                    Ok(status) => status,
+                    Err(error) => {
+                        let retry_operation_id = error.operation_id().and_then(|operation_id| {
+                            state
+                                .performance_operations()
+                                .has_retry_candidate(operation_id)
+                                .then(|| operation_id.to_string())
+                        });
+                        if let Some(install_id) = retry_operation_id.as_deref() {
+                            worker_identity.set(install_id);
+                        }
+                        let _ = ownership_tx.send(Err(performance_operation_start_error(error)));
+                        if let Some(install_id) = retry_operation_id {
+                            reconcile_failed_performance_start(&state, &operation, &install_id)
+                                .await;
+                        }
+                        return;
                     }
-                }
-                return;
-            }
-        };
-        let install_id = status.id.clone();
-        operation.status_operation_id = Some(install_id.clone());
-        state.installs().insert(install_id.clone()).await;
-        let store = state.installs().clone();
-        let response = PerformanceInstallResponse {
-            active: true,
-            status: "queued".to_string(),
-            install_id: Some(install_id.clone()),
-            health: axial_performance::BundleHealth::Disabled,
-            composition_id: String::new(),
-            tier: String::new(),
-            installed_count: 0,
-            managed_artifacts: Vec::new(),
-            warnings: Vec::new(),
-        };
-        let _ = ownership_tx.send(Ok(response));
-        tokio::task::yield_now().await;
-        run_queued_performance_operation(state, operation, store, install_id).await;
+                };
+                let install_id = status.id.clone();
+                worker_identity.set(&install_id);
+                operation.status_operation_id = Some(install_id.clone());
+                state.installs().insert(install_id.clone()).await;
+                let store = state.installs().clone();
+                let response = PerformanceInstallResponse {
+                    active: true,
+                    status: "queued".to_string(),
+                    install_id: Some(install_id.clone()),
+                    health: axial_performance::BundleHealth::Disabled,
+                    composition_id: String::new(),
+                    tier: String::new(),
+                    installed_count: 0,
+                    managed_artifacts: Vec::new(),
+                    warnings: Vec::new(),
+                };
+                let _ = ownership_tx.send(Ok(response));
+                run_queued_performance_operation(
+                    state,
+                    operation,
+                    store,
+                    install_id,
+                    worker_foreground,
+                )
+                .await;
+            },
+        )
+        .await;
     });
 
     ownership_rx.await.unwrap_or_else(|_| {
@@ -518,42 +698,80 @@ pub(super) async fn execute_synchronous_performance_operation(
     let producer = handoff
         .try_claim()
         .map_err(|_| performance_shutdown_error())?;
-    operation.installed_versions =
-        stage_performance_installed_versions(&state, &operation, &producer).await;
+    let foreground = register_performance_foreground(&state)?;
+    let worker_owner = producer.claim_child();
+    let operation_id = state.performance_operations().reserve_operation_id();
+    let worker_identity = PerformanceWorkerIdentity::default();
+    worker_identity.set(operation_id.operation_id());
+    let supervisor_identity = worker_identity.clone();
+    let action = operation.action;
+    let supervisor_state = state.clone();
     producer.spawn(async move {
-        let mut operation = operation;
-        let journal_identity = durable_performance_operation_identity(&state, &operation).await;
-        let status = match state
-            .performance_operations()
-            .start_with_identity(
-                operation.instance_id.clone(),
-                operation_action_name(operation.action).to_string(),
-                operation_payload(&operation),
-                journal_identity,
-            )
-            .await
-        {
-            Ok(status) => status,
-            Err(error) => {
-                let retry_operation_id = error.operation_id().and_then(|operation_id| {
-                    state
-                        .performance_operations()
-                        .has_retry_candidate(operation_id)
-                        .then(|| operation_id.to_string())
-                });
-                let _ = completion_tx.send(Err(performance_operation_start_error(error)));
-                if let Some(install_id) = retry_operation_id {
-                    reconcile_failed_performance_start(&state, &operation, &install_id).await;
-                }
-                return;
-            }
-        };
-        let install_id = status.id.clone();
-        operation.status_operation_id = Some(install_id.clone());
-        state.installs().insert(install_id.clone()).await;
-        let store = state.installs().clone();
-        run_owned_performance_operation(state, operation, store, install_id, Some(completion_tx))
-            .await;
+        let foreground = foreground.wait_for_settlement().await;
+        supervise_performance_worker(
+            supervisor_state,
+            action,
+            supervisor_identity,
+            worker_owner,
+            foreground,
+            move |runtime_owner, worker_foreground| async move {
+                operation.installed_versions = stage_performance_installed_versions(
+                    &state,
+                    &operation,
+                    &runtime_owner,
+                    &worker_foreground,
+                )
+                .await;
+                let journal_identity =
+                    durable_performance_operation_identity(&state, &operation, &worker_foreground)
+                        .await;
+                let status = match state
+                    .performance_operations()
+                    .start_reserved_with_identity(
+                        operation_id,
+                        operation.instance_id.clone(),
+                        operation_action_name(operation.action).to_string(),
+                        operation_payload(&operation),
+                        journal_identity,
+                    )
+                    .await
+                {
+                    Ok(status) => status,
+                    Err(error) => {
+                        let retry_operation_id = error.operation_id().and_then(|operation_id| {
+                            state
+                                .performance_operations()
+                                .has_retry_candidate(operation_id)
+                                .then(|| operation_id.to_string())
+                        });
+                        if let Some(install_id) = retry_operation_id.as_deref() {
+                            worker_identity.set(install_id);
+                        }
+                        let _ = completion_tx.send(Err(performance_operation_start_error(error)));
+                        if let Some(install_id) = retry_operation_id {
+                            reconcile_failed_performance_start(&state, &operation, &install_id)
+                                .await;
+                        }
+                        return;
+                    }
+                };
+                let install_id = status.id.clone();
+                worker_identity.set(&install_id);
+                operation.status_operation_id = Some(install_id.clone());
+                state.installs().insert(install_id.clone()).await;
+                let store = state.installs().clone();
+                run_owned_performance_operation(
+                    state,
+                    operation,
+                    store,
+                    install_id,
+                    Some(completion_tx),
+                    &worker_foreground,
+                )
+                .await;
+            },
+        )
+        .await;
     });
 
     let mut completion_rx = completion_rx;
@@ -611,8 +829,20 @@ pub(super) async fn resume_pending_performance_operations_owned(
     producer: &ProducerLease,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> usize {
+    let reconciliation = plan_orphaned_performance_reconciliation(&state);
+    if reconciliation.is_empty()
+        && !state
+            .performance_operations()
+            .has_pending_resumable_operations()
+    {
+        return 0;
+    }
+    let Ok(foreground) = state.register_integrity_foreground() else {
+        return 0;
+    };
+    let foreground = foreground.wait_for_settlement().await;
     let mut resumed = 0usize;
-    reconcile_orphaned_performance_journals(&state).await;
+    reconcile_orphaned_performance_journals(&state, reconciliation).await;
     loop {
         if *shutdown.borrow_and_update() {
             break;
@@ -635,12 +865,40 @@ pub(super) async fn resume_pending_performance_operations_owned(
             if let Some(mut operation) =
                 prepare_resumed_performance_operation(&state, &status, &store).await
             {
-                operation.installed_versions =
-                    stage_performance_installed_versions(&state, &operation, producer).await;
+                let action = operation.action;
+                let worker_identity = PerformanceWorkerIdentity::default();
+                worker_identity.set(&install_id);
+                let supervisor_identity = worker_identity.clone();
+                let worker_owner = producer.claim_child();
+                let worker_foreground = foreground.retained();
                 let state_task = state.clone();
+                let supervisor_state = state.clone();
                 producer.spawn_child(async move {
-                    run_queued_performance_operation(state_task, operation, store, install_id)
-                        .await;
+                    supervise_performance_worker(
+                        supervisor_state,
+                        action,
+                        supervisor_identity,
+                        worker_owner,
+                        worker_foreground,
+                        move |runtime_owner, operation_foreground| async move {
+                            operation.installed_versions = stage_performance_installed_versions(
+                                &state_task,
+                                &operation,
+                                &runtime_owner,
+                                &operation_foreground,
+                            )
+                            .await;
+                            run_queued_performance_operation(
+                                state_task,
+                                operation,
+                                store,
+                                install_id,
+                                operation_foreground,
+                            )
+                            .await;
+                        },
+                    )
+                    .await;
                 });
             }
         }
@@ -653,18 +911,32 @@ pub(super) async fn stage_performance_installed_versions(
     state: &AppState,
     operation: &PerformanceOperation,
     producer: &ProducerLease,
+    foreground: &IntegrityForegroundLease,
 ) -> Option<InstalledVersionsSnapshot> {
     if !matches!(operation.action, PerformanceInstallAction::Install) {
         return None;
     }
     state
-        .installed_versions_snapshot(producer)
+        .installed_versions_snapshot_with_foreground(producer, foreground.retained())
         .await
         .map(|lookup| lookup.snapshot)
 }
 
-async fn reconcile_orphaned_performance_journals(state: &AppState) {
+#[derive(Default)]
+struct PerformanceReconciliationPlan {
+    mismatched_statuses: Vec<(PerformanceOperationStatus, PerformanceInstallAction)>,
+    orphaned_journals: Vec<OperationJournalEntry>,
+}
+
+impl PerformanceReconciliationPlan {
+    fn is_empty(&self) -> bool {
+        self.mismatched_statuses.is_empty() && self.orphaned_journals.is_empty()
+    }
+}
+
+fn plan_orphaned_performance_reconciliation(state: &AppState) -> PerformanceReconciliationPlan {
     let statuses = state.performance_operations().list();
+    let mut mismatched_statuses = Vec::new();
     for status in statuses
         .iter()
         .filter(|status| performance_status_is_terminal(&status.state))
@@ -685,14 +957,7 @@ async fn reconcile_orphaned_performance_journals(state: &AppState) {
                 .and_then(|identity| operation_action_from_name(&identity.action))
                 .or_else(|| operation_action_from_name(&status.action))
                 .unwrap_or(PerformanceInstallAction::Install);
-            terminalize_mismatched_performance_operation(
-                state,
-                state.installs(),
-                status,
-                action,
-                PERFORMANCE_RECONCILIATION_FAILURE,
-            )
-            .await;
+            mismatched_statuses.push((status.clone(), action));
         }
     }
 
@@ -701,7 +966,7 @@ async fn reconcile_orphaned_performance_journals(state: &AppState) {
         .filter(|status| !performance_status_is_terminal(&status.state))
         .map(|status| status.id)
         .collect::<HashSet<_>>();
-    let orphaned = state
+    let orphaned_journals = state
         .journals()
         .list()
         .into_iter()
@@ -712,7 +977,28 @@ async fn reconcile_orphaned_performance_journals(state: &AppState) {
         .filter(|journal| !nonterminal_status_ids.contains(journal.operation_id.as_str()))
         .collect::<Vec<_>>();
 
-    for journal in orphaned {
+    PerformanceReconciliationPlan {
+        mismatched_statuses,
+        orphaned_journals,
+    }
+}
+
+async fn reconcile_orphaned_performance_journals(
+    state: &AppState,
+    plan: PerformanceReconciliationPlan,
+) {
+    for (status, action) in plan.mismatched_statuses {
+        terminalize_mismatched_performance_operation(
+            state,
+            state.installs(),
+            &status,
+            action,
+            PERFORMANCE_RECONCILIATION_FAILURE,
+        )
+        .await;
+    }
+
+    for journal in plan.orphaned_journals {
         if let Err(error) = terminalize_orphaned_performance_journal(state, &journal).await {
             tracing::warn!(
                 operation_id = journal.operation_id.as_str(),
@@ -916,8 +1202,9 @@ pub(super) async fn run_queued_performance_operation(
     operation: PerformanceOperation,
     store: std::sync::Arc<crate::state::InstallStore>,
     install_id: String,
+    foreground: IntegrityForegroundLease,
 ) {
-    run_owned_performance_operation(state, operation, store, install_id, None).await;
+    run_owned_performance_operation(state, operation, store, install_id, None, &foreground).await;
 }
 
 async fn run_owned_performance_operation(
@@ -930,6 +1217,7 @@ async fn run_owned_performance_operation(
             Result<PerformanceInstallResponse, PerformanceApplicationError>,
         >,
     >,
+    foreground: &IntegrityForegroundLease,
 ) {
     record_performance_progress_status(&state, &install_id, "queued").await;
     emit_performance_progress(
@@ -975,7 +1263,7 @@ async fn run_owned_performance_operation(
 
     loop {
         let mut reapply_requested_mutation = false;
-        match execute_performance_operation(&state, &operation).await {
+        match execute_performance_operation(&state, &operation, foreground).await {
             Ok(response) => {
                 let operation_id = OperationId::new(install_id.clone());
                 let Some(journal) = state.journals().get(&operation_id) else {
@@ -2247,8 +2535,9 @@ fn operation_payload(operation: &PerformanceOperation) -> PerformanceOperationPa
 async fn durable_performance_operation_identity(
     state: &AppState,
     operation: &PerformanceOperation,
+    foreground: &IntegrityForegroundLease,
 ) -> PerformanceOperationJournalIdentity {
-    performance_operation_journal_identity(state, operation)
+    performance_operation_journal_identity(state, operation, foreground)
         .await
         .map(|identity| {
             PerformanceOperationJournalIdentity::new(

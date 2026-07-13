@@ -550,7 +550,10 @@ fn managed_inspection_error(
                 "error": "managed composition mutation is blocked while the instance is running"
             })),
         ),
-        ManagedInspectionError::Admission(ManagedInstanceAdmissionError::Owner(error)) => (
+        ManagedInspectionError::Admission(
+            error @ (ManagedInstanceAdmissionError::ForeignForegroundAuthority
+            | ManagedInstanceAdmissionError::Owner(_)),
+        ) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "error": error.to_string() })),
         ),

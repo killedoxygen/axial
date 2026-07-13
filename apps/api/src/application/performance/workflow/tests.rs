@@ -2,7 +2,7 @@ use super::*;
 use crate::state::performance_operations::{
     PERFORMANCE_COMMITTING_COMPLETE_STATE, PerformanceOperationPayload,
 };
-use crate::state::{AppStateInit, DownloadProgress, InstallStore, SessionStore};
+use crate::state::{AppStateInit, DownloadProgress, IdleSweepTerminal, InstallStore, SessionStore};
 use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
 use axial_performance::modrinth::ModrinthError;
@@ -247,6 +247,22 @@ async fn collect_install_events(state: &AppState, install_id: &str) -> Vec<Downl
             return events;
         }
     }
+}
+
+async fn wait_for_integrity_idle(state: &AppState, expected: bool) {
+    let mut idle = state.subscribe_integrity_idle();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if idle.borrow_and_update().is_stably_idle() == expected {
+                return;
+            }
+            idle.changed()
+                .await
+                .expect("integrity idle state remains open");
+        }
+    })
+    .await
+    .expect("integrity idle state settles");
 }
 
 fn json_error_message(error: &(StatusCode, Json<serde_json::Value>)) -> String {

@@ -21,7 +21,7 @@ use crate::guardian::{
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{OperationId, OperationPhase, RollbackState};
-use crate::state::{AppManagedCompositionAdmission, AppState};
+use crate::state::{AppManagedCompositionAdmission, AppState, IntegrityForegroundLease};
 use axial_performance::{
     BundleHealth, CompositionState, InstallError, PerformanceMode, ResolutionRequest,
     RollbackSnapshotSummary as CoreRollbackSnapshotSummary, StateError,
@@ -104,6 +104,7 @@ fn public_performance_timestamp(value: &str) -> String {
 pub(super) async fn execute_performance_operation(
     state: &AppState,
     operation: &PerformanceOperation,
+    foreground: &IntegrityForegroundLease,
 ) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
     let instance = state
         .instances()
@@ -115,7 +116,7 @@ pub(super) async fn execute_performance_operation(
             )
         })?;
     let admitted = state
-        .admit_managed_instance(&instance.id, true)
+        .admit_managed_instance_with_foreground(foreground, &instance.id, true)
         .await
         .map_err(managed_admission_error)?;
 
@@ -142,6 +143,7 @@ pub(super) async fn execute_performance_operation(
 pub(super) async fn performance_operation_journal_identity(
     state: &AppState,
     operation: &PerformanceOperation,
+    foreground: &IntegrityForegroundLease,
 ) -> Result<PerformanceJournalIdentity, PerformanceApplicationError> {
     let instance = state
         .instances()
@@ -153,7 +155,7 @@ pub(super) async fn performance_operation_journal_identity(
             )
         })?;
     let admitted = state
-        .admit_managed_instance(&instance.id, false)
+        .admit_managed_instance_with_foreground(foreground, &instance.id, false)
         .await
         .map_err(managed_admission_error)?;
 
@@ -879,7 +881,8 @@ fn managed_admission_error(
             StatusCode::BAD_REQUEST
         }
         crate::state::ManagedInstanceAdmissionError::ActiveSession => StatusCode::CONFLICT,
-        crate::state::ManagedInstanceAdmissionError::Owner(_) => StatusCode::SERVICE_UNAVAILABLE,
+        crate::state::ManagedInstanceAdmissionError::ForeignForegroundAuthority
+        | crate::state::ManagedInstanceAdmissionError::Owner(_) => StatusCode::SERVICE_UNAVAILABLE,
     };
     (
         status,

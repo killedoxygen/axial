@@ -226,7 +226,30 @@ struct PerformanceOperationInner {
     operations: HashMap<String, PerformanceOperationStatus>,
     active_by_instance: HashMap<String, String>,
     starting_by_instance: HashMap<String, String>,
+    reserved_operation_ids: HashSet<String>,
     pending_resume_ids: Vec<String>,
+}
+
+#[must_use]
+pub(crate) struct PerformanceOperationIdReservation {
+    operation_id: String,
+    inner: Arc<RwLock<PerformanceOperationInner>>,
+}
+
+impl PerformanceOperationIdReservation {
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+}
+
+impl Drop for PerformanceOperationIdReservation {
+    fn drop(&mut self) {
+        self.inner
+            .write()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .reserved_operation_ids
+            .remove(&self.operation_id);
+    }
 }
 
 #[derive(Default)]
@@ -389,16 +412,48 @@ impl PerformanceOperationStore {
         })
     }
 
+    pub(crate) fn reserve_operation_id(&self) -> PerformanceOperationIdReservation {
+        let operation_id = loop {
+            let candidate = generate_performance_operation_id();
+            let mut inner = self
+                .inner
+                .write()
+                .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
+            if inner.operations.contains_key(&candidate)
+                || inner
+                    .starting_by_instance
+                    .values()
+                    .any(|operation_id| operation_id == &candidate)
+                || !inner.reserved_operation_ids.insert(candidate.clone())
+            {
+                continue;
+            }
+            break candidate;
+        };
+        PerformanceOperationIdReservation {
+            operation_id,
+            inner: self.inner.clone(),
+        }
+    }
+
+    #[cfg(test)]
     pub async fn start(
         &self,
         instance_id: String,
         action: String,
         payload: PerformanceOperationPayload,
     ) -> Result<PerformanceOperationStatus, PerformanceOperationStartError> {
-        self.start_internal(instance_id, action, payload, None)
-            .await
+        self.start_internal(
+            self.reserve_operation_id(),
+            instance_id,
+            action,
+            payload,
+            None,
+        )
+        .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_with_identity(
         &self,
         instance_id: String,
@@ -406,24 +461,50 @@ impl PerformanceOperationStore {
         payload: PerformanceOperationPayload,
         journal_identity: PerformanceOperationJournalIdentity,
     ) -> Result<PerformanceOperationStatus, PerformanceOperationStartError> {
-        self.start_internal(instance_id, action, payload, Some(journal_identity))
-            .await
+        self.start_reserved_with_identity(
+            self.reserve_operation_id(),
+            instance_id,
+            action,
+            payload,
+            journal_identity,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_reserved_with_identity(
+        &self,
+        reservation: PerformanceOperationIdReservation,
+        instance_id: String,
+        action: String,
+        payload: PerformanceOperationPayload,
+        journal_identity: PerformanceOperationJournalIdentity,
+    ) -> Result<PerformanceOperationStatus, PerformanceOperationStartError> {
+        self.start_internal(
+            reservation,
+            instance_id,
+            action,
+            payload,
+            Some(journal_identity),
+        )
+        .await
     }
 
     async fn start_internal(
         &self,
+        reservation: PerformanceOperationIdReservation,
         instance_id: String,
         action: String,
         payload: PerformanceOperationPayload,
         journal_identity: Option<PerformanceOperationJournalIdentity>,
     ) -> Result<PerformanceOperationStatus, PerformanceOperationStartError> {
         let mutation = self.mutation_gate.clone().lock_owned().await;
+        let operation_id = reservation.operation_id().to_string();
         if journal_identity
             .as_ref()
             .is_some_and(|identity| !valid_journal_identity(identity, &action))
         {
             return Err(PerformanceOperationStartError::Store {
-                operation_id: String::new(),
+                operation_id,
                 source: PerformanceOperationStoreError::InvalidIdentity,
             });
         }
@@ -432,6 +513,14 @@ impl PerformanceOperationStore {
                 .inner
                 .read()
                 .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
+            if !inner.reserved_operation_ids.contains(&operation_id)
+                || inner.operations.contains_key(&operation_id)
+            {
+                return Err(PerformanceOperationStartError::Store {
+                    operation_id,
+                    source: PerformanceOperationStoreError::InvalidIdentity,
+                });
+            }
             if let Some(existing_id) = inner.active_by_instance.get(&instance_id)
                 && inner
                     .operations
@@ -444,11 +533,9 @@ impl PerformanceOperationStore {
             if inner.starting_by_instance.contains_key(&instance_id) {
                 return Err(PerformanceOperationStartError::Conflict);
             }
-
-            let id = generate_performance_operation_id();
             let now = timestamp_utc();
             PerformanceOperationStatus {
-                id: id.clone(),
+                id: operation_id,
                 instance_id: instance_id.clone(),
                 action,
                 payload,
@@ -508,6 +595,39 @@ impl PerformanceOperationStore {
             .filter_map(|id| inner.operations.get(&id).cloned())
             .filter(|status| is_non_terminal(&status.state))
             .collect()
+    }
+
+    pub(crate) fn has_pending_resumable_operations(&self) -> bool {
+        !self
+            .inner
+            .read()
+            .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+            .pending_resume_ids
+            .is_empty()
+    }
+
+    pub(crate) fn has_reconciliation_obligation(&self, operation_id: &str) -> bool {
+        if !is_safe_operation_id(operation_id) {
+            return false;
+        }
+        let in_memory = {
+            let inner = self
+                .inner
+                .read()
+                .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT);
+            inner.operations.contains_key(operation_id)
+                || inner
+                    .starting_by_instance
+                    .values()
+                    .any(|candidate| candidate == operation_id)
+                || inner.reserved_operation_ids.contains(operation_id)
+        };
+        in_memory
+            || self
+                .retry_candidates
+                .lock()
+                .expect(PERFORMANCE_OPERATION_LOCK_INVARIANT)
+                .contains_key(operation_id)
     }
 
     pub async fn get(&self, id: &str) -> Option<PerformanceOperationStatus> {

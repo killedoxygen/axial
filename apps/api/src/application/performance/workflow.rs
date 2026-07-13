@@ -12,17 +12,20 @@ use crate::state::contracts::RollbackState;
 #[cfg(test)]
 use axial_performance::{CompositionTier, InstallError, PerformanceMode};
 #[cfg(test)]
-use mutation::{PERFORMANCE_INSTALL_INTERNAL_ERROR, performance_install_error};
+use mutation::{
+    PERFORMANCE_INSTALL_INTERNAL_ERROR, execute_performance_operation, performance_install_error,
+};
 pub use mutation::{PerformanceRollbackListResponse, performance_rollback_list};
 
 pub(crate) use operations::spawn_pending_performance_operations;
 #[cfg(test)]
 use operations::{
     PERFORMANCE_JOURNAL_ERROR, PerformanceInstallAction, PerformanceOperationExecutionError,
-    begin_performance_operation_journal, performance_journal_is_terminal,
-    record_performance_effect_started, record_performance_terminal_intent,
-    retry_performance_status_correction, retry_performance_status_transition,
-    run_queued_performance_operation, stage_performance_installed_versions,
+    PerformanceWorkerIdentity, begin_performance_operation_journal,
+    performance_journal_is_terminal, record_performance_effect_started,
+    record_performance_terminal_intent, retry_performance_status_correction,
+    retry_performance_status_transition, run_queued_performance_operation,
+    stage_performance_installed_versions, supervise_performance_worker,
     terminalize_mismatched_performance_operation,
 };
 pub use operations::{

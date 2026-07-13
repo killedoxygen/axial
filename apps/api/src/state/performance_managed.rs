@@ -128,6 +128,10 @@ pub(crate) enum ManagedInstanceAdmissionError {
     InvalidInstanceIdentity,
     #[error("managed composition mutation is blocked while the instance is running")]
     ActiveSession,
+    #[error(
+        "managed composition admission requires foreground authority from this application state"
+    )]
+    ForeignForegroundAuthority,
     #[error("{0}")]
     Owner(#[from] ManagedCompositionAdmissionError),
 }

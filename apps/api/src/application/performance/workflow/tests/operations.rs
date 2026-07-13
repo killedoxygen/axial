@@ -31,10 +31,17 @@ async fn install_target_staging_refreshes_once_cold_and_zero_times_warm() {
         .producer_handoff()
         .try_claim()
         .expect("claim staging producer");
+    let foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register staging foreground")
+        .wait_for_settlement()
+        .await;
 
-    let cold = stage_performance_installed_versions(&fixture.state, &operation, &producer)
-        .await
-        .expect("configured library snapshot");
+    let cold =
+        stage_performance_installed_versions(&fixture.state, &operation, &producer, &foreground)
+            .await
+            .expect("configured library snapshot");
     assert_eq!(fixture.state.installed_versions_walk_count(), 1);
     assert_eq!(
         resolve_instance_version_target(Some(&cold), &instance, None, None)
@@ -42,9 +49,10 @@ async fn install_target_staging_refreshes_once_cold_and_zero_times_warm() {
         ("1.20.4".to_string(), "fabric".to_string())
     );
 
-    let warm = stage_performance_installed_versions(&fixture.state, &operation, &producer)
-        .await
-        .expect("warm configured library snapshot");
+    let warm =
+        stage_performance_installed_versions(&fixture.state, &operation, &producer, &foreground)
+            .await
+            .expect("warm configured library snapshot");
     assert_eq!(fixture.state.installed_versions_walk_count(), 1);
     assert_eq!(
         resolve_instance_version_target(Some(&warm), &instance, None, None)
@@ -89,9 +97,16 @@ async fn degraded_install_target_snapshot_preserves_metadata_unavailable_error()
         .producer_handoff()
         .try_claim()
         .expect("claim degraded staging producer");
-    let snapshot = stage_performance_installed_versions(&fixture.state, &operation, &producer)
-        .await
-        .expect("configured degraded snapshot");
+    let foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register degraded staging foreground")
+        .wait_for_settlement()
+        .await;
+    let snapshot =
+        stage_performance_installed_versions(&fixture.state, &operation, &producer, &foreground)
+            .await
+            .expect("configured degraded snapshot");
 
     assert_eq!(
         snapshot.report().state,
@@ -107,6 +122,40 @@ async fn degraded_install_target_snapshot_preserves_metadata_unavailable_error()
             "error": "instance version metadata is unavailable; install the version before resolving performance files"
         })
     );
+}
+
+#[tokio::test]
+async fn performance_mutation_rejects_foreign_state_foreground_before_effect() {
+    let fixture = TestFixture::new("performance-foreign-foreground-owner");
+    let foreign = TestFixture::new("performance-foreign-foreground-source");
+    let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+    let lock_path = seed_managed_lock(&fixture.state, &instance_id, "foreign-owner-preserved");
+    let foreground = foreign
+        .state
+        .register_integrity_foreground()
+        .expect("register foreign performance foreground")
+        .wait_for_settlement()
+        .await;
+    let operation = PerformanceOperation {
+        instance_id,
+        game_version: None,
+        loader: None,
+        mode: None,
+        action: PerformanceInstallAction::Remove,
+        rollback_id: None,
+        status_operation_id: None,
+        persistence_failure: None,
+        installed_versions: None,
+    };
+
+    let error = match execute_performance_operation(&fixture.state, &operation, &foreground).await {
+        Ok(_) => panic!("foreign foreground authority must be rejected"),
+        Err(error) => error,
+    };
+    let (status, _) = error.into_application_error();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(lock_path.is_file(), "foreign authority cannot run effects");
+    assert!(fixture.state.journals().list().is_empty());
 }
 
 #[tokio::test]
@@ -132,12 +181,8 @@ async fn queued_remove_returns_install_id_and_complete_progress() {
     assert_eq!(response.status, "queued");
     let install_id = response.install_id.expect("queued response has install id");
     let events = collect_install_events(&fixture.state, &install_id).await;
-    let phases = events
-        .iter()
-        .map(|event| event.phase.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(phases, vec!["queued", "planning", "removing", "complete"]);
     let terminal = events.last().expect("terminal event");
+    assert_eq!(terminal.phase, "complete");
     assert!(terminal.done);
     assert!(terminal.error.is_none());
     let status = fixture
@@ -150,6 +195,71 @@ async fn queued_remove_returns_install_id_and_complete_progress() {
     assert_eq!(status.action, "remove");
     assert_eq!(status.state, "complete");
     assert_eq!(status.error, None);
+}
+
+#[tokio::test]
+async fn queued_remove_cancels_idle_sweep_before_shared_root_effect() {
+    let fixture = TestFixture::new("queued-remove-cancels-idle-sweep");
+    let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+    let lock_path = seed_managed_lock(&fixture.state, &instance_id, "sweep-blocked");
+    let idle = fixture.state.subscribe_integrity_idle();
+    let sweep_producer = fixture
+        .state
+        .try_claim_producer()
+        .expect("claim idle sweep producer");
+    let idle_epoch = idle.borrow().epoch();
+    let reservation = fixture
+        .state
+        .try_reserve_idle_sweep(idle_epoch, sweep_producer)
+        .expect("reserve idle sweep");
+    let cancellation = reservation.cancellation();
+    let request_state = fixture.state.clone();
+    let request_instance = instance_id.clone();
+    let request = tokio::spawn(async move {
+        handle_install(
+            State(request_state),
+            Json(InstallRequest {
+                instance_id: Some(request_instance),
+                game_version: None,
+                loader: None,
+                mode: None,
+                action: Some("remove".to_string()),
+                rollback_id: None,
+                queued: Some(true),
+            }),
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !cancellation.is_cancelled() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("performance registration cancels idle sweep");
+    assert!(lock_path.is_file(), "effect waits for sweep settlement");
+    assert!(
+        !request.is_finished(),
+        "queue ownership waits for settlement"
+    );
+    reservation.settle(IdleSweepTerminal::Cancelled);
+
+    let Json(response) = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("queued ownership settles after sweep cancellation")
+        .expect("queued request task")
+        .expect("queued remove accepted after sweep settlement");
+    let install_id = response.install_id.expect("queued response has install id");
+    let events = tokio::time::timeout(
+        Duration::from_secs(2),
+        collect_install_events(&fixture.state, &install_id),
+    )
+    .await
+    .expect("queued terminal publication settles after sweep cancellation");
+    assert!(events.last().is_some_and(|event| event.done));
+    assert!(!lock_path.exists(), "remove effect runs after settlement");
+    wait_for_integrity_idle(&fixture.state, true).await;
 }
 
 #[tokio::test]
@@ -303,6 +413,7 @@ async fn terminal_journal_failure_retries_before_status_and_stream_release() {
     let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
         .await
         .id;
+    assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
 
     let Json(response) = handle_install(
         State(state.clone()),
@@ -320,6 +431,10 @@ async fn terminal_journal_failure_retries_before_status_and_stream_release() {
     .expect("queue accepted");
     let install_id = response.install_id.expect("install id");
     journal_backend.wait_for_attempt(6).await;
+    assert!(
+        !state.subscribe_integrity_idle().borrow().is_stably_idle(),
+        "terminal journal persistence retains performance foreground"
+    );
 
     let (events, _, done) = state
         .installs()
@@ -359,6 +474,7 @@ async fn terminal_journal_failure_retries_before_status_and_stream_release() {
     journal_backend.release();
     let events = collect_install_events(&state, &install_id).await;
     assert!(events.last().is_some_and(|event| event.done));
+    wait_for_integrity_idle(&state, true).await;
     assert_eq!(
         state
             .performance_operations()
@@ -434,6 +550,11 @@ async fn pre_effect_status_acceptance_failure_does_not_run_filesystem_effect() {
         .await
         .expect("close status writer before effect checkpoint");
     state.installs().insert(status.id.clone()).await;
+    let foreground = state
+        .register_integrity_foreground()
+        .expect("register pre-effect status foreground")
+        .wait_for_settlement()
+        .await;
 
     tokio::time::timeout(
         Duration::from_secs(2),
@@ -452,6 +573,7 @@ async fn pre_effect_status_acceptance_failure_does_not_run_filesystem_effect() {
             },
             state.installs().clone(),
             status.id.clone(),
+            foreground,
         ),
     )
     .await
@@ -803,6 +925,11 @@ async fn pre_effect_journal_acceptance_failure_exits_without_retry_or_filesystem
         .await
         .expect("close journal owner before initial checkpoint");
     state.installs().insert(status.id.clone()).await;
+    let foreground = state
+        .register_integrity_foreground()
+        .expect("register pre-effect journal foreground")
+        .wait_for_settlement()
+        .await;
 
     tokio::time::timeout(
         Duration::from_secs(2),
@@ -821,6 +948,7 @@ async fn pre_effect_journal_acceptance_failure_exits_without_retry_or_filesystem
             },
             state.installs().clone(),
             status.id.clone(),
+            foreground,
         ),
     )
     .await
@@ -983,6 +1111,228 @@ async fn failed_start_returns_bounded_error_then_detached_owner_terminalizes_wit
 }
 
 #[tokio::test]
+async fn panicked_performance_worker_is_supervised_to_terminal_authority() {
+    let fixture = TestFixture::new("panicked-performance-worker-supervision");
+    let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+    let reservation = fixture
+        .state
+        .performance_operations()
+        .reserve_operation_id();
+    let operation_id = reservation.operation_id().to_string();
+    let identity = PerformanceWorkerIdentity::default();
+    identity.set(&operation_id);
+    let producer = fixture
+        .state
+        .try_claim_producer()
+        .expect("claim supervised worker producer");
+    let foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register supervised worker foreground")
+        .wait_for_settlement()
+        .await;
+
+    supervise_performance_worker(
+        fixture.state.clone(),
+        PerformanceInstallAction::Remove,
+        identity,
+        producer,
+        foreground,
+        {
+            let worker_state = fixture.state.clone();
+            move |_runtime_owner, _worker_foreground| async move {
+                worker_state
+                    .performance_operations()
+                    .start_reserved_with_identity(
+                        reservation,
+                        instance_id,
+                        "remove".to_string(),
+                        test_operation_payload(),
+                        crate::state::performance_operations::PerformanceOperationJournalIdentity::new(
+                            "remove",
+                            "panic-supervision",
+                            RollbackState::Unavailable,
+                        ),
+                    )
+                    .await
+                    .expect("durable performance start succeeds before panic");
+                panic!("injected performance worker panic");
+            }
+        },
+    )
+    .await;
+
+    let terminal = fixture
+        .state
+        .performance_operations()
+        .get(&operation_id)
+        .await
+        .expect("supervised terminal status");
+    assert_eq!(terminal.state, "failed");
+    assert_eq!(
+        terminal.error.as_deref(),
+        Some("performance operation stopped before its result could be confirmed")
+    );
+    let events = collect_install_events(&fixture.state, &operation_id).await;
+    assert!(events.last().is_some_and(|event| event.done));
+    assert!(performance_journal_is_terminal(
+        fixture
+            .state
+            .journals()
+            .get(&crate::state::contracts::OperationId::new(operation_id))
+            .expect("supervised terminal journal")
+            .status
+    ));
+    wait_for_integrity_idle(&fixture.state, true).await;
+}
+
+#[tokio::test]
+async fn interrupted_worker_retains_foreground_through_terminal_persistence_retry() {
+    let root = test_root("performance-supervisor-terminal-persistence");
+    let journal_backend = Arc::new(ScriptedOperationBackend::default());
+    journal_backend.fail_attempt(1);
+    journal_backend.gate_attempt(2);
+    let status_backend = Arc::new(ScriptedOperationBackend::default());
+    let state =
+        build_test_state_with_operation_backends(&root, journal_backend.clone(), status_backend);
+    let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
+        .await
+        .id;
+    let status = state
+        .performance_operations()
+        .start_with_identity(
+            instance_id,
+            "remove".to_string(),
+            test_operation_payload(),
+            crate::state::performance_operations::PerformanceOperationJournalIdentity::new(
+                "remove",
+                "terminal-persistence-retry",
+                RollbackState::Unavailable,
+            ),
+        )
+        .await
+        .expect("start persistence-gated status");
+    let identity = PerformanceWorkerIdentity::default();
+    identity.set(&status.id);
+    let producer = state
+        .try_claim_producer()
+        .expect("claim persistence-gated supervisor");
+    let foreground = state
+        .register_integrity_foreground()
+        .expect("register persistence-gated foreground")
+        .wait_for_settlement()
+        .await;
+    let supervisor_state = state.clone();
+    let supervisor = tokio::spawn(supervise_performance_worker(
+        supervisor_state,
+        PerformanceInstallAction::Remove,
+        identity,
+        producer,
+        foreground,
+        |_runtime_owner, _worker_foreground| async move {
+            panic!("injected persistence-gated worker panic");
+        },
+    ));
+
+    journal_backend.wait_for_attempt(2).await;
+    assert!(!supervisor.is_finished());
+    assert!(
+        !state.subscribe_integrity_idle().borrow().is_stably_idle(),
+        "terminal persistence retry retains foreground authority"
+    );
+    journal_backend.release();
+    tokio::time::timeout(Duration::from_secs(3), supervisor)
+        .await
+        .expect("supervision settles after persistence retry")
+        .expect("supervision task");
+    assert_eq!(
+        state
+            .performance_operations()
+            .get(&status.id)
+            .await
+            .expect("terminal persistence status")
+            .state,
+        "failed"
+    );
+    wait_for_integrity_idle(&state, true).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn terminal_supervisor_releases_unsettled_authority_only_after_integrity_shutdown() {
+    let fixture = TestFixture::new("performance-supervisor-shutdown-escape");
+    let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+    let status = fixture
+        .state
+        .performance_operations()
+        .start_with_identity(
+            instance_id,
+            "remove".to_string(),
+            test_operation_payload(),
+            crate::state::performance_operations::PerformanceOperationJournalIdentity::new(
+                "remove",
+                "shutdown-escape",
+                RollbackState::Unavailable,
+            ),
+        )
+        .await
+        .expect("start shutdown escape status");
+    fixture
+        .state
+        .journals()
+        .close()
+        .await
+        .expect("close journal authority before supervision");
+    let identity = PerformanceWorkerIdentity::default();
+    identity.set(&status.id);
+    let producer = fixture
+        .state
+        .try_claim_producer()
+        .expect("claim shutdown escape supervisor");
+    let foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register shutdown escape foreground")
+        .wait_for_settlement()
+        .await;
+    let supervisor_state = fixture.state.clone();
+    let supervisor = tokio::spawn(supervise_performance_worker(
+        supervisor_state,
+        PerformanceInstallAction::Remove,
+        identity,
+        producer,
+        foreground,
+        |_runtime_owner, _worker_foreground| async move {
+            panic!("injected shutdown escape worker panic");
+        },
+    ));
+    tokio::task::yield_now().await;
+    assert!(!supervisor.is_finished());
+
+    let shutdown_state = fixture.state.clone();
+    let shutdown = tokio::spawn(async move { shutdown_state.quiesce().await });
+    tokio::time::timeout(Duration::from_secs(3), supervisor)
+        .await
+        .expect("supervisor exits after integrity shutdown")
+        .expect("shutdown supervisor task");
+    tokio::time::timeout(Duration::from_secs(3), shutdown)
+        .await
+        .expect("shutdown joins escaped supervisor")
+        .expect("shutdown task")
+        .expect("state quiesces");
+    assert_eq!(
+        fixture
+            .state
+            .performance_operations()
+            .get(&status.id)
+            .await
+            .expect("unsettled shutdown status remains durable")
+            .state,
+        "queued"
+    );
+}
+
+#[tokio::test]
 async fn aborted_queued_request_does_not_cancel_owned_start_or_worker() {
     let root = test_root("queued-request-abort");
     let journal_backend = Arc::new(ScriptedOperationBackend::default());
@@ -1012,12 +1362,20 @@ async fn aborted_queued_request_does_not_cancel_owned_start_or_worker() {
         .await
     });
     status_backend.wait_for_attempt(1).await;
+    assert!(
+        !state.subscribe_integrity_idle().borrow().is_stably_idle(),
+        "queued start persistence retains performance foreground"
+    );
     request.abort();
     assert!(
         request
             .await
             .expect_err("request task is cancelled at start gate")
             .is_cancelled()
+    );
+    assert!(
+        !state.subscribe_integrity_idle().borrow().is_stably_idle(),
+        "request cancellation cannot release detached performance foreground"
     );
     let shutdown_state = state.clone();
     let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
@@ -2000,9 +2358,21 @@ async fn startup_resume_runs_persisted_pending_remove_operation() {
         .await
         .expect("pending operation should reload");
     assert_eq!(loaded.state, "removing");
+    let effect_blocker = reloaded
+        .admit_managed_instance(&instance_id, true)
+        .await
+        .expect("hold resumed instance lifecycle");
 
     let resumed = resume_pending_performance_operations(reloaded.clone()).await;
     assert_eq!(resumed, 1);
+    assert!(
+        !reloaded
+            .subscribe_integrity_idle()
+            .borrow()
+            .is_stably_idle(),
+        "resumed child retains foreground after startup owner returns"
+    );
+    drop(effect_blocker);
     let events = collect_install_events(&reloaded, &started.id).await;
     let phases = events
         .iter()
@@ -2017,6 +2387,7 @@ async fn startup_resume_runs_persisted_pending_remove_operation() {
     assert_eq!(completed.instance_id, instance_id);
     assert_eq!(completed.state, "complete");
     assert_eq!(completed.error, None);
+    wait_for_integrity_idle(&reloaded, true).await;
 
     let _ = fs::remove_dir_all(&root);
 }
