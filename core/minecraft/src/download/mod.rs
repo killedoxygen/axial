@@ -25,7 +25,7 @@ pub use integrity::{
 pub(crate) use libraries::DownloadJob;
 pub(crate) use libraries::download_installer_libraries_with_authority_and_facts_and_descriptors;
 pub(crate) use libraries::{
-    LibraryArtifactPlan, download_profile_libraries_with_proofs_and_facts_and_descriptors,
+    LibraryArtifactPlan, download_profile_libraries_with_declarations_and_facts_and_descriptors,
     library_artifact_plans_for,
 };
 pub use libraries::{

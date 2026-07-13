@@ -9,19 +9,71 @@ use crate::loaders::types::{
     LoaderProviderFailureKind, LoaderVersionIndex,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ProfileInstallProof {
-    pub(crate) canonical_profile_id: String,
-    pub(crate) inherits_from: String,
-    pub(crate) client_main_class: String,
-    pub(crate) required_libraries: Vec<ProfileLibraryProof>,
+    canonical_profile_id: String,
+    inherits_from: String,
+    client_main_class: String,
+    required_libraries: Vec<ProfileLibraryProof>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ProfileLibraryProof {
-    pub(crate) coordinate: String,
-    pub(crate) sha1: Option<String>,
-    pub(crate) size: Option<u64>,
+    coordinate: String,
+    sha1: Option<String>,
+    size: Option<u64>,
+}
+
+impl ProfileInstallProof {
+    pub(crate) fn identity(&self) -> (&str, &str, &str) {
+        (
+            &self.canonical_profile_id,
+            &self.inherits_from,
+            &self.client_main_class,
+        )
+    }
+
+    pub(crate) fn required_libraries(&self) -> &[ProfileLibraryProof] {
+        &self.required_libraries
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test(
+        canonical_profile_id: String,
+        inherits_from: String,
+        client_main_class: String,
+        required_libraries: Vec<ProfileLibraryProof>,
+    ) -> Self {
+        Self {
+            canonical_profile_id,
+            inherits_from,
+            client_main_class,
+            required_libraries,
+        }
+    }
+}
+
+impl ProfileLibraryProof {
+    pub(crate) fn coordinate(&self) -> &str {
+        &self.coordinate
+    }
+
+    pub(crate) fn exact_integrity(&self) -> Option<(&str, u64)> {
+        self.sha1.as_deref().zip(self.size)
+    }
+
+    pub(crate) fn has_partial_integrity(&self) -> bool {
+        self.sha1.is_some() != self.size.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test(coordinate: String, sha1: Option<String>, size: Option<u64>) -> Self {
+        Self {
+            coordinate,
+            sha1,
+            size,
+        }
+    }
 }
 
 pub async fn fetch_supported_versions(

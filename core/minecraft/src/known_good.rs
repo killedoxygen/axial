@@ -6,9 +6,7 @@ use crate::download::{
     parse_asset_index,
 };
 use crate::known_good_libraries::{SealedExactLibraryDeclarations, SealedLibraryKind};
-use crate::launch::{
-    Library, VersionJson, effective_java_version_for, merge_libraries_prefer_first,
-};
+use crate::launch::{Library, VersionJson, effective_java_version_for};
 use crate::loaders::{
     LoaderBuildRecord, LoaderComponentId, LoaderInstallStrategy, VerifiedInstallerClientBytes,
     VerifiedInstallerReceiptSource, VerifiedProcessorOutputs, compose_loader_version,
@@ -129,148 +127,6 @@ pub struct KnownGoodInstallReceipt {
 
 pub(crate) struct VerifiedInstallerLibraryAuthority {
     entries: BTreeMap<ArtifactRelativePath, VerifiedInstallerLibraryFact>,
-}
-
-pub(crate) struct VerifiedProfileLibraryAuthority {
-    libraries: Vec<Library>,
-    entries: BTreeMap<ArtifactRelativePath, VerifiedProfileLibraryFact>,
-}
-
-struct VerifiedProfileLibraryFact {
-    size: u64,
-    sha1: [u8; 20],
-    is_native: bool,
-}
-
-pub(crate) fn seal_verified_profile_library_authority(
-    libraries: &[Library],
-    downloads: Vec<ExactLibraryDownloadProof>,
-) -> Result<VerifiedProfileLibraryAuthority, KnownGoodInventoryError> {
-    let environment = crate::rules::default_environment();
-    let plans = library_artifact_plans_for(libraries, &environment)
-        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-    let expected = plans
-        .into_iter()
-        .map(|plan| (plan.relative_path.clone(), plan))
-        .collect::<BTreeMap<_, _>>();
-    let mut entries = BTreeMap::new();
-    for download in downloads {
-        let (path, _is_native, _provider_url, _proof_expected, size, sha1) = download.into_parts();
-        let plan = expected
-            .get(&path)
-            .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
-        if entries
-            .insert(
-                path,
-                VerifiedProfileLibraryFact {
-                    size,
-                    sha1,
-                    is_native: plan.is_native,
-                },
-            )
-            .is_some()
-        {
-            return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
-        }
-    }
-    if entries.len() != expected.len() {
-        return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
-    }
-    for (path, plan) in &expected {
-        let proof = entries
-            .get(path)
-            .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
-        if proof.is_native != plan.is_native
-            || plan.expected.size.is_some_and(|size| proof.size != size)
-            || plan.expected.sha1.as_deref().is_some_and(|sha1| {
-                !Sha1Digest::from_metadata(sha1)
-                    .is_ok_and(|expected| expected == sha1_array_digest(&proof.sha1))
-            })
-        {
-            return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
-        }
-    }
-
-    let mut enriched = libraries.to_vec();
-    for library in &mut enriched {
-        let selected = library_artifact_plans_for(std::slice::from_ref(library), &environment)
-            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-        if selected.is_empty() {
-            continue;
-        }
-        for plan in &selected {
-            let proof = entries
-                .get(&plan.relative_path)
-                .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
-            author_profile_library_integrity(library, plan, proof)?;
-        }
-    }
-
-    let enriched_plans = library_artifact_plans_for(&enriched, &environment)
-        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-    if enriched_plans.len() != expected.len()
-        || enriched_plans.iter().any(|plan| {
-            let Some(proof) = entries.get(&plan.relative_path) else {
-                return true;
-            };
-            plan.is_native != proof.is_native
-                || plan.expected.size != Some(proof.size)
-                || plan.expected.sha1.as_deref().is_none_or(|sha1| {
-                    !Sha1Digest::from_metadata(sha1)
-                        .is_ok_and(|digest| digest == sha1_array_digest(&proof.sha1))
-                })
-        })
-    {
-        return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
-    }
-
-    Ok(VerifiedProfileLibraryAuthority {
-        libraries: enriched,
-        entries,
-    })
-}
-
-fn author_profile_library_integrity(
-    library: &mut Library,
-    plan: &LibraryArtifactPlan,
-    proof: &VerifiedProfileLibraryFact,
-) -> Result<(), KnownGoodInventoryError> {
-    let size = i64::try_from(proof.size).map_err(|_| KnownGoodInventoryError::InputTooLarge)?;
-    let digest = sha1_array_digest(&proof.sha1).as_str().to_string();
-    if !plan.is_native {
-        library.sha1.clone_from(&digest);
-        library.size = size;
-    }
-
-    if let Some(downloads) = library.downloads.as_mut() {
-        let mut matches = 0;
-        if let Some(artifact) = downloads.artifact.as_mut()
-            && ArtifactRelativePath::new(&artifact.path).as_ref() == Ok(&plan.relative_path)
-        {
-            artifact.sha1.clone_from(&digest);
-            artifact.size = size;
-            matches += 1;
-        }
-        for artifact in downloads.classifiers.values_mut() {
-            if ArtifactRelativePath::new(&artifact.path).as_ref() == Ok(&plan.relative_path) {
-                artifact.sha1.clone_from(&digest);
-                artifact.size = size;
-                matches += 1;
-            }
-        }
-        if matches != 1 {
-            return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
-        }
-    } else if plan.is_native {
-        return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
-    }
-    Ok(())
-}
-
-impl VerifiedProfileLibraryAuthority {
-    pub(crate) fn libraries(&self) -> &[Library] {
-        &self.libraries
-    }
 }
 
 struct VerifiedInstallerLibraryFact {
@@ -557,7 +413,7 @@ impl KnownGoodInstallReceipt {
         record: &LoaderBuildRecord,
         resolved_version: VersionJson,
         version_bytes: &[u8],
-        library_authority: VerifiedProfileLibraryAuthority,
+        library_declarations: SealedExactLibraryDeclarations,
     ) -> Result<Self, KnownGoodInventoryError> {
         if base.version_id.as_str() != record.minecraft_version
             || base.effective_version.id != record.minecraft_version
@@ -617,12 +473,17 @@ impl KnownGoodInstallReceipt {
         if resolved_version.libraries.len() > MAX_KNOWN_GOOD_ENTRIES {
             return Err(KnownGoodInventoryError::InputTooLarge);
         }
-        if resolved_version.libraries
-            != merge_libraries_prefer_first(
-                library_authority.libraries(),
-                &base.effective_version.libraries,
-            )
-        {
+        let (profile_fragment, sealed_environment) = library_declarations
+            .profile_contract()
+            .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
+        let recomposed = compose_loader_version(
+            &base.effective_version,
+            &record.minecraft_version,
+            &record.version_id,
+            profile_fragment,
+        )
+        .map_err(|_| KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
+        if sealed_environment != &base.environment || resolved_version != recomposed {
             return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
         }
         let libraries = library_artifact_plans_for(&resolved_version.libraries, &base.environment)
@@ -635,21 +496,27 @@ impl KnownGoodInstallReceipt {
             } else {
                 KnownGoodArtifactKind::Library
             };
-            let integrity = if let Some(proof) = library_authority.entries.get(&plan.relative_path)
+            let integrity = if let Some((sealed_kind, sealed_sha1, sealed_size)) =
+                library_declarations.get(&plan.relative_path)
             {
-                if proof.is_native != plan.is_native
-                    || plan.expected.size != Some(proof.size)
+                let expected_kind = if plan.is_native {
+                    SealedLibraryKind::Native
+                } else {
+                    SealedLibraryKind::Library
+                };
+                if sealed_kind != expected_kind
+                    || plan.expected.size != Some(sealed_size)
                     || plan.expected.sha1.as_deref().is_none_or(|sha1| {
                         !Sha1Digest::from_metadata(sha1)
-                            .is_ok_and(|digest| digest == sha1_array_digest(&proof.sha1))
+                            .is_ok_and(|digest| digest == sha1_array_digest(&sealed_sha1))
                     })
                 {
                     return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
                 }
                 used_proofs.insert(plan.relative_path.clone());
                 KnownGoodIntegrity::Sha1 {
-                    digest: sha1_array_digest(&proof.sha1),
-                    size: proof.size,
+                    digest: sha1_array_digest(&sealed_sha1),
+                    size: sealed_size,
                 }
             } else {
                 matching_base_library_integrity(base, &plan, &path, kind)?
@@ -661,7 +528,7 @@ impl KnownGoodInstallReceipt {
                 integrity,
             })?;
         }
-        if used_proofs.len() != library_authority.entries.len() {
+        if used_proofs.len() != library_declarations.len() {
             return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
         }
 
@@ -1116,7 +983,7 @@ fn add_sealed_libraries(
 ) -> Result<(), KnownGoodInventoryError> {
     let plans = library_artifact_plans_for(&version.libraries, environment)
         .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-    if !authority.matches_version(version) {
+    if !authority.matches_version(version, environment) {
         return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
     }
     if plans.len() != authority.len() {
@@ -1539,18 +1406,23 @@ impl InventoryBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::known_good_libraries::seal_vanilla_library_declarations_for_test;
+    use crate::known_good_libraries::{
+        LibraryAcquisition, seal_profile_exact_library_declarations,
+        seal_vanilla_library_declarations_for_test,
+    };
     use crate::launch::{
         ArgumentsSection, AssetIndex, Downloads, JavaVersion, LibraryArtifact, LibraryDownload,
         LoggingConf, LoggingEntry, LoggingFile,
     };
+    use crate::loaders::providers::{ProfileInstallProof, ProfileLibraryProof};
     use crate::loaders::types::LoaderBuildSubjectKind;
     use crate::loaders::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderInstallSource, LoaderInstallability,
-        build_id_for, installed_version_id_for,
+        LoaderProfileFragment, build_id_for, installed_version_id_for,
     };
     use crate::rules::Rule;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     struct InstallerReceiptFixture {
         base: KnownGoodInstallReceipt,
@@ -1570,7 +1442,7 @@ mod tests {
     }
 
     fn installer_receipt_fixture(base_client_bytes: &[u8]) -> InstallerReceiptFixture {
-        let record = loader_record(FixtureShape::Forge, LoaderComponentId::Forge);
+        let record = loader_record(LoaderComponentId::Forge);
         let embedded_bytes = b"authenticated embedded library".to_vec();
         let terminal_bytes = b"authenticated terminal processor output".to_vec();
         let processor_bytes = b"authenticated processor-only library".to_vec();
@@ -1624,7 +1496,7 @@ mod tests {
         )
         .expect("sealed library authority");
 
-        let mut base_version = fixture(FixtureShape::Vanilla, false).version;
+        let mut base_version = fixture(false).version;
         base_version.id = record.minecraft_version.clone();
         base_version.libraries.clear();
         let client = base_version
@@ -1927,390 +1799,260 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn profile_library_sealer_is_exact_and_authors_both_metadata_locations() {
-        let path = "org/example/profile/1/profile-1.jar";
-        let library = Library {
-            name: "org.example:profile:1".to_string(),
-            downloads: Some(LibraryDownload {
-                artifact: Some(LibraryArtifact {
-                    path: path.to_string(),
-                    url: "https://example.invalid/profile.jar".to_string(),
-                    ..LibraryArtifact::default()
-                }),
-                classifiers: HashMap::new(),
-            }),
-            ..Library::default()
-        };
-        let proof = || {
-            ExactLibraryDownloadProof::new_for_test(
-                ArtifactRelativePath::new(path).expect("profile path"),
-                23,
-                [0xbb; 20],
-            )
-        };
-
-        assert_eq!(
-            seal_verified_profile_library_authority(std::slice::from_ref(&library), Vec::new())
-                .err()
-                .expect("missing proof"),
-            KnownGoodInventoryError::ProfileLibraryProofMismatch
-        );
-        assert_eq!(
-            seal_verified_profile_library_authority(
-                std::slice::from_ref(&library),
-                vec![proof(), proof()],
-            )
-            .err()
-            .expect("duplicate proof"),
-            KnownGoodInventoryError::ProfileLibraryProofMismatch
-        );
-        assert_eq!(
-            seal_verified_profile_library_authority(
-                std::slice::from_ref(&library),
-                vec![ExactLibraryDownloadProof::new_for_test(
-                    ArtifactRelativePath::new("org/example/extra/1/extra-1.jar")
-                        .expect("extra path"),
-                    23,
-                    [0xbb; 20],
-                )],
-            )
-            .err()
-            .expect("extra proof"),
-            KnownGoodInventoryError::ProfileLibraryProofMismatch
-        );
-
-        let authority = seal_verified_profile_library_authority(&[library], vec![proof()])
-            .expect("sealed profile proof");
-        let enriched = &authority.libraries()[0];
-        assert_eq!(enriched.sha1, SHA_B);
-        assert_eq!(enriched.size, 23);
-        let artifact = enriched
-            .downloads
-            .as_ref()
-            .and_then(|downloads| downloads.artifact.as_ref())
-            .expect("download artifact");
-        assert_eq!(artifact.sha1, SHA_B);
-        assert_eq!(artifact.size, 23);
-
-        let mut declared = enriched.clone();
-        assert_eq!(
-            seal_verified_profile_library_authority(
-                std::slice::from_ref(&declared),
-                vec![ExactLibraryDownloadProof::new_for_test(
-                    ArtifactRelativePath::new(path).expect("profile path"),
-                    24,
-                    [0xbb; 20],
-                )],
-            )
-            .err()
-            .expect("declared size drift"),
-            KnownGoodInventoryError::ProfileLibraryProofMismatch
-        );
-        assert_eq!(
-            seal_verified_profile_library_authority(
-                std::slice::from_ref(&declared),
-                vec![ExactLibraryDownloadProof::new_for_test(
-                    ArtifactRelativePath::new(path).expect("profile path"),
-                    23,
-                    [0xaa; 20],
-                )],
-            )
-            .err()
-            .expect("declared digest drift"),
-            KnownGoodInventoryError::ProfileLibraryProofMismatch
-        );
-        declared
-            .downloads
-            .as_mut()
-            .and_then(|downloads| downloads.artifact.as_mut())
-            .expect("download artifact")
-            .sha1 = SHA_A.to_string();
-        assert_eq!(
-            seal_verified_profile_library_authority(&[declared], vec![proof()])
-                .err()
-                .expect("conflicting nested metadata"),
-            KnownGoodInventoryError::InvalidLibraryPlan
-        );
-
-        let mut disallowed = enriched.clone();
-        disallowed.rules = vec![Rule {
-            action: "disallow".to_string(),
-            os: None,
-            features: None,
-        }];
-        assert_eq!(
-            seal_verified_profile_library_authority(&[disallowed], vec![proof()])
-                .err()
-                .expect("current environment drift"),
-            KnownGoodInventoryError::ProfileLibraryProofMismatch
-        );
-    }
-
-    #[test]
-    fn profile_library_sealer_authors_primary_and_native_contracts_independently() {
-        let environment = crate::rules::default_environment();
-        let classifier = crate::rules::native_classifier_key();
-        let primary_path = "org/example/dual/1/dual-1.jar";
-        let native_path = format!("org/example/dual/1/dual-1-{classifier}.jar");
-        let library = Library {
-            name: "org.example:dual:1".to_string(),
-            downloads: Some(LibraryDownload {
-                artifact: Some(LibraryArtifact {
-                    path: primary_path.to_string(),
-                    url: "https://example.invalid/dual.jar".to_string(),
-                    ..LibraryArtifact::default()
-                }),
-                classifiers: HashMap::from([(
-                    classifier.clone(),
-                    LibraryArtifact {
-                        path: native_path.clone(),
-                        url: "https://example.invalid/dual-native.jar".to_string(),
-                        ..LibraryArtifact::default()
+    fn profile_receipt_fixture() -> (
+        KnownGoodInstallReceipt,
+        LoaderBuildRecord,
+        SealedExactLibraryDeclarations,
+        VersionJson,
+        Vec<u8>,
+    ) {
+        let record = loader_record(LoaderComponentId::Fabric);
+        let mut base_version = fixture(false).version;
+        base_version.id = record.minecraft_version.clone();
+        base_version.inherits_from.clear();
+        base_version.materialized = false;
+        base_version.libraries = vec![
+            checksum_library(
+                "org.ow2.asm:asm:9.6",
+                "org/ow2/asm/asm/9.6/asm-9.6.jar",
+                SHA_A,
+                10,
+            ),
+            checksum_library(
+                "com.mojang:inherited:1",
+                "com/mojang/inherited/1/inherited-1.jar",
+                SHA_B,
+                11,
+            ),
+        ];
+        let mut inventory = InventoryBuilder::default();
+        for entry in test_base_client_inventory(&base_version).entries {
+            inventory.insert(entry).expect("base client");
+        }
+        for (path, digest, size) in [
+            ("org/ow2/asm/asm/9.6/asm-9.6.jar", SHA_A, 10),
+            ("com/mojang/inherited/1/inherited-1.jar", SHA_B, 11),
+        ] {
+            inventory
+                .insert(KnownGoodEntry {
+                    root: KnownGoodRoot::Libraries,
+                    path: KnownGoodRelativePath::new(path).expect("base library path"),
+                    kind: KnownGoodArtifactKind::Library,
+                    integrity: KnownGoodIntegrity::Sha1 {
+                        digest: Sha1Digest::from_metadata(digest).expect("base digest"),
+                        size,
                     },
-                )]),
-            }),
-            natives: HashMap::from([(environment.os_name, classifier.clone())]),
-            ..Library::default()
+                })
+                .expect("base library");
+        }
+        let base = KnownGoodInstallReceipt {
+            version_id: KnownGoodId::new(&record.minecraft_version).expect("base id"),
+            inventory: inventory.finish(),
+            effective_version: base_version.clone(),
+            environment: crate::rules::default_environment(),
         };
-        let authority = seal_verified_profile_library_authority(
-            &[library],
-            vec![
-                ExactLibraryDownloadProof::new_for_test(
-                    ArtifactRelativePath::new(primary_path).expect("primary path"),
-                    31,
-                    [0xaa; 20],
-                ),
-                ExactLibraryDownloadProof::new_for_test(
-                    ArtifactRelativePath::new(&native_path).expect("native path"),
-                    47,
-                    [0xcc; 20],
-                ),
-            ],
+        let profile_libraries = vec![
+            checksum_library(
+                "org.ow2.asm:asm:9.9",
+                "org/ow2/asm/asm/9.9/asm-9.9.jar",
+                SHA_C,
+                91,
+            ),
+            checksum_library(
+                "example:profile:1",
+                "example/profile/1/profile-1.jar",
+                SHA_C,
+                92,
+            ),
+        ];
+        let proof = ProfileInstallProof::from_test(
+            format!(
+                "fabric-loader-{}-{}",
+                record.loader_version, record.minecraft_version
+            ),
+            record.minecraft_version.clone(),
+            "example.ProfileMain".to_string(),
+            vec![ProfileLibraryProof::from_test(
+                "org.ow2.asm:asm:9.9".to_string(),
+                None,
+                None,
+            )],
+        );
+        let profile_fragment = LoaderProfileFragment {
+            id: format!(
+                "fabric-loader-{}-{}",
+                record.loader_version, record.minecraft_version
+            ),
+            inherits_from: record.minecraft_version.clone(),
+            kind: "release".to_string(),
+            main_class: "example.ProfileMain".to_string(),
+            libraries: profile_libraries,
+            ..LoaderProfileFragment::default()
+        };
+        let pending = seal_profile_exact_library_declarations(
+            profile_fragment,
+            proof,
+            LoaderComponentId::Fabric,
+            &base.environment,
         )
-        .expect("primary and native authority");
-        let enriched = &authority.libraries()[0];
-        assert_eq!(enriched.sha1, SHA_A);
-        assert_eq!(enriched.size, 31);
-        let downloads = enriched.downloads.as_ref().expect("downloads");
-        let primary = downloads.artifact.as_ref().expect("primary artifact");
-        assert_eq!(primary.sha1, SHA_A);
-        assert_eq!(primary.size, 31);
-        let native = downloads
-            .classifiers
-            .get(&classifier)
-            .expect("native artifact");
-        assert_eq!(native.sha1, SHA_C);
-        assert_eq!(native.size, 47);
+        .expect("profile declarations");
+        let root = PathBuf::from("/managed/libraries");
+        let (libraries, environment) = pending.profile_plan_inputs().expect("profile plan inputs");
+        let jobs = library_artifact_plans_for(libraries, environment)
+            .expect("profile plans")
+            .into_iter()
+            .map(|plan| crate::download::DownloadJob {
+                relative_path: plan.relative_path.clone(),
+                path: plan.relative_path.join_under(&root),
+                url: plan.source_url.expect("profile URL"),
+                name: plan.name,
+                expected: plan.expected,
+                is_native: plan.is_native,
+            })
+            .collect();
+        let (pending, classified) = pending
+            .classify_jobs(&root, jobs)
+            .expect("classified profile plans");
+        let streamed = classified
+            .into_iter()
+            .enumerate()
+            .map(|(index, classified)| {
+                assert_eq!(classified.acquisition, LibraryAcquisition::FreshStream);
+                let job = classified.job;
+                ExactLibraryDownloadProof::new_bound_for_test(
+                    job.relative_path,
+                    job.is_native,
+                    job.url,
+                    job.expected,
+                    20 + index as u64,
+                    [0xc0 + index as u8; 20],
+                )
+            })
+            .collect();
+        let declarations = pending
+            .seal_streamed(streamed)
+            .expect("sealed profile declarations");
+        let authored = declarations.profile_contract().unwrap().0;
+        let resolved = compose_loader_version(
+            &base_version,
+            &record.minecraft_version,
+            &record.version_id,
+            authored,
+        )
+        .expect("profile composition");
+        let version_bytes = serde_json::to_vec_pretty(&resolved).expect("profile version bytes");
+        (base, record, declarations, resolved, version_bytes)
     }
 
     #[test]
-    fn fabric_and_quilt_profile_receipts_bind_authored_checksumless_proofs() {
-        for shape in [FixtureShape::Fabric, FixtureShape::Quilt] {
-            let fixture = fixture(shape, false);
-            let record = fixture.loader_record.as_ref().expect("loader record");
-            let coordinate = format!("org.example:{}-proof:1", record.component_id.as_str());
-            let path = format!(
-                "org/example/{0}-proof/1/{0}-proof-1.jar",
-                record.component_id.as_str()
-            );
-            let library = Library {
-                name: coordinate,
-                downloads: Some(LibraryDownload {
-                    artifact: Some(LibraryArtifact {
-                        path: path.clone(),
-                        url: "https://example.invalid/profile.jar".to_string(),
-                        ..LibraryArtifact::default()
-                    }),
-                    classifiers: HashMap::new(),
-                }),
-                ..Library::default()
-            };
-            let authority = seal_verified_profile_library_authority(
-                &[library],
-                vec![ExactLibraryDownloadProof::new_for_test(
-                    ArtifactRelativePath::new(&path).expect("profile path"),
-                    53,
-                    [0xcc; 20],
-                )],
-            )
-            .expect("profile authority");
-            let authored = authority.libraries()[0].clone();
-            assert_eq!(authored.sha1, SHA_C);
-            assert_eq!(authored.size, 53);
-            let artifact = authored
-                .downloads
-                .as_ref()
-                .and_then(|downloads| downloads.artifact.as_ref())
-                .expect("authored artifact");
-            assert_eq!(artifact.sha1, SHA_C);
-            assert_eq!(artifact.size, 53);
+    fn profile_receipt_binds_authored_recombination_and_exact_base_shadowing() {
+        let (base, record, declarations, resolved, version_bytes) = profile_receipt_fixture();
+        let inventory = KnownGoodInstallReceipt::from_verified_profile_source(
+            &base,
+            &record,
+            resolved,
+            &version_bytes,
+            declarations,
+        )
+        .expect("profile receipt")
+        .into_inventory();
+        assert_eq!(
+            inventory
+                .entries()
+                .iter()
+                .filter(|entry| entry.path().as_str() == "com/mojang/inherited/1/inherited-1.jar")
+                .count(),
+            1
+        );
+        assert!(
+            inventory
+                .entries()
+                .iter()
+                .any(|entry| entry.path().as_str() == "org/ow2/asm/asm/9.9/asm-9.9.jar")
+        );
+        assert!(
+            inventory
+                .entries()
+                .iter()
+                .all(|entry| entry.path().as_str() != "org/ow2/asm/asm/9.6/asm-9.6.jar")
+        );
 
-            let mut base_version = fixture.version.clone();
-            base_version.id = record.minecraft_version.clone();
-            base_version.inherits_from.clear();
-            base_version.materialized = false;
-            base_version.libraries.clear();
-            let base = KnownGoodInstallReceipt {
-                version_id: KnownGoodId::new(&record.minecraft_version).expect("base id"),
-                inventory: test_base_client_inventory(&base_version),
-                effective_version: base_version.clone(),
-                environment: fixture.environment.clone(),
-            };
-            let mut child = base_version;
-            child.id = record.version_id.clone();
-            child.inherits_from = record.minecraft_version.clone();
-            child.materialized = true;
-            child.libraries = vec![authored];
-            let version_bytes = serde_json::to_vec_pretty(&child).expect("written version");
-            let written: VersionJson =
-                serde_json::from_slice(&version_bytes).expect("parse written version");
-            let written_artifact = written.libraries[0]
-                .downloads
-                .as_ref()
-                .and_then(|downloads| downloads.artifact.as_ref())
-                .expect("written artifact");
-            assert_eq!(written.libraries[0].sha1, SHA_C);
-            assert_eq!(written.libraries[0].size, 53);
-            assert_eq!(written_artifact.sha1, SHA_C);
-            assert_eq!(written_artifact.size, 53);
-            let receipt = KnownGoodInstallReceipt::from_verified_profile_source(
-                &base,
-                record,
-                child,
-                &version_bytes,
-                authority,
-            )
-            .expect("profile receipt");
-            assert!(receipt.inventory.entries().iter().any(|entry| {
-                entry.path().as_str() == path
-                    && entry.integrity()
-                        == &KnownGoodIntegrity::Sha1 {
-                            digest: Sha1Digest::from_metadata(SHA_C).expect("digest"),
-                            size: 53,
-                        }
-            }));
+        for mutation in 0..11 {
+            let (mut base, record, declarations, mut resolved, _) = profile_receipt_fixture();
+            match mutation {
+                0 => resolved.libraries.push(checksum_library(
+                    "example:added:1",
+                    "example/added/1/added-1.jar",
+                    SHA_A,
+                    1,
+                )),
+                1 => {
+                    resolved.libraries.remove(0);
+                }
+                2 => resolved.libraries.reverse(),
+                3 => {
+                    resolved.libraries[0].rules = vec![Rule {
+                        action: "allow".to_string(),
+                        os: None,
+                        features: None,
+                    }];
+                }
+                4 => {
+                    resolved.libraries[0]
+                        .downloads
+                        .as_mut()
+                        .and_then(|downloads| downloads.artifact.as_mut())
+                        .unwrap()
+                        .path = "org/ow2/asm/asm/9.9/other.jar".to_string();
+                }
+                5 => {
+                    let classifier = crate::rules::native_classifier_key();
+                    resolved.libraries[0]
+                        .natives
+                        .insert(base.environment.os_name.clone(), classifier.clone());
+                    resolved.libraries[0]
+                        .downloads
+                        .as_mut()
+                        .unwrap()
+                        .classifiers
+                        .insert(
+                            classifier,
+                            LibraryArtifact {
+                                path: "org/ow2/asm/asm/9.9/native.jar".to_string(),
+                                sha1: SHA_A.to_string(),
+                                size: 1,
+                                url: "https://example.invalid/native".to_string(),
+                            },
+                        );
+                }
+                6 => {
+                    resolved.libraries[0].sha1 = SHA_A.to_string();
+                    resolved.libraries[0].size += 1;
+                }
+                7 => base.environment.os_name = "different-os".to_string(),
+                8 => resolved.main_class = "different.Main".to_string(),
+                9 => resolved.kind = "snapshot".to_string(),
+                10 => resolved.minecraft_arguments = "--different".to_string(),
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec_pretty(&resolved).expect("mutated profile bytes");
+            assert_eq!(
+                KnownGoodInstallReceipt::from_verified_profile_source(
+                    &base,
+                    &record,
+                    resolved,
+                    &bytes,
+                    declarations,
+                ),
+                Err(KnownGoodInventoryError::ProfileLibraryProofMismatch),
+                "mutation {mutation} must fail"
+            );
         }
     }
 
     #[test]
-    fn profile_receipt_rejects_checksumless_inherited_base_library() {
-        let fixture = fixture(FixtureShape::Fabric, false);
-        let record = fixture.loader_record.as_ref().expect("loader record");
-        let profile = Library {
-            name: "org.example:profile-proof:1".to_string(),
-            url: "https://example.invalid/maven/".to_string(),
-            ..Library::default()
-        };
-        let authority = seal_verified_profile_library_authority(
-            std::slice::from_ref(&profile),
-            vec![ExactLibraryDownloadProof::new_for_test(
-                ArtifactRelativePath::new("org/example/profile-proof/1/profile-proof-1.jar")
-                    .expect("profile path"),
-                17,
-                [0xaa; 20],
-            )],
-        )
-        .expect("profile authority");
-        let mut base_version = fixture.version.clone();
-        base_version.id = record.minecraft_version.clone();
-        base_version.inherits_from.clear();
-        base_version.materialized = false;
-        base_version.libraries = vec![Library {
-            name: "org.example:unproved-base:1".to_string(),
-            url: "https://example.invalid/maven/".to_string(),
-            ..Library::default()
-        }];
-        let base = KnownGoodInstallReceipt {
-            version_id: KnownGoodId::new(&record.minecraft_version).expect("base id"),
-            inventory: test_base_client_inventory(&base_version),
-            effective_version: base_version.clone(),
-            environment: fixture.environment,
-        };
-        let mut child = base_version;
-        child.id = record.version_id.clone();
-        child.inherits_from = record.minecraft_version.clone();
-        child.materialized = true;
-        child.libraries =
-            merge_libraries_prefer_first(authority.libraries(), &base.effective_version.libraries);
-        let version_bytes = serde_json::to_vec_pretty(&child).expect("version bytes");
-        assert_eq!(
-            KnownGoodInstallReceipt::from_verified_profile_source(
-                &base,
-                record,
-                child,
-                &version_bytes,
-                authority,
-            ),
-            Err(KnownGoodInventoryError::MissingChecksum)
-        );
-    }
-
-    #[test]
-    fn profile_receipt_inventory_keeps_only_the_final_shadowing_library() {
-        let fixture = fixture(FixtureShape::Fabric, false);
-        let record = fixture.loader_record.as_ref().expect("loader record");
-        let profile_library = Library {
-            name: "org.ow2.asm:asm:9.9".to_string(),
-            url: "https://example.invalid/maven/".to_string(),
-            size: 12,
-            ..Library::default()
-        };
-        let authority = seal_verified_profile_library_authority(
-            std::slice::from_ref(&profile_library),
-            vec![ExactLibraryDownloadProof::new_for_test(
-                ArtifactRelativePath::new("org/ow2/asm/asm/9.9/asm-9.9.jar").expect("profile path"),
-                12,
-                [0xaa; 20],
-            )],
-        )
-        .expect("profile authority");
-        let mut child = fixture.version.clone();
-        child.inherits_from = record.minecraft_version.clone();
-        child.materialized = true;
-        child.libraries = authority.libraries().to_vec();
-        let mut base_version = child.clone();
-        base_version.id = record.minecraft_version.clone();
-        base_version.inherits_from.clear();
-        base_version.materialized = false;
-        base_version.libraries = vec![checksum_library(
-            "org.ow2.asm:asm:9.6",
-            "org/ow2/asm/asm/9.6/asm-9.6.jar",
-            SHA_A,
-            10,
-        )];
-        let base = KnownGoodInstallReceipt {
-            version_id: KnownGoodId::new(&record.minecraft_version).expect("base id"),
-            inventory: test_base_client_inventory(&base_version),
-            effective_version: base_version,
-            environment: fixture.environment.clone(),
-        };
-        let version_bytes = serde_json::to_vec_pretty(&child).expect("version bytes");
-        let receipt = KnownGoodInstallReceipt::from_verified_profile_source(
-            &base,
-            record,
-            child,
-            &version_bytes,
-            authority,
-        )
-        .expect("profile receipt");
-        let inventory = receipt.into_inventory();
-
-        assert!(inventory.entries().iter().any(|entry| {
-            entry.path().as_str() == "org/ow2/asm/asm/9.9/asm-9.9.jar"
-                && matches!(entry.integrity(), KnownGoodIntegrity::Sha1 { size: 12, .. })
-        }));
-        assert!(
-            !inventory
-                .entries()
-                .iter()
-                .any(|entry| entry.path().as_str().contains("/asm/9.6/"))
-        );
-    }
-
-    #[test]
     fn legacy_archive_receipt_is_derived_from_exact_child_sources_and_base_authority() {
-        let fixture = fixture(FixtureShape::Vanilla, false);
+        let fixture = fixture(false);
         let mut record = LoaderBuildRecord {
             subject_kind: LoaderBuildSubjectKind::LoaderBuild,
             component_id: LoaderComponentId::Forge,
@@ -2405,7 +2147,7 @@ mod tests {
 
     #[test]
     fn authenticated_base_receipt_rejects_corrupt_client_bytes() {
-        let fixture = fixture(FixtureShape::Vanilla, false);
+        let fixture = fixture(false);
         let base = KnownGoodInstallReceipt {
             version_id: KnownGoodId::new(&fixture.version.id).expect("base id"),
             inventory: InventoryBuilder::default().finish(),
@@ -2425,7 +2167,7 @@ mod tests {
 
     #[test]
     fn vanilla_fixture_derives_producer_declared_inventory() {
-        let fixture = fixture(FixtureShape::Vanilla, false);
+        let fixture = fixture(false);
         let inventory = derive_known_good_inventory(fixture.input()).expect("vanilla inventory");
 
         assert_entry(
@@ -2497,7 +2239,7 @@ mod tests {
 
     #[test]
     fn vanilla_library_without_declared_size_uses_same_hash_observation() {
-        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let mut fixture = fixture(false);
         let library = fixture
             .version
             .libraries
@@ -2543,7 +2285,7 @@ mod tests {
 
     #[test]
     fn vanilla_client_declared_and_observed_size_drift_fails_closed() {
-        let fixture = fixture(FixtureShape::Vanilla, false);
+        let fixture = fixture(false);
         let mut input = fixture.input();
         input.client_size = 39;
         assert_eq!(
@@ -2554,7 +2296,7 @@ mod tests {
 
     #[test]
     fn vanilla_authority_rejects_same_path_contract_and_rule_shadowing() {
-        let fixture = fixture(FixtureShape::Vanilla, false);
+        let fixture = fixture(false);
         let mut variants = Vec::new();
 
         let mut digest = fixture.version.clone();
@@ -2657,8 +2399,8 @@ mod tests {
 
     #[test]
     fn shuffled_metadata_derives_identical_sorted_inventory() {
-        let mut left = fixture(FixtureShape::Vanilla, false);
-        let mut right = fixture(FixtureShape::Vanilla, true);
+        let mut left = fixture(false);
+        let mut right = fixture(true);
         let extra = checksum_library(
             "com.mojang:also-strict:1.0",
             "com/mojang/also-strict/1.0/also-strict-1.0.jar",
@@ -2710,7 +2452,7 @@ mod tests {
 
     #[test]
     fn runtime_inventory_uses_raw_integrity_not_lzma_transport_integrity() {
-        let fixture = fixture(FixtureShape::Vanilla, false);
+        let fixture = fixture(false);
         let inventory = derive_known_good_inventory(fixture.input()).unwrap();
         let runtime = inventory
             .entries()
@@ -2726,7 +2468,7 @@ mod tests {
 
     #[test]
     fn runtime_path_tree_allows_directory_ancestor() {
-        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let mut fixture = fixture(false);
         fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
             runtime_directory_entry("bin"),
             runtime_file_entry("bin/java"),
@@ -2746,7 +2488,7 @@ mod tests {
 
     #[test]
     fn runtime_path_tree_rejects_file_ancestor() {
-        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let mut fixture = fixture(false);
         fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
             runtime_file_entry("bin"),
             runtime_file_entry("bin/java"),
@@ -2758,7 +2500,7 @@ mod tests {
 
     #[test]
     fn runtime_path_tree_rejects_link_ancestor() {
-        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let mut fixture = fixture(false);
         fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
             runtime_link_entry("bin", "java"),
             runtime_file_entry("bin/java"),
@@ -2770,7 +2512,7 @@ mod tests {
 
     #[test]
     fn runtime_path_tree_rejects_incompatible_exact_path() {
-        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let mut fixture = fixture(false);
         fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[runtime_file_entry(
             ".axial-ready",
         )]));
@@ -2781,7 +2523,7 @@ mod tests {
 
     #[test]
     fn asset_objects_deduplicate_by_content_address() {
-        let fixture = fixture(FixtureShape::Vanilla, false);
+        let fixture = fixture(false);
         let inventory = derive_known_good_inventory(fixture.input()).unwrap();
         let objects = inventory
             .entries()
@@ -2794,7 +2536,7 @@ mod tests {
 
     #[test]
     fn vanilla_missing_library_checksum_uses_fresh_streamed_identity() {
-        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let mut fixture = fixture(false);
         fixture
             .version
             .libraries
@@ -2819,7 +2561,7 @@ mod tests {
 
     #[test]
     fn vanilla_version_identity_mismatch_fails_closed() {
-        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let mut fixture = fixture(false);
         fixture.version_manifest.id = "different-version".to_string();
 
         let error = derive_known_good_inventory(fixture.input()).expect_err("version mismatch");
@@ -2828,7 +2570,7 @@ mod tests {
 
     #[test]
     fn vanilla_receipt_rejects_recombined_same_plan_version_metadata() {
-        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let mut fixture = fixture(false);
         let version_bytes = serde_json::to_vec(&fixture.version).expect("version bytes");
         fixture.version_manifest.sha1 = sha1_digest(&version_bytes).as_str().to_string();
         fixture.version_metadata_size = version_bytes.len() as u64;
@@ -2852,7 +2594,7 @@ mod tests {
 
     #[test]
     fn runtime_component_identity_mismatch_fails_closed() {
-        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let mut fixture = fixture(false);
         fixture.runtime_id = RuntimeId::from("java-runtime-gamma");
 
         let error = derive_known_good_inventory(fixture.input()).expect_err("runtime mismatch");
@@ -2861,7 +2603,7 @@ mod tests {
 
     #[test]
     fn unsafe_library_plan_maps_to_closed_inventory_error() {
-        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let mut fixture = fixture(false);
         fixture.version.libraries.push(checksum_library(
             "net.example:unsafe:1.0",
             "../outside.jar",
@@ -2875,7 +2617,7 @@ mod tests {
 
     #[test]
     fn conflicting_library_plan_maps_to_closed_inventory_error() {
-        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let mut fixture = fixture(false);
         fixture.version.libraries.push(checksum_library(
             "net.example:conflict:1.0",
             "com/mojang/strict/1.0/strict-1.0.jar",
@@ -2889,8 +2631,8 @@ mod tests {
 
     #[test]
     fn runtime_manifest_proof_is_canonical_across_provider_object_order() {
-        let left = fixture(FixtureShape::Vanilla, false);
-        let right = fixture(FixtureShape::Vanilla, true);
+        let left = fixture(false);
+        let right = fixture(true);
         let left = derive_known_good_inventory(left.input()).unwrap();
         let right = derive_known_good_inventory(right.input()).unwrap();
         let root = runtime_root();
@@ -2907,7 +2649,7 @@ mod tests {
 
     #[test]
     fn runtime_link_target_is_stored_canonically() {
-        let fixture = fixture(FixtureShape::Vanilla, false);
+        let fixture = fixture(false);
         let inventory = derive_known_good_inventory(fixture.input()).unwrap();
         let link = entry(&inventory, &runtime_root(), "java-link");
 
@@ -2920,40 +2662,12 @@ mod tests {
 
     #[test]
     fn oversized_runtime_manifest_is_rejected_before_parsing() {
-        let mut fixture = fixture(FixtureShape::Vanilla, false);
+        let mut fixture = fixture(false);
         fixture.runtime_manifest_bytes = vec![b' '; MAX_KNOWN_GOOD_RUNTIME_MANIFEST_BYTES + 1];
         fixture.runtime_manifest_expected = expected_for(&fixture.runtime_manifest_bytes);
 
         let error = derive_known_good_inventory(fixture.input()).expect_err("oversized manifest");
         assert_eq!(error, KnownGoodInventoryError::InputTooLarge);
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum FixtureShape {
-        Vanilla,
-        Fabric,
-        Quilt,
-        Forge,
-    }
-
-    impl FixtureShape {
-        fn component(self) -> Option<LoaderComponentId> {
-            match self {
-                Self::Vanilla => None,
-                Self::Fabric => Some(LoaderComponentId::Fabric),
-                Self::Quilt => Some(LoaderComponentId::Quilt),
-                Self::Forge => Some(LoaderComponentId::Forge),
-            }
-        }
-
-        fn strategy(self) -> Option<LoaderInstallStrategy> {
-            match self {
-                Self::Vanilla => None,
-                Self::Fabric => Some(LoaderInstallStrategy::FabricProfile),
-                Self::Quilt => Some(LoaderInstallStrategy::QuiltProfile),
-                Self::Forge => Some(LoaderInstallStrategy::ForgeModern),
-            }
-        }
     }
 
     struct Fixture {
@@ -2965,7 +2679,6 @@ mod tests {
         runtime_manifest_bytes: Vec<u8>,
         runtime_manifest_expected: ExpectedIntegrity,
         runtime_id: RuntimeId,
-        loader_record: Option<LoaderBuildRecord>,
         environment: Environment,
     }
 
@@ -2996,7 +2709,7 @@ mod tests {
         }
     }
 
-    fn fixture(shape: FixtureShape, shuffled: bool) -> Fixture {
+    fn fixture(shuffled: bool) -> Fixture {
         let asset_index = format!(
             r#"{{"objects":{{"first":{{"hash":"{SHA_A}","size":5}},"second":{{"hash":"{SHA_A}","size":5}}}}}}"#
         )
@@ -3008,23 +2721,10 @@ mod tests {
             SHA_A,
             10,
         )];
-        let profile_libraries = matches!(shape, FixtureShape::Fabric | FixtureShape::Quilt)
-            .then(|| vec![checksumless_loader_library()])
-            .unwrap_or_default();
-        libraries.extend(profile_libraries.iter().cloned());
-        if matches!(shape, FixtureShape::Forge) {
-            libraries.push(checksumless_loader_library());
-        }
         if shuffled {
             libraries.reverse();
         }
-        let loader_record = shape
-            .component()
-            .map(|component| loader_record(shape, component));
-        let version_id = loader_record
-            .as_ref()
-            .map(|record| record.version_id.clone())
-            .unwrap_or_else(|| "fixture-version".to_string());
+        let version_id = "fixture-version".to_string();
         let version = VersionJson {
             id: version_id.clone(),
             inherits_from: String::new(),
@@ -3098,7 +2798,6 @@ mod tests {
             runtime_manifest_bytes,
             runtime_manifest_expected,
             runtime_id: RuntimeId::from("java-runtime-delta"),
-            loader_record,
             environment,
         }
     }
@@ -3136,22 +2835,30 @@ mod tests {
             .map_err(|_| KnownGoodInventoryError::VanillaLibraryProofMismatch)
     }
 
-    fn loader_record(shape: FixtureShape, component: LoaderComponentId) -> LoaderBuildRecord {
-        let strategy = shape.strategy().expect("loader strategy");
-        let (artifact_kind, install_source) = match shape {
-            FixtureShape::Fabric | FixtureShape::Quilt => (
+    fn loader_record(component: LoaderComponentId) -> LoaderBuildRecord {
+        let (strategy, artifact_kind, install_source) = match component {
+            LoaderComponentId::Fabric | LoaderComponentId::Quilt => (
+                if component == LoaderComponentId::Fabric {
+                    LoaderInstallStrategy::FabricProfile
+                } else {
+                    LoaderInstallStrategy::QuiltProfile
+                },
                 LoaderArtifactKind::ProfileJson,
                 LoaderInstallSource::ProfileJson {
                     url: "https://example.invalid/profile".to_string(),
                 },
             ),
-            FixtureShape::Forge => (
+            LoaderComponentId::Forge | LoaderComponentId::NeoForge => (
+                if component == LoaderComponentId::Forge {
+                    LoaderInstallStrategy::ForgeModern
+                } else {
+                    LoaderInstallStrategy::NeoForgeModern
+                },
                 LoaderArtifactKind::InstallerJar,
                 LoaderInstallSource::InstallerJar {
                     url: "https://example.invalid/installer".to_string(),
                 },
             ),
-            FixtureShape::Vanilla => unreachable!(),
         };
         LoaderBuildRecord {
             subject_kind: LoaderBuildSubjectKind::LoaderBuild,

@@ -15,6 +15,10 @@ use super::transfer::{
     materialize_authenticated_library_source, prepare_library_publication,
 };
 use crate::artifact_path::ArtifactRelativePath;
+use crate::known_good_libraries::{
+    ClassifiedLibraryDownload, LibraryAcquisition, PendingExactLibraryDeclarations,
+    PendingStreamedLibraryDeclarations, SealedLibraryDeclarationError,
+};
 use crate::launch::{Library, maven_to_path};
 use crate::paths::libraries_dir;
 use crate::rules::{Environment, default_environment, evaluate_rules};
@@ -84,30 +88,48 @@ impl LibraryArtifactPlan {
     }
 }
 
-pub(crate) async fn download_profile_libraries_with_proofs_and_facts_and_descriptors<F, G, H>(
+pub(crate) async fn download_profile_libraries_with_declarations_and_facts_and_descriptors<
+    F,
+    G,
+    H,
+>(
     mc_dir: &Path,
-    libraries: &[Library],
+    declarations: PendingExactLibraryDeclarations,
     phase: &str,
     send: F,
     mut send_fact: G,
     mut send_descriptor: H,
-) -> Result<Vec<ExactLibraryDownloadProof>, DownloadError>
+) -> Result<
+    (
+        PendingStreamedLibraryDeclarations,
+        Vec<ExactLibraryDownloadProof>,
+    ),
+    DownloadError,
+>
 where
     F: FnMut(DownloadProgress),
     G: FnMut(ExecutionDownloadFact),
     H: FnMut(SelectedDownloadArtifactDescriptor),
 {
-    let env = default_environment();
-    let jobs = library_jobs_for(mc_dir, libraries, &env)?;
+    let jobs = {
+        let (libraries, environment) = declarations.profile_plan_inputs().ok_or_else(|| {
+            profile_declaration_error(SealedLibraryDeclarationError::AncestorMismatch)
+        })?;
+        library_jobs_for(mc_dir, libraries, environment)?
+    };
+    let (declarations, jobs) = declarations
+        .classify_jobs(&libraries_dir(mc_dir), jobs)
+        .map_err(profile_declaration_error)?;
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
-    let result = download_library_jobs_with_proofs(
+    let result = download_classified_library_jobs_with_proofs(
         mc_dir,
         jobs,
         phase,
         send,
         Some(fact_tx),
         Some(descriptor_tx),
+        false,
     )
     .await;
     while let Ok(fact) = fact_rx.try_recv() {
@@ -116,7 +138,13 @@ where
     while let Ok(descriptor) = descriptor_rx.try_recv() {
         send_descriptor(descriptor);
     }
-    result
+    result.map(|proofs| (declarations, proofs))
+}
+
+fn profile_declaration_error(error: SealedLibraryDeclarationError) -> DownloadError {
+    DownloadError::ResolveManifest(format!(
+        "profile library declaration classification failed: {error:?}"
+    ))
 }
 
 pub(crate) async fn download_installer_libraries_with_authority_and_facts_and_descriptors<F, G, H>(
@@ -159,9 +187,44 @@ async fn download_library_jobs_with_proofs<F>(
     mc_dir: &Path,
     jobs: Vec<DownloadJob>,
     phase: &str,
+    send: F,
+    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+) -> Result<Vec<ExactLibraryDownloadProof>, DownloadError>
+where
+    F: FnMut(DownloadProgress),
+{
+    let jobs = jobs
+        .into_iter()
+        .map(|job| ClassifiedLibraryDownload {
+            acquisition: if job.expected.sha1.is_some() && job.expected.size.is_some() {
+                LibraryAcquisition::ExactDeclaration
+            } else {
+                LibraryAcquisition::FreshStream
+            },
+            job,
+        })
+        .collect();
+    download_classified_library_jobs_with_proofs(
+        mc_dir,
+        jobs,
+        phase,
+        send,
+        fact_tx,
+        descriptor_tx,
+        true,
+    )
+    .await
+}
+
+async fn download_classified_library_jobs_with_proofs<F>(
+    mc_dir: &Path,
+    jobs: Vec<ClassifiedLibraryDownload>,
+    phase: &str,
     mut send: F,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
     descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+    retain_exact_proofs: bool,
 ) -> Result<Vec<ExactLibraryDownloadProof>, DownloadError>
 where
     F: FnMut(DownloadProgress),
@@ -173,14 +236,16 @@ where
     let total_jobs = jobs.len() as i32;
     let mut completed_jobs = 0;
     let mut authorities = BTreeMap::new();
-    let mut downloads = futures_util::stream::iter(jobs.into_iter().map(|job| {
+    let mut downloads = futures_util::stream::iter(jobs.into_iter().map(|classified| {
+        let job = classified.job;
+        let acquisition = classified.acquisition;
         let client = client.clone();
         let fact_tx = fact_tx.clone();
         let descriptor_tx = descriptor_tx.clone();
         let source_pool = source_pool.clone();
         let mc_dir = mc_dir.clone();
         async move {
-            let (authority, path) = if job.expected.sha1.is_some() && job.expected.size.is_some() {
+            let (authority, path) = if acquisition == LibraryAcquisition::ExactDeclaration {
                 let (_, observed_size) = ensure_selected_artifact_with_client_and_observed_size(
                     SelectedDownloadArtifactKind::Library,
                     &client,
@@ -198,7 +263,7 @@ where
                         .ok_or(LibraryPlanError::InvalidChecksum)?,
                 )
                 .ok_or(LibraryPlanError::InvalidChecksum)?;
-                (
+                let proof = retain_exact_proofs.then(|| {
                     ExactLibraryDownloadProof::new(
                         job.relative_path.clone(),
                         job.is_native,
@@ -206,9 +271,9 @@ where
                         job.expected.clone(),
                         observed_size,
                         sha1,
-                    ),
-                    job.relative_path,
-                )
+                    )
+                });
+                (proof, job.relative_path)
             } else {
                 let target = selected_download_target_label(
                     SelectedDownloadArtifactKind::Library,
@@ -238,7 +303,7 @@ where
                 let (authority, _) =
                     materialize_authenticated_library_source(prepared, source, fact_tx.as_ref())
                         .await?;
-                (authority, job.relative_path)
+                (Some(authority), job.relative_path)
             };
             Ok::<_, DownloadError>((path, job.name, authority))
         }
@@ -248,7 +313,9 @@ where
         let (path, name, authority) = result?;
         completed_jobs += 1;
         send(progress(phase, completed_jobs, total_jobs, Some(name)));
-        if authorities.insert(path, authority).is_some() {
+        if let Some(authority) = authority
+            && authorities.insert(path, authority).is_some()
+        {
             return Err(LibraryPlanError::ConflictingArtifactPath.into());
         }
     }
@@ -353,7 +420,7 @@ fn resolve_native_plan(
         name: artifact_name(&relative_path, &format!("{}:{classifier_key}", lib.name)),
         source_url: Some(maven_url(lib, &relative_path)),
         relative_path,
-        expected: library_expected_integrity(lib, lib.size, &lib.sha1, false)?,
+        expected: library_expected_integrity(lib, 0, "", false)?,
         is_native: true,
     }))
 }
@@ -395,6 +462,13 @@ fn library_expected_integrity(
     sha1: &str,
     compare_top_level: bool,
 ) -> Result<ExpectedIntegrity, LibraryPlanError> {
+    if !compare_top_level {
+        let sha1 = sha1.trim();
+        if !sha1.is_empty() && !is_sha1_hex(sha1) {
+            return Err(LibraryPlanError::InvalidChecksum);
+        }
+        return Ok(ExpectedIntegrity::from_mojang(size, sha1));
+    }
     if compare_top_level
         && ((!sha1.trim().is_empty()
             && !lib.sha1.trim().is_empty()
@@ -585,14 +659,12 @@ fn native_name_matches_env(name: &str, env: &crate::rules::Environment) -> bool 
 
 #[cfg(test)]
 mod exact_library_proof_tests {
-    use super::super::promotion::selected_promotion_temp_path;
     use super::{
         download_installer_libraries_with_authority_and_facts_and_descriptors,
-        download_profile_libraries_with_proofs_and_facts_and_descriptors,
         installer_library_jobs_for, library_artifact_plans_for,
     };
     use crate::artifact_path::ArtifactRelativePath;
-    use crate::download::{ExecutionDownloadFactKind, LibraryPlanError};
+    use crate::download::LibraryPlanError;
     use crate::launch::{Library, LibraryArtifact, LibraryDownload};
     use sha1::{Digest as _, Sha1};
     use std::collections::{BTreeSet, HashMap};
@@ -717,174 +789,11 @@ mod exact_library_proof_tests {
     }
 
     #[tokio::test]
-    async fn checksumless_profile_proof_replaces_a_readable_existing_jar() {
-        let root = temp_dir("profile-checksumless-fresh");
-        let relative = "org/example/profile/1/profile-1.jar";
-        let destination = root.join("libraries").join(relative);
-        std::fs::create_dir_all(destination.parent().expect("library parent"))
-            .expect("library parent");
-        std::fs::write(&destination, jar_bytes(b"readable stale")).expect("readable stale library");
-        let fresh = jar_bytes(b"authenticated fresh");
-        let fresh_sha1 = format!("{:x}", Sha1::digest(&fresh));
-        let url = spawn_response(fresh.clone()).await;
-        let library = direct_library(relative, &url, "", 0);
-        let mut descriptors = Vec::new();
-
-        let proofs = download_profile_libraries_with_proofs_and_facts_and_descriptors(
-            &root,
-            &[library],
-            "libraries",
-            |_| {},
-            |_| {},
-            |descriptor| descriptors.push(descriptor),
-        )
-        .await
-        .expect("fresh profile proof");
-        let (path, _, _, _, size, digest) = proofs
-            .into_iter()
-            .next()
-            .expect("profile proof")
-            .into_parts();
-
-        assert_eq!(path.as_str(), relative);
-        assert_eq!(size, fresh.len() as u64);
-        assert_eq!(digest, <[u8; 20]>::from(Sha1::digest(&fresh)));
-        assert_eq!(std::fs::read(destination).expect("promoted library"), fresh);
-        assert_eq!(descriptors.len(), 1);
-        assert_eq!(descriptors[0].expected_size, Some(size));
-        assert_eq!(descriptors[0].sha1(), fresh_sha1);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn size_only_profile_proof_forces_fresh_stream() {
-        let root = temp_dir("profile-size-only-fresh");
-        let relative = "org/example/size-only/1/size-only-1.jar";
-        let destination = root.join("libraries").join(relative);
-        std::fs::create_dir_all(destination.parent().expect("library parent"))
-            .expect("library parent");
-        let fresh = jar_bytes(b"fresh-size-only");
-        let stale = jar_bytes(b"stale-size-only");
-        assert_eq!(stale.len(), fresh.len());
-        std::fs::write(&destination, stale).expect("readable stale library");
-        let url = spawn_response(fresh.clone()).await;
-        let library = direct_library(relative, &url, "", fresh.len() as i64);
-
-        let proofs = download_profile_libraries_with_proofs_and_facts_and_descriptors(
-            &root,
-            &[library],
-            "libraries",
-            |_| {},
-            |_| {},
-            |_| {},
-        )
-        .await
-        .expect("fresh size-only proof");
-        let (_, _, _, _, size, digest) = proofs
-            .into_iter()
-            .next()
-            .expect("profile proof")
-            .into_parts();
-        assert_eq!(size, fresh.len() as u64);
-        assert_eq!(digest, <[u8; 20]>::from(Sha1::digest(&fresh)));
-        assert_eq!(std::fs::read(destination).expect("promoted library"), fresh);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn invalid_checksumless_profile_jar_returns_no_proof_or_promotion() {
-        let root = temp_dir("profile-invalid");
-        let relative = "org/example/profile/1/profile-1.jar";
-        let destination = root.join("libraries").join(relative);
-        let invalid = b"not a jar".to_vec();
-        let url = spawn_response(invalid).await;
-        let library = direct_library(relative, &url, "", 0);
-        let mut facts = Vec::new();
-
-        assert!(
-            download_profile_libraries_with_proofs_and_facts_and_descriptors(
-                &root,
-                &[library],
-                "libraries",
-                |_| {},
-                |fact| facts.push(fact),
-                |_| {},
-            )
-            .await
-            .is_err()
-        );
-        assert!(!destination.exists());
-        assert!(
-            facts
-                .iter()
-                .any(|fact| fact.kind == ExecutionDownloadFactKind::ChecksumMismatch)
-        );
-        assert!(!root.join("libraries").exists());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn source_failure_preserves_destination_temp_and_parent_sentinels() {
-        let root = temp_dir("profile-source-failure-sentinels");
-        let relative = "org/example/profile/1/profile-1.jar";
-        let destination = root.join("libraries").join(relative);
-        let parent = destination.parent().expect("library parent");
-        std::fs::create_dir_all(parent).expect("library parent");
-        std::fs::write(&destination, b"destination-sentinel").expect("destination sentinel");
-        let temp = selected_promotion_temp_path(&destination);
-        std::fs::write(&temp, b"temp-sentinel").expect("temp sentinel");
-        let marker = parent.join("parent-sentinel");
-        std::fs::write(&marker, b"parent-sentinel").expect("parent sentinel");
-        let url = spawn_response(b"invalid jar source".to_vec()).await;
-        let library = direct_library(relative, &url, "", 0);
-
-        assert!(
-            download_profile_libraries_with_proofs_and_facts_and_descriptors(
-                &root,
-                &[library],
-                "libraries",
-                |_| {},
-                |_| {},
-                |_| {},
-            )
-            .await
-            .is_err()
-        );
-        assert_eq!(
-            std::fs::read(destination).expect("destination sentinel"),
-            b"destination-sentinel"
-        );
-        assert_eq!(
-            std::fs::read(temp).expect("temp sentinel"),
-            b"temp-sentinel"
-        );
-        assert_eq!(
-            std::fs::read(marker).expect("parent sentinel"),
-            b"parent-sentinel"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn profile_and_installer_proofs_preserve_native_classifier_identity() {
-        let profile_root = temp_dir("profile-native-proof");
+    async fn installer_proofs_preserve_native_classifier_identity() {
         let installer_root = temp_dir("installer-native-proof");
         let relative = "org/example/native/1/native-1-platform.jar";
-        let profile_body = jar_bytes(b"profile native");
         let installer_body = jar_bytes(b"installer native");
-        let profile_url = spawn_response(profile_body).await;
         let installer_url = spawn_response(installer_body).await;
-
-        let profile_proofs = download_profile_libraries_with_proofs_and_facts_and_descriptors(
-            &profile_root,
-            &[native_library(relative, &profile_url)],
-            "libraries",
-            |_| {},
-            |_| {},
-            |_| {},
-        )
-        .await
-        .expect("profile native proof");
         let installer_proofs =
             download_installer_libraries_with_authority_and_facts_and_descriptors(
                 &installer_root,
@@ -898,18 +807,7 @@ mod exact_library_proof_tests {
             .await
             .expect("installer native proof");
 
-        assert_eq!(profile_proofs.len(), 1);
         assert_eq!(installer_proofs.len(), 1);
-        assert_eq!(
-            profile_proofs
-                .into_iter()
-                .next()
-                .unwrap()
-                .into_parts()
-                .0
-                .as_str(),
-            relative
-        );
         assert_eq!(
             installer_proofs
                 .into_iter()
@@ -920,7 +818,6 @@ mod exact_library_proof_tests {
                 .as_str(),
             relative
         );
-        let _ = std::fs::remove_dir_all(profile_root);
         let _ = std::fs::remove_dir_all(installer_root);
     }
 

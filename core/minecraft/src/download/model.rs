@@ -117,25 +117,6 @@ impl ExactLibraryDownloadProof {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_for_test(path: ArtifactRelativePath, size: u64, sha1: [u8; 20]) -> Self {
-        Self::new(
-            path,
-            false,
-            "https://example.invalid/library.jar".to_string(),
-            ExpectedIntegrity {
-                size: Some(size),
-                sha1: Some(
-                    sha1.iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>(),
-                ),
-            },
-            size,
-            sha1,
-        )
-    }
-
-    #[cfg(test)]
     pub(crate) fn new_bound_for_test(
         path: ArtifactRelativePath,
         is_native: bool,

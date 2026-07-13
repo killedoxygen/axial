@@ -239,4 +239,24 @@ mod tests {
         );
         assert_eq!(proof.size, Some(42));
     }
+
+    #[test]
+    fn profile_integrity_accepts_only_absent_or_complete_positive_pairs() {
+        let absent = profile_library_proof("example:absent:1".to_string(), String::new(), 0)
+            .expect("absent integrity");
+        assert_eq!(absent.exact_integrity(), None);
+        assert!(!absent.has_partial_integrity());
+
+        for (sha1, size) in [
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0),
+            ("", 7),
+            ("not-a-sha1", 7),
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", -1),
+        ] {
+            assert!(
+                profile_library_proof("example:invalid:1".to_string(), sha1.to_string(), size)
+                    .is_err()
+            );
+        }
+    }
 }
