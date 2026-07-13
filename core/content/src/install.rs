@@ -5,8 +5,9 @@ use crate::transaction::{FileTransaction, StagingGuard, contained_path};
 use axial_minecraft::download::{
     DownloadProgress, ExpectedIntegrity, download_file_with_client_report,
 };
+use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A single resolved file the pipeline should download and record. Callers build
 /// these from a resolution plan (selected content plus its dependencies).
@@ -103,8 +104,12 @@ where
         return Err(error);
     }
     transaction.commit();
+    let installed_destinations: HashSet<PathBuf> = relative_paths
+        .iter()
+        .map(|relative| game_dir.join(relative))
+        .collect();
     for (subdir, stale) in stale_files {
-        remove_content_file(&subdir, &stale);
+        remove_content_file_except(&subdir, &stale, &installed_destinations);
     }
     on_progress(done(total));
     Ok(manifest)
@@ -127,6 +132,50 @@ pub fn uninstall(game_dir: &Path, canonical_id: &CanonicalId) -> ContentResult<b
 fn remove_content_file(subdir: &Path, filename: &str) {
     let _ = fs::remove_file(subdir.join(filename));
     let _ = fs::remove_file(subdir.join(format!("{filename}.disabled")));
+}
+
+fn remove_content_file_except(subdir: &Path, filename: &str, protected: &HashSet<PathBuf>) {
+    for candidate in [
+        subdir.join(filename),
+        subdir.join(format!("{filename}.disabled")),
+    ] {
+        if !protected.contains(&candidate) {
+            let _ = fs::remove_file(candidate);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_cleanup_preserves_destinations_installed_by_the_same_batch() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-content-stale-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let mods = root.join("mods");
+        fs::create_dir_all(&mods).expect("create mods directory");
+        let installed = mods.join("common.jar");
+        let stale_disabled = mods.join("common.jar.disabled");
+        fs::write(&installed, b"new content").expect("write installed file");
+        fs::write(&stale_disabled, b"stale content").expect("write stale disabled file");
+        let protected = HashSet::from([installed.clone()]);
+
+        remove_content_file_except(&mods, "common.jar", &protected);
+
+        assert_eq!(
+            fs::read(&installed).expect("installed file"),
+            b"new content"
+        );
+        assert!(!stale_disabled.exists());
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> DownloadProgress {

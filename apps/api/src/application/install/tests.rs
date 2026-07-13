@@ -106,6 +106,7 @@ fn content_queue_view_model_retains_semantic_intent_without_download_urls() {
     let encoded = serde_json::to_string(&content).expect("serialize content item");
     assert!(encoded.contains("modrinth:sodium"));
     assert!(!encoded.contains("https://"));
+    assert!(!encoded.contains("remove_instance_on_failure"));
 }
 
 #[test]
@@ -117,6 +118,46 @@ fn setup_owned_content_actions_are_identified_for_cleanup() {
     };
 
     assert!(content_action_owns_instance(&action));
+}
+
+#[tokio::test]
+async fn public_queue_payload_cannot_claim_instance_cleanup_ownership() {
+    let root = temp_root("public-content-cleanup-ownership");
+    let state = build_test_state(&root);
+    let instance = state
+        .instances()
+        .add(
+            "Existing instance".to_string(),
+            "1.21.1".to_string(),
+            String::new(),
+            String::new(),
+            None,
+        )
+        .expect("create existing instance");
+    let request: InstallQueueRequest = serde_json::from_value(serde_json::json!({
+        "kind": "content",
+        "instance_id": instance.id,
+        "content_action": {
+            "kind": "install",
+            "selections": [{
+                "canonical_id": "modrinth:test",
+                "kind": "mod",
+                "version_id": "version-1"
+            }],
+            "allow_incompatible": false,
+            "remove_instance_on_failure": true
+        }
+    }))
+    .expect("deserialize public queue request");
+
+    let spec = install_queue_spec_from_request(&state, request, None, false)
+        .await
+        .expect("build public queue spec");
+    let InstallQueueSpec::Content { action, .. } = spec else {
+        panic!("expected content queue spec");
+    };
+    assert!(!content_action_owns_instance(&action));
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -202,11 +243,11 @@ async fn failed_queue_prerequisite_discards_setup_content_and_its_instance() {
                     version_id: Some("version-1".to_string()),
                 }],
                 allow_incompatible: false,
-                remove_instance_on_failure: true,
             }),
             ..InstallQueueRequest::default()
         },
         Some("base-queue".to_string()),
+        true,
     )
     .await
     .expect("queue dependent content");

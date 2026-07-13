@@ -504,19 +504,21 @@ pub async fn enqueue_install(
     state: &AppState,
     request: InstallQueueRequest,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    enqueue_install_with_dependency(state, request, None).await
+    enqueue_install_with_dependency(state, request, None, false).await
 }
 
 pub(crate) async fn enqueue_install_with_dependency(
     state: &AppState,
     request: InstallQueueRequest,
     prerequisite_queue_id: Option<String>,
+    remove_instance_on_failure: bool,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
     enqueue_install_with_placement(
         state,
         request,
         InstallQueuePlacement::Back,
         prerequisite_queue_id,
+        remove_instance_on_failure,
     )
     .await
 }
@@ -525,7 +527,7 @@ pub async fn retry_install(
     state: &AppState,
     request: InstallQueueRequest,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    enqueue_install_with_placement(state, request, InstallQueuePlacement::Front, None).await
+    enqueue_install_with_placement(state, request, InstallQueuePlacement::Front, None, false).await
 }
 
 pub async fn remove_queued_install(
@@ -585,8 +587,15 @@ async fn enqueue_install_with_placement(
     request: InstallQueueRequest,
     placement: InstallQueuePlacement,
     prerequisite_queue_id: Option<String>,
+    remove_instance_on_failure: bool,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    let spec = install_queue_spec_from_request(state, request, prerequisite_queue_id).await?;
+    let spec = install_queue_spec_from_request(
+        state,
+        request,
+        prerequisite_queue_id,
+        remove_instance_on_failure,
+    )
+    .await?;
     let queue_id = generate_install_id("install-queue");
     let outcome = state
         .installs()
@@ -603,6 +612,7 @@ async fn install_queue_spec_from_request(
     state: &AppState,
     request: InstallQueueRequest,
     prerequisite_queue_id: Option<String>,
+    remove_instance_on_failure: bool,
 ) -> Result<InstallQueueSpec, InstallApplicationError> {
     match request.kind.trim() {
         "vanilla" | "minecraft" => {
@@ -678,7 +688,6 @@ async fn install_queue_spec_from_request(
                 InstallQueueContentActionRequest::Install {
                     selections,
                     allow_incompatible,
-                    remove_instance_on_failure,
                 } => {
                     if selections.is_empty() || selections.len() > 40 {
                         return Err((
@@ -718,7 +727,6 @@ async fn install_queue_spec_from_request(
                     version_id,
                     selected_paths,
                     include_overrides,
-                    remove_instance_on_failure,
                 } => {
                     let canonical_id = canonical_id.trim().to_string();
                     let version_id = version_id.trim().to_string();
@@ -946,7 +954,6 @@ async fn start_content_operation(
                             version_id: Some(version_id.clone()),
                             selected_paths: selected_paths.clone(),
                             include_overrides: *include_overrides,
-                            remove_instance_on_failure: false,
                         },
                         |progress| {
                             let _ = progress_tx.send(progress);
@@ -1405,7 +1412,7 @@ fn content_action_request(action: &ContentQueueAction) -> InstallQueueContentAct
         ContentQueueAction::Install {
             selections,
             allow_incompatible,
-            remove_instance_on_failure,
+            ..
         } => InstallQueueContentActionRequest::Install {
             selections: selections
                 .iter()
@@ -1416,7 +1423,6 @@ fn content_action_request(action: &ContentQueueAction) -> InstallQueueContentAct
                 })
                 .collect(),
             allow_incompatible: *allow_incompatible,
-            remove_instance_on_failure: *remove_instance_on_failure,
         },
         ContentQueueAction::Uninstall { canonical_id } => {
             InstallQueueContentActionRequest::Uninstall {
@@ -1428,13 +1434,12 @@ fn content_action_request(action: &ContentQueueAction) -> InstallQueueContentAct
             version_id,
             selected_paths,
             include_overrides,
-            remove_instance_on_failure,
+            ..
         } => InstallQueueContentActionRequest::Modpack {
             canonical_id: canonical_id.clone(),
             version_id: version_id.clone(),
             selected_paths: selected_paths.clone(),
             include_overrides: *include_overrides,
-            remove_instance_on_failure: *remove_instance_on_failure,
         },
     }
 }

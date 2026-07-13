@@ -287,11 +287,11 @@ pub(crate) async fn queue_content_install_with_cleanup_after(
                     })
                     .collect(),
                 allow_incompatible: request.allow_incompatible,
-                remove_instance_on_failure,
             }),
             ..InstallQueueRequest::default()
         },
         prerequisite_queue_id,
+        remove_instance_on_failure,
     )
     .await
 }

@@ -104,7 +104,6 @@ export function installModpack(
   options: {
     selectedPaths?: string[];
     includeOverrides?: boolean;
-    removeInstanceOnFailure?: boolean;
   } = {},
 ): Promise<InstallQueueStateResponse> {
   return api<InstallQueueStateResponse>('POST', '/content/modpack/install', {
@@ -113,7 +112,6 @@ export function installModpack(
     version_id: versionId,
     selected_paths: options.selectedPaths ?? [],
     include_overrides: options.includeOverrides ?? true,
-    remove_instance_on_failure: options.removeInstanceOnFailure ?? false,
   });
 }
 

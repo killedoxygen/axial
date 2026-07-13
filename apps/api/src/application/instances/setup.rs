@@ -225,9 +225,9 @@ pub async fn execute_modpack_instance_setup(
             version_id: Some(target.version_id),
             selected_paths: Vec::new(),
             include_overrides: true,
-            remove_instance_on_failure: true,
         },
         prerequisite_queue_id,
+        true,
     )
     .await;
     match queued {

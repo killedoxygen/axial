@@ -117,7 +117,6 @@ export type InstallQueueContentAction =
       kind: 'install';
       selections: InstallQueueContentSelection[];
       allow_incompatible: boolean;
-      remove_instance_on_failure: boolean;
     }
   | { kind: 'uninstall'; canonical_id: string }
   | {
@@ -126,7 +125,6 @@ export type InstallQueueContentAction =
       version_id: string;
       selected_paths: string[];
       include_overrides: boolean;
-      remove_instance_on_failure: boolean;
     };
 
 export interface InstallQueueContentItemViewModel {

@@ -168,8 +168,6 @@ pub enum InstallQueueContentActionRequest {
         selections: Vec<InstallQueueContentSelection>,
         #[serde(default)]
         allow_incompatible: bool,
-        #[serde(default)]
-        remove_instance_on_failure: bool,
     },
     Uninstall {
         canonical_id: String,
@@ -181,8 +179,6 @@ pub enum InstallQueueContentActionRequest {
         selected_paths: Vec<String>,
         #[serde(default)]
         include_overrides: bool,
-        #[serde(default)]
-        remove_instance_on_failure: bool,
     },
 }
 

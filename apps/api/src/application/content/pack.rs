@@ -57,8 +57,6 @@ pub struct ModpackInstallRequest {
     pub selected_paths: Vec<String>,
     #[serde(default = "default_true")]
     pub include_overrides: bool,
-    #[serde(default)]
-    pub remove_instance_on_failure: bool,
 }
 
 fn default_true() -> bool {
@@ -319,13 +317,14 @@ pub async fn queue_modpack_install(
     state: &AppState,
     request: ModpackInstallRequest,
 ) -> Result<InstallQueueStateResponse, ContentApiError> {
-    queue_modpack_install_after(state, request, None).await
+    queue_modpack_install_after(state, request, None, false).await
 }
 
 pub(crate) async fn queue_modpack_install_after(
     state: &AppState,
     request: ModpackInstallRequest,
     prerequisite_queue_id: Option<String>,
+    remove_instance_on_failure: bool,
 ) -> Result<InstallQueueStateResponse, ContentApiError> {
     let target =
         modpack_target(state, &request.canonical_id, request.version_id.as_deref()).await?;
@@ -333,6 +332,7 @@ pub(crate) async fn queue_modpack_install_after(
         state,
         pinned_modpack_queue_request(request, target),
         prerequisite_queue_id,
+        remove_instance_on_failure,
     )
     .await
 }
@@ -359,7 +359,6 @@ fn pinned_modpack_queue_request(
             version_id: target.version_id,
             selected_paths: request.selected_paths,
             include_overrides: request.include_overrides,
-            remove_instance_on_failure: request.remove_instance_on_failure,
         }),
         ..InstallQueueRequest::default()
     }
@@ -691,7 +690,6 @@ mod tests {
                 version_id: None,
                 selected_paths: Vec::new(),
                 include_overrides: true,
-                remove_instance_on_failure: false,
             },
             ModpackTarget {
                 canonical_id: CanonicalId("modrinth:pack".to_string()),
