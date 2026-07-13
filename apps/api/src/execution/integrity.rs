@@ -4,20 +4,24 @@ use super::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use crate::state::{
-    AppState, InstanceLifecycleLease, KnownGoodVerificationLease, KnownGoodVerificationUnavailable,
+    AppState, InstanceLifecycleLease, KnownGoodTier2Ticket, KnownGoodVerificationLease,
+    KnownGoodVerificationUnavailable,
 };
+use axial_minecraft::ManagedRuntimeCache;
 #[cfg(test)]
 use axial_minecraft::known_good::KnownGoodArtifactKind;
 use axial_minecraft::known_good::{
     KnownGoodEntry, KnownGoodIntegrity, KnownGoodPhysicalPath, KnownGoodRoot,
     LaunchTier0RuntimeSelection, LaunchTier1AdmittedFile, MAX_LAUNCH_TIER1_AGGREGATE_BYTES,
-    known_good_entry_path, known_good_link_target_matches,
+    Tier2Projection, known_good_entry_path, known_good_link_target_matches,
 };
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 const MAX_INTEGRITY_TIER0_FACTS: usize = 64;
 
@@ -43,6 +47,7 @@ enum ContentHashObservation {
     WrongType,
     ChangedDuringRead,
     BudgetRefused,
+    Cancelled,
 }
 
 struct ContentHashResult {
@@ -50,10 +55,23 @@ struct ContentHashResult {
     bytes_read: u64,
 }
 
-fn read_exact_sha1(
+trait ContentReadControl {
+    fn before_read(&mut self, next_read_bytes: usize) -> bool;
+}
+
+struct UnrestrictedContentReadControl;
+
+impl ContentReadControl for UnrestrictedContentReadControl {
+    fn before_read(&mut self, _next_read_bytes: usize) -> bool {
+        true
+    }
+}
+
+fn read_exact_sha1_controlled(
     reader: &mut impl Read,
     expected_size: u64,
     byte_budget: u64,
+    control: &mut dyn ContentReadControl,
 ) -> ContentHashResult {
     if expected_size > byte_budget {
         return ContentHashResult {
@@ -68,6 +86,12 @@ fn read_exact_sha1(
     while bytes_read < expected_size {
         let remaining = expected_size - bytes_read;
         let limit = remaining.min(buffer.len() as u64) as usize;
+        if !control.before_read(limit) {
+            return ContentHashResult {
+                observation: Ok(ContentHashObservation::Cancelled),
+                bytes_read,
+            };
+        }
         let count = match reader.read(&mut buffer[..limit]) {
             Ok(count) => count,
             Err(error) => {
@@ -96,6 +120,20 @@ fn read_exact_sha1(
     }
 }
 
+#[cfg(test)]
+fn read_exact_sha1(
+    reader: &mut impl Read,
+    expected_size: u64,
+    byte_budget: u64,
+) -> ContentHashResult {
+    read_exact_sha1_controlled(
+        reader,
+        expected_size,
+        byte_budget,
+        &mut UnrestrictedContentReadControl,
+    )
+}
+
 trait MetadataReader {
     fn symlink_metadata(&self, path: &KnownGoodPhysicalPath) -> io::Result<MetadataObservation>;
     fn read_link(&self, path: &KnownGoodPhysicalPath) -> io::Result<PathBuf>;
@@ -112,14 +150,30 @@ trait ContentReader {
         byte_budget: u64,
     ) -> ContentHashResult;
 
+    fn hash_file_controlled(
+        &self,
+        path: &KnownGoodPhysicalPath,
+        expected_size: u64,
+        byte_budget: u64,
+        control: &mut dyn ContentReadControl,
+    ) -> ContentHashResult {
+        if !control.before_read(0) {
+            return ContentHashResult {
+                observation: Ok(ContentHashObservation::Cancelled),
+                bytes_read: 0,
+            };
+        }
+        self.hash_file(path, expected_size, byte_budget)
+    }
+
     fn revalidate(&self) -> io::Result<()>;
 }
 
 #[cfg(unix)]
 mod confined_fs {
     use super::{
-        ContentHashObservation, ContentHashResult, MetadataKind, MetadataObservation,
-        read_exact_sha1,
+        ContentHashObservation, ContentHashResult, ContentReadControl, MetadataKind,
+        MetadataObservation, read_exact_sha1_controlled,
     };
     use axial_minecraft::known_good::KnownGoodPhysicalPath;
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
@@ -139,6 +193,7 @@ mod confined_fs {
         blocked: RefCell<HashMap<PathBuf, io::ErrorKind>>,
         roots: RefCell<HashSet<PathBuf>>,
         leaves: RefCell<Vec<HeldLeaf>>,
+        metadata_leaves: RefCell<Vec<HeldMetadataLeaf>>,
     }
 
     struct HeldLeaf {
@@ -147,6 +202,19 @@ mod confined_fs {
         file: Rc<std::fs::File>,
         device: u64,
         inode: u64,
+        size: i64,
+        modified_seconds: i64,
+        modified_nanoseconds: u64,
+        changed_seconds: i64,
+        changed_nanoseconds: u64,
+    }
+
+    struct HeldMetadataLeaf {
+        parent: Rc<OwnedFd>,
+        name: OsString,
+        device: u64,
+        inode: u64,
+        mode: u32,
         size: i64,
         modified_seconds: i64,
         modified_nanoseconds: u64,
@@ -243,6 +311,18 @@ mod confined_fs {
             let (parent, leaf) = self.parent(path)?;
             let stat = rustix::fs::statat(parent.as_ref(), &leaf, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(io::Error::from)?;
+            self.metadata_leaves.borrow_mut().push(HeldMetadataLeaf {
+                parent,
+                name: leaf,
+                device: stat.st_dev,
+                inode: stat.st_ino,
+                mode: stat.st_mode,
+                size: stat.st_size,
+                modified_seconds: stat.st_mtime,
+                modified_nanoseconds: stat.st_mtime_nsec,
+                changed_seconds: stat.st_ctime,
+                changed_nanoseconds: stat.st_ctime_nsec,
+            });
             let kind = match FileType::from_raw_mode(stat.st_mode) {
                 FileType::RegularFile => MetadataKind::File,
                 FileType::Directory => MetadataKind::Directory,
@@ -269,6 +349,7 @@ mod confined_fs {
             path: &KnownGoodPhysicalPath,
             expected_size: u64,
             byte_budget: u64,
+            control: &mut dyn ContentReadControl,
         ) -> ContentHashResult {
             let mut bytes_read = 0_u64;
             let observation = (|| -> io::Result<ContentHashObservation> {
@@ -308,7 +389,8 @@ mod confined_fs {
                 }
 
                 let mut readable = file.as_ref();
-                let result = read_exact_sha1(&mut readable, expected_size, byte_budget);
+                let result =
+                    read_exact_sha1_controlled(&mut readable, expected_size, byte_budget, control);
                 bytes_read = result.bytes_read;
                 let digest = match result.observation? {
                     ContentHashObservation::Hashed { digest } => digest,
@@ -377,6 +459,25 @@ mod confined_fs {
                     ));
                 }
             }
+            for leaf in self.metadata_leaves.borrow().iter() {
+                let current =
+                    rustix::fs::statat(leaf.parent.as_ref(), &leaf.name, AtFlags::SYMLINK_NOFOLLOW)
+                        .map_err(io::Error::from)?;
+                if current.st_dev != leaf.device
+                    || current.st_ino != leaf.inode
+                    || current.st_mode != leaf.mode
+                    || current.st_size != leaf.size
+                    || current.st_mtime != leaf.modified_seconds
+                    || current.st_mtime_nsec != leaf.modified_nanoseconds
+                    || current.st_ctime != leaf.changed_seconds
+                    || current.st_ctime_nsec != leaf.changed_nanoseconds
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "known-good metadata leaf changed after observation",
+                    ));
+                }
+            }
             for leaf in self.leaves.borrow().iter() {
                 let held_stat = rustix::fs::fstat(leaf.file.as_ref()).map_err(io::Error::from)?;
                 if FileType::from_raw_mode(held_stat.st_mode) != FileType::RegularFile
@@ -419,8 +520,8 @@ mod confined_fs {
 #[cfg(windows)]
 mod confined_fs {
     use super::{
-        ContentHashObservation, ContentHashResult, MetadataKind, MetadataObservation,
-        read_exact_sha1,
+        ContentHashObservation, ContentHashResult, ContentReadControl, MetadataKind,
+        MetadataObservation, read_exact_sha1_controlled,
     };
     use axial_minecraft::known_good::KnownGoodPhysicalPath;
     use std::cell::RefCell;
@@ -459,6 +560,7 @@ mod confined_fs {
         blocked: RefCell<HashMap<PathBuf, io::ErrorKind>>,
         roots: RefCell<HashSet<PathBuf>>,
         leaves: RefCell<Vec<HeldLeaf>>,
+        metadata_leaves: RefCell<Vec<HeldMetadataLeaf>>,
     }
 
     struct HeldLeaf {
@@ -467,6 +569,18 @@ mod confined_fs {
         file: Rc<fs::File>,
         volume_serial_number: u64,
         file_id: [u8; 16],
+        size: i64,
+        modified: i64,
+        changed: i64,
+    }
+
+    struct HeldMetadataLeaf {
+        parent: Rc<fs::File>,
+        name: OsString,
+        file: Rc<fs::File>,
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+        attributes: u32,
         size: i64,
         modified: i64,
         changed: i64,
@@ -644,9 +758,21 @@ mod confined_fs {
             path: &KnownGoodPhysicalPath,
         ) -> io::Result<MetadataObservation> {
             let (parent, leaf) = self.parent(path)?;
-            let file = Self::open_relative(parent.as_ref(), &leaf, None)?;
-            let basic: FILE_BASIC_INFO = Self::query(&file, FileBasicInfo)?;
-            let standard: FILE_STANDARD_INFO = Self::query(&file, FileStandardInfo)?;
+            let file = Rc::new(Self::open_relative(parent.as_ref(), &leaf, None)?);
+            let basic: FILE_BASIC_INFO = Self::query(file.as_ref(), FileBasicInfo)?;
+            let standard: FILE_STANDARD_INFO = Self::query(file.as_ref(), FileStandardInfo)?;
+            let id: FILE_ID_INFO = Self::query(file.as_ref(), FileIdInfo)?;
+            self.metadata_leaves.borrow_mut().push(HeldMetadataLeaf {
+                parent,
+                name: leaf,
+                file,
+                volume_serial_number: id.VolumeSerialNumber,
+                file_id: id.FileId.Identifier,
+                attributes: basic.FileAttributes,
+                size: standard.EndOfFile,
+                modified: basic.LastWriteTime,
+                changed: basic.ChangeTime,
+            });
             let kind = if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                 MetadataKind::Link
             } else if basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 || standard.Directory {
@@ -673,6 +799,7 @@ mod confined_fs {
             path: &KnownGoodPhysicalPath,
             expected_size: u64,
             byte_budget: u64,
+            control: &mut dyn ContentReadControl,
         ) -> ContentHashResult {
             let mut bytes_read = 0_u64;
             let observation = (|| -> io::Result<ContentHashObservation> {
@@ -714,7 +841,8 @@ mod confined_fs {
                 }
 
                 let mut readable = file.as_ref();
-                let result = read_exact_sha1(&mut readable, expected_size, byte_budget);
+                let result =
+                    read_exact_sha1_controlled(&mut readable, expected_size, byte_budget, control);
                 bytes_read = result.bytes_read;
                 let digest = match result.observation? {
                     ContentHashObservation::Hashed { digest } => digest,
@@ -763,6 +891,34 @@ mod confined_fs {
                     ));
                 }
             }
+            for leaf in self.metadata_leaves.borrow().iter() {
+                let held_basic: FILE_BASIC_INFO = Self::query(leaf.file.as_ref(), FileBasicInfo)?;
+                let held_standard: FILE_STANDARD_INFO =
+                    Self::query(leaf.file.as_ref(), FileStandardInfo)?;
+                let held_id: FILE_ID_INFO = Self::query(leaf.file.as_ref(), FileIdInfo)?;
+                if held_id.VolumeSerialNumber != leaf.volume_serial_number
+                    || held_id.FileId.Identifier != leaf.file_id
+                    || held_basic.FileAttributes != leaf.attributes
+                    || held_standard.EndOfFile != leaf.size
+                    || held_basic.LastWriteTime != leaf.modified
+                    || held_basic.ChangeTime != leaf.changed
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "known-good metadata leaf changed after observation",
+                    ));
+                }
+                let current = Self::open_relative(leaf.parent.as_ref(), &leaf.name, None)?;
+                let current_id: FILE_ID_INFO = Self::query(&current, FileIdInfo)?;
+                if current_id.VolumeSerialNumber != leaf.volume_serial_number
+                    || current_id.FileId.Identifier != leaf.file_id
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "known-good metadata leaf identity changed",
+                    ));
+                }
+            }
             for leaf in self.leaves.borrow().iter() {
                 let held_basic: FILE_BASIC_INFO = Self::query(leaf.file.as_ref(), FileBasicInfo)?;
                 let held_standard: FILE_STANDARD_INFO =
@@ -804,12 +960,12 @@ mod confined_fs {
 }
 
 #[derive(Default)]
-struct FilesystemMetadataReader {
+struct FilesystemIntegrityReader {
     #[cfg(any(unix, windows))]
     inner: confined_fs::Reader,
 }
 
-impl MetadataReader for FilesystemMetadataReader {
+impl MetadataReader for FilesystemIntegrityReader {
     fn symlink_metadata(&self, path: &KnownGoodPhysicalPath) -> io::Result<MetadataObservation> {
         #[cfg(any(unix, windows))]
         return self.inner.metadata(path);
@@ -841,21 +997,32 @@ impl MetadataReader for FilesystemMetadataReader {
     }
 }
 
-#[derive(Default)]
-struct FilesystemContentReader {
-    #[cfg(any(unix, windows))]
-    inner: confined_fs::Reader,
-}
-
-impl ContentReader for FilesystemContentReader {
+impl ContentReader for FilesystemIntegrityReader {
     fn hash_file(
         &self,
         path: &KnownGoodPhysicalPath,
         expected_size: u64,
         byte_budget: u64,
     ) -> ContentHashResult {
+        self.hash_file_controlled(
+            path,
+            expected_size,
+            byte_budget,
+            &mut UnrestrictedContentReadControl,
+        )
+    }
+
+    fn hash_file_controlled(
+        &self,
+        path: &KnownGoodPhysicalPath,
+        expected_size: u64,
+        byte_budget: u64,
+        control: &mut dyn ContentReadControl,
+    ) -> ContentHashResult {
         #[cfg(any(unix, windows))]
-        return self.inner.hash_file(path, expected_size, byte_budget);
+        return self
+            .inner
+            .hash_file(path, expected_size, byte_budget, control);
         #[cfg(not(any(unix, windows)))]
         ContentHashResult {
             observation: Err(io::Error::new(
@@ -898,7 +1065,7 @@ pub(crate) fn sense_integrity_tier0(
     let report = sense_integrity_tier0_with(
         &lease,
         runtime_selection,
-        &FilesystemMetadataReader::default(),
+        &FilesystemIntegrityReader::default(),
     );
     if !state.known_good_verification_lease_is_current(&lease) {
         return Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable);
@@ -994,7 +1161,7 @@ pub(crate) async fn sense_integrity_tier1(
         state,
         lifecycle,
         expected_library_root,
-        FilesystemContentReader::default,
+        FilesystemIntegrityReader::default,
     )
     .await
 }
@@ -1138,6 +1305,12 @@ fn run_tier1_jobs(jobs: Vec<Tier1HashJob>, reader: &impl ContentReader) -> Integ
                 ExecutionFactKind::PrimitiveRefused,
                 "content_budget_refused",
             )),
+            Ok(ContentHashObservation::Cancelled) => Some(tier1_integrity_fact(
+                &job.file,
+                job.inventory_ordinal,
+                ExecutionFactKind::PrimitiveRefused,
+                "content_read_cancelled",
+            )),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Some(tier1_integrity_fact(
                 &job.file,
                 job.inventory_ordinal,
@@ -1242,6 +1415,622 @@ fn tier1_budget_accounting_refused_fact() -> ExecutionFact {
 
 fn push_bounded_tier1_fact(report: &mut IntegrityTier1Report, fact: ExecutionFact) {
     if report.facts.len() < MAX_INTEGRITY_TIER1_FACTS {
+        report.facts.push(fact);
+    } else {
+        report.suppressed_fact_count += 1;
+    }
+}
+
+const MAX_INTEGRITY_TIER2_FACTS: usize = 64;
+const MAX_INTEGRITY_TIER2_BATCH_ENTRIES: usize = 128;
+const INTEGRITY_TIER2_BATCH_CONTENT_THRESHOLD_BYTES: u64 = 64 << 20;
+const INTEGRITY_TIER2_BYTES_PER_SECOND: u64 = 8 << 20;
+const INTEGRITY_TIER2_ENTRIES_PER_SECOND: u64 = 64;
+const INTEGRITY_TIER2_BYTE_BURST: u64 = 64 * 1024;
+const MAX_INTEGRITY_TIER2_THROTTLE_SLEEP: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Default)]
+pub(crate) struct IntegrityTier2Cancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the R5 scheduler slice")
+)]
+impl IntegrityTier2Cancellation {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IntegrityTier2Status {
+    Complete,
+    Cancelled,
+    Refused,
+}
+
+#[derive(Debug)]
+pub(crate) struct IntegrityTier2Report {
+    pub(crate) status: IntegrityTier2Status,
+    pub(crate) facts: Vec<ExecutionFact>,
+    pub(crate) selected_entry_count: usize,
+    pub(crate) verified_entry_count: usize,
+    pub(crate) processed_entry_count: usize,
+    pub(crate) hashed_entry_count: usize,
+    pub(crate) expected_content_byte_count: u64,
+    pub(crate) content_read_byte_count: u64,
+    pub(crate) metadata_lookup_count: usize,
+    pub(crate) link_lookup_count: usize,
+    pub(crate) suppressed_fact_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct IntegrityTier2Progress {
+    pub(crate) selected_entry_count: usize,
+    pub(crate) verified_entry_count: usize,
+    pub(crate) processed_entry_count: usize,
+    pub(crate) hashed_entry_count: usize,
+    pub(crate) expected_content_byte_count: u64,
+    pub(crate) content_read_byte_count: u64,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct IntegrityTier2ProgressSink {
+    latest: Arc<Mutex<IntegrityTier2Progress>>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the R5 scheduler slice")
+)]
+impl IntegrityTier2ProgressSink {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn latest(&self) -> IntegrityTier2Progress {
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn publish(&self, report: &IntegrityTier2Report) {
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = IntegrityTier2Progress {
+            selected_entry_count: report.selected_entry_count,
+            verified_entry_count: report.verified_entry_count,
+            processed_entry_count: report.processed_entry_count,
+            hashed_entry_count: report.hashed_entry_count,
+            expected_content_byte_count: report.expected_content_byte_count,
+            content_read_byte_count: report.content_read_byte_count,
+        };
+    }
+}
+
+#[must_use = "Tier 2 work must be run by its blocking owner"]
+pub(crate) struct IntegrityTier2OwnedWork {
+    state: AppState,
+    ticket: KnownGoodTier2Ticket,
+    cancellation: IntegrityTier2Cancellation,
+    progress: IntegrityTier2ProgressSink,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the R5 scheduler slice")
+)]
+impl IntegrityTier2OwnedWork {
+    pub(crate) fn new(
+        state: AppState,
+        ticket: KnownGoodTier2Ticket,
+        cancellation: IntegrityTier2Cancellation,
+        progress: IntegrityTier2ProgressSink,
+    ) -> Self {
+        Self {
+            state,
+            ticket,
+            cancellation,
+            progress,
+        }
+    }
+
+    pub(crate) fn run(self) -> IntegrityTier2Report {
+        let Self {
+            state,
+            ticket,
+            cancellation,
+            progress,
+        } = self;
+        settle_integrity_tier2_owned(&progress, || {
+            sense_integrity_tier2_owned(&state, ticket, &cancellation, &progress)
+        })
+    }
+}
+
+fn settle_integrity_tier2_owned(
+    progress: &IntegrityTier2ProgressSink,
+    run: impl FnOnce() -> IntegrityTier2Report,
+) -> IntegrityTier2Report {
+    let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .unwrap_or_else(|_| IntegrityTier2Report::new(0, 0).refuse(tier2_worker_refused_fact()));
+    progress.publish(&report);
+    report
+}
+
+impl IntegrityTier2Report {
+    fn new(selected_entry_count: usize, expected_content_byte_count: u64) -> Self {
+        Self {
+            status: IntegrityTier2Status::Refused,
+            facts: Vec::new(),
+            selected_entry_count,
+            verified_entry_count: 0,
+            processed_entry_count: 0,
+            hashed_entry_count: 0,
+            expected_content_byte_count,
+            content_read_byte_count: 0,
+            metadata_lookup_count: 0,
+            link_lookup_count: 0,
+            suppressed_fact_count: 0,
+        }
+    }
+
+    fn cancel(mut self) -> Self {
+        self.status = IntegrityTier2Status::Cancelled;
+        self.facts.clear();
+        self.suppressed_fact_count = 0;
+        self
+    }
+
+    fn refuse(mut self, fact: ExecutionFact) -> Self {
+        self.status = IntegrityTier2Status::Refused;
+        self.facts.clear();
+        self.suppressed_fact_count = 0;
+        self.facts.push(fact);
+        self
+    }
+}
+
+trait IntegrityTier2Pacer {
+    fn elapsed(&self) -> Duration;
+    fn sleep(&self, duration: Duration);
+}
+
+struct SystemIntegrityTier2Pacer {
+    started_at: Instant,
+}
+
+impl SystemIntegrityTier2Pacer {
+    fn start() -> Self {
+        Self {
+            started_at: Instant::now(),
+        }
+    }
+}
+
+impl IntegrityTier2Pacer for SystemIntegrityTier2Pacer {
+    fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+struct IntegrityTier2ReadControl<'a, Pacer> {
+    cancellation: &'a IntegrityTier2Cancellation,
+    pacer: &'a Pacer,
+    last_refill: Duration,
+    byte_tokens: u128,
+    entry_tokens: u128,
+}
+
+impl<'a, Pacer: IntegrityTier2Pacer> IntegrityTier2ReadControl<'a, Pacer> {
+    fn new(cancellation: &'a IntegrityTier2Cancellation, pacer: &'a Pacer) -> Self {
+        Self {
+            cancellation,
+            pacer,
+            last_refill: pacer.elapsed(),
+            byte_tokens: u128::from(INTEGRITY_TIER2_BYTE_BURST) * 1_000_000_000,
+            entry_tokens: 1_000_000_000,
+        }
+    }
+}
+
+impl<Pacer: IntegrityTier2Pacer> IntegrityTier2ReadControl<'_, Pacer> {
+    fn before_entry(&mut self) -> bool {
+        self.admit(1, INTEGRITY_TIER2_ENTRIES_PER_SECOND, 1, false)
+    }
+
+    fn refill(&mut self) {
+        let now = self.pacer.elapsed();
+        let elapsed_nanoseconds = now.saturating_sub(self.last_refill).as_nanos();
+        self.last_refill = now;
+        self.byte_tokens = self
+            .byte_tokens
+            .saturating_add(
+                elapsed_nanoseconds.saturating_mul(u128::from(INTEGRITY_TIER2_BYTES_PER_SECOND)),
+            )
+            .min(u128::from(INTEGRITY_TIER2_BYTE_BURST) * 1_000_000_000);
+        self.entry_tokens = self
+            .entry_tokens
+            .saturating_add(
+                elapsed_nanoseconds.saturating_mul(u128::from(INTEGRITY_TIER2_ENTRIES_PER_SECOND)),
+            )
+            .min(1_000_000_000);
+    }
+
+    fn admit(&mut self, amount: u64, rate_per_second: u64, burst: u64, bytes: bool) -> bool {
+        let required = u128::from(amount) * 1_000_000_000;
+        debug_assert!(amount <= burst);
+        loop {
+            if self.cancellation.is_cancelled() {
+                return false;
+            }
+            self.refill();
+            let tokens = if bytes {
+                &mut self.byte_tokens
+            } else {
+                &mut self.entry_tokens
+            };
+            if *tokens >= required {
+                *tokens -= required;
+                return !self.cancellation.is_cancelled();
+            }
+            let deficit = required - *tokens;
+            let wait_nanoseconds = deficit.div_ceil(u128::from(rate_per_second));
+            let wait = Duration::from_nanos(wait_nanoseconds.try_into().unwrap_or(u64::MAX));
+            self.pacer
+                .sleep(wait.min(MAX_INTEGRITY_TIER2_THROTTLE_SLEEP));
+        }
+    }
+}
+
+impl<Pacer: IntegrityTier2Pacer> ContentReadControl for IntegrityTier2ReadControl<'_, Pacer> {
+    fn before_read(&mut self, next_read_bytes: usize) -> bool {
+        self.admit(
+            next_read_bytes as u64,
+            INTEGRITY_TIER2_BYTES_PER_SECOND,
+            INTEGRITY_TIER2_BYTE_BURST,
+            true,
+        )
+    }
+}
+
+struct IntegrityTier2RunContext<'a, Pacer> {
+    library_root: &'a Path,
+    runtime_cache: &'a ManagedRuntimeCache,
+    cancellation: &'a IntegrityTier2Cancellation,
+    pacer: &'a Pacer,
+    progress: &'a IntegrityTier2ProgressSink,
+}
+
+fn sense_integrity_tier2_owned(
+    state: &AppState,
+    ticket: KnownGoodTier2Ticket,
+    cancellation: &IntegrityTier2Cancellation,
+    progress: &IntegrityTier2ProgressSink,
+) -> IntegrityTier2Report {
+    let (library_root, runtime_cache, inventory) = ticket.execution_parts();
+    if cancellation.is_cancelled() {
+        let report = IntegrityTier2Report::new(inventory.entries().len(), 0).cancel();
+        progress.publish(&report);
+        return report;
+    }
+    let projection = match inventory.tier2_projection() {
+        Ok(projection) => projection,
+        Err(error) => {
+            let report = IntegrityTier2Report::new(error.entry_count(), 0)
+                .refuse(tier2_projection_refused_fact(error.entry_count()));
+            progress.publish(&report);
+            return report;
+        }
+    };
+    let pacer = SystemIntegrityTier2Pacer::start();
+    let report = run_integrity_tier2_with(
+        projection,
+        IntegrityTier2RunContext {
+            library_root,
+            runtime_cache,
+            cancellation,
+            pacer: &pacer,
+            progress,
+        },
+        FilesystemIntegrityReader::default,
+        || state.known_good_tier2_ticket_is_current(&ticket),
+    );
+    progress.publish(&report);
+    report
+}
+
+fn run_integrity_tier2_with<Reader, ReaderFactory, Pacer, IsCurrent>(
+    projection: Tier2Projection<'_>,
+    context: IntegrityTier2RunContext<'_, Pacer>,
+    mut reader_factory: ReaderFactory,
+    mut is_current: IsCurrent,
+) -> IntegrityTier2Report
+where
+    Reader: MetadataReader + ContentReader,
+    ReaderFactory: FnMut() -> Reader,
+    Pacer: IntegrityTier2Pacer,
+    IsCurrent: FnMut() -> bool,
+{
+    let mut report = IntegrityTier2Report::new(
+        projection.entry_count(),
+        projection.expected_content_byte_count(),
+    );
+    context.progress.publish(&report);
+    if context.cancellation.is_cancelled() {
+        return report.cancel();
+    }
+    if !is_current() {
+        return report.refuse(tier2_authority_refused_fact());
+    }
+
+    let mut entries = projection.iter().peekable();
+    let mut control = IntegrityTier2ReadControl::new(context.cancellation, context.pacer);
+    while entries.peek().is_some() {
+        if context.cancellation.is_cancelled() {
+            return report.cancel();
+        }
+        if !is_current() {
+            return report.refuse(tier2_authority_refused_fact());
+        }
+        let reader = reader_factory();
+        let batch_start_bytes = report.content_read_byte_count;
+        let mut batch_entry_count = 0_usize;
+        while batch_entry_count < MAX_INTEGRITY_TIER2_BATCH_ENTRIES && entries.peek().is_some() {
+            if context.cancellation.is_cancelled() {
+                return report.cancel();
+            }
+            if !control.before_entry() {
+                return report.cancel();
+            }
+            let projected = entries.next().expect("peeked Tier 2 entry");
+            let path = projected.physical_path(context.library_root, context.runtime_cache);
+            if !inspect_tier2_entry(
+                &reader,
+                projected.entry(),
+                projected.inventory_ordinal(),
+                &path,
+                &mut control,
+                &mut report,
+            ) {
+                return report.cancel();
+            }
+            report.processed_entry_count += 1;
+            context.progress.publish(&report);
+            batch_entry_count += 1;
+            if report
+                .content_read_byte_count
+                .saturating_sub(batch_start_bytes)
+                >= INTEGRITY_TIER2_BATCH_CONTENT_THRESHOLD_BYTES
+            {
+                break;
+            }
+        }
+        if context.cancellation.is_cancelled() {
+            return report.cancel();
+        }
+        if MetadataReader::revalidate(&reader).is_err() {
+            return report.refuse(tier2_confinement_refused_fact());
+        }
+        report.verified_entry_count = report.processed_entry_count;
+        context.progress.publish(&report);
+        drop(reader);
+        if !is_current() {
+            return report.refuse(tier2_authority_refused_fact());
+        }
+    }
+    if context.cancellation.is_cancelled() {
+        return report.cancel();
+    }
+    if !is_current() {
+        return report.refuse(tier2_authority_refused_fact());
+    }
+    report.status = IntegrityTier2Status::Complete;
+    context.progress.publish(&report);
+    report
+}
+
+fn inspect_tier2_entry(
+    reader: &(impl MetadataReader + ContentReader),
+    entry: &KnownGoodEntry,
+    inventory_ordinal: usize,
+    path: &KnownGoodPhysicalPath,
+    control: &mut dyn ContentReadControl,
+    report: &mut IntegrityTier2Report,
+) -> bool {
+    match entry.integrity() {
+        KnownGoodIntegrity::Sha1 { digest, size }
+        | KnownGoodIntegrity::ExactBytes { digest, size } => {
+            let byte_budget = report
+                .expected_content_byte_count
+                .saturating_sub(report.content_read_byte_count);
+            let result = reader.hash_file_controlled(path, *size, byte_budget, control);
+            report.content_read_byte_count = report
+                .content_read_byte_count
+                .saturating_add(result.bytes_read);
+            let fact = match result.observation {
+                Ok(ContentHashObservation::Hashed {
+                    digest: observed_digest,
+                }) => {
+                    report.hashed_entry_count += 1;
+                    (observed_digest != digest.as_str()).then(|| {
+                        integrity_fact(
+                            entry,
+                            inventory_ordinal,
+                            ExecutionFactKind::ArtifactHashMismatch,
+                            "hash_mismatch",
+                        )
+                    })
+                }
+                Ok(ContentHashObservation::SizeDrift { observed_size }) => {
+                    let mut fact = integrity_fact(
+                        entry,
+                        inventory_ordinal,
+                        ExecutionFactKind::ArtifactSizeDrift,
+                        "size_drift",
+                    );
+                    fact.fields.extend([
+                        public_field("expected_size", size.to_string()),
+                        public_field("observed_size", observed_size.to_string()),
+                    ]);
+                    Some(fact)
+                }
+                Ok(ContentHashObservation::WrongType) => Some(integrity_fact(
+                    entry,
+                    inventory_ordinal,
+                    ExecutionFactKind::ArtifactMissing,
+                    "wrong_type",
+                )),
+                Ok(ContentHashObservation::ChangedDuringRead) => Some(integrity_fact(
+                    entry,
+                    inventory_ordinal,
+                    ExecutionFactKind::PrimitiveRefused,
+                    "content_changed_during_read",
+                )),
+                Ok(ContentHashObservation::BudgetRefused) => Some(integrity_fact(
+                    entry,
+                    inventory_ordinal,
+                    ExecutionFactKind::PrimitiveRefused,
+                    "content_budget_refused",
+                )),
+                Ok(ContentHashObservation::Cancelled) => return false,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Some(integrity_fact(
+                    entry,
+                    inventory_ordinal,
+                    ExecutionFactKind::ArtifactMissing,
+                    "missing",
+                )),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    Some(integrity_fact(
+                        entry,
+                        inventory_ordinal,
+                        ExecutionFactKind::FilePermissionDenied,
+                        "content_permission_denied",
+                    ))
+                }
+                Err(_) => Some(integrity_fact(
+                    entry,
+                    inventory_ordinal,
+                    ExecutionFactKind::PrimitiveRefused,
+                    "content_unavailable",
+                )),
+            };
+            if let Some(fact) = fact {
+                push_bounded_tier2_fact(report, fact);
+            }
+        }
+        KnownGoodIntegrity::Directory | KnownGoodIntegrity::LinkTarget(_) => {
+            report.metadata_lookup_count += 1;
+            let fact = match reader.symlink_metadata(path) {
+                Ok(observation) => {
+                    let mut tier0_shape = IntegrityTier0Report::default();
+                    let fact = inspect_observation(
+                        reader,
+                        entry,
+                        path,
+                        inventory_ordinal,
+                        observation,
+                        &mut tier0_shape,
+                    );
+                    report.link_lookup_count += tier0_shape.link_lookup_count;
+                    fact
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Some(integrity_fact(
+                    entry,
+                    inventory_ordinal,
+                    ExecutionFactKind::ArtifactMissing,
+                    "missing",
+                )),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    Some(integrity_fact(
+                        entry,
+                        inventory_ordinal,
+                        ExecutionFactKind::FilePermissionDenied,
+                        "metadata_permission_denied",
+                    ))
+                }
+                Err(_) => Some(integrity_fact(
+                    entry,
+                    inventory_ordinal,
+                    ExecutionFactKind::PrimitiveRefused,
+                    "metadata_unavailable",
+                )),
+            };
+            if let Some(fact) = fact {
+                push_bounded_tier2_fact(report, fact);
+            }
+        }
+    }
+    true
+}
+
+fn tier2_projection_refused_fact(entry_count: usize) -> ExecutionFact {
+    tier2_refused_fact(
+        "known_good_tier2_projection",
+        "tier2_projection_refused",
+        Some(entry_count),
+    )
+}
+
+fn tier2_confinement_refused_fact() -> ExecutionFact {
+    tier2_refused_fact(
+        "known_good_tier2_path_confinement",
+        "path_identity_changed",
+        None,
+    )
+}
+
+fn tier2_authority_refused_fact() -> ExecutionFact {
+    tier2_refused_fact("known_good_tier2_authority", "live_authority_changed", None)
+}
+
+fn tier2_worker_refused_fact() -> ExecutionFact {
+    tier2_refused_fact("known_good_tier2_worker", "tier2_worker_unavailable", None)
+}
+
+fn tier2_refused_fact(
+    target_id: &'static str,
+    observation: &'static str,
+    entry_count: Option<usize>,
+) -> ExecutionFact {
+    let mut fields = vec![public_field("observation", observation)];
+    if let Some(entry_count) = entry_count {
+        fields.push(public_field(
+            "selected_entry_count",
+            entry_count.to_string(),
+        ));
+    }
+    ExecutionFact {
+        operation_id: None,
+        kind: ExecutionFactKind::PrimitiveRefused,
+        target: Some(TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            target_id,
+            OwnershipClass::LauncherManaged,
+        )),
+        fields,
+    }
+}
+
+fn push_bounded_tier2_fact(report: &mut IntegrityTier2Report, fact: ExecutionFact) {
+    if report.facts.len() < MAX_INTEGRITY_TIER2_FACTS {
         report.facts.push(fact);
     } else {
         report.suppressed_fact_count += 1;
@@ -1536,6 +2325,7 @@ mod tests {
     use axial_performance::PerformanceManager;
     use std::collections::HashMap;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
@@ -1726,6 +2516,116 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ScriptedTier2Reader {
+        metadata: Arc<ScriptedReader>,
+        content: Arc<ScriptedContentReader>,
+    }
+
+    impl MetadataReader for ScriptedTier2Reader {
+        fn symlink_metadata(
+            &self,
+            path: &KnownGoodPhysicalPath,
+        ) -> io::Result<MetadataObservation> {
+            self.metadata.symlink_metadata(path)
+        }
+
+        fn read_link(&self, path: &KnownGoodPhysicalPath) -> io::Result<PathBuf> {
+            self.metadata.read_link(path)
+        }
+
+        fn revalidate(&self) -> io::Result<()> {
+            self.metadata.revalidate()?;
+            self.content.revalidate()
+        }
+    }
+
+    impl ContentReader for ScriptedTier2Reader {
+        fn hash_file(
+            &self,
+            path: &KnownGoodPhysicalPath,
+            expected_size: u64,
+            byte_budget: u64,
+        ) -> ContentHashResult {
+            self.content.hash_file(path, expected_size, byte_budget)
+        }
+
+        fn hash_file_controlled(
+            &self,
+            path: &KnownGoodPhysicalPath,
+            expected_size: u64,
+            byte_budget: u64,
+            control: &mut dyn ContentReadControl,
+        ) -> ContentHashResult {
+            let result = self.content.hash_file(path, expected_size, byte_budget);
+            let mut admitted = 0_u64;
+            while admitted < result.bytes_read {
+                let next = (result.bytes_read - admitted).min(64 * 1024) as usize;
+                if !control.before_read(next) {
+                    return ContentHashResult {
+                        observation: Ok(ContentHashObservation::Cancelled),
+                        bytes_read: admitted,
+                    };
+                }
+                admitted += next as u64;
+            }
+            result
+        }
+
+        fn revalidate(&self) -> io::Result<()> {
+            self.metadata.revalidate()?;
+            self.content.revalidate()
+        }
+    }
+
+    struct ScriptedTier2Pacer {
+        elapsed: Mutex<Duration>,
+        sleeps: Mutex<Vec<Duration>>,
+        cancellation: Option<IntegrityTier2Cancellation>,
+        cancel_on_sleep: usize,
+    }
+
+    impl ScriptedTier2Pacer {
+        fn new() -> Self {
+            Self {
+                elapsed: Mutex::new(Duration::ZERO),
+                sleeps: Mutex::new(Vec::new()),
+                cancellation: None,
+                cancel_on_sleep: usize::MAX,
+            }
+        }
+
+        fn cancelling_on(cancellation: IntegrityTier2Cancellation, cancel_on_sleep: usize) -> Self {
+            Self {
+                cancellation: Some(cancellation),
+                cancel_on_sleep,
+                ..Self::new()
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            *self.elapsed.lock().expect("scripted elapsed") += duration;
+        }
+    }
+
+    impl IntegrityTier2Pacer for ScriptedTier2Pacer {
+        fn elapsed(&self) -> Duration {
+            *self.elapsed.lock().expect("scripted elapsed")
+        }
+
+        fn sleep(&self, duration: Duration) {
+            let mut sleeps = self.sleeps.lock().expect("scripted sleeps");
+            sleeps.push(duration);
+            if sleeps.len() == self.cancel_on_sleep
+                && let Some(cancellation) = &self.cancellation
+            {
+                cancellation.cancel();
+            }
+            drop(sleeps);
+            *self.elapsed.lock().expect("scripted elapsed") += duration;
+        }
+    }
+
     struct BlockingContentGate {
         state: Mutex<BlockingContentGateState>,
         released: Condvar,
@@ -1801,7 +2701,7 @@ mod tests {
 
     #[cfg(unix)]
     struct BlockingFilesystemContentReader {
-        inner: FilesystemContentReader,
+        inner: FilesystemIntegrityReader,
         blocked_leaf: PathBuf,
         gate: Arc<BlockingContentGate>,
     }
@@ -1821,7 +2721,7 @@ mod tests {
         }
 
         fn revalidate(&self) -> io::Result<()> {
-            self.inner.revalidate()
+            MetadataReader::revalidate(&self.inner)
         }
     }
 
@@ -1984,6 +2884,578 @@ mod tests {
         ));
         assert_eq!(refused.bytes_read, 0);
         assert_eq!(content.position(), 3);
+    }
+
+    #[test]
+    fn tier_two_verifies_every_inventory_integrity_shape_in_one_bounded_stream() {
+        let inventory = KnownGoodInventory::from_test_entries([
+            entry(
+                TestKnownGoodRoot::Versions,
+                "1.21.5/1.21.5.json",
+                KnownGoodArtifactKind::VersionMetadata,
+                TestKnownGoodIntegrity::ExactBytes { size: 1 },
+            ),
+            entry(
+                TestKnownGoodRoot::Assets,
+                "objects/00/object",
+                KnownGoodArtifactKind::AssetObject,
+                TestKnownGoodIntegrity::File { size: 2 },
+            ),
+            entry(
+                TestKnownGoodRoot::ManagedRuntime {
+                    component: "java-runtime-delta".to_string(),
+                },
+                "bin/java-real",
+                KnownGoodArtifactKind::RuntimeExecutable,
+                TestKnownGoodIntegrity::File { size: 3 },
+            ),
+            entry(
+                TestKnownGoodRoot::ManagedRuntime {
+                    component: "java-runtime-delta".to_string(),
+                },
+                "lib",
+                KnownGoodArtifactKind::RuntimeDirectory,
+                TestKnownGoodIntegrity::Directory,
+            ),
+            entry(
+                TestKnownGoodRoot::ManagedRuntime {
+                    component: "java-runtime-delta".to_string(),
+                },
+                "bin/java",
+                KnownGoodArtifactKind::RuntimeLink,
+                TestKnownGoodIntegrity::LinkTarget("java-real".to_string()),
+            ),
+        ])
+        .expect("Tier 2 inventory");
+        let projection = inventory.tier2_projection().expect("Tier 2 projection");
+        let reader = ScriptedTier2Reader {
+            metadata: Arc::new(ScriptedReader::new(
+                [
+                    ("lib", observation(MetadataKind::Directory, 0)),
+                    ("bin/java", observation(MetadataKind::Link, 0)),
+                ],
+                [("bin/java", Ok("java-real"))],
+            )),
+            content: Arc::new(ScriptedContentReader::new([
+                ("1.21.5/1.21.5.json", ScriptedContent::Hashed(ZERO_SHA1, 1)),
+                ("objects/00/object", ScriptedContent::Hashed(ZERO_SHA1, 2)),
+                ("bin/java-real", ScriptedContent::Hashed(ZERO_SHA1, 3)),
+            ])),
+        };
+        let cancellation = IntegrityTier2Cancellation::new();
+        let pacer = ScriptedTier2Pacer::new();
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+
+        let report = run_integrity_tier2_with(
+            projection,
+            IntegrityTier2RunContext {
+                library_root: Path::new("/private/library"),
+                runtime_cache: &runtime_cache,
+                cancellation: &cancellation,
+                pacer: &pacer,
+                progress: &IntegrityTier2ProgressSink::new(),
+            },
+            || reader.clone(),
+            || true,
+        );
+
+        assert_eq!(report.status, IntegrityTier2Status::Complete);
+        assert_eq!(report.selected_entry_count, 5);
+        assert_eq!(report.processed_entry_count, 5);
+        assert_eq!(report.verified_entry_count, 5);
+        assert_eq!(report.hashed_entry_count, 3);
+        assert_eq!(report.expected_content_byte_count, 6);
+        assert_eq!(report.content_read_byte_count, 6);
+        assert_eq!(report.metadata_lookup_count, 2);
+        assert_eq!(report.link_lookup_count, 1);
+        assert_eq!(report.suppressed_fact_count, 0);
+        assert!(report.facts.is_empty());
+        assert_eq!(
+            reader
+                .content
+                .content_paths
+                .lock()
+                .expect("content paths")
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn tier_two_pre_cancel_opens_nothing_and_publishes_no_partial_facts() {
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "org/example/library.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::File { size: 1 },
+        )])
+        .expect("inventory");
+        let projection = inventory.tier2_projection().expect("projection");
+        let cancellation = IntegrityTier2Cancellation::new();
+        cancellation.cancel();
+        let pacer = ScriptedTier2Pacer::new();
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        let reader_count = AtomicUsize::new(0);
+
+        let report = run_integrity_tier2_with::<ScriptedTier2Reader, _, _, _>(
+            projection,
+            IntegrityTier2RunContext {
+                library_root: Path::new("/private/library"),
+                runtime_cache: &runtime_cache,
+                cancellation: &cancellation,
+                pacer: &pacer,
+                progress: &IntegrityTier2ProgressSink::new(),
+            },
+            || {
+                reader_count.fetch_add(1, AtomicOrdering::SeqCst);
+                panic!("pre-cancelled sweep must not create a reader")
+            },
+            || true,
+        );
+
+        assert_eq!(report.status, IntegrityTier2Status::Cancelled);
+        assert_eq!(report.processed_entry_count, 0);
+        assert_eq!(report.content_read_byte_count, 0);
+        assert!(report.facts.is_empty());
+        assert_eq!(reader_count.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tier_two_cancels_inside_throttled_content_reads_with_ten_millisecond_waits() {
+        let content_size = 2 * 64 * 1024;
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "org/example/large.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::File { size: content_size },
+        )])
+        .expect("inventory");
+        let projection = inventory.tier2_projection().expect("projection");
+        let reader = ScriptedTier2Reader {
+            metadata: Arc::new(ScriptedReader::new([], [])),
+            content: Arc::new(ScriptedContentReader::new([(
+                "org/example/large.jar",
+                ScriptedContent::Hashed(ZERO_SHA1, content_size),
+            )])),
+        };
+        let cancellation = IntegrityTier2Cancellation::new();
+        let pacer = ScriptedTier2Pacer::cancelling_on(cancellation.clone(), 1);
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+
+        let report = run_integrity_tier2_with(
+            projection,
+            IntegrityTier2RunContext {
+                library_root: Path::new("/private/library"),
+                runtime_cache: &runtime_cache,
+                cancellation: &cancellation,
+                pacer: &pacer,
+                progress: &IntegrityTier2ProgressSink::new(),
+            },
+            || reader.clone(),
+            || true,
+        );
+
+        assert_eq!(report.status, IntegrityTier2Status::Cancelled);
+        assert_eq!(report.processed_entry_count, 0);
+        assert_eq!(report.content_read_byte_count, 64 * 1024);
+        assert!(report.facts.is_empty());
+        let sleeps = pacer.sleeps.lock().expect("scripted sleeps");
+        assert_eq!(sleeps.len(), 1);
+        assert!(
+            sleeps
+                .iter()
+                .all(|duration| *duration <= MAX_INTEGRITY_TIER2_THROTTLE_SLEEP)
+        );
+    }
+
+    #[test]
+    fn tier_two_rate_limiter_caps_the_complete_stream_at_eight_mebibytes_per_second() {
+        let content_size = 2 * 64 * 1024;
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "org/example/rate.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::File { size: content_size },
+        )])
+        .expect("inventory");
+        let projection = inventory.tier2_projection().expect("projection");
+        let reader = ScriptedTier2Reader {
+            metadata: Arc::new(ScriptedReader::new([], [])),
+            content: Arc::new(ScriptedContentReader::new([(
+                "org/example/rate.jar",
+                ScriptedContent::Hashed(ZERO_SHA1, content_size),
+            )])),
+        };
+        let cancellation = IntegrityTier2Cancellation::new();
+        let pacer = ScriptedTier2Pacer::new();
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+
+        let report = run_integrity_tier2_with(
+            projection,
+            IntegrityTier2RunContext {
+                library_root: Path::new("/private/library"),
+                runtime_cache: &runtime_cache,
+                cancellation: &cancellation,
+                pacer: &pacer,
+                progress: &IntegrityTier2ProgressSink::new(),
+            },
+            || reader.clone(),
+            || true,
+        );
+
+        assert_eq!(report.status, IntegrityTier2Status::Complete);
+        assert_eq!(report.content_read_byte_count, content_size);
+        let minimum_elapsed = Duration::from_secs_f64(
+            (content_size - INTEGRITY_TIER2_BYTE_BURST) as f64
+                / INTEGRITY_TIER2_BYTES_PER_SECOND as f64,
+        );
+        assert!(pacer.elapsed() >= minimum_elapsed);
+        assert!(
+            pacer
+                .sleeps
+                .lock()
+                .expect("scripted sleeps")
+                .iter()
+                .all(|duration| *duration <= MAX_INTEGRITY_TIER2_THROTTLE_SLEEP)
+        );
+    }
+
+    #[test]
+    fn tier_two_limiter_never_accrues_more_than_one_content_chunk_of_credit() {
+        let cancellation = IntegrityTier2Cancellation::new();
+        let pacer = ScriptedTier2Pacer::new();
+        let mut control = IntegrityTier2ReadControl::new(&cancellation, &pacer);
+
+        assert!(control.before_read(64 * 1024));
+        pacer.advance(Duration::from_secs(30));
+        assert!(control.before_read(64 * 1024));
+        let before = pacer.elapsed();
+        assert!(control.before_read(64 * 1024));
+
+        assert!(pacer.elapsed() > before);
+        assert!(
+            pacer
+                .sleeps
+                .lock()
+                .expect("scripted sleeps")
+                .iter()
+                .all(|duration| *duration <= MAX_INTEGRITY_TIER2_THROTTLE_SLEEP)
+        );
+    }
+
+    #[test]
+    fn tier_two_limiter_caps_zero_byte_entry_iops_at_sixty_four_per_second() {
+        let cancellation = IntegrityTier2Cancellation::new();
+        let pacer = ScriptedTier2Pacer::new();
+        let mut control = IntegrityTier2ReadControl::new(&cancellation, &pacer);
+
+        assert!(control.before_entry());
+        let before = pacer.elapsed();
+        assert!(control.before_entry());
+
+        assert!(
+            pacer.elapsed().saturating_sub(before)
+                >= Duration::from_secs_f64(1.0 / INTEGRITY_TIER2_ENTRIES_PER_SECOND as f64)
+        );
+        assert!(
+            pacer
+                .sleeps
+                .lock()
+                .expect("scripted sleeps")
+                .iter()
+                .all(|duration| *duration <= MAX_INTEGRITY_TIER2_THROTTLE_SLEEP)
+        );
+    }
+
+    #[test]
+    fn tier_two_processes_all_entries_while_bounding_facts_and_reader_batches() {
+        let inventory = KnownGoodInventory::from_test_entries((0..=128).map(|index| {
+            entry(
+                TestKnownGoodRoot::Libraries,
+                &format!("bounded/{index:03}.jar"),
+                KnownGoodArtifactKind::Library,
+                TestKnownGoodIntegrity::File { size: 1 },
+            )
+        }))
+        .expect("inventory");
+        let projection = inventory.tier2_projection().expect("projection");
+        let reader = ScriptedTier2Reader {
+            metadata: Arc::new(ScriptedReader::new([], [])),
+            content: Arc::new(
+                ScriptedContentReader::new([])
+                    .with_default(ScriptedContent::Hashed(NONZERO_SHA1, 1)),
+            ),
+        };
+        let cancellation = IntegrityTier2Cancellation::new();
+        let pacer = ScriptedTier2Pacer::new();
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        let reader_count = AtomicUsize::new(0);
+
+        let report = run_integrity_tier2_with(
+            projection,
+            IntegrityTier2RunContext {
+                library_root: Path::new("/private/library"),
+                runtime_cache: &runtime_cache,
+                cancellation: &cancellation,
+                pacer: &pacer,
+                progress: &IntegrityTier2ProgressSink::new(),
+            },
+            || {
+                reader_count.fetch_add(1, AtomicOrdering::SeqCst);
+                reader.clone()
+            },
+            || true,
+        );
+
+        assert_eq!(report.status, IntegrityTier2Status::Complete);
+        assert_eq!(report.processed_entry_count, 129);
+        assert_eq!(report.verified_entry_count, 129);
+        assert_eq!(report.hashed_entry_count, 129);
+        assert_eq!(report.facts.len(), MAX_INTEGRITY_TIER2_FACTS);
+        assert_eq!(report.suppressed_fact_count, 65);
+        assert_eq!(reader_count.load(AtomicOrdering::SeqCst), 2);
+        assert!(
+            report
+                .facts
+                .iter()
+                .all(|fact| fact.kind == ExecutionFactKind::ArtifactHashMismatch)
+        );
+    }
+
+    #[test]
+    fn tier_two_stale_authority_discards_previously_sensed_artifact_facts() {
+        let inventory = KnownGoodInventory::from_test_entries((0..=128).map(|index| {
+            entry(
+                TestKnownGoodRoot::Libraries,
+                &format!("stale/{index:03}.jar"),
+                KnownGoodArtifactKind::Library,
+                TestKnownGoodIntegrity::File { size: 0 },
+            )
+        }))
+        .expect("inventory");
+        let projection = inventory.tier2_projection().expect("projection");
+        let reader = ScriptedTier2Reader {
+            metadata: Arc::new(ScriptedReader::new([], [])),
+            content: Arc::new(
+                ScriptedContentReader::new([])
+                    .with_default(ScriptedContent::Hashed(NONZERO_SHA1, 0)),
+            ),
+        };
+        let cancellation = IntegrityTier2Cancellation::new();
+        let pacer = ScriptedTier2Pacer::new();
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        let current_checks = AtomicUsize::new(0);
+
+        let report = run_integrity_tier2_with(
+            projection,
+            IntegrityTier2RunContext {
+                library_root: Path::new("/private/library"),
+                runtime_cache: &runtime_cache,
+                cancellation: &cancellation,
+                pacer: &pacer,
+                progress: &IntegrityTier2ProgressSink::new(),
+            },
+            || reader.clone(),
+            || current_checks.fetch_add(1, AtomicOrdering::SeqCst) < 2,
+        );
+
+        assert_eq!(report.status, IntegrityTier2Status::Refused);
+        assert_eq!(report.processed_entry_count, 128);
+        assert_eq!(report.verified_entry_count, 128);
+        assert_eq!(report.facts.len(), 1);
+        assert_eq!(report.facts[0].kind, ExecutionFactKind::PrimitiveRefused);
+        assert_eq!(
+            fact_field(&report.facts[0], "observation"),
+            Some("live_authority_changed")
+        );
+        assert_eq!(report.suppressed_fact_count, 0);
+    }
+
+    #[test]
+    fn tier_two_batch_revalidation_refusal_discards_artifact_observations() {
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "drift/library.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::File { size: 1 },
+        )])
+        .expect("inventory");
+        let projection = inventory.tier2_projection().expect("projection");
+        let reader = ScriptedTier2Reader {
+            metadata: Arc::new(
+                ScriptedReader::new([], []).with_revalidate_error(io::ErrorKind::PermissionDenied),
+            ),
+            content: Arc::new(
+                ScriptedContentReader::new([])
+                    .with_default(ScriptedContent::Hashed(NONZERO_SHA1, 1)),
+            ),
+        };
+        let cancellation = IntegrityTier2Cancellation::new();
+        let pacer = ScriptedTier2Pacer::new();
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+
+        let report = run_integrity_tier2_with(
+            projection,
+            IntegrityTier2RunContext {
+                library_root: Path::new("/private/library"),
+                runtime_cache: &runtime_cache,
+                cancellation: &cancellation,
+                pacer: &pacer,
+                progress: &IntegrityTier2ProgressSink::new(),
+            },
+            || reader.clone(),
+            || true,
+        );
+
+        assert_eq!(report.status, IntegrityTier2Status::Refused);
+        assert_eq!(report.processed_entry_count, 1);
+        assert_eq!(report.verified_entry_count, 0);
+        assert_eq!(report.facts.len(), 1);
+        assert_eq!(report.facts[0].kind, ExecutionFactKind::PrimitiveRefused);
+        assert_eq!(
+            fact_field(&report.facts[0], "observation"),
+            Some("path_identity_changed")
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_two_move_only_work_publishes_latest_progress_from_the_owned_call() {
+        let (state, root) = state_fixture("tier2-owned-work", None);
+        let library_root = root.join("private-library-root");
+        let managed_parent = library_root.join("libraries/owned");
+        fs::create_dir_all(&managed_parent).expect("managed library parent");
+        fs::write(managed_parent.join("library.jar"), [7_u8]).expect("managed library");
+        let instance = state
+            .instances()
+            .insert_for_test("Tier two owned work", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "owned/library.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::File { size: 1 },
+        )])
+        .expect("inventory");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let ticket = state
+            .mint_known_good_tier2_ticket(&instance.id)
+            .await
+            .expect("Tier 2 ticket");
+        let progress = IntegrityTier2ProgressSink::new();
+        let work = IntegrityTier2OwnedWork::new(
+            state.clone(),
+            ticket,
+            IntegrityTier2Cancellation::new(),
+            progress.clone(),
+        );
+
+        let report = work.run();
+
+        assert_eq!(report.status, IntegrityTier2Status::Complete);
+        assert_eq!(report.selected_entry_count, 1);
+        assert_eq!(report.verified_entry_count, 1);
+        assert_eq!(report.hashed_entry_count, 1);
+        assert_eq!(report.content_read_byte_count, 1);
+        assert_eq!(report.facts.len(), 1);
+        assert_eq!(
+            report.facts[0].kind,
+            ExecutionFactKind::ArtifactHashMismatch
+        );
+        assert_eq!(
+            progress.latest(),
+            IntegrityTier2Progress {
+                selected_entry_count: 1,
+                verified_entry_count: 1,
+                processed_entry_count: 1,
+                hashed_entry_count: 1,
+                expected_content_byte_count: 1,
+                content_read_byte_count: 1,
+            }
+        );
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn tier_two_actual_confined_reader_cancels_during_a_multi_chunk_file() {
+        let (state, root) = state_fixture("tier2-confined-cancellation", None);
+        let library_root = root.join("private-library-root");
+        let managed_parent = library_root.join("libraries/cancel");
+        fs::create_dir_all(&managed_parent).expect("managed library parent");
+        fs::write(managed_parent.join("large.jar"), vec![7_u8; 2 * 64 * 1024])
+            .expect("managed library");
+        let instance = state
+            .instances()
+            .insert_for_test("Tier two cancellation", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "cancel/large.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::File {
+                size: 2 * 64 * 1024,
+            },
+        )])
+        .expect("inventory");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let ticket = state
+            .mint_known_good_tier2_ticket(&instance.id)
+            .await
+            .expect("Tier 2 ticket");
+        let cancellation = IntegrityTier2Cancellation::new();
+        let cancel_from_thread = cancellation.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2));
+            cancel_from_thread.cancel();
+        });
+        let work = IntegrityTier2OwnedWork::new(
+            state.clone(),
+            ticket,
+            cancellation,
+            IntegrityTier2ProgressSink::new(),
+        );
+
+        let report = work.run();
+        canceller.join().expect("cancellation thread");
+
+        assert_eq!(report.status, IntegrityTier2Status::Cancelled);
+        assert!(report.content_read_byte_count <= 64 * 1024);
+        assert!(report.facts.is_empty());
+        close_fixture(state, root).await;
+    }
+
+    #[test]
+    fn tier_two_owned_boundary_settles_worker_panics_as_one_bounded_refusal() {
+        let progress = IntegrityTier2ProgressSink::new();
+
+        let report =
+            settle_integrity_tier2_owned(&progress, || panic!("injected Tier 2 worker panic"));
+
+        assert_eq!(report.status, IntegrityTier2Status::Refused);
+        assert_eq!(report.facts.len(), 1);
+        assert_eq!(report.facts[0].kind, ExecutionFactKind::PrimitiveRefused);
+        assert_eq!(
+            fact_field(&report.facts[0], "observation"),
+            Some("tier2_worker_unavailable")
+        );
+        assert_eq!(progress.latest(), IntegrityTier2Progress::default());
+    }
+
+    #[test]
+    fn tier_two_primitive_is_move_only_and_contains_no_task_spawn() {
+        fn assert_send<T: Send>() {}
+        assert_send::<IntegrityTier2OwnedWork>();
+
+        let source = include_str!("integrity.rs");
+        let primitive = source
+            .split("fn sense_integrity_tier2_owned")
+            .nth(1)
+            .expect("Tier 2 primitive")
+            .split("fn run_integrity_tier2_with")
+            .next()
+            .expect("Tier 2 primitive body");
+        assert!(!primitive.contains("spawn"));
+        assert!(source.contains("Tier 2 work must be run by its blocking owner"));
+        assert!(!source.contains(concat!("impl Clone for IntegrityTier2", "OwnedWork")));
     }
 
     #[tokio::test]
@@ -2507,7 +3979,7 @@ mod tests {
                 &lifecycle,
                 &sensing_library_root,
                 move || BlockingFilesystemContentReader {
-                    inner: FilesystemContentReader::default(),
+                    inner: FilesystemIntegrityReader::default(),
                     blocked_leaf: PathBuf::from("race/second.jar"),
                     gate: sensing_gate,
                 },

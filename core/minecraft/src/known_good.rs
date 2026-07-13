@@ -38,6 +38,9 @@ pub const MAX_LAUNCH_TIER0_ENTRIES: usize = 512;
 pub const MAX_LAUNCH_TIER1_ENTRIES: usize = 512;
 pub const MAX_LAUNCH_TIER1_ARTIFACT_BYTES: u64 = 512 << 20;
 pub const MAX_LAUNCH_TIER1_AGGREGATE_BYTES: u64 = 2 << 30;
+pub const MAX_TIER2_ENTRIES: usize = MAX_KNOWN_GOOD_ENTRIES;
+pub const MAX_TIER2_ARTIFACT_BYTES: u64 = 512 << 20;
+pub const MAX_TIER2_AGGREGATE_BYTES: u64 = 16 << 30;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchTier0RuntimeSelection<'a> {
@@ -307,6 +310,51 @@ impl KnownGoodInventory {
         Ok(LaunchTier1Projection { entries })
     }
 
+    pub fn tier2_projection(&self) -> Result<Tier2Projection<'_>, Tier2ProjectionError> {
+        let entry_count = self.entries.len();
+        if entry_count > MAX_TIER2_ENTRIES {
+            return Err(Tier2ProjectionError::TooManyEntries { entry_count });
+        }
+
+        let mut expected_content_byte_count = 0_u64;
+        for (inventory_ordinal, entry) in self.entries.iter().enumerate() {
+            if !tier2_root_kind_is_supported(entry) {
+                return Err(Tier2ProjectionError::UnsupportedRootKind {
+                    entry_count,
+                    inventory_ordinal,
+                });
+            }
+            let Some(size) = tier2_content_size(entry) else {
+                if tier2_non_file_integrity_is_supported(entry) {
+                    continue;
+                }
+                return Err(Tier2ProjectionError::UnsupportedIntegrity {
+                    entry_count,
+                    inventory_ordinal,
+                });
+            };
+            if size > MAX_TIER2_ARTIFACT_BYTES {
+                return Err(Tier2ProjectionError::ArtifactByteLimitExceeded {
+                    entry_count,
+                    inventory_ordinal,
+                    expected_byte_count: size,
+                });
+            }
+            expected_content_byte_count = expected_content_byte_count.saturating_add(size);
+            if expected_content_byte_count > MAX_TIER2_AGGREGATE_BYTES {
+                return Err(Tier2ProjectionError::AggregateByteLimitExceeded {
+                    entry_count,
+                    expected_byte_count: expected_content_byte_count,
+                });
+            }
+        }
+
+        Ok(Tier2Projection {
+            entries: &self.entries,
+            expected_content_byte_count,
+        })
+    }
+
     #[cfg(feature = "test-support")]
     pub fn from_test_entries(
         entries: impl IntoIterator<Item = TestKnownGoodEntry>,
@@ -357,6 +405,59 @@ fn launch_tier1_root(entry: &KnownGoodEntry) -> Option<LaunchTier1PhysicalRoot> 
         ) => Some(LaunchTier1PhysicalRoot::Libraries),
         _ => None,
     }
+}
+
+fn tier2_root_kind_is_supported(entry: &KnownGoodEntry) -> bool {
+    matches!(
+        (entry.root(), entry.kind()),
+        (
+            KnownGoodRoot::Versions,
+            KnownGoodArtifactKind::VersionMetadata | KnownGoodArtifactKind::ClientJar,
+        ) | (
+            KnownGoodRoot::Libraries,
+            KnownGoodArtifactKind::Library | KnownGoodArtifactKind::NativeLibrary,
+        ) | (
+            KnownGoodRoot::Assets,
+            KnownGoodArtifactKind::AssetIndex
+                | KnownGoodArtifactKind::AssetObject
+                | KnownGoodArtifactKind::LogConfig,
+        ) | (
+            KnownGoodRoot::ManagedRuntime { .. },
+            KnownGoodArtifactKind::RuntimeManifestProof
+                | KnownGoodArtifactKind::RuntimeReadyMarker
+                | KnownGoodArtifactKind::RuntimeFile
+                | KnownGoodArtifactKind::RuntimeExecutable
+                | KnownGoodArtifactKind::RuntimeDirectory
+                | KnownGoodArtifactKind::RuntimeLink,
+        )
+    )
+}
+
+fn tier2_content_size(entry: &KnownGoodEntry) -> Option<u64> {
+    match entry.integrity() {
+        KnownGoodIntegrity::Sha1 { size, .. } | KnownGoodIntegrity::ExactBytes { size, .. }
+            if !matches!(
+                entry.kind(),
+                KnownGoodArtifactKind::RuntimeDirectory | KnownGoodArtifactKind::RuntimeLink
+            ) =>
+        {
+            Some(*size)
+        }
+        _ => None,
+    }
+}
+
+fn tier2_non_file_integrity_is_supported(entry: &KnownGoodEntry) -> bool {
+    matches!(
+        (entry.kind(), entry.integrity()),
+        (
+            KnownGoodArtifactKind::RuntimeDirectory,
+            KnownGoodIntegrity::Directory,
+        ) | (
+            KnownGoodArtifactKind::RuntimeLink | KnownGoodArtifactKind::RuntimeExecutable,
+            KnownGoodIntegrity::LinkTarget(_),
+        )
+    )
 }
 
 impl LaunchTier0RuntimeSelection<'_> {
@@ -497,6 +598,112 @@ impl LaunchTier1ProjectionError {
                 selected_entry_count,
                 ..
             } => selected_entry_count,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Tier2Projection<'a> {
+    entries: &'a [KnownGoodEntry],
+    expected_content_byte_count: u64,
+}
+
+impl<'a> Tier2Projection<'a> {
+    pub fn iter(self) -> Tier2ProjectionIter<'a> {
+        Tier2ProjectionIter {
+            entries: self.entries.iter().enumerate(),
+        }
+    }
+
+    pub fn entry_count(self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn expected_content_byte_count(self) -> u64 {
+        self.expected_content_byte_count
+    }
+}
+
+pub struct Tier2ProjectionIter<'a> {
+    entries: std::iter::Enumerate<std::slice::Iter<'a, KnownGoodEntry>>,
+}
+
+impl<'a> Iterator for Tier2ProjectionIter<'a> {
+    type Item = Tier2ProjectionEntry<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.entries
+            .next()
+            .map(|(inventory_ordinal, entry)| Tier2ProjectionEntry {
+                inventory_ordinal,
+                entry,
+            })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.entries.size_hint()
+    }
+}
+
+impl ExactSizeIterator for Tier2ProjectionIter<'_> {}
+impl std::iter::FusedIterator for Tier2ProjectionIter<'_> {}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Tier2ProjectionEntry<'a> {
+    inventory_ordinal: usize,
+    entry: &'a KnownGoodEntry,
+}
+
+impl<'a> Tier2ProjectionEntry<'a> {
+    pub fn inventory_ordinal(self) -> usize {
+        self.inventory_ordinal
+    }
+
+    pub fn entry(self) -> &'a KnownGoodEntry {
+        self.entry
+    }
+
+    pub fn physical_path(
+        self,
+        library_root: &Path,
+        runtime_cache: &crate::runtime::ManagedRuntimeCache,
+    ) -> KnownGoodPhysicalPath {
+        known_good_entry_path(library_root, runtime_cache, self.entry)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Tier2ProjectionError {
+    TooManyEntries {
+        entry_count: usize,
+    },
+    UnsupportedRootKind {
+        entry_count: usize,
+        inventory_ordinal: usize,
+    },
+    UnsupportedIntegrity {
+        entry_count: usize,
+        inventory_ordinal: usize,
+    },
+    ArtifactByteLimitExceeded {
+        entry_count: usize,
+        inventory_ordinal: usize,
+        expected_byte_count: u64,
+    },
+    AggregateByteLimitExceeded {
+        entry_count: usize,
+        expected_byte_count: u64,
+    },
+}
+
+impl Tier2ProjectionError {
+    pub fn entry_count(self) -> usize {
+        match self {
+            Self::TooManyEntries { entry_count }
+            | Self::UnsupportedRootKind { entry_count, .. }
+            | Self::UnsupportedIntegrity { entry_count, .. }
+            | Self::ArtifactByteLimitExceeded { entry_count, .. }
+            | Self::AggregateByteLimitExceeded { entry_count, .. } => entry_count,
         }
     }
 }
@@ -3264,6 +3471,356 @@ mod tests {
             LaunchTier1ProjectionError::AggregateByteLimitExceeded {
                 selected_entry_count: 5,
                 expected_byte_count,
+            }
+        );
+    }
+
+    #[test]
+    fn tier_two_projection_borrows_every_exact_launcher_owned_entry() {
+        let runtime_root = || KnownGoodRoot::ManagedRuntime {
+            component: KnownGoodId::new("java-runtime-delta").expect("component"),
+        };
+        let exact_bytes = |size| KnownGoodIntegrity::ExactBytes {
+            digest: Sha1Digest::from_metadata(SHA_B).expect("digest"),
+            size,
+        };
+        let directory = KnownGoodIntegrity::Directory;
+        let link = |path: &str, target: &str| {
+            KnownGoodIntegrity::LinkTarget(
+                KnownGoodLinkTarget::new(path, target).expect("link target"),
+            )
+        };
+        let inventory = KnownGoodInventory {
+            entries: vec![
+                tier_one_entry(
+                    KnownGoodRoot::Versions,
+                    "1.21.1/1.21.1.json",
+                    KnownGoodArtifactKind::VersionMetadata,
+                    exact_bytes(1),
+                ),
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Versions,
+                    "1.21.1/1.21.1.jar",
+                    KnownGoodArtifactKind::ClientJar,
+                    2,
+                ),
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Libraries,
+                    "com/example/library.jar",
+                    KnownGoodArtifactKind::Library,
+                    3,
+                ),
+                tier_one_entry(
+                    KnownGoodRoot::Libraries,
+                    "com/example/native.jar",
+                    KnownGoodArtifactKind::NativeLibrary,
+                    exact_bytes(4),
+                ),
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Assets,
+                    "indexes/1.21.json",
+                    KnownGoodArtifactKind::AssetIndex,
+                    5,
+                ),
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Assets,
+                    "objects/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    KnownGoodArtifactKind::AssetObject,
+                    6,
+                ),
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Assets,
+                    "log_configs/client.xml",
+                    KnownGoodArtifactKind::LogConfig,
+                    7,
+                ),
+                tier_one_entry(
+                    runtime_root(),
+                    "component-manifest.json",
+                    KnownGoodArtifactKind::RuntimeManifestProof,
+                    exact_bytes(8),
+                ),
+                tier_one_entry(
+                    runtime_root(),
+                    ".axial-ready",
+                    KnownGoodArtifactKind::RuntimeReadyMarker,
+                    exact_bytes(9),
+                ),
+                tier_one_sha1_entry(
+                    runtime_root(),
+                    "lib/runtime.bin",
+                    KnownGoodArtifactKind::RuntimeFile,
+                    10,
+                ),
+                tier_one_sha1_entry(
+                    runtime_root(),
+                    "bin/java",
+                    KnownGoodArtifactKind::RuntimeExecutable,
+                    11,
+                ),
+                tier_one_entry(
+                    runtime_root(),
+                    "legal",
+                    KnownGoodArtifactKind::RuntimeDirectory,
+                    directory,
+                ),
+                tier_one_entry(
+                    runtime_root(),
+                    "bin/tool",
+                    KnownGoodArtifactKind::RuntimeLink,
+                    link("bin/tool", "../lib/runtime.bin"),
+                ),
+                tier_one_entry(
+                    runtime_root(),
+                    "bin/java-link",
+                    KnownGoodArtifactKind::RuntimeExecutable,
+                    link("bin/java-link", "java"),
+                ),
+            ],
+        };
+
+        let projection = inventory.tier2_projection().expect("tier two projection");
+        assert_eq!(projection.entry_count(), inventory.entries().len());
+        assert_eq!(projection.expected_content_byte_count(), 66);
+        let projected = projection.iter().collect::<Vec<_>>();
+        assert_eq!(projected.len(), inventory.entries().len());
+        assert!(projected.iter().enumerate().all(|(ordinal, projected)| {
+            projected.inventory_ordinal() == ordinal
+                && std::ptr::eq(projected.entry(), &inventory.entries()[ordinal])
+        }));
+
+        let library_root = Path::new("/managed/library");
+        let runtime_cache = crate::runtime::ManagedRuntimeCache::isolated_for_test()
+            .expect("isolated runtime cache");
+        let version = projected[0].physical_path(library_root, &runtime_cache);
+        assert_eq!(version.root(), library_root);
+        assert_eq!(version.relative(), Path::new("versions/1.21.1/1.21.1.json"));
+        let library = projected[2].physical_path(library_root, &runtime_cache);
+        assert_eq!(library.root(), library_root);
+        assert_eq!(
+            library.relative(),
+            Path::new("libraries/com/example/library.jar")
+        );
+        let asset = projected[4].physical_path(library_root, &runtime_cache);
+        assert_eq!(asset.root(), library_root);
+        assert_eq!(asset.relative(), Path::new("assets/indexes/1.21.json"));
+        let runtime = projected[9].physical_path(library_root, &runtime_cache);
+        assert_eq!(runtime.root(), runtime_cache.root());
+        assert_eq!(
+            runtime.relative(),
+            Path::new("java-runtime-delta/lib/runtime.bin")
+        );
+    }
+
+    #[test]
+    fn tier_two_projection_rejects_every_cross_root_artifact_kind() {
+        let runtime_root = KnownGoodRoot::ManagedRuntime {
+            component: KnownGoodId::new("java-runtime-delta").expect("component"),
+        };
+        for (root, kind) in [
+            (KnownGoodRoot::Versions, KnownGoodArtifactKind::Library),
+            (KnownGoodRoot::Libraries, KnownGoodArtifactKind::ClientJar),
+            (
+                KnownGoodRoot::Assets,
+                KnownGoodArtifactKind::VersionMetadata,
+            ),
+            (runtime_root, KnownGoodArtifactKind::AssetObject),
+        ] {
+            let inventory = KnownGoodInventory {
+                entries: vec![tier_one_sha1_entry(root, "private/entry", kind, 1)],
+            };
+            let error = inventory
+                .tier2_projection()
+                .expect_err("cross-root kind must be refused");
+            assert_eq!(
+                error,
+                Tier2ProjectionError::UnsupportedRootKind {
+                    entry_count: 1,
+                    inventory_ordinal: 0,
+                }
+            );
+            assert_eq!(error.entry_count(), 1);
+            let debug = format!("{error:?}");
+            assert!(!debug.contains("private"));
+            assert!(!debug.contains(SHA_A));
+        }
+    }
+
+    #[test]
+    fn tier_two_projection_rejects_wrong_integrity_for_each_entry_shape() {
+        let runtime_root = || KnownGoodRoot::ManagedRuntime {
+            component: KnownGoodId::new("java-runtime-delta").expect("component"),
+        };
+        let link = || {
+            KnownGoodIntegrity::LinkTarget(
+                KnownGoodLinkTarget::new("entry", "target").expect("link target"),
+            )
+        };
+        let sha1 = || KnownGoodIntegrity::Sha1 {
+            digest: Sha1Digest::from_metadata(SHA_A).expect("digest"),
+            size: 1,
+        };
+        for (root, kind, integrity) in [
+            (
+                KnownGoodRoot::Versions,
+                KnownGoodArtifactKind::VersionMetadata,
+                KnownGoodIntegrity::Directory,
+            ),
+            (
+                KnownGoodRoot::Libraries,
+                KnownGoodArtifactKind::Library,
+                link(),
+            ),
+            (
+                KnownGoodRoot::Assets,
+                KnownGoodArtifactKind::AssetIndex,
+                KnownGoodIntegrity::Directory,
+            ),
+            (
+                runtime_root(),
+                KnownGoodArtifactKind::RuntimeDirectory,
+                sha1(),
+            ),
+            (runtime_root(), KnownGoodArtifactKind::RuntimeLink, sha1()),
+            (
+                runtime_root(),
+                KnownGoodArtifactKind::RuntimeFile,
+                KnownGoodIntegrity::Directory,
+            ),
+            (
+                runtime_root(),
+                KnownGoodArtifactKind::RuntimeExecutable,
+                KnownGoodIntegrity::Directory,
+            ),
+            (
+                runtime_root(),
+                KnownGoodArtifactKind::RuntimeManifestProof,
+                link(),
+            ),
+        ] {
+            let inventory = KnownGoodInventory {
+                entries: vec![tier_one_entry(root, "entry", kind, integrity)],
+            };
+            assert_eq!(
+                inventory
+                    .tier2_projection()
+                    .expect_err("wrong integrity must be refused"),
+                Tier2ProjectionError::UnsupportedIntegrity {
+                    entry_count: 1,
+                    inventory_ordinal: 0,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn tier_two_projection_enforces_exact_entry_bound_without_a_second_entry_list() {
+        let entry = tier_one_sha1_entry(
+            KnownGoodRoot::Libraries,
+            "bounded/library.jar",
+            KnownGoodArtifactKind::Library,
+            0,
+        );
+        let entries = vec![entry; MAX_TIER2_ENTRIES];
+        let exact = KnownGoodInventory {
+            entries: entries.clone(),
+        };
+        let projection = exact.tier2_projection().expect("exact entry bound");
+        assert_eq!(projection.entry_count(), MAX_TIER2_ENTRIES);
+        assert_eq!(projection.iter().len(), MAX_TIER2_ENTRIES);
+        assert!(std::ptr::eq(
+            projection.iter().next().expect("first entry").entry(),
+            &exact.entries()[0]
+        ));
+
+        let mut oversized = entries;
+        oversized.push(tier_one_sha1_entry(
+            KnownGoodRoot::Libraries,
+            "bounded/overflow.jar",
+            KnownGoodArtifactKind::Library,
+            0,
+        ));
+        assert_eq!(
+            KnownGoodInventory { entries: oversized }
+                .tier2_projection()
+                .expect_err("entry bound must be closed"),
+            Tier2ProjectionError::TooManyEntries {
+                entry_count: MAX_TIER2_ENTRIES + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn tier_two_projection_enforces_file_and_aggregate_byte_bounds() {
+        let exact_file = KnownGoodInventory {
+            entries: vec![tier_one_sha1_entry(
+                KnownGoodRoot::Assets,
+                "objects/aa/exact",
+                KnownGoodArtifactKind::AssetObject,
+                MAX_TIER2_ARTIFACT_BYTES,
+            )],
+        };
+        assert_eq!(
+            exact_file
+                .tier2_projection()
+                .expect("exact file bound")
+                .expected_content_byte_count(),
+            MAX_TIER2_ARTIFACT_BYTES
+        );
+        let oversized = MAX_TIER2_ARTIFACT_BYTES + 1;
+        assert_eq!(
+            KnownGoodInventory {
+                entries: vec![tier_one_sha1_entry(
+                    KnownGoodRoot::Assets,
+                    "objects/aa/oversized",
+                    KnownGoodArtifactKind::AssetObject,
+                    oversized,
+                )],
+            }
+            .tier2_projection()
+            .expect_err("file byte bound must be closed"),
+            Tier2ProjectionError::ArtifactByteLimitExceeded {
+                entry_count: 1,
+                inventory_ordinal: 0,
+                expected_byte_count: oversized,
+            }
+        );
+
+        let entry_count = usize::try_from(MAX_TIER2_AGGREGATE_BYTES / MAX_TIER2_ARTIFACT_BYTES)
+            .expect("bounded entry count");
+        let entries = (0..entry_count)
+            .map(|ordinal| {
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Libraries,
+                    &format!("aggregate/library-{ordinal}.jar"),
+                    KnownGoodArtifactKind::Library,
+                    MAX_TIER2_ARTIFACT_BYTES,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            KnownGoodInventory {
+                entries: entries.clone(),
+            }
+            .tier2_projection()
+            .expect("exact aggregate bound")
+            .expected_content_byte_count(),
+            MAX_TIER2_AGGREGATE_BYTES
+        );
+        let mut above = entries;
+        above.push(tier_one_sha1_entry(
+            KnownGoodRoot::Libraries,
+            "aggregate/overflow.jar",
+            KnownGoodArtifactKind::Library,
+            1,
+        ));
+        assert_eq!(
+            KnownGoodInventory { entries: above }
+                .tier2_projection()
+                .expect_err("aggregate byte bound must be closed"),
+            Tier2ProjectionError::AggregateByteLimitExceeded {
+                entry_count: entry_count + 1,
+                expected_byte_count: MAX_TIER2_AGGREGATE_BYTES + 1,
             }
         );
     }

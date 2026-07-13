@@ -14,6 +14,11 @@ mod java_probe_failures;
 mod journals;
 mod known_good;
 mod known_good_rebuilds;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the R5 scheduler slice")
+)]
+mod known_good_tier2;
 pub(crate) mod launch_reports;
 mod lifecycle;
 pub mod ownership;
@@ -77,6 +82,7 @@ pub(crate) use journals::{
 };
 pub use journals::{OperationJournalStore, OperationJournalStoreError};
 pub(crate) use known_good_rebuilds::KnownGoodRebuildError;
+pub(crate) use known_good_tier2::KnownGoodTier2Ticket;
 pub(crate) use lifecycle::{
     AppLifecycle, LifecycleAdmissionError, ProducerLease, RequestLease, RequestProducerHandoff,
 };
@@ -1042,12 +1048,31 @@ impl AppState {
         &self,
         lease: &KnownGoodVerificationLease,
     ) -> bool {
-        let Some(instance) = self.instances.get(&lease.instance_id) else {
+        self.known_good_authority_is_current(
+            &lease.instance_id,
+            &lease.version_id,
+            &lease.created_at,
+            &lease.library_root,
+            &lease.managed_runtime_cache,
+            &lease.inventory,
+        )
+    }
+
+    fn known_good_authority_is_current(
+        &self,
+        instance_id: &str,
+        version_id: &str,
+        created_at: &str,
+        expected_library_root: &Path,
+        expected_runtime_cache: &ManagedRuntimeCache,
+        expected_inventory: &Arc<axial_minecraft::known_good::KnownGoodInventory>,
+    ) -> bool {
+        let Some(instance) = self.instances.get(instance_id) else {
             return false;
         };
-        if instance.id != lease.instance_id
-            || instance.version_id != lease.version_id
-            || instance.created_at != lease.created_at
+        if instance.id != instance_id
+            || instance.version_id != version_id
+            || instance.created_at != created_at
         {
             return false;
         }
@@ -1058,10 +1083,10 @@ impl AppState {
         else {
             return false;
         };
-        if library_root != lease.library_root {
+        if library_root != expected_library_root {
             return false;
         }
-        if self.managed_runtime_cache.root() != lease.managed_runtime_cache.root() {
+        if self.managed_runtime_cache.root() != expected_runtime_cache.root() {
             return false;
         }
         self.known_good
@@ -1071,7 +1096,7 @@ impl AppState {
                 &instance.created_at,
                 &library_root,
             )
-            .is_some_and(|inventory| Arc::ptr_eq(&inventory, &lease.inventory))
+            .is_some_and(|inventory| Arc::ptr_eq(&inventory, expected_inventory))
     }
 
     #[cfg(test)]
