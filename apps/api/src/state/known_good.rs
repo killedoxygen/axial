@@ -159,6 +159,16 @@ impl<T> ActiveInventories<T> {
         }
     }
 
+    fn remove_identity(&mut self, instance_id: &str, version_id: &str) {
+        if self
+            .by_instance
+            .get(instance_id)
+            .is_some_and(|active| active.version_id == version_id)
+        {
+            self.by_instance.remove(instance_id);
+        }
+    }
+
     fn clear(&mut self) {
         self.by_instance.clear();
     }
@@ -275,13 +285,6 @@ impl KnownGoodInventoryStore {
         Ok(())
     }
 
-    pub(super) fn library_roots_match(left: &Path, right: &Path) -> bool {
-        normalize_library_root(left)
-            .ok()
-            .zip(normalize_library_root(right).ok())
-            .is_some_and(|(left, right)| left == right)
-    }
-
     pub(super) fn active_inventory(
         &self,
         instance_id: &str,
@@ -304,13 +307,14 @@ impl KnownGoodInventoryStore {
         version_id: &str,
         library_root: &Path,
     ) {
-        let Ok(library_root) = normalize_library_root(library_root) else {
-            return;
-        };
-        self.active
-            .lock()
-            .expect(STORE_LOCK_INVARIANT)
-            .remove_exact(instance_id, version_id, &library_root);
+        let normalized_root = normalize_library_root(library_root).ok();
+        let mut active = self.active.lock().expect(STORE_LOCK_INVARIANT);
+        deactivate_active_inventory(
+            &mut active,
+            instance_id,
+            version_id,
+            normalized_root.as_deref(),
+        );
     }
 
     pub(super) fn clear_active(&self) {
@@ -938,7 +942,7 @@ fn known_good_target(instance_id: &str) -> TargetDescriptor {
     )
 }
 
-fn normalize_library_root(path: &Path) -> io::Result<PathBuf> {
+pub(super) fn normalize_library_root(path: &Path) -> io::Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -965,6 +969,18 @@ fn normalize_library_root(path: &Path) -> io::Result<PathBuf> {
         ));
     }
     Ok(canonical)
+}
+
+fn deactivate_active_inventory<T>(
+    active: &mut ActiveInventories<T>,
+    instance_id: &str,
+    version_id: &str,
+    normalized_root: Option<&Path>,
+) {
+    match normalized_root {
+        Some(library_root) => active.remove_exact(instance_id, version_id, library_root),
+        None => active.remove_identity(instance_id, version_id),
+    }
 }
 
 fn invalid_snapshot(message: impl Into<String>) -> io::Error {
@@ -1329,6 +1345,53 @@ mod tests {
 
         active.clear();
         assert!(active.get("0000000000000002", "1.21.6", &root).is_none());
+    }
+
+    #[test]
+    fn deactivation_with_unresolvable_root_removes_only_the_exact_live_identity() {
+        let unique = format!(
+            "axial-missing-known-good-root-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let bound_root = std::env::temp_dir().join(format!("{unique}-bound"));
+        let missing_root = std::env::temp_dir().join(format!("{unique}-missing"));
+        let mut active = ActiveInventories::default();
+        active.activate(
+            "0000000000000001",
+            "1.21.5",
+            bound_root.clone(),
+            Arc::new(1_u8),
+        );
+        active.activate(
+            "0000000000000002",
+            "1.21.6",
+            bound_root.clone(),
+            Arc::new(2_u8),
+        );
+
+        assert!(normalize_library_root(&missing_root).is_err());
+        deactivate_active_inventory(&mut active, "0000000000000001", "1.21.4", None);
+        assert!(
+            active
+                .get("0000000000000001", "1.21.5", &bound_root)
+                .is_some()
+        );
+
+        deactivate_active_inventory(&mut active, "0000000000000001", "1.21.5", None);
+        assert!(
+            active
+                .get("0000000000000001", "1.21.5", &bound_root)
+                .is_none()
+        );
+        assert!(
+            active
+                .get("0000000000000002", "1.21.6", &bound_root)
+                .is_some()
+        );
     }
 
     #[tokio::test]

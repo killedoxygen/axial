@@ -416,8 +416,8 @@ impl AppState {
         installed_library_root: &Path,
         receipt: axial_minecraft::known_good::KnownGoodInstallReceipt,
     ) -> std::io::Result<()> {
-        require_matching_known_good_library_root(self.library_dir(), installed_library_root)?;
-
+        let installed_library_root =
+            require_matching_known_good_library_root(self.library_dir(), installed_library_root)?;
         let version_id = receipt.version_id().to_string();
         let inventory = Arc::new(receipt.into_inventory());
         let candidates = self
@@ -430,55 +430,91 @@ impl AppState {
             .map(|instance| instance.id)
             .collect::<Vec<_>>();
         for instance_id in candidates {
-            let _lifecycle = self.acquire_instance_lifecycle(&instance_id).await;
-            let current = self.instances.get(&instance_id);
-            if !matches_known_good_identity(current.as_ref(), &instance_id, &version_id) {
-                continue;
-            }
-            require_matching_known_good_library_root(self.library_dir(), installed_library_root)?;
-
-            self.known_good
-                .reconcile(
-                    &instance_id,
-                    &version_id,
-                    installed_library_root,
-                    inventory.clone(),
-                )
-                .await?;
-            if self
-                .active_known_good_inventory(&instance_id, &version_id, installed_library_root)
-                .is_none()
-            {
-                self.known_good
-                    .deactivate_exact(&instance_id, &version_id, installed_library_root);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "known-good live authority was not activated",
-                ));
-            }
+            self.reconcile_registered_known_good_instance(
+                &instance_id,
+                &version_id,
+                &installed_library_root,
+                inventory.clone(),
+            )
+            .await?;
         }
         Ok(())
     }
 
-    pub(crate) fn active_known_good_inventory(
+    pub(crate) async fn reconcile_registered_known_good_instance(
         &self,
         instance_id: &str,
         version_id: &str,
-        library_root: &Path,
-    ) -> Option<Arc<axial_minecraft::KnownGoodInventory>> {
-        let configured_library_root = self.library_dir().map(PathBuf::from)?;
-        if !known_good::KnownGoodInventoryStore::library_roots_match(
-            &configured_library_root,
-            library_root,
-        ) || !matches_known_good_identity(
+        installed_library_root: &Path,
+        inventory: Arc<axial_minecraft::KnownGoodInventory>,
+    ) -> std::io::Result<()> {
+        let _lifecycle = self.acquire_instance_lifecycle(instance_id).await;
+        if !matches_known_good_identity(
             self.instances.get(instance_id).as_ref(),
             instance_id,
             version_id,
         ) {
-            return None;
+            self.known_good
+                .deactivate_exact(instance_id, version_id, installed_library_root);
+            return Ok(());
         }
-        self.known_good
-            .active_inventory(instance_id, version_id, library_root)
+
+        let installed_library_root = match require_matching_known_good_library_root(
+            self.library_dir(),
+            installed_library_root,
+        ) {
+            Ok(root) => root,
+            Err(error) => {
+                self.known_good
+                    .deactivate_exact(instance_id, version_id, installed_library_root);
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = self
+            .known_good
+            .reconcile(instance_id, version_id, &installed_library_root, inventory)
+            .await
+        {
+            self.known_good
+                .deactivate_exact(instance_id, version_id, &installed_library_root);
+            return Err(error);
+        }
+
+        let current_identity_matches = matches_known_good_identity(
+            self.instances.get(instance_id).as_ref(),
+            instance_id,
+            version_id,
+        );
+        let current_root_matches =
+            require_matching_known_good_library_root(self.library_dir(), &installed_library_root)
+                .is_ok_and(|root| root == installed_library_root);
+        if !current_identity_matches {
+            self.known_good
+                .deactivate_exact(instance_id, version_id, &installed_library_root);
+            return Ok(());
+        }
+        if !current_root_matches {
+            self.known_good
+                .deactivate_exact(instance_id, version_id, &installed_library_root);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "known-good library root changed during installation",
+            ));
+        }
+        if self
+            .known_good
+            .active_inventory(instance_id, version_id, &installed_library_root)
+            .is_none()
+        {
+            self.known_good
+                .deactivate_exact(instance_id, version_id, &installed_library_root);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "known-good live authority was not activated",
+            ));
+        }
+        Ok(())
     }
 
     pub fn performance(&self) -> &Arc<AppPerformanceStore> {
@@ -928,23 +964,22 @@ fn matches_known_good_identity(
 fn require_matching_known_good_library_root(
     configured_library_root: Option<String>,
     installed_library_root: &Path,
-) -> std::io::Result<()> {
+) -> std::io::Result<PathBuf> {
     let configured_library_root = configured_library_root.map(PathBuf::from).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotConnected,
             "known-good library root is not configured",
         )
     })?;
-    if !known_good::KnownGoodInventoryStore::library_roots_match(
-        &configured_library_root,
-        installed_library_root,
-    ) {
+    let configured_library_root = known_good::normalize_library_root(&configured_library_root)?;
+    let installed_library_root = known_good::normalize_library_root(installed_library_root)?;
+    if configured_library_root != installed_library_root {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "known-good library root changed during installation",
         ));
     }
-    Ok(())
+    Ok(installed_library_root)
 }
 
 #[cfg(test)]
@@ -982,6 +1017,18 @@ mod known_good_identity_tests {
             &instance.id,
             "1.21.5"
         ));
+        assert!(!matches_known_good_identity(
+            None,
+            "0000000000000042",
+            "1.21.5"
+        ));
+        instance.version_id = "1.21.5".to_string();
+        instance.id = "not-canonical".to_string();
+        assert!(!matches_known_good_identity(
+            Some(&instance),
+            "not-canonical",
+            "1.21.5"
+        ));
     }
 
     #[test]
@@ -1014,11 +1061,15 @@ mod known_good_identity_tests {
             .kind(),
             std::io::ErrorKind::InvalidInput
         );
-        require_matching_known_good_library_root(
+        let normalized = require_matching_known_good_library_root(
             Some(configured.to_string_lossy().into_owned()),
             &configured,
         )
         .expect("exact root");
+        assert_eq!(
+            normalized,
+            std::fs::canonicalize(&configured).expect("root")
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
