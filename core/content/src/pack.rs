@@ -475,6 +475,7 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
         .map_err(|error| ContentError::Invalid(format!("not a readable modpack: {error}")))?;
 
     let mut applied = Vec::new();
+    let mut processed = HashSet::new();
     let mut extracted_bytes = 0_u64;
     // Client overrides go last: where both define a file, the client copy wins.
     for root in [OVERRIDES, CLIENT_OVERRIDES] {
@@ -500,14 +501,16 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
                 continue;
             }
             let relative = normalize_relative_path(&relative)?;
-            if applied.len() >= MAX_OVERRIDE_FILES {
+            let first_copy = processed.insert(relative.clone());
+            if first_copy && applied.len() >= MAX_OVERRIDE_FILES {
                 return Err(ContentError::Invalid(
                     "modpack contains too many override files".to_string(),
                 ));
             }
             let declared_size = entry.size();
             if declared_size > MAX_OVERRIDE_ENTRY_BYTES
-                || extracted_bytes.saturating_add(declared_size) > MAX_OVERRIDE_TOTAL_BYTES
+                || (first_copy
+                    && extracted_bytes.saturating_add(declared_size) > MAX_OVERRIDE_TOTAL_BYTES)
             {
                 return Err(ContentError::Invalid(
                     "modpack overrides exceed the extraction limit".to_string(),
@@ -519,16 +522,22 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
                 fs::create_dir_all(parent)?;
             }
             let mut sink = fs::File::create(&destination)?;
-            let remaining_total = MAX_OVERRIDE_TOTAL_BYTES.saturating_sub(extracted_bytes);
-            let copy_limit = MAX_OVERRIDE_ENTRY_BYTES.min(remaining_total);
+            let copy_limit = if first_copy {
+                MAX_OVERRIDE_ENTRY_BYTES
+                    .min(MAX_OVERRIDE_TOTAL_BYTES.saturating_sub(extracted_bytes))
+            } else {
+                MAX_OVERRIDE_ENTRY_BYTES
+            };
             let copied = io::copy(&mut (&mut entry).take(copy_limit + 1), &mut sink)?;
             if copied > copy_limit {
                 return Err(ContentError::Invalid(
                     "modpack overrides exceed the extraction limit".to_string(),
                 ));
             }
-            extracted_bytes = extracted_bytes.saturating_add(copied);
-            applied.push(relative);
+            if first_copy {
+                extracted_bytes = extracted_bytes.saturating_add(copied);
+                applied.push(relative);
+            }
         }
     }
     Ok(applied)
@@ -1135,6 +1144,40 @@ mod tests {
         );
 
         assert!(apply_overrides(&root, &archive).is_err());
+
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn client_override_replacements_are_counted_once() {
+        let root = std::env::temp_dir().join("axial-pack-client-override-replacement");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let archive = override_archive(
+            "client-replacement",
+            &[
+                (
+                    "overrides/config/shared.bin",
+                    vec![b'a'; MAX_OVERRIDE_ENTRY_BYTES as usize],
+                ),
+                (
+                    "overrides/config/other.bin",
+                    vec![b'b'; MAX_OVERRIDE_ENTRY_BYTES as usize],
+                ),
+                (
+                    "client-overrides/config/shared.bin",
+                    vec![b'c'; MAX_OVERRIDE_ENTRY_BYTES as usize],
+                ),
+            ],
+        );
+
+        let applied = apply_overrides(&root, &archive).expect("apply overrides");
+        assert_eq!(applied, ["config/shared.bin", "config/other.bin"]);
+        assert_eq!(
+            fs::read(root.join("config/shared.bin")).expect("client override"),
+            vec![b'c'; MAX_OVERRIDE_ENTRY_BYTES as usize]
+        );
 
         let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(root);

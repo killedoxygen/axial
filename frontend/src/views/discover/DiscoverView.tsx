@@ -26,6 +26,7 @@ import {
   loadingMore,
   loader,
   query,
+  resetSearch,
   results,
   searchError,
   sort,
@@ -357,7 +358,7 @@ export function DiscoverView(): JSX.Element {
     const id = ++requestId.current;
     loading.value = true;
     loadingMore.value = false;
-    searchError.value = null;
+    resetSearch();
     const timer = window.setTimeout(() => {
       searchContent(searchInput())
         .then((page) => {
@@ -415,7 +416,7 @@ export function DiscoverView(): JSX.Element {
   const error = searchError.value;
   const hasMore = items.length < total.value;
   const kindLabel = KIND_TABS.find((tab) => tab.value === currentKind)?.label.toLowerCase() ?? 'content';
-  const filtered = Boolean(currentQuery || loader.value || gameVersion.value || currentCategory);
+  const filtered = Boolean(currentQuery || activeLoader || activeVersion || currentCategory);
   const categories = KIND_CATEGORIES[currentKind];
 
   return (

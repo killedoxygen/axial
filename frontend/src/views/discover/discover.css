@@ -603,7 +603,7 @@
   font-weight: 700;
   line-height: 1.08;
   letter-spacing: 0;
-  word-break: break-word;
+  overflow-wrap: break-word;
 }
 .cp-content-hero-meta {
   display: flex;

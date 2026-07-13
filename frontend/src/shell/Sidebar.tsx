@@ -98,7 +98,10 @@ function RailButton({
   tooltip: RailTooltipController;
 }): JSX.Element {
   const current = route.value;
-  const active = isRouteActive(target, current) || (target.name === 'instances' && current.name === 'instance');
+  const active =
+    isRouteActive(target, current) ||
+    (target.name === 'instances' && current.name === 'instance') ||
+    (target.name === 'discover' && current.name === 'content');
   return (
     <button
       class="cp-rail-btn"

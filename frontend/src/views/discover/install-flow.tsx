@@ -27,24 +27,30 @@ export function useInstallFlow(instanceId: string | undefined): InstallFlow {
   const add = async (selections: ContentSelection[], label: string): Promise<AddOutcome> => {
     if (!instanceId || busy) return { status: 'failed' };
     setBusy(true);
-    const outcome = await addToInstance(instanceId, selections, label);
-    setBusy(false);
-    if (outcome.status === 'needs-confirmation' && outcome.plan) {
-      pending.current = { selections, label };
-      setPlan(outcome.plan);
+    try {
+      const outcome = await addToInstance(instanceId, selections, label);
+      if (outcome.status === 'needs-confirmation' && outcome.plan) {
+        pending.current = { selections, label };
+        setPlan(outcome.plan);
+      }
+      return outcome;
+    } finally {
+      setBusy(false);
     }
-    return outcome;
   };
 
   const confirm = async (): Promise<AddOutcome> => {
     const staged = pending.current;
     if (!instanceId || !staged) return { status: 'failed' };
     setBusy(true);
-    const outcome = await commitInstall(instanceId, staged.selections, staged.label, plan ?? undefined, true);
-    setBusy(false);
-    pending.current = null;
-    setPlan(null);
-    return outcome;
+    try {
+      const outcome = await commitInstall(instanceId, staged.selections, staged.label, plan ?? undefined, true);
+      pending.current = null;
+      setPlan(null);
+      return outcome;
+    } finally {
+      setBusy(false);
+    }
   };
 
   const cancel = (): void => {

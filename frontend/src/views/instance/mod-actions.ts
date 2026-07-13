@@ -9,19 +9,16 @@ import type { ContentUpdate, InstanceContentEntry } from '../../types-content';
 import type { EnrichedInstance, InstanceMod } from '../../types-instance';
 import { openInstanceFolder } from './instance-actions';
 import { confirmDeleteItems, partialFailureMessage, runBulkMutation } from './bulk-actions';
-
-export interface ModProvenance {
-  entries: Map<string, InstanceContentEntry>;
-  updates: Map<string, ContentUpdate>;
-}
-
-const provenanceCache = new Map<string, ModProvenance>();
-const provenanceGenerations = new Map<string, number>();
+import {
+  beginModProvenanceRefresh,
+  cacheModProvenance,
+  cachedModProvenance,
+  isCurrentModProvenanceRefresh,
+  type ModProvenance,
+} from './mod-provenance-cache';
 const CONTENT_INSTALL_BATCH_LIMIT = 40;
 
-export function cachedModProvenance(instanceId: string): ModProvenance | null {
-  return provenanceCache.get(instanceId) ?? null;
-}
+export { cachedModProvenance, type ModProvenance } from './mod-provenance-cache';
 
 /** Provenance and update state for an instance's mods, keyed by filename and
  * canonical id. Names land as soon as the listing does; the update check is
@@ -31,31 +28,30 @@ export async function fetchModProvenance(
   instanceId: string,
   onData: (provenance: ModProvenance) => void,
 ): Promise<void> {
-  const generation = (provenanceGenerations.get(instanceId) ?? 0) + 1;
-  provenanceGenerations.set(instanceId, generation);
-  const cached = provenanceCache.get(instanceId);
+  const generation = beginModProvenanceRefresh(instanceId);
+  const cached = cachedModProvenance(instanceId);
   if (cached) {
     const refreshing: ModProvenance = { entries: cached.entries, updates: new Map() };
-    provenanceCache.set(instanceId, refreshing);
+    cacheModProvenance(instanceId, refreshing);
     onData(refreshing);
   }
   const content = await listInstanceContent(instanceId);
-  if (provenanceGenerations.get(instanceId) !== generation) return;
+  if (!isCurrentModProvenanceRefresh(instanceId, generation)) return;
   const entries = new Map(
     content.entries.filter((entry) => entry.kind === 'mod').map((entry) => [entry.filename, entry]),
   );
   const listed: ModProvenance = { entries, updates: new Map() };
-  provenanceCache.set(instanceId, listed);
+  cacheModProvenance(instanceId, listed);
   onData(listed);
   try {
     const res = await checkContentUpdates(instanceId);
-    if (provenanceGenerations.get(instanceId) !== generation) return;
+    if (!isCurrentModProvenanceRefresh(instanceId, generation)) return;
     const updates = new Map<string, ContentUpdate>();
     for (const update of res.updates) {
       if (update.kind === 'mod') updates.set(update.canonical_id, update);
     }
     const checked: ModProvenance = { entries, updates };
-    provenanceCache.set(instanceId, checked);
+    cacheModProvenance(instanceId, checked);
     onData(checked);
   } catch {
     // A failed check reads as "no updates"; the list itself still works offline.

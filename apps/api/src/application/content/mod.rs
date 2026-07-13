@@ -201,11 +201,16 @@ pub async fn content_search(
         .collect();
     let installed_ids = if let Some(instance_id) = params.instance_id.as_deref() {
         if let Ok(game_dir) = require_instance_game_dir(state, instance_id) {
-            let _lifecycle_guard = state.sessions().lock_instance_lifecycle(instance_id).await;
-            ContentManifest::load(&game_dir)
-                .ok()
-                .map(|manifest| present_installed_ids(&game_dir, &manifest, &candidate_ids))
-                .unwrap_or_default()
+            if let Some(_lifecycle_guard) =
+                state.sessions().try_lock_instance_lifecycle(instance_id)
+            {
+                ContentManifest::load(&game_dir)
+                    .ok()
+                    .map(|manifest| present_installed_ids(&game_dir, &manifest, &candidate_ids))
+                    .unwrap_or_default()
+            } else {
+                HashSet::new()
+            }
         } else {
             HashSet::new()
         }

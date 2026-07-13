@@ -330,7 +330,6 @@ fn bound_startup_warnings(warnings: Vec<String>) -> Vec<String> {
 fn content_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(120))
         .build()
-        .unwrap_or_default()
+        .expect("content HTTP client configuration must be valid")
 }
