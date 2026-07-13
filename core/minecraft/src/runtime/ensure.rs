@@ -4,7 +4,7 @@ use super::discovery::{
     resolve_override_runtime, runtime_requirement,
 };
 use super::file_download::runtime_filesystem_path;
-use super::install::install_managed_runtime;
+use super::install::{install_ephemeral_processor_runtime, install_managed_runtime};
 use super::layout::{runtime_cache_dir, runtime_os_arch};
 use super::manifest::{
     COMPONENT_MANIFEST_PROOF_FILE, RuntimeSourceReceipt, acquire_runtime_source,
@@ -31,55 +31,40 @@ impl ProcessorRuntime {
     pub(crate) fn revalidate_cli_executable(&self) -> Result<PathBuf, JavaRuntimeLookupError> {
         self.probe_receipt.revalidate_cli_executable()
     }
+
+    pub(crate) fn into_source_receipt(self) -> RuntimeSourceReceipt {
+        self._source_receipt
+    }
 }
 
-pub(crate) async fn ensure_axial_managed_processor_runtime(
+pub(crate) async fn materialize_ephemeral_processor_runtime(
     java_version: &JavaVersion,
+    source_receipt: RuntimeSourceReceipt,
+    install_root: &Path,
+    max_entries: usize,
+    max_bytes: u64,
 ) -> Result<ProcessorRuntime, JavaRuntimeLookupError> {
     let requirement = runtime_requirement(java_version);
     let component = requirement.preferred_component;
-    if !is_known_runtime_component(component.as_str()) {
-        return Err(JavaRuntimeLookupError::Probe(
-            "processor runtime component is not in the closed managed-runtime vocabulary"
+    if source_receipt.component() != &component || !is_known_runtime_component(component.as_str()) {
+        return Err(JavaRuntimeLookupError::Download(
+            "processor runtime source does not match the authenticated base requirement"
                 .to_string(),
         ));
     }
-    let source_receipt = acquire_runtime_source(&component, &runtime_os_arch()).await?;
-    let install_root = runtime_cache_dir().join(component.as_str());
-    let install_lock = runtime_install_lock(component.as_str());
-    let _guard = install_lock.lock().await;
-    let _file_lock = acquire_runtime_install_file_lock(&install_root).await?;
-    let mut runtime = match resolve_axial_cached_runtime(&component, java_version.major_version) {
-        Ok(runtime) => Some(runtime),
-        Err(JavaRuntimeLookupError::NotFound { .. }) => None,
-        Err(error) => return Err(error),
-    };
-    let matches_source = match runtime.as_ref() {
-        Some(runtime) => runtime_record_matches_source(runtime, &source_receipt).await,
-        None => false,
-    };
-    if !matches_source {
-        let mut observer = |_| {};
-        install_managed_runtime(&component, &install_root, &source_receipt, &mut observer).await?;
-        runtime = Some(resolve_axial_cached_runtime(
-            &component,
-            java_version.major_version,
-        )?);
-    }
-    let runtime = runtime.ok_or_else(|| JavaRuntimeLookupError::NotFound {
-        component: component.as_str().to_string(),
-        major: java_version.major_version,
-    })?;
-    if runtime.source != RuntimeSource::Managed
-        || !runtime_record_matches_source(&runtime, &source_receipt).await
-    {
-        return Err(JavaRuntimeLookupError::Probe(
-            "processor runtime failed authenticated Axial-cache verification".to_string(),
-        ));
-    }
-    let java_path = PathBuf::from(runtime.java_path);
+    let mut observer = |_| {};
+    install_ephemeral_processor_runtime(
+        &component,
+        install_root,
+        &source_receipt,
+        max_entries,
+        max_bytes,
+        &mut observer,
+    )
+    .await?;
+    let java_path = super::layout::java_executable(install_root);
     let probe_receipt = tokio::task::spawn_blocking(move || {
-        probe_java_runtime_receipt(&java_path, Some("managed-processor-runtime"))
+        probe_java_runtime_receipt(&java_path, Some("ephemeral-processor-runtime"))
     })
     .await
     .map_err(|_| {

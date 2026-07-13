@@ -134,7 +134,6 @@ mod tests {
         require_exact_live_build_record, validate_version_id,
     };
     use crate::loaders::types::LoaderBuildSubjectKind;
-    use crate::paths::loader_work_dir;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -211,7 +210,6 @@ mod tests {
             .await
             .expect_err("noncanonical identity");
 
-        assert!(!loader_work_dir(&root).exists());
         let _ = fs::remove_dir_all(root);
     }
 

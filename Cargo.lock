@@ -363,6 +363,7 @@ dependencies = [
  "futures-util",
  "lzma-rs",
  "md5",
+ "ntapi",
  "regex",
  "reqwest 0.12.28",
  "rustix",

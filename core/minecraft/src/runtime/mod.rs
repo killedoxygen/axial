@@ -22,7 +22,7 @@ pub use discovery::{
     runtime_requirement,
 };
 pub(crate) use ensure::{
-    ProcessorRuntime, ensure_axial_managed_processor_runtime, materialize_preferred_runtime_source,
+    ProcessorRuntime, materialize_ephemeral_processor_runtime, materialize_preferred_runtime_source,
 };
 pub use ensure::{ensure_java_runtime, ensure_runtime_with_events};
 pub use model::{
@@ -54,6 +54,7 @@ pub(crate) use install::plan_runtime_manifest_files;
 use install::{
     install_managed_runtime, install_runtime_manifest_file, install_runtime_manifest_files,
     remove_runtime_install_path, remove_runtime_install_path_async,
+    validate_ephemeral_processor_manifest_for_test,
 };
 #[cfg(test)]
 use layout::{java_executable, java_executable_for_os, runtime_os_arch_for};

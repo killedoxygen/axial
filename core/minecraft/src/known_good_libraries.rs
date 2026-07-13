@@ -724,6 +724,48 @@ impl PendingInstallerReconstructionTerminalDeclarations {
             structure: LibraryStructure::Installer(Box::new(self.structure)),
         })
     }
+
+    pub(crate) fn seal_observed_terminal_outputs(
+        self,
+        outputs: VerifiedProcessorOutputs,
+    ) -> Result<SealedExactLibraryDeclarations, SealedLibraryDeclarationError> {
+        let mut outputs = outputs
+            .into_entries()
+            .into_iter()
+            .map(|(path, output)| {
+                let (bytes, size, sha1) = output.into_parts();
+                let observed_sha1: [u8; 20] = Sha1::digest(bytes.as_ref()).into();
+                if size == 0 || size != bytes.len() as u64 || sha1 != observed_sha1 {
+                    return Err(SealedLibraryDeclarationError::ContractDrift);
+                }
+                Ok((path, (size, sha1)))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let mut entries = self.entries;
+        for (path, selected) in &self.selected {
+            let InstallerLibraryProducer::Terminal(contract) = &selected.producer else {
+                continue;
+            };
+            let (size, sha1) = outputs
+                .remove(path)
+                .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?;
+            if sha1 != contract.sha1 || contract.size.is_some_and(|expected| expected != size) {
+                return Err(SealedLibraryDeclarationError::ContractDrift);
+            }
+            validate_plan_contract(&selected.plan, sha1, size)?;
+            insert_exact_declaration(&mut entries, &selected.plan, sha1, size)?;
+        }
+        if !outputs.is_empty() {
+            return Err(SealedLibraryDeclarationError::ExtraDeclaration);
+        }
+        if entries.len() != self.selected.len() {
+            return Err(SealedLibraryDeclarationError::MissingDeclaration);
+        }
+        Ok(SealedExactLibraryDeclarations {
+            entries,
+            structure: LibraryStructure::Installer(Box::new(self.structure)),
+        })
+    }
 }
 
 impl PendingInstallerTerminalDeclarations {
@@ -756,6 +798,53 @@ impl PendingInstallerTerminalDeclarations {
                 already_materialized,
                 sources,
                 libraries_root,
+            },
+        ))
+    }
+
+    pub(crate) fn seal_without_terminal_outputs(
+        self,
+    ) -> Result<
+        (SealedExactLibraryDeclarations, PendingInstallerPublications),
+        SealedLibraryDeclarationError,
+    > {
+        if self
+            .selected
+            .values()
+            .any(|selected| matches!(selected.producer, InstallerLibraryProducer::Terminal(_)))
+            || self.entries.len() != self.selected.len()
+        {
+            return Err(SealedLibraryDeclarationError::MissingDeclaration);
+        }
+        let declarations = SealedExactLibraryDeclarations {
+            entries: self.entries,
+            structure: LibraryStructure::Installer(Box::new(self.structure)),
+        };
+        let expected = declarations_clone_entries(&declarations);
+        let mut sources = Vec::new();
+        for (path, artifact) in self.embedded {
+            if !matches!(
+                self.selected.get(&path).map(|selected| &selected.producer),
+                Some(InstallerLibraryProducer::Embedded)
+            ) {
+                return Err(SealedLibraryDeclarationError::ContractDrift);
+            }
+            let selected = self
+                .selected
+                .get(&path)
+                .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?;
+            sources.push(RetainedInstallerLibrarySource {
+                kind: kind_for_plan(&selected.plan),
+                source: RetainedInstallerLibraryBytes::Embedded(artifact),
+            });
+        }
+        Ok((
+            declarations,
+            PendingInstallerPublications {
+                expected,
+                already_materialized: self.materialized_network,
+                sources,
+                libraries_root: self.libraries_root,
             },
         ))
     }
@@ -2659,9 +2748,7 @@ mod tests {
                 .unwrap();
             assert!(jobs.is_empty());
             let pending = pending.complete_network(Vec::new()).unwrap();
-            let (_, publications) = pending
-                .seal_terminal_outputs(VerifiedProcessorOutputs::none())
-                .unwrap();
+            let (_, publications) = pending.seal_without_terminal_outputs().unwrap();
             publications.into_sources()
         };
         let (gate, _) = build();

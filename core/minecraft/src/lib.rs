@@ -45,8 +45,8 @@ pub use manifest::{
 };
 pub use paths::{
     cache_dir, create_minecraft_dir, default_minecraft_dir, libraries_dir, loader_cache_dir,
-    loader_catalog_dir, loader_work_dir, runtime_dirs, validate_installation,
-    version_manifest_cache_path, versions_dir,
+    loader_catalog_dir, runtime_dirs, validate_installation, version_manifest_cache_path,
+    versions_dir,
 };
 pub use profiles::ensure_launcher_profiles;
 pub use rules::{

@@ -4,7 +4,7 @@ use crate::loaders::types::LoaderError;
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -78,6 +78,21 @@ pub(crate) struct ManagedTreeLimits {
     max_depth: usize,
     max_file_bytes: u64,
     max_total_bytes: u64,
+}
+
+pub(crate) struct ManagedTreeUsage {
+    entries: usize,
+    bytes: u64,
+}
+
+impl ManagedTreeUsage {
+    pub(crate) fn entries(&self) -> usize {
+        self.entries
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 impl ManagedTreeLimits {
@@ -378,17 +393,6 @@ impl ManagedDir {
         self.child(name, handle, identity)
     }
 
-    pub(crate) fn open_child_if_exists(&self, name: &str) -> Result<Option<Self>, LoaderError> {
-        validate_segment(name)?;
-        match platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))? {
-            None => Ok(None),
-            Some(EntryKind::Directory) => self.open_child(name).map(Some),
-            Some(_) => Err(LoaderError::Verify(
-                "managed loader child is not an exact directory".to_string(),
-            )),
-        }
-    }
-
     fn child(
         &self,
         name: &str,
@@ -434,6 +438,110 @@ impl ManagedDir {
     ) -> Result<(), LoaderError> {
         let (parent, name) = self.open_or_create_relative_parent(relative)?;
         parent.write_exact(&name, bytes).await
+    }
+
+    pub(crate) async fn import_relative_authenticated(
+        &self,
+        relative: &ArtifactRelativePath,
+        source: std::fs::File,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+    ) -> Result<(), LoaderError> {
+        if expected_size == 0 || expected_size > MAX_MANAGED_TREE_FILE_BYTES {
+            return Err(LoaderError::Verify(
+                "managed loader source exceeds the processor stage file bound".to_string(),
+            ));
+        }
+        let (parent, name) = self.open_or_create_relative_parent(relative)?;
+        tokio::task::spawn_blocking(move || {
+            parent.import_authenticated(&name, source, expected_size, expected_sha1)
+        })
+        .await
+        .map_err(|_| {
+            LoaderError::Verify(
+                "managed loader source import task stopped unexpectedly".to_string(),
+            )
+        })?
+    }
+
+    fn import_authenticated(
+        &self,
+        name: &str,
+        mut source: std::fs::File,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+    ) -> Result<(), LoaderError> {
+        validate_segment(name)?;
+        source.seek(SeekFrom::Start(0))?;
+        let temp_name = temp_name();
+        self.sweep_orphan_temps()?;
+        let active = ActiveTemp::register(self.inner.identity, &temp_name);
+        let mut destination = platform::create_new_file(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(&temp_name),
+        )?;
+        let mut pending = PendingTemp::arm(self.clone(), &temp_name, active);
+        let mut observed = 0_u64;
+        let mut hasher = Sha1::new();
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            let read = source.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            observed = observed.checked_add(read as u64).ok_or_else(|| {
+                LoaderError::Verify("managed loader source size overflowed".to_string())
+            })?;
+            if observed > expected_size {
+                return Err(LoaderError::Verify(
+                    "managed loader source exceeds its authenticated size".to_string(),
+                ));
+            }
+            destination.write_all(&chunk[..read])?;
+            hasher.update(&chunk[..read]);
+        }
+        if observed != expected_size || <[u8; 20]>::from(hasher.finalize()) != expected_sha1 {
+            return Err(LoaderError::Verify(
+                "managed loader source failed authenticated integrity".to_string(),
+            ));
+        }
+        destination.flush()?;
+        destination.sync_all()?;
+        drop(destination);
+        if platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))?.is_some() {
+            platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        }
+        platform::rename_entry(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(&temp_name),
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(name),
+        )?;
+        pending.disarm();
+        let mut budget = TreeCaptureBudget {
+            remaining_entries: 1,
+            remaining_bytes: expected_size,
+        };
+        let fact = self.capture_file_fact(
+            name,
+            ManagedTreeLimits {
+                max_entries: 1,
+                max_depth: 0,
+                max_file_bytes: expected_size,
+                max_total_bytes: expected_size,
+            },
+            &mut budget,
+        )?;
+        if fact.size != expected_size || fact.sha1 != expected_sha1 {
+            let _ = platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name));
+            return Err(LoaderError::Verify(
+                "managed loader import changed before promotion".to_string(),
+            ));
+        }
+        self.revalidate()
     }
 
     pub(crate) async fn materialize_installer_library(
@@ -576,6 +684,159 @@ impl ManagedDir {
         limits: ManagedTreeLimits,
     ) -> Result<ManagedTreeSnapshot, LoaderError> {
         self.snapshot_tree_with(limits, || Ok(()))
+    }
+
+    pub(crate) fn validate_tree_usage_no_links(
+        &self,
+        limits: ManagedTreeLimits,
+    ) -> Result<ManagedTreeUsage, LoaderError> {
+        self.validate_tree_usage(limits, false)
+    }
+
+    pub(crate) fn validate_tree_usage_allow_links(
+        &self,
+        limits: ManagedTreeLimits,
+    ) -> Result<ManagedTreeUsage, LoaderError> {
+        self.validate_tree_usage(limits, true)
+    }
+
+    pub(crate) fn validate_exact_child_directories(
+        &self,
+        expected: &[&str],
+    ) -> Result<(), LoaderError> {
+        self.revalidate()?;
+        let names = platform::entry_names(
+            &self.inner.handle,
+            &self.inner.path,
+            expected.len().saturating_add(1),
+        )?;
+        if names.len() != expected.len() {
+            return Err(LoaderError::Verify(
+                "managed root contains unexpected entries".to_string(),
+            ));
+        }
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        for name in names {
+            let name = name.to_str().ok_or_else(|| {
+                LoaderError::Verify("managed root contains a non-UTF-8 entry".to_string())
+            })?;
+            if !expected.contains(name)
+                || !matches!(
+                    platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))?,
+                    Some(EntryKind::Directory)
+                )
+            {
+                return Err(LoaderError::Verify(
+                    "managed root child identity is invalid".to_string(),
+                ));
+            }
+        }
+        self.revalidate()
+    }
+
+    fn validate_tree_usage(
+        &self,
+        limits: ManagedTreeLimits,
+        allow_links: bool,
+    ) -> Result<ManagedTreeUsage, LoaderError> {
+        self.revalidate()?;
+        let mut aliases = HashMap::new();
+        let mut budget = TreeCaptureBudget {
+            remaining_entries: limits.max_entries,
+            remaining_bytes: limits.max_total_bytes,
+        };
+        self.validate_tree_directory(None, 0, limits, &mut budget, &mut aliases, allow_links)?;
+        self.revalidate()?;
+        Ok(ManagedTreeUsage {
+            entries: limits.max_entries - budget.remaining_entries,
+            bytes: limits.max_total_bytes - budget.remaining_bytes,
+        })
+    }
+
+    fn validate_tree_directory(
+        &self,
+        prefix: Option<&str>,
+        depth: usize,
+        limits: ManagedTreeLimits,
+        budget: &mut TreeCaptureBudget,
+        aliases: &mut HashMap<String, String>,
+        allow_links: bool,
+    ) -> Result<(), LoaderError> {
+        self.revalidate()?;
+        let entries = platform::entry_names(
+            &self.inner.handle,
+            &self.inner.path,
+            budget.remaining_entries.saturating_add(1),
+        )?;
+        if entries.len() > budget.remaining_entries {
+            return Err(LoaderError::Verify(
+                "managed tree exceeds the aggregate entry bound".to_string(),
+            ));
+        }
+        budget.remaining_entries -= entries.len();
+        for name in entries {
+            let name = name.to_str().ok_or_else(|| {
+                LoaderError::Verify("managed tree contains a non-UTF-8 entry".to_string())
+            })?;
+            validate_segment(name)?;
+            let authored = match prefix {
+                Some(prefix) => format!("{prefix}/{name}"),
+                None => name.to_string(),
+            };
+            let relative = ArtifactRelativePath::new(&authored).map_err(|_| {
+                LoaderError::Verify("managed tree path is not canonical".to_string())
+            })?;
+            insert_tree_alias(aliases, &relative)?;
+            match platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))? {
+                Some(EntryKind::File) => self.validate_file_size(name, limits, budget)?,
+                Some(EntryKind::Directory) => {
+                    if depth >= limits.max_depth {
+                        return Err(LoaderError::Verify(
+                            "managed tree exceeds the depth bound".to_string(),
+                        ));
+                    }
+                    self.open_child(name)?.validate_tree_directory(
+                        Some(&authored),
+                        depth + 1,
+                        limits,
+                        budget,
+                        aliases,
+                        allow_links,
+                    )?;
+                }
+                Some(EntryKind::Link) if allow_links => {}
+                Some(EntryKind::Link) | None => {
+                    return Err(LoaderError::Verify(
+                        "managed tree contains a link or replaced entry".to_string(),
+                    ));
+                }
+                #[cfg(unix)]
+                Some(EntryKind::Other) => {
+                    return Err(LoaderError::Verify(
+                        "managed tree contains an unsupported entry".to_string(),
+                    ));
+                }
+            }
+        }
+        self.revalidate()
+    }
+
+    fn validate_file_size(
+        &self,
+        name: &str,
+        limits: ManagedTreeLimits,
+        budget: &mut TreeCaptureBudget,
+    ) -> Result<(), LoaderError> {
+        let file =
+            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        let size = file.metadata()?.len().max(file.metadata()?.len());
+        if size > limits.max_file_bytes || size > budget.remaining_bytes {
+            return Err(LoaderError::Verify(
+                "managed tree file exceeds its admitted byte bound".to_string(),
+            ));
+        }
+        budget.remaining_bytes -= size;
+        Ok(())
     }
 
     fn snapshot_tree_with(
@@ -759,7 +1020,7 @@ impl ManagedDir {
             LoaderError::Verify("managed loader artifact size is out of range".to_string())
         })?;
         let mut bytes = Vec::with_capacity(capacity);
-        file.by_ref()
+        Read::by_ref(&mut file)
             .take(limit.saturating_add(1))
             .read_to_end(&mut bytes)?;
         if bytes.len() as u64 > limit || (require_exact_len && bytes.len() as u64 != limit) {
@@ -1271,7 +1532,6 @@ mod platform {
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::Write as _;
 
     #[tokio::test]
     async fn active_temp_is_not_swept_by_another_writer() {
@@ -1426,6 +1686,56 @@ mod tests {
             assert!(directory.snapshot_tree(limits).is_err());
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_tree_limit_check_rejects_oversized_sparse_file_without_hashing() {
+        let root = test_root("tree-live-bounds");
+        fs::create_dir_all(&root).expect("root");
+        let file = fs::File::create(root.join("growing-output")).expect("output");
+        file.set_len(MAX_MANAGED_TREE_FILE_BYTES + 1)
+            .expect("sparse length");
+        drop(file);
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+
+        assert!(
+            directory
+                .validate_tree_usage_no_links(ManagedTreeLimits::processor_stage())
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn retained_file_import_streams_and_reauthenticates_destination() {
+        let source_root = test_root("managed-import-source");
+        let destination_root = test_root("managed-import-destination");
+        fs::create_dir_all(&source_root).expect("source root");
+        fs::create_dir_all(&destination_root).expect("destination root");
+        let bytes = b"authenticated retained source";
+        let source_path = source_root.join("source");
+        fs::write(&source_path, bytes).expect("source");
+        let destination = ManagedDir::open_root(&destination_root).expect("destination");
+        let relative = ArtifactRelativePath::new("nested/artifact.jar").expect("path");
+        let sha1: [u8; 20] = Sha1::digest(bytes).into();
+
+        destination
+            .import_relative_authenticated(
+                &relative,
+                fs::File::open(source_path).expect("retained source"),
+                bytes.len() as u64,
+                sha1,
+            )
+            .await
+            .expect("streamed import");
+        assert_eq!(
+            destination
+                .read_relative_authenticated(&relative, Some(bytes.len() as u64), &sha1)
+                .expect("authenticated destination"),
+            bytes
+        );
+        let _ = fs::remove_dir_all(source_root);
+        let _ = fs::remove_dir_all(destination_root);
     }
 
     #[test]

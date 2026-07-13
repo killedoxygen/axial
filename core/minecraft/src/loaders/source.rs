@@ -30,6 +30,15 @@ impl VerifiedLoaderSource {
                 .all(|byte| byte.is_ascii_hexdigit())
     }
 
+    pub(crate) fn matches_logical_identity(&self, logical_identity: &str) -> bool {
+        self.logical_identity == logical_identity
+            && self.expected_sha1.len() == 40
+            && self
+                .expected_sha1
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+    }
+
     pub(crate) fn into_bytes_for(
         self,
         provider_url: &str,

@@ -1,13 +1,14 @@
 use super::forge_installer::{
-    BoundForgeInstallerContinuation, BoundForgeProcessorExecution, BoundProcessorArgument,
-    BoundProcessorArgumentPart, BoundProcessorArtifact, BoundProcessorData,
+    BoundForgeInstallExecution, BoundForgeInstallerContinuation, BoundForgeProcessorExecution,
+    BoundProcessorArgument, BoundProcessorArgumentPart, BoundProcessorArtifact, BoundProcessorData,
     BoundProcessorOutputRole, BoundProcessorPlan, BoundProcessorStep, ProcessorBuiltinToken,
 };
-use super::managed_fs::ManagedTreeSnapshot;
-use super::workspace::cleanup::{LoaderWorkspace, ProcessorWorkspace};
+use super::managed_fs::{ManagedDir, ManagedTreeSnapshot};
+use super::workspace::cleanup::{ProcessorWorkspace, ProcessorWorkspaceOwner};
 use crate::artifact_path::ArtifactRelativePath;
-use crate::known_good::KnownGoodInstallReceipt;
-use crate::runtime::{ProcessorRuntime, ensure_axial_managed_processor_runtime};
+use crate::download::{AuthenticatedSelectedArtifactSource, ExpectedIntegrity};
+use crate::launch::VersionJson;
+use crate::runtime::{ProcessorRuntime, RuntimeSourceReceipt};
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -32,11 +33,192 @@ const MAX_PROCESS_OUTPUT_BYTES: usize = 1 << 20;
 const MAX_PROCESS_OUTPUT_TOTAL_BYTES: usize = 2 << 20;
 const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(120);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const STAGE_WATCH_INTERVAL: Duration = Duration::from_millis(100);
+
+#[cfg(unix)]
+struct PendingProcessContainment;
+
+#[cfg(unix)]
+struct ProcessContainment {
+    group: rustix::process::Pid,
+}
+
+#[cfg(unix)]
+fn prepare_process_containment(
+    command: &mut Command,
+) -> Result<PendingProcessContainment, BoundProcessorError> {
+    command.process_group(0);
+    Ok(PendingProcessContainment)
+}
+
+#[cfg(unix)]
+impl PendingProcessContainment {
+    fn attach(self, child: &Child) -> Result<ProcessContainment, BoundProcessorError> {
+        let raw = i32::try_from(child.id().ok_or(BoundProcessorError::Containment)?)
+            .map_err(|_| BoundProcessorError::Containment)?;
+        let group = rustix::process::Pid::from_raw(raw).ok_or(BoundProcessorError::Containment)?;
+        Ok(ProcessContainment { group })
+    }
+}
+
+#[cfg(unix)]
+impl ProcessContainment {
+    fn terminate(&self) -> Result<(), BoundProcessorError> {
+        match rustix::process::kill_process_group(self.group, rustix::process::Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(_) => Err(BoundProcessorError::Unreaped),
+        }
+    }
+
+    fn is_empty(&self) -> Result<bool, BoundProcessorError> {
+        match rustix::process::test_kill_process_group(self.group) {
+            Ok(()) => Ok(false),
+            Err(rustix::io::Errno::SRCH) => Ok(true),
+            Err(_) => Err(BoundProcessorError::Unreaped),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessContainment {
+    fn drop(&mut self) {
+        let _ = rustix::process::kill_process_group(self.group, rustix::process::Signal::KILL);
+    }
+}
+
+struct ContainedChild {
+    child: Child,
+    containment: ProcessContainment,
+}
+
+async fn spawn_contained_child(
+    command: &mut Command,
+) -> Result<ContainedChild, BoundProcessorError> {
+    let pending = prepare_process_containment(command)?;
+    let mut child = command.spawn().map_err(|_| BoundProcessorError::Spawn)?;
+    match pending.attach(&child) {
+        Ok(containment) => Ok(ContainedChild { child, containment }),
+        Err(error) => {
+            let _ = child.start_kill();
+            match tokio::time::timeout(PROCESS_REAP_TIMEOUT, child.wait()).await {
+                Ok(Ok(_)) => Err(error),
+                _ => Err(BoundProcessorError::Unreaped),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct PendingProcessContainment {
+    job: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+struct ProcessContainment {
+    job: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+fn prepare_process_containment(
+    command: &mut Command,
+) -> Result<PendingProcessContainment, BoundProcessorError> {
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::System::JobObjects::{
+        CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if raw.is_null() {
+        return Err(BoundProcessorError::Containment);
+    }
+    let job = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw.cast()) };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            raw,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if configured == 0 {
+        return Err(BoundProcessorError::Containment);
+    }
+    command.creation_flags(CREATE_SUSPENDED);
+    Ok(PendingProcessContainment { job })
+}
+
+#[cfg(windows)]
+impl PendingProcessContainment {
+    fn attach(self, child: &Child) -> Result<ProcessContainment, BoundProcessorError> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        let process = child.raw_handle().ok_or(BoundProcessorError::Containment)?;
+        let job = self.job.as_raw_handle();
+        if unsafe { AssignProcessToJobObject(job.cast(), process.cast()) } == 0 {
+            return Err(BoundProcessorError::Containment);
+        }
+        if unsafe { ntapi::ntpsapi::NtResumeProcess(process.cast()) } < 0 {
+            return Err(BoundProcessorError::Containment);
+        }
+        Ok(ProcessContainment { job: self.job })
+    }
+}
+
+#[cfg(windows)]
+impl ProcessContainment {
+    fn terminate(&self) -> Result<(), BoundProcessorError> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        if unsafe { TerminateJobObject(self.job.as_raw_handle().cast(), 1) } == 0 {
+            return Err(BoundProcessorError::Unreaped);
+        }
+        Ok(())
+    }
+
+    fn is_empty(&self) -> Result<bool, BoundProcessorError> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.job.as_raw_handle().cast(),
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if queried == 0 {
+            return Err(BoundProcessorError::Unreaped);
+        }
+        Ok(accounting.ActiveProcesses == 0)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessContainment {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+    }
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum BoundProcessorError {
     #[error("processor authority is invalid")]
     Authority,
+    #[error("processor source acquisition failed")]
+    Source,
     #[error("processor staging failed")]
     Stage,
     #[error("managed processor runtime is unavailable")]
@@ -45,6 +227,8 @@ pub(crate) enum BoundProcessorError {
     Manifest,
     #[error("processor could not be started")]
     Spawn,
+    #[error("processor containment could not be established")]
+    Containment,
     #[error("processor exceeded its execution time limit")]
     Timeout,
     #[error("processor output exceeded its capture limit")]
@@ -53,6 +237,8 @@ pub(crate) enum BoundProcessorError {
     Unsuccessful,
     #[error("processor execution was cancelled")]
     Cancelled,
+    #[error("processor descendants could not be proven stopped")]
+    Unreaped,
     #[error("processor workspace cleanup failed")]
     Cleanup,
     #[error("processor owner task stopped unexpectedly")]
@@ -77,10 +263,116 @@ struct VerifiedStepOutput {
 }
 
 pub(crate) struct BoundProcessorExecutionResult {
-    pub(crate) base_receipt: KnownGoodInstallReceipt,
-    pub(crate) base_client_bytes: Vec<u8>,
+    pub(crate) sources: AuthenticatedProcessorSources,
     pub(crate) continuation: BoundForgeInstallerContinuation,
     pub(crate) outputs: VerifiedProcessorOutputs,
+}
+
+pub(crate) struct AuthenticatedProcessorSources {
+    base_version: VersionJson,
+    client: ProcessorClientSource,
+    runtime_source: Option<RuntimeSourceReceipt>,
+    installed_root: Option<ManagedDir>,
+}
+
+enum ProcessorClientSource {
+    Installed(Vec<u8>),
+    Reconstructed(AuthenticatedSelectedArtifactSource),
+}
+
+impl AuthenticatedProcessorSources {
+    pub(crate) fn from_installed(
+        base_version: VersionJson,
+        client_bytes: Vec<u8>,
+        runtime_source: RuntimeSourceReceipt,
+        installed_root: ManagedDir,
+    ) -> Result<Self, BoundProcessorError> {
+        validate_client_source(&base_version, &client_bytes)?;
+        Ok(Self {
+            base_version,
+            client: ProcessorClientSource::Installed(client_bytes),
+            runtime_source: Some(runtime_source),
+            installed_root: Some(installed_root),
+        })
+    }
+
+    pub(crate) fn from_reconstructed(
+        base_version: VersionJson,
+        client_source: AuthenticatedSelectedArtifactSource,
+        runtime_source: RuntimeSourceReceipt,
+    ) -> Result<Self, BoundProcessorError> {
+        let client = base_version
+            .downloads
+            .client
+            .as_ref()
+            .ok_or(BoundProcessorError::Authority)?;
+        let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
+        if client_source.provider_url() != client.url || client_source.expected() != &expected {
+            return Err(BoundProcessorError::Authority);
+        }
+        validate_client_source(&base_version, client_source.bytes())?;
+        Ok(Self {
+            base_version,
+            client: ProcessorClientSource::Reconstructed(client_source),
+            runtime_source: Some(runtime_source),
+            installed_root: None,
+        })
+    }
+
+    fn client_bytes(&self) -> &[u8] {
+        match &self.client {
+            ProcessorClientSource::Installed(bytes) => bytes,
+            ProcessorClientSource::Reconstructed(source) => source.bytes(),
+        }
+    }
+
+    pub(crate) fn into_installed_parts(
+        mut self,
+    ) -> Result<(Vec<u8>, RuntimeSourceReceipt), BoundProcessorError> {
+        let ProcessorClientSource::Installed(client) = self.client else {
+            return Err(BoundProcessorError::Authority);
+        };
+        Ok((
+            client,
+            self.runtime_source
+                .take()
+                .ok_or(BoundProcessorError::Runtime)?,
+        ))
+    }
+
+    pub(crate) fn into_reconstructed_parts(
+        mut self,
+    ) -> Result<(AuthenticatedSelectedArtifactSource, RuntimeSourceReceipt), BoundProcessorError>
+    {
+        let ProcessorClientSource::Reconstructed(client) = self.client else {
+            return Err(BoundProcessorError::Authority);
+        };
+        Ok((
+            client,
+            self.runtime_source
+                .take()
+                .ok_or(BoundProcessorError::Runtime)?,
+        ))
+    }
+}
+
+fn validate_client_source(
+    base_version: &VersionJson,
+    bytes: &[u8],
+) -> Result<(), BoundProcessorError> {
+    let client = base_version
+        .downloads
+        .client
+        .as_ref()
+        .ok_or(BoundProcessorError::Authority)?;
+    if u64::try_from(client.size).ok() != Some(bytes.len() as u64)
+        || !client
+            .sha1
+            .eq_ignore_ascii_case(&format!("{:x}", Sha1::digest(bytes)))
+    {
+        return Err(BoundProcessorError::Authority);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -128,21 +420,88 @@ impl BoundProcessorExecutionHandle {
 }
 
 pub(crate) fn spawn_bound_processor_execution(
-    base_receipt: KnownGoodInstallReceipt,
     execution: BoundForgeProcessorExecution,
-    workspace: LoaderWorkspace,
+    target_version_id: String,
+    minecraft_version: String,
+    sources: AuthenticatedProcessorSources,
 ) -> BoundProcessorExecutionHandle {
     let (continuation, plan) = execution.into_parts();
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
-    let task = tokio::spawn(run_owned_execution(
-        base_receipt,
-        continuation,
-        plan,
-        workspace,
-        cancel_rx,
-        progress_tx,
-    ));
+    let task = tokio::spawn(async move {
+        let workspace = super::workspace::cleanup::prepare_ephemeral_processor_workspace(
+            &target_version_id,
+            &minecraft_version,
+        )
+        .map_err(|_| BoundProcessorError::Stage)?;
+        run_owned_execution(
+            continuation,
+            plan,
+            workspace,
+            sources,
+            cancel_rx,
+            progress_tx,
+        )
+        .await
+    });
+    BoundProcessorExecutionHandle {
+        cancel: Some(cancel_tx),
+        progress: progress_rx,
+        task: Some(task),
+    }
+}
+
+pub(crate) fn spawn_reconstruction_processor_execution(
+    pending: super::forge_installer::PendingForgeReconstructionSources,
+    target_version_id: String,
+    minecraft_version: String,
+    sources: AuthenticatedProcessorSources,
+) -> BoundProcessorExecutionHandle {
+    let (cancel_tx, mut cancel_rx) = oneshot::channel();
+    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let workspace = super::workspace::cleanup::prepare_ephemeral_processor_workspace(
+            &target_version_id,
+            &minecraft_version,
+        )
+        .map_err(|_| BoundProcessorError::Stage)?;
+        let execution = if let Err(error) = check_cancel(&mut cancel_rx) {
+            Err(error)
+        } else {
+            crate::download::reconstruct_installer_processor_sources(pending, workspace.workspace())
+                .await
+                .map_err(|_| BoundProcessorError::Source)
+                .and_then(|execution| {
+                    check_cancel(&mut cancel_rx)?;
+                    Ok(execution)
+                })
+        };
+        let execution = match execution {
+            Ok(BoundForgeInstallExecution::Run(execution)) => *execution,
+            Ok(_) => {
+                return match workspace.cleanup() {
+                    Ok(()) => Err(BoundProcessorError::Authority),
+                    Err(_) => Err(BoundProcessorError::Cleanup),
+                };
+            }
+            Err(error) => {
+                return match workspace.cleanup() {
+                    Ok(()) => Err(error),
+                    Err(_) => Err(BoundProcessorError::Cleanup),
+                };
+            }
+        };
+        let (continuation, plan) = execution.into_parts();
+        run_owned_execution(
+            continuation,
+            plan,
+            workspace,
+            sources,
+            cancel_rx,
+            progress_tx,
+        )
+        .await
+    });
     BoundProcessorExecutionHandle {
         cancel: Some(cancel_tx),
         progress: progress_rx,
@@ -151,90 +510,61 @@ pub(crate) fn spawn_bound_processor_execution(
 }
 
 async fn run_owned_execution(
-    base_receipt: KnownGoodInstallReceipt,
     continuation: BoundForgeInstallerContinuation,
     plan: BoundProcessorPlan,
-    loader_workspace: LoaderWorkspace,
+    workspace_owner: ProcessorWorkspaceOwner,
+    mut sources: AuthenticatedProcessorSources,
     mut cancel: oneshot::Receiver<()>,
     progress: mpsc::UnboundedSender<BoundProcessorProgress>,
 ) -> Result<BoundProcessorExecutionResult, BoundProcessorError> {
-    if continuation.version().inherits_from != base_receipt.version_id()
-        || base_receipt.effective_version().id != base_receipt.version_id()
-        || continuation.version().id != loader_workspace.target_version_id()
-    {
-        return match loader_workspace.cleanup() {
+    if !continuation.matches_execution_identity(
+        workspace_owner.target_version_id(),
+        &sources.base_version.id,
+    ) {
+        return match workspace_owner.cleanup() {
             Ok(()) => Err(BoundProcessorError::Authority),
             Err(_) => Err(BoundProcessorError::Cleanup),
         };
     }
-    let minecraft_version = base_receipt.version_id().to_string();
-    let processor_workspace = loader_workspace
-        .prepare_processor_stage(&minecraft_version)
-        .map_err(|_| BoundProcessorError::Stage);
-    let mut processor_workspace = match processor_workspace {
-        Ok(workspace) => Some(workspace),
-        Err(error) => {
-            return match loader_workspace.cleanup() {
-                Ok(()) => Err(error),
-                Err(_) => Err(BoundProcessorError::Cleanup),
-            };
-        }
-    };
-
     let execution = execute_in_workspace(
-        &loader_workspace,
-        &base_receipt,
         &continuation,
         &plan,
-        processor_workspace
-            .as_ref()
-            .ok_or(BoundProcessorError::Stage)?,
+        workspace_owner.workspace(),
+        &mut sources,
+        &workspace_owner,
         &mut cancel,
         &progress,
     )
     .await;
-    let processor_cleanup = processor_workspace
-        .take()
-        .ok_or(BoundProcessorError::Cleanup)
-        .and_then(|workspace| {
-            workspace
-                .cleanup()
-                .map_err(|_| BoundProcessorError::Cleanup)
-        });
-    let loader_cleanup = loader_workspace
-        .cleanup()
-        .map_err(|_| BoundProcessorError::Cleanup);
-    processor_cleanup?;
-    loader_cleanup?;
-    execution.map(
-        |(outputs, base_client_bytes)| BoundProcessorExecutionResult {
-            base_receipt,
-            base_client_bytes,
+    if matches!(execution, Err(BoundProcessorError::Unreaped)) {
+        workspace_owner.quarantine();
+        return execution.map(|outputs| BoundProcessorExecutionResult {
+            sources,
             continuation,
             outputs,
-        },
-    )
+        });
+    }
+    workspace_owner
+        .cleanup()
+        .map_err(|_| BoundProcessorError::Cleanup)?;
+    execution.map(|outputs| BoundProcessorExecutionResult {
+        sources,
+        continuation,
+        outputs,
+    })
 }
 
 async fn execute_in_workspace(
-    loader_workspace: &LoaderWorkspace,
-    base_receipt: &KnownGoodInstallReceipt,
     continuation: &BoundForgeInstallerContinuation,
     plan: &BoundProcessorPlan,
     workspace: &ProcessorWorkspace,
+    sources: &mut AuthenticatedProcessorSources,
+    workspace_owner: &ProcessorWorkspaceOwner,
     cancel: &mut oneshot::Receiver<()>,
     progress: &mpsc::UnboundedSender<BoundProcessorProgress>,
-) -> Result<(VerifiedProcessorOutputs, Vec<u8>), BoundProcessorError> {
+) -> Result<VerifiedProcessorOutputs, BoundProcessorError> {
     check_cancel(cancel)?;
-    let mut authority = stage_inputs(
-        loader_workspace,
-        base_receipt,
-        continuation,
-        plan,
-        workspace,
-        cancel,
-    )
-    .await?;
+    let mut authority = stage_inputs(continuation, plan, workspace, sources, cancel).await?;
     workspace
         .clear_scratch()
         .map_err(|_| BoundProcessorError::Stage)?;
@@ -245,8 +575,12 @@ async fn execute_in_workspace(
         .snapshot_stage()
         .map_err(|_| BoundProcessorError::Stage)?;
 
-    let java_version = base_receipt.effective_version().java_version.clone();
-    let runtime = ensure_axial_managed_processor_runtime(&java_version)
+    let runtime_source = sources
+        .runtime_source
+        .take()
+        .ok_or(BoundProcessorError::Runtime)?;
+    let runtime = workspace_owner
+        .materialize_runtime(&sources.base_version.java_version, runtime_source)
         .await
         .map_err(|_| BoundProcessorError::Runtime)?;
     check_cancel(cancel)?;
@@ -264,7 +598,7 @@ async fn execute_in_workspace(
             plan,
             workspace,
             &runtime,
-            base_receipt.version_id(),
+            &sources.base_version.id,
             &mut authority,
             cancel,
         )
@@ -293,14 +627,12 @@ async fn execute_in_workspace(
     final_rescan(
         workspace,
         plan,
-        base_receipt.version_id(),
+        &sources.base_version.id,
         &authority,
         &initial_stage,
     )?;
-    Ok((
-        VerifiedProcessorOutputs { entries: verified },
-        authority.base_client_bytes,
-    ))
+    sources.runtime_source = Some(runtime.into_source_receipt());
+    Ok(VerifiedProcessorOutputs { entries: verified })
 }
 
 struct AuthenticatedBytes {
@@ -313,35 +645,54 @@ struct StagedAuthority {
     version: AuthenticatedBytes,
     processor_data: BTreeMap<ArtifactRelativePath, AuthenticatedBytes>,
     installer: Option<AuthenticatedBytes>,
-    base_client_bytes: Vec<u8>,
 }
 
 async fn stage_inputs(
-    loader_workspace: &LoaderWorkspace,
-    base_receipt: &KnownGoodInstallReceipt,
     continuation: &BoundForgeInstallerContinuation,
     plan: &BoundProcessorPlan,
     workspace: &ProcessorWorkspace,
+    sources: &AuthenticatedProcessorSources,
     cancel: &mut oneshot::Receiver<()>,
 ) -> Result<StagedAuthority, BoundProcessorError> {
     let mut libraries = BTreeMap::new();
     for (path, contract) in &plan.input_artifacts {
         check_cancel(cancel)?;
         let bytes = match contract.source {
-            super::forge_installer::BoundProcessorInputSource::Download => loader_workspace
-                .read_live_library_authenticated(path, contract.size, &contract.sha1)
-                .map_err(|_| BoundProcessorError::Authority)?,
+            super::forge_installer::BoundProcessorInputSource::Download => {
+                if let Some(installed_root) = &sources.installed_root {
+                    let bytes = installed_root
+                        .open_child("libraries")
+                        .and_then(|libraries| {
+                            libraries.read_relative_authenticated(
+                                path,
+                                contract.size,
+                                &contract.sha1,
+                            )
+                        })
+                        .map_err(|_| BoundProcessorError::Authority)?;
+                    workspace
+                        .write_library_exact(path, &bytes)
+                        .await
+                        .map_err(|_| BoundProcessorError::Stage)?;
+                    bytes
+                } else {
+                    workspace
+                        .read_library_authenticated(path, contract.size, &contract.sha1)
+                        .map_err(|_| BoundProcessorError::Authority)?
+                }
+            }
             super::forge_installer::BoundProcessorInputSource::Embedded => {
                 let embedded = continuation
                     .embedded_maven_artifact(path)
                     .ok_or(BoundProcessorError::Authority)?;
-                authenticate_bytes(embedded.bytes(), contract.size, &contract.sha1)?
+                let bytes = authenticate_bytes(embedded.bytes(), contract.size, &contract.sha1)?;
+                workspace
+                    .write_library_exact(path, &bytes)
+                    .await
+                    .map_err(|_| BoundProcessorError::Stage)?;
+                bytes
             }
         };
-        workspace
-            .write_library_exact(path, &bytes)
-            .await
-            .map_err(|_| BoundProcessorError::Stage)?;
         libraries.insert(
             path.clone(),
             AuthenticatedBytes {
@@ -351,30 +702,19 @@ async fn stage_inputs(
         );
     }
 
-    let client_integrity = base_receipt
-        .authenticated_client_integrity()
-        .map_err(|_| BoundProcessorError::Authority)?;
-    let client_name = format!("{}.jar", base_receipt.version_id());
-    let client_bytes = loader_workspace
-        .read_base_client_authenticated(
-            base_receipt.version_id(),
-            client_integrity.size,
-            client_integrity.sha1.as_deref(),
-        )
-        .map_err(|_| BoundProcessorError::Authority)?;
-    base_receipt
-        .authenticate_client_bytes(&client_bytes)
-        .map_err(|_| BoundProcessorError::Authority)?;
+    let client_name = format!("{}.jar", sources.base_version.id);
+    let client_bytes = sources.client_bytes();
+    validate_client_source(&sources.base_version, client_bytes)?;
     let staged_client =
         ArtifactRelativePath::new(&client_name).map_err(|_| BoundProcessorError::Authority)?;
     workspace
-        .write_version_exact(&staged_client, &client_bytes)
+        .write_version_exact(&staged_client, client_bytes)
         .await
         .map_err(|_| BoundProcessorError::Stage)?;
 
     let version = AuthenticatedBytes {
         size: client_bytes.len() as u64,
-        sha1: Sha1::digest(&client_bytes).into(),
+        sha1: Sha1::digest(client_bytes).into(),
     };
     let mut processor_data = BTreeMap::new();
     for (path, bytes) in &plan.installer_data {
@@ -403,15 +743,11 @@ async fn stage_inputs(
     } else {
         None
     };
-    loader_workspace
-        .revalidate()
-        .map_err(|_| BoundProcessorError::Stage)?;
     Ok(StagedAuthority {
         libraries,
         version,
         processor_data,
         installer,
-        base_client_bytes: client_bytes,
     })
 }
 
@@ -493,18 +829,18 @@ async fn run_step(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     set_processor_environment(&mut command, workspace, &bootstrap_environment);
-    let mut child = command.spawn().map_err(|_| BoundProcessorError::Spawn)?;
-    let stdout = match child.stdout.take() {
+    let mut child = spawn_contained_child(&mut command).await?;
+    let stdout = match child.child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            kill_and_wait(&mut child).await?;
+            terminate_and_reap(&mut child).await?;
             return Err(BoundProcessorError::Spawn);
         }
     };
-    let stderr = match child.stderr.take() {
+    let stderr = match child.child.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            kill_and_wait(&mut child).await?;
+            terminate_and_reap(&mut child).await?;
             return Err(BoundProcessorError::Spawn);
         }
     };
@@ -512,15 +848,23 @@ async fn run_step(
     let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
     let stdout_task = tokio::spawn(drain_pipe(stdout, total.clone(), pipe_tx.clone()));
     let stderr_task = tokio::spawn(drain_pipe(stderr, total, pipe_tx));
-    let process_result = wait_for_direct_child(&mut child, cancel, &mut pipe_rx).await;
+    let process_result = wait_for_contained_child(
+        &mut child,
+        cancel,
+        &mut pipe_rx,
+        Some(workspace),
+        PROCESSOR_TIMEOUT,
+        PIPE_DRAIN_TIMEOUT,
+    )
+    .await;
     stdout_task.abort();
     stderr_task.abort();
     let _ = stdout_task.await;
     let _ = stderr_task.await;
+    process_result?;
     let runtime_result = runtime
         .revalidate_cli_executable()
         .map_err(|_| BoundProcessorError::Runtime);
-    process_result?;
     runtime_result?;
     workspace
         .revalidate()
@@ -957,26 +1301,20 @@ async fn drain_pipe(
     }
 }
 
-async fn wait_for_direct_child(
-    child: &mut Child,
+async fn wait_for_contained_child(
+    child: &mut ContainedChild,
     cancel: &mut oneshot::Receiver<()>,
     pipe: &mut mpsc::UnboundedReceiver<PipeEvent>,
-) -> Result<(), BoundProcessorError> {
-    wait_for_direct_child_with_limits(child, cancel, pipe, PROCESSOR_TIMEOUT, PIPE_DRAIN_TIMEOUT)
-        .await
-}
-
-async fn wait_for_direct_child_with_limits(
-    child: &mut Child,
-    cancel: &mut oneshot::Receiver<()>,
-    pipe: &mut mpsc::UnboundedReceiver<PipeEvent>,
+    workspace: Option<&ProcessorWorkspace>,
     process_timeout: Duration,
     drain_timeout: Duration,
 ) -> Result<(), BoundProcessorError> {
     let deadline = tokio::time::sleep(process_timeout);
     tokio::pin!(deadline);
+    let mut stage_watch = tokio::time::interval(STAGE_WATCH_INTERVAL);
+    stage_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut finished_pipes = 0_usize;
-    loop {
+    let outcome = loop {
         let outcome = tokio::select! {
             biased;
             event = pipe.recv(), if finished_pipes < 2 => match event {
@@ -984,27 +1322,37 @@ async fn wait_for_direct_child_with_limits(
                     finished_pipes += 1;
                     continue;
                 }
-                Some(PipeEvent::Limit) => Some(BoundProcessorError::OutputLimit),
-                Some(PipeEvent::Read) | None => Some(BoundProcessorError::Unsuccessful),
+                Some(PipeEvent::Limit) => {
+                    finished_pipes += 1;
+                    Err(BoundProcessorError::OutputLimit)
+                }
+                Some(PipeEvent::Read) => {
+                    finished_pipes += 1;
+                    Err(BoundProcessorError::Unsuccessful)
+                }
+                None => {
+                    finished_pipes = 2;
+                    Err(BoundProcessorError::Unsuccessful)
+                }
             },
-            _ = &mut *cancel => Some(BoundProcessorError::Cancelled),
-            _ = &mut deadline => Some(BoundProcessorError::Timeout),
-            status = child.wait() => match status {
-                Ok(status) if status.success() => None,
-                Ok(_) => return Err(BoundProcessorError::Unsuccessful),
-                Err(_) => Some(BoundProcessorError::Unsuccessful),
+            _ = &mut *cancel => Err(BoundProcessorError::Cancelled),
+            _ = &mut deadline => Err(BoundProcessorError::Timeout),
+            _ = stage_watch.tick(), if workspace.is_some() => match workspace
+                .expect("guarded processor workspace")
+                .validate_live_bounds()
+            {
+                Ok(()) => continue,
+                Err(_) => Err(BoundProcessorError::Stage),
+            },
+            status = child.child.wait() => match status {
+                Ok(status) if status.success() => Ok(()),
+                Ok(_) | Err(_) => Err(BoundProcessorError::Unsuccessful),
             },
         };
-        if let Some(error) = outcome {
-            let _ = child.start_kill();
-            child
-                .wait()
-                .await
-                .map_err(|_| BoundProcessorError::Unsuccessful)?;
-            return Err(error);
-        }
-        break;
-    }
+        break outcome;
+    };
+
+    terminate_and_reap(child).await?;
 
     let drains = async {
         while finished_pipes < 2 {
@@ -1016,18 +1364,32 @@ async fn wait_for_direct_child_with_limits(
         }
         Ok(())
     };
-    tokio::time::timeout(drain_timeout, drains)
+    let drain_result = tokio::time::timeout(drain_timeout, drains)
         .await
-        .map_err(|_| BoundProcessorError::Unsuccessful)?
+        .map_err(|_| BoundProcessorError::Unsuccessful)
+        .and_then(|result| result);
+    match outcome {
+        Ok(()) => drain_result,
+        Err(error) => Err(error),
+    }
 }
 
-async fn kill_and_wait(child: &mut Child) -> Result<(), BoundProcessorError> {
-    let _ = child.start_kill();
-    child
-        .wait()
+async fn terminate_and_reap(child: &mut ContainedChild) -> Result<(), BoundProcessorError> {
+    child.containment.terminate()?;
+    tokio::time::timeout(PROCESS_REAP_TIMEOUT, child.child.wait())
         .await
-        .map(|_| ())
-        .map_err(|_| BoundProcessorError::Unsuccessful)
+        .map_err(|_| BoundProcessorError::Unreaped)?
+        .map_err(|_| BoundProcessorError::Unreaped)?;
+    let deadline = tokio::time::Instant::now() + PROCESS_REAP_TIMEOUT;
+    loop {
+        if child.containment.is_empty()? {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(BoundProcessorError::Unreaped);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn verify_step_diff(
@@ -1212,12 +1574,6 @@ fn check_cancel(cancel: &mut oneshot::Receiver<()>) -> Result<(), BoundProcessor
 }
 
 impl VerifiedProcessorOutputs {
-    pub(crate) fn none() -> Self {
-        Self {
-            entries: BTreeMap::new(),
-        }
-    }
-
     pub(crate) fn into_entries(self) -> BTreeMap<ArtifactRelativePath, VerifiedProcessorOutput> {
         self.entries
     }
@@ -1249,7 +1605,7 @@ mod tests {
     use super::{
         AuthenticatedBytes, BoundProcessorError, PipeEvent, StagedAuthority, drain_pipe,
         manifest_attributes, processor_main_class, reauthenticate_step_dependencies,
-        valid_main_class, wait_for_direct_child_with_limits,
+        spawn_contained_child, valid_main_class, wait_for_contained_child,
     };
     use crate::artifact_path::ArtifactRelativePath;
     use crate::loaders::forge_installer::{
@@ -1257,7 +1613,7 @@ mod tests {
         BoundProcessorData, BoundProcessorOutput, BoundProcessorOutputRole, BoundProcessorPlan,
         BoundProcessorStep, ProcessorBuiltinToken,
     };
-    use crate::loaders::workspace::cleanup::prepare_fresh_work_dir;
+    use crate::loaders::workspace::cleanup::prepare_ephemeral_processor_workspace;
     use sha1::{Digest as _, Sha1};
     use std::collections::BTreeMap;
     use std::fs;
@@ -1313,14 +1669,17 @@ mod tests {
     fn processor_errors_are_closed_static_and_redacted() {
         for error in [
             BoundProcessorError::Authority,
+            BoundProcessorError::Source,
             BoundProcessorError::Stage,
             BoundProcessorError::Runtime,
             BoundProcessorError::Manifest,
             BoundProcessorError::Spawn,
+            BoundProcessorError::Containment,
             BoundProcessorError::Timeout,
             BoundProcessorError::OutputLimit,
             BoundProcessorError::Unsuccessful,
             BoundProcessorError::Cancelled,
+            BoundProcessorError::Unreaped,
             BoundProcessorError::Cleanup,
             BoundProcessorError::OwnerStopped,
         ] {
@@ -1336,12 +1695,9 @@ mod tests {
 
     #[tokio::test]
     async fn typed_non_library_dependencies_reject_staged_tampering() {
-        let root = temp_dir("typed-dependency-tamper");
-        fs::create_dir_all(&root).expect("Minecraft root");
-        let loader = prepare_fresh_work_dir(&root, "forge-target").expect("loader workspace");
-        let workspace = loader
-            .prepare_processor_stage("1.21.5")
+        let owner = prepare_ephemeral_processor_workspace("forge-target", "1.21.5")
             .expect("processor workspace");
+        let workspace = owner.workspace();
         let jar = ArtifactRelativePath::new("example/processor.jar").expect("jar path");
         let data = ArtifactRelativePath::new("patch/client.bin").expect("data path");
         let version = ArtifactRelativePath::new("1.21.5.jar").expect("version path");
@@ -1371,7 +1727,6 @@ mod tests {
             version: facts(b"client"),
             processor_data: BTreeMap::from([(data.clone(), facts(b"patch"))]),
             installer: Some(facts(b"installer")),
-            base_client_bytes: Vec::new(),
         };
         let artifact = BoundProcessorArtifact {
             coordinate: "example:processor:1".to_string(),
@@ -1393,7 +1748,7 @@ mod tests {
             installer_data: BTreeMap::new(),
             input_artifacts: BTreeMap::new(),
         };
-        reauthenticate_step_dependencies(&step, &plan, &workspace, &authority, "1.21.5")
+        reauthenticate_step_dependencies(&step, &plan, workspace, &authority, "1.21.5")
             .expect("authenticated dependencies");
 
         fs::write(
@@ -1402,7 +1757,7 @@ mod tests {
         )
         .expect("tamper staged jar");
         assert!(matches!(
-            reauthenticate_step_dependencies(&step, &plan, &workspace, &authority, "1.21.5"),
+            reauthenticate_step_dependencies(&step, &plan, workspace, &authority, "1.21.5"),
             Err(BoundProcessorError::Authority)
         ));
         workspace
@@ -1419,7 +1774,7 @@ mod tests {
         )
         .expect("tamper staged data");
         assert!(matches!(
-            reauthenticate_step_dependencies(&step, &plan, &workspace, &authority, "1.21.5"),
+            reauthenticate_step_dependencies(&step, &plan, workspace, &authority, "1.21.5"),
             Err(BoundProcessorError::Authority)
         ));
         workspace
@@ -1433,7 +1788,7 @@ mod tests {
         fs::write(workspace.version_path().join("1.21.5.jar"), b"changed")
             .expect("tamper staged client");
         assert!(matches!(
-            reauthenticate_step_dependencies(&step, &plan, &workspace, &authority, "1.21.5"),
+            reauthenticate_step_dependencies(&step, &plan, workspace, &authority, "1.21.5"),
             Err(BoundProcessorError::Authority)
         ));
         workspace
@@ -1446,7 +1801,7 @@ mod tests {
 
         fs::write(workspace.installer_path(), b"changed").expect("tamper installer");
         assert!(matches!(
-            reauthenticate_step_dependencies(&step, &plan, &workspace, &authority, "1.21.5"),
+            reauthenticate_step_dependencies(&step, &plan, workspace, &authority, "1.21.5"),
             Err(BoundProcessorError::Authority)
         ));
         workspace
@@ -1492,7 +1847,7 @@ mod tests {
         reauthenticate_step_dependencies(
             &output_step,
             &output_plan,
-            &workspace,
+            workspace,
             &authority,
             "1.21.5",
         )
@@ -1505,15 +1860,13 @@ mod tests {
             reauthenticate_step_dependencies(
                 &output_step,
                 &output_plan,
-                &workspace,
+                workspace,
                 &authority,
                 "1.21.5",
             ),
             Err(BoundProcessorError::Authority)
         ));
-        workspace.cleanup().expect("processor cleanup");
-        loader.cleanup().expect("loader cleanup");
-        let _ = fs::remove_dir_all(root);
+        owner.cleanup().expect("processor cleanup");
     }
 
     #[tokio::test]
@@ -1532,95 +1885,128 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn direct_child_nonzero_cancel_and_output_limit_are_reaped() {
-        let mut nonzero = Command::new("sh")
-            .args(["-c", "exit 7"])
-            .spawn()
+    async fn contained_nonzero_cancel_and_output_limit_are_reaped() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 7"]);
+        let mut nonzero = spawn_contained_child(&mut command)
+            .await
             .expect("nonzero child");
         let (_cancel_tx, mut cancel_rx) = oneshot::channel();
-        let (_pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
+        let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
+        pipe_tx.send(PipeEvent::Finished).unwrap();
+        pipe_tx.send(PipeEvent::Finished).unwrap();
         assert!(matches!(
-            wait_for_direct_child_with_limits(
+            wait_for_contained_child(
                 &mut nonzero,
                 &mut cancel_rx,
                 &mut pipe_rx,
+                None,
                 Duration::from_secs(2),
                 Duration::from_millis(50),
             )
             .await,
             Err(BoundProcessorError::Unsuccessful)
         ));
-        assert!(nonzero.try_wait().expect("nonzero wait").is_some());
+        assert!(nonzero.child.try_wait().expect("nonzero wait").is_some());
 
-        let mut cancelled = Command::new("sh")
-            .args(["-c", "while :; do :; done"])
-            .spawn()
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & wait"]);
+        let mut cancelled = spawn_contained_child(&mut command)
+            .await
             .expect("cancelled child");
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
         cancel_tx.send(()).expect("cancel signal");
-        let (_pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
+        let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
+        pipe_tx.send(PipeEvent::Finished).unwrap();
+        pipe_tx.send(PipeEvent::Finished).unwrap();
         assert!(matches!(
-            wait_for_direct_child_with_limits(
+            wait_for_contained_child(
                 &mut cancelled,
                 &mut cancel_rx,
                 &mut pipe_rx,
+                None,
                 Duration::from_secs(2),
                 Duration::from_millis(50),
             )
             .await,
             Err(BoundProcessorError::Cancelled)
         ));
-        assert!(cancelled.try_wait().expect("cancel wait").is_some());
+        assert!(cancelled.child.try_wait().expect("cancel wait").is_some());
 
-        let mut flooded = Command::new("sh")
-            .args(["-c", "while :; do :; done"])
-            .spawn()
+        let mut command = Command::new("sh");
+        command.args(["-c", "while :; do :; done"]);
+        let mut flooded = spawn_contained_child(&mut command)
+            .await
             .expect("flood child");
         let (_cancel_tx, mut cancel_rx) = oneshot::channel();
         let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
         pipe_tx.send(PipeEvent::Limit).expect("limit event");
         assert!(matches!(
-            wait_for_direct_child_with_limits(
+            wait_for_contained_child(
                 &mut flooded,
                 &mut cancel_rx,
                 &mut pipe_rx,
+                None,
                 Duration::from_secs(2),
                 Duration::from_millis(50),
             )
             .await,
             Err(BoundProcessorError::OutputLimit)
         ));
-        assert!(flooded.try_wait().expect("limit wait").is_some());
+        assert!(flooded.child.try_wait().expect("limit wait").is_some());
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn direct_child_timeout_is_reaped() {
-        let mut child = Command::new("sh")
-            .args(["-c", "while :; do :; done"])
-            .spawn()
+    async fn successful_leader_exit_terminates_surviving_descendants() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & exit 0"]);
+        let mut child = spawn_contained_child(&mut command)
+            .await
+            .expect("contained child");
+        let (_cancel_tx, mut cancel_rx) = oneshot::channel();
+        let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
+        pipe_tx.send(PipeEvent::Finished).unwrap();
+        pipe_tx.send(PipeEvent::Finished).unwrap();
+
+        wait_for_contained_child(
+            &mut child,
+            &mut cancel_rx,
+            &mut pipe_rx,
+            None,
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("contained success");
+        assert!(child.child.try_wait().expect("leader wait").is_some());
+        assert!(child.containment.is_empty().expect("empty process group"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contained_tree_timeout_is_reaped() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & wait"]);
+        let mut child = spawn_contained_child(&mut command)
+            .await
             .expect("timeout child");
         let (_cancel_tx, mut cancel_rx) = oneshot::channel();
-        let (_pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
+        let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
+        pipe_tx.send(PipeEvent::Finished).unwrap();
+        pipe_tx.send(PipeEvent::Finished).unwrap();
         assert!(matches!(
-            wait_for_direct_child_with_limits(
+            wait_for_contained_child(
                 &mut child,
                 &mut cancel_rx,
                 &mut pipe_rx,
+                None,
                 Duration::from_millis(20),
                 Duration::from_millis(20),
             )
             .await,
             Err(BoundProcessorError::Timeout)
         ));
-        assert!(child.try_wait().expect("timeout wait").is_some());
-    }
-
-    fn temp_dir(label: &str) -> std::path::PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!("axial-{label}-{nonce}"))
+        assert!(child.child.try_wait().expect("timeout wait").is_some());
     }
 }

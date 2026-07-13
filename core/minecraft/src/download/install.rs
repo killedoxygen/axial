@@ -69,6 +69,16 @@ pub(crate) struct ReconstructedVanillaClientAuthority {
     client_source: AuthenticatedSelectedArtifactSource,
 }
 
+pub(crate) struct ReconstructedVanillaProcessorAuthority {
+    pending: PendingReconstructedVanillaProcessorAuthority,
+    client_source: AuthenticatedSelectedArtifactSource,
+    runtime_source: RuntimeSourceReceipt,
+}
+
+pub(crate) struct PendingReconstructedVanillaProcessorAuthority {
+    parts: VanillaAuthorityParts,
+}
+
 impl ReconstructedVanillaClientAuthority {
     pub(crate) fn consume_for_overlay(
         self,
@@ -77,6 +87,43 @@ impl ReconstructedVanillaClientAuthority {
         AuthenticatedSelectedArtifactSource,
     ) {
         (self.receipt, self.client_source)
+    }
+}
+
+impl ReconstructedVanillaProcessorAuthority {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        PendingReconstructedVanillaProcessorAuthority,
+        AuthenticatedSelectedArtifactSource,
+        RuntimeSourceReceipt,
+    ) {
+        (self.pending, self.client_source, self.runtime_source)
+    }
+}
+
+impl PendingReconstructedVanillaProcessorAuthority {
+    pub(crate) fn version(&self) -> &VersionJson {
+        &self.parts.version
+    }
+
+    pub(crate) fn complete(
+        mut self,
+        runtime_source: RuntimeSourceReceipt,
+    ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
+        if self.parts.runtime_source.is_some() {
+            return Err(DownloadError::ResolveManifest(
+                "processor runtime authority was already completed".to_string(),
+            ));
+        }
+        self.parts.runtime_source = Some(runtime_source);
+        seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(self.parts)).map_err(
+            |error| {
+                DownloadError::ResolveManifest(format!(
+                    "reconstructed source inventory could not be derived: {error:?}"
+                ))
+            },
+        )
     }
 }
 
@@ -285,6 +332,44 @@ impl Downloader {
         &self,
         version_id: &str,
     ) -> Result<ReconstructedVanillaClientAuthority, DownloadError> {
+        let (authority, client_source) = self
+            .reconstruct_version_with_client_authority(version_id)
+            .await?;
+        let receipt = seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(authority))
+            .map_err(|error| {
+                DownloadError::ResolveManifest(format!(
+                    "reconstructed source inventory could not be derived: {error:?}"
+                ))
+            })?;
+        Ok(ReconstructedVanillaClientAuthority {
+            receipt,
+            client_source,
+        })
+    }
+
+    pub(crate) async fn reconstruct_version_for_processor(
+        &self,
+        version_id: &str,
+    ) -> Result<ReconstructedVanillaProcessorAuthority, DownloadError> {
+        let (mut authority, client_source) = self
+            .reconstruct_version_with_client_authority(version_id)
+            .await?;
+        let runtime_source = authority.runtime_source.take().ok_or_else(|| {
+            DownloadError::ResolveManifest(
+                "authenticated base version has no processor runtime source".to_string(),
+            )
+        })?;
+        Ok(ReconstructedVanillaProcessorAuthority {
+            pending: PendingReconstructedVanillaProcessorAuthority { parts: authority },
+            client_source,
+            runtime_source,
+        })
+    }
+
+    async fn reconstruct_version_with_client_authority(
+        &self,
+        version_id: &str,
+    ) -> Result<(VanillaAuthorityParts, AuthenticatedSelectedArtifactSource), DownloadError> {
         const MAX_RECONSTRUCTED_CLIENT_BYTES: usize = 512 << 20;
 
         validate_install_version_id(version_id)?;
@@ -325,16 +410,7 @@ impl Downloader {
                 fact_tx: None,
             })
             .await?;
-        let receipt = seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(authority))
-            .map_err(|error| {
-                DownloadError::ResolveManifest(format!(
-                    "reconstructed source inventory could not be derived: {error:?}"
-                ))
-            })?;
-        Ok(ReconstructedVanillaClientAuthority {
-            receipt,
-            client_source,
-        })
+        Ok((authority, client_source))
     }
 
     async fn reconstruct_vanilla_authority(
@@ -1102,19 +1178,45 @@ pub(crate) async fn reconstruct_profile_library_declarations(
 pub(crate) async fn reconstruct_installer_library_declarations(
     sources: crate::loaders::PendingForgeReconstructionSources,
 ) -> Result<crate::loaders::BoundForgeInstallExecution, DownloadError> {
-    let (pending, jobs) = sources.into_parts();
+    reconstruct_installer_library_declarations_inner(sources, None).await
+}
+
+pub(crate) async fn reconstruct_installer_processor_sources(
+    sources: crate::loaders::PendingForgeReconstructionSources,
+    workspace: &crate::loaders::workspace::cleanup::ProcessorWorkspace,
+) -> Result<crate::loaders::BoundForgeInstallExecution, DownloadError> {
+    reconstruct_installer_library_declarations_inner(sources, Some(workspace)).await
+}
+
+async fn reconstruct_installer_library_declarations_inner(
+    sources: crate::loaders::PendingForgeReconstructionSources,
+    workspace: Option<&crate::loaders::workspace::cleanup::ProcessorWorkspace>,
+) -> Result<crate::loaders::BoundForgeInstallExecution, DownloadError> {
+    let (pending, jobs, mut required_execution_inputs) = sources.into_parts();
+    if workspace.is_none() && !required_execution_inputs.is_empty() {
+        return Err(DownloadError::ResolveManifest(
+            "processor reconstruction sources require an ephemeral workspace".to_string(),
+        ));
+    }
     let client = standard_minecraft_download_client();
     let source_pool = LibrarySourcePool::new();
     let mut proofs = Vec::new();
     for classified in jobs {
         let (plan, acquisition) = classified.into_parts();
-        if acquisition == LibraryAcquisition::ExactDeclaration {
+        let required_by_execution = required_execution_inputs.remove(&plan.relative_path);
+        let stage_in_workspace = required_by_execution;
+        if acquisition == LibraryAcquisition::ExactDeclaration && !stage_in_workspace {
             continue;
         }
         let target = selected_download_source_label(
             SelectedDownloadArtifactKind::Library,
             plan.relative_path.as_str(),
         );
+        let max_bytes = if stage_in_workspace {
+            128 << 20
+        } else {
+            LIBRARY_SOURCE_MAX_BYTES
+        };
         let source = acquire_authenticated_library_source(LibrarySourceRequest {
             client: &client,
             url: plan.source_url.as_deref().ok_or_else(|| {
@@ -1124,13 +1226,45 @@ pub(crate) async fn reconstruct_installer_library_declarations(
             })?,
             expected: &plan.expected,
             relative_path: &plan.relative_path,
-            max_bytes: LIBRARY_SOURCE_MAX_BYTES,
+            max_bytes,
             target: &target,
             pool: &source_pool,
             fact_tx: None,
         })
         .await?;
-        proofs.push(source.into_exact_download_proof(plan.is_native));
+        if stage_in_workspace {
+            let (file, path, size, sha1, expected, _target, provider_url, permit) =
+                source.into_parts();
+            workspace
+                .ok_or_else(|| {
+                    DownloadError::ResolveManifest(
+                        "processor reconstruction workspace is missing".to_string(),
+                    )
+                })?
+                .import_library_authenticated(&path, file, size, sha1)
+                .await
+                .map_err(|error| {
+                    DownloadError::FileOperation(io::Error::other(error.to_string()))
+                })?;
+            drop(permit);
+            if acquisition == LibraryAcquisition::FreshStream {
+                proofs.push(ExactLibraryDownloadProof::new(
+                    path,
+                    plan.is_native,
+                    provider_url,
+                    expected,
+                    size,
+                    sha1,
+                ));
+            }
+        } else {
+            proofs.push(source.into_exact_download_proof(plan.is_native));
+        }
+    }
+    if !required_execution_inputs.is_empty() {
+        return Err(DownloadError::ResolveManifest(
+            "processor reconstruction input source is missing".to_string(),
+        ));
     }
     pending.complete_sources(proofs).map_err(|error| {
         DownloadError::ResolveManifest(format!(

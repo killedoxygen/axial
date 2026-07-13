@@ -14,7 +14,8 @@ use super::{
     runtime_download_client, runtime_file_download_concurrency_for, runtime_install_lock_file_path,
     runtime_install_lock_from_map, runtime_os_arch_for, runtime_record_matches_source_for_test,
     runtime_source_url_is_secure_for_test, runtime_windows_verbatim_path_string,
-    select_runtime_manifest, verify_runtime_download,
+    select_runtime_manifest, validate_ephemeral_processor_manifest_for_test,
+    verify_runtime_download,
 };
 use crate::JavaVersion;
 use serde::Deserialize;
@@ -1424,6 +1425,46 @@ async fn runtime_file_download_streams_and_verifies_to_temp() {
 
     assert_eq!(fs::read(&temp_path).expect("downloaded file"), b"hello");
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn ephemeral_processor_runtime_rejects_oversized_file_before_request() {
+    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+    let manifest = ComponentManifest {
+        files: HashMap::from([(
+            "bin/java".to_string(),
+            downloadable_manifest_file(
+                &url,
+                (128 << 20) + 1,
+                "0000000000000000000000000000000000000000",
+            ),
+        )]),
+    };
+
+    assert!(validate_ephemeral_processor_manifest_for_test(&manifest, 1).is_err());
+    tokio::task::yield_now().await;
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn ephemeral_processor_runtime_counts_lzma_peak_entry_before_effects() {
+    let mut files = (0..4091)
+        .map(|index| (format!("entry-{index}"), manifest_file("directory")))
+        .collect::<HashMap<_, _>>();
+    files.insert(
+        "bin/java".to_string(),
+        downloadable_lzma_manifest_file(
+            "https://example.invalid/java",
+            1,
+            "0000000000000000000000000000000000000000",
+            "https://example.invalid/java.lzma",
+            1,
+            "0000000000000000000000000000000000000000",
+        ),
+    );
+    let manifest = ComponentManifest { files };
+
+    assert!(validate_ephemeral_processor_manifest_for_test(&manifest, 1).is_err());
 }
 
 #[tokio::test]

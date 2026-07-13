@@ -20,11 +20,45 @@ use std::io::{BufReader, Write};
 use std::path::Path;
 use tokio::fs as async_fs;
 
+const MAX_EPHEMERAL_RUNTIME_ENTRIES: usize = 4096;
+const MAX_EPHEMERAL_RUNTIME_DEPTH: usize = 16;
+const MAX_EPHEMERAL_RUNTIME_FILE_BYTES: u64 = 128 << 20;
+const MAX_EPHEMERAL_RUNTIME_TOTAL_BYTES: u64 = 512 << 20;
+
 pub(super) async fn install_managed_runtime(
     component: &RuntimeId,
     dest_dir: &Path,
     source: &RuntimeSourceReceipt,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
+) -> Result<(), JavaRuntimeLookupError> {
+    install_managed_runtime_with_concurrency(
+        component,
+        dest_dir,
+        source,
+        observer,
+        runtime_file_download_concurrency(),
+    )
+    .await
+}
+
+pub(super) async fn install_ephemeral_processor_runtime(
+    component: &RuntimeId,
+    dest_dir: &Path,
+    source: &RuntimeSourceReceipt,
+    max_entries: usize,
+    max_bytes: u64,
+    observer: &mut impl FnMut(RuntimeEnsureEvent),
+) -> Result<(), JavaRuntimeLookupError> {
+    validate_ephemeral_processor_manifest(source, max_entries, max_bytes)?;
+    install_managed_runtime_with_concurrency(component, dest_dir, source, observer, 1).await
+}
+
+async fn install_managed_runtime_with_concurrency(
+    component: &RuntimeId,
+    dest_dir: &Path,
+    source: &RuntimeSourceReceipt,
+    observer: &mut impl FnMut(RuntimeEnsureEvent),
+    download_concurrency: usize,
 ) -> Result<(), JavaRuntimeLookupError> {
     if source.component() != component {
         return Err(JavaRuntimeLookupError::Download(
@@ -60,11 +94,12 @@ pub(super) async fn install_managed_runtime(
         let component_manifest = source.manifest();
         persist_component_manifest_proof(&temp_dir, component_manifest).await?;
 
-        install_runtime_manifest_files(
+        install_runtime_manifest_files_with_concurrency(
             component.as_str(),
             &temp_dir,
             component_manifest.files.clone(),
             observer,
+            download_concurrency,
         )
         .await?;
 
@@ -109,6 +144,136 @@ pub(super) async fn install_managed_runtime(
     Ok(())
 }
 
+fn validate_ephemeral_processor_manifest(
+    source: &RuntimeSourceReceipt,
+    max_entries: usize,
+    max_bytes: u64,
+) -> Result<(), JavaRuntimeLookupError> {
+    validate_ephemeral_processor_manifest_contract(
+        source.manifest(),
+        source.bytes().len() as u64,
+        max_entries.min(MAX_EPHEMERAL_RUNTIME_ENTRIES),
+        max_bytes.min(MAX_EPHEMERAL_RUNTIME_TOTAL_BYTES),
+    )
+}
+
+fn validate_ephemeral_processor_manifest_contract(
+    manifest: &ComponentManifest,
+    manifest_bytes: u64,
+    max_entries: usize,
+    max_bytes: u64,
+) -> Result<(), JavaRuntimeLookupError> {
+    if manifest.files.len() > max_entries {
+        return Err(JavaRuntimeLookupError::Download(
+            "processor runtime manifest exceeds the entry bound".to_string(),
+        ));
+    }
+    let mut filesystem_entries = std::collections::HashSet::new();
+    let mut raw_total = 0_u64;
+    let mut largest_compressed = 0_u64;
+    let mut has_compressed = false;
+    for (relative_path, file) in &manifest.files {
+        component_manifest_destination(Path::new("runtime"), relative_path)?;
+        let segments = relative_path.split(['/', '\\']).collect::<Vec<_>>();
+        if segments.len() > MAX_EPHEMERAL_RUNTIME_DEPTH {
+            return Err(JavaRuntimeLookupError::Download(
+                "processor runtime manifest exceeds the depth bound".to_string(),
+            ));
+        }
+        let mut prefix = String::new();
+        for segment in segments {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(segment);
+            filesystem_entries.insert(prefix.clone());
+        }
+        match file.kind.as_str() {
+            "directory" | "link" => {}
+            "file" => {
+                let downloads = file.downloads.as_ref().ok_or_else(|| {
+                    JavaRuntimeLookupError::Download(
+                        "processor runtime file is missing exact download proof".to_string(),
+                    )
+                })?;
+                let raw = downloads.raw.as_ref().ok_or_else(|| {
+                    JavaRuntimeLookupError::Download(
+                        "processor runtime file is missing exact raw proof".to_string(),
+                    )
+                })?;
+                let raw_size = exact_ephemeral_runtime_download_size(raw, "raw")?;
+                raw_total = raw_total.checked_add(raw_size).ok_or_else(|| {
+                    JavaRuntimeLookupError::Download(
+                        "processor runtime byte total overflowed".to_string(),
+                    )
+                })?;
+                if let Some(lzma) = downloads.lzma.as_ref() {
+                    has_compressed = true;
+                    largest_compressed = largest_compressed
+                        .max(exact_ephemeral_runtime_download_size(lzma, "compressed")?);
+                }
+            }
+            _ => {
+                return Err(JavaRuntimeLookupError::Download(
+                    "processor runtime manifest contains an unsupported entry".to_string(),
+                ));
+            }
+        }
+    }
+    let admitted_total = raw_total
+        .checked_add(largest_compressed)
+        .and_then(|total| total.checked_add(manifest_bytes))
+        .and_then(|total| total.checked_add(64))
+        .ok_or_else(|| {
+            JavaRuntimeLookupError::Download("processor runtime byte total overflowed".to_string())
+        })?;
+    let transient_entries = 3_usize.saturating_add(usize::from(has_compressed));
+    if filesystem_entries.len().saturating_add(transient_entries) > max_entries
+        || raw_total > max_bytes
+        || admitted_total > max_bytes
+    {
+        return Err(JavaRuntimeLookupError::Download(
+            "processor runtime manifest exceeds the aggregate bound".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn validate_ephemeral_processor_manifest_for_test(
+    manifest: &ComponentManifest,
+    manifest_bytes: u64,
+) -> Result<(), JavaRuntimeLookupError> {
+    validate_ephemeral_processor_manifest_contract(
+        manifest,
+        manifest_bytes,
+        MAX_EPHEMERAL_RUNTIME_ENTRIES,
+        MAX_EPHEMERAL_RUNTIME_TOTAL_BYTES,
+    )
+}
+
+fn exact_ephemeral_runtime_download_size(
+    download: &ComponentManifestDownload,
+    label: &str,
+) -> Result<u64, JavaRuntimeLookupError> {
+    let size = download.size.filter(|size| *size > 0).ok_or_else(|| {
+        JavaRuntimeLookupError::Download(format!(
+            "processor runtime {label} file is missing exact size"
+        ))
+    })?;
+    if size > MAX_EPHEMERAL_RUNTIME_FILE_BYTES {
+        return Err(JavaRuntimeLookupError::Download(format!(
+            "processor runtime {label} file exceeds the per-file bound"
+        )));
+    }
+    if !download.sha1.as_deref().is_some_and(runtime_sha1_is_valid) {
+        return Err(JavaRuntimeLookupError::Download(format!(
+            "processor runtime {label} file is missing exact checksum"
+        )));
+    }
+    Ok(size)
+}
+
 async fn persist_component_manifest_proof(
     temp_dir: &Path,
     component_manifest: &ComponentManifest,
@@ -150,11 +315,29 @@ pub(super) async fn remove_runtime_install_path_async(path: &Path) -> std::io::R
     }
 }
 
+#[cfg(test)]
 pub(super) async fn install_runtime_manifest_files(
     component: &str,
     temp_dir: &Path,
     files: HashMap<String, ComponentManifestFile>,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
+) -> Result<(), JavaRuntimeLookupError> {
+    install_runtime_manifest_files_with_concurrency(
+        component,
+        temp_dir,
+        files,
+        observer,
+        runtime_file_download_concurrency(),
+    )
+    .await
+}
+
+async fn install_runtime_manifest_files_with_concurrency(
+    component: &str,
+    temp_dir: &Path,
+    files: HashMap<String, ComponentManifestFile>,
+    observer: &mut impl FnMut(RuntimeEnsureEvent),
+    download_concurrency: usize,
 ) -> Result<(), JavaRuntimeLookupError> {
     let plan = plan_runtime_manifest_files(files);
     let download_client = runtime_download_client();
@@ -199,7 +382,7 @@ pub(super) async fn install_runtime_manifest_files(
                 )
             }
         }))
-        .buffer_unordered(runtime_file_download_concurrency());
+        .buffer_unordered(download_concurrency.max(1));
 
     let mut completed_files = 0;
     let mut completed_bytes = 0_u64;

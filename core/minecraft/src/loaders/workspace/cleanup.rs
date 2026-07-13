@@ -3,14 +3,17 @@ use crate::loaders::managed_fs::{ManagedDir, ManagedTreeLimits, ManagedTreeSnaps
 use crate::loaders::types::LoaderError;
 use crate::loaders::validate_version_id;
 use std::path::Path;
+use tempfile::TempDir;
 
-pub(crate) struct LoaderWorkspace {
-    root: ManagedDir,
-    directory: ManagedDir,
+pub(crate) struct ProcessorWorkspaceOwner {
+    temporary: TempDir,
+    temporary_root: ManagedDir,
+    workspace: ProcessorWorkspace,
     target_version_id: String,
 }
 
 pub(crate) struct ProcessorWorkspace {
+    owner_root: ManagedDir,
     stage: ManagedDir,
     root: ManagedDir,
     libraries: ManagedDir,
@@ -20,76 +23,104 @@ pub(crate) struct ProcessorWorkspace {
     temp: ManagedDir,
 }
 
-impl LoaderWorkspace {
+impl ProcessorWorkspaceOwner {
     pub(crate) fn target_version_id(&self) -> &str {
         &self.target_version_id
     }
 
     #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
-        self.directory.path()
-    }
-    pub(crate) fn revalidate(&self) -> Result<(), LoaderError> {
-        self.root.revalidate()?;
-        self.directory.revalidate()
+        self.temporary.path()
     }
 
-    pub(crate) fn read_live_library_authenticated(
-        &self,
-        relative: &ArtifactRelativePath,
-        expected_size: Option<u64>,
-        expected_sha1: &[u8; 20],
-    ) -> Result<Vec<u8>, LoaderError> {
-        self.root
-            .open_child("libraries")?
-            .read_relative_authenticated(relative, expected_size, expected_sha1)
+    pub(crate) fn workspace(&self) -> &ProcessorWorkspace {
+        &self.workspace
     }
 
-    pub(crate) fn read_base_client_authenticated(
+    pub(crate) async fn materialize_runtime(
         &self,
-        version_id: &str,
-        expected_size: Option<u64>,
-        expected_sha1: Option<&str>,
-    ) -> Result<Vec<u8>, LoaderError> {
-        validate_version_id(version_id, "processor base version id")?;
-        self.root
-            .open_child("versions")?
-            .open_child(version_id)?
-            .read_authenticated(&format!("{version_id}.jar"), expected_size, expected_sha1)
-    }
-
-    pub(crate) fn prepare_processor_stage(
-        &self,
-        minecraft_version: &str,
-    ) -> Result<ProcessorWorkspace, LoaderError> {
-        validate_version_id(minecraft_version, "processor stage Minecraft version")?;
-        if let Some(stale) = self.directory.open_child_if_exists("processor-stage")? {
-            stale.clear_owned_contents()?;
-        }
-        let stage = self.directory.open_or_create_child("processor-stage")?;
-        let root = stage.open_or_create_child("root")?;
-        let libraries = root.open_or_create_child("libraries")?;
-        let versions = root.open_or_create_child("versions")?;
-        let version = versions.open_or_create_child(minecraft_version)?;
-        let processor_data = root.open_or_create_child("processor-data")?;
-        let home = stage.open_or_create_child("home")?;
-        let temp = stage.open_or_create_child("tmp")?;
-        let workspace = ProcessorWorkspace {
-            stage,
-            root,
-            libraries,
-            version,
-            processor_data,
-            home,
-            temp,
-        };
-        workspace.revalidate()?;
-        workspace.validate_fresh_layout(minecraft_version)?;
-        Ok(workspace)
+        java_version: &crate::launch::JavaVersion,
+        source: crate::runtime::RuntimeSourceReceipt,
+    ) -> Result<crate::runtime::ProcessorRuntime, crate::runtime::JavaRuntimeLookupError> {
+        self.temporary_root.revalidate().map_err(|_| {
+            crate::runtime::JavaRuntimeLookupError::Download(
+                "processor temporary root identity changed".to_string(),
+            )
+        })?;
+        self.temporary_root
+            .validate_exact_child_directories(&["processor-stage"])
+            .map_err(|_| {
+                crate::runtime::JavaRuntimeLookupError::Download(
+                    "processor temporary root identity changed".to_string(),
+                )
+            })?;
+        let usage = self
+            .workspace
+            .stage
+            .validate_tree_usage_no_links(ManagedTreeLimits::processor_stage())
+            .map_err(|_| {
+                crate::runtime::JavaRuntimeLookupError::Download(
+                    "processor temporary root exceeds its admitted bound".to_string(),
+                )
+            })?;
+        let remaining_entries = 4096_usize
+            .checked_sub(usage.entries().saturating_add(1))
+            .ok_or_else(|| {
+                crate::runtime::JavaRuntimeLookupError::Download(
+                    "processor temporary root exceeds its entry bound".to_string(),
+                )
+            })?;
+        let remaining_bytes = (512_u64 << 20).checked_sub(usage.bytes()).ok_or_else(|| {
+            crate::runtime::JavaRuntimeLookupError::Download(
+                "processor temporary root exceeds its byte bound".to_string(),
+            )
+        })?;
+        let runtime_path = self.temporary.path().join("runtime");
+        let runtime = crate::runtime::materialize_ephemeral_processor_runtime(
+            java_version,
+            source,
+            &runtime_path,
+            remaining_entries,
+            remaining_bytes,
+        )
+        .await?;
+        self.temporary_root.revalidate().map_err(|_| {
+            crate::runtime::JavaRuntimeLookupError::Download(
+                "processor temporary root identity changed".to_string(),
+            )
+        })?;
+        self.workspace.validate_live_bounds().map_err(|_| {
+            crate::runtime::JavaRuntimeLookupError::Download(
+                "processor runtime destination identity changed".to_string(),
+            )
+        })?;
+        Ok(runtime)
     }
 
     pub(crate) fn cleanup(self) -> Result<(), LoaderError> {
-        self.directory.clear_owned_contents()
+        let Self {
+            temporary,
+            temporary_root,
+            workspace,
+            target_version_id: _,
+        } = self;
+        let workspace_cleanup = workspace.cleanup();
+        drop(temporary_root);
+        let root_cleanup = temporary.close().map_err(LoaderError::Io);
+        workspace_cleanup?;
+        root_cleanup
+    }
+
+    pub(crate) fn quarantine(self) {
+        let Self {
+            temporary,
+            temporary_root,
+            workspace,
+            target_version_id: _,
+        } = self;
+        drop(workspace);
+        drop(temporary_root);
+        let _ = temporary.keep();
     }
 }
 
@@ -168,6 +199,18 @@ impl ProcessorWorkspace {
         bytes: &[u8],
     ) -> Result<(), LoaderError> {
         self.libraries.write_relative_exact(relative, bytes).await
+    }
+
+    pub(crate) async fn import_library_authenticated(
+        &self,
+        relative: &ArtifactRelativePath,
+        source: std::fs::File,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+    ) -> Result<(), LoaderError> {
+        self.libraries
+            .import_relative_authenticated(relative, source, expected_size, expected_sha1)
+            .await
     }
 
     pub(crate) fn ensure_library_parent(
@@ -254,6 +297,29 @@ impl ProcessorWorkspace {
             .snapshot_tree(ManagedTreeLimits::processor_stage())
     }
 
+    pub(crate) fn validate_live_bounds(&self) -> Result<(), LoaderError> {
+        self.owner_root
+            .validate_exact_child_directories(&["processor-stage", "runtime"])?;
+        let limits = ManagedTreeLimits::processor_stage();
+        let stage = self.stage.validate_tree_usage_no_links(limits)?;
+        let runtime = self
+            .owner_root
+            .open_child("runtime")?
+            .validate_tree_usage_allow_links(limits)?;
+        if stage
+            .entries()
+            .saturating_add(runtime.entries())
+            .saturating_add(2)
+            > 4096
+            || stage.bytes().saturating_add(runtime.bytes()) > (512_u64 << 20)
+        {
+            return Err(LoaderError::Verify(
+                "processor temporary root exceeds its admitted bound".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn clear_scratch(&self) -> Result<(), LoaderError> {
         self.home.clone().clear_owned_contents()?;
         self.temp.clone().clear_owned_contents()?;
@@ -276,85 +342,59 @@ impl ProcessorWorkspace {
     }
 }
 
-pub(crate) fn prepare_fresh_work_dir(
-    library_dir: &Path,
+pub(crate) fn prepare_ephemeral_processor_workspace(
     version_id: &str,
-) -> Result<LoaderWorkspace, LoaderError> {
+    minecraft_version: &str,
+) -> Result<ProcessorWorkspaceOwner, LoaderError> {
     validate_version_id(version_id, "installer workspace version id")?;
-    let root = ManagedDir::open_root(library_dir)?;
-    let work = root
-        .open_or_create_child("cache")?
-        .open_or_create_child("loaders")?
-        .open_or_create_child("work")?;
-    if let Some(stale) = work.open_child_if_exists(version_id)? {
-        stale.clear_owned_contents()?;
-    }
-    let directory = work.open_or_create_child(version_id)?;
-    directory.revalidate()?;
-    Ok(LoaderWorkspace {
+    validate_version_id(minecraft_version, "processor stage Minecraft version")?;
+    let temporary = tempfile::Builder::new()
+        .prefix("axial-loader-processor-")
+        .tempdir()
+        .map_err(LoaderError::Io)?;
+    let temporary_root = ManagedDir::open_root(temporary.path())?;
+    let stage = temporary_root.open_or_create_child("processor-stage")?;
+    let root = stage.open_or_create_child("root")?;
+    let libraries = root.open_or_create_child("libraries")?;
+    let versions = root.open_or_create_child("versions")?;
+    let version = versions.open_or_create_child(minecraft_version)?;
+    let processor_data = root.open_or_create_child("processor-data")?;
+    let home = stage.open_or_create_child("home")?;
+    let temp = stage.open_or_create_child("tmp")?;
+    let workspace = ProcessorWorkspace {
+        owner_root: temporary_root.clone(),
+        stage,
         root,
-        directory,
+        libraries,
+        version,
+        processor_data,
+        home,
+        temp,
+    };
+    workspace.revalidate()?;
+    workspace.validate_fresh_layout(minecraft_version)?;
+    Ok(ProcessorWorkspaceOwner {
+        temporary,
+        temporary_root,
+        workspace,
         target_version_id: version_id.to_string(),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::prepare_fresh_work_dir;
+    use super::prepare_ephemeral_processor_workspace;
     use crate::artifact_path::ArtifactRelativePath;
     use sha1::{Digest as _, Sha1};
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[cfg(unix)]
-    #[test]
-    fn fresh_workspace_rejects_symlinked_stage_without_outside_mutation() {
-        let root = temp_dir("workspace-symlink-stage");
-        let outside = temp_dir("workspace-symlink-outside");
-        fs::create_dir_all(root.join("cache/loaders/work")).expect("work root");
-        fs::create_dir_all(&outside).expect("outside root");
-        let sentinel = outside.join("sentinel");
-        fs::write(&sentinel, b"untouched").expect("sentinel");
-        std::os::unix::fs::symlink(&outside, root.join("cache/loaders/work/version"))
-            .expect("stage symlink");
-
-        assert!(prepare_fresh_work_dir(&root, "version").is_err());
-        assert_eq!(fs::read(&sentinel).expect("sentinel"), b"untouched");
-        assert!(root.join("cache/loaders/work/version").is_symlink());
-        assert_eq!(fs::read(&sentinel).expect("sentinel"), b"untouched");
-
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(outside);
-    }
-
-    #[test]
-    fn fresh_workspace_reuses_cleared_admitted_shell() {
-        let root = temp_dir("workspace-retained-shell");
-        fs::create_dir_all(&root).expect("root");
-        let workspace = prepare_fresh_work_dir(&root, "version").expect("fresh workspace");
-        fs::write(workspace.path().join("stale"), b"stale").expect("stale artifact");
-
-        workspace.cleanup().expect("clear workspace");
-
-        let stage = root.join("cache/loaders/work/version");
-        assert!(stage.is_dir());
-        assert_eq!(fs::read_dir(&stage).expect("cleared stage").count(), 0);
-        let reused = prepare_fresh_work_dir(&root, "version").expect("reused workspace");
-        assert_eq!(reused.path(), stage);
-        drop(reused);
-        let _ = fs::remove_dir_all(root);
-    }
 
     #[tokio::test]
-    async fn processor_stage_has_canonical_layout_and_typed_observation() {
-        let root = temp_dir("processor-stage-layout");
-        fs::create_dir_all(&root).expect("root");
-        let workspace = prepare_fresh_work_dir(&root, "forge-version").expect("loader workspace");
-        let processor = workspace
-            .prepare_processor_stage("1.21.5")
-            .expect("processor stage");
-        let stage = workspace.path().join("processor-stage");
+    async fn ephemeral_processor_workspace_has_canonical_authenticated_layout() {
+        let owner = prepare_ephemeral_processor_workspace("forge-version", "1.21.5")
+            .expect("processor workspace");
+        let temporary = owner.path().to_path_buf();
+        let stage = temporary.join("processor-stage");
+        let processor = owner.workspace();
 
         assert_eq!(processor.root_path(), stage.join("root"));
         assert_eq!(processor.libraries_path(), stage.join("root/libraries"));
@@ -434,29 +474,17 @@ mod tests {
                 .count(),
             0
         );
-        processor.revalidate().expect("revalidated stage");
-        processor.cleanup().expect("processor cleanup");
-        let _ = fs::remove_dir_all(root);
+        owner.workspace().revalidate().expect("revalidated owner");
+        owner.cleanup().expect("ephemeral cleanup");
+        assert!(!temporary.exists());
     }
 
     #[test]
-    fn processor_stage_reuse_clears_stale_files_and_keeps_exact_shells() {
-        let root = temp_dir("processor-stage-reuse");
-        fs::create_dir_all(&root).expect("root");
-        let workspace = prepare_fresh_work_dir(&root, "forge-version").expect("loader workspace");
-        let first = workspace
-            .prepare_processor_stage("1.20.1")
-            .expect("first processor stage");
-        fs::write(first.libraries_path().join("stale"), b"stale").expect("stale library");
-        fs::write(first.home_path().join("stale"), b"stale").expect("stale home");
-        drop(first);
-
-        let reused = workspace
-            .prepare_processor_stage("1.20.1")
-            .expect("reused processor stage");
-        assert!(!reused.libraries_path().join("stale").exists());
-        assert!(!reused.home_path().join("stale").exists());
-        let snapshot = reused.snapshot_stage().expect("reused snapshot");
+    fn ephemeral_processor_workspace_starts_fresh_and_closes_completely() {
+        let owner = prepare_ephemeral_processor_workspace("forge-version", "1.20.1")
+            .expect("processor workspace");
+        let temporary = owner.path().to_path_buf();
+        let snapshot = owner.workspace().snapshot_stage().expect("fresh snapshot");
         let directories = snapshot
             .directories()
             .iter()
@@ -474,65 +502,7 @@ mod tests {
                 "tmp",
             ]
         );
-        reused.cleanup().expect("reused cleanup");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn processor_stage_reuse_admits_empty_nested_mutable_shells() {
-        let root = temp_dir("processor-stage-nested-reuse");
-        fs::create_dir_all(&root).expect("root");
-        let workspace = prepare_fresh_work_dir(&root, "forge-version").expect("loader workspace");
-        let first = workspace
-            .prepare_processor_stage("1.20.1")
-            .expect("first processor stage");
-        let library_shell = first.libraries_path().join("org/example");
-        let data_shell = first.processor_data_path().join("patches/client");
-        fs::create_dir_all(&library_shell).expect("library shell");
-        fs::create_dir_all(&data_shell).expect("data shell");
-        fs::write(library_shell.join("library.jar"), b"library").expect("nested library");
-        fs::write(data_shell.join("patch.bin"), b"patch").expect("nested data");
-        drop(first);
-
-        let reused = workspace
-            .prepare_processor_stage("1.20.1")
-            .expect("nested shell reuse");
-        assert!(library_shell.is_dir());
-        assert!(data_shell.is_dir());
-        assert_eq!(
-            fs::read_dir(&library_shell)
-                .expect("empty library shell")
-                .count(),
-            0
-        );
-        assert_eq!(
-            fs::read_dir(&data_shell).expect("empty data shell").count(),
-            0
-        );
-        reused.cleanup().expect("nested reuse cleanup");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn processor_stage_reuse_rejects_unexpected_retained_directories() {
-        let root = temp_dir("processor-stage-unexpected-shell");
-        fs::create_dir_all(&root).expect("root");
-        let workspace = prepare_fresh_work_dir(&root, "forge-version").expect("loader workspace");
-        let first = workspace
-            .prepare_processor_stage("1.20.1")
-            .expect("first processor stage");
-        fs::create_dir(first.root_path().join("unexpected")).expect("unexpected shell");
-        drop(first);
-
-        assert!(workspace.prepare_processor_stage("1.20.1").is_err());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    fn temp_dir(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|value| value.as_nanos())
-            .unwrap_or_default();
-        std::env::temp_dir().join(format!("axial-{prefix}-{nanos:x}"))
+        owner.cleanup().expect("ephemeral cleanup");
+        assert!(!temporary.exists());
     }
 }

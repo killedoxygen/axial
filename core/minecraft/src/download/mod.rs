@@ -23,7 +23,8 @@ pub(crate) use install::{
     ReconstructedVanillaAuthority,
 };
 pub(crate) use install::{
-    reconstruct_installer_library_declarations, reconstruct_profile_library_declarations,
+    reconstruct_installer_library_declarations, reconstruct_installer_processor_sources,
+    reconstruct_profile_library_declarations,
 };
 pub use integrity::{
     LauncherManagedArtifactReadiness, jar_contains_signed_metadata,

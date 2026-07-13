@@ -200,6 +200,7 @@ pub(crate) struct PendingForgeInstallExecution {
 pub(crate) struct PendingForgeReconstructionSources {
     execution: BoundForgeInstallExecution,
     jobs: Vec<ClassifiedLibraryReconstruction>,
+    required_execution_inputs: BTreeSet<ArtifactRelativePath>,
 }
 
 pub(crate) struct PendingForgeReconstructionExecution {
@@ -239,9 +240,6 @@ impl BoundForgeInstallExecution {
     ) -> Result<PendingForgeReconstructionSources, ForgeInstallerError> {
         let (execution, jobs) = match self {
             Self::Run(execution) => {
-                if !execution.has_exact_terminal_declarations() {
-                    return Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput);
-                }
                 let BoundForgeProcessorExecution { plan, continuation } = *execution;
                 let (continuation, jobs) = continuation.into_reconstruction_sources()?;
                 (
@@ -260,7 +258,23 @@ impl BoundForgeInstallExecution {
                 return Err(ForgeInstallerError::MissingForgeProcessorOutputs);
             }
         };
-        Ok(PendingForgeReconstructionSources { execution, jobs })
+        let required_execution_inputs = match &execution {
+            Self::Run(execution) => execution
+                .plan
+                .input_artifacts
+                .iter()
+                .filter(|(_, contract)| {
+                    matches!(contract.source, BoundProcessorInputSource::Download)
+                })
+                .map(|(path, _)| path.clone())
+                .collect(),
+            Self::Continue(_) | Self::UnsupportedMissingOutputs => BTreeSet::new(),
+        };
+        Ok(PendingForgeReconstructionSources {
+            execution,
+            jobs,
+            required_execution_inputs,
+        })
     }
 }
 
@@ -307,12 +321,14 @@ impl PendingForgeReconstructionSources {
     ) -> (
         PendingForgeReconstructionExecution,
         Vec<ClassifiedLibraryReconstruction>,
+        BTreeSet<ArtifactRelativePath>,
     ) {
         (
             PendingForgeReconstructionExecution {
                 execution: self.execution,
             },
             self.jobs,
+            self.required_execution_inputs,
         )
     }
 }
@@ -614,10 +630,10 @@ impl BoundForgeProcessorExecution {
     }
 
     pub(crate) fn into_declared_reconstruction(
-        self,
-    ) -> Result<BoundForgeInstallerContinuation, ForgeInstallerError> {
+        self: Box<Self>,
+    ) -> Result<BoundForgeInstallerContinuation, Box<Self>> {
         if !self.has_exact_terminal_declarations() {
-            return Err(ForgeInstallerError::InvalidForgeProcessorFinalOutput);
+            return Err(self);
         }
         Ok(self.continuation)
     }
@@ -649,13 +665,31 @@ impl BoundForgeInstallerContinuation {
         }
     }
 
-    pub(crate) fn version(&self) -> &LoaderProfileFragment {
-        &self.version
+    pub(super) fn matches_execution_identity(
+        &self,
+        target_version_id: &str,
+        minecraft_version: &str,
+    ) -> bool {
+        self.version.inherits_from == minecraft_version
+            && self.source.matches_logical_identity(target_version_id)
     }
 
     pub(crate) fn into_receipt_input(
         self,
+    ) -> Result<AuthenticatedInstallerReceiptInput, ForgeInstallerError> {
+        self.into_receipt_input_inner(None)
+    }
+
+    pub(crate) fn into_observed_receipt_input(
+        self,
         outputs: crate::loaders::VerifiedProcessorOutputs,
+    ) -> Result<AuthenticatedInstallerReceiptInput, ForgeInstallerError> {
+        self.into_receipt_input_inner(Some(outputs))
+    }
+
+    fn into_receipt_input_inner(
+        self,
+        outputs: Option<crate::loaders::VerifiedProcessorOutputs>,
     ) -> Result<AuthenticatedInstallerReceiptInput, ForgeInstallerError> {
         let Self {
             source,
@@ -667,9 +701,12 @@ impl BoundForgeInstallerContinuation {
         else {
             return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
         };
-        let (library_declarations, pending_publications) = library_declarations
-            .seal_terminal_outputs(outputs)
-            .map_err(|_| ForgeInstallerError::InvalidForgeProcessorFinalOutput)?;
+        let sealed = match outputs {
+            Some(outputs) => library_declarations.seal_terminal_outputs(outputs),
+            None => library_declarations.seal_without_terminal_outputs(),
+        };
+        let (library_declarations, pending_publications) =
+            sealed.map_err(|_| ForgeInstallerError::InvalidForgeProcessorFinalOutput)?;
         Ok(AuthenticatedInstallerReceiptInput {
             source: VerifiedInstallerReceiptSource {
                 source,
@@ -697,6 +734,34 @@ impl BoundForgeInstallerContinuation {
         };
         let library_declarations = library_declarations
             .seal_declared_terminal_outputs()
+            .map_err(|_| ForgeInstallerError::InvalidForgeProcessorFinalOutput)?;
+        Ok(AuthenticatedInstallerReconstructionInput {
+            source: VerifiedInstallerReceiptSource {
+                source,
+                version,
+                strip_client_meta,
+            },
+            library_declarations,
+        })
+    }
+
+    pub(crate) fn into_observed_reconstruction_receipt_input(
+        self,
+        outputs: crate::loaders::VerifiedProcessorOutputs,
+    ) -> Result<AuthenticatedInstallerReconstructionInput, ForgeInstallerError> {
+        let Self {
+            source,
+            version,
+            library_declarations,
+            strip_client_meta,
+        } = self;
+        let InstallerDeclarationState::ReconstructionTerminal(library_declarations) =
+            library_declarations
+        else {
+            return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
+        };
+        let library_declarations = library_declarations
+            .seal_observed_terminal_outputs(outputs)
             .map_err(|_| ForgeInstallerError::InvalidForgeProcessorFinalOutput)?;
         Ok(AuthenticatedInstallerReconstructionInput {
             source: VerifiedInstallerReceiptSource {
@@ -3114,7 +3179,7 @@ mod tests {
             .expect("bound execution")
             .into_reconstruction_sources()
             .expect("source-only reconstruction transition");
-        let (pending, jobs) = sources.into_parts();
+        let (pending, jobs, _) = sources.into_parts();
         let proofs = jobs
             .into_iter()
             .filter_map(|job| {
@@ -3143,9 +3208,11 @@ mod tests {
         else {
             panic!("typed processor reconstruction");
         };
-        let input = execution
-            .into_declared_reconstruction()
-            .expect("exact terminal reconstruction")
+        let continuation = match execution.into_declared_reconstruction() {
+            Ok(continuation) => continuation,
+            Err(_) => panic!("exact terminal reconstruction"),
+        };
+        let input = continuation
             .into_reconstruction_receipt_input()
             .expect("declared terminal reconstruction input");
         assert_eq!(
