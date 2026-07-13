@@ -76,6 +76,7 @@ pub(super) async fn persist_launch_proof_for_reservation_failure(
 }
 
 const STARTUP_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const SESSION_TERMINAL_REATTACH_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 const MAX_RECOVERY_ATTEMPTS: u8 = 3;
 
 pub struct LaunchSuccess {
@@ -105,6 +106,51 @@ enum LaunchTerminalizationDisposition {
 enum TerminalObservationHandoff {
     Observe { guardian: GuardianSummary },
     Preserve,
+}
+
+struct LaunchSessionRunTask {
+    application: crate::application::LaunchInstanceStaging,
+    preflight_stage_evidence: Vec<axial_launcher::LaunchStageEvidence>,
+    instance: axial_config::Instance,
+    intent: axial_launcher::LaunchIntent,
+    guardian: GuardianSummary,
+    launched_at: String,
+    benchmark: Option<crate::state::launch_reports::LaunchBenchmarkMetadata>,
+    resource_budget: Option<crate::state::launch_reports::LaunchProofResourceBudget>,
+    java_probe_receipt: Option<axial_minecraft::JavaRuntimeProbeReceipt>,
+}
+
+impl LaunchSessionRunTask {
+    fn from_prepared(
+        task: super::session::LaunchSessionTask,
+    ) -> (crate::state::IntegrityForegroundLease, Self) {
+        let super::session::LaunchSessionTask {
+            integrity_foreground,
+            application,
+            preflight_stage_evidence,
+            instance,
+            intent,
+            guardian,
+            launched_at,
+            benchmark,
+            resource_budget,
+            java_probe_receipt,
+        } = task;
+        (
+            integrity_foreground,
+            Self {
+                application,
+                preflight_stage_evidence,
+                instance,
+                intent,
+                guardian,
+                launched_at,
+                benchmark,
+                resource_budget,
+                java_probe_receipt,
+            },
+        )
+    }
 }
 
 pub(crate) async fn launch_session(
@@ -142,9 +188,19 @@ pub(crate) async fn launch_session(
     } else {
         None
     };
-    let result = launch_session_inner(state.clone(), task, &producer).await;
-    let disposition =
-        terminalize_unhandled_launch_error(&state, &producer, &session_id, result).await;
+    let (integrity_foreground, task) = LaunchSessionRunTask::from_prepared(task);
+    let mut integrity_foreground = Some(integrity_foreground);
+    let result =
+        launch_session_inner(state.clone(), task, &producer, &mut integrity_foreground).await;
+    let disposition = terminalize_unhandled_launch_error(
+        &state,
+        &producer,
+        &session_id,
+        result,
+        &mut integrity_foreground,
+    )
+    .await;
+    drop(integrity_foreground);
     let (handoff, transfer_hold) = match &disposition {
         LaunchTerminalizationDisposition::Complete(Ok(success)) => (
             TerminalObservationHandoff::Observe {
@@ -390,6 +446,7 @@ async fn terminalize_unhandled_launch_error(
     producer: &crate::state::ProducerLease,
     session_id: &str,
     result: Result<LaunchSuccess, LaunchRequestError>,
+    integrity_foreground: &mut Option<crate::state::IntegrityForegroundLease>,
 ) -> LaunchTerminalizationDisposition {
     let error = match result {
         Ok(success) => {
@@ -426,6 +483,9 @@ async fn terminalize_unhandled_launch_error(
             let deferred_session_id = session_id.to_string();
             let deferred_error = error.clone();
             let deferred_producer = producer.claim_child();
+            let retained_foreground = integrity_foreground
+                .take()
+                .expect("pending preboot terminalization must retain foreground authority");
             producer.spawn_child(async move {
                 match pending.wait_for_settlement().await {
                     Ok(lease) => {
@@ -437,9 +497,16 @@ async fn terminalize_unhandled_launch_error(
                         )
                         .await;
                         lease.release().await;
+                        drop(retained_foreground);
                     }
                     Err(error_class) => {
                         trace_unconfirmed_launch_failure_termination(error_class);
+                        retain_integrity_foreground_until_session_terminal(
+                            deferred_state,
+                            deferred_session_id,
+                            retained_foreground,
+                        )
+                        .await;
                     }
                 }
             });
@@ -447,7 +514,47 @@ async fn terminalize_unhandled_launch_error(
         }
         LaunchFailureTermination::Unconfirmed(error_class) => {
             trace_unconfirmed_launch_failure_termination(error_class);
+            let retained_state = state.clone();
+            let retained_session_id = session_id.to_string();
+            let retained_foreground = integrity_foreground
+                .take()
+                .expect("unconfirmed preboot terminalization must retain foreground authority");
+            producer.spawn_child(async move {
+                retain_integrity_foreground_until_session_terminal(
+                    retained_state,
+                    retained_session_id,
+                    retained_foreground,
+                )
+                .await;
+            });
             LaunchTerminalizationDisposition::Retained(Err(error))
+        }
+    }
+}
+
+async fn retain_integrity_foreground_until_session_terminal(
+    state: AppState,
+    session_id: String,
+    integrity_foreground: crate::state::IntegrityForegroundLease,
+) {
+    let _integrity_foreground = integrity_foreground;
+    let mut changes = state.sessions().subscribe_changes();
+    loop {
+        let terminal = state
+            .sessions()
+            .get(&session_id)
+            .await
+            .is_none_or(|record| matches!(record.state, LaunchState::Failed | LaunchState::Exited));
+        if terminal {
+            return;
+        }
+
+        match changes.recv().await {
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                tokio::time::sleep(SESSION_TERMINAL_REATTACH_DELAY).await;
+                changes = state.sessions().subscribe_changes();
+            }
         }
     }
 }
@@ -481,19 +588,28 @@ fn trace_unconfirmed_launch_failure_termination(error_class: LaunchFailureTermin
 
 async fn launch_session_inner(
     state: AppState,
-    task: super::session::LaunchSessionTask,
+    task: LaunchSessionRunTask,
     producer: &crate::state::ProducerLease,
+    integrity_foreground: &mut Option<crate::state::IntegrityForegroundLease>,
 ) -> Result<LaunchSuccess, LaunchRequestError> {
-    launch_session_inner_with_control(state, task, producer, &LaunchLoopControl::default()).await
+    launch_session_inner_with_control(
+        state,
+        task,
+        producer,
+        integrity_foreground,
+        &LaunchLoopControl::default(),
+    )
+    .await
 }
 
 async fn launch_session_inner_with_control(
     state: AppState,
-    task: super::session::LaunchSessionTask,
+    task: LaunchSessionRunTask,
     producer: &crate::state::ProducerLease,
+    integrity_foreground: &mut Option<crate::state::IntegrityForegroundLease>,
     control: &LaunchLoopControl,
 ) -> Result<LaunchSuccess, LaunchRequestError> {
-    let super::session::LaunchSessionTask {
+    let LaunchSessionRunTask {
         application,
         preflight_stage_evidence,
         mut instance,
@@ -994,6 +1110,7 @@ async fn launch_session_inner_with_control(
                 )
                 .await
                 .map_err(guardian_journal_error)?;
+                drop(integrity_foreground.take());
                 emit_launch_completed(
                     &state,
                     &mut launch_completion_pending,
@@ -1067,6 +1184,9 @@ async fn launch_session_inner_with_control(
                 };
                 let integrity_facts = sense_startup_failure_integrity(
                     &state,
+                    integrity_foreground
+                        .as_ref()
+                        .expect("preboot launch must retain foreground authority"),
                     &intent.instance_id,
                     &intent.library_dir,
                     failure_class,
@@ -1417,6 +1537,7 @@ fn failure_class_needs_tier1_integrity(failure_class: LaunchFailureClass) -> boo
 
 async fn sense_startup_failure_integrity(
     state: &AppState,
+    integrity_foreground: &crate::state::IntegrityForegroundLease,
     instance_id: &str,
     library_dir: &std::path::Path,
     failure_class: LaunchFailureClass,
@@ -1425,8 +1546,13 @@ async fn sense_startup_failure_integrity(
         return Vec::new();
     }
 
-    let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
-    sense_integrity_tier1(state, &lifecycle, library_dir)
+    let Ok(lifecycle) = state
+        .acquire_integrity_instance_lifecycle(integrity_foreground, instance_id)
+        .await
+    else {
+        return Vec::new();
+    };
+    sense_integrity_tier1(state, integrity_foreground, &lifecycle, library_dir)
         .await
         .map(|report| {
             report
@@ -1539,13 +1665,17 @@ mod tests {
             forced_prepare_failure: Some(forced_failure.clone()),
         };
         let producer = state.try_claim_producer().expect("claim launch producer");
+        let task = test_recovery_launch_task(&state, session_id, &root).await;
+        let (integrity_foreground, task) = LaunchSessionRunTask::from_prepared(task);
+        let mut integrity_foreground = Some(integrity_foreground);
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             launch_session_inner_with_control(
                 state.clone(),
-                test_recovery_launch_task(session_id, &root),
+                task,
                 &producer,
+                &mut integrity_foreground,
                 &control,
             ),
         )
@@ -1562,6 +1692,13 @@ mod tests {
             Ok(_) => panic!("non-applying recovery must fail at the cap"),
             Err(error) => error,
         };
+
+        assert!(
+            integrity_foreground.is_some(),
+            "preboot launch failure must return foreground ownership to terminalization"
+        );
+        drop(integrity_foreground);
+        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
 
         assert_eq!(
             forced_failure
@@ -1611,20 +1748,79 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn launch_foreground_releases_only_after_boot_stable() {
+        let root = unique_test_dir("launch-foreground-boot-stable");
+        let state = test_app_state(&root);
+        let session_id = "launch-foreground-boot-stable";
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert boot-stable session");
+        let mut events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe boot-stable session");
+        let java_path = write_delayed_boot_launch_fixture(&root);
+        let producer = state
+            .try_claim_producer()
+            .expect("claim boot-stable producer");
+        let mut task = test_recovery_launch_task(&state, session_id, &root).await;
+        task.instance.java_path = java_path.clone();
+        task.intent.requested_java = java_path;
+        task.intent.game_dir = Some(root.join("instance"));
+        assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+
+        let launch = tokio::spawn(launch_session(state.clone(), task, producer));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let LaunchEvent::Status(status) =
+                    events.recv().await.expect("boot-stable launch event")
+                    && status.state == "monitoring"
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("launch reaches startup monitoring");
+        assert!(
+            !state.subscribe_integrity_idle().borrow().is_stably_idle(),
+            "foreground lease must remain live while startup is not stable"
+        );
+
+        let launched = tokio::time::timeout(Duration::from_secs(5), launch)
+            .await
+            .expect("launch reaches boot-stable")
+            .expect("launch owner")
+            .unwrap_or_else(|error| panic!("boot-stable launch failed: {}", error.message));
+        assert_eq!(launched.session_id, session_id);
+        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
+        let _ = state.sessions().kill(session_id).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn out_of_memory_startup_exit_persists_bounded_proof_and_failure_memory() {
         let root = unique_test_dir("launch-out-of-memory-e2e");
         let paths = test_paths(&root);
         let session_id = "launch-out-of-memory-e2e";
         let java_path = write_out_of_memory_launch_fixture(&root);
         assert_scanner_recognizes_fabric_crash_install(&root);
-        let mut task = test_recovery_launch_task(session_id, &root);
+        let instance = test_fabric_crash_instance(&java_path, 1024);
+        let state = test_fabric_crash_app_state(&root, &instance);
+        let producer = state.try_claim_producer().expect("claim OOM producer");
+        let mut task = test_recovery_launch_task(&state, session_id, &root).await;
         retarget_test_launch_task(&mut task, CRASH_E2E_INSTANCE_ID);
         align_fabric_crash_task(&mut task, &java_path);
         task.instance.max_memory_mb = 1024;
         task.intent.max_memory_mb = 1024;
-        let state = test_fabric_crash_app_state(&root, &task.instance);
         task.intent.game_dir = Some(state.instances().game_dir(&task.instance.id));
         task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
+        let (integrity_foreground, task) = LaunchSessionRunTask::from_prepared(task);
+        let mut integrity_foreground = Some(integrity_foreground);
         let mut session = test_record(session_id);
         session.instance_id = CRASH_E2E_INSTANCE_ID.to_string();
         session.version_id = CRASH_E2E_FABRIC_VERSION_ID.to_string();
@@ -1638,11 +1834,9 @@ mod tests {
             .subscribe(session_id)
             .await
             .expect("subscribe to OOM session");
-        let producer = state.try_claim_producer().expect("claim OOM producer");
-
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            launch_session_inner(state.clone(), task, &producer),
+            launch_session_inner(state.clone(), task, &producer, &mut integrity_foreground),
         )
         .await
         .expect("OOM launch deadline");
@@ -1650,6 +1844,7 @@ mod tests {
             Ok(_) => panic!("OOM launch must fail"),
             Err(error) => error,
         };
+        drop(integrity_foreground);
 
         assert_eq!(error.message, "Guardian blocked launch startup.");
         assert!(error.message.chars().count() <= 180);
@@ -1894,15 +2089,14 @@ mod tests {
             .await
             .expect("subscribe to post-boot OOM session");
         let java_path = write_post_boot_out_of_memory_launch_fixture(&root);
-        let mut task = test_recovery_launch_task(session_id, &root);
+        let producer = state
+            .try_claim_producer()
+            .expect("claim post-boot OOM producer");
+        let mut task = test_recovery_launch_task(&state, session_id, &root).await;
         task.instance.java_path = java_path.clone();
         task.intent.requested_java = java_path;
         task.intent.game_dir = Some(root.join("instance"));
         task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
-        let producer = state
-            .try_claim_producer()
-            .expect("claim post-boot OOM producer");
-
         let launched = tokio::time::timeout(
             Duration::from_secs(10),
             launch_session(state.clone(), task, producer),
@@ -2055,10 +2249,14 @@ mod tests {
         let session_id = "launch-post-boot-mod-crash-e2e";
         let java_path = write_post_boot_mod_crash_launch_fixture(&root);
         assert_scanner_recognizes_fabric_crash_install(&root);
-        let mut task = test_recovery_launch_task(session_id, &root);
+        let instance = test_fabric_crash_instance(&java_path, 4096);
+        let state = test_fabric_crash_app_state(&root, &instance);
+        let producer = state
+            .try_claim_producer()
+            .expect("claim mod crash producer");
+        let mut task = test_recovery_launch_task(&state, session_id, &root).await;
         retarget_test_launch_task(&mut task, CRASH_E2E_INSTANCE_ID);
         align_fabric_crash_task(&mut task, &java_path);
-        let state = test_fabric_crash_app_state(&root, &task.instance);
         task.intent.game_dir = Some(state.instances().game_dir(&task.instance.id));
         task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
         let mut session = test_record(session_id);
@@ -2074,10 +2272,6 @@ mod tests {
             .subscribe(session_id)
             .await
             .expect("subscribe mod crash session");
-        let producer = state
-            .try_claim_producer()
-            .expect("claim mod crash producer");
-
         let launched = tokio::time::timeout(
             Duration::from_secs(10),
             launch_session(state.clone(), task, producer),
@@ -2308,8 +2502,13 @@ mod tests {
             .expect("subscribe observer handoff");
         let (handoff_tx, handoff_rx) = tokio::sync::oneshot::channel();
         drop(handoff_tx);
-        let task = test_recovery_launch_task(session_id, &root);
+        let producer = state
+            .try_claim_producer()
+            .expect("claim observer task producer");
+        let task = test_recovery_launch_task(&state, session_id, &root).await;
         let proof_context = LaunchProofContext::from_intent(&task.intent);
+        drop(task);
+        drop(producer);
 
         own_terminal_observation(
             state.clone(),
@@ -2347,8 +2546,13 @@ mod tests {
             .await
             .expect("subscribe observed startup failure");
         let (handoff_tx, handoff_rx) = tokio::sync::oneshot::channel();
-        let task = test_recovery_launch_task(session_id, &root);
+        let producer = state
+            .try_claim_producer()
+            .expect("claim observed failure task producer");
+        let task = test_recovery_launch_task(&state, session_id, &root).await;
         let proof_context = LaunchProofContext::from_intent(&task.intent);
+        drop(task);
+        drop(producer);
         let observer_state = state.clone();
         let observer = tokio::spawn(own_terminal_observation(
             observer_state,
@@ -2557,16 +2761,29 @@ mod tests {
         let error = guardian_journal_error(OperationJournalStoreError::MissingOperation);
 
         let producer = state.try_claim_producer().expect("claim terminal producer");
-        let result =
-            match terminalize_unhandled_launch_error(&state, &producer, session_id, Err(error))
-                .await
-            {
-                LaunchTerminalizationDisposition::Complete(result)
-                | LaunchTerminalizationDisposition::Retained(result)
-                | LaunchTerminalizationDisposition::Settled(result) => result,
-            };
+        let mut integrity_foreground = Some(
+            state
+                .register_integrity_foreground()
+                .expect("register terminal foreground")
+                .wait_for_settlement()
+                .await,
+        );
+        let result = match terminalize_unhandled_launch_error(
+            &state,
+            &producer,
+            session_id,
+            Err(error),
+            &mut integrity_foreground,
+        )
+        .await
+        {
+            LaunchTerminalizationDisposition::Complete(result)
+            | LaunchTerminalizationDisposition::Retained(result)
+            | LaunchTerminalizationDisposition::Settled(result) => result,
+        };
 
         assert!(result.is_err());
+        assert!(integrity_foreground.is_some());
         let record = state
             .sessions()
             .get(session_id)
@@ -2602,16 +2819,29 @@ mod tests {
         let expected_message = error.message.clone();
 
         let producer = state.try_claim_producer().expect("claim terminal producer");
-        let result =
-            match terminalize_unhandled_launch_error(&state, &producer, session_id, Err(error))
-                .await
-            {
-                LaunchTerminalizationDisposition::Complete(result)
-                | LaunchTerminalizationDisposition::Retained(result)
-                | LaunchTerminalizationDisposition::Settled(result) => result,
-            };
+        let mut integrity_foreground = Some(
+            state
+                .register_integrity_foreground()
+                .expect("register terminal foreground")
+                .wait_for_settlement()
+                .await,
+        );
+        let result = match terminalize_unhandled_launch_error(
+            &state,
+            &producer,
+            session_id,
+            Err(error),
+            &mut integrity_foreground,
+        )
+        .await
+        {
+            LaunchTerminalizationDisposition::Complete(result)
+            | LaunchTerminalizationDisposition::Retained(result)
+            | LaunchTerminalizationDisposition::Settled(result) => result,
+        };
 
         assert!(result.is_err());
+        assert!(integrity_foreground.is_some());
         let record = state
             .sessions()
             .get(session_id)
@@ -2675,20 +2905,37 @@ mod tests {
         let expected_message = error.message.clone();
 
         let producer = state.try_claim_producer().expect("claim terminal producer");
-        let result =
-            match terminalize_unhandled_launch_error(&state, &producer, session_id, Err(error))
-                .await
-            {
-                LaunchTerminalizationDisposition::Complete(result)
-                | LaunchTerminalizationDisposition::Retained(result)
-                | LaunchTerminalizationDisposition::Settled(result) => result,
-            };
+        let mut integrity_foreground = Some(
+            state
+                .register_integrity_foreground()
+                .expect("register terminal foreground")
+                .wait_for_settlement()
+                .await,
+        );
+        let result = match terminalize_unhandled_launch_error(
+            &state,
+            &producer,
+            session_id,
+            Err(error),
+            &mut integrity_foreground,
+        )
+        .await
+        {
+            LaunchTerminalizationDisposition::Complete(result)
+            | LaunchTerminalizationDisposition::Retained(result)
+            | LaunchTerminalizationDisposition::Settled(result) => result,
+        };
 
         let returned_error = match result {
             Ok(_) => panic!("journal error must remain public"),
             Err(error) => error,
         };
         assert_eq!(returned_error.message, expected_message);
+        assert!(integrity_foreground.is_none());
+        assert!(
+            !state.subscribe_integrity_idle().borrow().is_stably_idle(),
+            "pending terminalization must retain foreground ownership"
+        );
         let active = state
             .sessions()
             .get(session_id)
@@ -2736,6 +2983,7 @@ mod tests {
                     .expect("settled session");
                 if settled.state == LaunchState::Failed
                     && state.sessions().retention_hold_count(session_id).await == Some(0)
+                    && state.subscribe_integrity_idle().borrow().is_stably_idle()
                 {
                     assert_eq!(
                         settled
@@ -2756,6 +3004,122 @@ mod tests {
         .await
         .expect("deferred launch failure settlement");
         assert!(!state.sessions().has_active_instance(&instance.id).await);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_launch_failure_retains_foreground_until_exact_session_terminal() {
+        let root = unique_test_dir("unconfirmed-launch-failure-foreground");
+        let state = test_app_state(&root);
+        let session_id = "unconfirmed-launch-failure-foreground";
+        let mut record = test_record(session_id);
+        record.pid = Some(42);
+        state
+            .sessions()
+            .insert(record)
+            .await
+            .expect("insert unconfirmed session");
+        let error = guardian_journal_error(OperationJournalStoreError::MissingOperation);
+        let producer = state.try_claim_producer().expect("claim terminal producer");
+        let mut integrity_foreground = Some(
+            state
+                .register_integrity_foreground()
+                .expect("register terminal foreground")
+                .wait_for_settlement()
+                .await,
+        );
+
+        let disposition = terminalize_unhandled_launch_error(
+            &state,
+            &producer,
+            session_id,
+            Err(error),
+            &mut integrity_foreground,
+        )
+        .await;
+
+        assert!(matches!(
+            disposition,
+            LaunchTerminalizationDisposition::Retained(Err(_))
+        ));
+        assert!(integrity_foreground.is_none());
+        assert!(
+            !state.subscribe_integrity_idle().borrow().is_stably_idle(),
+            "unconfirmed terminalization must retain foreground ownership"
+        );
+
+        emit_status(
+            &state,
+            session_id,
+            LaunchState::Failed,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.subscribe_integrity_idle().borrow().is_stably_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unconfirmed foreground release after exact terminal state");
+        assert_eq!(
+            state
+                .sessions()
+                .get(session_id)
+                .await
+                .expect("terminal session")
+                .state,
+            LaunchState::Failed
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_foreground_owner_drains_after_shutdown_session_settlement() {
+        let root = unique_test_dir("unconfirmed-launch-failure-shutdown");
+        let state = test_app_state(&root);
+        let session_id = "unconfirmed-launch-failure-shutdown";
+        let mut record = test_record(session_id);
+        record.pid = Some(42);
+        state
+            .sessions()
+            .insert(record)
+            .await
+            .expect("insert unconfirmed session");
+        let producer = state.try_claim_producer().expect("claim terminal producer");
+        let mut integrity_foreground = Some(
+            state
+                .register_integrity_foreground()
+                .expect("register terminal foreground")
+                .wait_for_settlement()
+                .await,
+        );
+
+        let disposition = terminalize_unhandled_launch_error(
+            &state,
+            &producer,
+            session_id,
+            Err(guardian_journal_error(
+                OperationJournalStoreError::MissingOperation,
+            )),
+            &mut integrity_foreground,
+        )
+        .await;
+
+        assert!(matches!(
+            disposition,
+            LaunchTerminalizationDisposition::Retained(Err(_))
+        ));
+        assert!(integrity_foreground.is_none());
+        drop(producer);
+        tokio::time::timeout(Duration::from_secs(2), state.shutdown())
+            .await
+            .expect("shutdown must not deadlock on retained foreground")
+            .expect("shutdown after exact session settlement");
+        assert!(state.sessions().get(session_id).await.is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2890,11 +3254,40 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    fn test_recovery_launch_task(
+    fn test_recovery_launch_instance() -> Instance {
+        Instance {
+            id: "instance".to_string(),
+            name: "Recovery cap".to_string(),
+            version_id: "1.21.1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_played_at: String::new(),
+            art_seed: 0,
+            max_memory_mb: 4096,
+            min_memory_mb: 1024,
+            java_path: String::new(),
+            window_width: 0,
+            window_height: 0,
+            jvm_preset: String::new(),
+            performance_mode: "managed".to_string(),
+            extra_jvm_args: String::new(),
+            auto_optimize: false,
+            icon: String::new(),
+            accent: String::new(),
+        }
+    }
+
+    async fn test_recovery_launch_task(
+        state: &AppState,
         session_id: &str,
         root: &Path,
     ) -> super::super::session::LaunchSessionTask {
+        let integrity_foreground = state
+            .register_integrity_foreground()
+            .expect("register test launch foreground")
+            .wait_for_settlement()
+            .await;
         super::super::session::LaunchSessionTask {
+            integrity_foreground,
             application: crate::application::stage_launch_instance_command(
                 crate::application::LaunchInstanceCommand {
                     instance_id: "instance".to_string(),
@@ -2914,25 +3307,7 @@ mod tests {
                 ),
                 "managed",
             ),
-            instance: Instance {
-                id: "instance".to_string(),
-                name: "Recovery cap".to_string(),
-                version_id: "1.21.1".to_string(),
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                last_played_at: String::new(),
-                art_seed: 0,
-                max_memory_mb: 4096,
-                min_memory_mb: 1024,
-                java_path: String::new(),
-                window_width: 0,
-                window_height: 0,
-                jvm_preset: String::new(),
-                performance_mode: "managed".to_string(),
-                extra_jvm_args: String::new(),
-                auto_optimize: false,
-                icon: String::new(),
-                accent: String::new(),
-            },
+            instance: test_recovery_launch_instance(),
             intent: LaunchIntent {
                 session_id: session_id.to_string(),
                 library_dir: root.join("library"),
@@ -2984,6 +3359,16 @@ mod tests {
             },
             Some(task.intent.session_id.clone()),
         );
+    }
+
+    #[cfg(unix)]
+    fn test_fabric_crash_instance(java_path: &str, max_memory_mb: i32) -> Instance {
+        let mut instance = test_recovery_launch_instance();
+        instance.id = CRASH_E2E_INSTANCE_ID.to_string();
+        instance.version_id = CRASH_E2E_FABRIC_VERSION_ID.to_string();
+        instance.java_path = java_path.to_string();
+        instance.max_memory_mb = max_memory_mb;
+        instance
     }
 
     #[cfg(unix)]
@@ -3354,6 +3739,24 @@ mod tests {
         let java_path = write_out_of_memory_launch_fixture_with_boot(root, false);
         write_fabric_crash_install(root);
         java_path
+    }
+
+    #[cfg(unix)]
+    fn write_delayed_boot_launch_fixture(root: &Path) -> String {
+        write_crashing_java_fixture(
+            root,
+            "delayed-boot-java",
+            r#"#!/bin/sh
+if [ "$1" = "-XshowSettings:property" ]; then
+  echo 'openjdk version "21.0.3"' >&2
+  exit 0
+fi
+sleep 0.2
+printf '%s\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atlas/blocks.png-atlas' >&2
+sleep 1
+exit 0
+"#,
+        )
     }
 
     #[cfg(unix)]

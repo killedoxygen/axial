@@ -77,12 +77,13 @@ pub use installs::{
 pub use instance_registry::AppInstanceStore;
 pub(crate) use instance_registry::new_instance;
 pub(crate) use instance_registry::{ensure_instance_layout, instance_not_found_error};
-pub(crate) use integrity_activity::{
-    IdleSweepCancellation, IdleSweepReservation, IdleSweepReserveError, IntegrityActivityClosed,
-    IntegrityForegroundRegistration, IntegrityIdleEpoch, IntegrityIdleSnapshot,
-};
 #[cfg(test)]
 pub(crate) use integrity_activity::IdleSweepTerminal;
+pub(crate) use integrity_activity::{
+    IdleSweepCancellation, IdleSweepReservation, IdleSweepReserveError, IntegrityActivityClosed,
+    IntegrityForegroundLease, IntegrityForegroundRegistration, IntegrityIdleEpoch,
+    IntegrityIdleSnapshot,
+};
 pub(crate) use java_probe_failures::{
     JavaProbeFailureCache, JavaProbeFailureClaim, JavaProbeFailureKey, JavaProbeFailureKind,
     JavaProbeFailureOwner,
@@ -174,6 +175,7 @@ pub(crate) struct InstanceLifecycleLease {
 }
 
 pub(crate) struct KnownGoodVerificationLease {
+    _foreground: IntegrityForegroundLease,
     _lifecycle: InstanceLifecycleLease,
     instance_id: String,
     version_id: String,
@@ -190,6 +192,10 @@ pub(crate) enum KnownGoodVerificationUnavailable {
     LiveAuthorityUnavailable,
     SweepAuthorityUnavailable,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("integrity foreground lease belongs to another application state")]
+pub(crate) struct IntegrityForegroundOwnershipError;
 
 impl InstanceLifecycleLease {
     fn bind(instance_id: &str, guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
@@ -552,7 +558,16 @@ impl AppState {
         producer: &ProducerLease,
     ) -> Option<InstalledVersionsLookup> {
         let library_dir = self.library_dir().map(PathBuf::from)?;
-        Some(self.installed_versions.lookup(library_dir, producer).await)
+        let foreground = self
+            .register_integrity_foreground()
+            .ok()?
+            .wait_for_settlement()
+            .await;
+        Some(
+            self.installed_versions
+                .lookup(library_dir, producer, foreground)
+                .await,
+        )
     }
 
     pub(crate) fn invalidate_installed_versions(&self) {
@@ -795,10 +810,6 @@ impl AppState {
         self.integrity_activity.subscribe_idle()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the R5 foreground wiring slice")
-    )]
     pub(crate) fn register_integrity_foreground(
         &self,
     ) -> Result<IntegrityForegroundRegistration, IntegrityActivityClosed> {
@@ -1041,6 +1052,34 @@ impl AppState {
         result
     }
 
+    pub(crate) async fn acquire_integrity_instance_lifecycle(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: &str,
+    ) -> Result<InstanceLifecycleLease, IntegrityForegroundOwnershipError> {
+        self.validate_integrity_foreground(foreground)?;
+        Ok(self.acquire_instance_lifecycle(instance_id).await)
+    }
+
+    fn validate_integrity_foreground(
+        &self,
+        foreground: &IntegrityForegroundLease,
+    ) -> Result<(), IntegrityForegroundOwnershipError> {
+        self.integrity_activity
+            .owns_foreground(foreground)
+            .then_some(())
+            .ok_or(IntegrityForegroundOwnershipError)
+    }
+
+    #[cfg(not(test))]
+    async fn acquire_instance_lifecycle(&self, instance_id: &str) -> InstanceLifecycleLease {
+        InstanceLifecycleLease::bind(
+            instance_id,
+            self.instance_lifecycle_gates.acquire(instance_id).await,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) async fn acquire_instance_lifecycle(
         &self,
         instance_id: &str,
@@ -1053,9 +1092,12 @@ impl AppState {
 
     pub(crate) fn mint_known_good_verification_lease(
         &self,
+        foreground: &IntegrityForegroundLease,
         lifecycle: &InstanceLifecycleLease,
         expected_library_root: &Path,
     ) -> Result<KnownGoodVerificationLease, KnownGoodVerificationUnavailable> {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)?;
         let instance = self
             .instances
             .get(&lifecycle.instance_id)
@@ -1084,6 +1126,7 @@ impl AppState {
             .ok_or(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)?;
 
         Ok(KnownGoodVerificationLease {
+            _foreground: foreground.retained(),
             _lifecycle: lifecycle.retained(),
             instance_id: instance.id,
             version_id: instance.version_id,
@@ -1439,6 +1482,122 @@ mod known_good_identity_tests {
             startup_warnings: Vec::new(),
             frontend_dir: root.join("frontend"),
         })
+    }
+
+    #[tokio::test]
+    async fn integrity_lifecycle_rejects_a_foreign_state_lease() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-integrity-foreign-state-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let owner = known_good_state_fixture(&root.join("owner"));
+        let foreign = known_good_state_fixture(&root.join("foreign"));
+        let foreground = owner
+            .register_integrity_foreground()
+            .expect("register owner foreground")
+            .wait_for_settlement()
+            .await;
+
+        assert_eq!(
+            foreign
+                .acquire_integrity_instance_lifecycle(&foreground, "instance")
+                .await
+                .err(),
+            Some(IntegrityForegroundOwnershipError)
+        );
+        let foreign_lifecycle = foreign.acquire_instance_lifecycle("instance").await;
+        assert_eq!(
+            foreign
+                .mint_known_good_verification_lease(
+                    &foreground,
+                    &foreign_lifecycle,
+                    Path::new("foreign-library"),
+                )
+                .err(),
+            Some(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
+        );
+        drop(foreign_lifecycle);
+        let lifecycle = owner
+            .acquire_integrity_instance_lifecycle(&foreground, "instance")
+            .await
+            .expect("owner accepts its foreground lease");
+        drop(lifecycle);
+        drop(foreground);
+        assert!(owner.subscribe_integrity_idle().borrow().is_stably_idle());
+
+        owner
+            .close_known_good_inventories()
+            .await
+            .expect("close owner known-good store");
+        foreign
+            .close_known_good_inventories()
+            .await
+            .expect("close foreign known-good store");
+        drop(owner);
+        drop(foreign);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn active_integrity_sweep_blocks_installed_version_scan() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-installed-scan-sweep-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let library_root = root.join("library");
+        std::fs::create_dir_all(axial_minecraft::versions_dir(&library_root))
+            .expect("create versions root");
+        state.set_library_dir_for_test(library_root.to_string_lossy().into_owned());
+        let epoch = state.subscribe_integrity_idle().borrow().epoch();
+        let reservation = state
+            .try_reserve_idle_sweep(
+                epoch,
+                state.try_claim_producer().expect("claim sweep producer"),
+            )
+            .expect("reserve integrity sweep");
+        let cancellation = reservation.cancellation();
+        let scan = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let producer = state.try_claim_producer().expect("claim scan producer");
+                state.installed_versions_snapshot(&producer).await
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !cancellation.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scan registration cancels active sweep");
+        assert!(!scan.is_finished());
+        assert_eq!(state.installed_versions_walk_count(), 0);
+
+        drop(reservation);
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), scan)
+            .await
+            .expect("scan settles after sweep")
+            .expect("scan owner");
+        assert!(snapshot.is_some());
+        assert_eq!(state.installed_versions_walk_count(), 1);
+        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
+
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

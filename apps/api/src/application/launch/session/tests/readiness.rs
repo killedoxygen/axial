@@ -272,11 +272,18 @@ async fn launch_preflight_rejects_installed_report_from_changed_library_root() {
         .state
         .try_claim_producer()
         .expect("claim preflight producer");
+    let integrity_foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register preflight foreground")
+        .wait_for_settlement()
+        .await;
 
     let preflight = build_launch_preflight_facts(
         &fixture.state,
         &producer,
         LaunchPreflightBuild {
+            integrity_foreground: &integrity_foreground,
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,
@@ -694,11 +701,18 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
         .state
         .try_claim_producer()
         .expect("claim runtime repair producer");
+    let integrity_foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register runtime repair foreground")
+        .wait_for_settlement()
+        .await;
 
     let preflight = build_launch_preflight_facts(
         &fixture.state,
         &producer,
         LaunchPreflightBuild {
+            integrity_foreground: &integrity_foreground,
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,
@@ -720,6 +734,7 @@ async fn launch_preparation_repairs_managed_runtime_ready_marker_before_blocking
     let repaired = maybe_repair_managed_runtime_before_launch_owned(
         &fixture.state,
         &producer,
+        &integrity_foreground,
         preflight,
         ManagedRuntimeRepairLaunch {
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
@@ -780,6 +795,12 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
         .expect("instance");
     let config = fixture.state.config().current();
     let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let integrity_foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register runtime repair foreground")
+        .wait_for_settlement()
+        .await;
 
     let preflight = build_launch_preflight_facts(
         &fixture.state,
@@ -788,6 +809,7 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
             .try_claim_producer()
             .expect("claim preflight producer"),
         LaunchPreflightBuild {
+            integrity_foreground: &integrity_foreground,
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,
@@ -812,6 +834,7 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
     let repaired = maybe_repair_managed_runtime_before_launch_owned(
         &fixture.state,
         &producer,
+        &integrity_foreground,
         preflight,
         ManagedRuntimeRepairLaunch {
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
@@ -884,7 +907,7 @@ async fn prepare_launch_session_queues_recoverable_managed_runtime_missing_java(
     fs::write(runtime_root.join(".axial-ready"), b"ready").expect("ready marker");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
 
-    let _prepared = prepare_launch_session(
+    let prepared = prepare_launch_session(
         &fixture.state,
         LaunchRequest {
             instance_id: instance_id.clone(),
@@ -897,6 +920,14 @@ async fn prepare_launch_session_queues_recoverable_managed_runtime_missing_java(
     .await
     .expect("recoverable runtime should queue for ensure");
 
+    assert!(
+        !fixture
+            .state
+            .subscribe_integrity_idle()
+            .borrow()
+            .is_stably_idle(),
+        "repaired re-preflight must return foreground ownership to the runner"
+    );
     assert_eq!(fixture.state.sessions().active_session_count().await, 1);
     assert!(
         fixture
@@ -906,6 +937,14 @@ async fn prepare_launch_session_queues_recoverable_managed_runtime_missing_java(
             .await
     );
     assert!(fixture.state.failure_memory().list().is_empty());
+    drop(prepared);
+    assert!(
+        fixture
+            .state
+            .subscribe_integrity_idle()
+            .borrow()
+            .is_stably_idle()
+    );
 }
 
 #[cfg(unix)]
@@ -987,6 +1026,12 @@ async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
         .expect("instance");
     let config = fixture.state.config().current();
     let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let integrity_foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register runtime repair foreground")
+        .wait_for_settlement()
+        .await;
     let preflight = build_launch_preflight_facts(
         &fixture.state,
         &fixture
@@ -994,6 +1039,7 @@ async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
             .try_claim_producer()
             .expect("claim preflight producer"),
         LaunchPreflightBuild {
+            integrity_foreground: &integrity_foreground,
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,
@@ -1013,6 +1059,7 @@ async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
     let repaired = maybe_repair_managed_runtime_before_launch_owned(
         &fixture.state,
         &producer,
+        &integrity_foreground,
         preflight,
         ManagedRuntimeRepairLaunch {
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,

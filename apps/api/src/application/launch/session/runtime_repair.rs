@@ -15,7 +15,9 @@ use crate::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
 };
 use crate::state::contracts::OperationPhase;
-use crate::state::{AppState, InstanceLifecycleLease, OperationJournalStoreError};
+use crate::state::{
+    AppState, InstanceLifecycleLease, IntegrityForegroundLease, OperationJournalStoreError,
+};
 use axial_config::Instance;
 use axial_launcher::GuardianMode;
 use axial_minecraft::{ManagedRuntimeCache, preferred_runtime_component, resolve_version};
@@ -68,6 +70,7 @@ pub(super) struct ManagedRuntimeRepairLaunch<'a> {
 pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
     state: &AppState,
     producer: &crate::state::ProducerLease,
+    foreground: &IntegrityForegroundLease,
     mut preflight: LaunchPreflightFacts,
     launch: ManagedRuntimeRepairLaunch<'_>,
 ) -> Result<LaunchPreflightFacts, OperationJournalStoreError> {
@@ -126,6 +129,7 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
     let terminal_failure_task = terminal_failure.clone();
     let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let repair_foreground = foreground.retained();
     producer.spawn_child(async move {
         let result = match ManagedRuntimeRoot::from_managed_root(
             state_task.managed_runtime_cache(),
@@ -152,17 +156,17 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
                 std::io::Error::other("managed-runtime repair ownership changed before execution"),
             )),
         };
-        let _ = result_tx.send(result);
+        let _ = result_tx.send((result, repair_foreground));
     });
     let mut result_rx = result_rx;
-    let outcome = tokio::select! {
+    let response = tokio::select! {
         result = &mut result_rx => {
             request_guard.finish();
             result.map_err(|_| {
                 OperationJournalStoreError::Persistence(std::io::Error::other(
                     "managed-runtime repair owner stopped before responding",
                 ))
-            })??
+            })?
         }
         ready = &mut ready_rx => {
             if ready.is_err() {
@@ -171,7 +175,7 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
                     OperationJournalStoreError::Persistence(std::io::Error::other(
                         "managed-runtime repair owner stopped before effect ownership",
                     ))
-                })??
+                })?
             } else {
                 request_guard.finish();
                 tokio::select! {
@@ -179,7 +183,7 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
                         OperationJournalStoreError::Persistence(std::io::Error::other(
                             "managed-runtime repair owner stopped before responding",
                         ))
-                    })??,
+                    })?,
                     () = terminal_failure.notified() => {
                         return Err(OperationJournalStoreError::Persistence(std::io::Error::other(
                             "managed-runtime terminal journal reconciliation is still pending",
@@ -198,6 +202,8 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
             ));
         }
     };
+    let (outcome, repair_foreground) = response;
+    let outcome = outcome?;
 
     if outcome.status == GuardianRepairStatus::Failed {
         state.telemetry().emit(TelemetryEvent::error_captured(
@@ -213,13 +219,14 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
                 "managed-runtime repair outcome is missing its supported diagnosis",
             ))
         })?;
-    match outcome.status {
+    let result = match outcome.status {
         GuardianRepairStatus::Repaired => {
             let prior_java_probe_receipt = preflight.java_probe_receipt.take();
             let mut repaired = build_launch_preflight_facts(
                 state,
                 producer,
                 LaunchPreflightBuild {
+                    integrity_foreground: foreground,
                     instance_lifecycle: launch.instance_lifecycle,
                     instance: launch.instance,
                     config: &preflight.config,
@@ -243,7 +250,9 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
                 .expect("non-repaired runtime copy authors a blocked admission");
             Ok(preflight)
         }
-    }
+    };
+    drop(repair_foreground);
+    result
 }
 
 struct ManagedRuntimeRepairCandidate {

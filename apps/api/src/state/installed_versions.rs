@@ -1,4 +1,4 @@
-use super::ProducerLease;
+use super::{IntegrityForegroundLease, ProducerLease};
 use axial_minecraft::{
     VersionScanDependencyStamp, VersionScanIssue, VersionScanIssueKind, VersionScanReport,
     VersionScanState, scan_versions_snapshot,
@@ -90,6 +90,7 @@ struct RefreshOwnerGuard {
     index: Arc<InstalledVersionsIndex>,
     key: RefreshKey,
     completed: watch::Sender<Option<RefreshCompletion>>,
+    foreground: IntegrityForegroundLease,
     armed: bool,
 }
 
@@ -111,15 +112,16 @@ pub(crate) struct InstalledVersionsIndex {
 }
 
 impl InstalledVersionsIndex {
-    pub(crate) async fn lookup(
+    pub(super) async fn lookup(
         self: &Arc<Self>,
         library_dir: PathBuf,
         producer: &ProducerLease,
+        foreground: IntegrityForegroundLease,
     ) -> InstalledVersionsLookup {
         let mut refresh_count = 0_u32;
         loop {
             if let Some(hit) = self
-                .validated_hit(&library_dir, producer, refresh_count)
+                .validated_hit(&library_dir, producer, &foreground, refresh_count)
                 .await
             {
                 return hit;
@@ -150,6 +152,7 @@ impl InstalledVersionsIndex {
                         receiver: completed.subscribe(),
                         completed,
                         producer: producer.claim_child(),
+                        foreground: foreground.retained(),
                     }
                 }
             };
@@ -174,9 +177,10 @@ impl InstalledVersionsIndex {
                     completed,
                     mut receiver,
                     producer,
+                    foreground,
                 } => {
                     refresh_count = refresh_count.saturating_add(1);
-                    self.spawn_refresh(key.clone(), completed, producer);
+                    self.spawn_refresh(key.clone(), completed, producer, foreground);
                     (wait_for_refresh(&mut receiver, &key).await, false)
                 }
             };
@@ -232,6 +236,7 @@ impl InstalledVersionsIndex {
         &self,
         library_dir: &Path,
         producer: &ProducerLease,
+        foreground: &IntegrityForegroundLease,
         refresh_count: u32,
     ) -> Option<InstalledVersionsLookup> {
         let candidate = {
@@ -251,7 +256,7 @@ impl InstalledVersionsIndex {
                 })
         }?;
         let (key, revision, snapshot, validation) = candidate;
-        if !revalidate_owned(validation.clone(), producer).await {
+        if !revalidate_owned(validation.clone(), producer, foreground.retained()).await {
             return None;
         }
         self.cached_revision_is_current(&key, revision)
@@ -282,6 +287,7 @@ impl InstalledVersionsIndex {
         key: RefreshKey,
         completed: watch::Sender<Option<RefreshCompletion>>,
         producer: ProducerLease,
+        foreground: IntegrityForegroundLease,
     ) {
         let index = self.clone();
         #[cfg(test)]
@@ -291,14 +297,19 @@ impl InstalledVersionsIndex {
             index: index.clone(),
             key: key.clone(),
             completed: completed.clone(),
+            foreground,
             armed: true,
         };
+        let scan_foreground = owner.foreground.retained();
         producer.spawn(async move {
             let scan_dir = key.library_dir.clone();
-            let scanned = tokio::task::spawn_blocking(move || scan_with_validation(&scan_dir))
-                .await
-                .ok()
-                .flatten();
+            let scanned = tokio::task::spawn_blocking(move || {
+                let _foreground = scan_foreground;
+                scan_with_validation(&scan_dir)
+            })
+            .await
+            .ok()
+            .flatten();
             let Some((snapshot, validation)) = scanned else {
                 index.finish_refresh(
                     &key,
@@ -310,7 +321,12 @@ impl InstalledVersionsIndex {
             };
             let revalidated = {
                 let validation = validation.clone();
-                tokio::task::spawn_blocking(move || validation.is_revalidated()).await
+                let revalidation_foreground = owner.foreground.retained();
+                tokio::task::spawn_blocking(move || {
+                    let _foreground = revalidation_foreground;
+                    validation.is_revalidated()
+                })
+                .await
             };
             let result = match revalidated {
                 Ok(true) if !index.force_retry_for_test() => RefreshResult::Stable {
@@ -419,6 +435,7 @@ enum RefreshClaim {
         completed: watch::Sender<Option<RefreshCompletion>>,
         receiver: watch::Receiver<Option<RefreshCompletion>>,
         producer: ProducerLease,
+        foreground: IntegrityForegroundLease,
     },
 }
 
@@ -479,13 +496,19 @@ async fn wait_for_refresh(
 async fn revalidate_owned(
     validation: VersionScanDependencyStamp,
     producer: &ProducerLease,
+    foreground: IntegrityForegroundLease,
 ) -> bool {
+    let blocking_foreground = foreground.retained();
     producer
         .claim_child()
         .spawn_joinable(async move {
-            tokio::task::spawn_blocking(move || validation.is_revalidated())
-                .await
-                .unwrap_or(false)
+            let _foreground = foreground;
+            tokio::task::spawn_blocking(move || {
+                let _foreground = blocking_foreground;
+                validation.is_revalidated()
+            })
+            .await
+            .unwrap_or(false)
         })
         .await
         .unwrap_or(false)
@@ -524,7 +547,7 @@ fn degraded_report() -> VersionScanReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::AppLifecycle;
+    use crate::state::{AppLifecycle, integrity_activity::IntegrityActivityCoordinator};
     use axial_minecraft::versions_dir;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -550,6 +573,24 @@ mod tests {
         (request, producer)
     }
 
+    async fn foreground_lease() -> IntegrityForegroundLease {
+        IntegrityActivityCoordinator::new()
+            .register_foreground()
+            .expect("register test scan foreground")
+            .wait_for_settlement()
+            .await
+    }
+
+    async fn test_lookup(
+        index: &Arc<InstalledVersionsIndex>,
+        library_dir: PathBuf,
+        producer: &ProducerLease,
+    ) -> InstalledVersionsLookup {
+        index
+            .lookup(library_dir, producer, foreground_lease().await)
+            .await
+    }
+
     fn create_empty_library(root: &Path) {
         std::fs::create_dir_all(versions_dir(root)).expect("create versions root");
     }
@@ -572,8 +613,8 @@ mod tests {
         let index = Arc::new(InstalledVersionsIndex::default());
         let (_request, producer) = accepted_producer();
 
-        let first = index.lookup(root.clone(), &producer).await;
-        let second = index.lookup(root.clone(), &producer).await;
+        let first = test_lookup(&index, root.clone(), &producer).await;
+        let second = test_lookup(&index, root.clone(), &producer).await;
 
         assert_eq!(first.source, InstalledVersionsLookupSource::Refreshed);
         assert_eq!(second.source, InstalledVersionsLookupSource::Hit);
@@ -588,7 +629,7 @@ mod tests {
         write_version(&root, "1.21.1");
         let index = Arc::new(InstalledVersionsIndex::default());
         let (_request, producer) = accepted_producer();
-        let healthy = index.lookup(root.clone(), &producer).await;
+        let healthy = test_lookup(&index, root.clone(), &producer).await;
         assert_ne!(healthy.snapshot.report().state, VersionScanState::Degraded);
 
         std::fs::write(
@@ -596,8 +637,8 @@ mod tests {
             b"{malformed",
         )
         .expect("corrupt version metadata");
-        let degraded = index.lookup(root.clone(), &producer).await;
-        let unchanged = index.lookup(root.clone(), &producer).await;
+        let degraded = test_lookup(&index, root.clone(), &producer).await;
+        let unchanged = test_lookup(&index, root.clone(), &producer).await;
 
         assert_eq!(degraded.snapshot.report().state, VersionScanState::Degraded);
         assert_eq!(degraded.source, InstalledVersionsLookupSource::Refreshed);
@@ -616,10 +657,10 @@ mod tests {
         write_version(&second_root, "1.21.1");
         let index = Arc::new(InstalledVersionsIndex::default());
         let (_request, producer) = accepted_producer();
-        let _ = index.lookup(first_root.clone(), &producer).await;
+        let _ = test_lookup(&index, first_root.clone(), &producer).await;
         index.invalidate();
-        let invalidated = index.lookup(first_root.clone(), &producer).await;
-        let changed = index.lookup(second_root.clone(), &producer).await;
+        let invalidated = test_lookup(&index, first_root.clone(), &producer).await;
+        let changed = test_lookup(&index, second_root.clone(), &producer).await;
 
         assert_eq!(invalidated.source, InstalledVersionsLookupSource::Refreshed);
         assert_eq!(changed.snapshot.report().versions[0].id, "1.21.1");
@@ -667,7 +708,7 @@ mod tests {
             }));
         });
 
-        let lookup = index.lookup(root, &producer).await;
+        let lookup = test_lookup(&index, root, &producer).await;
         assert_eq!(lookup.source, InstalledVersionsLookupSource::Coalesced);
         assert_eq!(lookup.refresh_count, 1);
         assert_eq!(index.walk_count(), 0);
@@ -679,7 +720,7 @@ mod tests {
         create_empty_library(&root);
         let index = Arc::new(InstalledVersionsIndex::default());
         let (_request, producer) = accepted_producer();
-        let _ = index.lookup(root.clone(), &producer).await;
+        let _ = test_lookup(&index, root.clone(), &producer).await;
 
         let (key, old_revision) = {
             let mut state = index.state.lock().expect("index state");
@@ -714,7 +755,7 @@ mod tests {
             .store(2, std::sync::atomic::Ordering::Relaxed);
         let (_request, producer) = accepted_producer();
 
-        let lookup = index.lookup(root.clone(), &producer).await;
+        let lookup = test_lookup(&index, root.clone(), &producer).await;
 
         assert_eq!(lookup.source, InstalledVersionsLookupSource::Unavailable);
         assert_eq!(lookup.refresh_count, 2);
@@ -737,7 +778,7 @@ mod tests {
         lifecycle.begin_quiesce();
         tokio::task::yield_now().await;
 
-        let lookup = index.lookup(root.clone(), &producer).await;
+        let lookup = test_lookup(&index, root.clone(), &producer).await;
 
         assert_ne!(lookup.snapshot.report().state, VersionScanState::Degraded);
         assert_eq!(index.walk_count(), 1);
@@ -752,6 +793,7 @@ mod tests {
             library_dir: test_root("owner-drop"),
             generation: 0,
         };
+        let foreground = foreground_lease().await;
         let (completed, mut receiver) = watch::channel(None);
         index.state.lock().expect("index state").in_flight = Some(InFlightRefresh {
             key: key.clone(),
@@ -762,6 +804,7 @@ mod tests {
             index: index.clone(),
             key: key.clone(),
             completed,
+            foreground,
             armed: true,
         });
 
@@ -770,5 +813,70 @@ mod tests {
             wait_for_refresh(&mut receiver, &key).await,
             RefreshCompletion::Retry { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_retains_foreground_through_child_retry_publication() {
+        let root = test_root("cancelled-waiter-child");
+        create_empty_library(&root);
+        let index = Arc::new(InstalledVersionsIndex::default());
+        let coordinator = IntegrityActivityCoordinator::new();
+        let foreground = coordinator
+            .register_foreground()
+            .expect("register lookup foreground")
+            .wait_for_settlement()
+            .await;
+        let key = RefreshKey {
+            library_dir: root.clone(),
+            generation: 0,
+        };
+        let (completed, mut completion) = watch::channel(None);
+        index.state.lock().expect("index state").in_flight = Some(InFlightRefresh {
+            key: key.clone(),
+            completed: completed.clone(),
+        });
+        let owner = RefreshOwnerGuard {
+            index: index.clone(),
+            key: key.clone(),
+            completed: completed.clone(),
+            foreground: foreground.retained(),
+            armed: true,
+        };
+        let (_request, producer) = accepted_producer();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let child = producer.claim_child().spawn_joinable(async move {
+            let _ = release_rx.await;
+            drop(owner);
+        });
+        let lookup = tokio::spawn({
+            let index = index.clone();
+            let lookup_producer = producer.claim_child();
+            let lookup_root = root.clone();
+            async move {
+                index
+                    .lookup(lookup_root, &lookup_producer, foreground)
+                    .await
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while completed.receiver_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lookup subscribes to child completion");
+        lookup.abort();
+        assert!(matches!(lookup.await, Err(error) if error.is_cancelled()));
+        assert!(!coordinator.subscribe_idle().borrow().is_stably_idle());
+
+        let _ = release_tx.send(());
+        child.await.expect("refresh child");
+        assert!(matches!(
+            wait_for_refresh(&mut completion, &key).await,
+            RefreshCompletion::Retry { .. }
+        ));
+        assert!(coordinator.subscribe_idle().borrow().is_stably_idle());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

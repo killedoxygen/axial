@@ -32,7 +32,10 @@ use crate::guardian::{
 use crate::logging::timestamp_utc;
 use crate::state::contracts::OperationPhase;
 use crate::state::launch_reports::{LaunchBenchmarkMetadata, LaunchProofResourceBudget};
-use crate::state::{AppState, InstanceLifecycleLease, LaunchSessionRecord, ensure_instance_layout};
+use crate::state::{
+    AppState, InstanceLifecycleLease, IntegrityForegroundLease, LaunchSessionRecord,
+    ensure_instance_layout,
+};
 use auth::{LaunchAuthRefreshOptions, resolve_launch_auth_context};
 use axial_config::{AppConfig, Instance};
 use axial_launcher::{
@@ -78,6 +81,7 @@ pub struct LaunchRequest {
 }
 
 pub(crate) struct LaunchSessionTask {
+    pub integrity_foreground: IntegrityForegroundLease,
     pub application: LaunchInstanceStaging,
     pub preflight_stage_evidence: Vec<LaunchStageEvidence>,
     pub instance: Instance,
@@ -187,6 +191,11 @@ async fn prepare_launch_session_with_auth_refresh(
     producer: &crate::state::ProducerLease,
 ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
     let started_at = Instant::now();
+    let integrity_foreground = state
+        .register_integrity_foreground()
+        .map_err(launch_integrity_admission_error_response)?
+        .wait_for_settlement()
+        .await;
     let library_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
@@ -194,7 +203,10 @@ async fn prepare_launch_session_with_auth_refresh(
         )
     })?;
     let library_dir = PathBuf::from(library_dir);
-    let instance_lifecycle = state.acquire_instance_lifecycle(&payload.instance_id).await;
+    let instance_lifecycle = state
+        .acquire_integrity_instance_lifecycle(&integrity_foreground, &payload.instance_id)
+        .await
+        .map_err(launch_integrity_ownership_error_response)?;
 
     let instance = state.instances().get(&payload.instance_id).ok_or_else(|| {
         (
@@ -234,6 +246,7 @@ async fn prepare_launch_session_with_auth_refresh(
         state,
         producer,
         LaunchPreflightBuild {
+            integrity_foreground: &integrity_foreground,
             instance_lifecycle: &instance_lifecycle,
             instance: &instance,
             config: &config,
@@ -250,6 +263,7 @@ async fn prepare_launch_session_with_auth_refresh(
     preflight = maybe_repair_managed_runtime_before_launch_owned(
         state,
         producer,
+        &integrity_foreground,
         preflight,
         ManagedRuntimeRepairLaunch {
             instance_lifecycle: &instance_lifecycle,
@@ -381,6 +395,7 @@ async fn prepare_launch_session_with_auth_refresh(
 
     Ok(PreparedLaunch {
         task: LaunchSessionTask {
+            integrity_foreground,
             application,
             preflight_stage_evidence: preflight.preflight_stage_evidence,
             instance: instance.clone(),
@@ -424,6 +439,24 @@ fn launch_session_admission_error_response(
         Json(json!({
             "error": "Launches are unavailable while the application is shutting down."
         })),
+    )
+}
+
+fn launch_integrity_admission_error_response(
+    _error: crate::state::IntegrityActivityClosed,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "application shutdown is in progress" })),
+    )
+}
+
+fn launch_integrity_ownership_error_response(
+    _error: crate::state::IntegrityForegroundOwnershipError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "launch integrity ownership could not be validated" })),
     )
 }
 
@@ -499,6 +532,11 @@ async fn prepare_launch_preflight_with_memory_capture(
     let producer = state
         .try_claim_producer()
         .map_err(super::launch_shutdown_error_response)?;
+    let integrity_foreground = state
+        .register_integrity_foreground()
+        .map_err(launch_integrity_admission_error_response)?
+        .wait_for_settlement()
+        .await;
     let library_dir = state.library_dir().ok_or_else(|| {
         (
             StatusCode::PRECONDITION_FAILED,
@@ -506,7 +544,10 @@ async fn prepare_launch_preflight_with_memory_capture(
         )
     })?;
     let library_dir = PathBuf::from(library_dir);
-    let instance_lifecycle = state.acquire_instance_lifecycle(&instance_id).await;
+    let instance_lifecycle = state
+        .acquire_integrity_instance_lifecycle(&integrity_foreground, &instance_id)
+        .await
+        .map_err(launch_integrity_ownership_error_response)?;
 
     let instance = state.instances().get(&instance_id).ok_or_else(|| {
         (
@@ -520,6 +561,7 @@ async fn prepare_launch_preflight_with_memory_capture(
         state,
         &producer,
         LaunchPreflightBuild {
+            integrity_foreground: &integrity_foreground,
             instance_lifecycle: &instance_lifecycle,
             instance: &instance,
             config: &config,
@@ -547,6 +589,7 @@ async fn prepare_launch_preflight_with_memory_capture(
 }
 
 struct LaunchPreflightBuild<'a> {
+    integrity_foreground: &'a IntegrityForegroundLease,
     instance_lifecycle: &'a InstanceLifecycleLease,
     instance: &'a Instance,
     config: &'a AppConfig,
@@ -580,6 +623,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
     capture_memory: impl FnOnce() -> LaunchMemoryEvidence,
 ) -> LaunchPreflightFacts {
     let LaunchPreflightBuild {
+        integrity_foreground,
         instance_lifecycle,
         instance,
         config,
@@ -669,6 +713,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
     let java_inspection = inspect_explicit_java_override(
         state,
         producer,
+        integrity_foreground,
         instance,
         config,
         required_java_major,
@@ -711,11 +756,16 @@ async fn build_launch_preflight_facts_with_memory_capture(
     } else {
         LaunchTier0RuntimeSelection::PreferredManaged
     };
-    let (integrity_report, integrity_authority_unavailable) =
-        match sense_integrity_tier0(state, instance_lifecycle, library_dir, runtime_selection) {
-            Ok(report) => (report, false),
-            Err(_) => (IntegrityTier0Report::default(), true),
-        };
+    let (integrity_report, integrity_authority_unavailable) = match sense_integrity_tier0(
+        state,
+        integrity_foreground,
+        instance_lifecycle,
+        library_dir,
+        runtime_selection,
+    ) {
+        Ok(report) => (report, false),
+        Err(_) => (IntegrityTier0Report::default(), true),
+    };
     let integrity_elapsed = integrity_started_at.elapsed();
     execution_facts.extend(integrity_report.facts.iter().cloned());
     let mut guardian_facts = execution_facts

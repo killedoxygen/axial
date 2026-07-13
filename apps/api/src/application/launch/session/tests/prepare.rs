@@ -1,6 +1,83 @@
 use super::*;
 
 #[tokio::test]
+async fn launch_foreground_cancels_sweep_before_lifecycle_or_launch_effects() {
+    let fixture = TestFixture::new("launch-foreground-settlement-barrier");
+    fixture.write_ready_install("1.21.1");
+    let instance_id = fixture.add_instance("Foreground barrier", "1.21.1");
+    let idle_epoch = fixture.state.subscribe_integrity_idle().borrow().epoch();
+    let sweep_producer = fixture
+        .state
+        .try_claim_producer()
+        .expect("claim sweep producer");
+    let reservation = fixture
+        .state
+        .try_reserve_idle_sweep(idle_epoch, sweep_producer)
+        .expect("reserve idle sweep");
+    let cancellation = reservation.cancellation();
+    let state = fixture.state.clone();
+    let launch_instance_id = instance_id.clone();
+    let launch_producer = state.try_claim_producer().expect("claim launch producer");
+    let preparation = tokio::spawn(async move {
+        let result = prepare_launch_session_owned(
+            &state,
+            LaunchRequest {
+                instance_id: launch_instance_id,
+                username: None,
+                max_memory_mb: None,
+                min_memory_mb: None,
+                client_started_at_ms: None,
+            },
+            &launch_producer,
+        )
+        .await;
+        (launch_producer, result)
+    });
+
+    tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        while !cancellation.is_cancelled() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("launch cancels active sweep");
+    assert!(!preparation.is_finished());
+    assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+    let lifecycle = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        fixture.state.acquire_instance_lifecycle(&instance_id),
+    )
+    .await
+    .expect("launch must not wait on lifecycle before sweep settlement");
+    drop(lifecycle);
+
+    drop(reservation);
+    let (launch_producer, prepared) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), preparation)
+            .await
+            .expect("launch preparation after sweep settlement")
+            .expect("launch preparation owner");
+    let prepared = prepared.expect("launch preparation succeeds");
+    assert_eq!(fixture.state.sessions().active_session_count().await, 1);
+    assert!(
+        !fixture
+            .state
+            .subscribe_integrity_idle()
+            .borrow()
+            .is_stably_idle()
+    );
+    drop(prepared);
+    drop(launch_producer);
+    assert!(
+        fixture
+            .state
+            .subscribe_integrity_idle()
+            .borrow()
+            .is_stably_idle()
+    );
+}
+
+#[tokio::test]
 async fn prepare_launch_session_rejects_shutdown_without_returning_a_task() {
     let fixture = TestFixture::new("prepare-rejects-shutdown-admission");
     fixture.write_ready_install("1.21.1");

@@ -5,7 +5,8 @@ use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use crate::state::{
     AppState, IdleSweepCancellation, IdleSweepReservation, InstanceLifecycleLease,
-    KnownGoodTier2Ticket, KnownGoodVerificationLease, KnownGoodVerificationUnavailable,
+    IntegrityForegroundLease, KnownGoodTier2Ticket, KnownGoodVerificationLease,
+    KnownGoodVerificationUnavailable,
 };
 use axial_minecraft::ManagedRuntimeCache;
 #[cfg(test)]
@@ -1056,11 +1057,13 @@ pub(crate) struct IntegrityTier0Report {
 
 pub(crate) fn sense_integrity_tier0(
     state: &AppState,
+    foreground: &IntegrityForegroundLease,
     lifecycle: &InstanceLifecycleLease,
     expected_library_root: &Path,
     runtime_selection: LaunchTier0RuntimeSelection<'_>,
 ) -> Result<IntegrityTier0Report, KnownGoodVerificationUnavailable> {
-    let lease = state.mint_known_good_verification_lease(lifecycle, expected_library_root)?;
+    let lease =
+        state.mint_known_good_verification_lease(foreground, lifecycle, expected_library_root)?;
     let report = sense_integrity_tier0_with(
         &lease,
         runtime_selection,
@@ -1153,11 +1156,13 @@ pub(crate) struct IntegrityTier1Report {
 
 pub(crate) async fn sense_integrity_tier1(
     state: &AppState,
+    foreground: &IntegrityForegroundLease,
     lifecycle: &InstanceLifecycleLease,
     expected_library_root: &Path,
 ) -> Result<IntegrityTier1Report, KnownGoodVerificationUnavailable> {
     sense_integrity_tier1_with_reader_factory(
         state,
+        foreground,
         lifecycle,
         expected_library_root,
         FilesystemIntegrityReader::default,
@@ -1167,6 +1172,7 @@ pub(crate) async fn sense_integrity_tier1(
 
 async fn sense_integrity_tier1_with_reader_factory<Factory, Reader>(
     state: &AppState,
+    foreground: &IntegrityForegroundLease,
     lifecycle: &InstanceLifecycleLease,
     expected_library_root: &Path,
     reader_factory: Factory,
@@ -1175,7 +1181,8 @@ where
     Factory: FnOnce() -> Reader + Send + 'static,
     Reader: ContentReader,
 {
-    let lease = state.mint_known_good_verification_lease(lifecycle, expected_library_root)?;
+    let lease =
+        state.mint_known_good_verification_lease(foreground, lifecycle, expected_library_root)?;
     let prepared = prepare_tier1_jobs(&lease);
     let (lease, report) = match prepared {
         Ok(jobs) => tokio::task::spawn_blocking(move || {
@@ -2863,6 +2870,25 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    async fn test_integrity_foreground(state: &AppState) -> IntegrityForegroundLease {
+        state
+            .register_integrity_foreground()
+            .expect("register test integrity foreground")
+            .wait_for_settlement()
+            .await
+    }
+
+    async fn mint_test_verification_lease(
+        state: &AppState,
+        lifecycle: &InstanceLifecycleLease,
+        expected_library_root: &Path,
+    ) -> KnownGoodVerificationLease {
+        let foreground = test_integrity_foreground(state).await;
+        state
+            .mint_known_good_verification_lease(&foreground, lifecycle, expected_library_root)
+            .expect("mint test verification lease")
+    }
+
     const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
     const NONZERO_SHA1: &str = "1111111111111111111111111111111111111111";
 
@@ -3521,9 +3547,9 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease = state
-            .mint_known_good_verification_lease(&lifecycle, &root.join("private-library-root"))
-            .expect("lease");
+        let lease =
+            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
+                .await;
         let reader = ScriptedContentReader::new([
             ("1.21.5/1.21.5.jar", ScriptedContent::Hashed(ZERO_SHA1, 10)),
             (
@@ -3590,9 +3616,9 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease = state
-            .mint_known_good_verification_lease(&lifecycle, &root.join("private-library-root"))
-            .expect("lease");
+        let lease =
+            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
+                .await;
         let reader = ScriptedContentReader::new([(
             "private/vendor/secret-library.jar",
             ScriptedContent::Hashed(NONZERO_SHA1, 7),
@@ -3663,9 +3689,9 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease = state
-            .mint_known_good_verification_lease(&lifecycle, &root.join("private-library-root"))
-            .expect("lease");
+        let lease =
+            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
+                .await;
         let reader = ScriptedContentReader::new([
             (
                 "sensitive/missing.jar",
@@ -3768,9 +3794,9 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease = state
-            .mint_known_good_verification_lease(&lifecycle, &root.join("private-library-root"))
-            .expect("lease");
+        let lease =
+            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
+                .await;
         let reader = ScriptedContentReader::new(std::iter::empty())
             .with_default(ScriptedContent::Hashed(NONZERO_SHA1, 1));
 
@@ -3815,9 +3841,9 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease = state
-            .mint_known_good_verification_lease(&lifecycle, &root.join("private-library-root"))
-            .expect("lease");
+        let lease =
+            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
+                .await;
         let reader = ScriptedContentReader::new(std::iter::empty());
 
         let report = sense_integrity_tier1_with(&lease, &reader);
@@ -3858,9 +3884,9 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease = state
-            .mint_known_good_verification_lease(&lifecycle, &root.join("private-library-root"))
-            .expect("lease");
+        let lease =
+            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
+                .await;
         let reader = ScriptedContentReader::new([(
             "stable/library.jar",
             ScriptedContent::Hashed(NONZERO_SHA1, 7),
@@ -3889,7 +3915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aborted_tier_one_caller_retains_lifecycle_until_blocking_worker_finishes() {
+    async fn aborted_tier_one_waiter_retains_foreground_and_lifecycle_until_physical_completion() {
         let (state, root) = state_fixture("tier1-abort-retains-authority", None);
         let instance = state
             .instances()
@@ -3909,11 +3935,13 @@ mod tests {
         let sensing_library_root = root.join("private-library-root");
         let sensing_gate = gate.clone();
         let sensing = tokio::spawn(async move {
+            let foreground = test_integrity_foreground(&sensing_state).await;
             let lifecycle = sensing_state
                 .acquire_instance_lifecycle(&sensing_instance_id)
                 .await;
             sense_integrity_tier1_with_reader_factory(
                 &sensing_state,
+                &foreground,
                 &lifecycle,
                 &sensing_library_root,
                 move || BlockingContentReader { gate: sensing_gate },
@@ -3928,6 +3956,10 @@ mod tests {
         sensing.abort();
         let cancellation = sensing.await.expect_err("sensing caller must be aborted");
         assert!(cancellation.is_cancelled());
+        assert!(
+            !state.subscribe_integrity_idle().borrow().is_stably_idle(),
+            "blocking Tier one worker must retain foreground authority"
+        );
 
         let mut lifecycle_mutation = Box::pin(state.acquire_instance_lifecycle(&instance.id));
         assert!(
@@ -3943,6 +3975,7 @@ mod tests {
             .expect("blocking worker released lifecycle");
         drop(lifecycle);
         drop(lifecycle_mutation);
+        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
         close_fixture(state, root).await;
     }
 
@@ -3984,11 +4017,13 @@ mod tests {
         let sensing_library_root = library_root.clone();
         let sensing_gate = gate.clone();
         let sensing = tokio::spawn(async move {
+            let foreground = test_integrity_foreground(&sensing_state).await;
             let lifecycle = sensing_state
                 .acquire_instance_lifecycle(&sensing_instance_id)
                 .await;
             sense_integrity_tier1_with_reader_factory(
                 &sensing_state,
+                &foreground,
                 &lifecycle,
                 &sensing_library_root,
                 move || BlockingFilesystemContentReader {
@@ -4111,9 +4146,9 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease = state
-            .mint_known_good_verification_lease(&lifecycle, &root.join("private-library-root"))
-            .expect("exact live lease");
+        let lease =
+            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
+                .await;
         let normalized_root =
             fs::canonicalize(root.join("private-library-root")).expect("canonical root");
         assert_eq!(
@@ -4201,9 +4236,9 @@ mod tests {
         .expect("bounded inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease = state
-            .mint_known_good_verification_lease(&lifecycle, &root.join("private-library-root"))
-            .expect("lease");
+        let lease =
+            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
+                .await;
         let reader = ScriptedReader::new(
             std::iter::empty::<(&str, ScriptedMetadata)>(),
             std::iter::empty::<(&str, Result<&str, io::ErrorKind>)>(),
@@ -4241,9 +4276,9 @@ mod tests {
         .expect("oversized inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease = state
-            .mint_known_good_verification_lease(&lifecycle, &root.join("private-library-root"))
-            .expect("lease");
+        let lease =
+            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
+                .await;
         let reader = ScriptedReader::new(
             std::iter::empty::<(&str, ScriptedMetadata)>(),
             std::iter::empty::<(&str, Result<&str, io::ErrorKind>)>(),
@@ -4289,9 +4324,9 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease = state
-            .mint_known_good_verification_lease(&lifecycle, &root.join("private-library-root"))
-            .expect("lease");
+        let lease =
+            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
+                .await;
         let reader = ScriptedReader::new(
             [("stable/library.jar", observation(MetadataKind::File, 7))],
             std::iter::empty::<(&str, Result<&str, io::ErrorKind>)>(),
@@ -4333,9 +4368,9 @@ mod tests {
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
-        let lease = state
-            .mint_known_good_verification_lease(&lifecycle, &root.join("private-library-root"))
-            .expect("lease");
+        let lease =
+            mint_test_verification_lease(&state, &lifecycle, &root.join("private-library-root"))
+                .await;
         let healthy_reader = ScriptedReader::new(
             [("bin/java", observation(MetadataKind::Link, 0))],
             [("bin/java", Ok("./java-real"))],
@@ -4408,10 +4443,12 @@ mod tests {
         ])
         .expect("inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let foreground = test_integrity_foreground(&state).await;
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
 
         let report = sense_integrity_tier0(
             &state,
+            &foreground,
             &lifecycle,
             &library_root,
             LaunchTier0RuntimeSelection::PreferredManaged,
@@ -4434,6 +4471,7 @@ mod tests {
                 .iter()
                 .any(|field| field.key == "observation" && field.value == "wrong_type")
         }));
+        drop(foreground);
         drop(lifecycle);
         close_fixture(state, root).await;
     }
@@ -4484,10 +4522,12 @@ mod tests {
             &instance.id,
             KnownGoodInventory::from_test_entries(entries).expect("I8 inventory"),
         );
+        let foreground = test_integrity_foreground(&state).await;
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
 
         let warmup_report = sense_integrity_tier0(
             &state,
+            &foreground,
             &lifecycle,
             &library_root,
             LaunchTier0RuntimeSelection::PreferredManaged,
@@ -4500,6 +4540,7 @@ mod tests {
             let started_at = Instant::now();
             let report = sense_integrity_tier0(
                 &state,
+                &foreground,
                 &lifecycle,
                 &library_root,
                 LaunchTier0RuntimeSelection::PreferredManaged,
@@ -4537,6 +4578,7 @@ mod tests {
             })
         );
         assert!(p95 <= Duration::from_millis(INTEGRITY_TIER0_CEILING_MS));
+        drop(foreground);
         drop(lifecycle);
         close_fixture(state, root).await;
     }

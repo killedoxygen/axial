@@ -126,8 +126,11 @@ pub(crate) struct IntegrityForegroundRegistration {
 
 #[must_use]
 pub(crate) struct IntegrityForegroundLease {
+    hold: Arc<IntegrityForegroundHold>,
+}
+
+struct IntegrityForegroundHold {
     coordinator: IntegrityActivityCoordinator,
-    active: bool,
 }
 
 #[must_use]
@@ -160,6 +163,10 @@ impl IntegrityActivityCoordinator {
 
     pub(super) fn subscribe_idle(&self) -> watch::Receiver<IntegrityIdleSnapshot> {
         self.shared.changed.subscribe()
+    }
+
+    pub(super) fn owns_foreground(&self, lease: &IntegrityForegroundLease) -> bool {
+        Arc::ptr_eq(&self.shared, &lease.hold.coordinator.shared)
     }
 
     pub(super) fn register_foreground(
@@ -403,8 +410,9 @@ impl IntegrityForegroundRegistration {
         }
         self.active = false;
         IntegrityForegroundLease {
-            coordinator: self.coordinator.clone(),
-            active: true,
+            hold: Arc::new(IntegrityForegroundHold {
+                coordinator: self.coordinator.clone(),
+            }),
         }
     }
 }
@@ -417,12 +425,17 @@ impl Drop for IntegrityForegroundRegistration {
     }
 }
 
-impl Drop for IntegrityForegroundLease {
-    fn drop(&mut self) {
-        if self.active {
-            self.active = false;
-            self.coordinator.release_foreground();
+impl IntegrityForegroundLease {
+    pub(crate) fn retained(&self) -> Self {
+        Self {
+            hold: Arc::clone(&self.hold),
         }
+    }
+}
+
+impl Drop for IntegrityForegroundHold {
+    fn drop(&mut self) {
+        self.coordinator.release_foreground();
     }
 }
 
@@ -480,6 +493,7 @@ mod tests {
 
     const _: fn() = || {
         let _ = <IdleSweepReservation as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <IntegrityForegroundLease as AmbiguousIfClone<_>>::assert_not_clone;
     };
 
     #[test]
@@ -575,6 +589,25 @@ mod tests {
         let idle = *coordinator.subscribe_idle().borrow();
         assert!(idle.is_stably_idle());
         assert_eq!(idle.epoch(), active_epoch);
+    }
+
+    #[tokio::test]
+    async fn retained_foreground_releases_on_the_last_retained_drop() {
+        let coordinator = IntegrityActivityCoordinator::new();
+        let foreground = coordinator
+            .register_foreground()
+            .expect("foreground registration")
+            .wait_for_settlement()
+            .await;
+        let first_retained = foreground.retained();
+        let last_retained = foreground.retained();
+
+        drop(foreground);
+        drop(first_retained);
+        assert!(!coordinator.subscribe_idle().borrow().is_stably_idle());
+
+        drop(last_retained);
+        assert!(coordinator.subscribe_idle().borrow().is_stably_idle());
     }
 
     #[test]

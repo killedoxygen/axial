@@ -71,9 +71,14 @@ fn launch_success_response_payload_exposes_effective_memory() {
     assert_eq!(payload["min_memory_mb"], serde_json::json!(1024));
 }
 
-#[test]
-fn launch_prepared_response_payload_exposes_queued_session_metadata() {
-    let task = test_launch_session_task();
+#[tokio::test]
+async fn launch_prepared_response_payload_exposes_queued_session_metadata() {
+    let fixture = RouteTestFixture::new("prepared-response-payload");
+    let producer = fixture
+        .state
+        .try_claim_producer()
+        .expect("claim prepared response producer");
+    let task = test_launch_session_task(&fixture.state, &producer).await;
     let payload = launch_app::launch_prepared_response_payload(&task);
 
     assert_eq!(payload["status"], serde_json::json!("launching"));
@@ -4286,8 +4291,17 @@ fn test_record(session_id: &str) -> LaunchSessionRecord {
     }
 }
 
-fn test_launch_session_task() -> launch_app::LaunchSessionTask {
+async fn test_launch_session_task(
+    state: &AppState,
+    _producer: &crate::state::ProducerLease,
+) -> launch_app::LaunchSessionTask {
+    let integrity_foreground = state
+        .register_integrity_foreground()
+        .expect("register prepared response foreground")
+        .wait_for_settlement()
+        .await;
     launch_app::LaunchSessionTask {
+        integrity_foreground,
         application: crate::application::stage_launch_instance_command(
             crate::application::LaunchInstanceCommand {
                 instance_id: "instance-queued".to_string(),

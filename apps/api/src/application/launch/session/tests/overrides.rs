@@ -304,11 +304,18 @@ async fn runtime_repreflight_shape_reuses_the_flow_receipt() {
         .state
         .try_claim_producer()
         .expect("claim preflight producer");
+    let integrity_foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register preflight foreground")
+        .wait_for_settlement()
+        .await;
 
     let mut initial = build_launch_preflight_facts(
         &fixture.state,
         &producer,
         LaunchPreflightBuild {
+            integrity_foreground: &integrity_foreground,
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,
@@ -325,6 +332,7 @@ async fn runtime_repreflight_shape_reuses_the_flow_receipt() {
         &fixture.state,
         &producer,
         LaunchPreflightBuild {
+            integrity_foreground: &integrity_foreground,
             instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,

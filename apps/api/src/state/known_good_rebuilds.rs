@@ -843,9 +843,14 @@ mod tests {
             &instance.id,
             verification_test_inventory(&instance.version_id),
         );
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register verification foreground")
+            .wait_for_settlement()
+            .await;
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
         let lease = state
-            .mint_known_good_verification_lease(&lifecycle, &root.join("library"))
+            .mint_known_good_verification_lease(&foreground, &lifecycle, &root.join("library"))
             .expect("exact live lease");
         let normalized_root = std::fs::canonicalize(root.join("library")).expect("library root");
         assert_eq!(
@@ -862,7 +867,11 @@ mod tests {
         let different_expected_root = root.join("different-expected-library");
         std::fs::create_dir_all(&different_expected_root).expect("different expected root");
         assert!(matches!(
-            state.mint_known_good_verification_lease(&lifecycle, &different_expected_root),
+            state.mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &different_expected_root,
+            ),
             Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
         ));
 
@@ -873,7 +882,11 @@ mod tests {
             .replace_for_test(recreated)
             .expect("replace incarnation");
         assert!(matches!(
-            state.mint_known_good_verification_lease(&lifecycle, &root.join("library")),
+            state.mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &root.join("library"),
+            ),
             Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
         ));
 
@@ -881,10 +894,15 @@ mod tests {
         std::fs::create_dir_all(&changed_root).expect("changed root");
         state.set_library_dir_for_test(changed_root.to_string_lossy().into_owned());
         assert!(matches!(
-            state.mint_known_good_verification_lease(&lifecycle, &root.join("library")),
+            state.mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &root.join("library"),
+            ),
             Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
         ));
         drop(lifecycle);
+        drop(foreground);
         close_fixture(state, root).await;
     }
 
@@ -1032,15 +1050,25 @@ mod tests {
             Err(KnownGoodRebuildError::LiveAuthorityMissing),
             "persisted evidence must not hydrate live authority"
         );
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register verification foreground")
+            .wait_for_settlement()
+            .await;
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
         assert!(
             matches!(
-                state.mint_known_good_verification_lease(&lifecycle, &root.join("library")),
+                state.mint_known_good_verification_lease(
+                    &foreground,
+                    &lifecycle,
+                    &root.join("library"),
+                ),
                 Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
             ),
             "persisted evidence must not mint verification authority"
         );
         drop(lifecycle);
+        drop(foreground);
         close_fixture(state, root).await;
     }
 
