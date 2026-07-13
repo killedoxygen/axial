@@ -572,6 +572,297 @@ async fn install_existing_active_response_includes_backend_operation_id() {
 }
 
 #[tokio::test]
+async fn vanilla_start_registers_before_waiting_on_the_install_store() {
+    let root = temp_root("vanilla-install-foreground-order");
+    let state = build_test_state(&root);
+    configure_library_dir(&state, &root.join("library"));
+    state
+        .installs()
+        .insert_or_existing_vanilla("existing-install".to_string(), "1.21.5".to_string())
+        .await;
+    assert!(state.installs().mark_initialized("existing-install").await);
+
+    let epoch = state.subscribe_integrity_idle().borrow().epoch();
+    let reservation = state
+        .try_reserve_idle_sweep(
+            epoch,
+            state.try_claim_producer().expect("claim sweep producer"),
+        )
+        .expect("reserve sweep");
+    let cancellation = reservation.cancellation();
+    let start = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let producer = state.try_claim_producer().expect("claim install producer");
+            start_install_version_owned(
+                &state,
+                InstallVersionStartRequest {
+                    version_id: "1.21.5".to_string(),
+                },
+                &producer,
+            )
+            .await
+        }
+    });
+
+    timeout(Duration::from_secs(1), async {
+        while !cancellation.is_cancelled() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("foreground registration cancels sweep");
+    assert!(!start.is_finished());
+    assert_eq!(state.installs().active_install_count().await, 1);
+
+    drop(reservation);
+    let response = timeout(Duration::from_secs(1), start)
+        .await
+        .expect("start settles")
+        .expect("start owner")
+        .expect("existing install response");
+    assert_eq!(response.install_id, "existing-install");
+    wait_for_integrity_idle(&state).await;
+    state.installs().remove("existing-install").await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn install_foreground_activity_releases_and_reacquires_without_overlap() {
+    let root = temp_root("install-foreground-reacquire");
+    let state = build_test_state(&root);
+    let foreground = register_install_foreground(&state)
+        .expect("register install foreground")
+        .wait_for_settlement()
+        .await;
+    let activity = InstallForegroundActivity::new(foreground);
+    assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+
+    activity.release();
+    assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
+    assert!(retain_install_foreground(&state, &activity).await);
+    assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+
+    drop(activity);
+    wait_for_integrity_idle(&state).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn install_foreground_retention_waits_for_store_terminal() {
+    let root = temp_root("install-foreground-terminal-retention");
+    let state = build_test_state(&root);
+    let install_id = "foreground-retained-install";
+    state.installs().insert(install_id.to_string()).await;
+    let foreground = register_install_foreground(&state)
+        .expect("register install foreground")
+        .wait_for_settlement()
+        .await;
+    let activity = InstallForegroundActivity::new(foreground);
+    let producer = state.try_claim_producer().expect("claim install producer");
+
+    spawn_install_foreground_retention(
+        state.clone(),
+        install_id.to_string(),
+        producer,
+        activity.clone(),
+    );
+    drop(activity);
+    tokio::task::yield_now().await;
+    assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+
+    state.installs().emit(install_id, done_progress()).await;
+    wait_for_integrity_idle(&state).await;
+    state.installs().remove(install_id).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn failed_progress_journal_task_keeps_foreground_and_queue_active() {
+    let root = temp_root("install-journal-failure-retention");
+    let state = build_test_state(&root);
+    let install_id = "journal-failed-install";
+    let operation_id = install_operation_id(install_id);
+    state
+        .installs()
+        .insert_or_existing_vanilla(install_id.to_string(), "1.21.5".to_string())
+        .await;
+    assert!(state.installs().mark_initialized(install_id).await);
+    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
+        .await
+        .expect("begin install operation journal");
+    state
+        .installs()
+        .enqueue_queued_install(
+            "journal-failed-queue".to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let reserved = state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .expect("reserve active queue entry");
+    assert!(
+        state
+            .installs()
+            .mark_queued_install_started(&reserved.queue_id, install_id.to_string())
+            .await
+    );
+    state
+        .installs()
+        .enqueue_queued_install(
+            "journal-failed-successor".to_string(),
+            InstallQueueSpec::vanilla("1.21.6".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let queue_start_gate = state.installs().acquire_queue_start_gate().await;
+
+    let foreground = register_install_foreground(&state)
+        .expect("register install foreground")
+        .wait_for_settlement()
+        .await;
+    let foreground = InstallForegroundActivity::new(foreground);
+    spawn_install_foreground_retention(
+        state.clone(),
+        install_id.to_string(),
+        state
+            .try_claim_producer()
+            .expect("claim foreground retention producer"),
+        foreground.clone(),
+    );
+    spawn_install_queue_monitor(state.clone(), install_id.to_string());
+    let interrupted_state = state.clone();
+    let interrupted_foreground = foreground.clone();
+    let interrupted_journals = state.journals().clone();
+    let interrupted_operation_id = operation_id.clone();
+    let (handler_started_tx, handler_started_rx) = tokio::sync::oneshot::channel();
+    let (handler_release_tx, handler_release_rx) = tokio::sync::oneshot::channel();
+    let supervisor = InstallStore::spawn_tracked_worker_with_interrupt_handler_owned(
+        state.installs().clone(),
+        state
+            .try_claim_producer()
+            .expect("claim tracked worker producer"),
+        install_id.to_string(),
+        interrupted_install_progress(),
+        async move {
+            let progress_task = tokio::spawn(async { false });
+            assert!(!finish_install_progress_task(progress_task).await);
+        },
+        move |progress| async move {
+            assert!(retain_install_foreground(&interrupted_state, &interrupted_foreground).await);
+            let _ = handler_started_tx.send(());
+            handler_release_rx
+                .await
+                .expect("release interrupted journal settlement");
+            record_install_operation_interrupted(
+                interrupted_journals.as_ref(),
+                &interrupted_operation_id,
+                &progress,
+            )
+            .await
+            .is_ok()
+        },
+    );
+    drop(foreground);
+
+    timeout(Duration::from_secs(1), handler_started_rx)
+        .await
+        .expect("interruption handler should start")
+        .expect("interruption handler start signal");
+
+    let before_terminal = state
+        .installs()
+        .snapshot(install_id)
+        .await
+        .expect("install remains owned before interruption settlement");
+    assert!(!before_terminal.done);
+    assert!(!install_journal_is_terminal(
+        state
+            .journals()
+            .get(&operation_id)
+            .expect("live install journal")
+            .status
+    ));
+    assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+    let queue_before_terminal = state.installs().queue_snapshot().await;
+    assert_eq!(
+        queue_before_terminal
+            .active
+            .as_ref()
+            .and_then(|active| active.install_id.as_deref()),
+        Some(install_id)
+    );
+    assert_eq!(queue_before_terminal.pending.len(), 1);
+    assert_eq!(
+        queue_before_terminal.pending[0].queue_id,
+        "journal-failed-successor"
+    );
+
+    handler_release_tx
+        .send(())
+        .expect("release interruption handler");
+    timeout(Duration::from_secs(1), supervisor)
+        .await
+        .expect("tracked worker supervisor should settle")
+        .expect("tracked worker supervisor should not panic");
+
+    let terminal_journal = state
+        .journals()
+        .get(&operation_id)
+        .expect("interrupted terminal journal");
+    assert!(install_journal_is_terminal(terminal_journal.status));
+    assert_eq!(
+        terminal_journal.failure_point.as_deref(),
+        Some("install_worker_interrupted")
+    );
+    let terminal_store = state
+        .installs()
+        .snapshot(install_id)
+        .await
+        .expect("interrupted store terminal");
+    assert!(terminal_store.done);
+    assert!(
+        terminal_store
+            .latest
+            .as_ref()
+            .is_some_and(|record| record.progress.done && record.progress.error.is_some())
+    );
+
+    wait_for_integrity_idle(&state).await;
+    assert!(install_journal_is_terminal(
+        state
+            .journals()
+            .get(&operation_id)
+            .expect("terminal journal remains visible at idle")
+            .status
+    ));
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if state.installs().queue_snapshot().await.active.is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal queue owner should release");
+    let queue_at_terminal = state.installs().queue_snapshot().await;
+    assert_eq!(queue_at_terminal.pending.len(), 1);
+    assert_eq!(
+        queue_at_terminal.pending[0].queue_id,
+        "journal-failed-successor"
+    );
+
+    drop(queue_start_gate);
+    wait_for_queue_empty(&state).await;
+    state.installs().remove(install_id).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn install_queue_status_authors_backend_queue_view_models() {
     let root = temp_root("install-queue-view-model");
     let state = build_test_state(&root);
@@ -2355,6 +2646,56 @@ async fn loader_pre_operation_failure_does_not_allocate_an_operation() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn loader_start_registers_before_resolving_the_install_target() {
+    let root = temp_root("loader-install-foreground-order");
+    let state = build_test_state(&root);
+    configure_library_dir(&state, &root.join("library"));
+    let epoch = state.subscribe_integrity_idle().borrow().epoch();
+    let reservation = state
+        .try_reserve_idle_sweep(
+            epoch,
+            state.try_claim_producer().expect("claim sweep producer"),
+        )
+        .expect("reserve sweep");
+    let cancellation = reservation.cancellation();
+    let start = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let producer = state.try_claim_producer().expect("claim loader producer");
+            start_loader_install_owned(
+                &state,
+                LoaderInstallStartRequest {
+                    component_id: LoaderComponentId::Fabric,
+                    build_id: "invalid-build-id".to_string(),
+                },
+                &producer,
+            )
+            .await
+        }
+    });
+
+    timeout(Duration::from_secs(1), async {
+        while !cancellation.is_cancelled() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("foreground registration cancels sweep");
+    assert!(!start.is_finished());
+    assert!(state.journals().list().is_empty());
+
+    drop(reservation);
+    let error = timeout(Duration::from_secs(1), start)
+        .await
+        .expect("loader start settles")
+        .expect("loader start owner")
+        .expect_err("invalid target is rejected");
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    wait_for_integrity_idle(&state).await;
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn pre_operation_response_defensively_normalizes_unexpected_active_failure() {
     let error = loader_pre_operation_error_response(LoaderError::Verify(
@@ -2713,6 +3054,56 @@ async fn wait_for_active_vanilla_base_install_does_not_block_done_removed_or_fai
 }
 
 #[tokio::test]
+async fn wait_for_observed_vanilla_base_install_fails_when_subscription_is_missing() {
+    let store = InstallStore::new();
+    let install_id = "removed-after-observation";
+    store
+        .insert_or_existing_vanilla(install_id.to_string(), "1.21.5".to_string())
+        .await;
+    store.remove(install_id).await;
+    let (progress_tx, _progress_rx) = tokio_mpsc::unbounded_channel();
+
+    let progress = wait_for_observed_vanilla_base_install(&store, install_id, &progress_tx)
+        .await
+        .expect_err("an observed base cannot disappear successfully");
+
+    assert_eq!(progress.error.as_deref(), Some(BASE_INSTALL_FAILED_MESSAGE));
+    assert!(progress.done);
+}
+
+#[tokio::test]
+async fn wait_for_active_vanilla_base_install_fails_when_observed_channel_closes() {
+    let store = Arc::new(InstallStore::new());
+    let install_id = "closed-base-install";
+    store
+        .insert_or_existing_vanilla(install_id.to_string(), "1.21.5".to_string())
+        .await;
+    let (progress_tx, mut progress_rx) = tokio_mpsc::unbounded_channel();
+    let wait_store = store.clone();
+    let waiter = tokio::spawn(async move {
+        wait_for_active_vanilla_base_install(wait_store.as_ref(), "1.21.5", &progress_tx).await
+    });
+
+    let progress = base_progress("client");
+    store.emit(install_id, progress.clone()).await;
+    assert_eq!(
+        timeout(Duration::from_secs(1), progress_rx.recv())
+            .await
+            .expect("forwarded progress should arrive"),
+        Some(progress)
+    );
+    store.remove(install_id).await;
+
+    let progress = timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("closed base waiter should settle")
+        .expect("base waiter should not panic")
+        .expect_err("a closed observed base cannot settle successfully");
+    assert_eq!(progress.error.as_deref(), Some(BASE_INSTALL_FAILED_MESSAGE));
+    assert!(progress.done);
+}
+
+#[tokio::test]
 async fn wait_for_active_vanilla_base_install_fails_loader_when_base_fails_while_waiting() {
     let store = Arc::new(InstallStore::new());
     store
@@ -2751,6 +3142,7 @@ async fn wait_for_active_vanilla_base_install_fails_loader_when_base_fails_while
 #[tokio::test]
 async fn cancelled_initial_commit_releases_reservation_for_duplicate_retry() {
     let root = temp_root("cancelled-initial-journal");
+    let state = build_test_state(&root);
     let (backend, journals) = install_journal_persistence_fixture(&root);
     let installs = Arc::new(InstallStore::new());
     let install_id = "cancelled-initial".to_string();
@@ -2763,7 +3155,8 @@ async fn cancelled_initial_commit_releases_reservation_for_duplicate_retry() {
     );
 
     let gate = backend.gate_attempt(1);
-    let initialization = tokio::spawn(begin_install_journal_with_detached_reconciliation(
+    let initialization = tokio::spawn(begin_install_journal_with_test_ownership(
+        state.clone(),
         installs.clone(),
         journals.clone(),
         install_id.clone(),
@@ -2771,6 +3164,7 @@ async fn cancelled_initial_commit_releases_reservation_for_duplicate_retry() {
         "1.21.5".to_string(),
     ));
     backend.wait_for_attempt(1).await;
+    assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
 
     let duplicate_store = installs.clone();
     let duplicate_id = install_id.clone();
@@ -2819,6 +3213,7 @@ async fn cancelled_initial_commit_releases_reservation_for_duplicate_retry() {
             .as_deref(),
         Some("install_initialization_cancelled")
     );
+    wait_for_integrity_idle(&state).await;
     installs.remove(&retry_id).await;
     journals.close().await.expect("close journals");
     fs::remove_dir_all(root).expect("cleanup");
@@ -2826,6 +3221,8 @@ async fn cancelled_initial_commit_releases_reservation_for_duplicate_retry() {
 
 #[tokio::test]
 async fn cancelled_initialized_result_before_worker_handoff_releases_reservation() {
+    let root = temp_root("cancelled-initialized-handoff");
+    let state = build_test_state(&root);
     let journals = Arc::new(OperationJournalStore::new());
     let installs = Arc::new(InstallStore::new());
     let install_id = "cancelled-handoff".to_string();
@@ -2840,10 +3237,12 @@ async fn cancelled_initialized_result_before_worker_handoff_releases_reservation
     let (received_tx, received_rx) = tokio::sync::oneshot::channel();
     let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let initialization = tokio::spawn({
+        let initialization_state = state.clone();
         let installs = installs.clone();
         let journals = journals.clone();
         async move {
-            let reservation = begin_install_journal_with_detached_reconciliation(
+            let reservation = begin_install_journal_with_test_ownership(
+                initialization_state,
                 installs,
                 journals,
                 install_id,
@@ -2854,10 +3253,11 @@ async fn cancelled_initialized_result_before_worker_handoff_releases_reservation
             .expect("receive initialized reservation");
             let _ = received_tx.send(());
             let _ = release_rx.await;
-            reservation.hand_off();
+            drop(reservation.hand_off());
         }
     });
     received_rx.await.expect("reservation received");
+    assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
     initialization.abort();
     assert!(
         initialization
@@ -2880,11 +3280,14 @@ async fn cancelled_initialized_result_before_worker_handoff_releases_reservation
             .status,
         OperationStatus::Failed
     );
+    wait_for_integrity_idle(&state).await;
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn transient_initial_failure_reconciles_then_allows_retry() {
     let root = temp_root("transient-initial-journal");
+    let state = build_test_state(&root);
     let (backend, journals) = install_journal_persistence_fixture(&root);
     let installs = Arc::new(InstallStore::new());
     let install_id = "transient-initial".to_string();
@@ -2899,7 +3302,8 @@ async fn transient_initial_failure_reconciles_then_allows_retry() {
     let retry_gate = backend.gate_attempt(2);
 
     assert!(
-        begin_install_journal_with_detached_reconciliation(
+        begin_install_journal_with_test_ownership(
+            state.clone(),
             installs.clone(),
             journals.clone(),
             install_id.clone(),
@@ -2931,6 +3335,7 @@ async fn transient_initial_failure_reconciles_then_allows_retry() {
 
     retry_gate.release();
     wait_for_install_removal(&installs, &install_id).await;
+    wait_for_integrity_idle(&state).await;
     assert_eq!(
         journals.get(&operation_id).expect("retried journal").status,
         OperationStatus::Failed
@@ -2950,8 +3355,9 @@ async fn transient_initial_failure_reconciles_then_allows_retry() {
 }
 
 #[tokio::test]
-async fn persistent_initial_failure_keeps_live_owner_and_bounds_duplicates() {
+async fn repeated_initial_failure_keeps_live_owner_and_bounds_duplicates() {
     let root = temp_root("persistent-initial-journal");
+    let state = build_test_state(&root);
     let (backend, journals) = install_journal_persistence_fixture(&root);
     let installs = Arc::new(InstallStore::new());
     let install_id = "persistent-initial".to_string();
@@ -2962,11 +3368,13 @@ async fn persistent_initial_failure_keeps_live_owner_and_bounds_duplicates() {
             .await
             .1
     );
-    backend.fail_attempts(64);
+    backend.fail_attempts(2);
+    let final_retry_gate = backend.gate_attempt(3);
     assert!(
-        begin_install_journal_with_detached_reconciliation(
+        begin_install_journal_with_test_ownership(
+            state.clone(),
             installs.clone(),
-            journals,
+            journals.clone(),
             install_id.clone(),
             operation_id,
             "1.21.5".to_string(),
@@ -2983,9 +3391,16 @@ async fn persistent_initial_failure_keeps_live_owner_and_bounds_duplicates() {
         .expect("persistent reconciliation must not block duplicate response"),
         InstallInitializationStatus::Reconciling
     );
-    timeout(Duration::from_millis(250), backend.wait_for_attempt(2))
+    timeout(Duration::from_millis(250), backend.wait_for_attempt(3))
         .await
-        .expect("detached reconciliation owner must retry");
+        .expect("owned reconciliation must retry");
+    assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+
+    final_retry_gate.release();
+    wait_for_install_removal(&installs, &install_id).await;
+    wait_for_integrity_idle(&state).await;
+    journals.close().await.expect("close journals");
+    fs::remove_dir_all(root).expect("cleanup");
 }
 
 #[tokio::test]
@@ -4306,6 +4721,50 @@ fn build_test_state(root: &Path) -> AppState {
         startup_warnings: Vec::new(),
         frontend_dir: root.join("frontend"),
     })
+}
+
+async fn begin_install_journal_with_test_ownership(
+    state: AppState,
+    store: Arc<InstallStore>,
+    journals: Arc<OperationJournalStore>,
+    install_id: String,
+    operation_id: OperationId,
+    version_id: String,
+) -> Result<InstallInitializationReservation, ()> {
+    let producer = state
+        .try_claim_producer()
+        .expect("claim test install reconciliation producer");
+    let foreground = state
+        .register_integrity_foreground()
+        .expect("register test install foreground")
+        .wait_for_settlement()
+        .await;
+    begin_install_journal_with_owned_reconciliation(
+        store,
+        journals,
+        install_id,
+        operation_id,
+        version_id,
+        &producer,
+        foreground,
+    )
+    .await
+}
+
+async fn wait_for_integrity_idle(state: &AppState) {
+    let mut idle = state.subscribe_integrity_idle();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if idle.borrow_and_update().is_stably_idle() {
+                return;
+            }
+            idle.changed()
+                .await
+                .expect("integrity activity remains open");
+        }
+    })
+    .await
+    .expect("install foreground should settle");
 }
 
 struct InstallJournalBackend {

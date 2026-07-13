@@ -1,16 +1,17 @@
 use super::repair::InstallRepairResume;
 use super::{
     BASE_INSTALL_FAILED_MESSAGE, INSTALL_FAILURE_MESSAGE, InstallApplicationError,
-    InstallProgressCoalescer, InstallProgressViewModel, InstallStartResponse,
-    LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
-    begin_install_journal_with_owned_reconciliation, emit_install_failed,
-    finish_install_progress_task, generate_install_id, install_journal_error_response,
-    install_operation_id, known_good_acceptance_download_error,
+    InstallForegroundActivity, InstallProgressCoalescer, InstallProgressViewModel,
+    InstallStartResponse, LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest,
+    LoaderInstallStartRequest, begin_install_journal_with_owned_reconciliation,
+    emit_install_failed, finish_install_progress_task, generate_install_id,
+    install_journal_error_response, install_operation_id, known_good_acceptance_download_error,
     operation::install_progress_with_terminal_error, record_and_emit_install_progress,
     record_install_failure_outcome_and_repair, record_install_failure_outcome_and_repair_for_error,
     record_install_operation_interrupted,
     record_loader_base_install_dependency_guardian_failure_outcome,
-    record_loader_install_operation_guardian_failure_outcome, sanitize_install_progress,
+    record_loader_install_operation_guardian_failure_outcome, register_install_foreground,
+    retain_install_foreground, sanitize_install_progress, spawn_install_foreground_retention,
     stage_install_version_command, terminal_failure_progress_or_default,
 };
 use crate::application::{InstallVersionCommand, instances::invalidate_create_view_source};
@@ -50,6 +51,8 @@ pub(super) async fn start_loader_install_owned(
             Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
+    let foreground = register_install_foreground(state)?;
+    let foreground = foreground.wait_for_settlement().await;
     let build = resolve_build_record_for_install(request.component_id, &build_id)
         .await
         .map_err(loader_pre_operation_error_response)?;
@@ -95,6 +98,7 @@ pub(super) async fn start_loader_install_owned(
         operation_id.clone(),
         target_version_id.clone(),
         producer,
+        foreground,
     )
     .await
     .map_err(|_| install_journal_error_response())?;
@@ -116,6 +120,16 @@ pub(super) async fn start_loader_install_owned(
     let worker_state = state.clone();
     let worker_runtime_cache = state.managed_runtime_cache().clone();
     let progress_owner = producer.claim_child();
+    let foreground = InstallForegroundActivity::new(reservation.hand_off());
+    let worker_foreground = foreground.clone();
+    let interrupted_foreground = foreground.clone();
+    let interrupted_state = state.clone();
+    spawn_install_foreground_retention(
+        state.clone(),
+        install_id_task.clone(),
+        producer.claim_child(),
+        foreground,
+    );
     InstallStore::spawn_tracked_worker_with_interrupt_handler_owned(
         store,
         producer.claim_child(),
@@ -176,10 +190,16 @@ pub(super) async fn start_loader_install_owned(
                 build.component_id.short_key(),
                 build.build_id
             );
-            if let Err(progress) =
+            worker_foreground.release();
+            let base_install =
                 wait_for_active_vanilla_base_install(&worker_store, &base_version_id, &progress_tx)
-                    .await
-            {
+                    .await;
+            if !retain_install_foreground(&worker_state, &worker_foreground).await {
+                drop(progress_tx);
+                let _ = finish_install_progress_task(store_task).await;
+                return;
+            }
+            if let Err(progress) = base_install {
                 record_loader_base_install_dependency_guardian_failure_outcome(
                     worker_journals.as_ref(),
                     &worker_operation_id,
@@ -194,13 +214,7 @@ pub(super) async fn start_loader_install_owned(
                     .unwrap_or_else(|| BASE_INSTALL_FAILED_MESSAGE.to_string());
                 let _ = progress_tx.send(progress);
                 drop(progress_tx);
-                if finish_install_progress_task(
-                    store_task,
-                    worker_store.as_ref(),
-                    &worker_install_id,
-                )
-                .await
-                {
+                if finish_install_progress_task(store_task).await {
                     emit_install_failed(worker_telemetry.as_ref(), &failure_summary);
                 }
                 return;
@@ -236,12 +250,7 @@ pub(super) async fn start_loader_install_owned(
                 };
                 let Some(result) = result else {
                     drop(progress_tx);
-                    let _ = finish_install_progress_task(
-                        store_task,
-                        worker_store.as_ref(),
-                        &worker_install_id,
-                    )
-                    .await;
+                    let _ = finish_install_progress_task(store_task).await;
                     return;
                 };
 
@@ -268,13 +277,7 @@ pub(super) async fn start_loader_install_owned(
                             .unwrap_or_else(|| BASE_INSTALL_FAILED_MESSAGE.to_string());
                         let _ = progress_tx.send(progress);
                         drop(progress_tx);
-                        if finish_install_progress_task(
-                            store_task,
-                            worker_store.as_ref(),
-                            &worker_install_id,
-                        )
-                        .await
-                        {
+                        if finish_install_progress_task(store_task).await {
                             emit_install_failed(worker_telemetry.as_ref(), &failure_summary);
                         }
                         return;
@@ -309,12 +312,7 @@ pub(super) async fn start_loader_install_owned(
                             );
                         }
                         drop(progress_tx);
-                        let journal_committed = finish_install_progress_task(
-                            store_task,
-                            worker_store.as_ref(),
-                            &worker_install_id,
-                        )
-                        .await;
+                        let journal_committed = finish_install_progress_task(store_task).await;
                         if journal_committed && let Some(summary) = publication.failure_summary {
                             emit_install_failed(worker_telemetry.as_ref(), &summary);
                         }
@@ -324,6 +322,7 @@ pub(super) async fn start_loader_install_owned(
             }
         },
         move |progress| async move {
+            let _ = retain_install_foreground(&interrupted_state, &interrupted_foreground).await;
             if record_install_operation_interrupted(
                 journals.as_ref(),
                 &operation_id_task,
@@ -338,7 +337,6 @@ pub(super) async fn start_loader_install_owned(
             true
         },
     );
-    reservation.hand_off();
 
     Ok(InstallStartResponse {
         install_id,
@@ -527,40 +525,61 @@ pub(crate) async fn wait_for_active_vanilla_base_install(
         return Ok(());
     };
 
-    let Some((snapshot, mut receiver)) = store.subscribe_records(&install_id).await else {
-        return Ok(());
+    wait_for_observed_vanilla_base_install(store, &install_id, progress_tx).await
+}
+
+pub(crate) async fn wait_for_observed_vanilla_base_install(
+    store: &InstallStore,
+    install_id: &str,
+    progress_tx: &mpsc::UnboundedSender<DownloadProgress>,
+) -> Result<(), DownloadProgress> {
+    let Some((snapshot, mut receiver)) = store.subscribe_records(install_id).await else {
+        return Err(base_install_failed_progress());
     };
 
-    if let Some(record) = snapshot.latest {
-        if record.progress.done {
-            return if record.progress.error.is_some() {
-                Err(base_install_failed_progress())
-            } else {
-                Ok(())
-            };
+    if let Some(record) = snapshot.latest.as_ref() {
+        if let Some(terminal) = explicit_base_install_terminal(&record.progress) {
+            return terminal;
         }
-        let _ = progress_tx.send(record.progress);
+        let _ = progress_tx.send(record.progress.clone());
     }
     if snapshot.done {
-        return Ok(());
+        return Err(base_install_failed_progress());
     }
 
     loop {
         match receiver.recv().await {
             Ok(record) => {
-                if record.progress.done {
-                    return if record.progress.error.is_some() {
-                        Err(base_install_failed_progress())
-                    } else {
-                        Ok(())
-                    };
+                if let Some(terminal) = explicit_base_install_terminal(&record.progress) {
+                    return terminal;
                 }
                 let _ = progress_tx.send(record.progress);
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                let Some(snapshot) = store.snapshot(install_id).await else {
+                    return Err(base_install_failed_progress());
+                };
+                let Some(progress) = snapshot.latest.as_ref().map(|record| &record.progress) else {
+                    return Err(base_install_failed_progress());
+                };
+                return explicit_base_install_terminal(progress)
+                    .unwrap_or_else(|| Err(base_install_failed_progress()));
+            }
         }
     }
+}
+
+fn explicit_base_install_terminal(
+    progress: &DownloadProgress,
+) -> Option<Result<(), DownloadProgress>> {
+    progress.done.then(|| {
+        if progress.error.is_some() {
+            Err(base_install_failed_progress())
+        } else {
+            Ok(())
+        }
+    })
 }
 
 pub fn loader_pre_operation_error_response(error: LoaderError) -> InstallApplicationError {

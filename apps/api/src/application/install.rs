@@ -34,6 +34,7 @@ use crate::state::{
     QueuedInstallEntry, operation_journal_plan_is_visible,
 };
 use crate::state::{AppState, ProducerLease, RequestProducerHandoff};
+use crate::state::{IntegrityForegroundLease, IntegrityForegroundRegistration};
 use axial_minecraft::{
     DownloadError, DownloadProgress, Downloader,
     download::{ExecutionDownloadFact, SelectedDownloadArtifactDescriptor},
@@ -68,6 +69,7 @@ struct InstallInitializationReservation {
     install_id: Option<String>,
     operation_id: OperationId,
     cleanup_owner: Option<ProducerLease>,
+    foreground: Option<IntegrityForegroundLease>,
 }
 
 impl InstallInitializationReservation {
@@ -77,6 +79,7 @@ impl InstallInitializationReservation {
         install_id: String,
         operation_id: OperationId,
         cleanup_owner: ProducerLease,
+        foreground: IntegrityForegroundLease,
     ) -> Self {
         Self {
             store,
@@ -84,11 +87,15 @@ impl InstallInitializationReservation {
             install_id: Some(install_id),
             operation_id,
             cleanup_owner: Some(cleanup_owner),
+            foreground: Some(foreground),
         }
     }
 
-    fn hand_off(mut self) {
+    fn hand_off(mut self) -> IntegrityForegroundLease {
         self.install_id = None;
+        self.foreground
+            .take()
+            .expect("install initialization foreground owner remains available")
     }
 }
 
@@ -104,7 +111,12 @@ impl Drop for InstallInitializationReservation {
             .cleanup_owner
             .take()
             .expect("install initialization cleanup owner remains available");
+        let foreground = self
+            .foreground
+            .take()
+            .expect("install initialization foreground owner remains available");
         cleanup_owner.spawn(async move {
+            let _foreground = foreground;
             let _ = store.mark_initialization_reconciling(&install_id).await;
             let _ = operation::record_install_operation_initialization_cancelled(
                 &journals,
@@ -149,6 +161,7 @@ async fn begin_install_journal_with_owned_reconciliation(
     operation_id: OperationId,
     version_id: String,
     producer: &ProducerLease,
+    foreground: IntegrityForegroundLease,
 ) -> Result<InstallInitializationReservation, ()> {
     let reservation = InstallInitializationReservation::new(
         store,
@@ -156,6 +169,7 @@ async fn begin_install_journal_with_owned_reconciliation(
         install_id,
         operation_id.clone(),
         producer.claim_child(),
+        foreground,
     );
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     producer.claim_child().spawn(async move {
@@ -209,30 +223,82 @@ async fn begin_install_journal_with_owned_reconciliation(
     result_rx.await.unwrap_or(Err(()))
 }
 
-#[cfg(test)]
-async fn begin_install_journal_with_detached_reconciliation(
-    store: Arc<InstallStore>,
-    journals: Arc<OperationJournalStore>,
-    install_id: String,
-    operation_id: OperationId,
-    version_id: String,
-) -> Result<InstallInitializationReservation, ()> {
-    let lifecycle = crate::state::AppLifecycle::new();
-    let producer = lifecycle
-        .try_claim_producer()
-        .expect("claim test install reconciliation");
-    begin_install_journal_with_owned_reconciliation(
-        store,
-        journals,
-        install_id,
-        operation_id,
-        version_id,
-        &producer,
-    )
-    .await
+pub type InstallApplicationError = (StatusCode, Json<serde_json::Value>);
+
+#[derive(Clone)]
+struct InstallForegroundActivity {
+    lease: Arc<Mutex<Option<IntegrityForegroundLease>>>,
 }
 
-pub type InstallApplicationError = (StatusCode, Json<serde_json::Value>);
+impl InstallForegroundActivity {
+    fn new(lease: IntegrityForegroundLease) -> Self {
+        Self {
+            lease: Arc::new(Mutex::new(Some(lease))),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    fn release(&self) {
+        drop(
+            self.lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
+
+    fn retain(&self, lease: IntegrityForegroundLease) {
+        let replaced = self
+            .lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(lease);
+        assert!(
+            replaced.is_none(),
+            "install foreground activity retained more than one lease"
+        );
+    }
+}
+
+fn register_install_foreground(
+    state: &AppState,
+) -> Result<IntegrityForegroundRegistration, InstallApplicationError> {
+    state
+        .register_integrity_foreground()
+        .map_err(|_| install_shutdown_error_response())
+}
+
+async fn retain_install_foreground(
+    state: &AppState,
+    foreground: &InstallForegroundActivity,
+) -> bool {
+    if foreground.is_active() {
+        return true;
+    }
+    let Ok(registration) = register_install_foreground(state) else {
+        return false;
+    };
+    foreground.retain(registration.wait_for_settlement().await);
+    true
+}
+
+fn spawn_install_foreground_retention(
+    state: AppState,
+    install_id: String,
+    producer: ProducerLease,
+    foreground: InstallForegroundActivity,
+) {
+    producer.spawn(async move {
+        wait_for_install_terminal(&state, &install_id).await;
+        drop(foreground);
+    });
+}
 
 pub(crate) struct ContinuationInstallQueueResult {
     pub response: InstallQueueStateResponse,
@@ -249,7 +315,7 @@ use loader::start_loader_install_owned;
 use loader::{
     dispatch_loader_install_failure, loader_install_done_progress, loader_install_error_progress,
     publish_known_good_loader_terminal, require_exact_loader_receipt_version,
-    wait_for_active_vanilla_base_install,
+    wait_for_active_vanilla_base_install, wait_for_observed_vanilla_base_install,
 };
 pub use loader::{
     loader_builds, loader_components, loader_game_versions, loader_pre_operation_error_response,
@@ -305,6 +371,8 @@ pub(crate) async fn start_install_version_owned(
             Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
+    let foreground = register_install_foreground(state)?;
+    let foreground = foreground.wait_for_settlement().await;
 
     let install_id = loop {
         let candidate = generate_install_id("install");
@@ -346,6 +414,7 @@ pub(crate) async fn start_install_version_owned(
         operation_id.clone(),
         version_id.clone(),
         producer,
+        foreground,
     )
     .await
     .map_err(|_| install_journal_error_response())?;
@@ -368,6 +437,15 @@ pub(crate) async fn start_install_version_owned(
     let worker_state = state.clone();
     let worker_runtime_cache = state.managed_runtime_cache().clone();
     let progress_owner = producer.claim_child();
+    let foreground = InstallForegroundActivity::new(reservation.hand_off());
+    let interrupted_foreground = foreground.clone();
+    let interrupted_state = state.clone();
+    spawn_install_foreground_retention(
+        state.clone(),
+        install_id_task.clone(),
+        producer.claim_child(),
+        foreground,
+    );
     InstallStore::spawn_tracked_worker_with_interrupt_handler_owned(
         store,
         producer.claim_child(),
@@ -458,12 +536,7 @@ pub(crate) async fn start_install_version_owned(
                 };
                 let Some(install_result) = install_result else {
                     drop(progress_tx);
-                    let _ = finish_install_progress_task(
-                        store_task,
-                        worker_store.as_ref(),
-                        &worker_install_id,
-                    )
-                    .await;
+                    let _ = finish_install_progress_task(store_task).await;
                     return;
                 };
                 let attempt_terminal_progress = terminal_progress
@@ -544,14 +617,13 @@ pub(crate) async fn start_install_version_owned(
             };
             let _ = progress_tx.send(terminal_progress);
             drop(progress_tx);
-            let journal_committed =
-                finish_install_progress_task(store_task, worker_store.as_ref(), &worker_install_id)
-                    .await;
+            let journal_committed = finish_install_progress_task(store_task).await;
             if journal_committed && let Some(summary) = failure_summary {
                 emit_install_failed(worker_telemetry.as_ref(), &summary);
             }
         },
         move |progress| async move {
+            let _ = retain_install_foreground(&interrupted_state, &interrupted_foreground).await;
             if record_install_operation_interrupted(
                 journals.as_ref(),
                 &operation_id_task,
@@ -566,7 +638,6 @@ pub(crate) async fn start_install_version_owned(
             true
         },
     );
-    reservation.hand_off();
 
     Ok(InstallStartResponse {
         install_id,
@@ -754,17 +825,10 @@ fn install_journal_error_response() -> InstallApplicationError {
     )
 }
 
-async fn finish_install_progress_task(
-    task: tokio::task::JoinHandle<bool>,
-    store: &InstallStore,
-    install_id: &str,
-) -> bool {
+async fn finish_install_progress_task(task: tokio::task::JoinHandle<bool>) -> bool {
     match task.await {
         Ok(true) => true,
-        Ok(false) => {
-            store.remove(install_id).await;
-            false
-        }
+        Ok(false) => false,
         Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
         Err(error) => panic!("install progress task stopped unexpectedly: {error}"),
     }
