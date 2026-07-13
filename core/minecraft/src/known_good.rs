@@ -2,7 +2,9 @@ use crate::artifact_path::{
     ArtifactRelativePath, MAX_ARTIFACT_PATH_SEGMENT_BYTES, MAX_ARTIFACT_RELATIVE_PATH_BYTES,
 };
 use crate::download::{
-    ExpectedIntegrity, LibraryArtifactPlan, library_artifact_plans_for, parse_asset_index,
+    AuthenticatedSelectedArtifactSource, CompletedVanillaInstallAuthority, ExpectedIntegrity,
+    LibraryArtifactPlan, PendingVanillaInstallSourceAuthority, ReconstructedVanillaAuthority,
+    SelectedDownloadArtifactKind, library_artifact_plans_for, parse_asset_index,
 };
 use crate::known_good_libraries::{
     PendingInstallerPublications, RetainedInstallerLibrarySource, SealedExactLibraryDeclarations,
@@ -13,11 +15,12 @@ use crate::loaders::{
     AuthenticatedInstallerReceiptInput, LoaderBuildRecord, LoaderComponentId,
     LoaderInstallStrategy, VerifiedInstallerClientBytes, compose_loader_version,
 };
+#[cfg(test)]
 use crate::manifest::ManifestEntry;
 use crate::rules::Environment;
 use crate::runtime::{
-    COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, RuntimeId, component_manifest_proof_bytes,
-    plan_runtime_manifest_files, preferred_runtime_component,
+    COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, RuntimeId, RuntimeSourceReceipt,
+    component_manifest_proof_bytes, plan_runtime_manifest_files, preferred_runtime_component,
 };
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
@@ -120,16 +123,30 @@ impl KnownGoodInventory {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct KnownGoodInstallReceipt {
-    version_id: KnownGoodId,
-    inventory: KnownGoodInventory,
-    effective_version: VersionJson,
-    environment: Environment,
+    authenticated: AuthenticatedKnownGoodReceipt,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct KnownGoodReconstructionReceipt {
+    authenticated: AuthenticatedKnownGoodReceipt,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct KnownGoodActivationSource {
     version_id: KnownGoodId,
     inventory: KnownGoodInventory,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AuthenticatedKnownGoodReceipt {
+    version_id: KnownGoodId,
+    inventory: KnownGoodInventory,
+    effective_version: VersionJson,
+    environment: Environment,
+}
+
+pub(crate) struct PendingVanillaInstallReceipt {
+    authenticated: AuthenticatedKnownGoodReceipt,
 }
 
 pub(crate) struct PendingInstallerReceipt {
@@ -183,18 +200,18 @@ fn sha1_array_digest(value: &[u8; 20]) -> Sha1Digest {
 
 impl KnownGoodInstallReceipt {
     pub fn version_id(&self) -> &str {
-        self.version_id.as_str()
+        self.authenticated.version_id.as_str()
     }
 
     pub fn into_activation_source(self) -> KnownGoodActivationSource {
         KnownGoodActivationSource {
-            version_id: self.version_id,
-            inventory: self.inventory,
+            version_id: self.authenticated.version_id,
+            inventory: self.authenticated.inventory,
         }
     }
 
     pub(crate) fn effective_version(&self) -> &VersionJson {
-        &self.effective_version
+        &self.authenticated.effective_version
     }
 
     #[cfg(test)]
@@ -223,10 +240,12 @@ impl KnownGoodInstallReceipt {
             })
             .expect("unique test client entry");
         Self {
-            version_id,
-            inventory: inventory.finish(),
-            effective_version,
-            environment,
+            authenticated: AuthenticatedKnownGoodReceipt {
+                version_id,
+                inventory: inventory.finish(),
+                effective_version,
+                environment,
+            },
         }
     }
 
@@ -234,6 +253,7 @@ impl KnownGoodInstallReceipt {
         &self,
     ) -> Result<ExpectedIntegrity, KnownGoodInventoryError> {
         let client = self
+            .authenticated
             .effective_version
             .downloads
             .client
@@ -251,8 +271,9 @@ impl KnownGoodInstallReceipt {
     fn authenticated_client_known_good_integrity(
         &self,
     ) -> Result<KnownGoodIntegrity, KnownGoodInventoryError> {
-        let path = format!("{0}/{0}.jar", self.version_id.as_str());
-        self.inventory
+        let path = format!("{0}/{0}.jar", self.authenticated.version_id.as_str());
+        self.authenticated
+            .inventory
             .entries
             .iter()
             .find(|entry| {
@@ -279,8 +300,8 @@ impl KnownGoodInstallReceipt {
         version_bytes: &[u8],
         child_client_bytes: &[u8],
     ) -> Result<Self, KnownGoodInventoryError> {
-        if base.version_id.as_str() != record.minecraft_version
-            || base.effective_version.id != record.minecraft_version
+        if base.authenticated.version_id.as_str() != record.minecraft_version
+            || base.authenticated.effective_version.id != record.minecraft_version
             || record.component_id != LoaderComponentId::Forge
             || record.strategy != LoaderInstallStrategy::ForgeEarliestLegacy
             || crate::loaders::api::validate_loader_build_record_identity(record).is_err()
@@ -292,7 +313,7 @@ impl KnownGoodInstallReceipt {
             .map_err(|_| KnownGoodInventoryError::InputTooLarge)?;
         let child_digest = sha1_digest(child_client_bytes);
         let child_sha1 = child_digest.as_str().to_string();
-        let mut expected_version = base.effective_version.clone();
+        let mut expected_version = base.authenticated.effective_version.clone();
         expected_version.id = record.version_id.clone();
         expected_version.inherits_from = record.minecraft_version.clone();
         expected_version.materialized = true;
@@ -313,7 +334,7 @@ impl KnownGoodInstallReceipt {
 
         let version_id = KnownGoodId::new(&resolved_version.id)?;
         let mut builder = InventoryBuilder::default();
-        for entry in base.inventory.entries.iter().filter(|entry| {
+        for entry in base.authenticated.inventory.entries.iter().filter(|entry| {
             matches!(
                 &entry.root,
                 KnownGoodRoot::Assets | KnownGoodRoot::ManagedRuntime { .. }
@@ -340,15 +361,17 @@ impl KnownGoodInstallReceipt {
         add_exact_inherited_libraries(
             &mut builder,
             &resolved_version.libraries,
-            &base.environment,
-            &base.inventory,
+            &base.authenticated.environment,
+            &base.authenticated.inventory,
         )?;
 
         Ok(Self {
-            version_id,
-            inventory: builder.finish(),
-            effective_version: resolved_version,
-            environment: base.environment.clone(),
+            authenticated: AuthenticatedKnownGoodReceipt {
+                version_id,
+                inventory: builder.finish(),
+                effective_version: resolved_version,
+                environment: base.authenticated.environment.clone(),
+            },
         })
     }
 
@@ -359,16 +382,16 @@ impl KnownGoodInstallReceipt {
         version_bytes: &[u8],
         library_declarations: SealedExactLibraryDeclarations,
     ) -> Result<Self, KnownGoodInventoryError> {
-        if base.version_id.as_str() != record.minecraft_version
-            || base.effective_version.id != record.minecraft_version
+        if base.authenticated.version_id.as_str() != record.minecraft_version
+            || base.authenticated.effective_version.id != record.minecraft_version
             || resolved_version.id != record.version_id
             || resolved_version.inherits_from != record.minecraft_version
             || !resolved_version.materialized
-            || resolved_version.asset_index != base.effective_version.asset_index
-            || resolved_version.assets != base.effective_version.assets
-            || resolved_version.downloads != base.effective_version.downloads
-            || resolved_version.java_version != base.effective_version.java_version
-            || resolved_version.logging != base.effective_version.logging
+            || resolved_version.asset_index != base.authenticated.effective_version.asset_index
+            || resolved_version.assets != base.authenticated.effective_version.assets
+            || resolved_version.downloads != base.authenticated.effective_version.downloads
+            || resolved_version.java_version != base.authenticated.effective_version.java_version
+            || resolved_version.logging != base.authenticated.effective_version.logging
             || !serde_json::from_slice::<VersionJson>(version_bytes)
                 .is_ok_and(|version| version == resolved_version)
         {
@@ -392,7 +415,7 @@ impl KnownGoodInstallReceipt {
 
         let version_id = KnownGoodId::new(&resolved_version.id)?;
         let mut builder = InventoryBuilder::default();
-        for entry in base.inventory.entries.iter().filter(|entry| {
+        for entry in base.authenticated.inventory.entries.iter().filter(|entry| {
             matches!(
                 &entry.root,
                 KnownGoodRoot::Assets | KnownGoodRoot::ManagedRuntime { .. }
@@ -421,17 +444,20 @@ impl KnownGoodInstallReceipt {
             .profile_contract()
             .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
         let recomposed = compose_loader_version(
-            &base.effective_version,
+            &base.authenticated.effective_version,
             &record.minecraft_version,
             &record.version_id,
             profile_fragment,
         )
         .map_err(|_| KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
-        if sealed_environment != &base.environment || resolved_version != recomposed {
+        if sealed_environment != &base.authenticated.environment || resolved_version != recomposed {
             return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
         }
-        let libraries = library_artifact_plans_for(&resolved_version.libraries, &base.environment)
-            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+        let libraries = library_artifact_plans_for(
+            &resolved_version.libraries,
+            &base.authenticated.environment,
+        )
+        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
         let mut used_proofs = BTreeSet::new();
         for plan in libraries {
             let path = KnownGoodRelativePath::new(plan.relative_path.as_str())?;
@@ -477,10 +503,12 @@ impl KnownGoodInstallReceipt {
         }
 
         Ok(Self {
-            version_id,
-            inventory: builder.finish(),
-            effective_version: resolved_version,
-            environment: base.environment.clone(),
+            authenticated: AuthenticatedKnownGoodReceipt {
+                version_id,
+                inventory: builder.finish(),
+                effective_version: resolved_version,
+                environment: base.authenticated.environment.clone(),
+            },
         })
     }
 
@@ -510,11 +538,11 @@ impl KnownGoodInstallReceipt {
                 .ok_or(KnownGoodInventoryError::InstallerLibraryProofMismatch)?;
         if !strategy_matches
             || crate::loaders::api::validate_loader_build_record_identity(record).is_err()
-            || base.version_id.as_str() != record.minecraft_version
-            || base.effective_version.id != record.minecraft_version
+            || base.authenticated.version_id.as_str() != record.minecraft_version
+            || base.authenticated.effective_version.id != record.minecraft_version
             || resolved_version.id != record.version_id
             || source.source_bytes().is_empty()
-            || sealed_environment != &base.environment
+            || sealed_environment != &base.authenticated.environment
         {
             return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
         }
@@ -529,7 +557,7 @@ impl KnownGoodInstallReceipt {
             .map_err(|_| KnownGoodInventoryError::InputTooLarge)?;
         let child_digest = sha1_digest(child_client_bytes);
         let mut recomposed = compose_loader_version(
-            &base.effective_version,
+            &base.authenticated.effective_version,
             &record.minecraft_version,
             &record.version_id,
             source.version(),
@@ -561,7 +589,7 @@ impl KnownGoodInstallReceipt {
         }
         let version_id = KnownGoodId::new(&record.version_id)?;
         let mut builder = InventoryBuilder::default();
-        for entry in base.inventory.entries.iter().filter(|entry| {
+        for entry in base.authenticated.inventory.entries.iter().filter(|entry| {
             matches!(
                 &entry.root,
                 KnownGoodRoot::Assets | KnownGoodRoot::ManagedRuntime { .. }
@@ -586,8 +614,9 @@ impl KnownGoodInstallReceipt {
         })?;
 
         let mut selected = BTreeMap::new();
-        for plan in library_artifact_plans_for(&resolved_version.libraries, &base.environment)
-            .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?
+        for plan in
+            library_artifact_plans_for(&resolved_version.libraries, &base.authenticated.environment)
+                .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?
         {
             if selected
                 .insert(plan.relative_path.clone(), (plan, true))
@@ -657,51 +686,146 @@ impl KnownGoodInstallReceipt {
         }
         Ok(PendingInstallerReceipt {
             receipt: Self {
-                version_id,
-                inventory: builder.finish(),
-                effective_version: resolved_version,
-                environment: base.environment,
+                authenticated: AuthenticatedKnownGoodReceipt {
+                    version_id,
+                    inventory: builder.finish(),
+                    effective_version: resolved_version,
+                    environment: base.authenticated.environment,
+                },
             },
             publications: pending_publications,
         })
     }
+}
 
-    pub(crate) fn from_verified_vanilla_source(
-        input: KnownGoodInventoryInput<'_>,
-        version_json_bytes: &[u8],
-    ) -> Result<Self, KnownGoodInventoryError> {
-        validate_bytes(
-            version_json_bytes,
-            &ExpectedIntegrity::from_sha1(&input.shape.version_manifest.sha1),
-        )
-        .map_err(|_| KnownGoodInventoryError::VersionMetadataIntegrity)?;
-        let mut authenticated = serde_json::from_slice::<VersionJson>(version_json_bytes)
-            .map_err(|_| KnownGoodInventoryError::VersionMetadataIntegrity)?;
-        if authenticated.asset_index.id.is_empty() && !authenticated.assets.is_empty() {
-            authenticated
-                .asset_index
-                .id
-                .clone_from(&authenticated.assets);
+impl KnownGoodReconstructionReceipt {
+    pub fn into_activation_source(self) -> KnownGoodActivationSource {
+        KnownGoodActivationSource {
+            version_id: self.authenticated.version_id,
+            inventory: self.authenticated.inventory,
         }
-        authenticated.java_version = effective_java_version_for(
-            &authenticated.id,
-            &authenticated.kind,
-            &authenticated.java_version,
-        );
-        if authenticated != *input.resolved_version {
-            return Err(KnownGoodInventoryError::VersionIdentityMismatch);
-        }
-        let version_id = KnownGoodId::new(&input.resolved_version.id)?;
-        let effective_version = input.resolved_version.clone();
-        let environment = input.environment.clone();
-        let inventory = derive_known_good_inventory(input)?;
-        Ok(Self {
-            version_id,
-            inventory,
-            effective_version,
-            environment,
-        })
     }
+}
+
+pub(crate) fn seal_reconstructed_vanilla(
+    authority: ReconstructedVanillaAuthority,
+) -> Result<KnownGoodReconstructionReceipt, KnownGoodInventoryError> {
+    let (version, environment, libraries, version_source, asset_source, runtime_source) =
+        authority.into_parts();
+    let authenticated = authenticate_vanilla_authority(
+        version,
+        environment,
+        libraries,
+        version_source,
+        asset_source,
+        runtime_source,
+    )?;
+    Ok(KnownGoodReconstructionReceipt { authenticated })
+}
+
+pub(crate) fn seal_completed_vanilla_install(
+    authority: CompletedVanillaInstallAuthority,
+) -> KnownGoodInstallReceipt {
+    KnownGoodInstallReceipt {
+        authenticated: authority.into_pending_receipt().authenticated,
+    }
+}
+
+pub(crate) fn authenticate_pending_vanilla_install(
+    authority: PendingVanillaInstallSourceAuthority,
+) -> Result<PendingVanillaInstallReceipt, KnownGoodInventoryError> {
+    let (version, environment, libraries, version_source, asset_source, runtime_source) =
+        authority.into_parts();
+    let authenticated = authenticate_vanilla_authority(
+        version,
+        environment,
+        libraries,
+        version_source,
+        asset_source,
+        runtime_source,
+    )?;
+    Ok(PendingVanillaInstallReceipt { authenticated })
+}
+
+fn authenticate_vanilla_authority(
+    resolved_version: VersionJson,
+    environment: Environment,
+    libraries: SealedExactLibraryDeclarations,
+    version_source: AuthenticatedSelectedArtifactSource,
+    asset_source: Option<AuthenticatedSelectedArtifactSource>,
+    runtime_source: Option<RuntimeSourceReceipt>,
+) -> Result<AuthenticatedKnownGoodReceipt, KnownGoodInventoryError> {
+    if version_source.kind() != SelectedDownloadArtifactKind::VersionJson
+        || version_source.logical_identity() != resolved_version.id
+        || version_source.provider_url().trim().is_empty()
+    {
+        return Err(KnownGoodInventoryError::VersionIdentityMismatch);
+    }
+    validate_bytes(version_source.bytes(), version_source.expected())
+        .map_err(|_| KnownGoodInventoryError::VersionMetadataIntegrity)?;
+    let mut authenticated = serde_json::from_slice::<VersionJson>(version_source.bytes())
+        .map_err(|_| KnownGoodInventoryError::VersionMetadataIntegrity)?;
+    if authenticated.asset_index.id.is_empty() && !authenticated.assets.is_empty() {
+        authenticated
+            .asset_index
+            .id
+            .clone_from(&authenticated.assets);
+    }
+    authenticated.java_version = effective_java_version_for(
+        &authenticated.id,
+        &authenticated.kind,
+        &authenticated.java_version,
+    );
+    if authenticated != resolved_version {
+        return Err(KnownGoodInventoryError::VersionIdentityMismatch);
+    }
+    let asset_index_bytes = match asset_source.as_ref() {
+        Some(source)
+            if source.kind() == SelectedDownloadArtifactKind::AssetIndex
+                && source.logical_identity() == resolved_version.asset_index.id
+                && source.provider_url() == resolved_version.asset_index.url
+                && source.expected()
+                    == &ExpectedIntegrity::from_mojang(
+                        resolved_version.asset_index.size,
+                        &resolved_version.asset_index.sha1,
+                    ) =>
+        {
+            Some(source.bytes())
+        }
+        Some(_) => return Err(KnownGoodInventoryError::AssetIndexIntegrity),
+        None => None,
+    };
+    let version_id = KnownGoodId::new(&resolved_version.id)?;
+    let version_metadata_size = u64::try_from(version_source.bytes().len())
+        .map_err(|_| KnownGoodInventoryError::InputTooLarge)?;
+    let runtime_observation = runtime_source
+        .as_ref()
+        .map(|receipt| RuntimeSourceObservation {
+            component: receipt.component(),
+            manifest_bytes: receipt.bytes(),
+            manifest_expected: ExpectedIntegrity {
+                size: Some(receipt.expected_size()),
+                sha1: Some(receipt.expected_sha1().to_string()),
+            },
+        });
+    let inventory = derive_known_good_inventory(
+        &resolved_version,
+        &libraries,
+        asset_index_bytes,
+        VersionSourceObservation {
+            identity: version_source.logical_identity(),
+            expected: version_source.expected(),
+            metadata_size: version_metadata_size,
+        },
+        runtime_observation,
+        &environment,
+    )?;
+    Ok(AuthenticatedKnownGoodReceipt {
+        version_id,
+        inventory,
+        effective_version: resolved_version,
+        environment,
+    })
 }
 
 impl KnownGoodActivationSource {
@@ -768,30 +892,6 @@ impl KnownGoodLinkTarget {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct RuntimeInventoryInput<'a> {
-    pub(crate) component: &'a RuntimeId,
-    pub(crate) manifest_bytes: &'a [u8],
-    pub(crate) manifest_expected: &'a ExpectedIntegrity,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct KnownGoodInstallShape<'a> {
-    pub(crate) version_manifest: &'a ManifestEntry,
-}
-
-pub(crate) struct KnownGoodInventoryInput<'a> {
-    pub(crate) resolved_version: &'a VersionJson,
-    pub(crate) version_metadata_size: u64,
-    pub(crate) client_size: u64,
-    pub(crate) libraries: &'a SealedExactLibraryDeclarations,
-    pub(crate) log_config_size: Option<u64>,
-    pub(crate) asset_index_bytes: Option<&'a [u8]>,
-    pub(crate) runtime: Option<RuntimeInventoryInput<'a>>,
-    pub(crate) shape: KnownGoodInstallShape<'a>,
-    pub(crate) environment: &'a Environment,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KnownGoodInventoryError {
     UnsafePath,
@@ -817,7 +917,6 @@ pub enum KnownGoodInventoryError {
     MissingClient,
     InputTooLarge,
     InvalidLibraryPlan,
-    VanillaArtifactProofMismatch,
     VanillaLibraryProofMismatch,
     ProfileLibraryProofMismatch,
     InstallerLibraryProofMismatch,
@@ -826,10 +925,27 @@ pub enum KnownGoodInventoryError {
     TooManyEntries,
 }
 
-pub(crate) fn derive_known_good_inventory(
-    input: KnownGoodInventoryInput<'_>,
+struct VersionSourceObservation<'a> {
+    identity: &'a str,
+    expected: &'a ExpectedIntegrity,
+    metadata_size: u64,
+}
+
+struct RuntimeSourceObservation<'a> {
+    component: &'a RuntimeId,
+    manifest_bytes: &'a [u8],
+    manifest_expected: ExpectedIntegrity,
+}
+
+fn derive_known_good_inventory(
+    resolved_version: &VersionJson,
+    libraries: &SealedExactLibraryDeclarations,
+    asset_index_bytes: Option<&[u8]>,
+    version_source: VersionSourceObservation<'_>,
+    runtime_source: Option<RuntimeSourceObservation<'_>>,
+    environment: &Environment,
 ) -> Result<KnownGoodInventory, KnownGoodInventoryError> {
-    let version_id = KnownGoodId::new(&input.resolved_version.id)?;
+    let version_id = KnownGoodId::new(&resolved_version.id)?;
     let mut builder = InventoryBuilder::default();
     let version_base = version_id.as_str();
 
@@ -838,14 +954,14 @@ pub(crate) fn derive_known_good_inventory(
         path: KnownGoodRelativePath::new(&format!("{version_base}/{version_base}.json"))?,
         kind: KnownGoodArtifactKind::VersionMetadata,
         integrity: version_metadata_integrity(
-            input.shape,
-            input.resolved_version,
-            input.version_metadata_size,
+            version_source.identity,
+            version_source.expected,
+            resolved_version,
+            version_source.metadata_size,
         )?,
     })?;
 
-    let client = input
-        .resolved_version
+    let client = resolved_version
         .downloads
         .client
         .as_ref()
@@ -856,71 +972,58 @@ pub(crate) fn derive_known_good_inventory(
         kind: KnownGoodArtifactKind::ClientJar,
         integrity: expected_integrity_with_observed_size(
             &ExpectedIntegrity::from_mojang(client.size, &client.sha1),
-            input.client_size,
+            authenticated_mojang_size(client.size)?,
         )?,
     })?;
 
-    if input.resolved_version.libraries.len() > MAX_KNOWN_GOOD_ENTRIES {
+    if resolved_version.libraries.len() > MAX_KNOWN_GOOD_ENTRIES {
         return Err(KnownGoodInventoryError::InputTooLarge);
     }
-    add_sealed_libraries(
-        &mut builder,
-        input.resolved_version,
-        input.environment,
-        input.libraries,
-    )?;
+    add_sealed_libraries(&mut builder, resolved_version, environment, libraries)?;
 
-    if let Some(logging) = input
-        .resolved_version
+    if let Some(logging) = resolved_version
         .logging
         .as_ref()
         .and_then(|logging| logging.client.as_ref())
-        && !logging.file.url.trim().is_empty()
     {
-        let observed_size = input
-            .log_config_size
-            .ok_or(KnownGoodInventoryError::MissingSize)?;
         builder.insert(KnownGoodEntry {
             root: KnownGoodRoot::Assets,
             path: KnownGoodRelativePath::new(&format!("log_configs/{}", logging.file.id))?,
             kind: KnownGoodArtifactKind::LogConfig,
             integrity: expected_integrity_with_observed_size(
                 &ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1),
-                observed_size,
+                authenticated_mojang_size(logging.file.size)?,
             )?,
         })?;
-    } else if input.log_config_size.is_some() {
-        return Err(KnownGoodInventoryError::VanillaArtifactProofMismatch);
     }
 
-    add_asset_index(
-        &mut builder,
-        input.resolved_version,
-        input.asset_index_bytes,
-    )?;
-    if let Some(runtime) = input.runtime {
-        if runtime.component.as_str()
-            != preferred_runtime_component(&input.resolved_version.java_version)
+    add_asset_index(&mut builder, resolved_version, asset_index_bytes)?;
+    if let Some(runtime_source) = runtime_source {
+        if runtime_source.component.as_str()
+            != preferred_runtime_component(&resolved_version.java_version)
         {
             return Err(KnownGoodInventoryError::RuntimeIdentityMismatch);
         }
-        add_runtime(&mut builder, runtime)?;
+        add_runtime(
+            &mut builder,
+            runtime_source.component,
+            runtime_source.manifest_bytes,
+            &runtime_source.manifest_expected,
+        )?;
     }
     Ok(builder.finish())
 }
 
 fn version_metadata_integrity(
-    shape: KnownGoodInstallShape<'_>,
+    source_identity: &str,
+    source_expected: &ExpectedIntegrity,
     version: &VersionJson,
     observed_size: u64,
 ) -> Result<KnownGoodIntegrity, KnownGoodInventoryError> {
-    if shape.version_manifest.id != version.id {
+    if source_identity != version.id {
         return Err(KnownGoodInventoryError::VersionIdentityMismatch);
     }
-    expected_integrity_with_observed_size(
-        &ExpectedIntegrity::from_sha1(&shape.version_manifest.sha1),
-        observed_size,
-    )
+    expected_integrity_with_observed_size(source_expected, observed_size)
 }
 
 fn add_sealed_libraries(
@@ -1022,6 +1125,7 @@ fn matching_base_library_integrity(
         .ok_or(KnownGoodInventoryError::MissingChecksum)
         .and_then(Sha1Digest::from_metadata)?;
     let entry = base
+        .authenticated
         .inventory
         .entries
         .iter()
@@ -1046,17 +1150,29 @@ fn add_asset_index(
     if bytes.is_some_and(|bytes| bytes.len() > MAX_KNOWN_GOOD_ASSET_INDEX_BYTES) {
         return Err(KnownGoodInventoryError::InputTooLarge);
     }
-    if version.asset_index.id.trim().is_empty() {
+    let asset_index = &version.asset_index;
+    let absent = asset_index.id.is_empty()
+        && asset_index.url.is_empty()
+        && asset_index.sha1.is_empty()
+        && asset_index.size == 0
+        && asset_index.total_size == 0;
+    if absent {
         return if bytes.is_none() {
             Ok(())
         } else {
             Err(KnownGoodInventoryError::UnexpectedAssetIndex)
         };
     }
+    if asset_index.id.trim().is_empty()
+        || asset_index.url.trim().is_empty()
+        || asset_index.size < 0
+        || asset_index.total_size < 0
+    {
+        return Err(KnownGoodInventoryError::AssetIndexIntegrity);
+    }
     let bytes = bytes.ok_or(KnownGoodInventoryError::MissingAssetIndex)?;
-    let index_id = KnownGoodId::new(&version.asset_index.id)?;
-    let expected =
-        ExpectedIntegrity::from_mojang(version.asset_index.size, &version.asset_index.sha1);
+    let index_id = KnownGoodId::new(&asset_index.id)?;
+    let expected = ExpectedIntegrity::from_mojang(asset_index.size, &asset_index.sha1);
     validate_bytes(bytes, &expected).map_err(|_| KnownGoodInventoryError::AssetIndexIntegrity)?;
     builder.insert(KnownGoodEntry {
         root: KnownGoodRoot::Assets,
@@ -1087,19 +1203,21 @@ fn add_asset_index(
 
 fn add_runtime(
     builder: &mut InventoryBuilder,
-    input: RuntimeInventoryInput<'_>,
+    component: &RuntimeId,
+    manifest_bytes: &[u8],
+    manifest_expected: &ExpectedIntegrity,
 ) -> Result<(), KnownGoodInventoryError> {
-    if input.manifest_bytes.len() > MAX_KNOWN_GOOD_RUNTIME_MANIFEST_BYTES {
+    if manifest_bytes.len() > MAX_KNOWN_GOOD_RUNTIME_MANIFEST_BYTES {
         return Err(KnownGoodInventoryError::InputTooLarge);
     }
-    validate_bytes(input.manifest_bytes, input.manifest_expected)
+    validate_bytes(manifest_bytes, manifest_expected)
         .map_err(|_| KnownGoodInventoryError::RuntimeManifestIntegrity)?;
-    let manifest = serde_json::from_slice::<ComponentManifest>(input.manifest_bytes)
+    let manifest = serde_json::from_slice::<ComponentManifest>(manifest_bytes)
         .map_err(|_| KnownGoodInventoryError::RuntimeManifestParse)?;
     let manifest_proof = component_manifest_proof_bytes(&manifest)
         .map_err(|_| KnownGoodInventoryError::MetadataSerialization)?;
     let root = KnownGoodRoot::ManagedRuntime {
-        component: KnownGoodId::new(input.component.as_str())?,
+        component: KnownGoodId::new(component.as_str())?,
     };
     let mut entries = vec![KnownGoodEntry {
         root: root.clone(),
@@ -1197,6 +1315,13 @@ fn expected_integrity(
 ) -> Result<KnownGoodIntegrity, KnownGoodInventoryError> {
     let size = expected.size.ok_or(KnownGoodInventoryError::MissingSize)?;
     expected_integrity_with_observed_size(expected, size)
+}
+
+fn authenticated_mojang_size(size: i64) -> Result<u64, KnownGoodInventoryError> {
+    u64::try_from(size)
+        .ok()
+        .filter(|size| *size > 0)
+        .ok_or(KnownGoodInventoryError::MissingSize)
 }
 
 fn expected_integrity_with_observed_size(
@@ -1420,10 +1545,12 @@ mod tests {
                 .expect("base library");
         }
         let base = KnownGoodInstallReceipt {
-            version_id: KnownGoodId::new(&record.minecraft_version).expect("base id"),
-            inventory: inventory.finish(),
-            effective_version: base_version.clone(),
-            environment: crate::rules::default_environment(),
+            authenticated: AuthenticatedKnownGoodReceipt {
+                version_id: KnownGoodId::new(&record.minecraft_version).expect("base id"),
+                inventory: inventory.finish(),
+                effective_version: base_version.clone(),
+                environment: crate::rules::default_environment(),
+            },
         };
         let profile_libraries = vec![
             checksum_library(
@@ -1467,7 +1594,7 @@ mod tests {
             profile_fragment,
             proof,
             LoaderComponentId::Fabric,
-            &base.environment,
+            &base.authenticated.environment,
         )
         .expect("profile declarations");
         let root = PathBuf::from("/managed/libraries");
@@ -1583,9 +1710,10 @@ mod tests {
                 }
                 5 => {
                     let classifier = crate::rules::native_classifier_key();
-                    resolved.libraries[0]
-                        .natives
-                        .insert(base.environment.os_name.clone(), classifier.clone());
+                    resolved.libraries[0].natives.insert(
+                        base.authenticated.environment.os_name.clone(),
+                        classifier.clone(),
+                    );
                     resolved.libraries[0]
                         .downloads
                         .as_mut()
@@ -1605,7 +1733,7 @@ mod tests {
                     resolved.libraries[0].sha1 = SHA_A.to_string();
                     resolved.libraries[0].size += 1;
                 }
-                7 => base.environment.os_name = "different-os".to_string(),
+                7 => base.authenticated.environment.os_name = "different-os".to_string(),
                 8 => resolved.main_class = "different.Main".to_string(),
                 9 => resolved.kind = "snapshot".to_string(),
                 10 => resolved.minecraft_arguments = "--different".to_string(),
@@ -1657,10 +1785,12 @@ mod tests {
         )
         .expect("canonical child id");
         let base = KnownGoodInstallReceipt {
-            version_id: KnownGoodId::new(&fixture.version.id).expect("base id"),
-            inventory: derive_known_good_inventory(fixture.input()).expect("base inventory"),
-            effective_version: fixture.version.clone(),
-            environment: fixture.environment.clone(),
+            authenticated: AuthenticatedKnownGoodReceipt {
+                version_id: KnownGoodId::new(&fixture.version.id).expect("base id"),
+                inventory: fixture.derive().expect("base inventory"),
+                effective_version: fixture.version.clone(),
+                environment: fixture.environment.clone(),
+            },
         };
         let child_client_bytes = b"deterministic legacy child bytes";
         let mut child = fixture.version.clone();
@@ -1725,10 +1855,12 @@ mod tests {
     fn authenticated_base_receipt_rejects_corrupt_client_bytes() {
         let fixture = fixture(false);
         let base = KnownGoodInstallReceipt {
-            version_id: KnownGoodId::new(&fixture.version.id).expect("base id"),
-            inventory: InventoryBuilder::default().finish(),
-            effective_version: fixture.version,
-            environment: fixture.environment,
+            authenticated: AuthenticatedKnownGoodReceipt {
+                version_id: KnownGoodId::new(&fixture.version.id).expect("base id"),
+                inventory: InventoryBuilder::default().finish(),
+                effective_version: fixture.version,
+                environment: fixture.environment,
+            },
         };
 
         assert_eq!(
@@ -1744,7 +1876,7 @@ mod tests {
     #[test]
     fn vanilla_fixture_derives_producer_declared_inventory() {
         let fixture = fixture(false);
-        let inventory = derive_known_good_inventory(fixture.input()).expect("vanilla inventory");
+        let inventory = fixture.derive().expect("vanilla inventory");
 
         assert_entry(
             &inventory,
@@ -1846,7 +1978,7 @@ mod tests {
         )
         .expect("observed library authority");
 
-        let inventory = derive_known_good_inventory(fixture.input()).expect("inventory");
+        let inventory = fixture.derive().expect("inventory");
         assert_entry(
             &inventory,
             &KnownGoodRoot::Libraries,
@@ -1856,17 +1988,6 @@ mod tests {
                 digest: Sha1Digest::from_metadata(SHA_A).expect("digest"),
                 size: 10,
             },
-        );
-    }
-
-    #[test]
-    fn vanilla_client_declared_and_observed_size_drift_fails_closed() {
-        let fixture = fixture(false);
-        let mut input = fixture.input();
-        input.client_size = 39;
-        assert_eq!(
-            derive_known_good_inventory(input),
-            Err(KnownGoodInventoryError::SizeMismatch)
         );
     }
 
@@ -1929,10 +2050,8 @@ mod tests {
         variants.push(rules);
 
         for version in variants {
-            let mut input = fixture.input();
-            input.resolved_version = &version;
             assert_eq!(
-                derive_known_good_inventory(input),
+                fixture.derive_version(&version),
                 Err(KnownGoodInventoryError::VanillaLibraryProofMismatch)
             );
         }
@@ -1990,8 +2109,8 @@ mod tests {
             .expect("left library authority");
         right.library_authority = fixture_library_authority(&right.version, &right.environment)
             .expect("right library authority");
-        let left = derive_known_good_inventory(left.input()).unwrap();
-        let right = derive_known_good_inventory(right.input()).unwrap();
+        let left = left.derive().unwrap();
+        let right = right.derive().unwrap();
 
         assert_eq!(left, right);
         assert_sorted_unique(&left);
@@ -2029,7 +2148,7 @@ mod tests {
     #[test]
     fn runtime_inventory_uses_raw_integrity_not_lzma_transport_integrity() {
         let fixture = fixture(false);
-        let inventory = derive_known_good_inventory(fixture.input()).unwrap();
+        let inventory = fixture.derive().unwrap();
         let runtime = inventory
             .entries()
             .iter()
@@ -2050,7 +2169,7 @@ mod tests {
             runtime_file_entry("bin/java"),
         ]));
 
-        let inventory = derive_known_good_inventory(fixture.input()).expect("valid runtime tree");
+        let inventory = fixture.derive().expect("valid runtime tree");
 
         assert_entry(
             &inventory,
@@ -2070,7 +2189,7 @@ mod tests {
             runtime_file_entry("bin/java"),
         ]));
 
-        let error = derive_known_good_inventory(fixture.input()).expect_err("file ancestor");
+        let error = fixture.derive().expect_err("file ancestor");
         assert_eq!(error, KnownGoodInventoryError::ConflictingRuntimePath);
     }
 
@@ -2082,7 +2201,7 @@ mod tests {
             runtime_file_entry("bin/java"),
         ]));
 
-        let error = derive_known_good_inventory(fixture.input()).expect_err("link ancestor");
+        let error = fixture.derive().expect_err("link ancestor");
         assert_eq!(error, KnownGoodInventoryError::ConflictingRuntimePath);
     }
 
@@ -2093,14 +2212,14 @@ mod tests {
             ".axial-ready",
         )]));
 
-        let error = derive_known_good_inventory(fixture.input()).expect_err("reserved path");
+        let error = fixture.derive().expect_err("reserved path");
         assert_eq!(error, KnownGoodInventoryError::ConflictingRuntimePath);
     }
 
     #[test]
     fn asset_objects_deduplicate_by_content_address() {
         let fixture = fixture(false);
-        let inventory = derive_known_good_inventory(fixture.input()).unwrap();
+        let inventory = fixture.derive().unwrap();
         let objects = inventory
             .entries()
             .iter()
@@ -2121,7 +2240,7 @@ mod tests {
             fixture_library_authority(&fixture.version, &fixture.environment)
                 .expect("streamed checksumless declaration");
 
-        let inventory = derive_known_good_inventory(fixture.input()).expect("streamed inventory");
+        let inventory = fixture.derive().expect("streamed inventory");
         let bytes = vec![b'x'; 12];
         assert_entry(
             &inventory,
@@ -2140,31 +2259,7 @@ mod tests {
         let mut fixture = fixture(false);
         fixture.version_manifest.id = "different-version".to_string();
 
-        let error = derive_known_good_inventory(fixture.input()).expect_err("version mismatch");
-        assert_eq!(error, KnownGoodInventoryError::VersionIdentityMismatch);
-    }
-
-    #[test]
-    fn vanilla_receipt_rejects_recombined_same_plan_version_metadata() {
-        let mut fixture = fixture(false);
-        let version_bytes = serde_json::to_vec(&fixture.version).expect("version bytes");
-        fixture.version_manifest.sha1 = sha1_digest(&version_bytes).as_str().to_string();
-        fixture.version_metadata_size = version_bytes.len() as u64;
-        fixture.library_authority =
-            fixture_library_authority(&fixture.version, &fixture.environment)
-                .expect("bound library declarations");
-        let mut drift = fixture.version.clone();
-        drift.libraries[0].rules = vec![Rule {
-            action: "allow".to_string(),
-            os: None,
-            features: None,
-        }];
-        let mut input = fixture.input();
-        input.resolved_version = &drift;
-
-        let error = KnownGoodInstallReceipt::from_verified_vanilla_source(input, &version_bytes)
-            .expect_err("authenticated bytes must equal the full resolved version");
-
+        let error = fixture.derive().expect_err("version mismatch");
         assert_eq!(error, KnownGoodInventoryError::VersionIdentityMismatch);
     }
 
@@ -2173,7 +2268,7 @@ mod tests {
         let mut fixture = fixture(false);
         fixture.runtime_id = RuntimeId::from("java-runtime-gamma");
 
-        let error = derive_known_good_inventory(fixture.input()).expect_err("runtime mismatch");
+        let error = fixture.derive().expect_err("runtime mismatch");
         assert_eq!(error, KnownGoodInventoryError::RuntimeIdentityMismatch);
     }
 
@@ -2187,7 +2282,7 @@ mod tests {
             10,
         ));
 
-        let error = derive_known_good_inventory(fixture.input()).expect_err("unsafe plan");
+        let error = fixture.derive().expect_err("unsafe plan");
         assert_eq!(error, KnownGoodInventoryError::InvalidLibraryPlan);
     }
 
@@ -2201,7 +2296,7 @@ mod tests {
             11,
         ));
 
-        let error = derive_known_good_inventory(fixture.input()).expect_err("conflicting plan");
+        let error = fixture.derive().expect_err("conflicting plan");
         assert_eq!(error, KnownGoodInventoryError::InvalidLibraryPlan);
     }
 
@@ -2209,8 +2304,8 @@ mod tests {
     fn runtime_manifest_proof_is_canonical_across_provider_object_order() {
         let left = fixture(false);
         let right = fixture(true);
-        let left = derive_known_good_inventory(left.input()).unwrap();
-        let right = derive_known_good_inventory(right.input()).unwrap();
+        let left = left.derive().unwrap();
+        let right = right.derive().unwrap();
         let root = runtime_root();
 
         let left = entry(&left, &root, COMPONENT_MANIFEST_PROOF_FILE);
@@ -2226,7 +2321,7 @@ mod tests {
     #[test]
     fn runtime_link_target_is_stored_canonically() {
         let fixture = fixture(false);
-        let inventory = derive_known_good_inventory(fixture.input()).unwrap();
+        let inventory = fixture.derive().unwrap();
         let link = entry(&inventory, &runtime_root(), "java-link");
 
         assert_eq!(link.kind(), KnownGoodArtifactKind::RuntimeLink);
@@ -2242,7 +2337,7 @@ mod tests {
         fixture.runtime_manifest_bytes = vec![b' '; MAX_KNOWN_GOOD_RUNTIME_MANIFEST_BYTES + 1];
         fixture.runtime_manifest_expected = expected_for(&fixture.runtime_manifest_bytes);
 
-        let error = derive_known_good_inventory(fixture.input()).expect_err("oversized manifest");
+        let error = fixture.derive().expect_err("oversized manifest");
         assert_eq!(error, KnownGoodInventoryError::InputTooLarge);
     }
 
@@ -2259,24 +2354,31 @@ mod tests {
     }
 
     impl Fixture {
-        fn input(&self) -> KnownGoodInventoryInput<'_> {
-            KnownGoodInventoryInput {
-                resolved_version: &self.version,
-                version_metadata_size: self.version_metadata_size,
-                client_size: 40,
-                libraries: &self.library_authority,
-                log_config_size: Some(15),
-                asset_index_bytes: Some(&self.asset_index),
-                runtime: Some(RuntimeInventoryInput {
+        fn derive(&self) -> Result<KnownGoodInventory, KnownGoodInventoryError> {
+            self.derive_version(&self.version)
+        }
+
+        fn derive_version(
+            &self,
+            version: &VersionJson,
+        ) -> Result<KnownGoodInventory, KnownGoodInventoryError> {
+            let version_expected = ExpectedIntegrity::from_sha1(&self.version_manifest.sha1);
+            derive_known_good_inventory(
+                version,
+                &self.library_authority,
+                Some(&self.asset_index),
+                VersionSourceObservation {
+                    identity: &self.version_manifest.id,
+                    expected: &version_expected,
+                    metadata_size: self.version_metadata_size,
+                },
+                Some(RuntimeSourceObservation {
                     component: &self.runtime_id,
                     manifest_bytes: &self.runtime_manifest_bytes,
-                    manifest_expected: &self.runtime_manifest_expected,
+                    manifest_expected: self.runtime_manifest_expected.clone(),
                 }),
-                shape: KnownGoodInstallShape {
-                    version_manifest: &self.version_manifest,
-                },
-                environment: &self.environment,
-            }
+                &self.environment,
+            )
         }
 
         fn replace_runtime_manifest(&mut self, bytes: Vec<u8>) {
@@ -2638,7 +2740,34 @@ mod tests {
         let source = include_str!("known_good.rs");
         assert!(!source.contains(concat!("pub fn into_", "inventory")));
         assert!(!source.contains(concat!("pub fn derive_known_good_", "inventory")));
-        assert!(!source.contains(concat!("pub struct KnownGoodInventory", "Input")));
+        assert!(!source.contains(concat!("KnownGoodInventory", "Input")));
+        assert!(!source.contains(concat!("KnownGoodVanilla", "Source")));
+        assert!(!source.contains(concat!("RuntimeInventory", "Input")));
+        assert!(!source.contains(concat!("from_verified_vanilla_", "source")));
         assert!(!source.contains(concat!("pub struct KnownGoodInstall", "Shape")));
+        for receipt in [
+            "pub struct KnownGoodInstallReceipt",
+            "pub struct KnownGoodReconstructionReceipt",
+        ] {
+            let position = source.find(receipt).expect("receipt declaration");
+            let derive = source[..position]
+                .rsplit("#[derive(")
+                .next()
+                .and_then(|tail| tail.split(")]").next())
+                .expect("receipt derive");
+            assert!(!derive.contains("Clone"));
+            assert!(!derive.contains("Serialize"));
+            assert!(!derive.contains("Deserialize"));
+        }
+        let reconstruction_impl = source
+            .split("impl KnownGoodReconstructionReceipt")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("pub(crate) fn seal_reconstructed_vanilla")
+                    .next()
+            })
+            .expect("reconstruction receipt implementation");
+        assert!(!reconstruction_impl.contains("into_parts"));
+        assert!(!reconstruction_impl.contains("from_"));
     }
 }

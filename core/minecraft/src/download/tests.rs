@@ -38,13 +38,16 @@ use super::transfer::{
 };
 use super::*;
 use crate::artifact_path::ArtifactRelativePath;
+use crate::known_good::KnownGoodArtifactKind;
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
 use crate::manifest::VersionManifest;
 use crate::paths::{assets_dir, libraries_dir, runtime_dirs, versions_dir};
 use crate::rules::Environment;
-use crate::runtime::{RuntimeEnsureEvent, RuntimeSourceReceipt};
+use crate::runtime::{
+    RuntimeEnsureEvent, RuntimeId, RuntimeSourceReceipt, TestRuntimeSourceDescriptor,
+};
 use sha1::{Digest as _, Sha1};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -128,6 +131,57 @@ async fn invalid_library_preflight_precedes_asset_runtime_and_client_effects() {
 }
 
 #[tokio::test]
+async fn malformed_client_and_log_contracts_fail_before_install_effects() {
+    let variants = [
+        serde_json::json!({
+            "id": "contract-preflight",
+            "downloads": { "client": {
+                "url": "https://example.invalid/client.jar",
+                "sha1": "1111111111111111111111111111111111111111",
+                "size": 0
+            }}
+        }),
+        serde_json::json!({
+            "id": "contract-preflight",
+            "downloads": { "client": {
+                "url": "https://example.invalid/client.jar",
+                "sha1": "1111111111111111111111111111111111111111",
+                "size": 7
+            }},
+            "logging": { "client": {
+                "argument": "", "type": "log4j2-xml", "file": {
+                    "id": "../escape.xml",
+                    "url": "https://example.invalid/log.xml",
+                    "sha1": "2222222222222222222222222222222222222222",
+                    "size": 4
+                }
+            }}
+        }),
+    ];
+
+    for (index, value) in variants.into_iter().enumerate() {
+        let root = temp_dir(&format!("contract-preflight-{index}"));
+        let sentinel = root.join("versions/contract-preflight/contract-preflight.json");
+        fs::create_dir_all(sentinel.parent().expect("sentinel parent")).expect("sentinel parent");
+        fs::write(&sentinel, b"untouched").expect("sentinel");
+        let before = snapshot_tree(&root);
+        let body = value.to_string().into_bytes();
+        let version_url =
+            spawn_download_response_server("200 OK", Vec::new(), body.clone(), 1).await;
+        let downloader =
+            test_manifest_downloader(&root, "contract-preflight", &version_url, &sha1_hex(&body));
+
+        downloader
+            .install_version("contract-preflight", |_| {})
+            .await
+            .expect_err("malformed authenticated contract must fail");
+
+        assert_eq!(snapshot_tree(&root), before);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[tokio::test]
 async fn install_version_starts_asset_index_before_library_download_finishes() {
     let root = temp_dir("overlap-assets-libraries");
     let (version_url, version_sha1, mut requests, release_library) =
@@ -152,6 +206,160 @@ async fn install_version_starts_asset_index_before_library_download_finishes() {
         .expect("install task should join")
         .expect("install should succeed");
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn reconstruction_matches_install_without_touching_seeded_destinations() {
+    let root = temp_dir("reconstruction-parity");
+    let (version_url, version_sha1, mut requests) =
+        spawn_reconstruction_parity_server("reconstruction").await;
+    let downloader = test_manifest_downloader(&root, "reconstruction", &version_url, &version_sha1);
+    let seeded = [
+        root.join("versions/reconstruction/reconstruction.json"),
+        root.join("versions/reconstruction/reconstruction.jar"),
+        root.join("versions/reconstruction/.incomplete"),
+        root.join("libraries/org/example/exact/1.0.0/exact-1.0.0.jar"),
+        root.join("libraries/org/example/observed/1.0.0/observed-1.0.0.jar"),
+        root.join("libraries/org/example/observed-two/1.0.0/observed-two-1.0.0.jar"),
+        root.join("assets/indexes/reconstruction-assets.json"),
+        root.join("assets/log_configs/reconstruction-log.xml"),
+        root.join("launcher_profiles.json"),
+        root.join("cache/version_manifest_v2.json"),
+        root.join("state/known-good/reconstruction.json"),
+    ];
+    for path in &seeded {
+        fs::create_dir_all(path.parent().expect("seed parent")).expect("seed parent");
+        fs::write(path, format!("sentinel:{}", path.display())).expect("seed sentinel");
+    }
+    let before = snapshot_tree(&root);
+
+    let reconstruction = timeout(
+        Duration::from_secs(10),
+        downloader.reconstruct_version("reconstruction"),
+    )
+    .await
+    .expect("reconstruction must not deadlock the scratch pool")
+    .expect("reconstruct authenticated sources");
+
+    assert_eq!(snapshot_tree(&root), before);
+    let reconstruction_requests =
+        std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(
+        reconstruction_requests
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>(),
+        HashSet::from([
+            "/version.json".to_string(),
+            "/libraries/observed.jar".to_string(),
+            "/libraries/observed-two.jar".to_string(),
+            "/asset-index.json".to_string(),
+        ])
+    );
+    for path in [
+        "/version.json",
+        "/libraries/observed.jar",
+        "/libraries/observed-two.jar",
+        "/asset-index.json",
+    ] {
+        assert_eq!(
+            reconstruction_requests
+                .iter()
+                .filter(|request| request.as_str() == path)
+                .count(),
+            1,
+            "{path} must be fetched exactly once"
+        );
+    }
+    let reconstructed = reconstruction.into_activation_source().into_parts();
+
+    let installed = timeout(
+        Duration::from_secs(10),
+        downloader.install_version("reconstruction", |_| {}),
+    )
+    .await
+    .expect("install must not deadlock the scratch pool")
+    .expect("install identical authenticated sources")
+    .into_activation_source()
+    .into_parts();
+
+    assert_eq!(installed, reconstructed);
+    let install_requests = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+    for path in [
+        "/version.json",
+        "/client.jar",
+        "/libraries/exact.jar",
+        "/libraries/observed.jar",
+        "/libraries/observed-two.jar",
+        "/asset-index.json",
+        "/log-config.xml",
+    ] {
+        assert_eq!(
+            install_requests
+                .iter()
+                .filter(|request| request.as_str() == path)
+                .count(),
+            1,
+            "{path} must be fetched exactly once"
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn reconstruction_derives_runtime_inventory_without_runtime_effects() {
+    let root = temp_dir("reconstruction-runtime");
+    let (version_url, version_sha1, runtime_source, mut requests) =
+        spawn_runtime_reconstruction_server("runtime-reconstruction").await;
+    let downloader =
+        test_manifest_downloader(&root, "runtime-reconstruction", &version_url, &version_sha1)
+            .with_test_runtime_source(runtime_source);
+    let sentinels = [
+        root.join("versions/runtime-reconstruction/runtime-reconstruction.json"),
+        root.join("versions/runtime-reconstruction/runtime-reconstruction.jar"),
+        root.join("versions/runtime-reconstruction/.incomplete"),
+        root.join("runtime/jre-legacy/.axial-runtime-manifest.json"),
+        root.join("runtime/jre-legacy/.axial-ready"),
+        root.join("runtime/jre-legacy/bin/java"),
+        root.join("runtime/jre-legacy/lib/data"),
+        root.join("runtime/jre-legacy/java-link"),
+    ];
+    for path in &sentinels {
+        fs::create_dir_all(path.parent().expect("runtime sentinel parent"))
+            .expect("runtime sentinel parent");
+        fs::write(path, b"runtime-sentinel").expect("runtime sentinel");
+    }
+    let before = snapshot_tree(&root);
+
+    let (_, inventory) = downloader
+        .reconstruct_version("runtime-reconstruction")
+        .await
+        .expect("runtime reconstruction")
+        .into_activation_source()
+        .into_parts();
+
+    assert_eq!(snapshot_tree(&root), before);
+    let kinds = inventory
+        .entries()
+        .iter()
+        .map(|entry| entry.kind())
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&KnownGoodArtifactKind::RuntimeManifestProof));
+    assert!(kinds.contains(&KnownGoodArtifactKind::RuntimeReadyMarker));
+    assert!(kinds.contains(&KnownGoodArtifactKind::RuntimeDirectory));
+    assert!(kinds.contains(&KnownGoodArtifactKind::RuntimeExecutable));
+    assert!(kinds.contains(&KnownGoodArtifactKind::RuntimeFile));
+    assert!(kinds.contains(&KnownGoodArtifactKind::RuntimeLink));
+    let requests = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(
+        requests.iter().cloned().collect::<HashSet<_>>(),
+        HashSet::from([
+            "/version.json".to_string(),
+            "/runtime-manifest.json".to_string(),
+        ])
+    );
+    assert!(!requests.iter().any(|path| path == "/runtime-file"));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -455,19 +663,16 @@ async fn runtime_task_is_aborted_when_artifact_install_fails() {
         ),
     )
     .await
-    .expect("artifact error should return without waiting for runtime task");
+    .expect("runtime cancellation should settle promptly");
 
     assert!(matches!(
         result,
         Err(DownloadError::ResolveManifest(message)) if message == "artifact failed"
     ));
-    timeout(Duration::from_millis(100), async {
-        while !cancelled.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("runtime task should be aborted");
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "runtime task guard must be dropped before return"
+    );
 }
 
 #[tokio::test]
@@ -2255,6 +2460,48 @@ fn temp_dir(prefix: &str) -> PathBuf {
     ))
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum SnapshotEntry {
+    Directory,
+    File(Vec<u8>),
+    Link(PathBuf),
+}
+
+fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, SnapshotEntry> {
+    fn visit(root: &Path, path: &Path, snapshot: &mut BTreeMap<PathBuf, SnapshotEntry>) {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries {
+            let entry = entry.expect("snapshot entry");
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).expect("snapshot metadata");
+            let relative = path
+                .strip_prefix(root)
+                .expect("snapshot relative")
+                .to_path_buf();
+            if metadata.is_dir() {
+                snapshot.insert(relative, SnapshotEntry::Directory);
+                visit(root, &path, snapshot);
+            } else if metadata.file_type().is_symlink() {
+                snapshot.insert(
+                    relative,
+                    SnapshotEntry::Link(fs::read_link(&path).expect("snapshot link")),
+                );
+            } else {
+                snapshot.insert(
+                    relative,
+                    SnapshotEntry::File(fs::read(&path).expect("snapshot file")),
+                );
+            }
+        }
+    }
+
+    let mut snapshot = BTreeMap::new();
+    visit(root, root, &mut snapshot);
+    snapshot
+}
+
 async fn spawn_download_response_server(
     status: &str,
     headers: Vec<(String, String)>,
@@ -2373,6 +2620,204 @@ async fn spawn_overlapped_install_server() -> (
         version_sha1,
         request_rx,
         release_library_tx,
+    )
+}
+
+async fn spawn_reconstruction_parity_server(
+    version_id: &str,
+) -> (String, String, mpsc::UnboundedReceiver<String>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind reconstruction server");
+    let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let (request_tx, request_rx) = mpsc::unbounded_channel();
+    let client = b"reconstruction-client".to_vec();
+    let exact = b"reconstruction-exact-library".to_vec();
+    let observed = checksumless_test_jar();
+    let observed_two = checksumless_test_jar();
+    let log_config = b"<log4j/>".to_vec();
+    let asset_index = br#"{"objects":{}}"#.to_vec();
+    let version = serde_json::json!({
+        "id": version_id,
+        "downloads": {
+            "client": {
+                "url": format!("{base_url}/client.jar"),
+                "sha1": sha1_hex(&client),
+                "size": client.len()
+            }
+        },
+        "assetIndex": {
+            "id": "reconstruction-assets",
+            "url": format!("{base_url}/asset-index.json"),
+            "sha1": sha1_hex(&asset_index),
+            "size": 0
+        },
+        "logging": {
+            "client": {
+                "argument": "-Dlog4j.configurationFile=${path}",
+                "file": {
+                    "id": "reconstruction-log.xml",
+                    "url": format!("{base_url}/log-config.xml"),
+                    "sha1": sha1_hex(&log_config),
+                    "size": log_config.len()
+                },
+                "type": "log4j2-xml"
+            }
+        },
+        "libraries": [
+            {
+                "name": "org.example:exact:1.0.0",
+                "downloads": { "artifact": {
+                    "path": "org/example/exact/1.0.0/exact-1.0.0.jar",
+                    "url": format!("{base_url}/libraries/exact.jar"),
+                    "sha1": sha1_hex(&exact),
+                    "size": exact.len()
+                }}
+            },
+            {
+                "name": "org.example:observed:1.0.0",
+                "downloads": { "artifact": {
+                    "path": "org/example/observed/1.0.0/observed-1.0.0.jar",
+                    "url": format!("{base_url}/libraries/observed.jar"),
+                    "sha1": sha1_hex(&observed)
+                }}
+            },
+            {
+                "name": "org.example:observed-two:1.0.0",
+                "downloads": { "artifact": {
+                    "path": "org/example/observed-two/1.0.0/observed-two-1.0.0.jar",
+                    "url": format!("{base_url}/libraries/observed-two.jar"),
+                    "sha1": sha1_hex(&observed_two)
+                }}
+            }
+        ]
+    })
+    .to_string()
+    .into_bytes();
+    let version_sha1 = sha1_hex(&version);
+    let responses = Arc::new(HashMap::from([
+        ("/version.json".to_string(), version),
+        ("/client.jar".to_string(), client),
+        ("/libraries/exact.jar".to_string(), exact),
+        ("/libraries/observed.jar".to_string(), observed),
+        ("/libraries/observed-two.jar".to_string(), observed_two),
+        ("/asset-index.json".to_string(), asset_index),
+        ("/log-config.xml".to_string(), log_config),
+    ]));
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let responses = Arc::clone(&responses);
+            let request_tx = request_tx.clone();
+            tokio::spawn(async move {
+                let Some(path) = read_request_path(&mut socket).await else {
+                    return;
+                };
+                let _ = request_tx.send(path.clone());
+                match responses.get(&path) {
+                    Some(body) => write_raw_response(&mut socket, "200 OK", body).await,
+                    None => write_raw_response(&mut socket, "404 Not Found", b"not found").await,
+                }
+            });
+        }
+    });
+
+    (format!("{base_url}/version.json"), version_sha1, request_rx)
+}
+
+async fn spawn_runtime_reconstruction_server(
+    version_id: &str,
+) -> (
+    String,
+    String,
+    TestRuntimeSourceDescriptor,
+    mpsc::UnboundedReceiver<String>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind runtime reconstruction server");
+    let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let (request_tx, request_rx) = mpsc::unbounded_channel();
+    let client = b"runtime-reconstruction-client".to_vec();
+    let runtime_file = b"java".to_vec();
+    let runtime_manifest = serde_json::json!({
+        "files": {
+            "bin": { "type": "directory" },
+            "bin/java": {
+                "type": "file",
+                "executable": true,
+                "downloads": { "raw": {
+                    "url": format!("{base_url}/runtime-file"),
+                    "sha1": sha1_hex(&runtime_file),
+                    "size": runtime_file.len()
+                }}
+            },
+            "lib": { "type": "directory" },
+            "lib/data": {
+                "type": "file",
+                "downloads": { "raw": {
+                    "url": format!("{base_url}/runtime-file"),
+                    "sha1": sha1_hex(&runtime_file),
+                    "size": runtime_file.len()
+                }}
+            },
+            "java-link": { "type": "link", "target": "bin/java" }
+        }
+    })
+    .to_string()
+    .into_bytes();
+    let version = serde_json::json!({
+        "id": version_id,
+        "downloads": { "client": {
+            "url": format!("{base_url}/client.jar"),
+            "sha1": sha1_hex(&client),
+            "size": client.len()
+        }},
+        "javaVersion": { "component": "jre-legacy", "majorVersion": 8 }
+    })
+    .to_string()
+    .into_bytes();
+    let version_sha1 = sha1_hex(&version);
+    let runtime_source = TestRuntimeSourceDescriptor {
+        component: RuntimeId::from("jre-legacy"),
+        url: format!("{base_url}/runtime-manifest.json"),
+        sha1: sha1_hex(&runtime_manifest),
+        size: runtime_manifest.len() as u64,
+    };
+    let responses = Arc::new(HashMap::from([
+        ("/version.json".to_string(), version),
+        ("/client.jar".to_string(), client),
+        ("/runtime-manifest.json".to_string(), runtime_manifest),
+        ("/runtime-file".to_string(), runtime_file),
+    ]));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let responses = Arc::clone(&responses);
+            let request_tx = request_tx.clone();
+            tokio::spawn(async move {
+                let Some(path) = read_request_path(&mut socket).await else {
+                    return;
+                };
+                let _ = request_tx.send(path.clone());
+                match responses.get(&path) {
+                    Some(body) => write_raw_response(&mut socket, "200 OK", body).await,
+                    None => write_raw_response(&mut socket, "404 Not Found", b"not found").await,
+                }
+            });
+        }
+    });
+
+    (
+        format!("{base_url}/version.json"),
+        version_sha1,
+        runtime_source,
+        request_rx,
     )
 }
 
@@ -2848,6 +3293,7 @@ async fn authenticated_source_materialization_consumes_matching_prepared_contrac
         SelectedDownloadArtifactKind::VersionJson,
         &destination,
         &url,
+        "1.21.1",
         &expected,
         Some(&fact_tx),
         None,
@@ -2856,7 +3302,9 @@ async fn authenticated_source_materialization_consumes_matching_prepared_contrac
     .expect("prepare destination capability");
     let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
         client: &build_http_client(Duration::from_secs(5)),
+        kind: SelectedDownloadArtifactKind::VersionJson,
         url: &url,
+        logical_identity: "1.21.1",
         expected: &expected,
         max_bytes: 1024,
         target: prepared.target(),
@@ -2949,6 +3397,7 @@ async fn authenticated_source_rejects_mismatched_prepared_contract_without_mutat
         SelectedDownloadArtifactKind::AssetIndex,
         &destination,
         &url,
+        "asset-index",
         &prepared_expected,
         None,
         None,
@@ -2957,7 +3406,9 @@ async fn authenticated_source_rejects_mismatched_prepared_contract_without_mutat
     .expect("prepare destination capability");
     let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
         client: &build_http_client(Duration::from_secs(5)),
+        kind: SelectedDownloadArtifactKind::AssetIndex,
         url: &url,
+        logical_identity: "asset-index",
         expected: &source_expected,
         max_bytes: 1024,
         target: prepared.target(),
@@ -2979,6 +3430,74 @@ async fn authenticated_source_rejects_mismatched_prepared_contract_without_mutat
 }
 
 #[tokio::test]
+async fn authenticated_source_rejects_each_cross_identity_recombination_axis() {
+    for case in ["kind", "provider", "logical_identity"] {
+        let root = temp_dir(&format!("verified-source-cross-{case}"));
+        let destination = root.join("artifact.json");
+        fs::create_dir_all(&root).expect("source sentinel root");
+        fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
+        let body = br#"{"shared":"digest"}"#.to_vec();
+        let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+        let (source_url, _) =
+            spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)])
+                .await;
+        let source =
+            acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+                client: &build_http_client(Duration::from_secs(5)),
+                kind: SelectedDownloadArtifactKind::VersionJson,
+                url: &source_url,
+                logical_identity: "shared-identity",
+                expected: &expected,
+                max_bytes: 1024,
+                target: "version_source",
+                fact_tx: None,
+            })
+            .await
+            .expect("acquire authenticated source");
+        let prepared_kind = if case == "kind" {
+            SelectedDownloadArtifactKind::AssetIndex
+        } else {
+            SelectedDownloadArtifactKind::VersionJson
+        };
+        let prepared_provider = if case == "provider" {
+            format!("{source_url}?different-provider")
+        } else {
+            source_url.clone()
+        };
+        let prepared_identity = if case == "logical_identity" {
+            "different-identity"
+        } else {
+            "shared-identity"
+        };
+        let prepared = prepare_selected_artifact_install(
+            prepared_kind,
+            &destination,
+            &prepared_provider,
+            prepared_identity,
+            &expected,
+            None,
+            None,
+        )
+        .await
+        .expect("prepare distinct destination contract");
+
+        assert!(
+            matches!(
+                materialize_authenticated_selected_artifact_source(prepared, source, None).await,
+                Err(DownloadError::Integrity(_))
+            ),
+            "one mismatched identity axis must reject equal-digest recombination"
+        );
+        assert_eq!(
+            fs::read(&destination).expect("destination sentinel"),
+            b"installed-sentinel",
+            "{case} mismatch must not mutate destination"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[tokio::test]
 async fn authenticated_source_materialization_failure_emits_no_verified_fact() {
     let root = temp_dir("verified-source-materialization-failure");
     fs::create_dir_all(&root).expect("source root");
@@ -2994,6 +3513,7 @@ async fn authenticated_source_materialization_failure_emits_no_verified_fact() {
         SelectedDownloadArtifactKind::VersionJson,
         &destination,
         &url,
+        "1.21.1",
         &expected,
         Some(&fact_tx),
         None,
@@ -3002,7 +3522,9 @@ async fn authenticated_source_materialization_failure_emits_no_verified_fact() {
     .expect("prepare destination capability");
     let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
         client: &build_http_client(Duration::from_secs(5)),
+        kind: SelectedDownloadArtifactKind::VersionJson,
         url: &url,
+        logical_identity: "1.21.1",
         expected: &expected,
         max_bytes: 1024,
         target: prepared.target(),
@@ -3038,6 +3560,7 @@ async fn selected_materialization_fixture(
         SelectedDownloadArtifactKind::VersionJson,
         destination,
         &url,
+        "fixture-version",
         &expected,
         None,
         None,
@@ -3046,7 +3569,9 @@ async fn selected_materialization_fixture(
     .expect("prepare selected materialization");
     let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
         client: &build_http_client(Duration::from_secs(5)),
+        kind: SelectedDownloadArtifactKind::VersionJson,
         url: &url,
+        logical_identity: "fixture-version",
         expected: &expected,
         max_bytes: 1024,
         target: prepared.target(),

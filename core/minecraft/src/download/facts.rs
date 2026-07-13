@@ -168,6 +168,19 @@ pub(super) fn selected_download_target_label(
     }
 }
 
+pub(super) fn selected_download_source_label(
+    kind: SelectedDownloadArtifactKind,
+    identity: &str,
+) -> String {
+    let prefix = selected_download_target_prefix(kind);
+    let suffix = safe_download_fact_value(identity, prefix);
+    if suffix == prefix {
+        format!("{prefix}_source")
+    } else {
+        format!("{prefix}_source_{suffix}")
+    }
+}
+
 fn selected_download_target_prefix(kind: SelectedDownloadArtifactKind) -> &'static str {
     match kind {
         SelectedDownloadArtifactKind::VersionJson => "minecraft_version_json",

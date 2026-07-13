@@ -18,6 +18,10 @@ pub use assets::{
     asset_object_hash_prefix, repair_virtual_assets_from_index, virtual_asset_destination,
 };
 pub use install::Downloader;
+pub(crate) use install::{
+    CompletedVanillaInstallAuthority, PendingVanillaInstallSourceAuthority,
+    ReconstructedVanillaAuthority,
+};
 pub use integrity::{
     LauncherManagedArtifactReadiness, jar_contains_signed_metadata,
     verify_existing_launcher_managed_artifact,
@@ -38,7 +42,7 @@ pub use model::{
     SelectedDownloadArtifactKind,
 };
 pub(crate) use model::{ExactLibraryDownloadProof, MaterializedLibraryIdentity};
-pub(crate) use transfer::MaterializedSelectedArtifactSource;
+pub(crate) use transfer::AuthenticatedSelectedArtifactSource;
 pub use transfer::download_file_with_client_report;
 #[cfg(test)]
 pub(crate) use transfer::promote_launcher_managed_artifact_temp_once;

@@ -127,7 +127,7 @@ pub struct RuntimeProbeUsage {
     pub source: RuntimeProbeSource,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeEnsureResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<RuntimeRecord>,

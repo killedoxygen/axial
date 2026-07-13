@@ -1,7 +1,7 @@
 use super::discovery::{
-    is_known_runtime_component, parse_runtime_override, resolve_axial_cached_runtime,
-    resolve_component_runtime, resolve_managed_runtime, resolve_override_runtime,
-    runtime_requirement,
+    is_known_runtime_component, parse_runtime_override, preferred_runtime_component,
+    resolve_axial_cached_runtime, resolve_component_runtime, resolve_managed_runtime,
+    resolve_override_runtime, runtime_requirement,
 };
 use super::file_download::runtime_filesystem_path;
 use super::install::install_managed_runtime;
@@ -12,8 +12,8 @@ use super::manifest::{
 };
 use super::model::{
     JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureAction, RuntimeEnsureEvent,
-    RuntimeEnsureResult, RuntimeOverride, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement,
-    RuntimeSource,
+    RuntimeEnsureResult, RuntimeId, RuntimeOverride, RuntimeProbeUsage, RuntimeRecord,
+    RuntimeRequirement, RuntimeSource,
 };
 use super::probe::{JavaRuntimeProbeReceipt, probe_java_runtime_receipt};
 use crate::launch::JavaVersion;
@@ -99,6 +99,47 @@ pub(crate) async fn ensure_axial_managed_processor_runtime(
         probe_receipt,
         _source_receipt: source_receipt,
     })
+}
+
+pub(crate) async fn materialize_preferred_runtime_source<F>(
+    java_version: &JavaVersion,
+    source_receipt: RuntimeSourceReceipt,
+    observer: &mut F,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError>
+where
+    F: FnMut(RuntimeEnsureEvent),
+{
+    let component = RuntimeId::from(preferred_runtime_component(java_version));
+    if source_receipt.component() != &component || !is_known_runtime_component(component.as_str()) {
+        return Err(JavaRuntimeLookupError::Download(
+            "runtime source does not match the preferred managed component".to_string(),
+        ));
+    }
+    let install_root = runtime_cache_dir().join(component.as_str());
+    let install_lock = runtime_install_lock(component.as_str());
+    let _guard = install_lock.lock().await;
+    let _file_lock = acquire_runtime_install_file_lock(&install_root).await?;
+    let current = resolve_axial_cached_runtime(&component, java_version.major_version).ok();
+    let matches_source = match current.as_ref() {
+        Some(runtime) => runtime_record_matches_source(runtime, &source_receipt).await,
+        None => false,
+    };
+    if !matches_source {
+        observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
+            component: component.as_str().to_string(),
+        });
+        install_managed_runtime(&component, &install_root, &source_receipt, observer).await?;
+    }
+    let runtime = resolve_axial_cached_runtime(&component, java_version.major_version)?;
+    if !runtime_record_matches_source(&runtime, &source_receipt).await {
+        return Err(JavaRuntimeLookupError::Download(
+            "installed runtime does not match its authenticated source".to_string(),
+        ));
+    }
+    observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+        component: component.as_str().to_string(),
+    });
+    Ok(source_receipt)
 }
 
 pub async fn ensure_java_runtime(

@@ -3,7 +3,8 @@ use super::facts::{
     size_mismatch_fact,
 };
 use super::model::{
-    DownloadError, ExecutionDownloadFact, ExecutionDownloadFactKind, ExpectedIntegrity,
+    DownloadError, ExactLibraryDownloadProof, ExecutionDownloadFact, ExecutionDownloadFactKind,
+    ExpectedIntegrity,
 };
 use crate::artifact_path::ArtifactRelativePath;
 use futures_util::StreamExt as _;
@@ -93,6 +94,7 @@ impl AuthenticatedLibrarySource {
         &self.expected
     }
 
+    #[cfg(test)]
     pub(super) fn target(&self) -> &str {
         &self.target
     }
@@ -134,6 +136,17 @@ impl AuthenticatedLibrarySource {
             self.target,
             self.provider_url,
             self._permit,
+        )
+    }
+
+    pub(super) fn into_exact_download_proof(self, is_native: bool) -> ExactLibraryDownloadProof {
+        ExactLibraryDownloadProof::new(
+            self.relative_path,
+            is_native,
+            self.provider_url,
+            self.expected,
+            self.observed_size,
+            self.observed_sha1,
         )
     }
 }

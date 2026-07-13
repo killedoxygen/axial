@@ -3,8 +3,8 @@ use super::assets::{
     spawn_asset_download_pipeline,
 };
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
-use super::facts::selected_download_target_label;
-use super::libraries::{DownloadJob, library_jobs_for};
+use super::facts::selected_download_source_label;
+use super::libraries::library_jobs_for;
 use super::library_source::{
     LIBRARY_SOURCE_MAX_BYTES, LibrarySourcePool, LibrarySourceRequest,
     acquire_authenticated_library_source,
@@ -14,26 +14,38 @@ use super::model::{
     ExpectedIntegrity, SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
 };
 use super::plan::TransferPlan;
+#[cfg(test)]
+use super::runtime::spawn_test_runtime_source_pipeline;
 use super::runtime::{
     finish_runtime_pipeline_after_artifacts, recv_runtime_progress, spawn_runtime_ensure_pipeline,
 };
 use super::transfer::{
-    MaterializedSelectedArtifactSource, SelectedArtifactSourceRequest,
-    acquire_authenticated_selected_artifact_source,
-    ensure_selected_artifact_with_client_and_observed_size,
-    materialize_authenticated_library_source, materialize_authenticated_selected_artifact_source,
-    prepare_library_publication, prepare_selected_artifact_install,
+    AuthenticatedSelectedArtifactSource, MaterializedSelectedArtifactSource,
+    SelectedArtifactSourceRequest, acquire_authenticated_selected_artifact_source,
+    ensure_selected_artifact_with_client, materialize_authenticated_library_source,
+    materialize_authenticated_selected_artifact_source, prepare_library_publication,
+    prepare_selected_artifact_install,
 };
 use crate::artifact_path::validate_artifact_path_segment;
 use crate::known_good::{
-    KnownGoodInstallReceipt, KnownGoodInstallShape, KnownGoodInventoryInput,
-    MAX_KNOWN_GOOD_ASSET_INDEX_BYTES, MAX_KNOWN_GOOD_VERSION_JSON_BYTES, RuntimeInventoryInput,
+    KnownGoodInstallReceipt, KnownGoodReconstructionReceipt, MAX_KNOWN_GOOD_ASSET_INDEX_BYTES,
+    MAX_KNOWN_GOOD_VERSION_JSON_BYTES, PendingVanillaInstallReceipt,
+    authenticate_pending_vanilla_install, seal_completed_vanilla_install,
+    seal_reconstructed_vanilla,
 };
-use crate::known_good_libraries::{LibraryAcquisition, seal_vanilla_exact_library_declarations};
+use crate::known_good_libraries::{
+    ClassifiedLibraryDownload, LibraryAcquisition, PendingStreamedLibraryDeclarations,
+    seal_vanilla_exact_library_declarations,
+};
 use crate::launch::{VersionJson, effective_java_version_for};
 use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
 use crate::paths::{assets_dir, libraries_dir, versions_dir};
-use crate::rules::default_environment;
+use crate::rules::{Environment, default_environment};
+use crate::runtime::{RuntimeSourceReceipt, acquire_preferred_runtime_source};
+#[cfg(test)]
+use crate::runtime::{
+    TestRuntimeSourceDescriptor, acquire_test_runtime_source, authenticated_test_runtime_source,
+};
 use futures_util::StreamExt;
 use std::io;
 use std::path::PathBuf;
@@ -46,12 +58,139 @@ pub struct Downloader {
     client: reqwest::Client,
     #[cfg(test)]
     install_manifest: Option<VersionManifest>,
+    #[cfg(test)]
+    runtime_source: Option<TestRuntimeSourceDescriptor>,
 }
 
-struct VerifiedVanillaArtifacts {
-    client_size: u64,
-    library_proofs: Vec<ExactLibraryDownloadProof>,
-    log_config_size: Option<u64>,
+struct AuthenticatedVanillaPlan {
+    version: VersionJson,
+    environment: Environment,
+    pending_library_declarations: PendingStreamedLibraryDeclarations,
+    library_jobs: Vec<ClassifiedLibraryDownload>,
+    version_json_source: AuthenticatedSelectedArtifactSource,
+    asset_index_source: Option<AuthenticatedSelectedArtifactSource>,
+    runtime_source: Option<RuntimeSourceReceipt>,
+}
+
+struct VanillaAuthorityParts {
+    version: VersionJson,
+    environment: Environment,
+    libraries: crate::known_good_libraries::SealedExactLibraryDeclarations,
+    version_source: AuthenticatedSelectedArtifactSource,
+    asset_index_source: Option<AuthenticatedSelectedArtifactSource>,
+    runtime_source: Option<RuntimeSourceReceipt>,
+}
+
+pub(crate) struct ReconstructedVanillaAuthority {
+    parts: VanillaAuthorityParts,
+}
+
+struct PendingVanillaInstall {
+    receipt: PendingVanillaInstallReceipt,
+    destinations: AllVanillaDestinationsMaterialized,
+}
+
+pub(crate) struct CompletedVanillaInstallAuthority {
+    receipt: PendingVanillaInstallReceipt,
+    _destinations: AllVanillaDestinationsMaterialized,
+}
+
+pub(crate) struct PendingVanillaInstallSourceAuthority {
+    parts: VanillaAuthorityParts,
+}
+
+struct AllVanillaDestinationsMaterialized {
+    version_id: String,
+    libraries: usize,
+    marker_removed: bool,
+}
+
+impl ReconstructedVanillaAuthority {
+    fn new(parts: VanillaAuthorityParts) -> Self {
+        Self { parts }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        VersionJson,
+        Environment,
+        crate::known_good_libraries::SealedExactLibraryDeclarations,
+        AuthenticatedSelectedArtifactSource,
+        Option<AuthenticatedSelectedArtifactSource>,
+        Option<RuntimeSourceReceipt>,
+    ) {
+        self.parts.into_parts()
+    }
+}
+
+impl PendingVanillaInstall {
+    fn validate_completion(&self, version_id: &str) -> Result<(), DownloadError> {
+        if self.destinations.version_id != version_id
+            || self.destinations.marker_removed
+            || self.destinations.libraries > crate::known_good::MAX_KNOWN_GOOD_ENTRIES
+        {
+            return Err(DownloadError::ResolveManifest(
+                "vanilla install completion identity mismatch".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn complete_after_marker_removal(mut self) -> CompletedVanillaInstallAuthority {
+        self.destinations.marker_removed = true;
+        CompletedVanillaInstallAuthority {
+            receipt: self.receipt,
+            _destinations: self.destinations,
+        }
+    }
+}
+
+impl CompletedVanillaInstallAuthority {
+    pub(crate) fn into_pending_receipt(self) -> PendingVanillaInstallReceipt {
+        self.receipt
+    }
+}
+
+impl PendingVanillaInstallSourceAuthority {
+    fn new(parts: VanillaAuthorityParts) -> Self {
+        Self { parts }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        VersionJson,
+        Environment,
+        crate::known_good_libraries::SealedExactLibraryDeclarations,
+        AuthenticatedSelectedArtifactSource,
+        Option<AuthenticatedSelectedArtifactSource>,
+        Option<RuntimeSourceReceipt>,
+    ) {
+        self.parts.into_parts()
+    }
+}
+
+impl VanillaAuthorityParts {
+    fn into_parts(
+        self,
+    ) -> (
+        VersionJson,
+        Environment,
+        crate::known_good_libraries::SealedExactLibraryDeclarations,
+        AuthenticatedSelectedArtifactSource,
+        Option<AuthenticatedSelectedArtifactSource>,
+        Option<RuntimeSourceReceipt>,
+    ) {
+        (
+            self.version,
+            self.environment,
+            self.libraries,
+            self.version_source,
+            self.asset_index_source,
+            self.runtime_source,
+        )
+    }
 }
 
 impl Downloader {
@@ -61,6 +200,8 @@ impl Downloader {
             client: standard_minecraft_download_client(),
             #[cfg(test)]
             install_manifest: None,
+            #[cfg(test)]
+            runtime_source: None,
         }
     }
 
@@ -73,7 +214,17 @@ impl Downloader {
             mc_dir: mc_dir.into(),
             client: standard_minecraft_download_client(),
             install_manifest: Some(manifest),
+            runtime_source: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_runtime_source(
+        mut self,
+        descriptor: TestRuntimeSourceDescriptor,
+    ) -> Self {
+        self.runtime_source = Some(descriptor);
+        self
     }
 
     pub async fn install_version<F>(
@@ -84,8 +235,80 @@ impl Downloader {
     where
         F: FnMut(DownloadProgress),
     {
-        self.install_version_with_fact_sender(version_id, &mut send, None, None)
+        Box::pin(self.install_version_with_fact_sender(version_id, &mut send, None, None)).await
+    }
+
+    pub async fn reconstruct_version(
+        &self,
+        version_id: &str,
+    ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
+        validate_install_version_id(version_id)?;
+        let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
+        self.reconstruct_version_inner(version_id, version_manifest_entry)
             .await
+    }
+
+    async fn reconstruct_version_inner(
+        &self,
+        version_id: &str,
+        version_manifest_entry: ManifestEntry,
+    ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
+        let AuthenticatedVanillaPlan {
+            version,
+            environment,
+            pending_library_declarations,
+            library_jobs,
+            version_json_source,
+            asset_index_source,
+            runtime_source,
+        } = self
+            .acquire_vanilla_plan(version_id, &version_manifest_entry, None)
+            .await?;
+        let mut library_proofs = Vec::new();
+        let source_pool = LibrarySourcePool::new();
+        for classified in library_jobs {
+            let (job, acquisition) = classified.into_parts();
+            if acquisition == LibraryAcquisition::ExactDeclaration {
+                continue;
+            }
+            let target = selected_download_source_label(
+                SelectedDownloadArtifactKind::Library,
+                job.relative_path.as_str(),
+            );
+            let source = acquire_authenticated_library_source(LibrarySourceRequest {
+                client: &self.client,
+                url: &job.url,
+                expected: &job.expected,
+                relative_path: &job.relative_path,
+                max_bytes: LIBRARY_SOURCE_MAX_BYTES,
+                target: &target,
+                pool: &source_pool,
+                fact_tx: None,
+            })
+            .await?;
+            library_proofs.push(source.into_exact_download_proof(job.is_native));
+        }
+        let library_declarations = pending_library_declarations
+            .seal_streamed(library_proofs)
+            .map_err(|error| {
+                DownloadError::ResolveManifest(format!(
+                    "reconstructed library declarations could not be completed: {error:?}"
+                ))
+            })?;
+
+        seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(VanillaAuthorityParts {
+            version,
+            environment,
+            libraries: library_declarations,
+            version_source: version_json_source,
+            asset_index_source,
+            runtime_source,
+        }))
+        .map_err(|error| {
+            DownloadError::ResolveManifest(format!(
+                "reconstructed source inventory could not be derived: {error:?}"
+            ))
+        })
     }
 
     pub async fn install_version_with_facts_and_descriptors<F, G, H>(
@@ -102,14 +325,13 @@ impl Downloader {
     {
         let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
         let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
-        let result = self
-            .install_version_with_fact_sender(
-                version_id,
-                &mut send,
-                Some(fact_tx),
-                Some(descriptor_tx),
-            )
-            .await;
+        let result = Box::pin(self.install_version_with_fact_sender(
+            version_id,
+            &mut send,
+            Some(fact_tx),
+            Some(descriptor_tx),
+        ))
+        .await;
         while let Ok(fact) = fact_rx.try_recv() {
             send_fact(fact);
         }
@@ -140,23 +362,30 @@ impl Downloader {
         let install_result = async {
             validate_install_version_id(version_id)?;
             let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
+            let authenticated = self
+                .acquire_vanilla_plan(version_id, &version_manifest_entry, fact_tx.as_ref())
+                .await?;
             async_fs::create_dir_all(&version_dir).await?;
             async_fs::write(&marker_path, b"installing").await?;
-            self.install_version_inner(
-                version_id,
-                version_manifest_entry,
-                &mut send,
-                &plan,
-                fact_tx.as_ref(),
-                descriptor_tx.as_ref(),
-            )
-            .await
+            let pending = self
+                .install_version_inner(
+                    version_id,
+                    authenticated,
+                    &mut send,
+                    &plan,
+                    fact_tx.as_ref(),
+                    descriptor_tx.as_ref(),
+                )
+                .await?;
+            pending.validate_completion(version_id)?;
+            async_fs::remove_file(&marker_path).await?;
+            let completed = pending.complete_after_marker_removal();
+            Ok::<_, DownloadError>(seal_completed_vanilla_install(completed))
         }
         .await;
 
         match install_result {
             Ok(receipt) => {
-                let _ = async_fs::remove_file(&marker_path).await;
                 send(DownloadProgress {
                     phase: "done".to_string(),
                     current: 1,
@@ -188,12 +417,12 @@ impl Downloader {
     async fn install_version_inner<F>(
         &self,
         version_id: &str,
-        version_manifest_entry: ManifestEntry,
+        authenticated: AuthenticatedVanillaPlan,
         send: &mut F,
         plan: &Arc<TransferPlan>,
         fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
         descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-    ) -> Result<KnownGoodInstallReceipt, DownloadError>
+    ) -> Result<PendingVanillaInstall, DownloadError>
     where
         F: FnMut(DownloadProgress),
     {
@@ -206,53 +435,60 @@ impl Downloader {
             Some(format!("{version_id}.json")),
         ));
 
-        let version_json_expected = ExpectedIntegrity::from_sha1(&version_manifest_entry.sha1);
+        let AuthenticatedVanillaPlan {
+            version,
+            environment,
+            pending_library_declarations,
+            library_jobs,
+            version_json_source,
+            asset_index_source,
+            runtime_source,
+        } = authenticated;
         let version_json_install = prepare_selected_artifact_install(
             SelectedDownloadArtifactKind::VersionJson,
             &json_path,
-            &version_manifest_entry.url,
-            &version_json_expected,
+            version_json_source.provider_url(),
+            version_json_source.logical_identity(),
+            version_json_source.expected(),
             fact_tx,
             descriptor_tx,
         )
         .await?;
-        let version_json_source =
-            acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-                client: &self.client,
-                url: &version_manifest_entry.url,
-                expected: &version_json_expected,
-                max_bytes: MAX_KNOWN_GOOD_VERSION_JSON_BYTES,
-                target: version_json_install.target(),
-                fact_tx,
-            })
-            .await?;
         let version_json_source = materialize_authenticated_selected_artifact_source(
             version_json_install,
             version_json_source,
             fact_tx,
         )
         .await?;
-
-        let version = parse_vanilla_version_source(version_json_source.bytes(), version_id)?;
-        let environment = default_environment();
-        let (library_declarations, version_json_bytes, version_metadata_size, _version_sha1) =
-            seal_vanilla_exact_library_declarations(version_json_source, &version, &environment)
-                .map_err(|error| {
-                    DownloadError::ResolveManifest(format!(
-                        "authenticated library declarations could not be sealed: {error:?}"
-                    ))
-                })?
-                .into_parts();
-        let (pending_library_declarations, library_jobs) = library_declarations
-            .classify_jobs(&libraries_dir(&self.mc_dir), self.library_jobs(&version)?)
-            .map_err(|error| {
-                DownloadError::ResolveManifest(format!(
-                    "library declaration classification failed: {error:?}"
-                ))
-            })?;
+        let selected_library_count = library_jobs.len();
+        let asset_index_bytes = version
+            .asset_index
+            .size
+            .try_into()
+            .ok()
+            .filter(|size: &u64| *size > 0)
+            .unwrap_or(0);
+        if asset_index_source.is_some() {
+            plan.contribute_total(asset_index_bytes);
+            send(progress(
+                "asset_index",
+                0,
+                1,
+                Some(format!("{}.json", version.asset_index.id)),
+            ));
+        }
         let asset_index_source = self
-            .fetch_asset_index_source(&version, send, plan, fact_tx, descriptor_tx)
+            .materialize_asset_index_source(&version, asset_index_source, fact_tx, descriptor_tx)
             .await?;
+        if asset_index_source.is_some() {
+            plan.add_done(asset_index_bytes);
+            send(progress(
+                "asset_index",
+                1,
+                1,
+                Some(format!("{}.json", version.asset_index.id)),
+            ));
+        }
         let client_jar_bytes = version
             .downloads
             .client
@@ -264,13 +500,12 @@ impl Downloader {
             .logging
             .as_ref()
             .and_then(|logging| logging.client.as_ref())
-            .filter(|client| !client.file.url.is_empty())
             .and_then(|client| {
                 ExpectedIntegrity::from_mojang(client.file.size, &client.file.sha1).size
             })
             .unwrap_or(0);
         plan.contribute_total(log_config_bytes);
-        let mut runtime_pipeline = if version.java_version.major_version > 0 {
+        let mut runtime_pipeline = if let Some(runtime_source) = runtime_source {
             send(progress(
                 "java_runtime",
                 0,
@@ -286,13 +521,8 @@ impl Downloader {
                 )),
             ));
 
-            let mc_dir = self.mc_dir.clone();
             let java_version = version.java_version.clone();
-            Some(spawn_runtime_ensure_pipeline(
-                mc_dir,
-                java_version,
-                plan.clone(),
-            ))
+            Some(self.spawn_runtime_pipeline(java_version, runtime_source, plan.clone()))
         } else {
             None
         };
@@ -304,29 +534,30 @@ impl Downloader {
                 1,
                 Some(format!("{version_id}.jar")),
             ));
-            let client_jar_task = if let Some(client) = &version.downloads.client {
-                let http_client = self.client.clone();
-                let url = client.url.clone();
-                let jar_path = version_dir.join(format!("{version_id}.jar"));
-                let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
-                let fact_tx = fact_tx.cloned();
-                let descriptor_tx = descriptor_tx.cloned();
-                Some(tokio::spawn(async move {
-                    let (_, observed_size) = ensure_selected_artifact_with_client_and_observed_size(
-                        SelectedDownloadArtifactKind::ClientJar,
-                        &http_client,
-                        &url,
-                        &jar_path,
-                        &expected,
-                        fact_tx.as_ref(),
-                        descriptor_tx.as_ref(),
-                    )
-                    .await?;
-                    Ok::<u64, DownloadError>(observed_size)
-                }))
-            } else {
-                None
-            };
+            let client = version.downloads.client.as_ref().ok_or_else(|| {
+                DownloadError::ResolveManifest(
+                    "authenticated version has no exact client artifact".to_string(),
+                )
+            })?;
+            let http_client = self.client.clone();
+            let url = client.url.clone();
+            let jar_path = version_dir.join(format!("{version_id}.jar"));
+            let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
+            let client_fact_tx = fact_tx.cloned();
+            let client_descriptor_tx = descriptor_tx.cloned();
+            let client_jar_task = tokio::spawn(async move {
+                ensure_selected_artifact_with_client(
+                    SelectedDownloadArtifactKind::ClientJar,
+                    &http_client,
+                    &url,
+                    &jar_path,
+                    &expected,
+                    client_fact_tx.as_ref(),
+                    client_descriptor_tx.as_ref(),
+                )
+                .await?;
+                Ok::<(), DownloadError>(())
+            });
             let mut asset_pipeline = asset_index_source.as_ref().map(|source| {
                 spawn_asset_download_pipeline(
                     self.mc_dir.clone(),
@@ -354,16 +585,15 @@ impl Downloader {
                 let mut library_downloads =
                     futures_util::stream::iter(library_jobs.into_iter().map(|classified| {
                         let (job, acquisition) = classified.into_parts();
-                        let needs_stream = acquisition == LibraryAcquisition::FreshStream;
                         let client = client.clone();
                         let fact_tx = fact_tx.cloned();
                         let descriptor_tx = descriptor_tx.cloned();
                         let source_pool = source_pool.clone();
                         async move {
-                            let (observed_size, proof) = if needs_stream {
-                                let target = selected_download_target_label(
+                            if acquisition == LibraryAcquisition::FreshStream {
+                                let target = selected_download_source_label(
                                     SelectedDownloadArtifactKind::Library,
-                                    &job.path,
+                                    job.relative_path.as_str(),
                                 );
                                 let source = acquire_authenticated_library_source(
                                     LibrarySourceRequest {
@@ -411,9 +641,9 @@ impl Downloader {
                                     observed_size,
                                     sha1,
                                 );
-                                (observed_size, Some(proof))
+                                Ok::<_, DownloadError>((job.name, observed_size, Some(proof)))
                             } else {
-                                let (_, observed_size) = ensure_selected_artifact_with_client_and_observed_size(
+                                ensure_selected_artifact_with_client(
                                     SelectedDownloadArtifactKind::Library,
                                     &client,
                                     &job.url,
@@ -423,9 +653,12 @@ impl Downloader {
                                     descriptor_tx.as_ref(),
                                 )
                                 .await?;
-                                (observed_size, None)
-                            };
-                            Ok::<_, DownloadError>((job.name, observed_size, proof))
+                                Ok::<_, DownloadError>((
+                                    job.name,
+                                    job.expected.size.unwrap_or(0),
+                                    None,
+                                ))
+                            }
                         }
                     }))
                     .buffer_unordered(library_download_concurrency());
@@ -470,7 +703,7 @@ impl Downloader {
             }
             .await;
             let client_jar_result = await_client_jar_download(client_jar_task).await;
-            if client_jar_result.is_ok() && version.downloads.client.is_some() {
+            if client_jar_result.is_ok() {
                 plan.add_done(client_jar_bytes);
                 send(progress(
                     "client_jar",
@@ -484,18 +717,13 @@ impl Downloader {
             } else {
                 await_asset_download_pipeline(asset_pipeline, send).await?;
             }
-            let client_size = client_jar_result?.ok_or_else(|| {
-                DownloadError::ResolveManifest(
-                    "installed version has no authenticated client artifact".to_string(),
-                )
-            })?;
+            client_jar_result?;
             let library_proofs = library_result?;
 
-            let log_config_size = if let Some(logging) = version
+            if let Some(logging) = version
                 .logging
                 .as_ref()
                 .and_then(|logging| logging.client.as_ref())
-                && !logging.file.url.is_empty()
             {
                 let log_config_path = assets_dir(&self.mc_dir)
                     .join("log_configs")
@@ -503,7 +731,7 @@ impl Downloader {
                 send(progress("log_config", 0, 1, Some(logging.file.id.clone())));
                 let expected =
                     ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1);
-                let (_, observed_size) = ensure_selected_artifact_with_client_and_observed_size(
+                ensure_selected_artifact_with_client(
                     SelectedDownloadArtifactKind::LogConfig,
                     &self.client,
                     &logging.file.url,
@@ -514,124 +742,196 @@ impl Downloader {
                 )
                 .await?;
                 plan.add_done(log_config_bytes);
-                Some(observed_size)
-            } else {
-                None
-            };
-            Ok::<_, DownloadError>((
-                pending_library_declarations,
-                VerifiedVanillaArtifacts {
-                    client_size,
-                    library_proofs,
-                    log_config_size,
-                },
-            ))
+            }
+            Ok::<_, DownloadError>((pending_library_declarations, library_proofs))
         }
         .await;
 
-        let (runtime_receipt, (pending_library_declarations, verified_artifacts)) =
+        let (runtime_receipt, (pending_library_declarations, library_proofs)) =
             finish_runtime_pipeline_after_artifacts(runtime_pipeline, artifact_result, send)
                 .await?;
 
-        let runtime_expected = runtime_receipt.as_ref().map(|receipt| ExpectedIntegrity {
-            size: Some(receipt.expected_size()),
-            sha1: Some(receipt.expected_sha1().to_string()),
-        });
         let library_declarations = pending_library_declarations
-            .seal_streamed(verified_artifacts.library_proofs)
+            .seal_streamed(library_proofs)
             .map_err(|error| {
                 DownloadError::ResolveManifest(format!(
                     "installed library declarations could not be completed: {error:?}"
                 ))
             })?;
-        let asset_index_bytes = asset_index_source.map(|source| source.into_parts().0);
-        KnownGoodInstallReceipt::from_verified_vanilla_source(
-            KnownGoodInventoryInput {
-                resolved_version: &version,
-                version_metadata_size,
-                client_size: verified_artifacts.client_size,
-                libraries: &library_declarations,
-                log_config_size: verified_artifacts.log_config_size,
-                asset_index_bytes: asset_index_bytes.as_deref(),
-                runtime: runtime_receipt.as_ref().zip(runtime_expected.as_ref()).map(
-                    |(receipt, expected)| RuntimeInventoryInput {
-                        component: receipt.component(),
-                        manifest_bytes: receipt.bytes(),
-                        manifest_expected: expected,
-                    },
-                ),
-                shape: KnownGoodInstallShape {
-                    version_manifest: &version_manifest_entry,
-                },
-                environment: &environment,
-            },
-            &version_json_bytes,
+        let receipt = authenticate_pending_vanilla_install(
+            PendingVanillaInstallSourceAuthority::new(VanillaAuthorityParts {
+                version,
+                environment,
+                libraries: library_declarations,
+                version_source: version_json_source.into_authenticated_source(),
+                asset_index_source: asset_index_source
+                    .map(MaterializedSelectedArtifactSource::into_authenticated_source),
+                runtime_source: runtime_receipt,
+            }),
         )
         .map_err(|error| {
             DownloadError::ResolveManifest(format!(
                 "installed source inventory could not be derived: {error:?}"
             ))
+        })?;
+        Ok(PendingVanillaInstall {
+            receipt,
+            destinations: AllVanillaDestinationsMaterialized {
+                version_id: version_id.to_string(),
+                libraries: selected_library_count,
+                marker_removed: false,
+            },
         })
     }
 
-    async fn fetch_asset_index_source<F>(
+    async fn acquire_vanilla_plan(
+        &self,
+        version_id: &str,
+        version_manifest_entry: &ManifestEntry,
+        fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    ) -> Result<AuthenticatedVanillaPlan, DownloadError> {
+        let expected = ExpectedIntegrity::from_sha1(&version_manifest_entry.sha1);
+        let source_target =
+            selected_download_source_label(SelectedDownloadArtifactKind::VersionJson, version_id);
+        let source =
+            acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+                client: &self.client,
+                kind: SelectedDownloadArtifactKind::VersionJson,
+                url: &version_manifest_entry.url,
+                logical_identity: version_id,
+                expected: &expected,
+                max_bytes: MAX_KNOWN_GOOD_VERSION_JSON_BYTES,
+                target: &source_target,
+                fact_tx,
+            })
+            .await?;
+        let version = parse_vanilla_version_source(source.bytes(), version_id)?;
+        validate_vanilla_exact_artifact_contracts(&version)?;
+        let environment = default_environment();
+        let declaration_source =
+            seal_vanilla_exact_library_declarations(source, &version, &environment).map_err(
+                |error| {
+                    DownloadError::ResolveManifest(format!(
+                        "authenticated library declarations could not be sealed: {error:?}"
+                    ))
+                },
+            )?;
+        let (library_declarations, version_json_source) = declaration_source.into_parts();
+        let (pending_library_declarations, library_jobs) = library_declarations
+            .classify_jobs(
+                &libraries_dir(&self.mc_dir),
+                library_jobs_for(&self.mc_dir, &version.libraries, &environment)?,
+            )
+            .map_err(|error| {
+                DownloadError::ResolveManifest(format!(
+                    "library declaration classification failed: {error:?}"
+                ))
+            })?;
+        let asset_index_source = self.acquire_asset_index_source(&version, fact_tx).await?;
+        let runtime_source = if version.java_version.major_version > 0 {
+            Some(
+                self.acquire_runtime_source(&version.java_version)
+                    .await
+                    .map_err(|error| DownloadError::PrepareRuntime(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        Ok(AuthenticatedVanillaPlan {
+            version,
+            environment,
+            pending_library_declarations,
+            library_jobs,
+            version_json_source,
+            asset_index_source,
+            runtime_source,
+        })
+    }
+
+    async fn acquire_runtime_source(
+        &self,
+        java_version: &crate::launch::JavaVersion,
+    ) -> Result<RuntimeSourceReceipt, crate::runtime::JavaRuntimeLookupError> {
+        #[cfg(test)]
+        if let Some(descriptor) = &self.runtime_source {
+            return acquire_test_runtime_source(java_version, descriptor).await;
+        }
+        #[cfg(test)]
+        if self.install_manifest.is_some() {
+            return authenticated_test_runtime_source(java_version);
+        }
+        acquire_preferred_runtime_source(java_version).await
+    }
+
+    fn spawn_runtime_pipeline(
+        &self,
+        java_version: crate::launch::JavaVersion,
+        source_receipt: RuntimeSourceReceipt,
+        plan: Arc<TransferPlan>,
+    ) -> super::runtime::RuntimeEnsurePipeline {
+        #[cfg(test)]
+        if self.install_manifest.is_some() {
+            return spawn_test_runtime_source_pipeline(source_receipt, plan);
+        }
+        spawn_runtime_ensure_pipeline(java_version, source_receipt, plan)
+    }
+
+    async fn acquire_asset_index_source(
         &self,
         version: &VersionJson,
-        send: &mut F,
-        plan: &TransferPlan,
         fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-        descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-    ) -> Result<Option<MaterializedSelectedArtifactSource>, DownloadError>
-    where
-        F: FnMut(DownloadProgress),
-    {
+    ) -> Result<Option<AuthenticatedSelectedArtifactSource>, DownloadError> {
         if version.asset_index.url.trim().is_empty() {
-            return if version.asset_index.id.trim().is_empty() {
-                Ok(None)
-            } else {
-                Err(DownloadError::ResolveManifest(
-                    "version asset index has no download source".to_string(),
-                ))
-            };
+            return Ok(None);
         }
-        let index_name = format!("{}.json", version.asset_index.id);
-        if validate_artifact_path_segment(&version.asset_index.id).is_err()
-            || validate_artifact_path_segment(&index_name).is_err()
-        {
-            return Err(DownloadError::ResolveManifest(
-                "version asset index has an invalid identity".to_string(),
-            ));
-        }
-        let index_path = assets_dir(&self.mc_dir).join("indexes").join(&index_name);
         let expected =
             ExpectedIntegrity::from_mojang(version.asset_index.size, &version.asset_index.sha1);
-        let planned_bytes = expected.size.unwrap_or(0);
-        plan.contribute_total(planned_bytes);
-        send(progress("asset_index", 0, 1, Some(index_name.clone())));
+        let source_target = selected_download_source_label(
+            SelectedDownloadArtifactKind::AssetIndex,
+            &version.asset_index.id,
+        );
+        let source =
+            acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+                client: &self.client,
+                kind: SelectedDownloadArtifactKind::AssetIndex,
+                url: &version.asset_index.url,
+                logical_identity: &version.asset_index.id,
+                expected: &expected,
+                max_bytes: MAX_KNOWN_GOOD_ASSET_INDEX_BYTES,
+                target: &source_target,
+                fact_tx,
+            })
+            .await?;
+        Ok(Some(source))
+    }
+
+    async fn materialize_asset_index_source(
+        &self,
+        version: &VersionJson,
+        source: Option<AuthenticatedSelectedArtifactSource>,
+        fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+        descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
+    ) -> Result<Option<MaterializedSelectedArtifactSource>, DownloadError> {
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        let index_name = format!("{}.json", version.asset_index.id);
+        let index_path = assets_dir(&self.mc_dir).join("indexes").join(index_name);
+        let expected =
+            ExpectedIntegrity::from_mojang(version.asset_index.size, &version.asset_index.sha1);
         let prepared = prepare_selected_artifact_install(
             SelectedDownloadArtifactKind::AssetIndex,
             &index_path,
             &version.asset_index.url,
+            &version.asset_index.id,
             &expected,
             fact_tx,
             descriptor_tx,
         )
         .await?;
-        let source =
-            acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-                client: &self.client,
-                url: &version.asset_index.url,
-                expected: &expected,
-                max_bytes: MAX_KNOWN_GOOD_ASSET_INDEX_BYTES,
-                target: prepared.target(),
-                fact_tx,
-            })
-            .await?;
-        let source =
-            materialize_authenticated_selected_artifact_source(prepared, source, fact_tx).await?;
-        plan.add_done(planned_bytes);
-        send(progress("asset_index", 1, 1, Some(index_name)));
-        Ok(Some(source))
+        materialize_authenticated_selected_artifact_source(prepared, source, fact_tx)
+            .await
+            .map(Some)
     }
 
     async fn resolve_manifest_entry(
@@ -663,11 +963,6 @@ impl Downloader {
 
         fetch_fresh_install_version_manifest().await
     }
-
-    fn library_jobs(&self, version: &VersionJson) -> Result<Vec<DownloadJob>, DownloadError> {
-        let env = default_environment();
-        Ok(library_jobs_for(&self.mc_dir, &version.libraries, &env)?)
-    }
 }
 
 fn validate_install_version_id(version_id: &str) -> Result<(), DownloadError> {
@@ -679,6 +974,84 @@ fn validate_install_version_id(version_id: &str) -> Result<(), DownloadError> {
         return Err(DownloadError::ResolveManifest(
             "invalid Minecraft version identity".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_vanilla_exact_artifact_contracts(version: &VersionJson) -> Result<(), DownloadError> {
+    let client = version.downloads.client.as_ref().ok_or_else(|| {
+        DownloadError::ResolveManifest(
+            "authenticated version has no exact client artifact".to_string(),
+        )
+    })?;
+    if client.url.trim().is_empty() {
+        return Err(DownloadError::ResolveManifest(
+            "authenticated version has no client source".to_string(),
+        ));
+    }
+    validate_exact_mojang_contract(client.size, &client.sha1, "client")?;
+    if let Some(logging) = version
+        .logging
+        .as_ref()
+        .and_then(|logging| logging.client.as_ref())
+    {
+        if validate_artifact_path_segment(&logging.file.id).is_err()
+            || logging.file.url.trim().is_empty()
+        {
+            return Err(DownloadError::ResolveManifest(
+                "authenticated version has an invalid log config source".to_string(),
+            ));
+        }
+        validate_exact_mojang_contract(logging.file.size, &logging.file.sha1, "log config")?;
+    }
+    let asset_index = &version.asset_index;
+    let absent_asset_index = asset_index.id.is_empty()
+        && asset_index.url.is_empty()
+        && asset_index.sha1.is_empty()
+        && asset_index.size == 0
+        && asset_index.total_size == 0;
+    if absent_asset_index {
+        return Ok(());
+    }
+    let index_name = format!("{}.json", asset_index.id);
+    if asset_index.id.trim().is_empty()
+        || asset_index.url.trim().is_empty()
+        || asset_index.size < 0
+        || asset_index.total_size < 0
+        || validate_artifact_path_segment(&asset_index.id).is_err()
+        || validate_artifact_path_segment(&index_name).is_err()
+    {
+        return Err(DownloadError::ResolveManifest(
+            "authenticated version has an invalid asset index source".to_string(),
+        ));
+    }
+    if asset_index.sha1.len() != 40
+        || !asset_index
+            .sha1
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(DownloadError::ResolveManifest(
+            "authenticated version has an invalid asset index checksum".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_mojang_contract(
+    size: i64,
+    sha1: &str,
+    artifact: &str,
+) -> Result<(), DownloadError> {
+    let expected = ExpectedIntegrity::from_mojang(size, sha1);
+    if expected.size.is_none()
+        || expected.sha1.as_deref().is_none_or(|sha1| {
+            sha1.len() != 40 || !sha1.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err(DownloadError::ResolveManifest(format!(
+            "authenticated version has no exact {artifact} contract"
+        )));
     }
     Ok(())
 }
@@ -715,13 +1088,9 @@ fn parse_vanilla_version_source(
 }
 
 async fn await_client_jar_download(
-    task: Option<tokio::task::JoinHandle<Result<u64, DownloadError>>>,
-) -> Result<Option<u64>, DownloadError> {
-    let Some(task) = task else {
-        return Ok(None);
-    };
-
-    task.await.map_err(client_jar_task_error)?.map(Some)
+    task: tokio::task::JoinHandle<Result<(), DownloadError>>,
+) -> Result<(), DownloadError> {
+    task.await.map_err(client_jar_task_error)?
 }
 
 fn client_jar_task_error(error: tokio::task::JoinError) -> DownloadError {
@@ -740,6 +1109,77 @@ fn client_jar_task_error(error: tokio::task::JoinError) -> DownloadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exact_contract_version() -> serde_json::Value {
+        serde_json::json!({
+            "id": "contract",
+            "downloads": { "client": {
+                "url": "https://example.invalid/client.jar",
+                "sha1": "1111111111111111111111111111111111111111",
+                "size": 7
+            }}
+        })
+    }
+
+    #[test]
+    fn exact_contract_preflight_rejects_invalid_client_metadata() {
+        for (field, replacement) in [
+            ("url", Some(serde_json::json!(""))),
+            ("sha1", Some(serde_json::json!("bad"))),
+            ("size", Some(serde_json::json!(0))),
+            ("size", Some(serde_json::json!(-1))),
+            ("size", None),
+        ] {
+            let mut value = exact_contract_version();
+            if let Some(replacement) = replacement {
+                value["downloads"]["client"][field] = replacement;
+            } else {
+                value["downloads"]["client"]
+                    .as_object_mut()
+                    .expect("client object")
+                    .remove(field);
+            }
+            let version: VersionJson = serde_json::from_value(value).expect("version metadata");
+            assert!(validate_vanilla_exact_artifact_contracts(&version).is_err());
+        }
+    }
+
+    #[test]
+    fn exact_contract_preflight_distinguishes_absent_and_malformed_logging() {
+        for logging in [serde_json::Value::Null, serde_json::json!({})] {
+            let mut value = exact_contract_version();
+            if !logging.is_null() {
+                value["logging"] = logging;
+            }
+            let version: VersionJson = serde_json::from_value(value).expect("version metadata");
+            validate_vanilla_exact_artifact_contracts(&version).expect("absent logging");
+        }
+
+        for file in [
+            serde_json::json!({
+                "id": "../escape.xml", "url": "https://example.invalid/log.xml",
+                "sha1": "2222222222222222222222222222222222222222", "size": 4
+            }),
+            serde_json::json!({
+                "id": "log.xml", "url": "", "sha1": "2222222222222222222222222222222222222222", "size": 4
+            }),
+            serde_json::json!({
+                "id": "log.xml", "url": "https://example.invalid/log.xml",
+                "sha1": "2222222222222222222222222222222222222222", "size": 0
+            }),
+            serde_json::json!({
+                "id": "log.xml", "url": "https://example.invalid/log.xml",
+                "sha1": "2222222222222222222222222222222222222222", "size": -1
+            }),
+        ] {
+            let mut value = exact_contract_version();
+            value["logging"] = serde_json::json!({
+                "client": { "argument": "", "file": file, "type": "log4j2-xml" }
+            });
+            let version: VersionJson = serde_json::from_value(value).expect("version metadata");
+            assert!(validate_vanilla_exact_artifact_contracts(&version).is_err());
+        }
+    }
 
     #[test]
     fn parses_vanilla_metadata_only_for_the_selected_identity() {

@@ -21,7 +21,9 @@ pub use discovery::{
     runtime_component_ready_without_probe, runtime_executable_ready_without_probe,
     runtime_requirement,
 };
-pub(crate) use ensure::{ProcessorRuntime, ensure_axial_managed_processor_runtime};
+pub(crate) use ensure::{
+    ProcessorRuntime, ensure_axial_managed_processor_runtime, materialize_preferred_runtime_source,
+};
 pub use ensure::{ensure_java_runtime, ensure_runtime_with_events};
 pub use model::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureAction,
@@ -59,6 +61,63 @@ pub(crate) use manifest::{
     COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, RuntimeSourceReceipt,
     component_manifest_proof_bytes,
 };
+
+pub(crate) async fn acquire_preferred_runtime_source(
+    java_version: &crate::launch::JavaVersion,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    let component = RuntimeId::from(preferred_runtime_component(java_version));
+    if !is_known_runtime_component(component.as_str()) {
+        return Err(JavaRuntimeLookupError::Download(
+            "preferred runtime component is not in the closed managed-runtime vocabulary"
+                .to_string(),
+        ));
+    }
+    manifest::acquire_runtime_source(&component, &layout::runtime_os_arch()).await
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestRuntimeSourceDescriptor {
+    pub(crate) component: RuntimeId,
+    pub(crate) url: String,
+    pub(crate) sha1: String,
+    pub(crate) size: u64,
+}
+
+#[cfg(test)]
+pub(crate) async fn acquire_test_runtime_source(
+    java_version: &crate::launch::JavaVersion,
+    descriptor: &TestRuntimeSourceDescriptor,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    let preferred = RuntimeId::from(preferred_runtime_component(java_version));
+    if descriptor.component != preferred || !is_known_runtime_component(preferred.as_str()) {
+        return Err(JavaRuntimeLookupError::Download(
+            "test runtime source does not match the preferred managed component".to_string(),
+        ));
+    }
+    manifest::acquire_runtime_source_for_test(
+        preferred,
+        manifest::RuntimeDownloadManifest {
+            url: descriptor.url.clone(),
+            sha1: descriptor.sha1.clone(),
+            size: descriptor.size,
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) fn authenticated_test_runtime_source(
+    java_version: &crate::launch::JavaVersion,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    let preferred = RuntimeId::from(preferred_runtime_component(java_version));
+    if !is_known_runtime_component(preferred.as_str()) {
+        return Err(JavaRuntimeLookupError::Download(
+            "test runtime source does not match the closed managed-runtime vocabulary".to_string(),
+        ));
+    }
+    manifest::authenticated_runtime_source_fixture_for_test(preferred)
+}
 #[cfg(test)]
 pub(crate) use manifest::{
     ComponentManifestDownload, ComponentManifestDownloads, ComponentManifestFile,

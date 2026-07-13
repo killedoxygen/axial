@@ -105,6 +105,14 @@ async fn acquire_runtime_source_from_descriptor(
     policy: RuntimeSourceTransportPolicy,
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
     let bytes = fetch_bounded_runtime_bytes(&expected.url, policy).await?;
+    authenticate_runtime_source_bytes(component, expected, bytes)
+}
+
+fn authenticate_runtime_source_bytes(
+    component: super::model::RuntimeId,
+    expected: RuntimeDownloadManifest,
+    bytes: Vec<u8>,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
     verify_component_manifest_bytes(&bytes, &expected)?;
     let manifest = serde_json::from_slice::<ComponentManifest>(&bytes)
         .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
@@ -178,7 +186,7 @@ pub(super) struct RuntimeDownloadManifest {
 
 pub(super) type RuntimeManifest = HashMap<String, HashMap<String, Vec<RuntimeManifestEntry>>>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeSourceReceipt {
     component: super::model::RuntimeId,
     bytes: Arc<[u8]>,
@@ -243,6 +251,24 @@ pub(super) async fn acquire_runtime_source_for_test(
         RuntimeSourceTransportPolicy::AllowHttpForTest,
     )
     .await
+}
+
+#[cfg(test)]
+pub(super) fn authenticated_runtime_source_fixture_for_test(
+    component: super::model::RuntimeId,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    const MANIFEST: &[u8] = br#"{"files":{"bin":{"type":"directory"},"bin/java":{"type":"file","executable":true,"downloads":{"raw":{"url":"https://fixtures.invalid/java","sha1":"11f6ad8ec52a2984abaafd7c3b516503785c2072","size":1}}}}}"#;
+    const MANIFEST_SHA1: &str = "2797f4f6a71abbbf22d8a8d4386f93135e46cf06";
+
+    authenticate_runtime_source_bytes(
+        component,
+        RuntimeDownloadManifest {
+            url: "https://fixtures.invalid/runtime-manifest.json".to_string(),
+            sha1: MANIFEST_SHA1.to_string(),
+            size: MANIFEST.len() as u64,
+        },
+        MANIFEST.to_vec(),
+    )
 }
 
 #[cfg(test)]

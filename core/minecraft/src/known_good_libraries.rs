@@ -1,7 +1,7 @@
 use crate::artifact_path::ArtifactRelativePath;
 use crate::download::{
-    DownloadJob, ExactLibraryDownloadProof, LibraryArtifactPlan, MaterializedLibraryIdentity,
-    MaterializedSelectedArtifactSource, library_artifact_plans_for,
+    AuthenticatedSelectedArtifactSource, DownloadJob, ExactLibraryDownloadProof,
+    LibraryArtifactPlan, MaterializedLibraryIdentity, library_artifact_plans_for,
 };
 use crate::launch::{Library, VersionJson, effective_java_version_for, library_merge_key};
 use crate::loaders::providers::ProfileInstallProof;
@@ -148,14 +148,17 @@ enum InstallerLibraryProducer {
 
 pub(crate) struct AuthenticatedVanillaLibraryDeclarationSource {
     declarations: PendingExactLibraryDeclarations,
-    bytes: Arc<[u8]>,
-    size: u64,
-    sha1: [u8; 20],
+    source: AuthenticatedSelectedArtifactSource,
 }
 
 impl AuthenticatedVanillaLibraryDeclarationSource {
-    pub(crate) fn into_parts(self) -> (PendingExactLibraryDeclarations, Arc<[u8]>, u64, [u8; 20]) {
-        (self.declarations, self.bytes, self.size, self.sha1)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        PendingExactLibraryDeclarations,
+        AuthenticatedSelectedArtifactSource,
+    ) {
+        (self.declarations, self.source)
     }
 }
 
@@ -863,7 +866,7 @@ impl PendingStreamedLibraryDeclarations {
 }
 
 pub(crate) fn seal_vanilla_exact_library_declarations(
-    source: MaterializedSelectedArtifactSource,
+    source: AuthenticatedSelectedArtifactSource,
     resolved: &VersionJson,
     environment: &Environment,
 ) -> Result<AuthenticatedVanillaLibraryDeclarationSource, SealedLibraryDeclarationError> {
@@ -892,12 +895,9 @@ pub(crate) fn seal_vanilla_exact_library_declarations(
             environment: environment.clone(),
         })),
     )?;
-    let (bytes, size, sha1) = source.into_parts();
     Ok(AuthenticatedVanillaLibraryDeclarationSource {
         declarations,
-        bytes,
-        size,
-        sha1,
+        source,
     })
 }
 

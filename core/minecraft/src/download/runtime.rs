@@ -2,9 +2,9 @@ use super::model::{DownloadError, DownloadProgress, progress};
 use super::plan::TransferPlan;
 use crate::launch::JavaVersion;
 use crate::runtime::{
-    JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeSourceReceipt, ensure_runtime_with_events,
+    JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeSourceReceipt,
+    materialize_preferred_runtime_source,
 };
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -15,8 +15,8 @@ pub(super) struct RuntimeEnsurePipeline {
 }
 
 pub(super) fn spawn_runtime_ensure_pipeline(
-    mc_dir: PathBuf,
     java_version: JavaVersion,
+    source_receipt: RuntimeSourceReceipt,
     plan: Arc<TransferPlan>,
 ) -> RuntimeEnsurePipeline {
     // Runtime bytes are unknown until the component manifest is fetched (and
@@ -29,8 +29,8 @@ pub(super) fn spawn_runtime_ensure_pipeline(
         let progress_tx = progress_tx.clone();
         let mut plan_contribution_resolved = false;
         let mut plan_done_seen = 0_u64;
-        let ensure_result =
-            ensure_runtime_with_events(&mc_dir, &java_version, "", false, None, |event| {
+        let source_receipt =
+            materialize_preferred_runtime_source(&java_version, source_receipt, &mut |event| {
                 match &event {
                     RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
                         bytes_done,
@@ -60,7 +60,23 @@ pub(super) fn spawn_runtime_ensure_pipeline(
         if !plan_contribution_resolved {
             plan.resolve_contribution(0);
         }
-        Ok::<_, JavaRuntimeLookupError>(ensure_result?.source_receipt)
+        Ok::<_, JavaRuntimeLookupError>(Some(source_receipt?))
+    });
+
+    RuntimeEnsurePipeline { task, progress_rx }
+}
+
+#[cfg(test)]
+pub(super) fn spawn_test_runtime_source_pipeline(
+    source_receipt: RuntimeSourceReceipt,
+    plan: Arc<TransferPlan>,
+) -> RuntimeEnsurePipeline {
+    plan.expect_contribution();
+    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        plan.resolve_contribution(0);
+        drop(progress_tx);
+        Ok(Some(source_receipt))
     });
 
     RuntimeEnsurePipeline { task, progress_rx }
@@ -130,6 +146,7 @@ where
     match artifact_result {
         Err(error) => {
             task.abort();
+            let _ = task.await;
             Err(error)
         }
         Ok(artifacts) => {

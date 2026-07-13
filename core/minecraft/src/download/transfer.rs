@@ -62,17 +62,36 @@ struct SelectedArtifactDownload<'a> {
     descriptor_tx: Option<&'a mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 }
 
-pub(super) struct AuthenticatedSelectedArtifactSource {
+pub(crate) struct AuthenticatedSelectedArtifactSource {
     bytes: Arc<[u8]>,
     observed_size: u64,
     observed_sha1: [u8; 20],
+    kind: SelectedDownloadArtifactKind,
+    provider_url: String,
+    logical_identity: String,
     expected: ExpectedIntegrity,
     target: String,
 }
 
 impl AuthenticatedSelectedArtifactSource {
-    pub(super) fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn kind(&self) -> SelectedDownloadArtifactKind {
+        self.kind
+    }
+
+    pub(crate) fn provider_url(&self) -> &str {
+        &self.provider_url
+    }
+
+    pub(crate) fn logical_identity(&self) -> &str {
+        &self.logical_identity
+    }
+
+    pub(crate) fn expected(&self) -> &ExpectedIntegrity {
+        &self.expected
     }
 
     #[cfg(test)]
@@ -88,6 +107,9 @@ impl AuthenticatedSelectedArtifactSource {
 
 pub(super) struct PreparedSelectedArtifactInstall {
     destination: PathBuf,
+    kind: SelectedDownloadArtifactKind,
+    provider_url: String,
+    logical_identity: String,
     expected: ExpectedIntegrity,
     target: String,
 }
@@ -113,6 +135,7 @@ impl PreparedLibraryPublication {
 }
 
 impl PreparedSelectedArtifactInstall {
+    #[cfg(test)]
     pub(super) fn target(&self) -> &str {
         &self.target
     }
@@ -161,6 +184,7 @@ impl RetainedExactSource {
 }
 
 impl MaterializedSelectedArtifactSource {
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> &[u8] {
         self.source.bytes()
     }
@@ -169,12 +193,8 @@ impl MaterializedSelectedArtifactSource {
         Arc::clone(&self.source.bytes)
     }
 
-    pub(crate) fn into_parts(self) -> (Arc<[u8]>, u64, [u8; 20]) {
-        (
-            self.source.bytes,
-            self.source.observed_size,
-            self.source.observed_sha1,
-        )
+    pub(crate) fn into_authenticated_source(self) -> AuthenticatedSelectedArtifactSource {
+        self.source
     }
 }
 
@@ -225,7 +245,9 @@ impl SelectedPromotionTestControl {
 
 pub(super) struct SelectedArtifactSourceRequest<'a> {
     pub(super) client: &'a reqwest::Client,
+    pub(super) kind: SelectedDownloadArtifactKind,
     pub(super) url: &'a str,
+    pub(super) logical_identity: &'a str,
     pub(super) expected: &'a ExpectedIntegrity,
     pub(super) max_bytes: usize,
     pub(super) target: &'a str,
@@ -236,6 +258,7 @@ pub(super) async fn prepare_selected_artifact_install(
     kind: SelectedDownloadArtifactKind,
     destination: &Path,
     url: &str,
+    logical_identity: &str,
     expected: &ExpectedIntegrity,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
     descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
@@ -253,6 +276,9 @@ pub(super) async fn prepare_selected_artifact_install(
     emit_selected_artifact_missing_fact_if_absent(fact_tx, kind, destination, expected).await;
     Ok(PreparedSelectedArtifactInstall {
         destination: destination.to_path_buf(),
+        kind,
+        provider_url: url.to_string(),
+        logical_identity: logical_identity.to_string(),
         expected: expected.clone(),
         target: selected_download_target_label(kind, destination),
     })
@@ -280,6 +306,9 @@ pub(super) async fn prepare_library_publication(
     let selected = PreparedSelectedArtifactInstall {
         target: selected_download_target_label(SelectedDownloadArtifactKind::Library, &destination),
         destination,
+        kind: SelectedDownloadArtifactKind::Library,
+        provider_url: url.to_string(),
+        logical_identity: relative_path.as_str().to_string(),
         expected: expected.clone(),
     };
     Ok(PreparedLibraryPublication {
@@ -297,7 +326,6 @@ pub(super) async fn materialize_authenticated_library_source(
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
 ) -> Result<(MaterializedLibraryIdentity, ExactPublicationOutcome), DownloadError> {
     if source.relative_path() != &prepared.relative_path
-        || source.target() != prepared.selected.target
         || source.expected() != &prepared.selected.expected
         || source.provider_url() != prepared.provider_url
     {
@@ -312,12 +340,11 @@ pub(super) async fn materialize_authenticated_library_source(
         observed_size,
         observed_sha1,
         expected,
-        source_target,
+        _source_target,
         source_provider_url,
         permit,
     ) = source.into_parts();
     if source_relative_path != prepared.relative_path
-        || source_target != prepared.selected.target
         || expected != prepared.selected.expected
         || source_provider_url != prepared.provider_url
     {
@@ -409,15 +436,20 @@ pub(super) async fn materialize_authenticated_selected_artifact_source_with_cont
 
 async fn materialize_authenticated_selected_artifact_source_inner(
     prepared: PreparedSelectedArtifactInstall,
-    source: AuthenticatedSelectedArtifactSource,
+    mut source: AuthenticatedSelectedArtifactSource,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
     #[cfg(test)] control: Option<SelectedPromotionTestControl>,
 ) -> Result<MaterializedSelectedArtifactSource, DownloadError> {
-    if source.target != prepared.target || source.expected != prepared.expected {
+    if source.kind != prepared.kind
+        || source.provider_url != prepared.provider_url
+        || source.logical_identity != prepared.logical_identity
+        || source.expected != prepared.expected
+    {
         return Err(DownloadError::Integrity(
             "authenticated source does not match its prepared install contract".to_string(),
         ));
     }
+    source.target.clone_from(&prepared.target);
     let fact_tx = fact_tx.cloned();
     tokio::spawn(async move {
         materialize_authenticated_selected_artifact_source_owned(
@@ -1233,43 +1265,31 @@ async fn acquire_authenticated_selected_artifact_source_with_retry_delays(
     request: SelectedArtifactSourceRequest<'_>,
     retry_delays: &[Duration],
 ) -> Result<AuthenticatedSelectedArtifactSource, DownloadError> {
-    let SelectedArtifactSourceRequest {
-        client,
-        url,
-        expected,
-        max_bytes,
-        target,
-        fact_tx,
-    } = request;
-    let Some(expected_sha1) = expected.sha1.as_deref() else {
+    let Some(expected_sha1) = request.expected.sha1.as_deref() else {
         emit_source_metadata_failure(
-            expected,
-            target,
-            fact_tx,
+            request.expected,
+            request.target,
+            request.fact_tx,
             ExecutionDownloadFactKind::MetadataMissing,
             "sha1",
         );
-        return Err(source_artifact_metadata_error(target, "missing"));
+        return Err(source_artifact_metadata_error(request.target, "missing"));
     };
     if !is_sha1_hex(expected_sha1) {
         emit_source_metadata_failure(
-            expected,
-            target,
-            fact_tx,
+            request.expected,
+            request.target,
+            request.fact_tx,
             ExecutionDownloadFactKind::MetadataInvalid,
             "sha1",
         );
-        return Err(source_artifact_metadata_error(target, "invalid"));
+        return Err(source_artifact_metadata_error(request.target, "invalid"));
     }
 
-    let max_bytes = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    let max_bytes = u64::try_from(request.max_bytes).unwrap_or(u64::MAX);
     let mut next_delay = 0_usize;
     loop {
-        match acquire_authenticated_selected_artifact_source_attempt(
-            client, url, expected, max_bytes, fact_tx, target,
-        )
-        .await
-        {
+        match acquire_authenticated_selected_artifact_source_attempt(&request, max_bytes).await {
             Ok(source) => return Ok(source),
             Err(error) if error.retryable && next_delay < retry_delays.len() => {
                 let delay = retry_delays[next_delay];
@@ -1293,7 +1313,9 @@ pub(super) async fn acquire_authenticated_selected_artifact_source_with_retry_de
     acquire_authenticated_selected_artifact_source_with_retry_delays(
         SelectedArtifactSourceRequest {
             client,
+            kind: SelectedDownloadArtifactKind::VersionJson,
             url,
+            logical_identity: target,
             expected,
             max_bytes,
             target,
@@ -1310,34 +1332,35 @@ struct VerifiedSelectedBytesAttemptError {
 }
 
 async fn acquire_authenticated_selected_artifact_source_attempt(
-    client: &reqwest::Client,
-    url: &str,
-    expected: &ExpectedIntegrity,
+    request: &SelectedArtifactSourceRequest<'_>,
     max_bytes: u64,
-    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    target: &str,
 ) -> Result<AuthenticatedSelectedArtifactSource, VerifiedSelectedBytesAttemptError> {
-    let response = client.get(url).send().await.map_err(|error| {
-        emit_execution_download_facts(
-            fact_tx,
-            &[execution_download_fact(
-                ExecutionDownloadFactKind::NetworkFailure,
-                target,
-                no_download_fact_fields(),
-            )],
-        );
-        VerifiedSelectedBytesAttemptError {
-            error: DownloadError::Request(error),
-            retryable: true,
-        }
-    })?;
+    let response = request
+        .client
+        .get(request.url)
+        .send()
+        .await
+        .map_err(|error| {
+            emit_execution_download_facts(
+                request.fact_tx,
+                &[execution_download_fact(
+                    ExecutionDownloadFactKind::NetworkFailure,
+                    request.target,
+                    no_download_fact_fields(),
+                )],
+            );
+            VerifiedSelectedBytesAttemptError {
+                error: DownloadError::Request(error),
+                retryable: true,
+            }
+        })?;
     if let Err(error) = response.error_for_status_ref() {
         let status = response.status();
         emit_execution_download_facts(
-            fact_tx,
+            request.fact_tx,
             &[execution_download_fact(
                 ExecutionDownloadFactKind::ProviderFailure,
-                target,
+                request.target,
                 vec![("status", status.as_u16().to_string())],
             )],
         );
@@ -1349,16 +1372,17 @@ async fn acquire_authenticated_selected_artifact_source_attempt(
     let declared_content_length = response.content_length();
     if declared_content_length.is_some_and(|length| length > max_bytes) {
         emit_execution_download_facts(
-            fact_tx,
+            request.fact_tx,
             &[size_mismatch_fact(
-                target,
+                request.target,
                 max_bytes,
                 declared_content_length.unwrap_or(0),
             )],
         );
         return Err(VerifiedSelectedBytesAttemptError {
             error: DownloadError::Integrity(format!(
-                "{target} exceeds the safe in-memory size limit"
+                "{} exceeds the safe in-memory size limit",
+                request.target
             )),
             retryable: false,
         });
@@ -1369,10 +1393,10 @@ async fn acquire_authenticated_selected_artifact_source_attempt(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             emit_execution_download_facts(
-                fact_tx,
+                request.fact_tx,
                 &[execution_download_fact(
                     ExecutionDownloadFactKind::NetworkFailure,
-                    target,
+                    request.target,
                     no_download_fact_fields(),
                 )],
             );
@@ -1384,16 +1408,17 @@ async fn acquire_authenticated_selected_artifact_source_attempt(
         let next_len = body.len().saturating_add(chunk.len());
         if u64::try_from(next_len).unwrap_or(u64::MAX) > max_bytes {
             emit_execution_download_facts(
-                fact_tx,
+                request.fact_tx,
                 &[size_mismatch_fact(
-                    target,
+                    request.target,
                     max_bytes,
                     u64::try_from(next_len).unwrap_or(u64::MAX),
                 )],
             );
             return Err(VerifiedSelectedBytesAttemptError {
                 error: DownloadError::Integrity(format!(
-                    "{target} exceeds the safe in-memory size limit"
+                    "{} exceeds the safe in-memory size limit",
+                    request.target
                 )),
                 retryable: false,
             });
@@ -1402,16 +1427,17 @@ async fn acquire_authenticated_selected_artifact_source_attempt(
     }
     if declared_content_length.is_some_and(|length| length != body.len() as u64) {
         emit_execution_download_facts(
-            fact_tx,
+            request.fact_tx,
             &[execution_download_fact(
                 ExecutionDownloadFactKind::Interrupted,
-                target,
+                request.target,
                 no_download_fact_fields(),
             )],
         );
         return Err(VerifiedSelectedBytesAttemptError {
             error: DownloadError::Integrity(format!(
-                "{target} download ended before the declared content length"
+                "{} download ended before the declared content length",
+                request.target
             )),
             retryable: true,
         });
@@ -1419,8 +1445,16 @@ async fn acquire_authenticated_selected_artifact_source_attempt(
 
     let observed_size = body.len() as u64;
     let observed_sha1: [u8; 20] = Sha1::digest(&body).into();
-    if let Err(error) = verify_source_integrity(target, expected, observed_size, &observed_sha1) {
-        emit_execution_download_facts(fact_tx, &[integrity_mismatch_fact(target, &error)]);
+    if let Err(error) = verify_source_integrity(
+        request.target,
+        request.expected,
+        observed_size,
+        &observed_sha1,
+    ) {
+        emit_execution_download_facts(
+            request.fact_tx,
+            &[integrity_mismatch_fact(request.target, &error)],
+        );
         return Err(VerifiedSelectedBytesAttemptError {
             error: DownloadError::Integrity(error.to_string()),
             retryable: false,
@@ -1430,8 +1464,11 @@ async fn acquire_authenticated_selected_artifact_source_attempt(
         bytes: Arc::from(body),
         observed_size,
         observed_sha1,
-        expected: expected.clone(),
-        target: target.to_string(),
+        kind: request.kind,
+        provider_url: request.url.to_string(),
+        logical_identity: request.logical_identity.to_string(),
+        expected: request.expected.clone(),
+        target: request.target.to_string(),
     })
 }
 
