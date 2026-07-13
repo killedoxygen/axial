@@ -53,18 +53,10 @@ pub(crate) struct IntegrityIdleSnapshot {
 }
 
 impl IntegrityIdleSnapshot {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the R5 stable-idle scheduler slice")
-    )]
     pub(crate) const fn epoch(self) -> IntegrityIdleEpoch {
         self.epoch
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the R5 stable-idle scheduler slice")
-    )]
     pub(crate) const fn is_stably_idle(self) -> bool {
         self.running && self.foreground_count == 0 && !self.sweep_active
     }
@@ -267,6 +259,22 @@ impl IntegrityActivityCoordinator {
             return;
         }
         state.phase = IntegrityActivityPhase::Closing;
+        if let Some(sweep) = state.active_sweep.as_ref() {
+            sweep.cancellation.cancel();
+        }
+        self.publish(&state);
+    }
+
+    pub(super) fn invalidate_idle_epoch(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect(INTEGRITY_ACTIVITY_LOCK_INVARIANT);
+        if state.phase == IntegrityActivityPhase::Closing {
+            return;
+        }
+        state.advance_epoch();
         if let Some(sweep) = state.active_sweep.as_ref() {
             sweep.cancellation.cancel();
         }
@@ -717,6 +725,27 @@ mod tests {
         let idle = *coordinator.subscribe_idle().borrow();
         assert!(idle.is_stably_idle());
         assert_ne!(idle.epoch(), epoch);
+    }
+
+    #[test]
+    fn config_invalidation_advances_idle_epoch_and_cancels_an_active_sweep() {
+        let coordinator = IntegrityActivityCoordinator::new();
+        let epoch = coordinator.subscribe_idle().borrow().epoch();
+        let reservation = coordinator
+            .try_reserve_idle_sweep(epoch, producer())
+            .expect("reservation");
+        let cancellation = reservation.cancellation();
+
+        coordinator.invalidate_idle_epoch();
+
+        let invalidated = *coordinator.subscribe_idle().borrow();
+        assert_ne!(invalidated.epoch(), epoch);
+        assert!(cancellation.is_cancelled());
+        assert!(!reservation.is_current());
+        assert_eq!(
+            reservation.settle(IdleSweepTerminal::Complete),
+            IdleSweepSettlement::Superseded
+        );
     }
 
     #[tokio::test]

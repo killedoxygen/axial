@@ -186,7 +186,7 @@ mod tests {
         observability::telemetry::{
             DEFAULT_POSTHOG_HOST, TelemetryEvent, TelemetryHub, TelemetryLaunchOutcome,
         },
-        state::{AppState, AppStateInit, InstallStore, SessionStore},
+        state::{AppState, AppStateInit, IdleSweepTerminal, InstallStore, SessionStore},
     };
     use axial_config::{
         AppConfig, AppConfigValidationError, AppPaths, ConfigStore, ConfigStoreError,
@@ -342,6 +342,18 @@ mod tests {
     #[tokio::test]
     async fn config_update_persists_guardian_idle_integrity_setting() {
         let fixture = TestFixture::new("guardian-idle-integrity-setting");
+        let initial_idle = *fixture.state.subscribe_integrity_idle().borrow();
+        let reservation = fixture
+            .state
+            .try_reserve_idle_sweep(
+                initial_idle.epoch(),
+                fixture
+                    .state
+                    .try_claim_producer()
+                    .expect("claim config invalidation producer"),
+            )
+            .expect("reserve sweep before config commit");
+        let cancellation = reservation.cancellation();
 
         let disabled = super::update_config(
             &fixture.state,
@@ -354,6 +366,9 @@ mod tests {
         .expect("disable guardian idle integrity");
 
         assert!(!disabled.guardian_idle_integrity_enabled);
+        assert!(cancellation.is_cancelled());
+        assert!(!reservation.is_current());
+        reservation.settle(IdleSweepTerminal::Cancelled);
         assert!(
             !fixture
                 .state
@@ -361,6 +376,8 @@ mod tests {
                 .current()
                 .guardian_idle_integrity_enabled
         );
+        let disabled_epoch = fixture.state.subscribe_integrity_idle().borrow().epoch();
+        assert_ne!(disabled_epoch, initial_idle.epoch());
 
         let enabled = super::update_config(
             &fixture.state,
@@ -373,6 +390,10 @@ mod tests {
         .expect("enable guardian idle integrity");
 
         assert!(enabled.guardian_idle_integrity_enabled);
+        assert_ne!(
+            fixture.state.subscribe_integrity_idle().borrow().epoch(),
+            disabled_epoch
+        );
         assert!(
             fixture
                 .state

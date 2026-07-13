@@ -1,6 +1,6 @@
 use axial_api::app::{
     DEFAULT_API_PORT, build_router, default_frontend_dir, spawn_benchmark_suite_drivers_resume,
-    spawn_known_good_rebuilds, spawn_performance_operations_resume,
+    spawn_idle_integrity_scheduler, spawn_known_good_rebuilds, spawn_performance_operations_resume,
     spawn_performance_rules_refresh, spawn_remote_flags_refresh, spawn_telemetry_export,
 };
 use axial_api::observability::telemetry::{
@@ -62,6 +62,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
     spawn_known_good_rebuilds(&state);
+    spawn_idle_integrity_scheduler(&state);
     spawn_performance_operations_resume(&state);
     spawn_benchmark_suite_drivers_resume(&state);
     spawn_performance_rules_refresh(&state);

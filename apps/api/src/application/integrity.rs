@@ -26,14 +26,14 @@ const JOURNAL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(50);
 const JOURNAL_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IdleIntegrityTerminal {
+pub(super) enum IdleIntegrityTerminal {
     Succeeded,
     Cancelled,
     Refused,
 }
 
 #[must_use = "a planned integrity sweep must execute or be cancelled"]
-pub(crate) struct PlannedIntegritySweep {
+pub(super) struct PlannedIntegritySweep {
     state: AppState,
     producer: ProducerLease,
     instance_id: String,
@@ -41,19 +41,19 @@ pub(crate) struct PlannedIntegritySweep {
 }
 
 #[must_use = "a reserved integrity sweep must execute or be cancelled"]
-pub(crate) struct ReservedIntegritySweep {
+pub(super) struct ReservedIntegritySweep {
     planned: PlannedIntegritySweep,
     reservation: IdleSweepReservation,
 }
 
 #[must_use = "a failed integrity reservation must cancel its durable plan"]
-pub(crate) struct IntegritySweepReservationFailure {
+pub(super) struct IntegritySweepReservationFailure {
     planned: Box<PlannedIntegritySweep>,
     error: IdleSweepReserveError,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum Tier2IntegritySweepError {
+pub(super) enum Tier2IntegritySweepError {
     #[error("Tier 2 integrity target is not a canonical instance")]
     InvalidInstanceId,
     #[error("Tier 2 integrity target is not registered")]
@@ -63,7 +63,7 @@ pub(crate) enum Tier2IntegritySweepError {
 }
 
 impl Tier2IntegritySweepError {
-    pub(crate) const fn class(&self) -> &'static str {
+    pub(super) const fn class(&self) -> &'static str {
         match self {
             Self::InvalidInstanceId => "invalid_instance_id",
             Self::InstanceNotRegistered => "instance_not_registered",
@@ -72,11 +72,7 @@ impl Tier2IntegritySweepError {
     }
 }
 
-#[cfg_attr(
-    test,
-    expect(dead_code, reason = "consumed by the R5 stable-idle scheduler slice")
-)]
-pub(crate) async fn plan_tier2_integrity_sweep(
+pub(super) async fn plan_tier2_integrity_sweep(
     state: AppState,
     producer: ProducerLease,
     instance_id: String,
@@ -112,11 +108,11 @@ async fn plan_tier2_integrity_sweep_with_id(
 
 impl PlannedIntegritySweep {
     #[cfg(test)]
-    pub(crate) fn operation_id(&self) -> &OperationId {
+    fn operation_id(&self) -> &OperationId {
         &self.journal.operation_id
     }
 
-    pub(crate) fn reserve(
+    pub(super) fn reserve(
         self,
         expected_epoch: IntegrityIdleEpoch,
     ) -> Result<ReservedIntegritySweep, IntegritySweepReservationFailure> {
@@ -135,7 +131,7 @@ impl PlannedIntegritySweep {
         }
     }
 
-    pub(crate) async fn cancel(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
+    pub(super) async fn cancel(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
         let transition = Tier2TerminalTransition::cancelled(Tier2IntegrityCounters::default());
         self.record_terminal(&transition).await?;
         Ok(IdleIntegrityTerminal::Cancelled)
@@ -251,15 +247,15 @@ impl PlannedIntegritySweep {
 }
 
 impl ReservedIntegritySweep {
-    pub(crate) async fn execute(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
+    pub(super) fn is_current(&self) -> bool {
+        self.reservation.is_current()
+    }
+
+    pub(super) async fn execute(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
         self.planned.execute_reserved(self.reservation).await
     }
 
-    #[cfg_attr(
-        test,
-        expect(dead_code, reason = "consumed by the R5 stable-idle scheduler slice")
-    )]
-    pub(crate) async fn cancel(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
+    pub(super) async fn cancel(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
         self.reservation.settle(IdleSweepTerminal::Cancelled);
         self.planned.cancel().await
     }
@@ -275,7 +271,7 @@ impl ReservedIntegritySweep {
 }
 
 impl IntegritySweepReservationFailure {
-    pub(crate) const fn class(&self) -> &'static str {
+    pub(super) const fn class(&self) -> &'static str {
         match self.error {
             IdleSweepReserveError::Closing => "closing",
             IdleSweepReserveError::EpochChanged => "epoch_changed",
@@ -284,12 +280,12 @@ impl IntegritySweepReservationFailure {
         }
     }
 
-    pub(crate) async fn cancel(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
+    pub(super) async fn cancel(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
         self.planned.cancel().await
     }
 }
 
-pub(crate) async fn reconcile_interrupted_tier2_integrity_sweeps(
+pub(super) async fn reconcile_interrupted_tier2_integrity_sweeps(
     state: &AppState,
     producer: ProducerLease,
 ) -> Result<(), OperationJournalStoreError> {

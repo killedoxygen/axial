@@ -13,11 +13,8 @@ pub mod flags;
 mod guardian_conversion;
 pub mod install;
 pub mod instances;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the R5 stable-idle scheduler slice")
-)]
 mod integrity;
+mod integrity_scheduler;
 pub mod java;
 mod known_good;
 pub mod launch;
@@ -80,15 +77,7 @@ pub(crate) use install::{
     enqueue_install_from_continuation, enqueue_install_owned, install_queue_status_owned,
     retry_install_owned,
 };
-#[expect(
-    unused_imports,
-    reason = "consumed by the R5 stable-idle scheduler slice"
-)]
-pub(crate) use integrity::{
-    IdleIntegrityTerminal, IntegritySweepReservationFailure, PlannedIntegritySweep,
-    ReservedIntegritySweep, Tier2IntegritySweepError, plan_tier2_integrity_sweep,
-    reconcile_interrupted_tier2_integrity_sweeps,
-};
+pub(crate) use integrity_scheduler::spawn_idle_integrity_scheduler;
 pub use java::{JavaRuntimesResponse, java_runtimes};
 pub(crate) use known_good::{
     rebuild_registered_known_good, registered_known_good_is_live, spawn_startup_known_good_rebuilds,

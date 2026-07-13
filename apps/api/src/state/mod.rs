@@ -890,13 +890,18 @@ impl AppState {
     #[cfg(test)]
     pub fn set_library_dir_for_test(&self, value: String) {
         let mut config = self.config.current();
-        if config.library_dir != value {
-            self.known_good.clear_active();
-        }
         config.library_dir = value;
+        self.replace_config_for_test(config);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_config_for_test(&self, config: AppConfig) {
+        let previous = self.config.current();
         self.config
             .replace_for_test(config)
             .expect("test config replacement must remain valid");
+        let current = self.config.current();
+        self.config_commit_observer()(previous, current);
     }
 
     pub async fn mutate_config<Mutation>(
@@ -1407,6 +1412,7 @@ impl AppState {
         let changes = self.config_changes.clone();
         let known_good = self.known_good.clone();
         let installed_versions = self.installed_versions.clone();
+        let integrity_activity = self.integrity_activity.clone();
         Arc::new(move |previous: AppConfig, current: AppConfig| {
             if previous.telemetry_enabled && !current.telemetry_enabled {
                 telemetry.clear_queue();
@@ -1419,6 +1425,7 @@ impl AppState {
             {
                 installed_versions.invalidate();
             }
+            integrity_activity.invalidate_idle_epoch();
             let _ = changes.send(());
         })
     }
