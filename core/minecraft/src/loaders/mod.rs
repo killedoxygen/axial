@@ -19,11 +19,16 @@ pub use api::{
 };
 pub(crate) use bound_processors::VerifiedProcessorOutputs;
 pub(crate) use compose::{LoaderProfileFragment, compose_loader_version};
-pub(crate) use forge_installer::{VerifiedInstallerClientBytes, VerifiedInstallerReceiptSource};
+pub(crate) use forge_installer::{
+    AuthenticatedEmbeddedMavenArtifact, AuthenticatedInstallerLibraryInputs,
+    AuthenticatedInstallerLibraryParts, AuthenticatedInstallerReceiptInput,
+    PendingForgeInstallExecution, PendingForgeNetworkInstall, VerifiedInstallerClientBytes,
+};
 pub use index::{
     fetch_builds, fetch_cached_builds, fetch_components, fetch_supported_versions,
     resolve_build_record_for_install,
 };
+pub(crate) use managed_fs::MaterializedInstallerLibrary;
 pub use types::{
     LOADER_CATALOG_SCHEMA_VERSION, LoaderActiveInstallFailure, LoaderArtifactKind,
     LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState,

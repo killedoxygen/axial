@@ -1,8 +1,7 @@
 use super::forge_installer::{
-    AuthenticatedEmbeddedMavenArtifact, BoundForgeInstallerContinuation,
-    BoundForgeProcessorExecution, BoundProcessorArgument, BoundProcessorArgumentPart,
-    BoundProcessorArtifact, BoundProcessorData, BoundProcessorOutputRole, BoundProcessorPlan,
-    BoundProcessorStep, ProcessorBuiltinToken,
+    BoundForgeInstallerContinuation, BoundForgeProcessorExecution, BoundProcessorArgument,
+    BoundProcessorArgumentPart, BoundProcessorArtifact, BoundProcessorData,
+    BoundProcessorOutputRole, BoundProcessorPlan, BoundProcessorStep, ProcessorBuiltinToken,
 };
 use super::managed_fs::ManagedTreeSnapshot;
 use super::workspace::cleanup::{LoaderWorkspace, ProcessorWorkspace};
@@ -333,7 +332,8 @@ async fn stage_inputs(
                 .read_live_library_authenticated(path, contract.size, &contract.sha1)
                 .map_err(|_| BoundProcessorError::Authority)?,
             super::forge_installer::BoundProcessorInputSource::Embedded => {
-                let embedded = exact_embedded(continuation.embedded_maven_artifacts(), path)
+                let embedded = continuation
+                    .embedded_maven_artifact(path)
                     .ok_or(BoundProcessorError::Authority)?;
                 authenticate_bytes(embedded.bytes(), contract.size, &contract.sha1)?
             }
@@ -413,17 +413,6 @@ async fn stage_inputs(
         installer,
         base_client_bytes: client_bytes,
     })
-}
-
-fn exact_embedded<'a>(
-    embedded: &'a [AuthenticatedEmbeddedMavenArtifact],
-    path: &ArtifactRelativePath,
-) -> Option<&'a AuthenticatedEmbeddedMavenArtifact> {
-    let mut matches = embedded
-        .iter()
-        .filter(|artifact| artifact.relative_path() == path);
-    let found = matches.next()?;
-    matches.next().is_none().then_some(found)
 }
 
 fn authenticate_bytes(

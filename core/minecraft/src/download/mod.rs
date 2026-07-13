@@ -23,7 +23,7 @@ pub use integrity::{
     verify_existing_launcher_managed_artifact,
 };
 pub(crate) use libraries::DownloadJob;
-pub(crate) use libraries::download_installer_libraries_with_authority_and_facts_and_descriptors;
+pub(crate) use libraries::download_installer_libraries_with_declarations_and_facts_and_descriptors;
 pub(crate) use libraries::{
     LibraryArtifactPlan, download_profile_libraries_with_declarations_and_facts_and_descriptors,
     library_artifact_plans_for,
@@ -31,13 +31,13 @@ pub(crate) use libraries::{
 pub use libraries::{
     LibraryVerificationIntegrity, LibraryVerificationPlan, library_verification_plans_for,
 };
-pub(crate) use model::ExactLibraryDownloadProof;
 pub use model::{
     DownloadError, DownloadProgress, ExecutionDownloadError, ExecutionDownloadFact,
     ExecutionDownloadFactKind, ExecutionDownloadOwnership, ExecutionDownloadReport,
     ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactDescriptor,
     SelectedDownloadArtifactKind,
 };
+pub(crate) use model::{ExactLibraryDownloadProof, MaterializedLibraryIdentity};
 pub(crate) use transfer::MaterializedSelectedArtifactSource;
 pub use transfer::download_file_with_client_report;
 #[cfg(test)]

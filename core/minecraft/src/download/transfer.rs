@@ -10,10 +10,9 @@ use super::integrity::{
 };
 use super::library_source::AuthenticatedLibrarySource;
 use super::model::{
-    ActualIntegrity, DownloadError, DownloadIntegrityError, ExactLibraryDownloadProof,
-    ExecutionDownloadError, ExecutionDownloadFact, ExecutionDownloadFactKind,
-    ExecutionDownloadReport, ExpectedIntegrity, SelectedDownloadArtifactDescriptor,
-    SelectedDownloadArtifactKind,
+    ActualIntegrity, DownloadError, DownloadIntegrityError, ExecutionDownloadError,
+    ExecutionDownloadFact, ExecutionDownloadFactKind, ExecutionDownloadReport, ExpectedIntegrity,
+    MaterializedLibraryIdentity, SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind,
 };
 use super::path_safety::{
     bounded_download_file_label, filesystem_path, safe_download_target_label,
@@ -296,7 +295,7 @@ pub(super) async fn materialize_authenticated_library_source(
     prepared: PreparedLibraryPublication,
     source: AuthenticatedLibrarySource,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-) -> Result<(ExactLibraryDownloadProof, ExactPublicationOutcome), DownloadError> {
+) -> Result<(MaterializedLibraryIdentity, ExactPublicationOutcome), DownloadError> {
     if source.relative_path() != &prepared.relative_path
         || source.target() != prepared.selected.target
         || source.expected() != &prepared.selected.expected
@@ -346,6 +345,7 @@ pub(super) async fn materialize_authenticated_library_source(
     )
     .await;
     let target = prepared.selected.target;
+    let destination = prepared.selected.destination.clone();
     let outcome = publish_authenticated_retained_file(
         RetainedExactSource::new(file, observed_size, observed_sha1, permit),
         prepared.selected.destination,
@@ -363,8 +363,9 @@ pub(super) async fn materialize_authenticated_library_source(
     ));
     emit_execution_download_facts(fact_tx, &facts);
     Ok((
-        ExactLibraryDownloadProof::new(
+        MaterializedLibraryIdentity::new(
             prepared.relative_path,
+            destination,
             prepared.is_native,
             prepared.provider_url,
             expected,

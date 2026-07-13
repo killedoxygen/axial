@@ -60,8 +60,6 @@ pub enum LibraryPlanError {
     ConflictingArtifactPath,
     #[error("library artifact integrity metadata conflicts across representations")]
     ConflictingArtifactIntegrity,
-    #[error("installer library exclusions do not exactly match the planned artifact inventory")]
-    InvalidArtifactExclusions,
 }
 
 pub(crate) struct ExactLibraryDownloadProof {
@@ -73,11 +71,98 @@ pub(crate) struct ExactLibraryDownloadProof {
     sha1: [u8; 20],
 }
 
-impl ExactLibraryDownloadProof {
-    pub(super) fn observed_size(&self) -> u64 {
-        self.size
+pub(crate) struct MaterializedLibraryIdentity {
+    path: ArtifactRelativePath,
+    destination: PathBuf,
+    is_native: bool,
+    provider_url: String,
+    expected: ExpectedIntegrity,
+    size: u64,
+    sha1: [u8; 20],
+}
+
+impl MaterializedLibraryIdentity {
+    pub(super) fn new(
+        path: ArtifactRelativePath,
+        destination: PathBuf,
+        is_native: bool,
+        provider_url: String,
+        expected: ExpectedIntegrity,
+        size: u64,
+        sha1: [u8; 20],
+    ) -> Self {
+        Self {
+            path,
+            destination,
+            is_native,
+            provider_url,
+            expected,
+            size,
+            sha1,
+        }
     }
 
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ArtifactRelativePath,
+        PathBuf,
+        bool,
+        String,
+        ExpectedIntegrity,
+        u64,
+        [u8; 20],
+    ) {
+        (
+            self.path,
+            self.destination,
+            self.is_native,
+            self.provider_url,
+            self.expected,
+            self.size,
+            self.sha1,
+        )
+    }
+
+    pub(crate) fn from_installer_publication(
+        publication: crate::loaders::MaterializedInstallerLibrary,
+    ) -> Self {
+        let (source, destination) = publication.into_parts();
+        let (path, is_native, sha1, size) = source.into_materialized_parts();
+        Self {
+            path,
+            destination,
+            is_native,
+            provider_url: String::new(),
+            expected: ExpectedIntegrity::default(),
+            size,
+            sha1,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test(
+        path: ArtifactRelativePath,
+        destination: PathBuf,
+        is_native: bool,
+        provider_url: String,
+        expected: ExpectedIntegrity,
+        size: u64,
+        sha1: [u8; 20],
+    ) -> Self {
+        Self {
+            path,
+            destination,
+            is_native,
+            provider_url,
+            expected,
+            size,
+            sha1,
+        }
+    }
+}
+
+impl ExactLibraryDownloadProof {
     pub(super) fn new(
         path: ArtifactRelativePath,
         is_native: bool,

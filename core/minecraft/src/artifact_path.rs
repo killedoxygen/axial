@@ -29,6 +29,10 @@ impl ArtifactRelativePath {
     pub(crate) fn join_under(&self, root: &Path) -> PathBuf {
         root.join(&self.0)
     }
+
+    pub(crate) fn portable_key(&self) -> String {
+        self.0.chars().flat_map(char::to_lowercase).collect()
+    }
 }
 
 pub(crate) fn validate_artifact_path_segment(value: &str) -> Result<(), ArtifactRelativePathError> {

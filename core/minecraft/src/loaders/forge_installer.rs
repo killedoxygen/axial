@@ -7,6 +7,12 @@ use super::types::{
 };
 use crate::artifact_path::ArtifactRelativePath;
 use crate::download::{DownloadError, library_artifact_plans_for};
+use crate::known_good_libraries::{
+    BoundInstallerLibraryDeclarations, ClassifiedLibraryDownload,
+    PendingInstallerNetworkDeclarations, PendingInstallerPublications,
+    PendingInstallerTerminalDeclarations, SealedExactLibraryDeclarations,
+    bind_installer_library_declarations,
+};
 use crate::launch::{Library, maven_to_path};
 use crate::rules::default_environment;
 use serde::{Deserialize, Deserializer, de};
@@ -167,15 +173,103 @@ pub(crate) enum BoundForgeInstallExecution {
 }
 
 pub(crate) struct BoundForgeInstallerContinuation {
-    authenticated: AuthenticatedForgeInstallerPlan,
+    source: VerifiedLoaderSource,
+    version: LoaderProfileFragment,
+    library_declarations: InstallerDeclarationState,
+    strip_client_meta: bool,
+}
+
+enum InstallerDeclarationState {
+    Bound(BoundInstallerLibraryDeclarations),
+    NetworkPending(PendingInstallerNetworkDeclarations),
+    TerminalPending(PendingInstallerTerminalDeclarations),
+}
+
+pub(crate) struct PendingForgeNetworkInstall {
+    execution: BoundForgeInstallExecution,
+    jobs: Vec<ClassifiedLibraryDownload>,
+}
+
+pub(crate) struct PendingForgeInstallExecution {
+    execution: BoundForgeInstallExecution,
+}
+
+impl BoundForgeInstallExecution {
+    pub(crate) fn into_network_install(
+        self,
+        libraries_root: &Path,
+    ) -> Result<PendingForgeNetworkInstall, ForgeInstallerError> {
+        let (execution, jobs) = match self {
+            Self::Run(execution) => {
+                let BoundForgeProcessorExecution { plan, continuation } = *execution;
+                let (continuation, jobs) = continuation.into_network_install(libraries_root)?;
+                (
+                    Self::Run(Box::new(BoundForgeProcessorExecution {
+                        plan,
+                        continuation,
+                    })),
+                    jobs,
+                )
+            }
+            Self::Continue(continuation) => {
+                let (continuation, jobs) = continuation.into_network_install(libraries_root)?;
+                (Self::Continue(Box::new(continuation)), jobs)
+            }
+            Self::UnsupportedMissingOutputs => {
+                return Err(ForgeInstallerError::MissingForgeProcessorOutputs);
+            }
+        };
+        Ok(PendingForgeNetworkInstall { execution, jobs })
+    }
+}
+
+impl PendingForgeNetworkInstall {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (PendingForgeInstallExecution, Vec<ClassifiedLibraryDownload>) {
+        (
+            PendingForgeInstallExecution {
+                execution: self.execution,
+            },
+            self.jobs,
+        )
+    }
+}
+
+impl PendingForgeInstallExecution {
+    pub(crate) fn complete_network(
+        self,
+        materialized: Vec<crate::download::MaterializedLibraryIdentity>,
+    ) -> Result<BoundForgeInstallExecution, ForgeInstallerError> {
+        match self.execution {
+            BoundForgeInstallExecution::Run(execution) => {
+                let BoundForgeProcessorExecution { plan, continuation } = *execution;
+                let continuation = continuation.complete_network(materialized)?;
+                Ok(BoundForgeInstallExecution::Run(Box::new(
+                    BoundForgeProcessorExecution { plan, continuation },
+                )))
+            }
+            BoundForgeInstallExecution::Continue(continuation) => {
+                let continuation = continuation.complete_network(materialized)?;
+                Ok(BoundForgeInstallExecution::Continue(Box::new(continuation)))
+            }
+            BoundForgeInstallExecution::UnsupportedMissingOutputs => {
+                Err(ForgeInstallerError::MissingForgeProcessorOutputs)
+            }
+        }
+    }
 }
 
 pub(crate) struct VerifiedInstallerReceiptSource {
     source: VerifiedLoaderSource,
     version: LoaderProfileFragment,
-    libraries: Vec<Library>,
-    embedded_maven_artifacts: Vec<AuthenticatedEmbeddedMavenArtifact>,
     strip_client_meta: bool,
+}
+
+pub(crate) struct AuthenticatedInstallerReceiptInput {
+    source: VerifiedInstallerReceiptSource,
+    library_declarations: SealedExactLibraryDeclarations,
+    pending_publications: PendingInstallerPublications,
 }
 
 pub(crate) struct VerifiedInstallerClientBytes {
@@ -272,10 +366,53 @@ pub(super) enum BoundProcessorOutputRole {
     Terminal { expected_size: Option<u64> },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct AuthenticatedEmbeddedMavenArtifact {
     relative_path: ArtifactRelativePath,
     bytes: Vec<u8>,
+}
+
+pub(crate) struct AuthenticatedInstallerLibraryInputs {
+    libraries: Vec<Library>,
+    embedded_artifacts: Vec<AuthenticatedEmbeddedMavenArtifact>,
+    terminal_outputs: Vec<(ArtifactRelativePath, [u8; 20], Option<u64>)>,
+}
+
+pub(crate) struct AuthenticatedInstallerLibraryParts {
+    pub(crate) libraries: Vec<Library>,
+    pub(crate) embedded_artifacts: Vec<AuthenticatedEmbeddedMavenArtifact>,
+    pub(crate) terminal_outputs: Vec<(ArtifactRelativePath, [u8; 20], Option<u64>)>,
+}
+
+impl AuthenticatedInstallerLibraryInputs {
+    pub(crate) fn into_parts(self) -> AuthenticatedInstallerLibraryParts {
+        AuthenticatedInstallerLibraryParts {
+            libraries: self.libraries,
+            embedded_artifacts: self.embedded_artifacts,
+            terminal_outputs: self.terminal_outputs,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test(
+        libraries: Vec<Library>,
+        embedded_artifacts: Vec<(ArtifactRelativePath, Vec<u8>)>,
+        terminal_outputs: Vec<(ArtifactRelativePath, [u8; 20], Option<u64>)>,
+    ) -> Self {
+        Self {
+            libraries,
+            embedded_artifacts: embedded_artifacts
+                .into_iter()
+                .map(
+                    |(relative_path, bytes)| AuthenticatedEmbeddedMavenArtifact {
+                        relative_path,
+                        bytes,
+                    },
+                )
+                .collect(),
+            terminal_outputs,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -303,14 +440,55 @@ impl BoundForgeInstallerPlan {
         &self.processor_disposition
     }
 
-    pub(crate) fn into_install_execution(self) -> BoundForgeInstallExecution {
+    pub(crate) fn into_install_execution(
+        self,
+    ) -> Result<BoundForgeInstallExecution, ForgeInstallerError> {
         let Self {
-            mut authenticated,
+            authenticated,
             processor_disposition,
         } = self;
-        authenticated.install_profile_json = None;
-        let continuation = BoundForgeInstallerContinuation { authenticated };
-        match processor_disposition {
+        let terminal_outputs = match &processor_disposition {
+            BoundProcessorDisposition::TypedRunnable(plan) => plan
+                .steps
+                .iter()
+                .flat_map(|step| &step.outputs)
+                .filter_map(|output| match output.role {
+                    BoundProcessorOutputRole::Intermediate => None,
+                    BoundProcessorOutputRole::Terminal { expected_size } => Some((
+                        output.artifact.relative_path.clone(),
+                        output.sha1,
+                        expected_size,
+                    )),
+                })
+                .collect(),
+            BoundProcessorDisposition::LegacyNoClientWork
+            | BoundProcessorDisposition::EmptyClientWork
+            | BoundProcessorDisposition::UnsupportedMissingOutputs => Vec::new(),
+        };
+        let AuthenticatedForgeInstallerPlan {
+            source,
+            version,
+            install_profile_json: _,
+            libraries,
+            embedded_maven_artifacts,
+            strip_client_meta,
+        } = authenticated;
+        let library_declarations = bind_installer_library_declarations(
+            AuthenticatedInstallerLibraryInputs {
+                libraries,
+                embedded_artifacts: embedded_maven_artifacts,
+                terminal_outputs,
+            },
+            default_environment(),
+        )
+        .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?;
+        let continuation = BoundForgeInstallerContinuation {
+            source,
+            version,
+            library_declarations: InstallerDeclarationState::Bound(library_declarations),
+            strip_client_meta,
+        };
+        Ok(match processor_disposition {
             BoundProcessorDisposition::TypedRunnable(plan) => {
                 BoundForgeInstallExecution::Run(Box::new(BoundForgeProcessorExecution {
                     plan,
@@ -324,7 +502,7 @@ impl BoundForgeInstallerPlan {
             BoundProcessorDisposition::UnsupportedMissingOutputs => {
                 BoundForgeInstallExecution::UnsupportedMissingOutputs
             }
-        }
+        })
     }
 }
 
@@ -332,84 +510,141 @@ impl BoundForgeProcessorExecution {
     pub(super) fn into_parts(self) -> (BoundForgeInstallerContinuation, BoundProcessorPlan) {
         (self.continuation, self.plan)
     }
-
-    pub(crate) fn excluded_live_library_paths(
-        &self,
-    ) -> Result<BTreeSet<ArtifactRelativePath>, ForgeInstallerError> {
-        let mut paths = self.continuation.final_embedded_library_paths()?;
-        paths.extend(
-            self.plan
-                .steps
-                .iter()
-                .flat_map(|step| &step.outputs)
-                .filter(|output| matches!(output.role, BoundProcessorOutputRole::Terminal { .. }))
-                .map(|output| output.artifact.relative_path.clone()),
-        );
-        Ok(paths)
-    }
-
-    pub(crate) fn libraries(&self) -> &[Library] {
-        &self.continuation.authenticated.libraries
-    }
 }
 
 impl BoundForgeInstallerContinuation {
     pub(super) fn source_bytes(&self) -> &[u8] {
-        self.authenticated.source.bytes()
+        self.source.bytes()
     }
 
-    pub(super) fn embedded_maven_artifacts(&self) -> &[AuthenticatedEmbeddedMavenArtifact] {
-        &self.authenticated.embedded_maven_artifacts
+    pub(super) fn embedded_maven_artifact(
+        &self,
+        path: &ArtifactRelativePath,
+    ) -> Option<&AuthenticatedEmbeddedMavenArtifact> {
+        match &self.library_declarations {
+            InstallerDeclarationState::NetworkPending(declarations) => {
+                declarations.embedded_maven_artifact(path)
+            }
+            InstallerDeclarationState::TerminalPending(declarations) => {
+                declarations.embedded_maven_artifact(path)
+            }
+            InstallerDeclarationState::Bound(_) => None,
+        }
     }
 
     pub(crate) fn version(&self) -> &LoaderProfileFragment {
-        &self.authenticated.version
+        &self.version
     }
 
-    pub(crate) fn libraries(&self) -> &[Library] {
-        &self.authenticated.libraries
-    }
-
-    fn final_embedded_library_paths(
-        &self,
-    ) -> Result<BTreeSet<ArtifactRelativePath>, ForgeInstallerError> {
-        let final_paths =
-            library_artifact_plans_for(&self.authenticated.libraries, &default_environment())
-                .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?
-                .into_iter()
-                .map(|plan| plan.relative_path)
-                .collect::<BTreeSet<_>>();
-        Ok(self
-            .authenticated
-            .embedded_maven_artifacts
-            .iter()
-            .filter(|artifact| final_paths.contains(&artifact.relative_path))
-            .map(|artifact| artifact.relative_path.clone())
-            .collect())
-    }
-
-    pub(crate) fn excluded_live_library_paths(
-        &self,
-    ) -> Result<BTreeSet<ArtifactRelativePath>, ForgeInstallerError> {
-        self.final_embedded_library_paths()
-    }
-
-    pub(crate) fn into_receipt_source(self) -> VerifiedInstallerReceiptSource {
-        let AuthenticatedForgeInstallerPlan {
+    pub(crate) fn into_receipt_input(
+        self,
+        outputs: crate::loaders::VerifiedProcessorOutputs,
+    ) -> Result<AuthenticatedInstallerReceiptInput, ForgeInstallerError> {
+        let Self {
             source,
             version,
-            install_profile_json: _,
-            libraries,
-            embedded_maven_artifacts,
+            library_declarations,
             strip_client_meta,
-        } = self.authenticated;
-        VerifiedInstallerReceiptSource {
+        } = self;
+        let InstallerDeclarationState::TerminalPending(library_declarations) = library_declarations
+        else {
+            return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
+        };
+        let (library_declarations, pending_publications) = library_declarations
+            .seal_terminal_outputs(outputs)
+            .map_err(|_| ForgeInstallerError::InvalidForgeProcessorFinalOutput)?;
+        Ok(AuthenticatedInstallerReceiptInput {
+            source: VerifiedInstallerReceiptSource {
+                source,
+                version,
+                strip_client_meta,
+            },
+            library_declarations,
+            pending_publications,
+        })
+    }
+
+    fn into_network_install(
+        self,
+        libraries_root: &Path,
+    ) -> Result<(Self, Vec<ClassifiedLibraryDownload>), ForgeInstallerError> {
+        let Self {
             source,
             version,
-            libraries,
-            embedded_maven_artifacts,
+            library_declarations,
             strip_client_meta,
-        }
+        } = self;
+        let InstallerDeclarationState::Bound(library_declarations) = library_declarations else {
+            return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
+        };
+        let (library_declarations, jobs) =
+            library_declarations
+                .into_network_jobs(libraries_root)
+                .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?;
+        Ok((
+            Self {
+                source,
+                version,
+                library_declarations: InstallerDeclarationState::NetworkPending(
+                    library_declarations,
+                ),
+                strip_client_meta,
+            },
+            jobs,
+        ))
+    }
+
+    fn complete_network(
+        self,
+        materialized: Vec<crate::download::MaterializedLibraryIdentity>,
+    ) -> Result<Self, ForgeInstallerError> {
+        let Self {
+            source,
+            version,
+            library_declarations,
+            strip_client_meta,
+        } = self;
+        let InstallerDeclarationState::NetworkPending(library_declarations) = library_declarations
+        else {
+            return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
+        };
+        let library_declarations = library_declarations
+            .complete_network(materialized)
+            .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?;
+        Ok(Self {
+            source,
+            version,
+            library_declarations: InstallerDeclarationState::TerminalPending(library_declarations),
+            strip_client_meta,
+        })
+    }
+}
+
+impl AuthenticatedInstallerReceiptInput {
+    pub(crate) fn version(&self) -> &LoaderProfileFragment {
+        self.source.version()
+    }
+
+    pub(crate) fn derive_child_client_bytes(
+        &self,
+        authenticated_base_bytes: &[u8],
+    ) -> Result<VerifiedInstallerClientBytes, ForgeInstallerError> {
+        self.source
+            .derive_child_client_bytes(authenticated_base_bytes)
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        VerifiedInstallerReceiptSource,
+        SealedExactLibraryDeclarations,
+        PendingInstallerPublications,
+    ) {
+        (
+            self.source,
+            self.library_declarations,
+            self.pending_publications,
+        )
     }
 }
 
@@ -420,14 +655,6 @@ impl VerifiedInstallerReceiptSource {
 
     pub(crate) fn version(&self) -> &LoaderProfileFragment {
         &self.version
-    }
-
-    pub(crate) fn libraries(&self) -> &[Library] {
-        &self.libraries
-    }
-
-    pub(crate) fn embedded_maven_artifacts(&self) -> &[AuthenticatedEmbeddedMavenArtifact] {
-        &self.embedded_maven_artifacts
     }
 
     pub(crate) fn derive_child_client_bytes(
@@ -453,17 +680,8 @@ impl VerifiedInstallerReceiptSource {
         })
     }
 
-    pub(crate) fn into_embedded_maven_artifacts(self) -> Vec<AuthenticatedEmbeddedMavenArtifact> {
-        self.embedded_maven_artifacts
-    }
-
     #[cfg(test)]
-    pub(crate) fn from_test(
-        version_libraries: Vec<Library>,
-        libraries: Vec<Library>,
-        embedded_maven_artifacts: Vec<(ArtifactRelativePath, Vec<u8>)>,
-        strip_client_meta: bool,
-    ) -> Self {
+    pub(crate) fn from_test(version_libraries: Vec<Library>, strip_client_meta: bool) -> Self {
         let version = LoaderProfileFragment {
             main_class: "example.LoaderMain".to_string(),
             libraries: version_libraries,
@@ -472,16 +690,6 @@ impl VerifiedInstallerReceiptSource {
         Self {
             source: VerifiedLoaderSource::from_test_bytes(b"verified installer".to_vec()),
             version,
-            libraries,
-            embedded_maven_artifacts: embedded_maven_artifacts
-                .into_iter()
-                .map(
-                    |(relative_path, bytes)| AuthenticatedEmbeddedMavenArtifact {
-                        relative_path,
-                        bytes,
-                    },
-                )
-                .collect(),
             strip_client_meta,
         }
     }
@@ -520,6 +728,10 @@ impl AuthenticatedEmbeddedMavenArtifact {
 
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn into_parts(self) -> (ArtifactRelativePath, Vec<u8>) {
+        (self.relative_path, self.bytes)
     }
 }
 
@@ -710,7 +922,7 @@ pub(crate) fn plan_authenticated_installer(
     let mut embedded = BTreeMap::new();
     let mut embedded_total = 0_u64;
     for (index, path, source_name) in embedded_candidates {
-        if !allowed.contains_key(&portable_path_key(path.as_str())) {
+        if !allowed.contains_key(&portable_path_key(&path)) {
             return Err(ForgeInstallerError::UndeclaredEmbeddedArtifact { name: source_name });
         }
         let mut entry = archive.by_index(index)?;
@@ -1036,7 +1248,7 @@ fn bind_forge_processor_plan(
         for (target, sha1) in &declaration.outputs {
             let artifact = resolve_processor_output_artifact(target, &data)?;
             let sha1 = resolve_processor_output_sha1(sha1, &data)?;
-            let portable = portable_path_key(artifact.relative_path.as_str());
+            let portable = portable_path_key(&artifact.relative_path);
             let output = BoundProcessorOutput {
                 artifact,
                 sha1,
@@ -1234,7 +1446,7 @@ fn resolved_processor_artifact_contracts(
                 source: BoundProcessorInputSource::Embedded,
             },
         };
-        let portable = portable_path_key(embedded_contract.path.as_str());
+        let portable = portable_path_key(&embedded_contract.path);
         if let Some(final_contract) = final_inventory.get(&portable)
             && (final_contract.path != embedded_contract.path
                 || final_contract
@@ -1271,7 +1483,7 @@ fn insert_exact_input_contract(
     contracts: &mut HashMap<String, ExactProcessorInputContract>,
     contract: ExactProcessorInputContract,
 ) -> Result<(), ForgeInstallerError> {
-    let portable = portable_path_key(contract.path.as_str());
+    let portable = portable_path_key(&contract.path);
     match contracts.get(&portable) {
         Some(existing) if existing.path != contract.path => {
             Err(ForgeInstallerError::ForgeProcessorPortableAlias)
@@ -1294,7 +1506,7 @@ fn insert_exact_final_contract(
     contracts: &mut HashMap<String, ExactProcessorFinalContract>,
     contract: ExactProcessorFinalContract,
 ) -> Result<(), ForgeInstallerError> {
-    let portable = portable_path_key(contract.path.as_str());
+    let portable = portable_path_key(&contract.path);
     match contracts.get(&portable) {
         Some(existing) if existing.path != contract.path => {
             Err(ForgeInstallerError::ForgeProcessorPortableAlias)
@@ -1488,7 +1700,7 @@ fn parse_processor_argument(
     }
     if let Some(coordinate) = exact_delimited(arg, '[', ']') {
         let artifact = parse_processor_artifact(coordinate)?;
-        let portable = portable_path_key(artifact.relative_path.as_str());
+        let portable = portable_path_key(&artifact.relative_path);
         if let Some(expected) = current_outputs.get(&portable) {
             if expected != artifact.relative_path.as_str() {
                 return Err(ForgeInstallerError::ForgeProcessorPortableAlias);
@@ -1532,7 +1744,7 @@ fn parse_processor_argument(
                 }
                 if let Some(value) = data.get(&token) {
                     if let BoundProcessorData::Artifact(artifact) = value {
-                        let portable = portable_path_key(artifact.relative_path.as_str());
+                        let portable = portable_path_key(&artifact.relative_path);
                         if let Some(expected) = current_outputs.get(&portable) {
                             if expected != artifact.relative_path.as_str() {
                                 return Err(ForgeInstallerError::ForgeProcessorPortableAlias);
@@ -1706,7 +1918,7 @@ fn classify_processor_outputs(
     final_inventory: &HashMap<String, ExactProcessorFinalContract>,
 ) -> Result<(), ForgeInstallerError> {
     for output in steps.iter_mut().flat_map(|step| &mut step.outputs) {
-        let portable = portable_path_key(output.artifact.relative_path.as_str());
+        let portable = portable_path_key(&output.artifact.relative_path);
         let consumed_by_later_step = consumed_outputs.contains(&portable);
         if let Some(contract) = final_inventory.get(&portable) {
             if contract.path != output.artifact.relative_path
@@ -1730,7 +1942,7 @@ fn record_processor_dependency(
     dependencies: &mut BTreeMap<String, String>,
     artifact: &BoundProcessorArtifact,
 ) -> Result<(), ForgeInstallerError> {
-    let portable = portable_path_key(artifact.relative_path.as_str());
+    let portable = portable_path_key(&artifact.relative_path);
     match dependencies.get(&portable) {
         Some(existing) if existing != artifact.relative_path.as_str() => {
             Err(ForgeInstallerError::ForgeProcessorPortableAlias)
@@ -1769,7 +1981,7 @@ fn extract_authenticated_processor_data(
     }
     let requested_portable = requested
         .iter()
-        .map(|path| (portable_path_key(path.as_str()), path.as_str()))
+        .map(|path| (portable_path_key(path), path.as_str()))
         .collect::<HashMap<_, _>>();
     if requested_portable.len() != requested.len() {
         return Err(ForgeInstallerError::ForgeProcessorPortableAlias);
@@ -1783,7 +1995,7 @@ fn extract_authenticated_processor_data(
         let Ok(source_path) = ArtifactRelativePath::new(authored_name) else {
             continue;
         };
-        let portable = portable_path_key(source_path.as_str());
+        let portable = portable_path_key(&source_path);
         let Some(expected) = requested_portable.get(&portable) else {
             continue;
         };
@@ -2130,7 +2342,7 @@ fn insert_portable_path(
     paths: &mut HashMap<String, String>,
     path: &ArtifactRelativePath,
 ) -> Result<bool, ForgeInstallerError> {
-    let key = portable_path_key(path.as_str());
+    let key = portable_path_key(path);
     match paths.get(&key) {
         Some(existing) if existing == path.as_str() => Ok(false),
         Some(_) => Err(ForgeInstallerError::PortablePathAlias),
@@ -2141,8 +2353,8 @@ fn insert_portable_path(
     }
 }
 
-fn portable_path_key(path: &str) -> String {
-    path.chars().flat_map(char::to_lowercase).collect()
+fn portable_path_key(path: &ArtifactRelativePath) -> String {
+    path.portable_key()
 }
 
 fn legacy_root_artifact_path(
@@ -2401,6 +2613,7 @@ mod tests {
     };
     use crate::loaders::{build_id_for, installed_version_id_for};
     use std::io::{Cursor, Read, Write};
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
     use zip::write::SimpleFileOptions;
 
@@ -2409,6 +2622,14 @@ mod tests {
             BoundProcessorDisposition::TypedRunnable(plan) => plan,
             _ => panic!("typed processor plan"),
         }
+    }
+
+    fn assert_installer_declaration_transition(bound: BoundForgeInstallerPlan) {
+        bound
+            .into_install_execution()
+            .expect("bind installer declarations")
+            .into_network_install(Path::new("/tmp/axial-installer-declaration-fixture"))
+            .expect("classify installer declarations without I/O");
     }
 
     #[test]
@@ -2459,7 +2680,9 @@ mod tests {
             "55.0.0",
         );
         let (version, install) = modern_binding_profiles(&forge);
-        bind_modern_fixture(&forge, &version, &install).expect("modern Forge binding");
+        let bound = bind_modern_fixture_with_entries(&forge, &version, &install, &[])
+            .expect("modern Forge binding");
+        assert_installer_declaration_transition(bound);
 
         let neoforge = binding_record(
             LoaderComponentId::NeoForge,
@@ -2468,7 +2691,9 @@ mod tests {
             "21.5.74",
         );
         let (version, install) = modern_binding_profiles(&neoforge);
-        bind_modern_fixture(&neoforge, &version, &install).expect("modern NeoForge binding");
+        let bound = bind_modern_fixture_with_entries(&neoforge, &version, &install, &[])
+            .expect("modern NeoForge binding");
+        assert_installer_declaration_transition(bound);
 
         let legacy = binding_record(
             LoaderComponentId::Forge,
@@ -2477,7 +2702,8 @@ mod tests {
             "10.13.4.1614-1.7.10",
         );
         let install = legacy_binding_profile(&legacy);
-        bind_legacy_fixture(&legacy, &install).expect("legacy Forge binding");
+        let bound = bind_legacy_fixture_plan(&legacy, &install).expect("legacy Forge binding");
+        assert_installer_declaration_transition(bound);
 
         let legacy_assets_alias = binding_record(
             LoaderComponentId::Forge,
@@ -2496,7 +2722,9 @@ mod tests {
             "14.23.5.2859",
         );
         let (version, install) = later_legacy_binding_profiles(&later_legacy);
-        bind_modern_fixture(&later_legacy, &version, &install).expect("later legacy Forge binding");
+        let bound = bind_modern_fixture_with_entries(&later_legacy, &version, &install, &[])
+            .expect("later legacy Forge binding");
+        assert_installer_declaration_transition(bound);
     }
 
     #[test]
@@ -2514,17 +2742,6 @@ mod tests {
             empty.processor_disposition(),
             BoundProcessorDisposition::EmptyClientWork
         ));
-        let BoundForgeInstallExecution::Continue(continuation) = empty.into_install_execution()
-        else {
-            panic!("empty client work continuation");
-        };
-        assert!(
-            continuation
-                .excluded_live_library_paths()
-                .expect("empty exclusions")
-                .is_empty()
-        );
-
         let mut server_only = install;
         server_only["processors"] = serde_json::json!([
             {"sides":["server"]},
@@ -2552,7 +2769,7 @@ mod tests {
         ));
         assert!(matches!(
             legacy_bound.into_install_execution(),
-            BoundForgeInstallExecution::Continue(_)
+            Ok(BoundForgeInstallExecution::Continue(_))
         ));
 
         let mut hybrid = legacy_profile;
@@ -2685,7 +2902,7 @@ mod tests {
         ));
         assert!(matches!(
             bound.into_install_execution(),
-            BoundForgeInstallExecution::UnsupportedMissingOutputs
+            Ok(BoundForgeInstallExecution::UnsupportedMissingOutputs)
         ));
     }
 
@@ -2910,28 +3127,25 @@ mod tests {
                 expected_size: None,
             }
         ));
-        let BoundForgeInstallExecution::Run(execution) = bound.into_install_execution() else {
-            panic!("runnable processor execution");
-        };
-        let excluded = execution
-            .excluded_live_library_paths()
-            .expect("exact exclusions");
-        assert!(
-            !excluded.contains(
-                &crate::artifact_path::ArtifactRelativePath::new(
-                    "example/intermediate/1.0/intermediate-1.0.jar"
+        let execution = bound.into_install_execution().expect("install execution");
+        let (_, jobs) = execution
+            .into_network_install(std::path::Path::new("/managed/libraries"))
+            .expect("classified network install")
+            .into_parts();
+        assert!(!jobs.iter().any(|classified| {
+            classified.job().relative_path
+                == crate::artifact_path::ArtifactRelativePath::new(
+                    "example/intermediate/1.0/intermediate-1.0.jar",
                 )
                 .expect("intermediate path")
-            )
-        );
-        assert!(
-            excluded.contains(
-                &crate::artifact_path::ArtifactRelativePath::new(
-                    "net/minecraftforge/forge/1.21.5-55.0.0/forge-1.21.5-55.0.0-client.jar"
+        }));
+        assert!(!jobs.iter().any(|classified| {
+            classified.job().relative_path
+                == crate::artifact_path::ArtifactRelativePath::new(
+                    "net/minecraftforge/forge/1.21.5-55.0.0/forge-1.21.5-55.0.0-client.jar",
                 )
                 .expect("terminal path")
-            )
-        );
+        }));
     }
 
     #[test]
@@ -2971,20 +3185,18 @@ mod tests {
                 expected_size: Some(2),
             }
         ));
-        let BoundForgeInstallExecution::Run(execution) = bound.into_install_execution() else {
-            panic!("runnable processor execution");
-        };
-        assert!(
-            execution
-                .excluded_live_library_paths()
-                .expect("exact exclusions")
-                .contains(
-                    &crate::artifact_path::ArtifactRelativePath::new(
-                        "example/first/1.0/first-1.0.jar"
-                    )
-                    .expect("terminal final path")
+        let execution = bound.into_install_execution().expect("install execution");
+        let (_, jobs) = execution
+            .into_network_install(std::path::Path::new("/managed/libraries"))
+            .expect("classified network install")
+            .into_parts();
+        assert!(!jobs.iter().any(|classified| {
+            classified.job().relative_path
+                == crate::artifact_path::ArtifactRelativePath::new(
+                    "example/first/1.0/first-1.0.jar",
                 )
-        );
+                .expect("terminal final path")
+        }));
     }
 
     #[test]
@@ -3672,12 +3884,7 @@ mod tests {
             ("META-INF/CLIENT.RSA", b"signature"),
             ("client/payload.bin", b"payload"),
         ]);
-        let source = super::VerifiedInstallerReceiptSource::from_test(
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            true,
-        );
+        let source = super::VerifiedInstallerReceiptSource::from_test(Vec::new(), true);
         let first = source
             .derive_child_client_bytes(&base)
             .expect("stripped client");

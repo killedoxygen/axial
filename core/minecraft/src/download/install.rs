@@ -341,7 +341,7 @@ impl Downloader {
             plan.contribute_total(
                 library_jobs
                     .iter()
-                    .map(|classified| classified.job.expected.size.unwrap_or(0))
+                    .map(|classified| classified.job().expected.size.unwrap_or(0))
                     .sum::<u64>(),
             );
             send(progress("libraries", 0, library_jobs.len() as i32, None));
@@ -353,8 +353,8 @@ impl Downloader {
                 let mut proofs = Vec::with_capacity(total_library_jobs as usize);
                 let mut library_downloads =
                     futures_util::stream::iter(library_jobs.into_iter().map(|classified| {
-                        let job = classified.job;
-                        let needs_stream = classified.acquisition == LibraryAcquisition::FreshStream;
+                        let (job, acquisition) = classified.into_parts();
+                        let needs_stream = acquisition == LibraryAcquisition::FreshStream;
                         let client = client.clone();
                         let fact_tx = fact_tx.cloned();
                         let descriptor_tx = descriptor_tx.cloned();
@@ -388,13 +388,29 @@ impl Downloader {
                                     descriptor_tx.as_ref(),
                                 )
                                 .await?;
-                                let (proof, _) = materialize_authenticated_library_source(
+                                let (identity, _) = materialize_authenticated_library_source(
                                     prepared,
                                     source,
                                     fact_tx.as_ref(),
                                 )
                                 .await?;
-                                let observed_size = proof.observed_size();
+                                let (
+                                    path,
+                                    _destination,
+                                    is_native,
+                                    provider_url,
+                                    expected,
+                                    observed_size,
+                                    sha1,
+                                ) = identity.into_parts();
+                                let proof = ExactLibraryDownloadProof::new(
+                                    path,
+                                    is_native,
+                                    provider_url,
+                                    expected,
+                                    observed_size,
+                                    sha1,
+                                );
                                 (observed_size, Some(proof))
                             } else {
                                 let (_, observed_size) = ensure_selected_artifact_with_client_and_observed_size(

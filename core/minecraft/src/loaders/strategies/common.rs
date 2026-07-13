@@ -1,13 +1,12 @@
 use crate::download::{
-    DownloadProgress, Downloader, ExactLibraryDownloadProof,
-    download_installer_libraries_with_authority_and_facts_and_descriptors,
+    DownloadProgress, Downloader, ExactLibraryDownloadProof, MaterializedLibraryIdentity,
+    download_installer_libraries_with_declarations_and_facts_and_descriptors,
     download_profile_libraries_with_declarations_and_facts_and_descriptors,
-    library_artifact_plans_for,
 };
-use crate::known_good::{KnownGoodInstallReceipt, seal_verified_installer_library_authority};
+use crate::known_good::KnownGoodInstallReceipt;
 use crate::known_good_libraries::{
     PendingExactLibraryDeclarations, PendingStreamedLibraryDeclarations,
-    seal_profile_exact_library_declarations,
+    RetainedInstallerLibrarySource, seal_profile_exact_library_declarations,
 };
 use crate::loaders::api::validate_loader_build_record_identity;
 use crate::loaders::bound_processors::spawn_bound_processor_execution;
@@ -16,8 +15,8 @@ use crate::loaders::compose::{
     create_managed_version_dir, finalize_version_install, write_composed_version,
 };
 use crate::loaders::forge_installer::{
-    AuthenticatedEmbeddedMavenArtifact, AuthenticatedForgeInstallerPlan,
-    BoundForgeInstallExecution, bind_authenticated_installer_plan, plan_authenticated_installer,
+    AuthenticatedForgeInstallerPlan, BoundForgeInstallExecution, PendingForgeInstallExecution,
+    PendingForgeNetworkInstall, bind_authenticated_installer_plan, plan_authenticated_installer,
 };
 #[cfg(not(test))]
 use crate::loaders::http::fetch_bytes;
@@ -35,7 +34,7 @@ use crate::loaders::{validate_provider_version_id, validate_version_id};
 use crate::paths::versions_dir;
 use crate::profiles::ensure_launcher_profiles;
 use sha1::{Digest as _, Sha1};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -216,45 +215,41 @@ where
         extract_installer_blocking(installer_source, plan.record.component_name.clone()).await?;
     let installer_plan = bind_authenticated_installer_plan(authenticated, &plan.record)
         .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
-    let execution = installer_plan.into_install_execution();
-    let excluded_paths = match &execution {
-        BoundForgeInstallExecution::Run(execution) => execution
-            .excluded_live_library_paths()
-            .map_err(|error| installer_extract_error(&plan.record.component_name, error))?,
-        BoundForgeInstallExecution::Continue(continuation) => continuation
-            .excluded_live_library_paths()
-            .map_err(|error| installer_extract_error(&plan.record.component_name, error))?,
-        BoundForgeInstallExecution::UnsupportedMissingOutputs => {
-            return Err(LoaderError::InvalidProfile(
-                "loader installer processors do not expose authenticated client outputs"
-                    .to_string(),
-            ));
-        }
-    };
+    let execution = installer_plan
+        .into_install_execution()
+        .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
+    if matches!(
+        &execution,
+        BoundForgeInstallExecution::UnsupportedMissingOutputs
+    ) {
+        return Err(LoaderError::InvalidProfile(
+            "loader installer processors do not expose authenticated client outputs".to_string(),
+        ));
+    }
+    let network_install = execution
+        .into_network_install(&crate::paths::libraries_dir(library_dir))
+        .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
     let base_receipt = Box::pin(ensure_base_version(
         library_dir,
         &plan.record.minecraft_version,
         send,
     ))
     .await?;
-    let installer_libraries = match &execution {
-        BoundForgeInstallExecution::Run(execution) => execution.libraries(),
-        BoundForgeInstallExecution::Continue(continuation) => continuation.libraries(),
-        BoundForgeInstallExecution::UnsupportedMissingOutputs => unreachable!(),
-    };
-    let download_authority = Box::pin(download_installer_libraries_with_evidence(
-        library_dir,
-        installer_libraries,
-        &excluded_paths,
-        "loader_libraries",
-        &mut *send,
-    ))
-    .await?;
+    let (pending_execution, materialized_network) =
+        Box::pin(download_installer_libraries_with_evidence(
+            library_dir,
+            network_install,
+            "loader_libraries",
+            &mut *send,
+        ))
+        .await?;
+    let execution = pending_execution
+        .complete_network(materialized_network)
+        .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
     Box::pin(finish_supported_installer_install(
         library_dir,
         plan,
         execution,
-        download_authority,
         base_receipt,
         send,
     ))
@@ -265,7 +260,6 @@ async fn finish_supported_installer_install<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
     execution: BoundForgeInstallExecution,
-    download_authority: Vec<ExactLibraryDownloadProof>,
     base_receipt: KnownGoodInstallReceipt,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
@@ -338,14 +332,16 @@ where
         }
         BoundForgeInstallExecution::UnsupportedMissingOutputs => unreachable!(),
     };
-    let source = continuation.into_receipt_source();
+    let receipt_input = continuation
+        .into_receipt_input(processor_outputs)
+        .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
     let mut version = compose_loader_version(
         base_receipt.effective_version(),
         &plan.record.minecraft_version,
         &installed_version_id,
-        source.version(),
+        receipt_input.version(),
     )?;
-    let child_client = source
+    let child_client = receipt_input
         .derive_child_client_bytes(&base_client_bytes)
         .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
     let client = version.downloads.client.as_mut().ok_or_else(|| {
@@ -356,26 +352,14 @@ where
         .map_err(|_| LoaderError::Verify("loader client is too large".to_string()))?;
     client.url.clear();
     let version_bytes = serde_json::to_vec_pretty(&version)?;
-    let materialized_library_paths =
-        library_artifact_plans_for(source.libraries(), &crate::rules::default_environment())
-            .map_err(|error| LoaderError::Verify(format!("plan installer libraries: {error}")))?
-            .into_iter()
-            .map(|library| library.relative_path)
-            .collect::<BTreeSet<_>>();
-    let library_authority =
-        seal_verified_installer_library_authority(&source, download_authority, processor_outputs)
-            .map_err(|error| {
-            LoaderError::Verify(format!("derive loader library authority: {error:?}"))
-        })?;
-    let receipt = KnownGoodInstallReceipt::from_verified_installer_source(
+    let pending_receipt = KnownGoodInstallReceipt::from_verified_installer_source(
         base_receipt,
         &plan.record,
-        &source,
+        receipt_input,
         version,
         &version_bytes,
         &base_client_bytes,
         &child_client,
-        &library_authority,
     )
     .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
 
@@ -388,8 +372,7 @@ where
         ));
     }
     let child_client_bytes = child_client.into_bytes();
-    let embedded = source.into_embedded_maven_artifacts();
-    let terminal = library_authority.into_terminal_materializations();
+    let (pending_receipt, retained_sources) = pending_receipt.into_publications();
     let version_dir = create_managed_version_dir(library_dir, &installed_version_id)?;
     cleanup_on_error(
         write_loader_install_effects(
@@ -402,22 +385,14 @@ where
         library_dir,
         &installed_version_id,
     )?;
-    cleanup_on_error(
-        materialize_selected_embedded_maven_artifacts(
-            library_dir,
-            embedded,
-            &materialized_library_paths,
-        )
-        .await,
+    let materialized = cleanup_on_error(
+        materialize_retained_installer_libraries(library_dir, retained_sources).await,
         library_dir,
         &installed_version_id,
     )?;
-    cleanup_on_error(
-        materialize_terminal_processor_outputs(library_dir, terminal, &materialized_library_paths)
-            .await,
-        library_dir,
-        &installed_version_id,
-    )?;
+    let receipt = pending_receipt.complete(materialized).map_err(|error| {
+        LoaderError::Verify(format!("complete installer materializations: {error:?}"))
+    })?;
     if child_client_bytes != base_client_bytes {
         send(progress(
             "client_jar",
@@ -671,20 +646,24 @@ where
 
 async fn download_installer_libraries_with_evidence<F>(
     library_dir: &Path,
-    libraries: &[crate::launch::Library],
-    excluded_paths: &BTreeSet<crate::artifact_path::ArtifactRelativePath>,
+    install: PendingForgeNetworkInstall,
     phase: &str,
     send: &mut F,
-) -> Result<Vec<ExactLibraryDownloadProof>, LoaderError>
+) -> Result<
+    (
+        PendingForgeInstallExecution,
+        Vec<MaterializedLibraryIdentity>,
+    ),
+    LoaderError,
+>
 where
     F: FnMut(DownloadProgress),
 {
     let mut facts = Vec::new();
     let mut descriptors = Vec::new();
-    download_installer_libraries_with_authority_and_facts_and_descriptors(
+    download_installer_libraries_with_declarations_and_facts_and_descriptors(
         library_dir,
-        libraries,
-        excluded_paths,
+        install,
         phase,
         &mut *send,
         |fact| facts.push(fact),
@@ -758,39 +737,20 @@ async fn extract_installer_blocking(
     .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
 }
 
-async fn materialize_selected_embedded_maven_artifacts(
+async fn materialize_retained_installer_libraries(
     library_dir: &Path,
-    artifacts: Vec<AuthenticatedEmbeddedMavenArtifact>,
-    selected_paths: &BTreeSet<crate::artifact_path::ArtifactRelativePath>,
-) -> Result<(), LoaderError> {
+    sources: Vec<RetainedInstallerLibrarySource>,
+) -> Result<Vec<MaterializedLibraryIdentity>, LoaderError> {
     let root = ManagedDir::open_root(library_dir)?.open_or_create_child("libraries")?;
-    for artifact in artifacts
-        .into_iter()
-        .filter(|artifact| selected_paths.contains(artifact.relative_path()))
-    {
-        root.write_relative_exact(artifact.relative_path(), artifact.bytes())
-            .await?;
+    let mut materialized = Vec::with_capacity(sources.len());
+    for source in sources {
+        let publication = root.materialize_installer_library(source).await?;
+        materialized.push(MaterializedLibraryIdentity::from_installer_publication(
+            publication,
+        ));
     }
     root.revalidate()?;
-    Ok(())
-}
-
-async fn materialize_terminal_processor_outputs(
-    library_dir: &Path,
-    outputs: Vec<(crate::artifact_path::ArtifactRelativePath, Arc<[u8]>)>,
-    selected_paths: &BTreeSet<crate::artifact_path::ArtifactRelativePath>,
-) -> Result<(), LoaderError> {
-    let root = ManagedDir::open_root(library_dir)?.open_or_create_child("libraries")?;
-    for (path, bytes) in outputs {
-        if !selected_paths.contains(&path) {
-            return Err(LoaderError::Verify(
-                "processor output is outside the sealed installer library inventory".to_string(),
-            ));
-        }
-        root.write_relative_exact(&path, &bytes).await?;
-    }
-    root.revalidate()?;
-    Ok(())
+    Ok(materialized)
 }
 
 async fn overlay_legacy_archive_bytes_blocking(
@@ -1214,6 +1174,20 @@ mod tests {
             )) < 4096,
             "public loader install future should not embed the strategy dispatcher"
         );
+    }
+
+    #[test]
+    fn earliest_archive_route_never_enters_installer_declaration_pipeline() {
+        let route = include_str!("forge_earliest_legacy.rs");
+        assert!(route.contains("install_from_legacy_archive"));
+        for installer_transition in [
+            "bind_authenticated_installer_plan",
+            "into_install_execution",
+            "into_network_install",
+            "AuthenticatedInstallerLibraryInputs",
+        ] {
+            assert!(!route.contains(installer_transition));
+        }
     }
 
     #[tokio::test]
@@ -1718,28 +1692,17 @@ mod tests {
         };
         let installer_source =
             verified_test_source(&installer_server.url, "loader installer").await;
-        let execution = bind_test_installer(installer_source, &record).into_install_execution();
-        let BoundForgeInstallExecution::Continue(continuation) = &execution else {
-            panic!("continue fixture");
-        };
-        let excluded = continuation
-            .excluded_live_library_paths()
-            .expect("continue exclusions");
-        let authority = download_installer_libraries_with_evidence(
+        let execution = materialize_test_installer_network(
             &root,
-            continuation.libraries(),
-            &excluded,
-            "loader_libraries",
+            bind_test_installer(installer_source, &record),
             &mut |_| {},
         )
-        .await
-        .expect("installer authority");
+        .await;
 
         let error = finish_supported_installer_install(
             &root,
             &plan,
             execution,
-            authority,
             test_authenticated_receipt(&root, "1.21.4"),
             &mut |_| {},
         )
@@ -1768,26 +1731,17 @@ mod tests {
         };
         let installer_source =
             verified_test_source(&installer_server.url, "loader installer").await;
-        let execution = bind_test_installer(installer_source, &record).into_install_execution();
-        let BoundForgeInstallExecution::Run(run) = &execution else {
-            panic!("run fixture");
-        };
-        let excluded = run.excluded_live_library_paths().expect("run exclusions");
-        let authority = download_installer_libraries_with_evidence(
+        let execution = materialize_test_installer_network(
             &root,
-            run.libraries(),
-            &excluded,
-            "loader_libraries",
+            bind_test_installer(installer_source, &record),
             &mut |_| {},
         )
-        .await
-        .expect("installer authority");
+        .await;
 
         let error = finish_supported_installer_install(
             &root,
             &plan,
             execution,
-            authority,
             test_authenticated_receipt(&root, "1.21.4"),
             &mut |_| {},
         )
@@ -1817,29 +1771,18 @@ mod tests {
         };
         let installer_source =
             verified_test_source(&installer_server.url, "loader installer").await;
-        let execution = bind_test_installer(installer_source, &record).into_install_execution();
-        let BoundForgeInstallExecution::Continue(continuation) = &execution else {
-            panic!("continue fixture");
-        };
-        let excluded = continuation
-            .excluded_live_library_paths()
-            .expect("continue exclusions");
-        let authority = download_installer_libraries_with_evidence(
+        let execution = materialize_test_installer_network(
             &root,
-            continuation.libraries(),
-            &excluded,
-            "loader_libraries",
+            bind_test_installer(installer_source, &record),
             &mut |_| {},
         )
-        .await
-        .expect("installer authority");
+        .await;
         let mut progress = Vec::new();
 
         let error = finish_supported_installer_install(
             &root,
             &plan,
             execution,
-            authority,
             test_authenticated_receipt(&root, "1.21.5"),
             &mut |update| progress.push(update),
         )
@@ -2629,43 +2572,40 @@ mod tests {
         installer_plan: BoundForgeInstallerPlan,
         send: &mut impl FnMut(DownloadProgress),
     ) -> KnownGoodInstallReceipt {
-        let execution = installer_plan.into_install_execution();
-        let (libraries, excluded_paths) = match &execution {
-            BoundForgeInstallExecution::Run(execution) => (
-                execution.libraries(),
-                execution
-                    .excluded_live_library_paths()
-                    .expect("run exclusions"),
-            ),
-            BoundForgeInstallExecution::Continue(continuation) => (
-                continuation.libraries(),
-                continuation
-                    .excluded_live_library_paths()
-                    .expect("continue exclusions"),
-            ),
-            BoundForgeInstallExecution::UnsupportedMissingOutputs => {
-                panic!("supported installer fixture")
-            }
-        };
-        let download_authority = download_installer_libraries_with_evidence(
-            root,
-            libraries,
-            &excluded_paths,
-            "loader_libraries",
-            send,
-        )
-        .await
-        .expect("installer library authority");
+        let execution = materialize_test_installer_network(root, installer_plan, send).await;
         finish_supported_installer_install(
             root,
             plan,
             execution,
-            download_authority,
             test_authenticated_receipt(root, &plan.record.minecraft_version),
             send,
         )
         .await
         .expect("finish installer install")
+    }
+
+    async fn materialize_test_installer_network(
+        root: &std::path::Path,
+        installer_plan: BoundForgeInstallerPlan,
+        send: &mut impl FnMut(DownloadProgress),
+    ) -> BoundForgeInstallExecution {
+        let execution = installer_plan
+            .into_install_execution()
+            .expect("installer execution");
+        let network_install = execution
+            .into_network_install(&crate::paths::libraries_dir(root))
+            .expect("classified installer network");
+        let (pending, materialized) = download_installer_libraries_with_evidence(
+            root,
+            network_install,
+            "loader_libraries",
+            send,
+        )
+        .await
+        .expect("materialized installer network");
+        pending
+            .complete_network(materialized)
+            .expect("completed installer network")
     }
 
     fn installer_jar_with_profile_json(profile_json: &[u8]) -> Vec<u8> {

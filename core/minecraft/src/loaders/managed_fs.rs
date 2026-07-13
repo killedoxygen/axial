@@ -1,4 +1,5 @@
 use crate::artifact_path::{ArtifactRelativePath, validate_artifact_path_segment};
+use crate::known_good_libraries::RetainedInstallerLibrarySource;
 use crate::loaders::types::LoaderError;
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -25,6 +26,17 @@ static ACTIVE_TEMPS: OnceLock<Mutex<HashSet<ActiveTempKey>>> = OnceLock::new();
 #[derive(Clone)]
 pub(crate) struct ManagedDir {
     inner: Arc<ManagedDirInner>,
+}
+
+pub(crate) struct MaterializedInstallerLibrary {
+    source: RetainedInstallerLibrarySource,
+    destination: PathBuf,
+}
+
+impl MaterializedInstallerLibrary {
+    pub(crate) fn into_parts(self) -> (RetainedInstallerLibrarySource, PathBuf) {
+        (self.source, self.destination)
+    }
 }
 
 impl std::fmt::Debug for ManagedDir {
@@ -422,6 +434,19 @@ impl ManagedDir {
     ) -> Result<(), LoaderError> {
         let (parent, name) = self.open_or_create_relative_parent(relative)?;
         parent.write_exact(&name, bytes).await
+    }
+
+    pub(crate) async fn materialize_installer_library(
+        &self,
+        source: RetainedInstallerLibrarySource,
+    ) -> Result<MaterializedInstallerLibrary, LoaderError> {
+        let destination = source.path().join_under(&self.inner.path);
+        self.write_relative_exact(source.path(), source.bytes())
+            .await?;
+        Ok(MaterializedInstallerLibrary {
+            source,
+            destination,
+        })
     }
 
     pub(crate) async fn write_exact(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
