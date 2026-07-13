@@ -8,7 +8,7 @@
 //! indexed downloads and the overrides go through the same containment check.
 
 use crate::error::{ContentError, ContentResult};
-use crate::manifest::sha512_file;
+use crate::manifest::{MANIFEST_FILE, MANIFEST_TEMP_FILE, sha512_file};
 use crate::model::{ContentKind, FileRef};
 use crate::transaction::{FileTransaction, StagingGuard};
 use axial_minecraft::download::{
@@ -575,7 +575,16 @@ fn normalize_relative_path(relative: &str) -> ContentResult<String> {
             "modpack file path is empty: {relative}"
         )));
     }
-    Ok(parts.join("/"))
+    let normalized = parts.join("/");
+    if [MANIFEST_FILE, MANIFEST_TEMP_FILE]
+        .iter()
+        .any(|reserved| normalized.eq_ignore_ascii_case(reserved))
+    {
+        return Err(ContentError::Invalid(format!(
+            "modpack file uses a launcher-reserved path: {relative}"
+        )));
+    }
+    Ok(normalized)
 }
 
 pub fn parse_pack_index(raw: &str) -> ContentResult<PackIndex> {
@@ -1025,6 +1034,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn launcher_manifest_paths_are_reserved_at_the_instance_root() {
+        let root = Path::new("/instances/aurora");
+
+        for reserved in [
+            "axial.content.json",
+            "./axial.content.json",
+            "AXIAL.CONTENT.JSON",
+            "axial.content.json.tmp",
+        ] {
+            assert!(
+                contained_path(root, reserved).is_err(),
+                "{reserved} must remain launcher-owned"
+            );
+        }
+        assert_eq!(
+            contained_path(root, "config/axial.content.json").expect("nested path is not reserved"),
+            root.join("config").join("axial.content.json")
+        );
+    }
+
     fn override_archive(name: &str, entries: &[(&str, Vec<u8>)]) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "axial-pack-overrides-{name}-{}-{}.mrpack",
@@ -1060,6 +1090,25 @@ mod tests {
         );
 
         assert!(apply_overrides(&root, &archive).is_err());
+
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn overrides_cannot_claim_launcher_manifest_paths() {
+        let root = std::env::temp_dir().join("axial-pack-override-manifest-path");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let archive = override_archive(
+            "manifest-path",
+            &[("overrides/./axial.content.json.tmp", b"payload".to_vec())],
+        );
+
+        let error = apply_overrides(&root, &archive)
+            .expect_err("override must not claim launcher manifest paths");
+        assert!(error.to_string().contains("launcher-reserved path"));
+        assert!(!root.join(MANIFEST_TEMP_FILE).exists());
 
         let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(root);

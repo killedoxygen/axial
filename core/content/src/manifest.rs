@@ -12,6 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const MANIFEST_FILE: &str = "axial.content.json";
+pub const MANIFEST_TEMP_FILE: &str = "axial.content.json.tmp";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,7 +154,7 @@ impl ContentManifest {
             fs::create_dir_all(parent)?;
         }
         let body = serde_json::to_vec_pretty(self)?;
-        let temp = path.with_extension("json.tmp");
+        let temp = game_dir.join(MANIFEST_TEMP_FILE);
         fs::write(&temp, &body)?;
         match promote_replacement(&temp, &path) {
             Ok(()) => Ok(()),

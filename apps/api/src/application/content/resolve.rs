@@ -504,12 +504,19 @@ fn incompatible_dependency_matches(
     project_id: &str,
     version_id: &str,
 ) -> bool {
-    dependency.kind == DependencyKind::Incompatible
-        && dependency.project_id.as_deref() == Some(project_id)
-        && dependency
-            .version_id
-            .as_deref()
-            .is_none_or(|exact_version| exact_version == version_id)
+    if dependency.kind != DependencyKind::Incompatible {
+        return false;
+    }
+    match dependency.project_id.as_deref() {
+        Some(exact_project) => {
+            exact_project == project_id
+                && dependency
+                    .version_id
+                    .as_deref()
+                    .is_none_or(|exact_version| exact_version == version_id)
+        }
+        None => dependency.version_id.as_deref() == Some(version_id),
+    }
 }
 
 fn exact_requirement_needs_retry(
@@ -948,6 +955,58 @@ mod tests {
             &file("installed.jar", None),
             vec![ContentDependency {
                 project_id: Some("candidate".to_string()),
+                version_id: Some("candidate-v1".to_string()),
+                kind: DependencyKind::Incompatible,
+            }],
+            Some("Installed".to_string()),
+        );
+        let manifest = ContentManifest {
+            entries: vec![installed.clone()],
+            ..ContentManifest::default()
+        };
+        let candidate_v1 = version(
+            "candidate-v1",
+            ReleaseChannel::Release,
+            vec![file("candidate.jar", None)],
+        );
+        let candidate_v2 = version(
+            "candidate-v2",
+            ReleaseChannel::Release,
+            vec![file("candidate.jar", None)],
+        );
+
+        assert!(version_conflicts_with_installed(
+            &candidate_v1,
+            &candidate,
+            std::slice::from_ref(&installed),
+        ));
+        assert!(!version_conflicts_with_installed(
+            &candidate_v2,
+            &candidate,
+            std::slice::from_ref(&installed),
+        ));
+        assert_eq!(
+            installed_entries_incompatible_with(&manifest, &candidate, "candidate-v1", None,).len(),
+            1
+        );
+        assert!(
+            installed_entries_incompatible_with(&manifest, &candidate, "candidate-v2", None,)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn version_only_reverse_incompatibilities_match_the_exact_candidate() {
+        let candidate = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
+        let installed = ManifestEntry::managed(
+            CanonicalId::for_project(ProviderId::Modrinth, "installed"),
+            ProviderId::Modrinth,
+            "installed".to_string(),
+            "installed-v1".to_string(),
+            ContentKind::Mod,
+            &file("installed.jar", None),
+            vec![ContentDependency {
+                project_id: None,
                 version_id: Some("candidate-v1".to_string()),
                 kind: DependencyKind::Incompatible,
             }],
