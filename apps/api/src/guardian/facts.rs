@@ -36,6 +36,10 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
             GuardianFactId::ArtifactChecksumMismatch,
             GuardianDomain::Library,
         ),
+        ExecutionFactKind::ArtifactHashMismatch => (
+            GuardianFactId::ArtifactHashMismatch,
+            GuardianDomain::Library,
+        ),
         ExecutionFactKind::DownloadSizeMismatch => (
             GuardianFactId::ArtifactSizeMismatch,
             GuardianDomain::Library,
@@ -277,6 +281,7 @@ fn reliability_for_execution_fact(kind: ExecutionFactKind) -> FactReliability {
         | ExecutionFactKind::RuntimeUnavailableForPlatform
         | ExecutionFactKind::RuntimeWrongMajor
         | ExecutionFactKind::RuntimeWrongUpdate
+        | ExecutionFactKind::ArtifactHashMismatch
         | ExecutionFactKind::DownloadChecksumMismatch
         | ExecutionFactKind::DownloadSizeMismatch => FactReliability::ValidatedProbe,
         ExecutionFactKind::RuntimeJavaOverrideEmpty

@@ -35,6 +35,9 @@ pub const MAX_KNOWN_GOOD_VERSION_JSON_BYTES: usize = 16 << 20;
 pub const MAX_KNOWN_GOOD_ASSET_INDEX_BYTES: usize = 64 << 20;
 pub const MAX_KNOWN_GOOD_RUNTIME_MANIFEST_BYTES: usize = 16 << 20;
 pub const MAX_LAUNCH_TIER0_ENTRIES: usize = 512;
+pub const MAX_LAUNCH_TIER1_ENTRIES: usize = 512;
+pub const MAX_LAUNCH_TIER1_ARTIFACT_BYTES: u64 = 512 << 20;
+pub const MAX_LAUNCH_TIER1_AGGREGATE_BYTES: u64 = 2 << 30;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchTier0RuntimeSelection<'a> {
@@ -240,6 +243,70 @@ impl KnownGoodInventory {
         Ok(selected)
     }
 
+    pub fn launch_tier1_projection(
+        &self,
+    ) -> Result<LaunchTier1Projection, LaunchTier1ProjectionError> {
+        let selected_entry_count = self
+            .entries
+            .iter()
+            .filter(|entry| launch_tier1_root(entry).is_some())
+            .count();
+        if selected_entry_count > MAX_LAUNCH_TIER1_ENTRIES {
+            return Err(LaunchTier1ProjectionError::TooManyEntries {
+                selected_entry_count,
+            });
+        }
+
+        let mut expected_byte_count = 0_u64;
+        let mut entries = Vec::with_capacity(selected_entry_count);
+        for (inventory_ordinal, entry, root) in
+            self.entries
+                .iter()
+                .enumerate()
+                .filter_map(|(inventory_ordinal, entry)| {
+                    launch_tier1_root(entry).map(|root| (inventory_ordinal, entry, root))
+                })
+        {
+            let (digest, size) = match entry.integrity() {
+                KnownGoodIntegrity::Sha1 { digest, size }
+                | KnownGoodIntegrity::ExactBytes { digest, size } => (digest.clone(), *size),
+                KnownGoodIntegrity::Directory | KnownGoodIntegrity::LinkTarget(_) => {
+                    return Err(LaunchTier1ProjectionError::UnsupportedIntegrity {
+                        selected_entry_count,
+                        inventory_ordinal,
+                    });
+                }
+            };
+            if size > MAX_LAUNCH_TIER1_ARTIFACT_BYTES {
+                return Err(LaunchTier1ProjectionError::ArtifactByteLimitExceeded {
+                    selected_entry_count,
+                    inventory_ordinal,
+                    expected_byte_count: size,
+                });
+            }
+            expected_byte_count += size;
+            if expected_byte_count > MAX_LAUNCH_TIER1_AGGREGATE_BYTES {
+                return Err(LaunchTier1ProjectionError::AggregateByteLimitExceeded {
+                    selected_entry_count,
+                    expected_byte_count,
+                });
+            }
+            entries.push(LaunchTier1ProjectionEntry {
+                inventory_ordinal,
+                file: LaunchTier1AdmittedFile {
+                    root: entry.root.clone(),
+                    physical_root: root,
+                    path: entry.path.clone(),
+                    kind: entry.kind,
+                    digest,
+                    size,
+                },
+            });
+        }
+
+        Ok(LaunchTier1Projection { entries })
+    }
+
     #[cfg(feature = "test-support")]
     pub fn from_test_entries(
         entries: impl IntoIterator<Item = TestKnownGoodEntry>,
@@ -279,6 +346,19 @@ impl KnownGoodInventory {
     }
 }
 
+fn launch_tier1_root(entry: &KnownGoodEntry) -> Option<LaunchTier1PhysicalRoot> {
+    match (entry.root(), entry.kind()) {
+        (KnownGoodRoot::Versions, KnownGoodArtifactKind::ClientJar) => {
+            Some(LaunchTier1PhysicalRoot::Versions)
+        }
+        (
+            KnownGoodRoot::Libraries,
+            KnownGoodArtifactKind::Library | KnownGoodArtifactKind::NativeLibrary,
+        ) => Some(LaunchTier1PhysicalRoot::Libraries),
+        _ => None,
+    }
+}
+
 impl LaunchTier0RuntimeSelection<'_> {
     fn includes(self, root: &KnownGoodRoot) -> bool {
         let KnownGoodRoot::ManagedRuntime { component } = root else {
@@ -300,6 +380,124 @@ pub struct LaunchTier0ProjectionError {
 impl LaunchTier0ProjectionError {
     pub fn selected_entry_count(self) -> usize {
         self.selected_entry_count
+    }
+}
+
+#[derive(Debug)]
+pub struct LaunchTier1Projection {
+    entries: Vec<LaunchTier1ProjectionEntry>,
+}
+
+impl LaunchTier1Projection {
+    pub fn into_entries(self) -> Vec<LaunchTier1ProjectionEntry> {
+        self.entries
+    }
+}
+
+#[derive(Debug)]
+pub struct LaunchTier1ProjectionEntry {
+    inventory_ordinal: usize,
+    file: LaunchTier1AdmittedFile,
+}
+
+impl LaunchTier1ProjectionEntry {
+    pub fn into_parts(self) -> (usize, LaunchTier1AdmittedFile) {
+        (self.inventory_ordinal, self.file)
+    }
+}
+
+#[derive(Debug)]
+pub struct LaunchTier1AdmittedFile {
+    root: KnownGoodRoot,
+    physical_root: LaunchTier1PhysicalRoot,
+    path: KnownGoodRelativePath,
+    kind: KnownGoodArtifactKind,
+    digest: Sha1Digest,
+    size: u64,
+}
+
+impl LaunchTier1AdmittedFile {
+    pub fn root(&self) -> &KnownGoodRoot {
+        &self.root
+    }
+
+    #[cfg(test)]
+    pub fn path(&self) -> &KnownGoodRelativePath {
+        &self.path
+    }
+
+    pub fn kind(&self) -> KnownGoodArtifactKind {
+        self.kind
+    }
+
+    pub fn digest(&self) -> &Sha1Digest {
+        &self.digest
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn physical_path(&self, library_root: &Path) -> KnownGoodPhysicalPath {
+        let mut relative = match self.physical_root {
+            LaunchTier1PhysicalRoot::Versions => PathBuf::from("versions"),
+            LaunchTier1PhysicalRoot::Libraries => PathBuf::from("libraries"),
+        };
+        for segment in self.path.as_str().split('/') {
+            relative.push(segment);
+        }
+        KnownGoodPhysicalPath {
+            root: library_root.to_path_buf(),
+            relative,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchTier1PhysicalRoot {
+    Versions,
+    Libraries,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaunchTier1ProjectionError {
+    TooManyEntries {
+        selected_entry_count: usize,
+    },
+    UnsupportedIntegrity {
+        selected_entry_count: usize,
+        inventory_ordinal: usize,
+    },
+    ArtifactByteLimitExceeded {
+        selected_entry_count: usize,
+        inventory_ordinal: usize,
+        expected_byte_count: u64,
+    },
+    AggregateByteLimitExceeded {
+        selected_entry_count: usize,
+        expected_byte_count: u64,
+    },
+}
+
+impl LaunchTier1ProjectionError {
+    pub fn selected_entry_count(self) -> usize {
+        match self {
+            Self::TooManyEntries {
+                selected_entry_count,
+            }
+            | Self::UnsupportedIntegrity {
+                selected_entry_count,
+                ..
+            }
+            | Self::ArtifactByteLimitExceeded {
+                selected_entry_count,
+                ..
+            }
+            | Self::AggregateByteLimitExceeded {
+                selected_entry_count,
+                ..
+            } => selected_entry_count,
+        }
     }
 }
 
@@ -2688,6 +2886,385 @@ mod tests {
                 .expect_err("oversized projection")
                 .selected_entry_count(),
             MAX_LAUNCH_TIER0_ENTRIES + 1
+        );
+    }
+
+    fn tier_one_entry(
+        root: KnownGoodRoot,
+        path: &str,
+        kind: KnownGoodArtifactKind,
+        integrity: KnownGoodIntegrity,
+    ) -> KnownGoodEntry {
+        KnownGoodEntry {
+            root,
+            path: KnownGoodRelativePath::new(path).expect("tier one test path"),
+            kind,
+            integrity,
+        }
+    }
+
+    fn tier_one_sha1_entry(
+        root: KnownGoodRoot,
+        path: &str,
+        kind: KnownGoodArtifactKind,
+        size: u64,
+    ) -> KnownGoodEntry {
+        tier_one_entry(
+            root,
+            path,
+            kind,
+            KnownGoodIntegrity::Sha1 {
+                digest: Sha1Digest::from_metadata(SHA_A).expect("digest"),
+                size,
+            },
+        )
+    }
+
+    #[test]
+    fn tier_one_projection_is_closed_to_managed_client_library_and_native_files() {
+        let runtime_root = || KnownGoodRoot::ManagedRuntime {
+            component: KnownGoodId::new("java-runtime-delta").expect("component"),
+        };
+        let inventory = KnownGoodInventory {
+            entries: vec![
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Assets,
+                    "indexes/1.json",
+                    KnownGoodArtifactKind::AssetIndex,
+                    1,
+                ),
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Libraries,
+                    "com/example/library.jar",
+                    KnownGoodArtifactKind::Library,
+                    11,
+                ),
+                tier_one_entry(
+                    KnownGoodRoot::Versions,
+                    "1.21.1/1.21.1.jar",
+                    KnownGoodArtifactKind::ClientJar,
+                    KnownGoodIntegrity::ExactBytes {
+                        digest: Sha1Digest::from_metadata(SHA_B).expect("digest"),
+                        size: 13,
+                    },
+                ),
+                tier_one_sha1_entry(
+                    runtime_root(),
+                    "bin/java",
+                    KnownGoodArtifactKind::RuntimeExecutable,
+                    15,
+                ),
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Libraries,
+                    "com/example/native.jar",
+                    KnownGoodArtifactKind::NativeLibrary,
+                    17,
+                ),
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Versions,
+                    "1.21.1/log.xml",
+                    KnownGoodArtifactKind::LogConfig,
+                    19,
+                ),
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Assets,
+                    "objects/spoofed-client.jar",
+                    KnownGoodArtifactKind::ClientJar,
+                    23,
+                ),
+                tier_one_sha1_entry(
+                    runtime_root(),
+                    "lib/spoofed-library.jar",
+                    KnownGoodArtifactKind::Library,
+                    29,
+                ),
+            ],
+        };
+
+        let projection = inventory
+            .launch_tier1_projection()
+            .expect("bounded tier one projection");
+        let projected = projection
+            .into_entries()
+            .into_iter()
+            .map(LaunchTier1ProjectionEntry::into_parts)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected
+                .iter()
+                .map(|(inventory_ordinal, _)| *inventory_ordinal)
+                .collect::<Vec<_>>(),
+            [1, 2, 4]
+        );
+        assert_eq!(
+            projected
+                .iter()
+                .map(|(_, file)| file.root().clone())
+                .collect::<Vec<_>>(),
+            [
+                KnownGoodRoot::Libraries,
+                KnownGoodRoot::Versions,
+                KnownGoodRoot::Libraries,
+            ]
+        );
+        assert_eq!(
+            projected
+                .iter()
+                .map(|(_, file)| file.kind())
+                .collect::<Vec<_>>(),
+            [
+                KnownGoodArtifactKind::Library,
+                KnownGoodArtifactKind::ClientJar,
+                KnownGoodArtifactKind::NativeLibrary,
+            ]
+        );
+        assert_eq!(
+            projected
+                .iter()
+                .map(|(_, file)| file.path().as_str())
+                .collect::<Vec<_>>(),
+            [
+                "com/example/library.jar",
+                "1.21.1/1.21.1.jar",
+                "com/example/native.jar",
+            ]
+        );
+        assert_eq!(
+            projected
+                .iter()
+                .map(|(_, file)| (file.digest().as_str(), file.size()))
+                .collect::<Vec<_>>(),
+            [(SHA_A, 11), (SHA_B, 13), (SHA_A, 17)]
+        );
+        assert_eq!(
+            projected.iter().map(|(_, file)| file.size()).sum::<u64>(),
+            41
+        );
+        let physical = projected[1].1.physical_path(Path::new("/managed/library"));
+        assert_eq!(physical.root(), Path::new("/managed/library"));
+        assert_eq!(physical.relative(), Path::new("versions/1.21.1/1.21.1.jar"));
+    }
+
+    #[test]
+    fn tier_one_projection_excludes_every_other_artifact_kind() {
+        let runtime_root = || KnownGoodRoot::ManagedRuntime {
+            component: KnownGoodId::new("java-runtime-delta").expect("component"),
+        };
+        let entries = [
+            (
+                KnownGoodRoot::Versions,
+                KnownGoodArtifactKind::VersionMetadata,
+            ),
+            (KnownGoodRoot::Assets, KnownGoodArtifactKind::AssetIndex),
+            (KnownGoodRoot::Assets, KnownGoodArtifactKind::AssetObject),
+            (KnownGoodRoot::Versions, KnownGoodArtifactKind::LogConfig),
+            (runtime_root(), KnownGoodArtifactKind::RuntimeManifestProof),
+            (runtime_root(), KnownGoodArtifactKind::RuntimeReadyMarker),
+            (runtime_root(), KnownGoodArtifactKind::RuntimeFile),
+            (runtime_root(), KnownGoodArtifactKind::RuntimeExecutable),
+            (runtime_root(), KnownGoodArtifactKind::RuntimeDirectory),
+            (runtime_root(), KnownGoodArtifactKind::RuntimeLink),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, (root, kind))| {
+            tier_one_sha1_entry(root, &format!("excluded/{ordinal}"), kind, 1)
+        })
+        .collect();
+
+        let projection = KnownGoodInventory { entries }
+            .launch_tier1_projection()
+            .expect("excluded kinds cannot invalidate projection");
+        assert_eq!(projection.into_entries().len(), 0);
+    }
+
+    #[test]
+    fn tier_one_projection_admits_exact_entry_bound_and_refuses_above_it() {
+        let entries = (0..MAX_LAUNCH_TIER1_ENTRIES)
+            .map(|ordinal| {
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Libraries,
+                    &format!("bounded/library-{ordinal}.jar"),
+                    KnownGoodArtifactKind::Library,
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let exact = KnownGoodInventory {
+            entries: entries.clone(),
+        }
+        .launch_tier1_projection()
+        .expect("exact entry bound");
+        assert_eq!(exact.into_entries().len(), MAX_LAUNCH_TIER1_ENTRIES);
+
+        let mut oversized = entries;
+        oversized.push(tier_one_sha1_entry(
+            KnownGoodRoot::Libraries,
+            "bounded/overflow.jar",
+            KnownGoodArtifactKind::Library,
+            0,
+        ));
+        assert_eq!(
+            KnownGoodInventory { entries: oversized }
+                .launch_tier1_projection()
+                .expect_err("entry bound must be closed"),
+            LaunchTier1ProjectionError::TooManyEntries {
+                selected_entry_count: MAX_LAUNCH_TIER1_ENTRIES + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn tier_one_projection_counts_large_matching_set_before_admission() {
+        let selected_entry_count = MAX_LAUNCH_TIER1_ENTRIES * 8 + 37;
+        let entries = (0..selected_entry_count)
+            .map(|ordinal| {
+                tier_one_entry(
+                    KnownGoodRoot::Libraries,
+                    &format!("large/library-{ordinal}.jar"),
+                    KnownGoodArtifactKind::Library,
+                    if ordinal == 0 {
+                        KnownGoodIntegrity::Directory
+                    } else {
+                        KnownGoodIntegrity::Sha1 {
+                            digest: Sha1Digest::from_metadata(SHA_A).expect("digest"),
+                            size: 0,
+                        }
+                    },
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            KnownGoodInventory { entries }
+                .launch_tier1_projection()
+                .expect_err("large matching projection must refuse before admission"),
+            LaunchTier1ProjectionError::TooManyEntries {
+                selected_entry_count,
+            }
+        );
+    }
+
+    #[test]
+    fn tier_one_projection_refuses_non_file_integrity() {
+        for integrity in [
+            KnownGoodIntegrity::Directory,
+            KnownGoodIntegrity::LinkTarget(
+                KnownGoodLinkTarget::new("linked.jar", "target.jar").expect("link target"),
+            ),
+        ] {
+            let inventory = KnownGoodInventory {
+                entries: vec![
+                    tier_one_sha1_entry(
+                        KnownGoodRoot::Assets,
+                        "objects/excluded",
+                        KnownGoodArtifactKind::AssetObject,
+                        1,
+                    ),
+                    tier_one_entry(
+                        KnownGoodRoot::Libraries,
+                        "linked.jar",
+                        KnownGoodArtifactKind::Library,
+                        integrity,
+                    ),
+                ],
+            };
+            assert_eq!(
+                inventory
+                    .launch_tier1_projection()
+                    .expect_err("non-file integrity must be refused"),
+                LaunchTier1ProjectionError::UnsupportedIntegrity {
+                    selected_entry_count: 1,
+                    inventory_ordinal: 1,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn tier_one_projection_enforces_per_artifact_byte_bound() {
+        let exact = KnownGoodInventory {
+            entries: vec![tier_one_sha1_entry(
+                KnownGoodRoot::Versions,
+                "bounded/client.jar",
+                KnownGoodArtifactKind::ClientJar,
+                MAX_LAUNCH_TIER1_ARTIFACT_BYTES,
+            )],
+        }
+        .launch_tier1_projection()
+        .expect("exact artifact byte bound");
+        let (_, exact) = exact
+            .into_entries()
+            .into_iter()
+            .next()
+            .expect("projected file")
+            .into_parts();
+        assert_eq!(exact.size(), MAX_LAUNCH_TIER1_ARTIFACT_BYTES);
+
+        let oversized = MAX_LAUNCH_TIER1_ARTIFACT_BYTES + 1;
+        let error = KnownGoodInventory {
+            entries: vec![tier_one_sha1_entry(
+                KnownGoodRoot::Versions,
+                "bounded/client.jar",
+                KnownGoodArtifactKind::ClientJar,
+                oversized,
+            )],
+        }
+        .launch_tier1_projection()
+        .expect_err("artifact byte bound must be closed");
+        assert_eq!(
+            error,
+            LaunchTier1ProjectionError::ArtifactByteLimitExceeded {
+                selected_entry_count: 1,
+                inventory_ordinal: 0,
+                expected_byte_count: oversized,
+            }
+        );
+        assert_eq!(error.selected_entry_count(), 1);
+    }
+
+    #[test]
+    fn tier_one_projection_enforces_aggregate_byte_bound() {
+        let entries = |count| {
+            (0..count)
+                .map(|ordinal| {
+                    tier_one_sha1_entry(
+                        KnownGoodRoot::Libraries,
+                        &format!("aggregate/library-{ordinal}.jar"),
+                        KnownGoodArtifactKind::Library,
+                        MAX_LAUNCH_TIER1_ARTIFACT_BYTES,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let exact = KnownGoodInventory {
+            entries: entries(4),
+        }
+        .launch_tier1_projection()
+        .expect("exact aggregate byte bound");
+        assert_eq!(
+            exact
+                .into_entries()
+                .into_iter()
+                .map(LaunchTier1ProjectionEntry::into_parts)
+                .map(|(_, file)| file.size())
+                .sum::<u64>(),
+            MAX_LAUNCH_TIER1_AGGREGATE_BYTES
+        );
+
+        let expected_byte_count = MAX_LAUNCH_TIER1_AGGREGATE_BYTES
+            .checked_add(MAX_LAUNCH_TIER1_ARTIFACT_BYTES)
+            .expect("bounded test total");
+        assert_eq!(
+            KnownGoodInventory {
+                entries: entries(5),
+            }
+            .launch_tier1_projection()
+            .expect_err("aggregate byte bound must be closed"),
+            LaunchTier1ProjectionError::AggregateByteLimitExceeded {
+                selected_entry_count: 5,
+                expected_byte_count,
+            }
         );
     }
 

@@ -353,6 +353,7 @@ fn assert_reachable_public_copy(cells: &[KernelCell]) {
                 mode,
                 observation,
                 crash_evidence: None,
+                integrity_facts: &[],
                 target_version_id: "1.21.5",
                 runtime_major: 21,
                 requested_java_present: false,

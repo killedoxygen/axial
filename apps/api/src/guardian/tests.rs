@@ -189,6 +189,90 @@ fn execution_runtime_fact_maps_to_confirmed_runtime_diagnosis() {
 }
 
 #[test]
+fn execution_hash_mismatch_maps_to_launcher_managed_corruption() {
+    let execution_fact = ExecutionFact {
+        operation_id: None,
+        kind: ExecutionFactKind::ArtifactHashMismatch,
+        target: Some(target(
+            "known_good_library",
+            TargetKind::Artifact,
+            OwnershipClass::LauncherManaged,
+        )),
+        fields: Vec::new(),
+    };
+
+    let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Launching);
+    let diagnoses = diagnose(std::slice::from_ref(&fact), OperationPhase::Launching);
+
+    assert_eq!(fact.id, GuardianFactId::ArtifactHashMismatch);
+    assert_eq!(fact.domain, GuardianDomain::Library);
+    assert_eq!(fact.reliability, FactReliability::ValidatedProbe);
+    assert_eq!(diagnoses.len(), 1);
+    assert_eq!(
+        diagnoses[0].id(),
+        DiagnosisId::LauncherManagedArtifactCorrupt
+    );
+    assert_eq!(diagnoses[0].severity(), GuardianSeverity::Repairable);
+}
+
+#[tokio::test]
+async fn startup_integrity_facts_share_one_policy_evaluation() {
+    let integrity_facts = [GuardianFact {
+        operation_id: None,
+        id: GuardianFactId::ArtifactHashMismatch,
+        domain: GuardianDomain::Library,
+        phase: OperationPhase::Launching,
+        reliability: FactReliability::ValidatedProbe,
+        severity: None,
+        confidence: None,
+        ownership: OwnershipClass::LauncherManaged,
+        target: Some(target(
+            "known_good_library",
+            TargetKind::Artifact,
+            OwnershipClass::LauncherManaged,
+        )),
+        fields: Vec::new(),
+    }];
+    let (outcome, evaluations) = with_guardian_policy_evaluation_count(async {
+        guardian_startup_failure_outcome(GuardianStartupFailureRequest {
+            mode: GuardianMode::Managed,
+            observation: GuardianStartupFailureObservation::Exited {
+                failure_class: LaunchFailureClass::ClasspathModuleConflict,
+            },
+            crash_evidence: None,
+            integrity_facts: &integrity_facts,
+            target_version_id: "1.21.1",
+            runtime_major: 21,
+            requested_java_present: false,
+            explicit_java_override_present: false,
+            explicit_jvm_args_present: false,
+            explicit_jvm_preset_present: false,
+            startup_recovery_applied: false,
+            disable_custom_gc: false,
+            effective_preset: "performance",
+        })
+    })
+    .await;
+
+    assert_eq!(evaluations, 1);
+    assert_eq!(outcome.safety_case.phase, OperationPhase::Launching);
+    assert!(
+        outcome
+            .safety_case
+            .diagnoses
+            .iter()
+            .any(|diagnosis| { diagnosis.id() == DiagnosisId::LauncherManagedArtifactCorrupt })
+    );
+    assert!(
+        outcome
+            .safety_case
+            .diagnoses
+            .iter()
+            .any(|diagnosis| { diagnosis.id() == DiagnosisId::ClasspathModuleConflict })
+    );
+}
+
+#[test]
 fn execution_java_override_sentinel_maps_to_unavailable_diagnosis() {
     let target = target(
         "instance_java_override",
@@ -1654,6 +1738,7 @@ impl NamedPolicyBoundaryCase {
                     mode: GuardianMode::Managed,
                     observation: GuardianStartupFailureObservation::Stalled,
                     crash_evidence: None,
+                    integrity_facts: &[],
                     target_version_id: "1.21.1",
                     runtime_major: 21,
                     requested_java_present: false,

@@ -50,6 +50,7 @@ pub struct GuardianStartupFailureRequest<'a> {
     pub mode: GuardianMode,
     pub observation: GuardianStartupFailureObservation,
     pub crash_evidence: Option<&'a CrashEvidence>,
+    pub integrity_facts: &'a [GuardianFact],
     pub target_version_id: &'a str,
     pub runtime_major: u32,
     pub requested_java_present: bool,
@@ -349,6 +350,7 @@ fn startup_failure_facts(
             OperationPhase::Launching,
         ));
     }
+    facts.extend_from_slice(request.integrity_facts);
     facts
 }
 
@@ -691,6 +693,7 @@ mod tests {
                 failure_class: LaunchFailureClass::LauncherManagedArtifactSignature,
             },
             crash_evidence: None,
+            integrity_facts: &[],
             target_version_id: "1.5.2",
             runtime_major: 8,
             requested_java_present: false,
@@ -724,6 +727,7 @@ mod tests {
                 failure_class: LaunchFailureClass::OutOfMemory,
             },
             crash_evidence: None,
+            integrity_facts: &[],
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,
@@ -809,6 +813,7 @@ mod tests {
                 mode: GuardianMode::Managed,
                 observation: GuardianStartupFailureObservation::Exited { failure_class },
                 crash_evidence: None,
+                integrity_facts: &[],
                 target_version_id: "1.21.1",
                 runtime_major: 21,
                 requested_java_present: false,
@@ -878,6 +883,7 @@ mod tests {
                 failure_class: LaunchFailureClass::ModAttributedCrash,
             },
             crash_evidence: Some(&crash_evidence),
+            integrity_facts: &[],
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,
@@ -916,6 +922,7 @@ mod tests {
             mode: GuardianMode::Managed,
             observation: GuardianStartupFailureObservation::Stalled,
             crash_evidence: None,
+            integrity_facts: &[],
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,

@@ -29,9 +29,9 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Kernel cells | 540 |
 | Public kernel cells | 90 |
 | Diagnosis rules | 60 |
-| Registered facts | 120 |
+| Registered facts | 121 |
 | Preflight senses | 7 |
-| Adapter sources | 103 |
+| Adapter sources | 104 |
 | Repair hands | 3 |
 
 ### Decision Distribution

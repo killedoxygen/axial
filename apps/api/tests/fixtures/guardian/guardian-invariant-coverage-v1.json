@@ -4864,12 +4864,14 @@
       "diagnosis": "launcher_managed_artifact_corrupt",
       "triggers": [
         "artifact_checksum_mismatch",
+        "artifact_hash_mismatch",
         "artifact_size_drift",
         "artifact_size_mismatch",
         "artifact_missing"
       ],
       "evidence": [
         "artifact_checksum_mismatch",
+        "artifact_hash_mismatch",
         "artifact_size_drift",
         "artifact_size_mismatch",
         "artifact_missing"
@@ -5396,6 +5398,11 @@
     },
     {
       "fact": "artifact_checksum_mismatch",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "artifact_hash_mismatch",
       "availability": "registered_current",
       "referenced_by_rule": true
     },
@@ -6045,6 +6052,14 @@
   ],
   "adapters": {
     "execution": [
+      {
+        "source": "artifact_hash_mismatch",
+        "classification": "diagnostic",
+        "fact": "artifact_hash_mismatch",
+        "diagnoses": [
+          "launcher_managed_artifact_corrupt"
+        ]
+      },
       {
         "source": "artifact_missing",
         "classification": "diagnostic",

@@ -25,6 +25,7 @@ pub enum GuardianFactId {
     AgentHookFailed,
     AgentUnavailable,
     ArtifactChecksumMismatch,
+    ArtifactHashMismatch,
     ArtifactMissing,
     ArtifactQuarantined,
     ArtifactSizeDrift,
@@ -134,10 +135,11 @@ pub enum GuardianFactId {
 }
 
 impl GuardianFactId {
-    pub const ALL: [Self; 120] = [
+    pub const ALL: [Self; 121] = [
         Self::AgentHookFailed,
         Self::AgentUnavailable,
         Self::ArtifactChecksumMismatch,
+        Self::ArtifactHashMismatch,
         Self::ArtifactMissing,
         Self::ArtifactQuarantined,
         Self::ArtifactSizeDrift,
@@ -262,6 +264,7 @@ impl GuardianFactId {
             Self::AgentHookFailed => "agent_hook_failed",
             Self::AgentUnavailable => "agent_unavailable",
             Self::ArtifactChecksumMismatch => "artifact_checksum_mismatch",
+            Self::ArtifactHashMismatch => "artifact_hash_mismatch",
             Self::ArtifactMissing => "artifact_missing",
             Self::ArtifactQuarantined => "artifact_quarantined",
             Self::ArtifactSizeDrift => "artifact_size_drift",

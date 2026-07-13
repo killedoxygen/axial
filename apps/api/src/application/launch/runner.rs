@@ -8,14 +8,16 @@ mod status;
 
 use crate::application::guardian_conversion::api_guardian_mode;
 use crate::application::launch_application_stage_evidence;
+use crate::execution::integrity::sense_integrity_tier1;
 use crate::execution::launch::{
     LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
 };
 use crate::guardian::{
-    GuardianCopyRequest, GuardianLaunchRecoveryPlan, GuardianObservedLaunchFailurePhase,
-    GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
-    GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianSummary,
-    author_guardian_copy, guardian_prelaunch_preset_adjustment_directive,
+    GuardianCopyRequest, GuardianFact, GuardianLaunchRecoveryPlan,
+    GuardianObservedLaunchFailurePhase, GuardianPrepareFailureRequest,
+    GuardianPresetAdjustmentRequest, GuardianStartupFailureObservation,
+    GuardianStartupFailureRequest, GuardianSummary, author_guardian_copy,
+    guardian_fact_from_execution, guardian_prelaunch_preset_adjustment_directive,
     guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
     guardian_summary_with_blocked_outcome, guardian_summary_with_observed_outcome,
     is_guardian_launch_crash_class, record_launch_failure_observation,
@@ -1050,16 +1052,26 @@ async fn launch_session_inner_with_control(
                 } else {
                     state.sessions().get(&session_id).await
                 };
+                let failure_class = if stalled {
+                    LaunchFailureClass::StartupStalled
+                } else {
+                    terminal_record
+                        .as_ref()
+                        .and_then(|record| record.failure.as_ref().map(|failure| failure.class))
+                        .unwrap_or(LaunchFailureClass::Unknown)
+                };
                 let observation = if stalled {
                     GuardianStartupFailureObservation::Stalled
                 } else {
-                    GuardianStartupFailureObservation::Exited {
-                        failure_class: terminal_record
-                            .as_ref()
-                            .and_then(|record| record.failure.as_ref().map(|failure| failure.class))
-                            .unwrap_or(LaunchFailureClass::Unknown),
-                    }
+                    GuardianStartupFailureObservation::Exited { failure_class }
                 };
+                let integrity_facts = sense_startup_failure_integrity(
+                    &state,
+                    &intent.instance_id,
+                    &intent.library_dir,
+                    failure_class,
+                )
+                .await;
                 let guardian_mode = api_guardian_mode(intent.guardian.mode);
                 let startup_outcome =
                     guardian_startup_failure_outcome(GuardianStartupFailureRequest {
@@ -1068,6 +1080,7 @@ async fn launch_session_inner_with_control(
                         crash_evidence: terminal_record
                             .as_ref()
                             .and_then(|record| record.crash_evidence.as_ref()),
+                        integrity_facts: &integrity_facts,
                         target_version_id: &intent.target_version_id,
                         runtime_major: prepared.runtime.effective_info.major,
                         requested_java_present: !intent.requested_java.trim().is_empty(),
@@ -1393,6 +1406,43 @@ fn startup_failure_healing(
     })
 }
 
+fn failure_class_needs_tier1_integrity(failure_class: LaunchFailureClass) -> bool {
+    matches!(
+        failure_class,
+        LaunchFailureClass::LauncherManagedArtifactSignature
+            | LaunchFailureClass::ClasspathModuleConflict
+            | LaunchFailureClass::MissingDependency
+    )
+}
+
+async fn sense_startup_failure_integrity(
+    state: &AppState,
+    instance_id: &str,
+    library_dir: &std::path::Path,
+    failure_class: LaunchFailureClass,
+) -> Vec<GuardianFact> {
+    if !failure_class_needs_tier1_integrity(failure_class) {
+        return Vec::new();
+    }
+
+    let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
+    sense_integrity_tier1(state, &lifecycle, library_dir)
+        .await
+        .map(|report| {
+            report
+                .facts
+                .iter()
+                .map(|fact| {
+                    guardian_fact_from_execution(
+                        fact,
+                        crate::state::contracts::OperationPhase::Launching,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn trace_launch_event(session_id: &str, message: &str) {
     append_trace("launch", session_id, message);
 }
@@ -1445,6 +1495,23 @@ mod tests {
             "net/fabricmc/intermediary/1.21.1/intermediary-1.21.1.jar",
         ),
     ];
+
+    #[test]
+    fn tier1_integrity_has_an_exhaustive_closed_failure_class_trigger() {
+        for &failure_class in LaunchFailureClass::ALL {
+            assert_eq!(
+                failure_class_needs_tier1_integrity(failure_class),
+                matches!(
+                    failure_class,
+                    LaunchFailureClass::LauncherManagedArtifactSignature
+                        | LaunchFailureClass::ClasspathModuleConflict
+                        | LaunchFailureClass::MissingDependency
+                ),
+                "unexpected Tier1 admission for {}",
+                failure_class.as_str()
+            );
+        }
+    }
 
     fn empty_guardian_summary(mode: axial_launcher::GuardianMode) -> GuardianSummary {
         guardian_summary_for_test(

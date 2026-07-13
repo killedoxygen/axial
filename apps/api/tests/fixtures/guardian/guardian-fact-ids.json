@@ -2,6 +2,7 @@
   "agent_hook_failed",
   "agent_unavailable",
   "artifact_checksum_mismatch",
+  "artifact_hash_mismatch",
   "artifact_missing",
   "artifact_quarantined",
   "artifact_size_drift",

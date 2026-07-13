@@ -937,6 +937,7 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         LauncherManagedArtifactCorrupt,
         [
             ArtifactChecksumMismatch,
+            ArtifactHashMismatch,
             ArtifactSizeDrift,
             ArtifactSizeMismatch,
             ArtifactMissing,

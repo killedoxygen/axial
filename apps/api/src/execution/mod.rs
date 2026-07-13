@@ -108,6 +108,7 @@ macro_rules! execution_fact_kinds {
 }
 
 execution_fact_kinds! {
+    ArtifactHashMismatch => ("artifact_hash_mismatch", Diagnostic),
     ArtifactMissing => ("artifact_missing", Diagnostic),
     ArtifactSizeDrift => ("artifact_size_drift", Diagnostic),
     DownloadChecksumMismatch => ("download_checksum_mismatch", Diagnostic),

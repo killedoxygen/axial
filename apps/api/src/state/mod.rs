@@ -152,11 +152,11 @@ struct KnownGoodCandidateAdmission {
 
 pub(crate) struct InstanceLifecycleLease {
     instance_id: String,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
 }
 
-pub(crate) struct KnownGoodVerificationLease<'a> {
-    _lifecycle: &'a InstanceLifecycleLease,
+pub(crate) struct KnownGoodVerificationLease {
+    _lifecycle: InstanceLifecycleLease,
     instance_id: String,
     version_id: String,
     created_at: String,
@@ -176,16 +176,23 @@ impl InstanceLifecycleLease {
     fn bind(instance_id: &str, guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
         Self {
             instance_id: instance_id.to_string(),
-            _guard: guard,
+            _guard: Arc::new(guard),
         }
     }
 
     fn matches(&self, instance_id: &str) -> bool {
         self.instance_id == instance_id
     }
+
+    fn retained(&self) -> Self {
+        Self {
+            instance_id: self.instance_id.clone(),
+            _guard: self._guard.clone(),
+        }
+    }
 }
 
-impl KnownGoodVerificationLease<'_> {
+impl KnownGoodVerificationLease {
     pub(crate) fn execution_parts(
         &self,
     ) -> (
@@ -988,11 +995,11 @@ impl AppState {
         )
     }
 
-    pub(crate) fn mint_known_good_verification_lease<'a>(
+    pub(crate) fn mint_known_good_verification_lease(
         &self,
-        lifecycle: &'a InstanceLifecycleLease,
+        lifecycle: &InstanceLifecycleLease,
         expected_library_root: &Path,
-    ) -> Result<KnownGoodVerificationLease<'a>, KnownGoodVerificationUnavailable> {
+    ) -> Result<KnownGoodVerificationLease, KnownGoodVerificationUnavailable> {
         let instance = self
             .instances
             .get(&lifecycle.instance_id)
@@ -1021,7 +1028,7 @@ impl AppState {
             .ok_or(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)?;
 
         Ok(KnownGoodVerificationLease {
-            _lifecycle: lifecycle,
+            _lifecycle: lifecycle.retained(),
             instance_id: instance.id,
             version_id: instance.version_id,
             created_at: instance.created_at,
@@ -1033,7 +1040,7 @@ impl AppState {
 
     pub(crate) fn known_good_verification_lease_is_current(
         &self,
-        lease: &KnownGoodVerificationLease<'_>,
+        lease: &KnownGoodVerificationLease,
     ) -> bool {
         let Some(instance) = self.instances.get(&lease.instance_id) else {
             return false;
