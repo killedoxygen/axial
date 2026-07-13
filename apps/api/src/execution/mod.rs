@@ -9,6 +9,7 @@ pub mod file;
 pub(crate) mod integrity;
 pub mod jvm;
 pub mod launch;
+mod low_priority;
 pub(crate) mod persistence;
 pub mod process;
 pub mod runtime;

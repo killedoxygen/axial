@@ -1,12 +1,17 @@
 //! Bounded integrity verification of exact live launcher-owned inventory authority.
 
-use super::{ExecutionFact, ExecutionFactKind};
+use super::{
+    ExecutionFact, ExecutionFactKind,
+    low_priority::{
+        LowPriorityOutcome, LowPriorityPlatform, SystemLowPriorityPlatform, run_at_low_priority,
+    },
+};
 use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use crate::state::{
-    AppState, IdleSweepCancellation, IdleSweepReservation, InstanceLifecycleLease,
-    IntegrityForegroundLease, KnownGoodTier2Ticket, KnownGoodVerificationLease,
-    KnownGoodVerificationUnavailable,
+    AppState, IdleSweepCancellation, IdleSweepReservation, IdleSweepSettlement, IdleSweepTerminal,
+    InstanceLifecycleLease, IntegrityForegroundLease, KnownGoodTier2Ticket,
+    KnownGoodVerificationLease, KnownGoodVerificationUnavailable,
 };
 use axial_minecraft::ManagedRuntimeCache;
 #[cfg(test)]
@@ -1511,11 +1516,25 @@ pub(crate) struct IntegrityTier2OwnedWork {
     progress: IntegrityTier2ProgressSink,
 }
 
-#[must_use = "Tier 2 result owns idle sweep settlement authority"]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the R5 scheduler slice")
+)]
+#[derive(Debug)]
+#[must_use = "Tier 2 result records the finalized report and sweep settlement"]
 pub(crate) struct IntegrityTier2OwnedResult {
-    reservation: IdleSweepReservation,
-    report: IntegrityTier2Report,
+    pub(crate) report: IntegrityTier2Report,
+    pub(crate) settlement: IdleSweepSettlement,
 }
+
+#[must_use = "Tier 2 blocking ownership must be joined through physical completion"]
+pub(crate) struct IntegrityTier2BlockingWorker {
+    completion: tokio::sync::oneshot::Receiver<IntegrityTier2OwnedResult>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("Tier 2 dedicated worker stopped before terminal settlement")]
+pub(crate) struct IntegrityTier2BlockingWorkerUnavailable;
 
 #[cfg_attr(
     not(test),
@@ -1536,20 +1555,47 @@ impl IntegrityTier2OwnedWork {
         }
     }
 
-    pub(crate) fn run(self) -> IntegrityTier2OwnedResult {
-        let Self {
-            state,
-            ticket,
-            reservation,
-            progress,
-        } = self;
-        let cancellation = reservation.cancellation();
-        let report = settle_integrity_tier2_owned(&progress, || {
-            sense_integrity_tier2_owned(&state, ticket, &cancellation, &progress)
-        });
-        IntegrityTier2OwnedResult {
-            reservation,
-            report,
+    pub(crate) fn spawn(self) -> IntegrityTier2BlockingWorker {
+        self.spawn_with_platform(SystemLowPriorityPlatform)
+    }
+
+    fn spawn_with_platform<Platform>(self, platform: Platform) -> IntegrityTier2BlockingWorker
+    where
+        Platform: LowPriorityPlatform,
+    {
+        let work = Arc::new(Mutex::new(Some(self)));
+        let thread_work = work.clone();
+        let (completion_tx, completion) = tokio::sync::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("axial-tier-two-integrity".to_string())
+            .spawn(move || {
+                let work = thread_work
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("Tier 2 worker was already claimed");
+                let result = complete_integrity_tier2_owned(work, platform);
+                let _ = completion_tx.send(result);
+            });
+
+        match spawned {
+            Ok(thread) => {
+                drop(thread);
+                IntegrityTier2BlockingWorker { completion }
+            }
+            Err(_) => {
+                let work = work
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("failed Tier 2 thread spawn must leave work recoverable");
+                let result = refuse_integrity_tier2_thread_spawn(work);
+                let (ready_tx, ready_completion) = tokio::sync::oneshot::channel();
+                let _ = ready_tx.send(result);
+                IntegrityTier2BlockingWorker {
+                    completion: ready_completion,
+                }
+            }
         }
     }
 }
@@ -1558,17 +1604,91 @@ impl IntegrityTier2OwnedWork {
     not(test),
     expect(dead_code, reason = "consumed by the R5 scheduler slice")
 )]
-impl IntegrityTier2OwnedResult {
-    pub(crate) fn into_parts(self) -> (IdleSweepReservation, IntegrityTier2Report) {
-        (self.reservation, self.report)
+impl IntegrityTier2BlockingWorker {
+    pub(crate) async fn join(
+        self,
+    ) -> Result<IntegrityTier2OwnedResult, IntegrityTier2BlockingWorkerUnavailable> {
+        self.completion
+            .await
+            .map_err(|_| IntegrityTier2BlockingWorkerUnavailable)
     }
 }
 
-fn settle_integrity_tier2_owned(
-    progress: &IntegrityTier2ProgressSink,
-    run: impl FnOnce() -> IntegrityTier2Report,
+fn complete_integrity_tier2_owned<Platform>(
+    work: IntegrityTier2OwnedWork,
+    platform: Platform,
+) -> IntegrityTier2OwnedResult
+where
+    Platform: LowPriorityPlatform,
+{
+    let IntegrityTier2OwnedWork {
+        state,
+        ticket,
+        reservation,
+        progress,
+    } = work;
+    let cancellation = reservation.cancellation();
+    let mut report = settle_integrity_tier2_owned(&progress, platform, || {
+        sense_integrity_tier2_owned(&state, ticket, &cancellation, &progress)
+    });
+    let terminal = match report.status {
+        IntegrityTier2Status::Complete => IdleSweepTerminal::Complete,
+        IntegrityTier2Status::Cancelled => IdleSweepTerminal::Cancelled,
+        IntegrityTier2Status::Refused => IdleSweepTerminal::Refused,
+    };
+    let settlement = reservation.settle(terminal);
+    report = finalize_integrity_tier2_report(report, settlement);
+    if report.status == IntegrityTier2Status::Cancelled {
+        progress.publish(&report);
+    }
+    IntegrityTier2OwnedResult { report, settlement }
+}
+
+fn finalize_integrity_tier2_report(
+    report: IntegrityTier2Report,
+    settlement: IdleSweepSettlement,
 ) -> IntegrityTier2Report {
-    let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+    if report.status == IntegrityTier2Status::Complete
+        && settlement == IdleSweepSettlement::Superseded
+    {
+        report.cancel()
+    } else {
+        report
+    }
+}
+
+fn refuse_integrity_tier2_thread_spawn(work: IntegrityTier2OwnedWork) -> IntegrityTier2OwnedResult {
+    let IntegrityTier2OwnedWork {
+        reservation,
+        progress,
+        ..
+    } = work;
+    let report = IntegrityTier2Report::new(0, 0).refuse(tier2_worker_refused_fact());
+    progress.publish(&report);
+    let settlement = reservation.settle(IdleSweepTerminal::Refused);
+    IntegrityTier2OwnedResult { report, settlement }
+}
+
+fn settle_integrity_tier2_owned<Platform>(
+    progress: &IntegrityTier2ProgressSink,
+    platform: Platform,
+    run: impl FnOnce() -> IntegrityTier2Report,
+) -> IntegrityTier2Report
+where
+    Platform: LowPriorityPlatform,
+{
+    let report =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match run_at_low_priority(platform, run) {
+                LowPriorityOutcome::Complete(report) => report,
+                LowPriorityOutcome::EnterFailed => {
+                    IntegrityTier2Report::new(0, 0).refuse(tier2_priority_enter_refused_fact())
+                }
+                LowPriorityOutcome::RestoreFailed(report) => {
+                    report.refuse(tier2_priority_restore_refused_fact())
+                }
+            }
+        }))
         .unwrap_or_else(|_| IntegrityTier2Report::new(0, 0).refuse(tier2_worker_refused_fact()));
     progress.publish(&report);
     report
@@ -2008,6 +2128,22 @@ fn tier2_worker_refused_fact() -> ExecutionFact {
     tier2_refused_fact("known_good_tier2_worker", "tier2_worker_unavailable", None)
 }
 
+fn tier2_priority_enter_refused_fact() -> ExecutionFact {
+    tier2_refused_fact(
+        "known_good_tier2_low_priority",
+        "tier2_low_priority_enter_failed",
+        None,
+    )
+}
+
+fn tier2_priority_restore_refused_fact() -> ExecutionFact {
+    tier2_refused_fact(
+        "known_good_tier2_low_priority",
+        "tier2_low_priority_restore_failed",
+        None,
+    )
+}
+
 fn tier2_refused_fact(
     target_id: &'static str,
     observation: &'static str,
@@ -2321,7 +2457,7 @@ fn push_bounded_fact(report: &mut IntegrityTier0Report, fact: ExecutionFact) {
 mod tests {
     use super::*;
     use crate::application::timing::INTEGRITY_TIER0_CEILING_MS;
-    use crate::state::{AppState, AppStateInit, IdleSweepTerminal, InstallStore, SessionStore};
+    use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_minecraft::known_good::{
         KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity, TestKnownGoodRoot,
@@ -2680,6 +2816,76 @@ mod tests {
         gate: Arc<BlockingContentGate>,
     }
 
+    #[derive(Clone)]
+    struct ScriptedLowPriorityPlatform {
+        enter_fails: bool,
+        restore_failures: Arc<Mutex<usize>>,
+        gate: Option<Arc<BlockingContentGate>>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl ScriptedLowPriorityPlatform {
+        fn successful() -> Self {
+            Self {
+                enter_fails: false,
+                restore_failures: Arc::new(Mutex::new(0)),
+                gate: None,
+                events: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn enter_failure() -> Self {
+            Self {
+                enter_fails: true,
+                ..Self::successful()
+            }
+        }
+
+        fn restore_failure() -> Self {
+            Self {
+                restore_failures: Arc::new(Mutex::new(1)),
+                ..Self::successful()
+            }
+        }
+
+        fn gated(gate: Arc<BlockingContentGate>) -> Self {
+            Self {
+                gate: Some(gate),
+                ..Self::successful()
+            }
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().expect("priority events").clone()
+        }
+    }
+
+    impl LowPriorityPlatform for ScriptedLowPriorityPlatform {
+        type Saved = ();
+
+        fn enter(&self) -> Result<Self::Saved, ()> {
+            self.events.lock().expect("priority events").push("enter");
+            if self.enter_fails {
+                return Err(());
+            }
+            if let Some(gate) = &self.gate {
+                gate.wait();
+            }
+            Ok(())
+        }
+
+        fn restore(&self, _saved: &Self::Saved) -> Result<(), ()> {
+            self.events.lock().expect("priority events").push("restore");
+            let mut failures = self.restore_failures.lock().expect("restore failures");
+            if *failures == 0 {
+                Ok(())
+            } else {
+                *failures -= 1;
+                Err(())
+            }
+        }
+    }
+
     impl ContentReader for BlockingContentReader {
         fn hash_file(
             &self,
@@ -2868,6 +3074,47 @@ mod tests {
             .expect("close instance store");
         drop(state);
         let _ = fs::remove_dir_all(root);
+    }
+
+    async fn tier2_owned_work_fixture(
+        label: &str,
+    ) -> (
+        AppState,
+        PathBuf,
+        IntegrityTier2OwnedWork,
+        IntegrityTier2ProgressSink,
+    ) {
+        let (state, root) = state_fixture(label, None);
+        let managed_parent = root.join("private-library-root/libraries/owned");
+        fs::create_dir_all(&managed_parent).expect("managed library parent");
+        fs::write(managed_parent.join("library.jar"), [7_u8]).expect("managed library");
+        let instance = state
+            .instances()
+            .insert_for_test("Tier two owned work", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "owned/library.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::File { size: 1 },
+        )])
+        .expect("inventory");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let idle_epoch = state.subscribe_integrity_idle().borrow().epoch();
+        let producer = state
+            .try_claim_producer()
+            .expect("claim idle sweep producer");
+        let reservation = state
+            .try_reserve_idle_sweep(idle_epoch, producer)
+            .expect("idle sweep reservation");
+        let ticket = state
+            .mint_known_good_tier2_ticket(&reservation, &instance.id)
+            .await
+            .expect("Tier 2 ticket");
+        let progress = IntegrityTier2ProgressSink::new();
+        let work =
+            IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation, progress.clone());
+        (state, root, work, progress)
     }
 
     async fn test_integrity_foreground(state: &AppState) -> IntegrityForegroundLease {
@@ -3347,41 +3594,12 @@ mod tests {
 
     #[tokio::test]
     async fn tier_two_move_only_work_publishes_latest_progress_from_the_owned_call() {
-        let (state, root) = state_fixture("tier2-owned-work", None);
-        let library_root = root.join("private-library-root");
-        let managed_parent = library_root.join("libraries/owned");
-        fs::create_dir_all(&managed_parent).expect("managed library parent");
-        fs::write(managed_parent.join("library.jar"), [7_u8]).expect("managed library");
-        let instance = state
-            .instances()
-            .insert_for_test("Tier two owned work", "1.21.5")
-            .expect("instance");
-        let inventory = KnownGoodInventory::from_test_entries([entry(
-            TestKnownGoodRoot::Libraries,
-            "owned/library.jar",
-            KnownGoodArtifactKind::Library,
-            TestKnownGoodIntegrity::File { size: 1 },
-        )])
-        .expect("inventory");
-        state.activate_known_good_inventory_for_test(&instance.id, inventory);
-        let idle_epoch = state.subscribe_integrity_idle().borrow().epoch();
-        let producer = state
-            .try_claim_producer()
-            .expect("claim idle sweep producer");
-        let reservation = state
-            .try_reserve_idle_sweep(idle_epoch, producer)
-            .expect("idle sweep reservation");
-        let ticket = state
-            .mint_known_good_tier2_ticket(&reservation, &instance.id)
-            .await
-            .expect("Tier 2 ticket");
-        let progress = IntegrityTier2ProgressSink::new();
-        let work =
-            IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation, progress.clone());
+        let (state, root, work, progress) = tier2_owned_work_fixture("tier2-owned-work").await;
 
-        let (reservation, report) = work.run().into_parts();
-        reservation.settle(IdleSweepTerminal::Complete);
+        let result = work.spawn().join().await.expect("dedicated worker result");
+        let report = result.report;
 
+        assert_eq!(result.settlement, IdleSweepSettlement::Authoritative);
         assert_eq!(report.status, IntegrityTier2Status::Complete);
         assert_eq!(report.selected_entry_count, 1);
         assert_eq!(report.verified_entry_count, 1);
@@ -3452,10 +3670,11 @@ mod tests {
             IntegrityTier2ProgressSink::new(),
         );
 
-        let (reservation, report) = work.run().into_parts();
+        let result = work.spawn().join().await.expect("dedicated worker result");
         canceller.join().expect("cancellation thread");
-        reservation.settle(IdleSweepTerminal::Cancelled);
+        let report = result.report;
 
+        assert_eq!(result.settlement, IdleSweepSettlement::Superseded);
         assert_eq!(report.status, IntegrityTier2Status::Cancelled);
         assert!(report.content_read_byte_count <= 64 * 1024);
         assert!(report.facts.is_empty());
@@ -3465,9 +3684,11 @@ mod tests {
     #[test]
     fn tier_two_owned_boundary_settles_worker_panics_as_one_bounded_refusal() {
         let progress = IntegrityTier2ProgressSink::new();
+        let platform = ScriptedLowPriorityPlatform::successful();
 
-        let report =
-            settle_integrity_tier2_owned(&progress, || panic!("injected Tier 2 worker panic"));
+        let report = settle_integrity_tier2_owned(&progress, platform.clone(), || {
+            panic!("injected Tier 2 worker panic")
+        });
 
         assert_eq!(report.status, IntegrityTier2Status::Refused);
         assert_eq!(report.facts.len(), 1);
@@ -3477,14 +3698,172 @@ mod tests {
             Some("tier2_worker_unavailable")
         );
         assert_eq!(progress.latest(), IntegrityTier2Progress::default());
+        assert_eq!(platform.events(), vec!["enter", "restore"]);
+    }
+
+    #[tokio::test]
+    async fn tier_two_priority_enter_failure_refuses_without_sensing() {
+        let (state, root, work, progress) = tier2_owned_work_fixture("tier2-enter-failure").await;
+        let platform = ScriptedLowPriorityPlatform::enter_failure();
+
+        let result = work
+            .spawn_with_platform(platform.clone())
+            .join()
+            .await
+            .expect("priority refusal result");
+
+        assert_eq!(result.settlement, IdleSweepSettlement::Superseded);
+        assert_eq!(result.report.status, IntegrityTier2Status::Refused);
+        assert_eq!(result.report.selected_entry_count, 0);
+        assert_eq!(result.report.processed_entry_count, 0);
+        assert_eq!(result.report.facts.len(), 1);
+        assert_eq!(
+            fact_field(&result.report.facts[0], "observation"),
+            Some("tier2_low_priority_enter_failed")
+        );
+        assert_eq!(progress.latest(), IntegrityTier2Progress::default());
+        assert_eq!(platform.events(), vec!["enter"]);
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn tier_two_priority_restore_failure_discards_facts_but_preserves_counters() {
+        let (state, root, work, progress) = tier2_owned_work_fixture("tier2-restore-failure").await;
+        let platform = ScriptedLowPriorityPlatform::restore_failure();
+
+        let result = work
+            .spawn_with_platform(platform.clone())
+            .join()
+            .await
+            .expect("priority refusal result");
+
+        assert_eq!(result.settlement, IdleSweepSettlement::Superseded);
+        assert_eq!(result.report.status, IntegrityTier2Status::Refused);
+        assert_eq!(result.report.selected_entry_count, 1);
+        assert_eq!(result.report.processed_entry_count, 1);
+        assert_eq!(result.report.hashed_entry_count, 1);
+        assert_eq!(result.report.content_read_byte_count, 1);
+        assert_eq!(result.report.facts.len(), 1);
+        assert_eq!(
+            fact_field(&result.report.facts[0], "observation"),
+            Some("tier2_low_priority_restore_failed")
+        );
+        assert_eq!(
+            progress.latest(),
+            IntegrityTier2Progress {
+                selected_entry_count: 1,
+                verified_entry_count: 1,
+                processed_entry_count: 1,
+                hashed_entry_count: 1,
+                expected_content_byte_count: 1,
+                content_read_byte_count: 1,
+            }
+        );
+        assert_eq!(platform.events(), vec!["enter", "restore", "restore"]);
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn tier_two_spawned_join_stays_pending_until_the_dedicated_worker_finishes() {
+        let (state, root, work, _) = tier2_owned_work_fixture("tier2-gated-join").await;
+        let (gate, entered) = BlockingContentGate::new();
+        let platform = ScriptedLowPriorityPlatform::gated(gate.clone());
+        let worker = work.spawn_with_platform(platform.clone());
+        let join = tokio::spawn(worker.join());
+
+        entered
+            .await
+            .expect("dedicated worker enters priority scope");
+        assert!(!join.is_finished());
+        gate.release();
+        let result = tokio::time::timeout(Duration::from_secs(5), join)
+            .await
+            .expect("dedicated worker finishes")
+            .expect("join waiter")
+            .expect("dedicated worker result");
+
+        assert_eq!(result.settlement, IdleSweepSettlement::Authoritative);
+        assert_eq!(result.report.status, IntegrityTier2Status::Complete);
+        assert_eq!(platform.events(), vec!["enter", "restore"]);
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_join_waiter_keeps_physical_sweep_ownership_until_thread_exit() {
+        let (state, root, work, _) = tier2_owned_work_fixture("tier2-dropped-waiter").await;
+        let (gate, entered) = BlockingContentGate::new();
+        let worker = work.spawn_with_platform(ScriptedLowPriorityPlatform::gated(gate.clone()));
+        let join = tokio::spawn(worker.join());
+        entered
+            .await
+            .expect("dedicated worker enters priority scope");
+
+        join.abort();
+        assert!(
+            join.await
+                .expect_err("join waiter is aborted")
+                .is_cancelled()
+        );
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register foreground against active sweep");
+        let foreground_waiter = tokio::spawn(foreground.wait_for_settlement());
+        tokio::task::yield_now().await;
+        assert!(!foreground_waiter.is_finished());
+
+        gate.release();
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), foreground_waiter)
+                .await
+                .expect("foreground waits for physical worker exit")
+                .expect("foreground waiter"),
+        );
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn tier_two_join_reports_a_bounded_closed_worker_error() {
+        let (completion_tx, completion) = tokio::sync::oneshot::channel();
+        drop(completion_tx);
+
+        let error = IntegrityTier2BlockingWorker { completion }
+            .join()
+            .await
+            .expect_err("closed worker completion must be bounded");
+
+        assert_eq!(error, IntegrityTier2BlockingWorkerUnavailable);
+        assert_eq!(
+            error.to_string(),
+            "Tier 2 dedicated worker stopped before terminal settlement"
+        );
     }
 
     #[test]
-    fn tier_two_primitive_is_move_only_and_contains_no_task_spawn() {
+    fn superseded_complete_report_becomes_cancelled_and_discards_findings() {
+        let report = IntegrityTier2Report::new(1, 1).refuse(tier2_authority_refused_fact());
+        let mut report = report;
+        report.status = IntegrityTier2Status::Complete;
+
+        let report = finalize_integrity_tier2_report(report, IdleSweepSettlement::Superseded);
+
+        assert_eq!(report.status, IntegrityTier2Status::Cancelled);
+        assert!(report.facts.is_empty());
+    }
+
+    #[test]
+    fn tier_two_primitive_is_move_only_and_has_no_direct_run_path() {
         fn assert_send<T: Send>() {}
         assert_send::<IntegrityTier2OwnedWork>();
+        assert_send::<IntegrityTier2BlockingWorker>();
 
         let source = include_str!("integrity.rs");
+        let owner = source
+            .split("impl IntegrityTier2OwnedWork")
+            .nth(1)
+            .expect("Tier 2 owner implementation")
+            .split("impl IntegrityTier2BlockingWorker")
+            .next()
+            .expect("Tier 2 owner body");
         let primitive = source
             .split("fn sense_integrity_tier2_owned")
             .nth(1)
@@ -3495,6 +3874,10 @@ mod tests {
         assert!(!primitive.contains("spawn"));
         assert!(source.contains("Tier 2 work must be run by its blocking owner"));
         assert!(!source.contains(concat!("impl Clone for IntegrityTier2", "OwnedWork")));
+        assert!(!owner.contains(concat!("pub(crate) fn ", "run(self)")));
+        assert!(!owner.contains("spawn_blocking"));
+        assert!(!source.contains(concat!("into_parts(self) -> (", "IdleSweepReservation")));
+        assert!(source.contains("std::thread::Builder::new()"));
     }
 
     #[tokio::test]

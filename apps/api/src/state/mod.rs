@@ -78,12 +78,10 @@ pub use installs::{
 pub use instance_registry::AppInstanceStore;
 pub(crate) use instance_registry::{InstanceUpdate, new_instance};
 pub(crate) use instance_registry::{ensure_instance_layout, instance_not_found_error};
-#[cfg(test)]
-pub(crate) use integrity_activity::IdleSweepTerminal;
 pub(crate) use integrity_activity::{
-    IdleSweepCancellation, IdleSweepReservation, IdleSweepReserveError, IntegrityActivityClosed,
-    IntegrityForegroundLease, IntegrityForegroundRegistration, IntegrityIdleEpoch,
-    IntegrityIdleSnapshot,
+    IdleSweepCancellation, IdleSweepReservation, IdleSweepReserveError, IdleSweepSettlement,
+    IdleSweepTerminal, IntegrityActivityClosed, IntegrityForegroundLease,
+    IntegrityForegroundRegistration, IntegrityIdleEpoch, IntegrityIdleSnapshot,
 };
 pub(crate) use java_probe_failures::{
     JavaProbeFailureCache, JavaProbeFailureClaim, JavaProbeFailureKey, JavaProbeFailureKind,

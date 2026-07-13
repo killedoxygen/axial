@@ -49,3 +49,6 @@ windows-sys = { version = "0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_F
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2.184"

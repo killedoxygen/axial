@@ -285,6 +285,7 @@ dependencies = [
  "http-body-util",
  "include_dir",
  "keyring",
+ "libc",
  "p256",
  "png",
  "rand 0.8.5",
