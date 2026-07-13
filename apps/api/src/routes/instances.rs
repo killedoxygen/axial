@@ -168,14 +168,11 @@ async fn handle_duplicate_instance(
     Path(id): Path<String>,
     payload: Option<Json<DuplicateInstanceRequest>>,
 ) -> Result<Json<EnrichedInstance>, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
-        .map_err(super::producer_claim_error_response)?;
-    instances::handle_duplicate_instance(
+    instances::handle_duplicate_instance_owned(
         &state,
-        &producer,
         &id,
         payload.map(|Json(payload)| payload),
+        handoff,
     )
     .await
     .map(Json)

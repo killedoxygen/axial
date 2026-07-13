@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Notify, RwLock, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock, broadcast};
 use tokio::task::JoinHandle;
 
 use crate::state::ProducerLease;
@@ -181,6 +181,8 @@ enum InstallKey {
 pub struct InstallStore {
     installs: RwLock<HashMap<String, InstallEntry>>,
     queue: RwLock<InstallQueueInner>,
+    // Production starters hold this through reservation and exact commit-or-discard settlement.
+    queue_start_gate: Arc<AsyncMutex<()>>,
 }
 
 impl InstallStore {
@@ -188,7 +190,12 @@ impl InstallStore {
         Self {
             installs: RwLock::new(HashMap::new()),
             queue: RwLock::new(InstallQueueInner::default()),
+            queue_start_gate: Arc::new(AsyncMutex::new(())),
         }
+    }
+
+    pub(crate) async fn acquire_queue_start_gate(&self) -> OwnedMutexGuard<()> {
+        self.queue_start_gate.clone().lock_owned().await
     }
 
     pub async fn insert(&self, install_id: String) {

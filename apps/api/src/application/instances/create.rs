@@ -8,7 +8,9 @@ use super::{
         preferred_loader_build, select_preferred_loader_build,
         stale_loader_version_catalog_message,
     },
-    enrich_instance_for_scan, instance_write_error_response,
+    enrich_instance_for_scan, instance_internal_error_response, instance_shutdown_error_response,
+    instance_store_error_class, instance_write_error_response, known_good_rebuild_error_response,
+    rollback_new_instance,
 };
 use crate::application::install::InstallQueueInstallItemViewModel;
 use crate::application::timing::{
@@ -19,7 +21,9 @@ use crate::application::version::{
 };
 use crate::application::{
     CommandResult, CommandResultCarriers, CreateInstancePayload, InstallQueueRequest,
-    InstallQueueStateResponse, enqueue_install_owned, loader_pre_operation_error_response,
+    InstallQueueStateResponse, enqueue_install_from_continuation,
+    loader_pre_operation_error_response, rebuild_registered_known_good,
+    registered_known_good_is_live,
 };
 use crate::guardian::{
     GuardianJvmPresetNotice, GuardianJvmPresetOption, GuardianJvmPresetResolution,
@@ -28,9 +32,10 @@ use crate::guardian::{
 use crate::observability::telemetry::TelemetryEvent;
 use crate::state::contracts::{CommandKind, OperationId, OperationStatus};
 use crate::state::{
-    AppState, InstalledVersionsLookup, ProducerLease, RequestProducerHandoff, new_instance,
+    AppState, InstallQueueEnqueueOutcome, InstalledVersionsLookup, ProducerLease,
+    RequestProducerHandoff, new_instance,
 };
-use axial_config::{EnrichedInstance, Instance, InstanceStoreError, generate_instance_id};
+use axial_config::{EnrichedInstance, Instance, generate_instance_id};
 use axial_launcher::{
     GuardianMode, LaunchReadinessReasonId, LaunchReadinessRequest, LaunchReadinessSeverity,
     inspect_launch_readiness,
@@ -45,6 +50,7 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
+    future::Future,
     path::Path,
     time::{Duration, Instant},
 };
@@ -426,10 +432,32 @@ pub(crate) async fn handle_create_instance_owned(
     payload: CreateInstanceRequest,
     handoff: RequestProducerHandoff,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
+    handle_create_instance_owned_with_rebuild(
+        state,
+        payload,
+        handoff,
+        |state, instance_id| async move {
+            rebuild_registered_known_good(&state, &instance_id).await
+        },
+    )
+    .await
+}
+
+async fn handle_create_instance_owned_with_rebuild<Rebuild, RebuildFuture>(
+    state: &AppState,
+    payload: CreateInstanceRequest,
+    handoff: RequestProducerHandoff,
+    rebuild: Rebuild,
+) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)>
+where
+    Rebuild: FnOnce(AppState, String) -> RebuildFuture + Send + 'static,
+    RebuildFuture:
+        Future<Output = Result<(), crate::state::KnownGoodRebuildError>> + Send + 'static,
+{
     let started_at = Instant::now();
     let producer = handoff
         .try_claim()
-        .map_err(create_shutdown_error_response)?;
+        .map_err(instance_shutdown_error_response)?;
     let installed_lookup = state
         .installed_versions_snapshot(&producer)
         .await
@@ -450,19 +478,68 @@ pub(crate) async fn handle_create_instance_owned(
     )?;
     let queued_install_request = install_request.clone();
     let instance = build_created_instance(&payload, &selection, &preset)?;
-    let instance = state
-        .create_instance(instance, mc_dir)
+    let continuation = producer.claim_child();
+    let rollback_owner = producer.claim_child();
+    let queue_owner = install_request.as_ref().map(|_| producer.claim_child());
+    let continuation_state = state.clone();
+    let completed = continuation.spawn_joinable(async move {
+        let instance = continuation_state
+            .create_instance(instance, mc_dir)
+            .await
+            .map_err(|error| {
+                instance_write_error_response(InstanceWriteOperation::Create, error)
+            })?;
+        let instance_id = instance.id.clone();
+        let completion = match install_request {
+            Some(request) => match enqueue_install_from_continuation(
+                &continuation_state,
+                request,
+                queue_owner.expect("queued create retains its install owner"),
+            )
+            .await
+            {
+                Ok(queued) => {
+                    if matches!(
+                        &queued.outcome,
+                        InstallQueueEnqueueOutcome::AlreadyActive { .. }
+                    ) && !registered_known_good_is_live(&continuation_state, &instance_id).await
+                    {
+                        Err(active_install_missed_instance_response())
+                    } else {
+                        Ok(Some(queued.response))
+                    }
+                }
+                Err(error) => Err(error),
+            },
+            None => rebuild(continuation_state.clone(), instance_id.clone())
+                .await
+                .map(|()| None)
+                .map_err(|error| {
+                    known_good_rebuild_error_response(InstanceWriteOperation::Create, error)
+                }),
+        };
+        match completion {
+            Ok(install_queue) => Ok((instance, install_queue)),
+            Err(error) => {
+                if let Err(rollback_error) =
+                    rollback_new_instance(&continuation_state, &instance_id, rollback_owner).await
+                {
+                    error!(
+                        failure_class = instance_store_error_class(&rollback_error),
+                        "create compensation rollback persistence failed"
+                    );
+                    return Err(instance_write_error_response(
+                        InstanceWriteOperation::Create,
+                        rollback_error,
+                    ));
+                }
+                Err(error)
+            }
+        }
+    });
+    let (instance, install_queue) = completed
         .await
-        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Create, error))?;
-    let created_instance_id = instance.id.clone();
-    let install_queue = queue_create_install_or_rollback_owned(
-        state,
-        &created_instance_id,
-        install_request,
-        handoff,
-        &producer,
-    )
-    .await?;
+        .map_err(|_| instance_internal_error_response(InstanceWriteOperation::Create))??;
     let enriched = enrich_instance_for_scan(
         state,
         instance,
@@ -769,70 +846,30 @@ fn create_install_queue_request_if_needed(
     Ok(Some(request))
 }
 
-async fn queue_create_install_request(
-    state: &AppState,
-    request: Option<InstallQueueRequest>,
-    handoff: RequestProducerHandoff,
-) -> Result<Option<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let Some(request) = request else {
-        return Ok(None);
-    };
-
-    enqueue_install_owned(state, request, handoff)
-        .await
-        .map(Some)
-}
-
-pub(super) async fn queue_create_install_or_rollback_owned(
-    state: &AppState,
-    instance_id: &str,
-    request: Option<InstallQueueRequest>,
-    handoff: RequestProducerHandoff,
-    producer: &ProducerLease,
-) -> Result<Option<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    match queue_create_install_request(state, request, handoff).await {
-        Ok(install_queue) => Ok(install_queue),
-        Err(error) => {
-            if let Err(rollback_error) =
-                rollback_created_instance(state, instance_id, producer.claim_child()).await
-            {
-                error!(
-                    failure_class = instance_store_error_class(&rollback_error),
-                    "create compensation rollback persistence failed"
-                );
-                return Err(instance_write_error_response(
-                    InstanceWriteOperation::Create,
-                    rollback_error,
-                ));
-            }
-            Err(error)
-        }
-    }
-}
-
 #[cfg(test)]
 pub(crate) async fn handle_create_instance(
     state: &AppState,
     payload: CreateInstanceRequest,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
-    let request = state
-        .try_admit_request()
-        .expect("admit test create request");
-    handle_create_instance_owned(state, payload, request.producer_handoff()).await
+    handle_create_instance_with_rebuild(state, payload, |_, _| async { Ok(()) }).await
 }
 
 #[cfg(test)]
-pub(super) async fn queue_create_install_or_rollback(
+pub(super) async fn handle_create_instance_with_rebuild<Rebuild, RebuildFuture>(
     state: &AppState,
-    instance_id: &str,
-    request: Option<InstallQueueRequest>,
-) -> Result<Option<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let admitted = state
+    payload: CreateInstanceRequest,
+    rebuild: Rebuild,
+) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)>
+where
+    Rebuild: FnOnce(AppState, String) -> RebuildFuture + Send + 'static,
+    RebuildFuture:
+        Future<Output = Result<(), crate::state::KnownGoodRebuildError>> + Send + 'static,
+{
+    let request = state
         .try_admit_request()
         .expect("admit test create request");
-    let handoff = admitted.producer_handoff();
-    let producer = handoff.try_claim().expect("claim test create producer");
-    queue_create_install_or_rollback_owned(state, instance_id, request, handoff, &producer).await
+    handle_create_instance_owned_with_rebuild(state, payload, request.producer_handoff(), rebuild)
+        .await
 }
 
 fn version_is_launch_ready_or_user_blocked(
@@ -859,35 +896,6 @@ fn version_is_launch_ready_or_user_blocked(
         .iter()
         .filter(|reason| reason.severity == LaunchReadinessSeverity::Blocking)
         .all(|reason| reason.id == LaunchReadinessReasonId::JavaOverrideMissing))
-}
-
-fn create_shutdown_error_response(
-    _error: crate::state::LifecycleAdmissionError,
-) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({ "error": "application shutdown is in progress" })),
-    )
-}
-
-async fn rollback_created_instance(
-    state: &AppState,
-    instance_id: &str,
-    producer: ProducerLease,
-) -> Result<(), InstanceStoreError> {
-    state
-        .delete_instance(instance_id.to_string(), true, producer)
-        .await
-}
-
-fn instance_store_error_class(error: &InstanceStoreError) -> &'static str {
-    match error {
-        InstanceStoreError::Read(_) => "read",
-        InstanceStoreError::Parse(_) => "parse",
-        InstanceStoreError::Validation(_) => "validation",
-        InstanceStoreError::TooLarge { .. } => "too_large",
-        InstanceStoreError::Persistence(_) => "persistence",
-    }
 }
 
 fn create_queued_install_summary(
@@ -921,6 +929,15 @@ fn create_queued_install_summary(
             install_id: None,
             operation_id: None,
         })
+}
+
+fn active_install_missed_instance_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "The active version install did not include this instance. Try again after it finishes."
+        })),
+    )
 }
 
 fn install_queue_item_matches_request(

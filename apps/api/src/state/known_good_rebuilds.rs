@@ -230,6 +230,15 @@ impl FlightWaiter {
 }
 
 impl AppState {
+    pub(crate) async fn registered_instance_has_live_known_good(
+        &self,
+        instance_id: &str,
+    ) -> Result<bool, KnownGoodRebuildError> {
+        self.capture_known_good_rebuild_target(instance_id)
+            .await
+            .map(|(_, live_authority)| live_authority)
+    }
+
     pub(crate) async fn rebuild_known_good_for_registered_instance<Reconstruct, ReconstructFuture>(
         &self,
         instance_id: &str,

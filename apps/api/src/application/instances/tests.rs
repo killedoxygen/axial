@@ -8,7 +8,15 @@ use axial_minecraft::VersionEntry;
 use axial_performance::PerformanceManager;
 use axum::http::{HeaderValue, header};
 use sha1::{Digest as _, Sha1};
-use std::{collections::HashMap, fs, io, path::Path as FsPath, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs, io,
+    path::Path as FsPath,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 #[test]
 fn instance_write_error_mapper_preserves_safe_status_messages() {
@@ -1441,52 +1449,348 @@ async fn update_instance_rejects_raw_bad_version_id_change() {
 }
 
 #[tokio::test]
-async fn create_queue_failure_rolls_back_created_instance() {
-    let fixture = TestFixture::new("create-queue-failure-rollback");
-    let instance = add_test_instance(&fixture, "Rollback", "1.21.1");
+async fn create_ready_instance_rebuilds_known_good_once() {
+    let fixture = TestFixture::new("create-ready-known-good");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    let rebuilds = Arc::new(AtomicUsize::new(0));
+    let observed_rebuilds = rebuilds.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let create_state = fixture.state.clone();
+    let create = tokio::spawn(async move {
+        super::create::handle_create_instance_with_rebuild(
+            &create_state,
+            CreateInstanceRequest {
+                name: "Ready".to_string(),
+                selection_id: "vanilla|1.21.1".to_string(),
+                ..CreateInstanceRequest::default()
+            },
+            move |_, _| async move {
+                observed_rebuilds.fetch_add(1, Ordering::SeqCst);
+                entered_tx.send(()).expect("signal rebuild entry");
+                release_rx.await.expect("release rebuild");
+                Ok(())
+            },
+        )
+        .await
+    });
 
-    let (status, Json(body)) = super::create::queue_create_install_or_rollback(
-        &fixture.state,
-        &instance.id,
-        Some(crate::application::InstallQueueRequest::Vanilla {
-            version_id: String::new(),
-        }),
-    )
-    .await
-    .expect_err("invalid staged install request should fail");
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        .await
+        .expect("rebuild enters")
+        .expect("rebuild entry signal");
+    assert!(!create.is_finished(), "create must wait for rebuild");
+    release_tx.send(()).expect("release rebuild");
+    let created = tokio::time::timeout(std::time::Duration::from_secs(5), create)
+        .await
+        .expect("create completes")
+        .expect("create task")
+        .expect("create ready instance");
 
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_bounded_error_body(&body, "version_id is required");
-    assert!(fixture.state.instances().get(&instance.id).is_none());
-    assert!(!fixture.state.instances().game_dir(&instance.id).exists());
+    assert!(created.install_queue.is_none());
+    assert_eq!(rebuilds.load(Ordering::SeqCst), 1);
+}
+
+async fn seed_committed_busy_install(state: &AppState, queue_id: &str) {
+    let install_id = format!("{queue_id}-install");
+    state.installs().insert(install_id.clone()).await;
+    state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            crate::state::InstallQueueSpec::vanilla("busy".to_string()),
+            crate::state::InstallQueuePlacement::Back,
+        )
+        .await;
+    let reserved = state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .expect("reserve committed busy install");
+    assert_eq!(reserved.queue_id, queue_id);
+    assert!(
+        state
+            .installs()
+            .mark_queued_install_started(queue_id, install_id)
+            .await
+    );
 }
 
 #[tokio::test]
-async fn create_queue_failure_surfaces_compensation_persistence_failure() {
-    let fixture = TestFixture::new("create-queue-compensation-failure");
-    let instance = add_test_instance(&fixture, "Retained", "1.21.1");
-    let instances_file = fixture.state.instances().paths().instances_file.clone();
-    fs::create_dir_all(instances_file.parent().expect("registry parent"))
-        .expect("create registry parent");
-    fs::create_dir(&instances_file).expect("block registry file promotion");
+async fn create_queued_instance_does_not_rebuild_known_good() {
+    let fixture = TestFixture::new("create-queued-no-known-good");
+    fixture.configure_create_manifest(&["1.21.2"]);
+    seed_committed_busy_install(&fixture.state, "busy-create-queue").await;
+    let rebuilds = Arc::new(AtomicUsize::new(0));
+    let observed_rebuilds = rebuilds.clone();
 
-    let (status, Json(body)) = super::create::queue_create_install_or_rollback(
+    let created = super::create::handle_create_instance_with_rebuild(
         &fixture.state,
-        &instance.id,
-        Some(crate::application::InstallQueueRequest::Vanilla {
-            version_id: String::new(),
-        }),
+        CreateInstanceRequest {
+            name: "Queued".to_string(),
+            selection_id: "vanilla|1.21.2".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+        move |_, _| async move {
+            observed_rebuilds.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
     )
     .await
-    .expect_err("closed persistence should prevent create compensation");
+    .expect("create queued instance");
 
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(created.queued_install.is_some());
+    assert_eq!(rebuilds.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn create_missed_active_install_receipt_rolls_back_new_instance() {
+    let fixture = TestFixture::new("create-missed-active-receipt");
+    fixture.configure_create_manifest(&["1.21.2"]);
+    fixture
+        .state
+        .installs()
+        .enqueue_queued_install(
+            "active-selected-install".to_string(),
+            crate::state::InstallQueueSpec::vanilla("1.21.2".to_string()),
+            crate::state::InstallQueuePlacement::Back,
+        )
+        .await;
+    let active = fixture
+        .state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .expect("reserve selected active install");
+    assert_eq!(active.queue_id, "active-selected-install");
+
+    let (status, Json(body)) = super::create::handle_create_instance_with_rebuild(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Missed active receipt".to_string(),
+            selection_id: "vanilla|1.21.2".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+        |_, _| async { panic!("queued create must not reconstruct") },
+    )
+    .await
+    .expect_err("instance absent from active receipt fanout must roll back");
+
+    assert_eq!(status, StatusCode::CONFLICT);
     assert_bounded_error_body(
         &body,
-        "Could not create the instance. Check app data permissions and try again.",
+        "The active version install did not include this instance. Try again after it finishes.",
     );
-    assert!(fixture.state.instances().get(&instance.id).is_some());
-    assert!(fixture.state.instances().game_dir(&instance.id).exists());
+    assert!(fixture.state.instances().list().is_empty());
+    let queue = fixture.state.installs().queue_snapshot().await;
+    assert_eq!(
+        queue.active.as_ref().map(|entry| entry.queue_id.as_str()),
+        Some("active-selected-install")
+    );
+}
+
+#[tokio::test]
+async fn create_rebuild_failure_rolls_back_the_new_instance() {
+    let fixture = TestFixture::new("create-known-good-rollback");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    let created_id = Arc::new(Mutex::new(None::<String>));
+    let observed_id = created_id.clone();
+
+    let (status, Json(body)) = super::create::handle_create_instance_with_rebuild(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Rollback".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+        move |_, instance_id| async move {
+            *observed_id.lock().expect("capture created id") = Some(instance_id);
+            Err(crate::state::KnownGoodRebuildError::ReconstructionFailed)
+        },
+    )
+    .await
+    .expect_err("failed rebuild rolls back create");
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_bounded_error_body(
+        &body,
+        "Could not verify the selected version. Check your connection and try again.",
+    );
+    let created_id = created_id
+        .lock()
+        .expect("read created id")
+        .clone()
+        .expect("rebuild observed created id");
+    assert!(fixture.state.instances().get(&created_id).is_none());
+    assert!(!fixture.state.instances().game_dir(&created_id).exists());
+}
+
+#[tokio::test]
+async fn duplicate_instance_rebuilds_known_good_once() {
+    let fixture = TestFixture::new("duplicate-known-good");
+    let source = add_test_instance(&fixture, "Source", "1.21.1");
+    let rebuilds = Arc::new(AtomicUsize::new(0));
+    let observed_rebuilds = rebuilds.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let duplicate_state = fixture.state.clone();
+    let source_id = source.id.clone();
+    let request = duplicate_state
+        .try_admit_request()
+        .expect("admit duplicate request");
+    let producer = request
+        .producer_handoff()
+        .try_claim()
+        .expect("claim duplicate producer");
+    let duplicate = tokio::spawn(async move {
+        let _request = request;
+        handle_duplicate_instance_with_rebuild(
+            &duplicate_state,
+            &producer,
+            &source_id,
+            None,
+            move |_, _| async move {
+                observed_rebuilds.fetch_add(1, Ordering::SeqCst);
+                entered_tx.send(()).expect("signal rebuild entry");
+                release_rx.await.expect("release rebuild");
+                Ok(())
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        .await
+        .expect("rebuild enters")
+        .expect("rebuild entry signal");
+    assert!(!duplicate.is_finished(), "duplicate must wait for rebuild");
+    release_tx.send(()).expect("release rebuild");
+    let duplicate = tokio::time::timeout(std::time::Duration::from_secs(5), duplicate)
+        .await
+        .expect("duplicate completes")
+        .expect("duplicate task")
+        .expect("duplicate instance");
+
+    assert_ne!(duplicate.id, source.id);
+    assert!(fixture.state.instances().get(&source.id).is_some());
+    assert!(fixture.state.instances().get(&duplicate.id).is_some());
+    assert_eq!(rebuilds.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn duplicate_rebuild_failure_rolls_back_only_the_copy() {
+    let fixture = TestFixture::new("duplicate-known-good-rollback");
+    let source = add_test_instance(&fixture, "Source", "1.21.1");
+    let duplicate_id = Arc::new(Mutex::new(None::<String>));
+    let observed_id = duplicate_id.clone();
+
+    let (status, Json(body)) = handle_duplicate_instance_with_rebuild(
+        &fixture.state,
+        &fixture.producer,
+        &source.id,
+        None,
+        move |_, instance_id| async move {
+            *observed_id.lock().expect("capture duplicate id") = Some(instance_id);
+            Err(crate::state::KnownGoodRebuildError::ReconstructionFailed)
+        },
+    )
+    .await
+    .expect_err("failed rebuild rolls back duplicate");
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_bounded_error_body(
+        &body,
+        "Could not verify the selected version. Check your connection and try again.",
+    );
+    let duplicate_id = duplicate_id
+        .lock()
+        .expect("read duplicate id")
+        .clone()
+        .expect("rebuild observed duplicate id");
+    assert!(fixture.state.instances().get(&source.id).is_some());
+    assert!(fixture.state.instances().get(&duplicate_id).is_none());
+    assert!(!fixture.state.instances().game_dir(&duplicate_id).exists());
+}
+
+#[tokio::test]
+async fn dropped_create_caller_keeps_rebuild_rollback_owned_until_quiescence() {
+    let (state, root) = test_state("create-known-good-caller-drop");
+    let library_dir = root.join("library");
+    state.set_library_dir_for_test(library_dir.to_string_lossy().into_owned());
+    write_version_manifest_cache(&library_dir, &["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    let created_id = Arc::new(Mutex::new(None::<String>));
+    let observed_id = created_id.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let create_state = state.clone();
+    let caller = tokio::spawn(async move {
+        super::create::handle_create_instance_with_rebuild(
+            &create_state,
+            CreateInstanceRequest {
+                name: "Owned rollback".to_string(),
+                selection_id: "vanilla|1.21.1".to_string(),
+                ..CreateInstanceRequest::default()
+            },
+            move |_, instance_id| async move {
+                *observed_id.lock().expect("capture created id") = Some(instance_id);
+                entered_tx.send(()).expect("signal rebuild entry");
+                release_rx.await.expect("release rebuild");
+                Err(crate::state::KnownGoodRebuildError::ReconstructionFailed)
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        .await
+        .expect("rebuild enters")
+        .expect("rebuild entry signal");
+    let created_id = created_id
+        .lock()
+        .expect("read created id")
+        .clone()
+        .expect("rebuild observed created id");
+    assert!(state.instances().get(&created_id).is_some());
+    caller.abort();
+    assert!(
+        caller
+            .await
+            .expect_err("caller cancellation")
+            .is_cancelled()
+    );
+
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while state.lifecycle_phase() != crate::state::AppLifecyclePhase::QuiescingProducers {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("quiescence waits on accepted create");
+    assert!(!quiesce.is_finished());
+    release_tx.send(()).expect("release failed rebuild");
+    tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+        .await
+        .expect("rollback drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
+
+    assert!(state.instances().get(&created_id).is_none());
+    assert!(!state.instances().game_dir(&created_id).exists());
+    state
+        .close_known_good_inventories()
+        .await
+        .expect("close known-good store");
+    state
+        .close_instance_registry()
+        .await
+        .expect("close instance registry");
+    drop(state);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -1817,21 +2121,7 @@ async fn create_instance_loader_version_uses_beta_build_when_only_beta_builds_ex
     beta.build_meta.selection.source = axial_minecraft::LoaderSelectionSource::ExplicitVersionLabel;
     let beta_version_id = beta.version_id.clone();
     write_loader_build_cache_records(&library_dir, component_id, "26.2", vec![beta]);
-    fixture
-        .state
-        .installs()
-        .enqueue_queued_install(
-            "busy-beta-queue".to_string(),
-            crate::state::InstallQueueSpec::vanilla("busy".to_string()),
-            crate::state::InstallQueuePlacement::Back,
-        )
-        .await;
-    fixture
-        .state
-        .installs()
-        .reserve_next_queued_install()
-        .await
-        .expect("reserve active queue slot");
+    seed_committed_busy_install(&fixture.state, "busy-beta-queue").await;
 
     let created = handle_create_instance(
         &fixture.state,
@@ -1869,21 +2159,7 @@ async fn create_instance_quilt_java25_default_uses_compatible_beta_fallback() {
         "26.1.2",
         vec![stable_build, beta_build],
     );
-    fixture
-        .state
-        .installs()
-        .enqueue_queued_install(
-            "busy-quilt-beta-queue".to_string(),
-            crate::state::InstallQueueSpec::vanilla("busy".to_string()),
-            crate::state::InstallQueuePlacement::Back,
-        )
-        .await;
-    fixture
-        .state
-        .installs()
-        .reserve_next_queued_install()
-        .await
-        .expect("reserve active queue slot");
+    seed_committed_busy_install(&fixture.state, "busy-quilt-beta-queue").await;
 
     let created = handle_create_instance(
         &fixture.state,
@@ -2343,21 +2619,7 @@ async fn create_instance_vanilla_selection_returns_backend_queue_state() {
         .state
         .set_library_dir_for_test(fixture.root.join("library").to_string_lossy().to_string());
     write_version_manifest_cache(&fixture.root.join("library"), &["1.21.2"]);
-    fixture
-        .state
-        .installs()
-        .enqueue_queued_install(
-            "busy-queue".to_string(),
-            crate::state::InstallQueueSpec::vanilla("busy".to_string()),
-            crate::state::InstallQueuePlacement::Back,
-        )
-        .await;
-    fixture
-        .state
-        .installs()
-        .reserve_next_queued_install()
-        .await
-        .expect("reserve active queue slot");
+    seed_committed_busy_install(&fixture.state, "busy-queue").await;
     fixture
         .state
         .installs()
@@ -2496,21 +2758,7 @@ async fn create_instance_checksumless_loader_probe_stays_strict_without_instance
         "0.16.14",
     );
     let build_id = write_fabric_loader_build_cache(&library_dir, "1.21.1", "0.16.14");
-    fixture
-        .state
-        .installs()
-        .enqueue_queued_install(
-            "busy-checksumless-probe".to_string(),
-            crate::state::InstallQueueSpec::vanilla("busy".to_string()),
-            crate::state::InstallQueuePlacement::Back,
-        )
-        .await;
-    fixture
-        .state
-        .installs()
-        .reserve_next_queued_install()
-        .await
-        .expect("reserve active queue slot");
+    seed_committed_busy_install(&fixture.state, "busy-checksumless-probe").await;
 
     let created = handle_create_instance(
         &fixture.state,
@@ -3018,54 +3266,6 @@ async fn admitted_delete_claims_its_request_handoff_during_drain() {
     assert!(fixture.state.instances().get(&instance.id).is_none());
 
     drop(request);
-    quiesce.abort();
-    let _ = quiesce.await;
-}
-
-#[tokio::test]
-async fn create_rollback_uses_live_producer_child_during_request_drain() {
-    let fixture = TestFixture::new("create-rollback-request-drain");
-    let instance = add_test_instance(&fixture, "Rollback during drain", "1.21.1");
-    let request = fixture
-        .state
-        .try_admit_request()
-        .expect("admit create request before drain");
-    let handoff = request.producer_handoff();
-    let create_producer = handoff
-        .try_claim()
-        .expect("claim create producer before drain");
-    let shutdown_state = fixture.state.clone();
-    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while fixture.state.lifecycle_phase() != crate::state::AppLifecyclePhase::DrainingRequests {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("request drain begins");
-    assert!(fixture.state.try_claim_producer().is_err());
-    drop(request);
-    assert_eq!(
-        fixture.state.lifecycle_phase(),
-        crate::state::AppLifecyclePhase::DrainingRequests
-    );
-
-    let (status, Json(body)) = super::create::queue_create_install_or_rollback_owned(
-        &fixture.state,
-        &instance.id,
-        Some(crate::application::InstallQueueRequest::Vanilla {
-            version_id: String::new(),
-        }),
-        handoff,
-        &create_producer,
-    )
-    .await
-    .expect_err("invalid queue request triggers owned rollback");
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_bounded_error_body(&body, "version_id is required");
-    assert!(fixture.state.instances().get(&instance.id).is_none());
-
-    drop(create_producer);
     quiesce.abort();
     let _ = quiesce.await;
 }
@@ -3682,27 +3882,7 @@ fn write_installed_checksumless_loader_version(
 
 impl TestFixture {
     fn new(name: &str) -> Self {
-        let root = test_root(name);
-        let paths = test_paths(&root);
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
-        );
-        let state = AppState::new(AppStateInit {
-            app_name: "Axial".to_string(),
-            version: "test".to_string(),
-            config,
-            instances,
-            installs: Arc::new(InstallStore::new()),
-            sessions: Arc::new(SessionStore::new()),
-            performance: Arc::new(
-                PerformanceManager::load_for_startup(&paths.config_dir)
-                    .expect("performance manager"),
-            ),
-            startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
-        });
+        let (state, root) = test_state(name);
 
         let request = state.try_admit_request().expect("admit fixture request");
         let producer = request
@@ -3725,6 +3905,30 @@ impl TestFixture {
         write_version_manifest_cache(&library_dir, version_ids);
         library_dir
     }
+}
+
+fn test_state(name: &str) -> (AppState, PathBuf) {
+    let root = test_root(name);
+    let paths = test_paths(&root);
+    let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+    let instances = Arc::new(
+        InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+            .expect("load instances"),
+    );
+    let state = AppState::new(AppStateInit {
+        app_name: "Axial".to_string(),
+        version: "test".to_string(),
+        config,
+        instances,
+        installs: Arc::new(InstallStore::new()),
+        sessions: Arc::new(SessionStore::new()),
+        performance: Arc::new(
+            PerformanceManager::load_for_startup(&paths.config_dir).expect("performance manager"),
+        ),
+        startup_warnings: Vec::new(),
+        frontend_dir: root.join("frontend"),
+    });
+    (state, root)
 }
 
 impl Drop for TestFixture {

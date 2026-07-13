@@ -229,6 +229,14 @@ pub fn spawn_performance_operations_resume(state: &AppState) -> bool {
     true
 }
 
+pub fn spawn_known_good_rebuilds(state: &AppState) -> bool {
+    let Ok(producer) = state.try_claim_producer() else {
+        return false;
+    };
+    crate::application::spawn_startup_known_good_rebuilds(state, producer);
+    true
+}
+
 pub fn spawn_benchmark_suite_drivers_resume(state: &AppState) -> bool {
     crate::application::launch::spawn_restart_interrupted_benchmark_suite_drivers(state)
 }

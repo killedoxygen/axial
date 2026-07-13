@@ -14,6 +14,7 @@ mod guardian_conversion;
 pub mod install;
 pub mod instances;
 pub mod java;
+mod known_good;
 pub mod launch;
 pub mod music;
 pub mod performance;
@@ -70,8 +71,14 @@ pub use install::{
     record_install_operation_progress, remove_queued_install, sanitize_install_progress,
     stage_install_version_command, vanilla_install_progress_view_model,
 };
-pub(crate) use install::{enqueue_install_owned, install_queue_status_owned, retry_install_owned};
+pub(crate) use install::{
+    enqueue_install_from_continuation, enqueue_install_owned, install_queue_status_owned,
+    retry_install_owned,
+};
 pub use java::{JavaRuntimesResponse, java_runtimes};
+pub(crate) use known_good::{
+    rebuild_registered_known_good, registered_known_good_is_live, spawn_startup_known_good_rebuilds,
+};
 pub use launch::{
     LaunchInstanceStaging, LaunchPreflightMemory, LaunchPreflightOverride,
     LaunchPreflightOverrides, LaunchPreflightResourceBudget, LaunchPreflightResponse,

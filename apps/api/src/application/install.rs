@@ -40,6 +40,7 @@ use axial_minecraft::{
     resolve_build_record_for_install,
 };
 use axum::{Json, http::StatusCode};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -232,6 +233,16 @@ async fn begin_install_journal_with_detached_reconciliation(
 }
 
 pub type InstallApplicationError = (StatusCode, Json<serde_json::Value>);
+
+pub(crate) struct ContinuationInstallQueueResult {
+    pub response: InstallQueueStateResponse,
+    pub outcome: InstallQueueEnqueueOutcome,
+}
+
+struct InstallQueueSelection {
+    notice: InstallQueueNoticeViewModel,
+    outcome: InstallQueueEnqueueOutcome,
+}
 
 use loader::start_loader_install_owned;
 #[cfg(test)]
@@ -837,10 +848,7 @@ pub(crate) async fn install_queue_status_owned(
     handoff: RequestProducerHandoff,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
     let started = maybe_start_next_queued_install(state, handoff).await?;
-    let started_install = started.as_ref().map(|(started, _)| started.clone());
-    let response = install_queue_state_response(state, None, started_install).await;
-    spawn_install_queue_monitor_for_started(state.clone(), started);
-    Ok(response)
+    Ok(install_queue_state_response(state, None, started).await)
 }
 
 pub(crate) async fn enqueue_install_owned(
@@ -849,6 +857,47 @@ pub(crate) async fn enqueue_install_owned(
     handoff: RequestProducerHandoff,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
     enqueue_install_with_placement(state, request, InstallQueuePlacement::Back, handoff).await
+}
+
+pub(crate) async fn enqueue_install_from_continuation(
+    state: &AppState,
+    request: InstallQueueRequest,
+    producer: ProducerLease,
+) -> Result<ContinuationInstallQueueResult, InstallApplicationError> {
+    let selection = enqueue_install_request(state, request, InstallQueuePlacement::Back).await?;
+    let selected_queue_id = install_queue_outcome_id(&selection.outcome).to_string();
+    let owns_selected_queue = matches!(
+        &selection.outcome,
+        InstallQueueEnqueueOutcome::Enqueued { .. }
+    );
+    let started = if matches!(
+        &selection.outcome,
+        InstallQueueEnqueueOutcome::AlreadyActive { .. }
+    ) {
+        None
+    } else {
+        let start_state = state.clone();
+        maybe_start_selected_queued_install_owned_with(
+            state,
+            &selected_queue_id,
+            owns_selected_queue,
+            |spec| {
+                let state = start_state.clone();
+                let attempt_owner = producer.claim_child();
+                async move { start_queued_install(&state, &spec, &attempt_owner).await }
+            },
+        )
+        .await?
+    };
+    if let Some(started) = started.as_ref() {
+        spawn_install_queue_monitor_owned(state.clone(), started.install_id.clone(), producer);
+    }
+    let response =
+        install_queue_state_response(state, Some(selection.notice), started.clone()).await;
+    Ok(ContinuationInstallQueueResult {
+        response,
+        outcome: selection.outcome,
+    })
 }
 
 pub(crate) async fn retry_install_owned(
@@ -891,18 +940,24 @@ async fn enqueue_install_with_placement(
     placement: InstallQueuePlacement,
     handoff: RequestProducerHandoff,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
+    let selection = enqueue_install_request(state, request, placement).await?;
+    let started = maybe_start_next_queued_install(state, handoff).await?;
+    Ok(install_queue_state_response(state, Some(selection.notice), started).await)
+}
+
+async fn enqueue_install_request(
+    state: &AppState,
+    request: InstallQueueRequest,
+    placement: InstallQueuePlacement,
+) -> Result<InstallQueueSelection, InstallApplicationError> {
     let spec = install_queue_spec_from_request(state, request).await?;
     let queue_id = generate_install_id("install-queue");
     let outcome = state
         .installs()
         .enqueue_queued_install(queue_id, spec.clone(), placement)
         .await;
-    let notice = Some(install_queue_notice_for_outcome(&outcome, &spec, placement));
-    let started = maybe_start_next_queued_install(state, handoff).await?;
-    let started_install = started.as_ref().map(|(started, _)| started.clone());
-    let response = install_queue_state_response(state, notice, started_install).await;
-    spawn_install_queue_monitor_for_started(state.clone(), started);
-    Ok(response)
+    let notice = install_queue_notice_for_outcome(&outcome, &spec, placement);
+    Ok(InstallQueueSelection { notice, outcome })
 }
 
 async fn install_queue_spec_from_request(
@@ -960,41 +1015,58 @@ async fn install_queue_spec_from_request(
 async fn maybe_start_next_queued_install(
     state: &AppState,
     handoff: RequestProducerHandoff,
-) -> Result<Option<(InstallStartResponse, ProducerLease)>, InstallApplicationError> {
-    let Some(entry) = state.installs().reserve_next_queued_install().await else {
-        return Ok(None);
-    };
-    let producer = match handoff.try_claim() {
-        Ok(producer) => producer,
-        Err(_) => {
-            state
-                .installs()
-                .release_active_queued_install_to_front(&entry.queue_id)
-                .await;
-            return Err(install_shutdown_error_response());
+) -> Result<Option<InstallStartResponse>, InstallApplicationError> {
+    let producer = handoff
+        .try_claim()
+        .map_err(|_| install_shutdown_error_response())?;
+    let transaction_owner = producer.claim_child();
+    let transaction_state = state.clone();
+    let transaction = transaction_owner.spawn_joinable(async move {
+        let _queue_start = transaction_state
+            .installs()
+            .acquire_queue_start_gate()
+            .await;
+        let Some(entry) = transaction_state
+            .installs()
+            .reserve_next_queued_install()
+            .await
+        else {
+            return Ok(None);
+        };
+        let started = match start_queued_install(&transaction_state, &entry.spec, &producer).await {
+            Ok(started) => started,
+            Err(error) => {
+                transaction_state
+                    .installs()
+                    .discard_active_queued_install(&entry.queue_id)
+                    .await;
+                return Err(error);
+            }
+        };
+        if !transaction_state
+            .installs()
+            .mark_queued_install_started(&entry.queue_id, started.install_id.clone())
+            .await
+        {
+            return Err(install_queue_start_stopped_error_response());
         }
-    };
-    let started = match start_queued_install(state, &entry.spec, &producer).await {
-        Ok(started) => started,
-        Err(error) => {
-            state
-                .installs()
-                .discard_active_queued_install(&entry.queue_id)
-                .await;
-            return Err(error);
-        }
-    };
-    state
-        .installs()
-        .mark_queued_install_started(&entry.queue_id, started.install_id.clone())
-        .await;
-    Ok(Some((started, producer)))
+        spawn_install_queue_monitor_owned(
+            transaction_state.clone(),
+            started.install_id.clone(),
+            producer,
+        );
+        Ok(Some(started))
+    });
+    transaction
+        .await
+        .map_err(|_| install_queue_start_stopped_error_response())?
 }
 
 async fn maybe_start_next_queued_install_owned(
     state: &AppState,
     producer: &ProducerLease,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError> {
+    let _queue_start = state.installs().acquire_queue_start_gate().await;
     let Some(entry) = state.installs().reserve_next_queued_install().await else {
         return Ok(None);
     };
@@ -1008,11 +1080,95 @@ async fn maybe_start_next_queued_install_owned(
             return Err(error);
         }
     };
-    state
+    if !state
         .installs()
         .mark_queued_install_started(&entry.queue_id, started.install_id.clone())
-        .await;
+        .await
+    {
+        return Err(install_queue_start_stopped_error_response());
+    }
     Ok(Some(started))
+}
+
+async fn maybe_start_selected_queued_install_owned_with<Start, StartFuture>(
+    state: &AppState,
+    selected_queue_id: &str,
+    owns_selected_queue: bool,
+    mut start: Start,
+) -> Result<Option<InstallStartResponse>, InstallApplicationError>
+where
+    Start: FnMut(InstallQueueSpec) -> StartFuture,
+    StartFuture: Future<Output = Result<InstallStartResponse, InstallApplicationError>>,
+{
+    let _queue_start = state.installs().acquire_queue_start_gate().await;
+    let initial_pending = state.installs().queue_snapshot().await.pending.len();
+    for _ in 0..initial_pending.saturating_add(1) {
+        let Some(entry) = state.installs().reserve_next_queued_install().await else {
+            return selected_queue_residual(state, selected_queue_id, owns_selected_queue).await;
+        };
+        match start(entry.spec.clone()).await {
+            Ok(started) => {
+                if !state
+                    .installs()
+                    .mark_queued_install_started(&entry.queue_id, started.install_id.clone())
+                    .await
+                {
+                    return Err(selected_queue_missing_error_response());
+                }
+                return Ok(Some(started));
+            }
+            Err(error) => {
+                state
+                    .installs()
+                    .discard_active_queued_install(&entry.queue_id)
+                    .await;
+                if entry.queue_id == selected_queue_id {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    selected_queue_residual(state, selected_queue_id, owns_selected_queue).await
+}
+
+async fn selected_queue_residual(
+    state: &AppState,
+    selected_queue_id: &str,
+    owns_selected_queue: bool,
+) -> Result<Option<InstallStartResponse>, InstallApplicationError> {
+    let snapshot = state.installs().queue_snapshot().await;
+    let selected_is_committed_active = snapshot
+        .active
+        .as_ref()
+        .is_some_and(|active| active.queue_id == selected_queue_id && active.install_id.is_some());
+    let selected_is_pending = snapshot
+        .pending
+        .iter()
+        .any(|entry| entry.queue_id == selected_queue_id);
+    let committed_active_owner = snapshot
+        .active
+        .as_ref()
+        .is_some_and(|active| active.install_id.is_some());
+    if selected_is_committed_active || (selected_is_pending && committed_active_owner) {
+        Ok(None)
+    } else {
+        if owns_selected_queue {
+            if snapshot.active.as_ref().is_some_and(|active| {
+                active.queue_id == selected_queue_id && active.install_id.is_none()
+            }) {
+                state
+                    .installs()
+                    .discard_active_queued_install(selected_queue_id)
+                    .await;
+            } else {
+                state
+                    .installs()
+                    .remove_queued_install(selected_queue_id)
+                    .await;
+            }
+        }
+        Err(selected_queue_missing_error_response())
+    }
 }
 
 async fn start_queued_install(
@@ -1077,15 +1233,6 @@ fn spawn_install_queue_monitor_owned(state: AppState, install_id: String, produc
     });
 }
 
-fn spawn_install_queue_monitor_for_started(
-    state: AppState,
-    started: Option<(InstallStartResponse, ProducerLease)>,
-) {
-    if let Some((started_install, producer)) = started {
-        spawn_install_queue_monitor_owned(state, started_install.install_id, producer);
-    }
-}
-
 #[cfg(test)]
 fn spawn_install_queue_monitor(state: AppState, install_id: String) {
     let producer = state
@@ -1099,6 +1246,24 @@ fn install_shutdown_error_response() -> InstallApplicationError {
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({
             "error": "Installs are unavailable while the application is shutting down."
+        })),
+    )
+}
+
+fn install_queue_start_stopped_error_response() -> InstallApplicationError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "The queued install stopped before startup settled. Try again."
+        })),
+    )
+}
+
+fn selected_queue_missing_error_response() -> InstallApplicationError {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "The selected install left the queue before it could start. Try again."
         })),
     )
 }
@@ -1349,6 +1514,15 @@ fn install_queue_notice_for_outcome(
             "Retry moved to the front of the queue",
             Some(label),
         ),
+    }
+}
+
+fn install_queue_outcome_id(outcome: &InstallQueueEnqueueOutcome) -> &str {
+    match outcome {
+        InstallQueueEnqueueOutcome::Enqueued { queue_id }
+        | InstallQueueEnqueueOutcome::AlreadyActive { queue_id }
+        | InstallQueueEnqueueOutcome::AlreadyQueued { queue_id }
+        | InstallQueueEnqueueOutcome::MovedToFront { queue_id } => queue_id,
     }
 }
 

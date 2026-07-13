@@ -4,8 +4,9 @@ mod events;
 mod state;
 
 use axial_api::app::{
-    spawn_background, spawn_benchmark_suite_drivers_resume, spawn_performance_operations_resume,
-    spawn_performance_rules_refresh, spawn_remote_flags_refresh, spawn_telemetry_export,
+    spawn_background, spawn_benchmark_suite_drivers_resume, spawn_known_good_rebuilds,
+    spawn_performance_operations_resume, spawn_performance_rules_refresh,
+    spawn_remote_flags_refresh, spawn_telemetry_export,
 };
 use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
@@ -64,6 +65,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         frontend_dir: axial_api::app::default_frontend_dir(),
     })
     .await?;
+    spawn_known_good_rebuilds(&state);
     let telemetry = state.telemetry().clone();
     let discord_presence = discord_presence::spawn(state.clone());
     spawn_performance_operations_resume(&state);

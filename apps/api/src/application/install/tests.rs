@@ -696,6 +696,264 @@ async fn install_queue_state_shows_reserved_item_while_starting() {
 }
 
 #[tokio::test]
+async fn continuation_queue_skips_failed_older_head_and_starts_selected_residual() {
+    let root = temp_root("install-queue-selected-residual");
+    let state = build_test_state(&root);
+    state
+        .installs()
+        .enqueue_queued_install(
+            "invalid-older-head".to_string(),
+            InstallQueueSpec::vanilla(String::new()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    state
+        .installs()
+        .enqueue_queued_install(
+            "selected-queue".to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let attempts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let observed_attempts = attempts.clone();
+
+    let started = maybe_start_selected_queued_install_owned_with(
+        &state,
+        "selected-queue",
+        true,
+        move |spec| {
+            let attempts = observed_attempts.clone();
+            async move {
+                let version_id = spec.target_version_id().to_string();
+                attempts
+                    .lock()
+                    .expect("record queue start attempt")
+                    .push(version_id.clone());
+                if version_id.is_empty() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "invalid older queue head" })),
+                    ));
+                }
+                Ok(InstallStartResponse {
+                    operation_id: install_operation_id("selected-install"),
+                    install_id: "selected-install".to_string(),
+                    view_model: InstallProgressViewModel::starting(),
+                })
+            }
+        },
+    )
+    .await
+    .expect("unrelated head failure does not fail selected enqueue")
+    .expect("selected install starts");
+
+    assert_eq!(started.install_id, "selected-install");
+    assert_eq!(
+        *attempts.lock().expect("read queue start attempts"),
+        vec![String::new(), "1.21.5".to_string()]
+    );
+    let snapshot = state.installs().queue_snapshot().await;
+    assert!(snapshot.pending.is_empty());
+    let active = snapshot.active.expect("selected queue remains active");
+    assert_eq!(active.queue_id, "selected-queue");
+    assert_eq!(active.install_id.as_deref(), Some("selected-install"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn continuation_queue_removes_owned_selection_after_front_retry_budget() {
+    let root = temp_root("install-queue-selected-front-injection");
+    let state = build_test_state(&root);
+    state
+        .installs()
+        .enqueue_queued_install(
+            "older-head".to_string(),
+            InstallQueueSpec::vanilla("older".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    state
+        .installs()
+        .enqueue_queued_install(
+            "selected-queue".to_string(),
+            InstallQueueSpec::vanilla("selected".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let injections = Arc::new(AtomicUsize::new(0));
+    let observed_injections = injections.clone();
+    let injection_state = state.clone();
+
+    let (status, Json(body)) =
+        maybe_start_selected_queued_install_owned_with(&state, "selected-queue", true, move |_| {
+            let attempt = observed_injections.fetch_add(1, Ordering::SeqCst);
+            let state = injection_state.clone();
+            async move {
+                state
+                    .installs()
+                    .enqueue_queued_install(
+                        format!("injected-front-{attempt}"),
+                        InstallQueueSpec::vanilla(format!("injected-{attempt}")),
+                        InstallQueuePlacement::Front,
+                    )
+                    .await;
+                Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": "injected start failure" })),
+                ))
+            }
+        })
+        .await
+        .expect_err("front retries exhausting the budget must fail and settle the owned selection");
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body,
+        json!({
+            "error": "The selected install left the queue before it could start. Try again."
+        })
+    );
+    assert_eq!(injections.load(Ordering::SeqCst), 3);
+    let snapshot = state.installs().queue_snapshot().await;
+    assert!(snapshot.active.is_none());
+    assert!(
+        snapshot
+            .pending
+            .iter()
+            .all(|entry| entry.queue_id != "selected-queue")
+    );
+    assert_eq!(snapshot.pending.len(), 1);
+    assert_eq!(snapshot.pending[0].queue_id, "injected-front-2");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn continuation_queue_waits_for_selected_reservation_failure_and_errors() {
+    let root = temp_root("install-queue-selected-reservation-failure");
+    let state = build_test_state(&root);
+    state
+        .installs()
+        .enqueue_queued_install(
+            "selected-queue".to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let competing_start = state.installs().acquire_queue_start_gate().await;
+    let reserved = state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .expect("competing starter reserves selected queue");
+    assert_eq!(reserved.queue_id, "selected-queue");
+    let continuation_starts = Arc::new(AtomicUsize::new(0));
+    let observed_starts = continuation_starts.clone();
+
+    let continuation =
+        maybe_start_selected_queued_install_owned_with(&state, "selected-queue", true, move |_| {
+            observed_starts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "unexpected continuation start" })),
+                ))
+            }
+        });
+    tokio::pin!(continuation);
+    tokio::select! {
+        biased;
+        result = &mut continuation => panic!("continuation escaped uncommitted reservation: {result:?}"),
+        _ = std::future::ready(()) => {}
+    }
+
+    assert!(
+        state
+            .installs()
+            .discard_active_queued_install("selected-queue")
+            .await
+    );
+    drop(competing_start);
+    let (status, Json(body)) = continuation
+        .await
+        .expect_err("discarded selected reservation must fail continuation");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body,
+        json!({
+            "error": "The selected install left the queue before it could start. Try again."
+        })
+    );
+    assert_eq!(continuation_starts.load(Ordering::SeqCst), 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn continuation_queue_accepts_committed_selected_active_install() {
+    let root = temp_root("install-queue-selected-active-committed");
+    let state = build_test_state(&root);
+    state
+        .installs()
+        .enqueue_queued_install(
+            "selected-queue".to_string(),
+            InstallQueueSpec::vanilla("1.21.5".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let competing_start = state.installs().acquire_queue_start_gate().await;
+    let reserved = state
+        .installs()
+        .reserve_next_queued_install()
+        .await
+        .expect("competing starter reserves selected queue");
+    assert_eq!(reserved.queue_id, "selected-queue");
+    state
+        .installs()
+        .insert("selected-install".to_string())
+        .await;
+    assert!(
+        state
+            .installs()
+            .mark_queued_install_started("selected-queue", "selected-install".to_string())
+            .await
+    );
+    spawn_install_queue_monitor(state.clone(), "selected-install".to_string());
+    drop(competing_start);
+    let continuation_starts = Arc::new(AtomicUsize::new(0));
+    let observed_starts = continuation_starts.clone();
+
+    let started =
+        maybe_start_selected_queued_install_owned_with(&state, "selected-queue", true, move |_| {
+            observed_starts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "unexpected continuation start" })),
+                ))
+            }
+        })
+        .await
+        .expect("committed active selected queue is sufficient");
+    assert!(started.is_none());
+    let snapshot = state.installs().queue_snapshot().await;
+    let active = snapshot.active.expect("selected queue remains active");
+    assert_eq!(active.queue_id, "selected-queue");
+    assert_eq!(active.install_id.as_deref(), Some("selected-install"));
+    assert_eq!(continuation_starts.load(Ordering::SeqCst), 0);
+
+    state
+        .installs()
+        .emit("selected-install", failed_progress())
+        .await;
+    wait_for_queue_empty(&state).await;
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn queue_monitor_advances_only_after_terminal_progress_and_discards_start_failure() {
     let root = temp_root("install-queue-monitor-terminal");
     let state = build_test_state(&root);

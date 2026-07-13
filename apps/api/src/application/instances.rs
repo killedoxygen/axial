@@ -44,7 +44,7 @@ use crate::application::version::{
     installed_versions_scan,
 };
 use crate::guardian::normalize_create_jvm_preset;
-use crate::state::{AppState, ProducerLease, RequestProducerHandoff};
+use crate::state::{AppState, KnownGoodRebuildError, ProducerLease, RequestProducerHandoff};
 use axial_config::{EnrichedInstance, InstanceStoreError, LaunchActionState};
 use axial_launcher::{
     GuardianMode, LaunchReadiness, LaunchReadinessReasonId, LaunchReadinessRequest,
@@ -53,10 +53,12 @@ use axial_launcher::{
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{
+    future::Future,
     io::ErrorKind,
     path::PathBuf,
     time::{Duration, Instant},
 };
+use tracing::error;
 
 const INSTANCE_READINESS_SLOW_SPAN: Duration = Duration::from_millis(25);
 
@@ -115,6 +117,80 @@ fn instance_write_error_response(
     };
 
     (status, Json(serde_json::json!({ "error": message })))
+}
+
+fn instance_internal_error_response(
+    operation: InstanceWriteOperation,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": operation.internal_error_message() })),
+    )
+}
+
+fn instance_shutdown_error_response(
+    _error: crate::state::LifecycleAdmissionError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": "application shutdown is in progress" })),
+    )
+}
+
+fn known_good_rebuild_error_response(
+    operation: InstanceWriteOperation,
+    error: KnownGoodRebuildError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, message) = match error {
+        KnownGoodRebuildError::LibraryRootUnavailable => (
+            StatusCode::PRECONDITION_FAILED,
+            "Axial library is not configured",
+        ),
+        KnownGoodRebuildError::CapacityExhausted => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Version verification is busy. Try again.",
+        ),
+        KnownGoodRebuildError::ReconstructionFailed => (
+            StatusCode::BAD_GATEWAY,
+            "Could not verify the selected version. Check your connection and try again.",
+        ),
+        KnownGoodRebuildError::InstanceNotRegistered | KnownGoodRebuildError::TargetChanged => (
+            StatusCode::CONFLICT,
+            "The instance changed before version verification completed. Try again.",
+        ),
+        KnownGoodRebuildError::InvalidInstanceIdentity
+        | KnownGoodRebuildError::ReceiptIdentityMismatch
+        | KnownGoodRebuildError::LiveAuthorityMissing
+        | KnownGoodRebuildError::OwnerStopped => {
+            return instance_internal_error_response(operation);
+        }
+    };
+    (status, Json(serde_json::json!({ "error": message })))
+}
+
+async fn rollback_new_instance(
+    state: &AppState,
+    instance_id: &str,
+    producer: ProducerLease,
+) -> Result<(), InstanceStoreError> {
+    match state
+        .delete_instance(instance_id.to_string(), true, producer)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(_) if state.instances().get(instance_id).is_none() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn instance_store_error_class(error: &InstanceStoreError) -> &'static str {
+    match error {
+        InstanceStoreError::Read(_) => "read",
+        InstanceStoreError::Parse(_) => "parse",
+        InstanceStoreError::Validation(_) => "validation",
+        InstanceStoreError::TooLarge { .. } => "too_large",
+        InstanceStoreError::Persistence(_) => "persistence",
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -358,22 +434,107 @@ pub(crate) struct DuplicateInstanceRequest {
     pub name: Option<String>,
 }
 
+pub(crate) async fn handle_duplicate_instance_owned(
+    state: &AppState,
+    id: &str,
+    payload: Option<DuplicateInstanceRequest>,
+    handoff: RequestProducerHandoff,
+) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
+    let producer = handoff
+        .try_claim()
+        .map_err(instance_shutdown_error_response)?;
+    complete_duplicate_instance_with_rebuild(
+        state,
+        &producer,
+        id,
+        payload,
+        |state, instance_id| async move {
+            crate::application::rebuild_registered_known_good(&state, &instance_id).await
+        },
+    )
+    .await
+}
+
+async fn complete_duplicate_instance_with_rebuild<Rebuild, RebuildFuture>(
+    state: &AppState,
+    producer: &ProducerLease,
+    id: &str,
+    payload: Option<DuplicateInstanceRequest>,
+    rebuild: Rebuild,
+) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)>
+where
+    Rebuild: FnOnce(AppState, String) -> RebuildFuture + Send + 'static,
+    RebuildFuture: Future<Output = Result<(), KnownGoodRebuildError>> + Send + 'static,
+{
+    let payload = payload.unwrap_or_default();
+    let continuation = producer.claim_child();
+    let rollback_owner = producer.claim_child();
+    let continuation_state = state.clone();
+    let source_id = id.to_string();
+    let completed = continuation.spawn_joinable(async move {
+        let instance = continuation_state
+            .duplicate_instance(
+                source_id,
+                payload.name,
+                continuation_state.library_dir().map(PathBuf::from),
+            )
+            .await
+            .map_err(|error| {
+                instance_write_error_response(InstanceWriteOperation::Duplicate, error)
+            })?;
+        let instance_id = instance.id.clone();
+        match rebuild(continuation_state.clone(), instance_id.clone()).await {
+            Ok(()) => Ok(instance),
+            Err(error) => {
+                if let Err(rollback_error) =
+                    rollback_new_instance(&continuation_state, &instance_id, rollback_owner).await
+                {
+                    error!(
+                        failure_class = instance_store_error_class(&rollback_error),
+                        "duplicate compensation rollback persistence failed"
+                    );
+                    return Err(instance_write_error_response(
+                        InstanceWriteOperation::Duplicate,
+                        rollback_error,
+                    ));
+                }
+                Err(known_good_rebuild_error_response(
+                    InstanceWriteOperation::Duplicate,
+                    error,
+                ))
+            }
+        }
+    });
+    let instance = completed
+        .await
+        .map_err(|_| instance_internal_error_response(InstanceWriteOperation::Duplicate))??;
+    Ok(enrich_instance_for_state_indexed(state, producer, instance).await)
+}
+
+#[cfg(test)]
 pub(crate) async fn handle_duplicate_instance(
     state: &AppState,
     producer: &ProducerLease,
     id: &str,
     payload: Option<DuplicateInstanceRequest>,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
-    let payload = payload.unwrap_or_default();
-    let instance = state
-        .duplicate_instance(
-            id.to_string(),
-            payload.name,
-            state.library_dir().map(PathBuf::from),
-        )
+    complete_duplicate_instance_with_rebuild(state, producer, id, payload, |_, _| async { Ok(()) })
         .await
-        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Duplicate, error))?;
-    Ok(enrich_instance_for_state_indexed(state, producer, instance).await)
+}
+
+#[cfg(test)]
+async fn handle_duplicate_instance_with_rebuild<Rebuild, RebuildFuture>(
+    state: &AppState,
+    producer: &ProducerLease,
+    id: &str,
+    payload: Option<DuplicateInstanceRequest>,
+    rebuild: Rebuild,
+) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)>
+where
+    Rebuild: FnOnce(AppState, String) -> RebuildFuture + Send + 'static,
+    RebuildFuture: Future<Output = Result<(), KnownGoodRebuildError>> + Send + 'static,
+{
+    complete_duplicate_instance_with_rebuild(state, producer, id, payload, rebuild).await
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -486,14 +647,9 @@ pub(crate) async fn handle_delete_instance_owned(
     query: std::collections::HashMap<String, String>,
     handoff: RequestProducerHandoff,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff.try_claim().map_err(|_| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "application shutdown is in progress"
-            })),
-        )
-    })?;
+    let producer = handoff
+        .try_claim()
+        .map_err(instance_shutdown_error_response)?;
     let keep_files = query.get("keep_files").is_some_and(|value| value == "true");
     state
         .delete_instance(id.to_string(), !keep_files, producer)

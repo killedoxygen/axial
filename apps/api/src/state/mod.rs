@@ -75,6 +75,7 @@ pub(crate) use journals::{
     operation_journal_plan_is_visible, operation_journal_terminal_is_visible,
 };
 pub use journals::{OperationJournalStore, OperationJournalStoreError};
+pub(crate) use known_good_rebuilds::KnownGoodRebuildError;
 pub(crate) use lifecycle::{
     AppLifecycle, LifecycleAdmissionError, ProducerLease, RequestLease, RequestProducerHandoff,
 };
