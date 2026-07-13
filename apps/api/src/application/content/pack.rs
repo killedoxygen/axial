@@ -731,11 +731,8 @@ async fn build_pack_manifest(
         });
     }
 
-    let by_hash: HashMap<String, &axial_content::PackFile> = installed
-        .iter()
-        .filter(|file| file.kind().is_some())
-        .filter_map(|file| file.sha512.clone().map(|hash| (hash, file)))
-        .collect();
+    let by_hash = group_pack_files_by_sha512(installed);
+    reject_duplicate_pack_hashes(&by_hash)?;
 
     let mut identified = 0;
     if !by_hash.is_empty() {
@@ -748,7 +745,7 @@ async fn build_pack_manifest(
             let titles = super::project_titles(state, &ids).await;
 
             for (hash, identity) in resolved {
-                let Some(file) = by_hash.get(&hash) else {
+                let Some(file) = by_hash.get(&hash).and_then(|files| files.first()) else {
                     continue;
                 };
                 let Some(kind) = file.kind() else { continue };
@@ -786,6 +783,30 @@ async fn build_pack_manifest(
     }
 
     Ok((manifest, identified, stale_entries))
+}
+
+fn group_pack_files_by_sha512(
+    installed: &[axial_content::PackFile],
+) -> HashMap<String, Vec<&axial_content::PackFile>> {
+    let mut grouped: HashMap<String, Vec<&axial_content::PackFile>> = HashMap::new();
+    for file in installed.iter().filter(|file| file.kind().is_some()) {
+        if let Some(hash) = &file.sha512 {
+            grouped.entry(hash.clone()).or_default().push(file);
+        }
+    }
+    grouped
+}
+
+fn reject_duplicate_pack_hashes(
+    grouped: &HashMap<String, Vec<&axial_content::PackFile>>,
+) -> Result<(), ContentApiError> {
+    if grouped.values().any(|files| files.len() > 1) {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "modpack repeats the same managed content at multiple paths",
+        ));
+    }
+    Ok(())
 }
 
 fn verified_stale_pack_files(
@@ -857,6 +878,27 @@ mod tests {
             mismatch_notice("forge", "1.21.6", Some("fabric"), "1.21.6").expect("loaders differ");
         assert!(notice.contains("fabric"));
         assert!(notice.contains("forge"));
+    }
+
+    #[test]
+    fn duplicate_pack_hashes_are_rejected_before_manifest_finalization() {
+        let file = |path: &str, hash: &str| axial_content::PackFile {
+            path: path.to_string(),
+            url: format!("https://example.invalid/{path}"),
+            sha1: None,
+            sha512: Some(hash.to_string()),
+            size: Some(42),
+        };
+        let installed = vec![
+            file("mods/first.jar", "shared-hash"),
+            file("mods/second.jar", "shared-hash"),
+        ];
+
+        let grouped = group_pack_files_by_sha512(&installed);
+        assert_eq!(grouped["shared-hash"].len(), 2);
+        let (status, _) = reject_duplicate_pack_hashes(&grouped)
+            .expect_err("one manifest entry cannot safely own two paths");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
