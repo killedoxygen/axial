@@ -14,18 +14,24 @@ use super::model::{ActualIntegrity, DownloadIntegrityError};
 use super::path_safety::{
     bounded_download_file_label, safe_download_target_label, windows_verbatim_path_string,
 };
-use super::promotion::sweep_stale_promotion_backups;
+use super::promotion::{
+    selected_promotion_temp_path, sweep_stale_promotion_backups,
+    sweep_stale_selected_promotion_temps,
+};
 use super::runtime::{
     RuntimeEnsurePipeline, finish_runtime_pipeline_after_artifacts, runtime_ensure_progress,
 };
 use super::transfer::{
-    SelectedArtifactSourceRequest, acquire_authenticated_selected_artifact_source,
+    AuthenticatedSelectedArtifactSource, PreparedSelectedArtifactInstall,
+    SelectedArtifactSourceRequest, SelectedPromotionTestControl, SelectedPromotionTestStage,
+    acquire_authenticated_selected_artifact_source,
     acquire_authenticated_selected_artifact_source_with_retry_delays_for_test,
     download_file_with_client, download_file_with_client_report_with_retry_delays,
     download_temp_path, ensure_selected_artifact_with_client, execute_download_to_temp,
     execute_download_to_temp_with_pre_promote_hook,
-    materialize_authenticated_selected_artifact_source, prepare_selected_artifact_install,
-    remove_stale_download_temp,
+    materialize_authenticated_selected_artifact_source,
+    materialize_authenticated_selected_artifact_source_with_control,
+    prepare_selected_artifact_install, remove_stale_download_temp,
 };
 use super::*;
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
@@ -1708,10 +1714,12 @@ async fn promotion_sweep_removes_stale_other_pid_backups_only() {
     let unrelated = root.join("other.jar.axial-backup-7");
     let backup_directory = root.join("artifact.jar.axial-backup-8");
     let invalid_pid_backup = root.join("artifact.jar.axial-backup-not-a-pid");
+    let malformed_suffix_backup = root.join(format!("artifact.jar.axial-backup-{other_pid}-extra"));
     fs::write(&other_pid_backup, b"stale").expect("write stale backup");
     fs::write(&current_pid_backup, b"current").expect("write current backup");
     fs::write(&unrelated, b"unrelated").expect("write unrelated backup");
     fs::write(&invalid_pid_backup, b"ambiguous").expect("write invalid pid backup");
+    fs::write(&malformed_suffix_backup, b"ambiguous").expect("write malformed suffix backup");
     fs::create_dir_all(&backup_directory).expect("create backup-looking directory");
 
     sweep_stale_promotion_backups(&destination)
@@ -1724,6 +1732,7 @@ async fn promotion_sweep_removes_stale_other_pid_backups_only() {
     assert!(unrelated.exists());
     assert!(backup_directory.exists());
     assert!(invalid_pid_backup.exists());
+    assert!(malformed_suffix_backup.exists());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1748,6 +1757,35 @@ async fn promotion_sweep_preserves_live_other_pid_backup() {
     assert!(destination_exists);
     assert!(live_pid_backup_exists);
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn selected_temp_sweep_removes_only_strict_stale_owner_names() {
+    let root = temp_dir("selected-temp-owner-sweep");
+    let destination = root.join("version.json");
+    fs::create_dir_all(&root).expect("source root");
+    let stale_pid = unused_pid_for_test(&[std::process::id()]);
+    let stale = root.join(format!("version.json.axial-selected-tmp-{stale_pid}"));
+    let current = selected_promotion_temp_path(&destination);
+    let malformed = root.join(format!("version.json.axial-selected-tmp-{stale_pid}-extra"));
+    let foreign = root.join(format!("other.json.axial-selected-tmp-{stale_pid}"));
+    let mut child = spawn_promotion_sweep_child_process();
+    let live = root.join(format!("version.json.axial-selected-tmp-{}", child.id()));
+    for path in [&stale, &current, &malformed, &foreign, &live] {
+        fs::write(path, b"reserved").expect("write selected temp fixture");
+    }
+
+    let sweep = sweep_stale_selected_promotion_temps(&destination).await;
+    let _ = child.kill();
+    let _ = child.wait();
+    sweep.expect("sweep selected temps");
+
+    assert!(!stale.exists());
+    assert!(current.exists());
+    assert!(malformed.exists());
+    assert!(foreign.exists());
+    assert!(live.exists());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -2765,6 +2803,52 @@ async fn authenticated_source_materialization_consumes_matching_prepared_contrac
 }
 
 #[tokio::test]
+async fn authenticated_source_repeat_exact_materialization_reuses_with_retained_backup() {
+    let root = temp_dir("selected-repeat-exact");
+    let destination = root.join("version.json");
+    fs::create_dir_all(&root).expect("source root");
+    fs::write(&destination, b"old-source").expect("old destination");
+    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
+    materialize_authenticated_selected_artifact_source(prepared, source, None)
+        .await
+        .expect("first exact transition");
+    let backups = selected_reserved_backups(&destination);
+    assert_eq!(backups.len(), 1);
+    assert_eq!(
+        fs::read(&backups[0]).expect("retained backup"),
+        b"old-source"
+    );
+
+    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
+    materialize_authenticated_selected_artifact_source(prepared, source, None)
+        .await
+        .expect("repeat exact materialization");
+
+    assert_eq!(
+        fs::read(&destination).expect("exact destination"),
+        b"new-source"
+    );
+    assert!(!selected_promotion_temp_path(&destination).exists());
+    assert_eq!(selected_reserved_backups(&destination), backups);
+
+    let (prepared, source) = selected_materialization_fixture(&destination, b"third-source").await;
+    materialize_authenticated_selected_artifact_source(prepared, source, None)
+        .await
+        .err()
+        .expect("different replacement must respect retained backup slot");
+    assert_eq!(
+        fs::read(&destination).expect("bounded destination"),
+        b"new-source"
+    );
+    assert_eq!(selected_reserved_backups(&destination), backups);
+    assert_eq!(
+        fs::read(selected_promotion_temp_path(&destination)).expect("one retained temp obligation"),
+        b"third-source"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn authenticated_source_rejects_mismatched_prepared_contract_without_mutation() {
     let root = temp_dir("verified-source-mismatched-contract");
     let destination = root.join("asset-index.json");
@@ -2852,6 +2936,430 @@ async fn authenticated_source_materialization_failure_emits_no_verified_fact() {
     assert!(
         std::iter::from_fn(|| fact_rx.try_recv().ok())
             .all(|fact| fact.kind != ExecutionDownloadFactKind::ArtifactVerified)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+async fn selected_materialization_fixture(
+    destination: &Path,
+    body: &[u8],
+) -> (
+    PreparedSelectedArtifactInstall,
+    AuthenticatedSelectedArtifactSource,
+) {
+    let body = body.to_vec();
+    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+    let (url, _) =
+        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
+    let prepared = prepare_selected_artifact_install(
+        SelectedDownloadArtifactKind::VersionJson,
+        destination,
+        &url,
+        &expected,
+        None,
+        None,
+    )
+    .await
+    .expect("prepare selected materialization");
+    let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+        client: &build_http_client(Duration::from_secs(5)),
+        url: &url,
+        expected: &expected,
+        max_bytes: 1024,
+        target: prepared.target(),
+        fact_tx: None,
+    })
+    .await
+    .expect("acquire selected materialization source");
+    (prepared, source)
+}
+
+fn selected_promotion_control(
+    hook: impl FnMut(SelectedPromotionTestStage, &Path, &Path) + Send + 'static,
+) -> SelectedPromotionTestControl {
+    SelectedPromotionTestControl {
+        hook: Some(Box::new(hook)),
+        pause_at: None,
+        reached: None,
+        resume: None,
+        fail_publish_rename: false,
+    }
+}
+
+fn selected_reserved_backups(destination: &Path) -> Vec<PathBuf> {
+    let prefix = format!(
+        "{}.axial-backup-",
+        destination
+            .file_name()
+            .expect("selected destination name")
+            .to_string_lossy()
+    );
+    fs::read_dir(destination.parent().expect("selected destination parent"))
+        .expect("selected destination directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn authenticated_source_rejects_temp_path_substitution_before_namespace_mutation() {
+    let root = temp_dir("selected-temp-substitution");
+    let destination = root.join("version.json");
+    fs::create_dir_all(&root).expect("source root");
+    fs::write(&destination, b"old-source").expect("old destination");
+    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
+    let retained = root.join("retained-authenticated-temp");
+    let retained_hook = retained.clone();
+    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
+    let control = selected_promotion_control(move |stage, temp, _destination| {
+        if stage == SelectedPromotionTestStage::TempWritten {
+            fs::rename(temp, &retained_hook).expect("retain authenticated temp");
+            fs::write(temp, b"new-source").expect("substitute same-byte temp");
+        }
+    });
+
+    materialize_authenticated_selected_artifact_source_with_control(
+        prepared,
+        source,
+        Some(&fact_tx),
+        control,
+    )
+    .await
+    .err()
+    .expect("substituted temp must fail");
+
+    assert_eq!(
+        fs::read(&destination).expect("old destination"),
+        b"old-source"
+    );
+    assert_eq!(
+        fs::read(&retained).expect("retained proof bytes"),
+        b"new-source"
+    );
+    let facts = std::iter::from_fn(|| fact_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        facts
+            .iter()
+            .any(|fact| fact.kind == ExecutionDownloadFactKind::PromoteFailed)
+    );
+    assert!(
+        facts
+            .iter()
+            .all(|fact| fact.kind != ExecutionDownloadFactKind::ChecksumMismatch)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_post_publish_corruption_restores_exact_backup() {
+    let root = temp_dir("selected-post-publish-restore");
+    let destination = root.join("version.json");
+    fs::create_dir_all(&root).expect("source root");
+    fs::write(&destination, b"old-source").expect("old destination");
+    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
+    let control = selected_promotion_control(|stage, _temp, destination| {
+        if stage == SelectedPromotionTestStage::PublishedUnverified {
+            fs::write(destination, b"bad-source").expect("corrupt published handle");
+        }
+    });
+
+    materialize_authenticated_selected_artifact_source_with_control(
+        prepared, source, None, control,
+    )
+    .await
+    .err()
+    .expect("post-publish corruption must fail");
+
+    assert_eq!(
+        fs::read(&destination).expect("restored destination"),
+        b"old-source"
+    );
+    assert_eq!(
+        fs::read(selected_promotion_temp_path(&destination)).expect("retained rejected identity"),
+        b"bad-source"
+    );
+    assert!(selected_reserved_backups(&destination).is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_post_publish_corruption_restores_absence() {
+    let root = temp_dir("selected-post-publish-absence");
+    let destination = root.join("version.json");
+    fs::create_dir_all(&root).expect("source root");
+    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
+    let control = selected_promotion_control(|stage, _temp, destination| {
+        if stage == SelectedPromotionTestStage::PublishedUnverified {
+            fs::write(destination, b"bad-source").expect("corrupt published handle");
+        }
+    });
+
+    materialize_authenticated_selected_artifact_source_with_control(
+        prepared, source, None, control,
+    )
+    .await
+    .err()
+    .expect("post-publish corruption must fail");
+
+    assert!(!destination.exists());
+    assert_eq!(
+        fs::read(selected_promotion_temp_path(&destination)).expect("retained rejected identity"),
+        b"bad-source"
+    );
+    assert!(selected_reserved_backups(&destination).is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_forced_publish_failure_restores_backup_and_retains_temp() {
+    let root = temp_dir("selected-forced-publish-restore");
+    let destination = root.join("version.json");
+    fs::create_dir_all(&root).expect("source root");
+    fs::write(&destination, b"old-source").expect("old destination");
+    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
+    let mut control = selected_promotion_control(|_, _, _| {});
+    control.fail_publish_rename = true;
+
+    materialize_authenticated_selected_artifact_source_with_control(
+        prepared, source, None, control,
+    )
+    .await
+    .err()
+    .expect("forced publish failure must fail");
+
+    assert_eq!(
+        fs::read(&destination).expect("restored destination"),
+        b"old-source"
+    );
+    assert_eq!(
+        fs::read(selected_promotion_temp_path(&destination)).expect("retained authenticated temp"),
+        b"new-source"
+    );
+    assert!(selected_reserved_backups(&destination).is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_forced_publish_failure_restores_absence_and_retains_temp() {
+    let root = temp_dir("selected-forced-publish-absence");
+    let destination = root.join("version.json");
+    fs::create_dir_all(&root).expect("source root");
+    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
+    let mut control = selected_promotion_control(|_, _, _| {});
+    control.fail_publish_rename = true;
+
+    materialize_authenticated_selected_artifact_source_with_control(
+        prepared, source, None, control,
+    )
+    .await
+    .err()
+    .expect("forced publish failure must fail");
+
+    assert!(!destination.exists());
+    assert_eq!(
+        fs::read(selected_promotion_temp_path(&destination)).expect("retained authenticated temp"),
+        b"new-source"
+    );
+    assert!(selected_reserved_backups(&destination).is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_destination_substitution_never_deletes_foreign_replacement() {
+    let root = temp_dir("selected-destination-substitution");
+    let destination = root.join("version.json");
+    let displaced = root.join("displaced-authenticated-source");
+    fs::create_dir_all(&root).expect("source root");
+    fs::write(&destination, b"old-source").expect("old destination");
+    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
+    let displaced_hook = displaced.clone();
+    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
+    let control = selected_promotion_control(move |stage, _temp, destination| {
+        if stage == SelectedPromotionTestStage::PublishedUnverified {
+            fs::rename(destination, &displaced_hook).expect("displace authenticated publication");
+            fs::write(destination, b"foreign!!").expect("foreign replacement");
+        }
+    });
+
+    materialize_authenticated_selected_artifact_source_with_control(
+        prepared,
+        source,
+        Some(&fact_tx),
+        control,
+    )
+    .await
+    .err()
+    .expect("destination substitution must fail closed");
+
+    assert_eq!(
+        fs::read(&destination).expect("foreign replacement"),
+        b"foreign!!"
+    );
+    assert_eq!(
+        fs::read(&displaced).expect("displaced source"),
+        b"new-source"
+    );
+    let backups = selected_reserved_backups(&destination);
+    assert_eq!(backups.len(), 1);
+    assert_eq!(
+        fs::read(&backups[0]).expect("reserved exact backup"),
+        b"old-source"
+    );
+    assert!(std::iter::from_fn(|| fact_rx.try_recv().ok()).all(|fact| {
+        !matches!(
+            fact.kind,
+            ExecutionDownloadFactKind::Promoted | ExecutionDownloadFactKind::ArtifactVerified
+        )
+    }));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_cancellation_after_backup_still_settles_publication() {
+    let root = temp_dir("selected-cancel-after-backup");
+    let destination = root.join("version.json");
+    fs::create_dir_all(&root).expect("source root");
+    fs::write(&destination, b"old-source").expect("old destination");
+    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    let control = SelectedPromotionTestControl {
+        hook: None,
+        pause_at: Some(SelectedPromotionTestStage::BackupOwned),
+        reached: Some(reached_tx),
+        resume: Some(resume_rx),
+        fail_publish_rename: false,
+    };
+    let materialization = tokio::spawn(async move {
+        materialize_authenticated_selected_artifact_source_with_control(
+            prepared, source, None, control,
+        )
+        .await
+    });
+    reached_rx.await.expect("backup-owned boundary");
+    materialization.abort();
+    let _ = resume_tx.send(());
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if fs::read(&destination).ok().as_deref() == Some(b"new-source")
+                && !selected_promotion_temp_path(&destination).exists()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("owned publication must settle after caller cancellation");
+    let backups = selected_reserved_backups(&destination);
+    assert_eq!(backups.len(), 1);
+    assert_eq!(
+        fs::read(&backups[0]).expect("retained backup"),
+        b"old-source"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_missing_temp_after_backup_restores_destination() {
+    let root = temp_dir("selected-missing-temp-after-backup");
+    let destination = root.join("version.json");
+    fs::create_dir_all(&root).expect("source root");
+    fs::write(&destination, b"old-source").expect("old destination");
+    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
+    let control = selected_promotion_control(|stage, temp, _destination| {
+        if stage == SelectedPromotionTestStage::BackupOwned {
+            fs::remove_file(temp).expect("remove authenticated temp at backup boundary");
+        }
+    });
+
+    materialize_authenticated_selected_artifact_source_with_control(
+        prepared, source, None, control,
+    )
+    .await
+    .err()
+    .expect("missing temp must fail");
+
+    assert_eq!(
+        fs::read(&destination).expect("restored destination"),
+        b"old-source"
+    );
+    assert!(selected_reserved_backups(&destination).is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_missing_publication_restores_destination() {
+    let root = temp_dir("selected-missing-publication");
+    let destination = root.join("version.json");
+    fs::create_dir_all(&root).expect("source root");
+    fs::write(&destination, b"old-source").expect("old destination");
+    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
+    let control = selected_promotion_control(|stage, _temp, destination| {
+        if stage == SelectedPromotionTestStage::PublishedUnverified {
+            fs::remove_file(destination).expect("remove unverified publication");
+        }
+    });
+
+    materialize_authenticated_selected_artifact_source_with_control(
+        prepared, source, None, control,
+    )
+    .await
+    .err()
+    .expect("missing publication must fail");
+
+    assert_eq!(
+        fs::read(&destination).expect("restored destination"),
+        b"old-source"
+    );
+    assert!(selected_reserved_backups(&destination).is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn authenticated_source_foreign_backup_substitution_is_nonterminal_and_retained() {
+    let root = temp_dir("selected-foreign-backup-cleanup");
+    let destination = root.join("version.json");
+    let displaced_backup = root.join("displaced-exact-backup");
+    fs::create_dir_all(&root).expect("source root");
+    fs::write(&destination, b"old-source").expect("old destination");
+    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
+    let displaced_hook = displaced_backup.clone();
+    let control = selected_promotion_control(move |stage, _temp, destination| {
+        if stage == SelectedPromotionTestStage::PublishedVerified {
+            let backup = selected_reserved_backups(destination)
+                .into_iter()
+                .next()
+                .expect("exact backup");
+            fs::rename(&backup, &displaced_hook).expect("displace exact backup");
+            fs::write(&backup, b"foreign-backup").expect("foreign backup replacement");
+        }
+    });
+
+    materialize_authenticated_selected_artifact_source_with_control(
+        prepared, source, None, control,
+    )
+    .await
+    .expect("verified publication is already committed");
+
+    assert_eq!(
+        fs::read(&destination).expect("published destination"),
+        b"new-source"
+    );
+    assert_eq!(
+        fs::read(&displaced_backup).expect("displaced exact backup"),
+        b"old-source"
+    );
+    let backups = selected_reserved_backups(&destination);
+    assert_eq!(backups.len(), 1);
+    assert_eq!(
+        fs::read(&backups[0]).expect("foreign backup"),
+        b"foreign-backup"
     );
     let _ = fs::remove_dir_all(root);
 }

@@ -17,7 +17,10 @@ use super::model::{
 use super::path_safety::{
     bounded_download_file_label, filesystem_path, safe_download_target_label,
 };
-use super::promotion::{promotion_backup_path, sweep_stale_promotion_backups};
+use super::promotion::{
+    promotion_backup_path, selected_promotion_temp_path, sweep_stale_promotion_backups,
+    sweep_stale_selected_promotion_temps,
+};
 use super::transfer_failure::{
     finish_execution_error, finish_execution_error_after_temp_discard,
     finish_io_failure_after_temp_discard, record_io_failure_fact_pair,
@@ -87,7 +90,6 @@ impl AuthenticatedSelectedArtifactSource {
 }
 
 pub(super) struct PreparedSelectedArtifactInstall {
-    kind: SelectedDownloadArtifactKind,
     destination: PathBuf,
     expected: ExpectedIntegrity,
     target: String,
@@ -121,6 +123,51 @@ impl MaterializedSelectedArtifactSource {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SelectedPromotionTestStage {
+    TempWritten,
+    TempValidated,
+    BackupOwned,
+    PublishedUnverified,
+    PublishedVerified,
+}
+
+#[cfg(test)]
+type SelectedPromotionTestHook =
+    Box<dyn FnMut(SelectedPromotionTestStage, &Path, &Path) + Send + 'static>;
+
+#[cfg(test)]
+pub(super) struct SelectedPromotionTestControl {
+    pub(super) hook: Option<SelectedPromotionTestHook>,
+    pub(super) pause_at: Option<SelectedPromotionTestStage>,
+    pub(super) reached: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(super) resume: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub(super) fail_publish_rename: bool,
+}
+
+#[cfg(test)]
+impl SelectedPromotionTestControl {
+    async fn reach(
+        &mut self,
+        stage: SelectedPromotionTestStage,
+        temp_path: &Path,
+        destination: &Path,
+    ) {
+        if let Some(hook) = self.hook.as_mut() {
+            hook(stage, temp_path, destination);
+        }
+        if self.pause_at == Some(stage) {
+            if let Some(reached) = self.reached.take() {
+                let _ = reached.send(());
+            }
+            if let Some(resume) = self.resume.take() {
+                let _ = resume.await;
+            }
+        }
+    }
+}
+
 pub(super) struct SelectedArtifactSourceRequest<'a> {
     pub(super) client: &'a reqwest::Client,
     pub(super) url: &'a str,
@@ -150,7 +197,6 @@ pub(super) async fn prepare_selected_artifact_install(
     emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
     emit_selected_artifact_missing_fact_if_absent(fact_tx, kind, destination, expected).await;
     Ok(PreparedSelectedArtifactInstall {
-        kind,
         destination: destination.to_path_buf(),
         expected: expected.clone(),
         target: selected_download_target_label(kind, destination),
@@ -162,32 +208,650 @@ pub(super) async fn materialize_authenticated_selected_artifact_source(
     source: AuthenticatedSelectedArtifactSource,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
 ) -> Result<MaterializedSelectedArtifactSource, DownloadError> {
+    materialize_authenticated_selected_artifact_source_inner(
+        prepared,
+        source,
+        fact_tx,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(super) async fn materialize_authenticated_selected_artifact_source_with_control(
+    prepared: PreparedSelectedArtifactInstall,
+    source: AuthenticatedSelectedArtifactSource,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    control: SelectedPromotionTestControl,
+) -> Result<MaterializedSelectedArtifactSource, DownloadError> {
+    materialize_authenticated_selected_artifact_source_inner(
+        prepared,
+        source,
+        fact_tx,
+        Some(control),
+    )
+    .await
+}
+
+async fn materialize_authenticated_selected_artifact_source_inner(
+    prepared: PreparedSelectedArtifactInstall,
+    source: AuthenticatedSelectedArtifactSource,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    #[cfg(test)] control: Option<SelectedPromotionTestControl>,
+) -> Result<MaterializedSelectedArtifactSource, DownloadError> {
     if source.target != prepared.target || source.expected != prepared.expected {
         return Err(DownloadError::Integrity(
             "authenticated source does not match its prepared install contract".to_string(),
         ));
     }
-    let temp_path = download_temp_path(&prepared.destination);
-    let report = write_launcher_managed_artifact_bytes_to_temp(
-        &prepared.destination,
-        &temp_path,
-        source.bytes(),
-    )
+    let fact_tx = fact_tx.cloned();
+    tokio::spawn(async move {
+        materialize_authenticated_selected_artifact_source_owned(
+            prepared,
+            source,
+            fact_tx,
+            #[cfg(test)]
+            control,
+        )
+        .await
+    })
     .await
-    .map_err(ExecutionDownloadError::into_download_error)?;
-    let mut facts =
-        selected_execution_download_facts(prepared.kind, &prepared.destination, &report.facts)
-            .into_iter()
-            .filter(|fact| fact.kind != ExecutionDownloadFactKind::MetadataMissing)
-            .collect::<Vec<_>>();
-    facts.extend(metadata_facts(&source.expected, &source.target));
+    .map_err(|error| {
+        DownloadError::FileOperation(io::Error::other(format!(
+            "selected artifact materialization task failed: {error}"
+        )))
+    })?
+}
+
+async fn materialize_authenticated_selected_artifact_source_owned(
+    prepared: PreparedSelectedArtifactInstall,
+    source: AuthenticatedSelectedArtifactSource,
+    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    #[cfg(test)] mut control: Option<SelectedPromotionTestControl>,
+) -> Result<MaterializedSelectedArtifactSource, DownloadError> {
+    let target = source.target.clone();
+    let temp_path = selected_promotion_temp_path(&prepared.destination);
+    let mut facts = Vec::new();
+    if matches!(
+        async_fs::symlink_metadata(filesystem_path(&prepared.destination).as_ref()).await,
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink()
+    ) {
+        let destination = prepared.destination.clone();
+        let existing = tokio::task::spawn_blocking(move || open_regular_nofollow(&destination))
+            .await
+            .map_err(|error| DownloadError::FileOperation(io::Error::other(error.to_string())))??;
+        if validate_open_source_at_path(
+            &existing,
+            &prepared.destination,
+            source.observed_size,
+            source.observed_sha1,
+        )
+        .await?
+            == OpenSourceValidation::Exact
+        {
+            facts.extend(metadata_facts(&source.expected, &target));
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::ArtifactVerified,
+                &target,
+                no_download_fact_fields(),
+            ));
+            emit_execution_download_facts(fact_tx.as_ref(), &facts);
+            return Ok(MaterializedSelectedArtifactSource { source });
+        }
+    }
+    if let Some(parent) = prepared.destination.parent()
+        && let Err(error) = async_fs::create_dir_all(filesystem_path(parent).as_ref()).await
+    {
+        record_io_failure_fact_pair(
+            &mut facts,
+            &target,
+            error.kind(),
+            ExecutionDownloadFactKind::TempWriteFailed,
+        );
+        emit_execution_download_facts(fact_tx.as_ref(), &facts);
+        return Err(DownloadError::FileOperation(error));
+    }
+    sweep_stale_selected_promotion_temps(&prepared.destination).await?;
+    match async_fs::symlink_metadata(filesystem_path(&temp_path).as_ref()).await {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::OwnershipRefused,
+                &target,
+                no_download_fact_fields(),
+            ));
+            emit_execution_download_facts(fact_tx.as_ref(), &facts);
+            return Err(DownloadError::Integrity(
+                "selected artifact has an unsettled retained temp obligation".to_string(),
+            ));
+        }
+        Err(error) => return Err(DownloadError::FileOperation(error)),
+    }
+    let mut output = async_fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(filesystem_path(&temp_path).as_ref())
+        .await
+        .map_err(|error| {
+            record_io_failure_fact_pair(
+                &mut facts,
+                &target,
+                error.kind(),
+                ExecutionDownloadFactKind::TempWriteFailed,
+            );
+            emit_execution_download_facts(fact_tx.as_ref(), &facts);
+            DownloadError::FileOperation(error)
+        })?;
+    if let Err(error) = output.write_all(source.bytes()).await {
+        drop(output);
+        record_io_failure_fact_pair(
+            &mut facts,
+            &target,
+            error.kind(),
+            ExecutionDownloadFactKind::TempWriteFailed,
+        );
+        emit_execution_download_facts(fact_tx.as_ref(), &facts);
+        return Err(DownloadError::FileOperation(error));
+    }
+    if let Err(error) = output.flush().await {
+        drop(output);
+        record_io_failure_fact_pair(
+            &mut facts,
+            &target,
+            error.kind(),
+            ExecutionDownloadFactKind::TempWriteFailed,
+        );
+        emit_execution_download_facts(fact_tx.as_ref(), &facts);
+        return Err(DownloadError::FileOperation(error));
+    }
+    if let Err(error) = output.sync_data().await {
+        drop(output);
+        record_io_failure_fact_pair(
+            &mut facts,
+            &target,
+            error.kind(),
+            ExecutionDownloadFactKind::TempWriteFailed,
+        );
+        emit_execution_download_facts(fact_tx.as_ref(), &facts);
+        return Err(DownloadError::FileOperation(error));
+    }
     facts.push(execution_download_fact(
-        ExecutionDownloadFactKind::ArtifactVerified,
-        &source.target,
-        no_download_fact_fields(),
+        ExecutionDownloadFactKind::WrittenToTemp,
+        &target,
+        vec![("bytes", source.observed_size.to_string())],
     ));
-    emit_execution_download_facts(fact_tx, &facts);
-    Ok(MaterializedSelectedArtifactSource { source })
+    let output = output.into_std().await;
+    #[cfg(test)]
+    if let Some(control) = control.as_mut() {
+        control
+            .reach(
+                SelectedPromotionTestStage::TempWritten,
+                &temp_path,
+                &prepared.destination,
+            )
+            .await;
+    }
+    let expected_size = source.observed_size;
+    let expected_sha1 = source.observed_sha1;
+    let temp_path_for_validation = temp_path.clone();
+    let validation = tokio::task::spawn_blocking(move || {
+        let valid = validate_open_source_sync(
+            &output,
+            &temp_path_for_validation,
+            expected_size,
+            &expected_sha1,
+        );
+        (output, valid)
+    })
+    .await;
+    let (output, valid) = match validation {
+        Ok((output, Ok(valid))) => (output, valid),
+        Ok((_output, Err(error))) => {
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::TempWriteFailed,
+                &target,
+                no_download_fact_fields(),
+            ));
+            emit_execution_download_facts(fact_tx.as_ref(), &facts);
+            return Err(DownloadError::FileOperation(error));
+        }
+        Err(error) => {
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::TempWriteFailed,
+                &target,
+                no_download_fact_fields(),
+            ));
+            emit_execution_download_facts(fact_tx.as_ref(), &facts);
+            return Err(DownloadError::FileOperation(io::Error::other(
+                error.to_string(),
+            )));
+        }
+    };
+    if valid != OpenSourceValidation::Exact {
+        facts.push(match valid {
+            OpenSourceValidation::ContentMismatch => execution_download_fact(
+                ExecutionDownloadFactKind::ChecksumMismatch,
+                &target,
+                vec![("algorithm", "sha1")],
+            ),
+            OpenSourceValidation::IdentityMismatch => execution_download_fact(
+                ExecutionDownloadFactKind::PromoteFailed,
+                &target,
+                no_download_fact_fields(),
+            ),
+            OpenSourceValidation::Exact => unreachable!(),
+        });
+        emit_execution_download_facts(fact_tx.as_ref(), &facts);
+        return Err(DownloadError::Integrity(
+            "selected artifact temp does not match authenticated source".to_string(),
+        ));
+    }
+    #[cfg(test)]
+    if let Some(control) = control.as_mut() {
+        control
+            .reach(
+                SelectedPromotionTestStage::TempValidated,
+                &temp_path,
+                &prepared.destination,
+            )
+            .await;
+    }
+
+    let publish = publish_authenticated_selected_artifact(
+        output,
+        &temp_path,
+        &prepared.destination,
+        expected_size,
+        expected_sha1,
+        #[cfg(test)]
+        control.as_mut(),
+    )
+    .await;
+    match publish {
+        Ok(()) => {
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::Promoted,
+                &target,
+                no_download_fact_fields(),
+            ));
+            facts.extend(metadata_facts(&source.expected, &target));
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::ArtifactVerified,
+                &target,
+                no_download_fact_fields(),
+            ));
+            emit_execution_download_facts(fact_tx.as_ref(), &facts);
+            Ok(MaterializedSelectedArtifactSource { source })
+        }
+        Err(error) => {
+            facts.push(execution_download_fact(
+                ExecutionDownloadFactKind::PromoteFailed,
+                &target,
+                no_download_fact_fields(),
+            ));
+            emit_execution_download_facts(fact_tx.as_ref(), &facts);
+            Err(DownloadError::FileOperation(error))
+        }
+    }
+}
+
+async fn publish_authenticated_selected_artifact(
+    output: std::fs::File,
+    temp_path: &Path,
+    destination: &Path,
+    expected_size: u64,
+    expected_sha1: [u8; 20],
+    #[cfg(test)] mut control: Option<&mut SelectedPromotionTestControl>,
+) -> io::Result<()> {
+    sweep_stale_promotion_backups(destination).await?;
+    if validate_open_source_at_path(&output, temp_path, expected_size, expected_sha1).await?
+        != OpenSourceValidation::Exact
+    {
+        return Err(io::Error::other(
+            "authenticated temp identity changed before promotion",
+        ));
+    }
+
+    let backup_path = promotion_backup_path(destination);
+    let existing = match async_fs::symlink_metadata(filesystem_path(destination).as_ref()).await {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            let destination = destination.to_path_buf();
+            Some(
+                tokio::task::spawn_blocking(move || open_regular_nofollow(&destination))
+                    .await
+                    .map_err(|error| io::Error::other(error.to_string()))??,
+            )
+        }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "selected artifact destination identity is unsupported",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let backup = if let Some(existing) = existing {
+        let existing_size = existing.metadata()?.len();
+        rename_no_replace(destination, &backup_path).await?;
+        if !validate_open_identity_at_path(&existing, &backup_path, existing_size).await? {
+            return Err(io::Error::other(
+                "selected artifact backup identity changed during promotion",
+            ));
+        }
+        #[cfg(test)]
+        if let Some(control) = control.as_deref_mut() {
+            control
+                .reach(
+                    SelectedPromotionTestStage::BackupOwned,
+                    temp_path,
+                    destination,
+                )
+                .await;
+        }
+        Some((existing, existing_size))
+    } else {
+        None
+    };
+
+    match validate_open_source_at_path(&output, temp_path, expected_size, expected_sha1).await {
+        Ok(OpenSourceValidation::Exact) => {}
+        Ok(_) => {
+            restore_unpublished_backup(backup.as_ref(), &backup_path, destination).await?;
+            return Err(io::Error::other(
+                "authenticated temp identity changed at promotion boundary",
+            ));
+        }
+        Err(error) => {
+            restore_unpublished_backup(backup.as_ref(), &backup_path, destination).await?;
+            return Err(error);
+        }
+    }
+    #[cfg(test)]
+    let publish_rename = if control
+        .as_deref()
+        .is_some_and(|control| control.fail_publish_rename)
+    {
+        Err(io::Error::other("forced selected publication failure"))
+    } else {
+        rename_no_replace(temp_path, destination).await
+    };
+    #[cfg(not(test))]
+    let publish_rename = rename_no_replace(temp_path, destination).await;
+    if let Err(error) = publish_rename {
+        restore_unpublished_backup(backup.as_ref(), &backup_path, destination).await?;
+        return Err(error);
+    }
+    #[cfg(test)]
+    if let Some(control) = control.as_deref_mut() {
+        control
+            .reach(
+                SelectedPromotionTestStage::PublishedUnverified,
+                temp_path,
+                destination,
+            )
+            .await;
+    }
+
+    let publication_validation =
+        validate_open_source_at_path(&output, destination, expected_size, expected_sha1).await;
+    if !matches!(publication_validation, Ok(OpenSourceValidation::Exact)) {
+        let rollback = rollback_selected_publication(
+            &output,
+            expected_size,
+            destination,
+            temp_path,
+            backup.as_ref(),
+            &backup_path,
+        )
+        .await;
+        rollback?;
+        return Err(match publication_validation {
+            Ok(_) => {
+                io::Error::other("published selected artifact does not match authenticated source")
+            }
+            Err(error) => error,
+        });
+    }
+    #[cfg(test)]
+    if let Some(control) = control {
+        control
+            .reach(
+                SelectedPromotionTestStage::PublishedVerified,
+                temp_path,
+                destination,
+            )
+            .await;
+    }
+
+    // A live-process backup is retained as one bounded cleanup obligation. Its deterministic name
+    // makes later replacement fail closed instead of accumulating files; the stale-owner sweep
+    // retires it after process restart.
+    Ok(())
+}
+
+async fn restore_unpublished_backup(
+    backup: Option<&(std::fs::File, u64)>,
+    backup_path: &Path,
+    destination: &Path,
+) -> io::Result<()> {
+    let Some((backup, size)) = backup else {
+        return Ok(());
+    };
+    match async_fs::symlink_metadata(filesystem_path(destination).as_ref()).await {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(io::Error::other(
+                "destination changed before exact backup restoration",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    rename_no_replace(backup_path, destination).await?;
+    if !validate_open_identity_at_path(backup, destination, *size).await? {
+        return Err(io::Error::other(
+            "restored selected artifact backup identity does not match",
+        ));
+    }
+    Ok(())
+}
+
+async fn rollback_selected_publication(
+    output: &std::fs::File,
+    expected_size: u64,
+    destination: &Path,
+    rejected_path: &Path,
+    backup: Option<&(std::fs::File, u64)>,
+    backup_path: &Path,
+) -> io::Result<()> {
+    match async_fs::symlink_metadata(filesystem_path(destination).as_ref()).await {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            restore_unpublished_backup(backup, backup_path, destination).await?;
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(error) => return Err(error),
+    }
+    if !validate_open_identity_at_path(output, destination, expected_size).await? {
+        return Err(io::Error::other(
+            "published pathname changed before exact rollback",
+        ));
+    }
+    rename_no_replace(destination, rejected_path).await?;
+    if !validate_open_identity_at_path(output, rejected_path, expected_size).await? {
+        return Err(io::Error::other(
+            "rejected selected artifact identity changed during rollback",
+        ));
+    }
+    restore_unpublished_backup(backup, backup_path, destination).await?;
+    Ok(())
+}
+
+async fn validate_open_source_at_path(
+    file: &std::fs::File,
+    path: &Path,
+    expected_size: u64,
+    expected_sha1: [u8; 20],
+) -> io::Result<OpenSourceValidation> {
+    let file = file.try_clone()?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        validate_open_source_sync(&file, &path, expected_size, &expected_sha1)
+    })
+    .await
+    .map_err(|error| io::Error::other(error.to_string()))?
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenSourceValidation {
+    Exact,
+    ContentMismatch,
+    IdentityMismatch,
+}
+
+fn validate_open_source_sync(
+    file: &std::fs::File,
+    path: &Path,
+    expected_size: u64,
+    expected_sha1: &[u8; 20],
+) -> io::Result<OpenSourceValidation> {
+    if !open_file_matches_source(file, expected_size, expected_sha1)? {
+        return Ok(OpenSourceValidation::ContentMismatch);
+    }
+    if !path_matches_open_file(file, path, expected_size)? {
+        return Ok(OpenSourceValidation::IdentityMismatch);
+    }
+    Ok(OpenSourceValidation::Exact)
+}
+
+async fn validate_open_identity_at_path(
+    file: &std::fs::File,
+    path: &Path,
+    expected_size: u64,
+) -> io::Result<bool> {
+    let file = file.try_clone()?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || path_matches_open_file(&file, &path, expected_size))
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?
+}
+
+fn open_file_matches_source(
+    file: &std::fs::File,
+    expected_size: u64,
+    expected_sha1: &[u8; 20],
+) -> io::Result<bool> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    if file.metadata()?.len() != expected_size {
+        return Ok(false);
+    }
+    let mut reader = file;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha1::new();
+    let mut observed = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        observed = observed.saturating_add(read as u64);
+        hasher.update(&buffer[..read]);
+    }
+    let sha1: [u8; 20] = hasher.finalize().into();
+    Ok(observed == expected_size && sha1 == *expected_sha1)
+}
+
+async fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    let source = source.to_path_buf();
+    let destination = destination.to_path_buf();
+    tokio::task::spawn_blocking(move || rename_no_replace_sync(&source, &destination))
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?
+}
+
+#[cfg(unix)]
+fn rename_no_replace_sync(source: &Path, destination: &Path) -> io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    renameat_with(
+        CWD,
+        filesystem_path(source).as_ref(),
+        CWD,
+        filesystem_path(destination).as_ref(),
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(io::Error::from)
+}
+
+#[cfg(windows)]
+fn rename_no_replace_sync(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let source = filesystem_path(source)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = filesystem_path(destination)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn open_regular_nofollow(path: &Path) -> io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let file = std::fs::File::from(
+        rustix::fs::open(
+            filesystem_path(path).as_ref(),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?,
+    );
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "selected artifact destination is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_regular_nofollow(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(filesystem_path(path).as_ref())?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "selected artifact destination is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 pub(super) async fn acquire_authenticated_selected_artifact_source(

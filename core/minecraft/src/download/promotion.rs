@@ -6,10 +6,42 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::fs as async_fs;
 
 pub(super) async fn sweep_stale_promotion_backups(destination: &Path) -> io::Result<()> {
-    let Some(parent) = destination.parent() else {
+    let Some(prefix) = promotion_backup_file_name_prefix(destination) else {
         return Ok(());
     };
-    let Some(prefix) = promotion_backup_file_name_prefix(destination) else {
+    sweep_stale_owned_slots(destination, &prefix).await
+}
+
+pub(super) fn promotion_backup_path(destination: &Path) -> PathBuf {
+    let mut name = destination
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("artifact"))
+        .to_os_string();
+    name.push(".axial-backup-");
+    name.push(std::process::id().to_string());
+    destination.with_file_name(name)
+}
+
+pub(super) fn selected_promotion_temp_path(destination: &Path) -> PathBuf {
+    let mut name = destination
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("artifact"))
+        .to_os_string();
+    name.push(".axial-selected-tmp-");
+    name.push(std::process::id().to_string());
+    destination.with_file_name(name)
+}
+
+pub(super) async fn sweep_stale_selected_promotion_temps(destination: &Path) -> io::Result<()> {
+    let Some(file_name) = destination.file_name() else {
+        return Ok(());
+    };
+    let prefix = format!("{}.axial-selected-tmp-", file_name.to_string_lossy());
+    sweep_stale_owned_slots(destination, &prefix).await
+}
+
+async fn sweep_stale_owned_slots(destination: &Path, prefix: &str) -> io::Result<()> {
+    let Some(parent) = destination.parent() else {
         return Ok(());
     };
     let current_pid = std::process::id();
@@ -19,23 +51,16 @@ pub(super) async fn sweep_stale_promotion_backups(destination: &Path) -> io::Res
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        if path == destination {
-            continue;
-        }
-        let Some(file_name) = path.file_name() else {
+        let Some(name) = path.file_name() else {
             continue;
         };
-        let file_name = file_name.to_string_lossy();
-        let Some(pid) = file_name.strip_prefix(&prefix) else {
+        let name = name.to_string_lossy();
+        let Some(pid) = name.strip_prefix(prefix).and_then(promotion_slot_owner_pid) else {
             continue;
         };
-        let Some(pid) = promotion_backup_owner_pid(pid) else {
-            continue;
-        };
-        if pid == current_pid || promotion_backup_owner_is_live(&mut system, pid) {
+        if pid == current_pid || promotion_slot_owner_is_live(&mut system, pid) {
             continue;
         }
         let metadata = match async_fs::symlink_metadata(filesystem_path(&path).as_ref()).await {
@@ -51,28 +76,17 @@ pub(super) async fn sweep_stale_promotion_backups(destination: &Path) -> io::Res
             }
         }
     }
-
     Ok(())
 }
 
-pub(super) fn promotion_backup_path(destination: &Path) -> PathBuf {
-    let mut name = destination
-        .file_name()
-        .unwrap_or_else(|| OsStr::new("artifact"))
-        .to_os_string();
-    name.push(".axial-backup-");
-    name.push(std::process::id().to_string());
-    destination.with_file_name(name)
-}
-
-fn promotion_backup_owner_pid(pid: &str) -> Option<u32> {
+fn promotion_slot_owner_pid(pid: &str) -> Option<u32> {
     if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
     pid.parse().ok()
 }
 
-fn promotion_backup_owner_is_live(system: &mut System, pid: u32) -> bool {
+fn promotion_slot_owner_is_live(system: &mut System, pid: u32) -> bool {
     let pid = Pid::from_u32(pid);
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),

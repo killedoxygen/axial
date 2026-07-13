@@ -338,6 +338,8 @@ Loader provider connectivity is not a route or frontend policy concern. Core loa
 
 Loader base-version dependencies follow the same split. If a loader strategy has to install a missing base Minecraft version and that lower-level install fails, core returns a bounded `BaseInstallFailed` error carrying redacted vanilla install facts and private selected descriptors. Application adapts those facts into the normal Guardian install evidence and one-shot repair path; when no lower-level facts exist, the dependent loader operation records `install_dependency_failed` and Guardian authors the public block outcome. Routes and frontend surfaces never infer base-install safety from raw errors.
 
+Selected version-JSON and asset-index materialization writes through one retained open temp handle, verifies its exact size and SHA-1 before namespace mutation, and binds that identity before and after publication. Backup-first replacement runs in an owned task that settles publication or exact rollback even if its caller is cancelled; foreign pathname substitutions are never removed, and `Promoted`/`ArtifactVerified` facts appear only after the authenticated identity is published. Portable cleanup retains at most one deterministic live-process backup or rejected-temp obligation per destination instead of unlinking through a raced pathname; an exact already-published source remains reusable, while a different replacement fails closed until stale-owner cleanup after restart.
+
 ### Version and lifecycle pipeline
 ```mermaid
 flowchart TD
