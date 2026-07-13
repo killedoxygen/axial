@@ -31,7 +31,7 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Diagnosis rules | 60 |
 | Registered facts | 121 |
 | Preflight senses | 7 |
-| Adapter sources | 104 |
+| Adapter sources | 103 |
 | Repair hands | 3 |
 
 ### Decision Distribution

@@ -6705,10 +6705,6 @@
         "fact": "artifact_checksum_mismatch"
       },
       {
-        "source": "LauncherManagedArtifactSignatureCorrupt",
-        "fact": "launcher_managed_artifact_signature_corruption"
-      },
-      {
         "source": "AssetIndexMissing",
         "fact": "asset_index_missing"
       },
