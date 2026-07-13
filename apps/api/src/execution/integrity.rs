@@ -24,11 +24,42 @@ use axial_minecraft::known_good::{
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
+#[cfg(any(windows, test))]
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 const MAX_INTEGRITY_TIER0_FACTS: usize = 64;
+#[cfg(any(windows, test))]
+const WINDOWS_TIER0_WORKERS: usize = 4;
+
+#[cfg(any(windows, test))]
+fn tier0_worker_ranges(item_count: usize) -> Vec<Range<usize>> {
+    let worker_count = item_count.min(WINDOWS_TIER0_WORKERS);
+    (0..worker_count)
+        .map(|worker| item_count * worker / worker_count..item_count * (worker + 1) / worker_count)
+        .collect()
+}
+
+#[cfg(any(windows, test))]
+fn order_indexed_results<T>(
+    item_count: usize,
+    results: impl IntoIterator<Item = (usize, T)>,
+) -> Result<Vec<T>, ()> {
+    let mut ordered = std::iter::repeat_with(|| None)
+        .take(item_count)
+        .collect::<Vec<_>>();
+    for (index, result) in results {
+        let Some(slot) = ordered.get_mut(index) else {
+            return Err(());
+        };
+        if slot.replace(result).is_some() {
+            return Err(());
+        }
+    }
+    ordered.into_iter().collect::<Option<Vec<_>>>().ok_or(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MetadataKind {
@@ -141,8 +172,14 @@ fn read_exact_sha1(
 
 trait MetadataReader {
     fn symlink_metadata(&self, path: &KnownGoodPhysicalPath) -> io::Result<MetadataObservation>;
-    fn tier0_metadata(&self, path: &KnownGoodPhysicalPath) -> io::Result<MetadataObservation> {
-        self.symlink_metadata(path)
+    fn tier0_metadata_batch(
+        &self,
+        paths: &[&KnownGoodPhysicalPath],
+    ) -> Vec<io::Result<MetadataObservation>> {
+        paths
+            .iter()
+            .map(|path| self.symlink_metadata(path))
+            .collect()
     }
     fn read_link(&self, path: &KnownGoodPhysicalPath) -> io::Result<PathBuf>;
     fn revalidate(&self) -> io::Result<()> {
@@ -529,9 +566,10 @@ mod confined_fs {
 mod confined_fs {
     use super::{
         ContentHashObservation, ContentHashResult, ContentReadControl, MetadataKind,
-        MetadataObservation, read_exact_sha1_controlled,
+        MetadataObservation, order_indexed_results, read_exact_sha1_controlled,
+        tier0_worker_ranges,
     };
-    use axial_minecraft::known_good::KnownGoodPhysicalPath;
+    use axial_minecraft::known_good::{KnownGoodPhysicalPath, MAX_LAUNCH_TIER0_ENTRIES};
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
     use std::ffi::{OsStr, OsString};
@@ -544,6 +582,7 @@ mod confined_fs {
     use std::path::{Component, Path, PathBuf};
     use std::ptr;
     use std::rc::Rc;
+    use std::thread;
     use std::time::SystemTime;
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
@@ -569,8 +608,22 @@ mod confined_fs {
         blocked: RefCell<HashMap<PathBuf, io::ErrorKind>>,
         roots: RefCell<HashSet<PathBuf>>,
         leaves: RefCell<Vec<HeldLeaf>>,
-        tier0_metadata_handles: RefCell<Vec<Rc<fs::File>>>,
+        tier0_metadata_handles: RefCell<Vec<fs::File>>,
         revalidated_metadata_leaves: RefCell<Vec<HeldRevalidatedMetadataLeaf>>,
+    }
+
+    struct PreparedTier0Leaf {
+        input_index: usize,
+        parent: Rc<fs::File>,
+        name: OsString,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Tier0WorkerLeaf<'a> {
+        batch_index: usize,
+        input_index: usize,
+        parent: &'a fs::File,
+        name: &'a OsStr,
     }
 
     struct HeldLeaf {
@@ -830,18 +883,17 @@ mod confined_fs {
             })
         }
 
-        pub(super) fn tier0_metadata(
-            &self,
-            path: &KnownGoodPhysicalPath,
-        ) -> io::Result<MetadataObservation> {
-            let (parent, leaf) = self.parent(path)?;
-            let file = Rc::new(Self::open_relative_with_access_and_share(
-                parent.as_ref(),
-                &leaf,
+        fn open_and_query_tier0(
+            parent: &fs::File,
+            name: &OsStr,
+        ) -> io::Result<(MetadataObservation, fs::File)> {
+            let file = Self::open_relative_with_access_and_share(
+                parent,
+                name,
                 None,
                 FILE_EXECUTE,
                 FILE_SHARE_READ,
-            )?);
+            )?;
             let mut info = FILE_NETWORK_OPEN_INFORMATION::default();
             let mut status = IO_STATUS_BLOCK::default();
             let result = unsafe {
@@ -859,8 +911,164 @@ mod confined_fs {
             }
             // FILE_EXECUTE engages read-class share enforcement; no read or map call is made.
             // Last-write time is only an availability counter, not integrity authority.
-            self.tier0_metadata_handles.borrow_mut().push(file);
-            Ok(tier0_observation(info))
+            Ok((tier0_observation(info), file))
+        }
+
+        pub(super) fn tier0_metadata_batch(
+            &self,
+            paths: &[&KnownGoodPhysicalPath],
+        ) -> Vec<io::Result<MetadataObservation>> {
+            if paths.len() > MAX_LAUNCH_TIER0_ENTRIES {
+                return paths
+                    .iter()
+                    .map(|_| {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Tier 0 metadata batch exceeds its entry bound",
+                        ))
+                    })
+                    .collect();
+            }
+
+            let mut results = std::iter::repeat_with(|| None)
+                .take(paths.len())
+                .collect::<Vec<_>>();
+            let mut prepared = Vec::with_capacity(paths.len());
+            for (input_index, path) in paths.iter().enumerate() {
+                match self.parent(path) {
+                    Ok((parent, name)) => prepared.push(PreparedTier0Leaf {
+                        input_index,
+                        parent,
+                        name,
+                    }),
+                    Err(error) => results[input_index] = Some(Err(error)),
+                }
+            }
+
+            let worker_jobs = prepared
+                .iter()
+                .enumerate()
+                .map(|(batch_index, prepared)| Tier0WorkerLeaf {
+                    batch_index,
+                    input_index: prepared.input_index,
+                    parent: prepared.parent.as_ref(),
+                    name: prepared.name.as_os_str(),
+                })
+                .collect::<Vec<_>>();
+            let indexed_results = thread::scope(|scope| {
+                let mut indexed_results = Vec::with_capacity(worker_jobs.len());
+                let mut workers = Vec::new();
+                for (worker_index, range) in tier0_worker_ranges(worker_jobs.len())
+                    .into_iter()
+                    .enumerate()
+                {
+                    let worker_range = range.clone();
+                    let jobs = &worker_jobs[range];
+                    match thread::Builder::new()
+                        .name(format!("axial-tier0-open-{worker_index}"))
+                        .spawn_scoped(scope, move || {
+                            jobs.iter()
+                                .map(|job| {
+                                    (
+                                        job.batch_index,
+                                        (
+                                            job.input_index,
+                                            Self::open_and_query_tier0(job.parent, job.name),
+                                        ),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        }) {
+                        Ok(worker) => workers.push((worker_range, worker)),
+                        Err(error) => {
+                            let kind = error.kind();
+                            indexed_results.extend(worker_jobs[worker_range].iter().map(|job| {
+                                (
+                                    job.batch_index,
+                                    (
+                                        job.input_index,
+                                        Err(io::Error::new(
+                                            kind,
+                                            "failed to spawn Tier 0 metadata worker",
+                                        )),
+                                    ),
+                                )
+                            }));
+                        }
+                    }
+                }
+                for (range, worker) in workers {
+                    match worker.join() {
+                        Ok(worker_results) => indexed_results.extend(worker_results),
+                        Err(_) => {
+                            indexed_results.extend(worker_jobs[range].iter().map(|job| {
+                                (
+                                    job.batch_index,
+                                    (
+                                        job.input_index,
+                                        Err(io::Error::other("Tier 0 metadata worker failed")),
+                                    ),
+                                )
+                            }));
+                        }
+                    }
+                }
+                indexed_results
+            });
+
+            match order_indexed_results(worker_jobs.len(), indexed_results) {
+                Ok(ordered) => {
+                    for (input_index, result) in ordered {
+                        results[input_index] = Some(result);
+                    }
+                }
+                Err(()) => {
+                    for prepared in &prepared {
+                        results[prepared.input_index] = Some(Err(io::Error::other(
+                            "Tier 0 metadata worker returned malformed results",
+                        )));
+                    }
+                }
+            }
+
+            let mut retained = self.tier0_metadata_handles.borrow_mut();
+            results
+                .into_iter()
+                .map(|result| {
+                    match result.unwrap_or_else(|| {
+                        Err(io::Error::other("Tier 0 metadata result is missing"))
+                    }) {
+                        Ok((observation, file)) => {
+                            retained.push(file);
+                            Ok(observation)
+                        }
+                        Err(error) => Err(error),
+                    }
+                })
+                .collect()
+        }
+
+        pub(super) fn finish_tier0(&self) {
+            let retained = self.tier0_metadata_handles.take();
+            if retained.is_empty() {
+                return;
+            }
+            let ranges = tier0_worker_ranges(retained.len());
+            let mut retained = retained.into_iter();
+            let mut workers = Vec::with_capacity(ranges.len());
+            for (worker_index, range) in ranges.into_iter().enumerate() {
+                let bucket = retained.by_ref().take(range.len()).collect::<Vec<_>>();
+                if let Ok(worker) = thread::Builder::new()
+                    .name(format!("axial-tier0-close-{worker_index}"))
+                    .spawn(move || drop(bucket))
+                {
+                    workers.push(worker);
+                }
+                // On spawn failure the rejected closure and its bucket are dropped here.
+            }
+            for worker in workers {
+                let _ = worker.join();
+            }
         }
 
         pub(super) fn read_link(&self, _path: &KnownGoodPhysicalPath) -> io::Result<PathBuf> {
@@ -1110,6 +1318,15 @@ mod confined_fs {
             Ok(())
         }
 
+        fn tier0_one(
+            reader: &Reader,
+            path: &KnownGoodPhysicalPath,
+        ) -> io::Result<MetadataObservation> {
+            let mut results = reader.tier0_metadata_batch(&[path]);
+            assert_eq!(results.len(), 1);
+            results.pop().expect("one Tier 0 result")
+        }
+
         #[test]
         fn tier0_metadata_handle_rejects_posix_namespace_replacement() {
             let root = test_root("retained-handle");
@@ -1125,7 +1342,7 @@ mod confined_fs {
             );
 
             let reader = Reader::default();
-            let observation = reader.tier0_metadata(&path).expect("Tier 0 metadata");
+            let observation = tier0_one(&reader, &path).expect("Tier 0 metadata");
             assert_eq!(observation.kind, MetadataKind::File);
             assert_eq!(observation.size, 7);
             assert_eq!(reader.tier0_metadata_handles.borrow().len(), 1);
@@ -1149,7 +1366,24 @@ mod confined_fs {
             assert_eq!(fs::read(&leaf).expect("original contents"), b"1234567");
             reader.revalidate().expect("root currency after rejection");
 
-            drop(reader);
+            reader.finish_tier0();
+            assert!(reader.tier0_metadata_handles.borrow().is_empty());
+            drop(
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&leaf)
+                    .expect("writer after joined close"),
+            );
+            let replacement_handle = fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(&replacement)
+                .expect("replacement handle after close");
+            replace_with_posix_semantics(&replacement_handle, &leaf)
+                .expect("replacement after joined close");
+            drop(replacement_handle);
+            assert_eq!(fs::read(&leaf).expect("replacement contents"), b"7654321");
+
             let _ = fs::remove_dir_all(root);
         }
 
@@ -1206,13 +1440,81 @@ mod confined_fs {
             );
 
             let reader = Reader::default();
-            let error = reader
-                .tier0_metadata(&path)
-                .expect_err("Tier 0 must reject an existing data writer");
+            let error =
+                tier0_one(&reader, &path).expect_err("Tier 0 must reject an existing data writer");
             assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
 
             drop(writer);
             drop(reader);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn tier0_batch_preserves_input_order_and_retains_every_successful_leaf() {
+            let root = test_root("ordered-batch");
+            let first_parent = root.join("libraries/first");
+            let second_parent = root.join("libraries/second");
+            fs::create_dir_all(&first_parent).expect("first parent");
+            fs::create_dir_all(&second_parent).expect("second parent");
+            let mut relative_paths = Vec::new();
+            for index in 0..8 {
+                let parent = if index % 2 == 0 {
+                    &first_parent
+                } else {
+                    &second_parent
+                };
+                let leaf = parent.join(format!("{index}.jar"));
+                fs::write(&leaf, vec![b'x'; index + 1]).expect("fixture leaf");
+                relative_paths.push(PathBuf::from(format!(
+                    "libraries/{}/{index}.jar",
+                    if index % 2 == 0 { "first" } else { "second" }
+                )));
+            }
+            relative_paths.reverse();
+            let paths = relative_paths
+                .iter()
+                .cloned()
+                .map(|relative| KnownGoodPhysicalPath::for_test(root.clone(), relative))
+                .collect::<Vec<_>>();
+            let path_refs = paths.iter().collect::<Vec<_>>();
+
+            let reader = Reader::default();
+            let results = reader.tier0_metadata_batch(&path_refs);
+
+            assert_eq!(results.len(), paths.len());
+            for (result, path) in results.into_iter().zip(&paths) {
+                let observation = result.expect("batch observation");
+                let index = path
+                    .relative()
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .expect("fixture index");
+                assert_eq!(observation.kind, MetadataKind::File);
+                assert_eq!(observation.size, (index + 1) as u64);
+            }
+            assert_eq!(reader.tier0_metadata_handles.borrow().len(), paths.len());
+            for path in &paths {
+                assert!(
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(path.root().join(path.relative()))
+                        .is_err(),
+                    "every retained leaf must reject writers"
+                );
+            }
+
+            reader.finish_tier0();
+            assert!(reader.tier0_metadata_handles.borrow().is_empty());
+            for path in &paths {
+                drop(
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(path.root().join(path.relative()))
+                        .expect("writer after joined close"),
+                );
+            }
+
             let _ = fs::remove_dir_all(root);
         }
 
@@ -1249,11 +1551,12 @@ impl MetadataReader for FilesystemIntegrityReader {
         ))
     }
 
-    fn tier0_metadata(&self, path: &KnownGoodPhysicalPath) -> io::Result<MetadataObservation> {
-        #[cfg(windows)]
-        return self.inner.tier0_metadata(path);
-        #[cfg(not(windows))]
-        self.symlink_metadata(path)
+    #[cfg(windows)]
+    fn tier0_metadata_batch(
+        &self,
+        paths: &[&KnownGoodPhysicalPath],
+    ) -> Vec<io::Result<MetadataObservation>> {
+        self.inner.tier0_metadata_batch(paths)
     }
 
     fn read_link(&self, path: &KnownGoodPhysicalPath) -> io::Result<PathBuf> {
@@ -1274,6 +1577,13 @@ impl MetadataReader for FilesystemIntegrityReader {
             io::ErrorKind::Unsupported,
             "race-resistant known-good revalidation is unavailable on this platform",
         ))
+    }
+}
+
+impl FilesystemIntegrityReader {
+    fn finish_tier0(&self) {
+        #[cfg(windows)]
+        self.inner.finish_tier0();
     }
 }
 
@@ -1346,10 +1656,11 @@ pub(crate) fn sense_integrity_tier0(
         state.mint_known_good_verification_lease(foreground, lifecycle, expected_library_root)?;
     let reader = FilesystemIntegrityReader::default();
     let report = sense_integrity_tier0_with(&lease, runtime_selection, &reader);
-    if !state.known_good_verification_lease_is_current(&lease) {
+    let lease_is_current = state.known_good_verification_lease_is_current(&lease);
+    reader.finish_tier0();
+    if !lease_is_current {
         return Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable);
     }
-    drop(reader);
     Ok(report)
 }
 
@@ -1374,36 +1685,60 @@ fn sense_integrity_tier0_with(
     };
     report.selected_entry_count = projection.len();
     report.skipped_bulk_entry_count = inventory.entries().len() - projection.len();
+    let jobs = projection
+        .into_iter()
+        .map(|(ordinal, entry)| {
+            (
+                ordinal,
+                entry,
+                known_good_entry_path(library_root, managed_runtime_cache, entry),
+            )
+        })
+        .collect::<Vec<_>>();
+    report.metadata_lookup_count = jobs.len();
+    let paths = jobs.iter().map(|(_, _, path)| path).collect::<Vec<_>>();
+    let observations = reader.tier0_metadata_batch(&paths);
     let mut sensed_facts = Vec::new();
-    for (ordinal, entry) in projection {
-        report.metadata_lookup_count += 1;
-        let path = known_good_entry_path(library_root, managed_runtime_cache, entry);
-        let fact = match reader.tier0_metadata(&path) {
-            Ok(observation) => {
-                report.mtime_observation_count += usize::from(observation.modified.is_some());
-                inspect_observation(reader, entry, &path, ordinal, observation, &mut report)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Some(integrity_fact(
+    if observations.len() != jobs.len() {
+        sensed_facts.extend(jobs.iter().map(|(ordinal, entry, _)| {
+            integrity_fact(
                 entry,
-                ordinal,
-                ExecutionFactKind::ArtifactMissing,
-                "missing",
-            )),
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Some(integrity_fact(
-                entry,
-                ordinal,
-                ExecutionFactKind::FilePermissionDenied,
-                "metadata_permission_denied",
-            )),
-            Err(_) => Some(integrity_fact(
-                entry,
-                ordinal,
+                *ordinal,
                 ExecutionFactKind::PrimitiveRefused,
                 "metadata_unavailable",
-            )),
-        };
-        if let Some(fact) = fact {
-            sensed_facts.push(fact);
+            )
+        }));
+    } else {
+        for ((ordinal, entry, path), observation) in jobs.iter().zip(observations) {
+            let fact = match observation {
+                Ok(observation) => {
+                    report.mtime_observation_count += usize::from(observation.modified.is_some());
+                    inspect_observation(reader, entry, path, *ordinal, observation, &mut report)
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Some(integrity_fact(
+                    entry,
+                    *ordinal,
+                    ExecutionFactKind::ArtifactMissing,
+                    "missing",
+                )),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    Some(integrity_fact(
+                        entry,
+                        *ordinal,
+                        ExecutionFactKind::FilePermissionDenied,
+                        "metadata_permission_denied",
+                    ))
+                }
+                Err(_) => Some(integrity_fact(
+                    entry,
+                    *ordinal,
+                    ExecutionFactKind::PrimitiveRefused,
+                    "metadata_unavailable",
+                )),
+            };
+            if let Some(fact) = fact {
+                sensed_facts.push(fact);
+            }
         }
     }
     if reader.revalidate().is_err() {
@@ -2677,6 +3012,34 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn tier0_worker_ranges_are_balanced_bounded_and_exact() {
+        for item_count in [0, 1, 3, 4, 5, 511, 512] {
+            let ranges = tier0_worker_ranges(item_count);
+            assert!(ranges.len() <= WINDOWS_TIER0_WORKERS);
+            let covered = ranges
+                .iter()
+                .flat_map(|range| range.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(covered, (0..item_count).collect::<Vec<_>>());
+            let lengths = ranges.iter().map(Range::len).collect::<Vec<_>>();
+            if let (Some(minimum), Some(maximum)) = (lengths.iter().min(), lengths.iter().max()) {
+                assert!(maximum - minimum <= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_tier0_results_restore_order_and_refuse_bad_cardinality() {
+        assert_eq!(
+            order_indexed_results(5, [(4, 'e'), (2, 'c'), (0, 'a'), (3, 'd'), (1, 'b')]),
+            Ok(vec!['a', 'b', 'c', 'd', 'e'])
+        );
+        assert_eq!(order_indexed_results(2, [(0, 'a')]), Err(()));
+        assert_eq!(order_indexed_results(2, [(0, 'a'), (0, 'b')]), Err(()));
+        assert_eq!(order_indexed_results(2, [(0, 'a'), (2, 'c')]), Err(()));
+    }
 
     fn tier2_cancellation() -> IdleSweepCancellation {
         IdleSweepCancellation::new_for_test()
