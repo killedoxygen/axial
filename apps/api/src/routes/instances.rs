@@ -332,8 +332,9 @@ async fn handle_delete_instance(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    instances::handle_delete_instance(&state, &id, query)
+    instances::handle_delete_instance_owned(&state, &id, query, handoff)
         .await
         .map(Json)
 }

@@ -11,10 +11,12 @@ use axial_minecraft::known_good::{
     MAX_KNOWN_GOOD_RELATIVE_PATH_BYTES,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock};
@@ -22,6 +24,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock};
 const KNOWN_GOOD_SCHEMA: &str = "axial.state.known_good_inventory.v4";
 const KNOWN_GOOD_DIR: &str = "known-good";
 const MAX_KNOWN_GOOD_SNAPSHOT_BYTES: u64 = 256 << 20;
+const MAX_KNOWN_GOOD_CLEANUP_OBLIGATIONS: usize = 4_096;
 const STORE_LOCK_INVARIANT: &str =
     "known-good inventory store lock poisoned; cache settlement may be inconsistent";
 
@@ -90,6 +93,43 @@ struct PendingSnapshot {
 struct StoreState {
     writers: HashMap<String, AtomicSnapshotWriter>,
     pending: HashMap<String, PendingSnapshot>,
+}
+
+#[derive(Default)]
+struct CleanupState {
+    reserved: BTreeSet<String>,
+    committed: BTreeSet<String>,
+}
+
+pub(super) struct KnownGoodRetirementReservation {
+    store: Arc<KnownGoodInventoryStore>,
+    instance_id: String,
+    armed: bool,
+}
+
+impl KnownGoodRetirementReservation {
+    pub(super) async fn commit(mut self) -> io::Result<()> {
+        {
+            let mut cleanup = self.store.cleanup.lock().expect(STORE_LOCK_INVARIANT);
+            cleanup.reserved.remove(&self.instance_id);
+            cleanup.committed.insert(self.instance_id.clone());
+        }
+        self.armed = false;
+        self.store.retry_retirement(&self.instance_id).await
+    }
+}
+
+impl Drop for KnownGoodRetirementReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.store
+                .cleanup
+                .lock()
+                .expect(STORE_LOCK_INVARIANT)
+                .reserved
+                .remove(&self.instance_id);
+        }
+    }
 }
 
 struct ActiveInventory<T> {
@@ -211,11 +251,14 @@ pub(super) struct KnownGoodInventoryStore {
     root: PathBuf,
     owner: PersistenceOwnerLease,
     state: Arc<Mutex<StoreState>>,
+    cleanup: Arc<Mutex<CleanupState>>,
     active: Mutex<ActiveInventories<KnownGoodInventory>>,
     gates: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     lifecycle: Arc<AsyncRwLock<()>>,
     close_gate: AsyncMutex<()>,
     phase: Arc<AtomicU8>,
+    #[cfg(test)]
+    retirement_delete_failures: AtomicUsize,
 }
 
 impl KnownGoodInventoryStore {
@@ -242,11 +285,14 @@ impl KnownGoodInventoryStore {
             root,
             owner,
             state: Arc::new(Mutex::new(StoreState::default())),
+            cleanup: Arc::new(Mutex::new(CleanupState::default())),
             active: Mutex::new(ActiveInventories::default()),
             gates: Mutex::new(HashMap::new()),
             lifecycle: Arc::new(AsyncRwLock::new(())),
             close_gate: AsyncMutex::new(()),
             phase: Arc::new(AtomicU8::new(StorePhase::Running as u8)),
+            #[cfg(test)]
+            retirement_delete_failures: AtomicUsize::new(0),
         })
     }
 
@@ -343,10 +389,81 @@ impl KnownGoodInventoryStore {
             });
     }
 
-    pub(super) async fn retire(&self, instance_id: &str) -> io::Result<()> {
+    pub(super) fn reserve_retirement(
+        self: &Arc<Self>,
+        instance_id: &str,
+    ) -> io::Result<KnownGoodRetirementReservation> {
         if !is_canonical_instance_id(instance_id) {
             return Err(invalid_snapshot("invalid known-good instance identity"));
         }
+        if self.phase() != StorePhase::Running {
+            return Err(closed_error());
+        }
+        let mut cleanup = self.cleanup.lock().expect(STORE_LOCK_INVARIANT);
+        if cleanup.reserved.contains(instance_id) || cleanup.committed.contains(instance_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "known-good retirement already has an owner",
+            ));
+        }
+        if cleanup.reserved.len() + cleanup.committed.len() >= MAX_KNOWN_GOOD_CLEANUP_OBLIGATIONS {
+            return Err(invalid_snapshot(
+                "known-good cleanup obligation capacity is exhausted",
+            ));
+        }
+        cleanup.reserved.insert(instance_id.to_string());
+        drop(cleanup);
+        Ok(KnownGoodRetirementReservation {
+            store: self.clone(),
+            instance_id: instance_id.to_string(),
+            armed: true,
+        })
+    }
+
+    pub(super) fn discover_absent_snapshot_obligations(
+        &self,
+        registered_instances: impl IntoIterator<Item = String>,
+    ) -> io::Result<()> {
+        let registered = registered_instances.into_iter().collect::<BTreeSet<_>>();
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let mut absent = BTreeSet::new();
+        for (index, entry) in entries.enumerate() {
+            if index >= MAX_KNOWN_GOOD_CLEANUP_OBLIGATIONS {
+                return Err(invalid_snapshot(
+                    "known-good cleanup obligation capacity is exhausted",
+                ));
+            }
+            let entry = entry?;
+            let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Some(instance_id) = file_name.strip_suffix(".json") else {
+                continue;
+            };
+            if is_canonical_instance_id(instance_id) && !registered.contains(instance_id) {
+                absent.insert(instance_id.to_string());
+            }
+        }
+        let mut cleanup = self.cleanup.lock().expect(STORE_LOCK_INVARIANT);
+        absent.retain(|instance_id| {
+            !cleanup.reserved.contains(instance_id) && !cleanup.committed.contains(instance_id)
+        });
+        if cleanup.reserved.len() + cleanup.committed.len() + absent.len()
+            > MAX_KNOWN_GOOD_CLEANUP_OBLIGATIONS
+        {
+            return Err(invalid_snapshot(
+                "known-good cleanup obligation capacity is exhausted",
+            ));
+        }
+        cleanup.committed.extend(absent);
+        Ok(())
+    }
+
+    async fn retry_retirement(&self, instance_id: &str) -> io::Result<()> {
         let _lifecycle = self.lifecycle.clone().read_owned().await;
         if self.phase() != StorePhase::Running {
             return Err(closed_error());
@@ -378,13 +495,68 @@ impl KnownGoodInventoryStore {
 
         let path = self.snapshot_path(instance_id);
         let target = known_good_target(instance_id);
+        #[cfg(test)]
+        if self
+            .retirement_delete_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |failures| {
+                (failures > 0).then(|| failures - 1)
+            })
+            .is_ok()
+        {
+            return Err(io::Error::other(
+                "injected known-good retirement delete failure",
+            ));
+        }
         tokio::task::spawn_blocking(move || {
             delete_launcher_managed_file(DeleteFileRequest::new(target, &path))
                 .map(|_| ())
                 .map_err(io::Error::from)
         })
         .await
-        .map_err(|_| io::Error::other("known-good retirement owner stopped"))?
+        .map_err(|_| io::Error::other("known-good retirement owner stopped"))??;
+        self.cleanup
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .committed
+            .remove(instance_id);
+        Ok(())
+    }
+
+    pub(super) async fn retry_retirements(&self) -> io::Result<()> {
+        let instance_ids = self
+            .cleanup
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .committed
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for instance_id in instance_ids {
+            if let Err(error) = self.retry_retirement(&instance_id).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    #[cfg(test)]
+    fn fail_retirement_deletes(&self, failures: usize) {
+        self.retirement_delete_failures
+            .store(failures, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn pending_retirement_ids(&self) -> Vec<String> {
+        self.cleanup
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .committed
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub(super) async fn close(&self) -> io::Result<()> {
@@ -392,6 +564,7 @@ impl KnownGoodInventoryStore {
         if self.phase() == StorePhase::Closed {
             return Ok(());
         }
+        self.retry_retirements().await?;
         let _lifecycle = self.lifecycle.write().await;
         self.phase
             .store(StorePhase::Closing as u8, Ordering::Release);
@@ -1558,7 +1731,7 @@ mod tests {
     async fn retirement_settles_pending_work_and_deletes_only_the_exact_snapshot() {
         let (root, paths) = paths("retire");
         let backend = FileBackend::new(1);
-        let store = store(&paths, backend.clone());
+        let store = Arc::new(store(&paths, backend.clone()));
         let current = snapshot("0000000000000005", "1.21.5");
         let path = store.snapshot_path(&current.instance_id);
         let sibling = store.snapshot_path("0000000000000006");
@@ -1571,7 +1744,9 @@ mod tests {
         assert!(store.flush_for_test().await.is_err());
         wait_for_failed_pending(&store, &current.instance_id).await;
         store
-            .retire(&current.instance_id)
+            .reserve_retirement(&current.instance_id)
+            .expect("reserve exact retirement")
+            .commit()
             .await
             .expect("settle and retire exact snapshot");
 
@@ -1583,6 +1758,160 @@ mod tests {
         assert!(!state.writers.contains_key(&current.instance_id));
         drop(state);
         drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn committed_retirement_delete_failure_is_retained_and_retried_on_close() {
+        let (root, paths) = paths("retirement-delete-retry");
+        let backend = FileBackend::new(0);
+        let store = Arc::new(store(&paths, backend));
+        let instance_id = "0000000000000041";
+        fs::create_dir_all(&store.root).expect("known-good directory");
+        let path = store.snapshot_path(instance_id);
+        fs::write(
+            &path,
+            encode_snapshot(snapshot(instance_id, "1.21.5")).expect("snapshot"),
+        )
+        .expect("seed snapshot");
+        store.fail_retirement_deletes(1);
+
+        let retirement = store
+            .reserve_retirement(instance_id)
+            .expect("reserve retirement");
+        retirement
+            .commit()
+            .await
+            .expect_err("first delete must fail");
+        assert_eq!(
+            store.pending_retirement_ids(),
+            vec![instance_id.to_string()]
+        );
+        assert!(path.is_file());
+
+        store.close().await.expect("close retries retirement");
+        assert!(store.pending_retirement_ids().is_empty());
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn uncommitted_retirement_reservation_leaves_known_good_untouched() {
+        let (root, paths) = paths("retirement-reservation-compensation");
+        let backend = FileBackend::new(0);
+        let store = Arc::new(store(&paths, backend));
+        let instance_id = "0000000000000040";
+        fs::create_dir_all(&store.root).expect("known-good directory");
+        let path = store.snapshot_path(instance_id);
+        fs::write(
+            &path,
+            encode_snapshot(snapshot(instance_id, "1.21.5")).expect("snapshot"),
+        )
+        .expect("seed snapshot");
+
+        let retirement = store
+            .reserve_retirement(instance_id)
+            .expect("reserve retirement");
+        drop(retirement);
+
+        assert!(store.pending_retirement_ids().is_empty());
+        assert!(path.is_file());
+        store.close().await.expect("close untouched store");
+        assert!(path.is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn duplicate_retirement_reservation_cannot_disarm_the_exact_owner() {
+        let (root, paths) = paths("retirement-reservation-owner");
+        let store = Arc::new(store(&paths, FileBackend::new(0)));
+        let instance_id = "0000000000000041";
+
+        let retirement = store
+            .reserve_retirement(instance_id)
+            .expect("reserve exact retirement");
+        let error = store
+            .reserve_retirement(instance_id)
+            .err()
+            .expect("duplicate reservation must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            store.cleanup.lock().expect(STORE_LOCK_INVARIANT).reserved,
+            BTreeSet::from([instance_id.to_string()])
+        );
+
+        drop(retirement);
+        assert!(store.pending_retirement_ids().is_empty());
+        drop(
+            store
+                .reserve_retirement(instance_id)
+                .expect("released retirement can be reserved again"),
+        );
+        store.close().await.expect("close retirement store");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn committed_retirement_writer_failure_retains_exact_cleanup_obligation() {
+        let (root, paths) = paths("retirement-writer-retry");
+        let backend = FileBackend::new(2);
+        let store = Arc::new(store(&paths, backend));
+        let instance_id = "0000000000000042";
+        store
+            .reconcile_snapshot(snapshot(instance_id, "1.21.5"))
+            .await
+            .expect("accept pending snapshot");
+        wait_for_failed_pending(&store, instance_id).await;
+
+        let retirement = store
+            .reserve_retirement(instance_id)
+            .expect("reserve retirement");
+        retirement
+            .commit()
+            .await
+            .expect_err("settlement retry must fail");
+        assert_eq!(
+            store.pending_retirement_ids(),
+            vec![instance_id.to_string()]
+        );
+
+        store
+            .close()
+            .await
+            .expect("close retries writer and cleanup");
+        assert!(store.pending_retirement_ids().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn restart_discovers_only_absent_instance_snapshot_cleanup() {
+        let (root, paths) = paths("restart-retirement-discovery");
+        let backend = FileBackend::new(0);
+        let store = Arc::new(store(&paths, backend));
+        let absent = "0000000000000043";
+        let registered = "0000000000000044";
+        fs::create_dir_all(&store.root).expect("known-good directory");
+        let absent_path = store.snapshot_path(absent);
+        let registered_path = store.snapshot_path(registered);
+        fs::write(
+            &absent_path,
+            encode_snapshot(snapshot(absent, "1.21.5")).expect("absent snapshot"),
+        )
+        .expect("seed absent snapshot");
+        fs::write(
+            &registered_path,
+            encode_snapshot(snapshot(registered, "1.21.5")).expect("registered snapshot"),
+        )
+        .expect("seed registered snapshot");
+
+        store
+            .discover_absent_snapshot_obligations([registered.to_string()])
+            .expect("discover absent snapshot");
+        assert_eq!(store.pending_retirement_ids(), vec![absent.to_string()]);
+
+        store.close().await.expect("close discovered cleanup");
+        assert!(!absent_path.exists());
+        assert!(registered_path.is_file());
         let _ = fs::remove_dir_all(root);
     }
 

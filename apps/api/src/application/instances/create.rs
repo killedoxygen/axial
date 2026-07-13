@@ -460,6 +460,7 @@ pub(crate) async fn handle_create_instance_owned(
         &created_instance_id,
         install_request,
         handoff,
+        &producer,
     )
     .await?;
     let enriched = enrich_instance_for_scan(
@@ -787,11 +788,14 @@ pub(super) async fn queue_create_install_or_rollback_owned(
     instance_id: &str,
     request: Option<InstallQueueRequest>,
     handoff: RequestProducerHandoff,
+    producer: &ProducerLease,
 ) -> Result<Option<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
     match queue_create_install_request(state, request, handoff).await {
         Ok(install_queue) => Ok(install_queue),
         Err(error) => {
-            if let Err(rollback_error) = rollback_created_instance(state, instance_id).await {
+            if let Err(rollback_error) =
+                rollback_created_instance(state, instance_id, producer.claim_child()).await
+            {
                 error!(
                     failure_class = instance_store_error_class(&rollback_error),
                     "create compensation rollback persistence failed"
@@ -826,8 +830,9 @@ pub(super) async fn queue_create_install_or_rollback(
     let admitted = state
         .try_admit_request()
         .expect("admit test create request");
-    queue_create_install_or_rollback_owned(state, instance_id, request, admitted.producer_handoff())
-        .await
+    let handoff = admitted.producer_handoff();
+    let producer = handoff.try_claim().expect("claim test create producer");
+    queue_create_install_or_rollback_owned(state, instance_id, request, handoff, &producer).await
 }
 
 fn version_is_launch_ready_or_user_blocked(
@@ -868,8 +873,11 @@ fn create_shutdown_error_response(
 async fn rollback_created_instance(
     state: &AppState,
     instance_id: &str,
+    producer: ProducerLease,
 ) -> Result<(), InstanceStoreError> {
-    state.delete_instance(instance_id.to_string(), true).await
+    state
+        .delete_instance(instance_id.to_string(), true, producer)
+        .await
 }
 
 fn instance_store_error_class(error: &InstanceStoreError) -> &'static str {

@@ -188,7 +188,7 @@ impl AppState {
             AuthLoginStore::load_from_secure_store(),
             RemoteFlagStore::load_from_config_dir(remote_flags_config_dir),
         );
-        tokio::task::spawn_blocking(move || {
+        let state = tokio::task::spawn_blocking(move || {
             Self::new_with_telemetry_inner(
                 init,
                 config,
@@ -198,7 +198,11 @@ impl AppState {
             )
         })
         .await
-        .map_err(|_| std::io::Error::other("persisted state startup task stopped"))?
+        .map_err(|_| std::io::Error::other("persisted state startup task stopped"))??;
+        if state.known_good.retry_retirements().await.is_err() {
+            tracing::warn!("known-good restart cleanup remains pending");
+        }
+        Ok(state)
     }
 
     #[cfg(test)]
@@ -255,6 +259,7 @@ impl AppState {
         auth_logins: Arc<AuthLoginStore>,
         remote_flags: Arc<RemoteFlagStore>,
     ) -> std::io::Result<Self> {
+        let instance_registry_authoritative = init.instances.mutation_allowed();
         let instances = Arc::new(AppInstanceStore::claim(&init.instances).unwrap_or_else(
             |error| panic!("failed to initialize instance registry persistence: {error}"),
         ));
@@ -295,6 +300,11 @@ impl AppState {
         let failure_memory = Arc::new(GuardianFailureMemoryStore::load_from_paths(config.paths()));
         let journals = Arc::new(OperationJournalStore::load_from_paths(config.paths()));
         let known_good = Arc::new(known_good::KnownGoodInventoryStore::claim(config.paths())?);
+        if instance_registry_authoritative {
+            known_good.discover_absent_snapshot_obligations(
+                instances.list().into_iter().map(|instance| instance.id),
+            )?;
+        }
         let (config_changes, _) = broadcast::channel(32);
 
         Ok(Self {
@@ -715,6 +725,25 @@ impl AppState {
         &self,
         instance_id: String,
         delete_files: bool,
+        owner: ProducerLease,
+    ) -> Result<(), InstanceStoreError> {
+        let state = self.clone();
+        owner
+            .spawn_joinable(
+                async move { state.delete_instance_owned(instance_id, delete_files).await },
+            )
+            .await
+            .map_err(|_| {
+                InstanceStoreError::Persistence(std::io::Error::other(
+                    "instance deletion owner stopped before reporting completion",
+                ))
+            })?
+    }
+
+    async fn delete_instance_owned(
+        &self,
+        instance_id: String,
+        delete_files: bool,
     ) -> Result<(), InstanceStoreError> {
         if self.sessions.has_active_instance(&instance_id).await {
             return Err(InstanceStoreError::Persistence(std::io::Error::new(
@@ -739,33 +768,35 @@ impl AppState {
             .map_err(|error| {
                 InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
             })?;
-        self.known_good
-            .retire(&instance_id)
-            .await
+        let known_good_retirement = self
+            .known_good
+            .reserve_retirement(&instance_id)
             .map_err(InstanceStoreError::Persistence)?;
         let instances = self.instances.clone();
-        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let _lifecycle = lifecycle;
-            let retained_instance_id = instance_id.clone();
-            let result = match instances.acquire_mutation().await {
-                Ok(gate) => {
-                    instances
-                        .delete_with_gate(instance_id, delete_files, gate)
-                        .await
-                }
-                Err(error) => Err(error),
-            };
-            if result.is_ok() || instances.get(&retained_instance_id).is_none() {
-                retirement.commit();
+        let _lifecycle = lifecycle;
+        let retained_instance_id = instance_id.clone();
+        let result = match instances.acquire_mutation().await {
+            Ok(gate) => {
+                instances
+                    .delete_with_gate(instance_id, delete_files, gate)
+                    .await
             }
-            let _ = completed_tx.send(result);
-        });
-        completed_rx.await.map_err(|_| {
-            InstanceStoreError::Persistence(std::io::Error::other(
-                "instance deletion owner stopped before reporting completion",
-            ))
-        })?
+            Err(error) => Err(error),
+        };
+        if instances.get(&retained_instance_id).is_none() {
+            retirement.commit();
+            if known_good_retirement.commit().await.is_err() {
+                tracing::warn!(
+                    instance_id = retained_instance_id,
+                    "known-good retirement cleanup was retained for retry"
+                );
+            }
+        } else if result.is_ok() {
+            return Err(InstanceStoreError::Persistence(std::io::Error::other(
+                "instance registry reported successful deletion without removing the instance",
+            )));
+        }
+        result
     }
 
     pub(crate) async fn acquire_instance_lifecycle(

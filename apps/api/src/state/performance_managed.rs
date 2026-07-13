@@ -21,7 +21,7 @@ struct ManagedInstanceEntry {
 
 pub(super) struct ManagedCompositionOwner {
     authority: ManagedCompositionAuthority,
-    entries: Mutex<HashMap<String, Arc<ManagedInstanceEntry>>>,
+    entries: Arc<Mutex<HashMap<String, Arc<ManagedInstanceEntry>>>>,
     lifecycle: Arc<AsyncRwLock<()>>,
     instance_lifecycle: super::instance_lifecycle::InstanceLifecycleGates,
     close_gate: Arc<AsyncMutex<()>>,
@@ -52,6 +52,7 @@ pub(crate) struct ManagedCompositionAdmission {
 }
 
 pub(crate) struct ManagedCompositionRetirement {
+    entries: Arc<Mutex<HashMap<String, Arc<ManagedInstanceEntry>>>>,
     entry: Arc<ManagedInstanceEntry>,
     _lifecycle: OwnedRwLockReadGuard<()>,
     _gate: OwnedMutexGuard<()>,
@@ -61,6 +62,14 @@ pub(crate) struct ManagedCompositionRetirement {
 impl ManagedCompositionRetirement {
     pub(crate) fn commit(mut self) {
         self.committed = true;
+        let instance_id = self.entry.identity.instance_id();
+        let mut entries = self.entries.lock().expect(MANAGED_OWNER_LOCK_INVARIANT);
+        if entries
+            .get(instance_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.entry))
+        {
+            entries.remove(instance_id);
+        }
     }
 }
 
@@ -144,7 +153,7 @@ impl ManagedCompositionOwner {
     ) -> Self {
         Self {
             authority,
-            entries: Mutex::new(HashMap::new()),
+            entries: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: Arc::new(AsyncRwLock::new(())),
             instance_lifecycle,
             close_gate: Arc::new(AsyncMutex::new(())),
@@ -207,13 +216,22 @@ impl ManagedCompositionOwner {
         match entry.phase() {
             ManagedEntryPhase::Open => entry.store_phase(ManagedEntryPhase::Retired),
             ManagedEntryPhase::Latched => {
-                return Err(ManagedCompositionAdmissionError::RecoveryFailed);
+                if self
+                    .authority
+                    .recover_and_inspect(&entry.identity)
+                    .await
+                    .is_err()
+                {
+                    return Err(ManagedCompositionAdmissionError::RecoveryFailed);
+                }
+                entry.store_phase(ManagedEntryPhase::Retired);
             }
             ManagedEntryPhase::Retired => {
                 return Err(ManagedCompositionAdmissionError::Retired);
             }
         }
         Ok(ManagedCompositionRetirement {
+            entries: self.entries.clone(),
             entry,
             _lifecycle: lifecycle,
             _gate: gate,
@@ -562,7 +580,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retirement_rolls_back_uncommitted_and_preserves_committed_tombstone() {
+    async fn retirement_rolls_back_uncommitted_and_removes_committed_entry() {
         let uncommitted = OwnerFixture::new("retirement-rollback");
         let retirement = uncommitted
             .owner
@@ -583,14 +601,97 @@ mod tests {
             .await
             .expect("retire instance")
             .commit();
+        assert!(
+            committed
+                .owner
+                .entries
+                .lock()
+                .expect(super::MANAGED_OWNER_LOCK_INVARIANT)
+                .is_empty()
+        );
+        committed
+            .admit(INSTANCE_A)
+            .await
+            .expect("a recreated identity gets a fresh owner entry");
+    }
+
+    #[tokio::test]
+    async fn committed_retirement_does_not_remove_a_stale_replacement_entry() {
+        let fixture = OwnerFixture::new("retirement-stale-owner");
+        let retirement = fixture
+            .owner
+            .retire(INSTANCE_A)
+            .await
+            .expect("retire original entry");
+        let original = retirement.entry.clone();
+        fixture
+            .owner
+            .entries
+            .lock()
+            .expect(super::MANAGED_OWNER_LOCK_INVARIANT)
+            .remove(INSTANCE_A);
+        let replacement = fixture.owner.entry(INSTANCE_A).expect("replacement entry");
+        assert!(!Arc::ptr_eq(&original, &replacement));
+
+        retirement.commit();
+
+        let retained = fixture
+            .owner
+            .entries
+            .lock()
+            .expect(super::MANAGED_OWNER_LOCK_INVARIANT)
+            .get(INSTANCE_A)
+            .cloned()
+            .expect("stale commit must retain replacement");
+        assert!(Arc::ptr_eq(&retained, &replacement));
+        assert_eq!(retained.phase(), ManagedEntryPhase::Open);
+    }
+
+    #[tokio::test]
+    async fn duplicate_retirement_owner_cannot_retain_or_remove_an_entry() {
+        let fixture = OwnerFixture::new("retirement-duplicate-owner");
+        let retirement = fixture
+            .owner
+            .retire(INSTANCE_A)
+            .await
+            .expect("retire exact entry");
+        let mut duplicate = Box::pin(fixture.owner.retire(INSTANCE_A));
+        assert!(matches!(poll_once(duplicate.as_mut()), Poll::Pending));
+
+        retirement.commit();
         assert!(matches!(
-            committed.admit(INSTANCE_A).await,
+            duplicate.await,
             Err(ManagedCompositionAdmissionError::Retired)
         ));
-        assert!(matches!(
-            committed.owner.retire(INSTANCE_A).await,
-            Err(ManagedCompositionAdmissionError::Retired)
-        ));
+        assert!(
+            fixture
+                .owner
+                .entries
+                .lock()
+                .expect(super::MANAGED_OWNER_LOCK_INVARIANT)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_retirement_churn_keeps_the_owner_map_bounded() {
+        let fixture = OwnerFixture::new("retirement-churn");
+        for _ in 0..512 {
+            fixture
+                .owner
+                .retire(INSTANCE_A)
+                .await
+                .expect("reserve churn retirement")
+                .commit();
+            assert!(
+                fixture
+                    .owner
+                    .entries
+                    .lock()
+                    .expect(super::MANAGED_OWNER_LOCK_INVARIANT)
+                    .is_empty()
+            );
+        }
     }
 
     #[tokio::test]

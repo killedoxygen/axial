@@ -2782,6 +2782,325 @@ async fn delete_waits_for_launch_admission_and_rejects_newly_queued_session() {
     assert!(fixture.state.instances().game_dir(&instance.id).is_dir());
 }
 
+#[tokio::test]
+async fn cancelled_delete_caller_cannot_cancel_lifecycle_waiting_owner() {
+    let fixture = TestFixture::new("delete-cancel-lifecycle");
+    let instance = add_test_instance(&fixture, "Cancel lifecycle", "1.21.1");
+    let known_good = fixture
+        .root
+        .join("config/state/known-good")
+        .join(format!("{}.json", instance.id));
+    fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
+    fs::write(&known_good, "known-good").expect("known-good snapshot");
+    let lifecycle = fixture.state.acquire_instance_lifecycle(&instance.id).await;
+    let state = fixture.state.clone();
+    let instance_id = instance.id.clone();
+    let mut delete =
+        Box::pin(state.delete_instance(instance_id.clone(), false, fixture.producer.claim_child()));
+    {
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(delete.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+    }
+    drop(delete);
+    drop(lifecycle);
+
+    wait_for_instance_absence(&fixture.state, &instance_id).await;
+    assert!(!known_good.exists());
+}
+
+#[tokio::test]
+async fn cancelled_delete_caller_cannot_cancel_registry_waiting_owner() {
+    let fixture = TestFixture::new("delete-cancel-registry");
+    let instance = add_test_instance(&fixture, "Cancel registry", "1.21.1");
+    let registry = fixture
+        .state
+        .instances()
+        .acquire_mutation()
+        .await
+        .expect("hold registry mutation");
+    let state = fixture.state.clone();
+    let instance_id = instance.id.clone();
+    let mut delete =
+        Box::pin(state.delete_instance(instance_id.clone(), false, fixture.producer.claim_child()));
+    {
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(delete.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    drop(delete);
+    drop(registry);
+
+    wait_for_instance_absence(&fixture.state, &instance_id).await;
+}
+
+#[tokio::test]
+async fn successful_registry_delete_without_absence_compensates_retirements() {
+    let fixture = TestFixture::new("delete-postcondition");
+    let instance = add_test_instance(&fixture, "Delete postcondition", "1.21.1");
+    let known_good = fixture
+        .root
+        .join("config/state/known-good")
+        .join(format!("{}.json", instance.id));
+    fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
+    fs::write(&known_good, "known-good").expect("known-good snapshot");
+    drop(
+        fixture
+            .state
+            .admit_managed_instance(&instance.id, false)
+            .await
+            .expect("create managed authority before deletion"),
+    );
+    fixture
+        .state
+        .instances()
+        .succeed_next_delete_without_removal();
+
+    let error = fixture
+        .state
+        .delete_instance(instance.id.clone(), false, fixture.producer.claim_child())
+        .await
+        .expect_err("registry presence must fail the deletion postcondition");
+    let InstanceStoreError::Persistence(error) = error else {
+        panic!("postcondition failure must be a persistence error");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert!(
+        error
+            .to_string()
+            .contains("successful deletion without removing the instance")
+    );
+    assert!(fixture.state.instances().get(&instance.id).is_some());
+    assert!(known_good.is_file());
+    drop(
+        fixture
+            .state
+            .admit_managed_instance(&instance.id, false)
+            .await
+            .expect("performance retirement must be compensated"),
+    );
+}
+
+#[tokio::test]
+async fn failed_registry_delete_with_presence_compensates_retirements() {
+    let fixture = TestFixture::new("delete-registry-failure");
+    let instance = add_test_instance(&fixture, "Delete failure", "1.21.1");
+    let known_good = fixture
+        .root
+        .join("config/state/known-good")
+        .join(format!("{}.json", instance.id));
+    fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
+    fs::write(&known_good, "known-good").expect("known-good snapshot");
+    drop(
+        fixture
+            .state
+            .admit_managed_instance(&instance.id, false)
+            .await
+            .expect("create managed authority before deletion"),
+    );
+    fixture.state.instances().fail_next_delete_without_removal();
+
+    let error = fixture
+        .state
+        .delete_instance(instance.id.clone(), false, fixture.producer.claim_child())
+        .await
+        .expect_err("registry failure must fail deletion");
+    let InstanceStoreError::Persistence(error) = error else {
+        panic!("registry failure must remain a persistence error");
+    };
+    assert!(error.to_string().contains("injected instance registry"));
+    assert!(fixture.state.instances().get(&instance.id).is_some());
+    assert!(known_good.is_file());
+    drop(
+        fixture
+            .state
+            .admit_managed_instance(&instance.id, false)
+            .await
+            .expect("failed deletion must reopen managed authority"),
+    );
+}
+
+#[tokio::test]
+async fn deletion_recovers_latched_managed_state_before_registry_absence() {
+    let fixture = TestFixture::new("delete-recover-latched");
+    let instance = add_test_instance(&fixture, "Recover latch", "1.21.1");
+    let known_good = fixture
+        .root
+        .join("config/state/known-good")
+        .join(format!("{}.json", instance.id));
+    fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
+    fs::write(&known_good, "known-good").expect("known-good snapshot");
+    let staged = latch_managed_instance(&fixture, &instance.id).await;
+    fs::remove_file(staged).expect("make exact managed recovery possible");
+
+    fixture
+        .state
+        .delete_instance(instance.id.clone(), false, fixture.producer.claim_child())
+        .await
+        .expect("recovered latch permits deletion");
+
+    assert!(fixture.state.instances().get(&instance.id).is_none());
+    assert!(!known_good.exists());
+}
+
+#[tokio::test]
+async fn unrecoverable_latched_managed_state_preserves_present_instance_authorities() {
+    let fixture = TestFixture::new("delete-unrecoverable-latch");
+    let instance = add_test_instance(&fixture, "Retain latch", "1.21.1");
+    let known_good = fixture
+        .root
+        .join("config/state/known-good")
+        .join(format!("{}.json", instance.id));
+    fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
+    fs::write(&known_good, "known-good").expect("known-good snapshot");
+    let staged = latch_managed_instance(&fixture, &instance.id).await;
+
+    fixture
+        .state
+        .delete_instance(instance.id.clone(), false, fixture.producer.claim_child())
+        .await
+        .expect_err("unrecoverable latch must block deletion");
+
+    assert!(fixture.state.instances().get(&instance.id).is_some());
+    assert!(known_good.is_file());
+    let error = fixture
+        .state
+        .admit_managed_instance(&instance.id, false)
+        .await
+        .err()
+        .expect("managed identity remains latched");
+    assert!(
+        error
+            .to_string()
+            .contains("exact recovery could not prove a clean state")
+    );
+    fs::remove_file(staged).expect("repair managed recovery stage");
+    drop(
+        fixture
+            .state
+            .admit_managed_instance(&instance.id, false)
+            .await
+            .expect("retained latch remains recoverable later"),
+    );
+}
+
+#[tokio::test]
+async fn admitted_delete_claims_its_request_handoff_during_drain() {
+    let fixture = TestFixture::new("delete-request-drain");
+    let instance = add_test_instance(&fixture, "Delete during drain", "1.21.1");
+    let request = fixture
+        .state
+        .try_admit_request()
+        .expect("admit delete request before drain");
+    let handoff = request.producer_handoff();
+    let shutdown_state = fixture.state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while fixture.state.lifecycle_phase() != crate::state::AppLifecyclePhase::DrainingRequests {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request drain begins");
+    assert!(fixture.state.try_claim_producer().is_err());
+
+    let body = handle_delete_instance_owned(&fixture.state, &instance.id, HashMap::new(), handoff)
+        .await
+        .expect("admitted delete completes during request drain");
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    assert!(fixture.state.instances().get(&instance.id).is_none());
+
+    drop(request);
+    quiesce.abort();
+    let _ = quiesce.await;
+}
+
+#[tokio::test]
+async fn create_rollback_uses_live_producer_child_during_request_drain() {
+    let fixture = TestFixture::new("create-rollback-request-drain");
+    let instance = add_test_instance(&fixture, "Rollback during drain", "1.21.1");
+    let request = fixture
+        .state
+        .try_admit_request()
+        .expect("admit create request before drain");
+    let handoff = request.producer_handoff();
+    let create_producer = handoff
+        .try_claim()
+        .expect("claim create producer before drain");
+    let shutdown_state = fixture.state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while fixture.state.lifecycle_phase() != crate::state::AppLifecyclePhase::DrainingRequests {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request drain begins");
+    assert!(fixture.state.try_claim_producer().is_err());
+    drop(request);
+    assert_eq!(
+        fixture.state.lifecycle_phase(),
+        crate::state::AppLifecyclePhase::DrainingRequests
+    );
+
+    let (status, Json(body)) = super::create::queue_create_install_or_rollback_owned(
+        &fixture.state,
+        &instance.id,
+        Some(crate::application::InstallQueueRequest::Vanilla {
+            version_id: String::new(),
+        }),
+        handoff,
+        &create_producer,
+    )
+    .await
+    .expect_err("invalid queue request triggers owned rollback");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_bounded_error_body(&body, "version_id is required");
+    assert!(fixture.state.instances().get(&instance.id).is_none());
+
+    drop(create_producer);
+    quiesce.abort();
+    let _ = quiesce.await;
+}
+
+async fn wait_for_instance_absence(state: &AppState, instance_id: &str) {
+    for _ in 0..200 {
+        if state.instances().get(instance_id).is_none() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("detached instance deletion did not finish");
+}
+
+async fn latch_managed_instance(fixture: &TestFixture, instance_id: &str) -> PathBuf {
+    let staged = fixture
+        .state
+        .instances()
+        .game_dir(instance_id)
+        .join("mods/.axial-lock.json.new.tmp");
+    fs::create_dir_all(staged.parent().expect("managed state parent"))
+        .expect("create managed state directory");
+    fs::write(&staged, b"not-json").expect("seed ambiguous managed publication");
+    let admitted = fixture
+        .state
+        .admit_managed_instance(instance_id, false)
+        .await
+        .expect("admit managed inspection");
+    admitted
+        .inspect(None)
+        .await
+        .expect_err("ambiguous publication must latch managed identity");
+    staged
+}
+
 fn assert_bounded_error_body(body: &serde_json::Value, expected: &str) {
     let object = body.as_object().expect("error body should be an object");
     assert_eq!(object.len(), 1);

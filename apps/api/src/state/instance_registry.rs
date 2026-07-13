@@ -9,6 +9,8 @@ use axial_config::{
 };
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -57,6 +59,8 @@ pub struct AppInstanceStore {
     state: Arc<Mutex<InstanceRegistryState>>,
     mutation_gate: Arc<AsyncMutex<()>>,
     closed: AtomicBool,
+    #[cfg(test)]
+    delete_result_without_removal: AtomicU8,
     persistence: InstanceRegistryPersistence,
 }
 
@@ -102,6 +106,8 @@ impl AppInstanceStore {
             })),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             closed: AtomicBool::new(false),
+            #[cfg(test)]
+            delete_result_without_removal: AtomicU8::new(0),
             persistence,
         }
     }
@@ -287,6 +293,20 @@ impl AppInstanceStore {
         gate: OwnedMutexGuard<()>,
     ) -> Result<(), InstanceStoreError> {
         let mut gate = self.reconcile_obligations(gate).await?;
+        #[cfg(test)]
+        match self.delete_result_without_removal.swap(0, Ordering::AcqRel) {
+            1 => {
+                drop(gate);
+                return Ok(());
+            }
+            2 => {
+                drop(gate);
+                return Err(InstanceStoreError::Persistence(io::Error::other(
+                    "injected instance registry deletion failure",
+                )));
+            }
+            _ => {}
+        }
         let mut candidate = self.current();
         if let Some(index) = candidate
             .instances
@@ -319,6 +339,18 @@ impl AppInstanceStore {
         gate = self.reconcile_obligations(gate).await?;
         drop(gate);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn succeed_next_delete_without_removal(&self) {
+        self.delete_result_without_removal
+            .store(1, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_delete_without_removal(&self) {
+        self.delete_result_without_removal
+            .store(2, Ordering::Release);
     }
 
     pub(crate) async fn close(&self) -> Result<(), InstanceStoreError> {

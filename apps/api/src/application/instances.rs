@@ -44,7 +44,7 @@ use crate::application::version::{
     installed_versions_scan,
 };
 use crate::guardian::normalize_create_jvm_preset;
-use crate::state::{AppState, ProducerLease};
+use crate::state::{AppState, ProducerLease, RequestProducerHandoff};
 use axial_config::{EnrichedInstance, InstanceStoreError, LaunchActionState};
 use axial_launcher::{
     GuardianMode, LaunchReadiness, LaunchReadinessReasonId, LaunchReadinessRequest,
@@ -480,27 +480,39 @@ fn redact_runtime_overrides(mut instance: EnrichedInstance) -> EnrichedInstance 
     instance
 }
 
+pub(crate) async fn handle_delete_instance_owned(
+    state: &AppState,
+    id: &str,
+    query: std::collections::HashMap<String, String>,
+    handoff: RequestProducerHandoff,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let producer = handoff.try_claim().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "application shutdown is in progress"
+            })),
+        )
+    })?;
+    let keep_files = query.get("keep_files").is_some_and(|value| value == "true");
+    state
+        .delete_instance(id.to_string(), !keep_files, producer)
+        .await
+        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Delete, error))?;
+
+    Ok(serde_json::json!({ "status": "ok" }))
+}
+
+#[cfg(test)]
 pub(crate) async fn handle_delete_instance(
     state: &AppState,
     id: &str,
     query: std::collections::HashMap<String, String>,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    if state.sessions().has_active_instance(id).await {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(
-                serde_json::json!({ "error": "cannot delete a running instance; stop the game first" }),
-            ),
-        ));
-    }
-
-    let keep_files = query.get("keep_files").is_some_and(|value| value == "true");
-    state
-        .delete_instance(id.to_string(), !keep_files)
-        .await
-        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Delete, error))?;
-
-    Ok(serde_json::json!({ "status": "ok" }))
+    let request = state
+        .try_admit_request()
+        .expect("admit test delete request");
+    handle_delete_instance_owned(state, id, query, request.producer_handoff()).await
 }
 
 #[cfg(test)]
