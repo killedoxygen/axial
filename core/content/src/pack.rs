@@ -475,7 +475,8 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
         .map_err(|error| ContentError::Invalid(format!("not a readable modpack: {error}")))?;
 
     let mut applied = Vec::new();
-    let mut processed = HashSet::new();
+    let mut processed = HashMap::new();
+    let mut extracted_files = 0_usize;
     let mut extracted_bytes = 0_u64;
     // Client overrides go last: where both define a file, the client copy wins.
     for root in [OVERRIDES, CLIENT_OVERRIDES] {
@@ -501,16 +502,29 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
                 continue;
             }
             let relative = normalize_relative_path(&relative)?;
-            let first_copy = processed.insert(relative.clone());
-            if first_copy && applied.len() >= MAX_OVERRIDE_FILES {
+            let first_copy = match processed.get(relative.as_str()) {
+                None => {
+                    processed.insert(relative.clone(), root);
+                    true
+                }
+                Some(previous_root) if *previous_root == OVERRIDES && root == CLIENT_OVERRIDES => {
+                    processed.insert(relative.clone(), root);
+                    false
+                }
+                Some(_) => {
+                    return Err(ContentError::Invalid(
+                        "modpack contains a duplicate override path".to_string(),
+                    ));
+                }
+            };
+            if extracted_files >= MAX_OVERRIDE_FILES {
                 return Err(ContentError::Invalid(
                     "modpack contains too many override files".to_string(),
                 ));
             }
             let declared_size = entry.size();
             if declared_size > MAX_OVERRIDE_ENTRY_BYTES
-                || (first_copy
-                    && extracted_bytes.saturating_add(declared_size) > MAX_OVERRIDE_TOTAL_BYTES)
+                || extracted_bytes.saturating_add(declared_size) > MAX_OVERRIDE_TOTAL_BYTES
             {
                 return Err(ContentError::Invalid(
                     "modpack overrides exceed the extraction limit".to_string(),
@@ -522,20 +536,17 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
                 fs::create_dir_all(parent)?;
             }
             let mut sink = fs::File::create(&destination)?;
-            let copy_limit = if first_copy {
-                MAX_OVERRIDE_ENTRY_BYTES
-                    .min(MAX_OVERRIDE_TOTAL_BYTES.saturating_sub(extracted_bytes))
-            } else {
-                MAX_OVERRIDE_ENTRY_BYTES
-            };
+            let copy_limit = MAX_OVERRIDE_ENTRY_BYTES
+                .min(MAX_OVERRIDE_TOTAL_BYTES.saturating_sub(extracted_bytes));
             let copied = io::copy(&mut (&mut entry).take(copy_limit + 1), &mut sink)?;
             if copied > copy_limit {
                 return Err(ContentError::Invalid(
                     "modpack overrides exceed the extraction limit".to_string(),
                 ));
             }
+            extracted_files += 1;
+            extracted_bytes = extracted_bytes.saturating_add(copied);
             if first_copy {
-                extracted_bytes = extracted_bytes.saturating_add(copied);
                 applied.push(relative);
             }
         }
@@ -1150,12 +1161,37 @@ mod tests {
     }
 
     #[test]
-    fn client_override_replacements_are_counted_once() {
+    fn client_override_replacements_are_reported_once() {
         let root = std::env::temp_dir().join("axial-pack-client-override-replacement");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("root");
         let archive = override_archive(
             "client-replacement",
+            &[
+                ("overrides/config/shared.bin", vec![b'a'; 128]),
+                ("overrides/config/other.bin", vec![b'b'; 128]),
+                ("client-overrides/config/shared.bin", vec![b'c'; 128]),
+            ],
+        );
+
+        let applied = apply_overrides(&root, &archive).expect("apply overrides");
+        assert_eq!(applied, ["config/shared.bin", "config/other.bin"]);
+        assert_eq!(
+            fs::read(root.join("config/shared.bin")).expect("client override"),
+            vec![b'c'; 128]
+        );
+
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn client_override_replacements_count_toward_the_extraction_limit() {
+        let root = std::env::temp_dir().join("axial-pack-client-override-limit");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let archive = override_archive(
+            "client-replacement-limit",
             &[
                 (
                     "overrides/config/shared.bin",
@@ -1167,17 +1203,34 @@ mod tests {
                 ),
                 (
                     "client-overrides/config/shared.bin",
-                    vec![b'c'; MAX_OVERRIDE_ENTRY_BYTES as usize],
+                    b"replacement".to_vec(),
                 ),
             ],
         );
 
-        let applied = apply_overrides(&root, &archive).expect("apply overrides");
-        assert_eq!(applied, ["config/shared.bin", "config/other.bin"]);
-        assert_eq!(
-            fs::read(root.join("config/shared.bin")).expect("client override"),
-            vec![b'c'; MAX_OVERRIDE_ENTRY_BYTES as usize]
+        let error = apply_overrides(&root, &archive)
+            .expect_err("replacement extraction must remain cumulatively bounded");
+        assert!(error.to_string().contains("extraction limit"));
+
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn duplicate_override_paths_are_rejected() {
+        let root = std::env::temp_dir().join("axial-pack-duplicate-override-path");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let archive = override_archive(
+            "duplicate-path",
+            &[
+                ("overrides/config/shared.bin", b"first".to_vec()),
+                ("overrides/config/./shared.bin", b"second".to_vec()),
+            ],
         );
+
+        let error = apply_overrides(&root, &archive).expect_err("duplicate path must be rejected");
+        assert!(error.to_string().contains("duplicate override path"));
 
         let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(root);

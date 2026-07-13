@@ -738,6 +738,7 @@ async fn build_pack_manifest(
     if !by_hash.is_empty() {
         let hashes: Vec<String> = by_hash.keys().cloned().collect();
         if let Ok(resolved) = state.content().identify(&hashes).await {
+            reject_duplicate_pack_projects(&resolved, &by_hash)?;
             let ids: Vec<CanonicalId> = resolved
                 .values()
                 .map(|identity| CanonicalId::for_project(identity.provider, &identity.project_id))
@@ -805,6 +806,29 @@ fn reject_duplicate_pack_hashes(
             StatusCode::BAD_REQUEST,
             "modpack repeats the same managed content at multiple paths",
         ));
+    }
+    Ok(())
+}
+
+fn reject_duplicate_pack_projects(
+    resolved: &HashMap<String, VersionIdentity>,
+    grouped: &HashMap<String, Vec<&axial_content::PackFile>>,
+) -> Result<(), ContentApiError> {
+    let mut projects = HashSet::new();
+    for (hash, identity) in resolved {
+        let Some(file) = grouped.get(hash).and_then(|files| files.first()) else {
+            continue;
+        };
+        if file.kind().is_none() {
+            continue;
+        }
+        let canonical_id = CanonicalId::for_project(identity.provider, &identity.project_id);
+        if !projects.insert(canonical_id) {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                "modpack contains multiple managed files for the same project",
+            ));
+        }
     }
     Ok(())
 }
@@ -898,6 +922,39 @@ mod tests {
         assert_eq!(grouped["shared-hash"].len(), 2);
         let (status, _) = reject_duplicate_pack_hashes(&grouped)
             .expect_err("one manifest entry cannot safely own two paths");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn duplicate_pack_projects_are_rejected_before_manifest_finalization() {
+        let file = |path: &str, hash: &str| axial_content::PackFile {
+            path: path.to_string(),
+            url: format!("https://example.invalid/{path}"),
+            sha1: None,
+            sha512: Some(hash.to_string()),
+            size: Some(42),
+        };
+        let installed = vec![
+            file("mods/first.jar", "first-hash"),
+            file("mods/second.jar", "second-hash"),
+        ];
+        let identity = |version_id: &str| VersionIdentity {
+            provider: ProviderId::Modrinth,
+            project_id: "shared-project".to_string(),
+            version_id: version_id.to_string(),
+            game_versions: Vec::new(),
+            loaders: Vec::new(),
+            dependencies: Vec::new(),
+            title: None,
+        };
+        let resolved = HashMap::from([
+            ("first-hash".to_string(), identity("first-version")),
+            ("second-hash".to_string(), identity("second-version")),
+        ]);
+        let grouped = group_pack_files_by_sha512(&installed);
+
+        let (status, _) = reject_duplicate_pack_projects(&resolved, &grouped)
+            .expect_err("one canonical project cannot safely own two pack files");
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
