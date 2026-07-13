@@ -307,6 +307,49 @@ async fn busy_setup_content_failure_preserves_a_running_instance() {
 }
 
 #[tokio::test]
+async fn interrupted_setup_worker_cleans_up_an_inactive_instance() {
+    let root = temp_root("interrupted-setup-cleanup");
+    let state = build_test_state(&root);
+    let instance = state
+        .instances()
+        .add(
+            "Interrupted setup".to_string(),
+            "1.21.1".to_string(),
+            String::new(),
+            String::new(),
+            None,
+        )
+        .expect("create setup instance");
+    let install_id = "interrupted-setup".to_string();
+    state.installs().insert(install_id.clone()).await;
+    let interrupted_state = state.clone();
+    let interrupted_instance_id = instance.id.clone();
+
+    InstallStore::spawn_tracked_worker_with_async_interrupt_handler(
+        state.installs().clone(),
+        install_id.clone(),
+        content_interrupted_progress(false),
+        async { panic!("simulated interrupted setup worker") },
+        move |_| async move {
+            interrupted_content_progress(&interrupted_state, &interrupted_instance_id, true).await
+        },
+    )
+    .await
+    .expect("tracked worker should finish");
+
+    let progress = state
+        .installs()
+        .snapshot(&install_id)
+        .await
+        .and_then(|snapshot| snapshot.latest)
+        .expect("terminal progress");
+    assert_eq!(progress.progress.phase, CONTENT_INSTANCE_REMOVED_PHASE);
+    assert!(state.instances().get(&instance.id).is_none());
+    assert!(!state.instances().game_dir(&instance.id).exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn failed_queue_prerequisite_discards_setup_content_and_its_instance() {
     let root = temp_root("setup-content-queue-dependency");
     let state = build_test_state(&root);

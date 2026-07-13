@@ -223,13 +223,13 @@ impl ContentManifest {
     /// so a removed or later-identified file does not leave a stale record.
     /// Returns whether anything was dropped.
     pub fn prune_unidentified(&mut self, unmanaged: &[UnmanagedFile]) -> bool {
-        let live: HashSet<(ContentKind, &str)> = unmanaged
+        let live: HashSet<(ContentKind, String)> = unmanaged
             .iter()
-            .map(|file| (file.kind, file.filename.as_str()))
+            .map(|file| (file.kind, file.disk_filename()))
             .collect();
         let before = self.unidentified.len();
         self.unidentified
-            .retain(|record| live.contains(&(record.kind, record.filename.as_str())));
+            .retain(|record| live.contains(&(record.kind, record.filename.clone())));
         self.unidentified.len() != before
     }
 }
@@ -250,6 +250,15 @@ pub struct UnmanagedFile {
     pub path: PathBuf,
 }
 
+impl UnmanagedFile {
+    pub fn disk_filename(&self) -> String {
+        self.path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.filename.clone())
+    }
+}
+
 /// Pure filesystem reconcile: flags entries whose file vanished and files that no
 /// entry accounts for. Network identification of unmanaged files happens a layer
 /// up (it needs a provider).
@@ -257,8 +266,8 @@ pub fn reconcile(game_dir: &Path, manifest: &ContentManifest) -> ReconcileReport
     let mut report = ReconcileReport::default();
     let mut recorded = HashSet::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
-        if entry_file_present(game_dir, entry) {
-            recorded.insert((entry.kind, entry.filename.clone()));
+        if let Some(filename) = matching_entry_filename(game_dir, entry) {
+            recorded.insert((entry.kind, filename));
         } else {
             report.missing.push(entry.canonical_id.clone());
         }
@@ -281,13 +290,12 @@ pub fn reconcile(game_dir: &Path, manifest: &ContentManifest) -> ReconcileReport
                 continue;
             }
             let raw = dir_entry.file_name().to_string_lossy().to_string();
-            let base = enabled_base_name(&raw);
-            if recorded.contains(&(kind, base.clone())) {
+            if recorded.contains(&(kind, raw.clone())) {
                 continue;
             }
             report.unmanaged.push(UnmanagedFile {
                 kind,
-                filename: base,
+                filename: enabled_base_name(&raw),
                 path: dir_entry.path(),
             });
         }
@@ -300,18 +308,26 @@ pub fn reconcile(game_dir: &Path, manifest: &ContentManifest) -> ReconcileReport
 /// integrity metadata, presence includes matching the recorded size and
 /// strongest available hash so a same-name manual replacement is not trusted.
 pub fn entry_file_present(game_dir: &Path, entry: &ManifestEntry) -> bool {
+    matching_entry_filename(game_dir, entry).is_some()
+}
+
+fn matching_entry_filename(game_dir: &Path, entry: &ManifestEntry) -> Option<String> {
     // A modpack entry records which pack the instance came from and owns no file
     // of its own, so it can never go missing.
     let Some(kind_dir) = entry.kind.install_subdir() else {
-        return true;
+        return Some(entry.filename.clone());
     };
     let dir = game_dir.join(kind_dir);
-    [
-        dir.join(&entry.filename),
-        dir.join(format!("{}.disabled", entry.filename)),
-    ]
-    .into_iter()
-    .any(|path| entry_path_matches(&path, entry))
+    let enabled = entry.filename.clone();
+    let disabled = format!("{}.disabled", entry.filename);
+    let variants = if entry.enabled {
+        [enabled, disabled]
+    } else {
+        [disabled, enabled]
+    };
+    variants
+        .into_iter()
+        .find(|filename| entry_path_matches(&dir.join(filename), entry))
 }
 
 /// Whether one exact on-disk path still matches the integrity recorded for a
@@ -585,6 +601,30 @@ mod tests {
         let report = reconcile(&dir, &manifest);
         assert!(report.missing.is_empty(), "disabled file still counts");
         assert!(report.unmanaged.is_empty(), "disabled file is recorded");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reconcile_reports_the_extra_enabled_or_disabled_variant_as_unmanaged() {
+        let dir = temp_game_dir("duplicate-variant");
+        let mods_dir = dir.join("mods");
+        fs::create_dir_all(&mods_dir).expect("mods dir");
+        fs::write(mods_dir.join("sodium.jar"), b"jar").expect("enabled file");
+        fs::write(mods_dir.join("sodium.jar.disabled"), b"jar").expect("disabled file");
+
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(managed_entry("AAA", "sodium.jar"));
+
+        let report = reconcile(&dir, &manifest);
+        assert!(report.missing.is_empty());
+        assert_eq!(report.unmanaged.len(), 1);
+        assert_eq!(
+            report.unmanaged[0]
+                .path
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("sodium.jar.disabled")
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

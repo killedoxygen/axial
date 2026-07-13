@@ -15,6 +15,7 @@ struct InstallEntry {
     latest: Option<InstallProgressRecord>,
     events: broadcast::Sender<DownloadProgress>,
     record_events: broadcast::Sender<InstallProgressRecord>,
+    finishing: bool,
     done: bool,
 }
 
@@ -284,7 +285,7 @@ impl InstallStore {
             let Some(entry) = installs.get_mut(install_id) else {
                 return;
             };
-            if entry.done {
+            if entry.done || entry.finishing {
                 return;
             }
             entry.done = record.progress.done;
@@ -303,7 +304,7 @@ impl InstallStore {
             let Some(entry) = installs.get_mut(install_id) else {
                 return false;
             };
-            if entry.done {
+            if entry.done || entry.finishing {
                 return false;
             }
 
@@ -392,6 +393,68 @@ impl InstallStore {
                 on_interrupted(interrupted_progress);
             }
         })
+    }
+
+    /// Run asynchronous interruption cleanup before publishing the terminal
+    /// progress it determines. Claiming the entry first prevents a late worker
+    /// event from racing cleanup or changing its outcome.
+    pub fn spawn_tracked_worker_with_async_interrupt_handler<F, H, HF>(
+        store: Arc<Self>,
+        install_id: String,
+        fallback_progress: DownloadProgress,
+        worker: F,
+        on_interrupted: H,
+    ) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+        H: FnOnce(DownloadProgress) -> HF + Send + 'static,
+        HF: Future<Output = DownloadProgress> + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let _ = tokio::spawn(worker).await;
+            if !store.claim_interrupted_finish(&install_id).await {
+                return;
+            }
+            let fallback = fallback_progress.clone();
+            let progress = tokio::spawn(on_interrupted(fallback_progress))
+                .await
+                .unwrap_or(fallback);
+            store
+                .finish_claimed_interruption(&install_id, progress)
+                .await;
+        })
+    }
+
+    async fn claim_interrupted_finish(&self, install_id: &str) -> bool {
+        let mut installs = self.installs.write().await;
+        let Some(entry) = installs.get_mut(install_id) else {
+            return false;
+        };
+        if entry.done || entry.finishing {
+            return false;
+        }
+        entry.finishing = true;
+        true
+    }
+
+    async fn finish_claimed_interruption(&self, install_id: &str, mut progress: DownloadProgress) {
+        progress.done = true;
+        let record = InstallProgressRecord::new(progress);
+        let senders = {
+            let mut installs = self.installs.write().await;
+            let Some(entry) = installs.get_mut(install_id) else {
+                return;
+            };
+            if !entry.finishing || entry.done {
+                return;
+            }
+            entry.finishing = false;
+            entry.done = true;
+            entry.latest = Some(record.clone());
+            (entry.events.clone(), entry.record_events.clone())
+        };
+        let _ = senders.0.send(record.progress.clone());
+        let _ = senders.1.send(record);
     }
 
     pub async fn snapshot(&self, install_id: &str) -> Option<InstallSnapshot> {
@@ -628,6 +691,7 @@ fn new_install_entry(key: Option<InstallKey>) -> InstallEntry {
         latest: None,
         events,
         record_events,
+        finishing: false,
         done: false,
     }
 }

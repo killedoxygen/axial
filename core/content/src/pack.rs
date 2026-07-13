@@ -623,6 +623,13 @@ pub fn parse_pack_index(raw: &str) -> ContentResult<PackIndex> {
 
 fn pack_file(file: dto::IndexFile) -> ContentResult<PackFile> {
     let path = normalize_relative_path(&file.path)?;
+    let sha1 = validate_pack_hash(file.hashes.sha1, 40, "sha1", &path)?;
+    let sha512 = validate_pack_hash(file.hashes.sha512, 128, "sha512", &path)?;
+    if sha1.is_none() && sha512.is_none() {
+        return Err(ContentError::Invalid(format!(
+            "modpack file has no supported integrity hash: {path}"
+        )));
+    }
     let url = file
         .downloads
         .into_iter()
@@ -637,10 +644,27 @@ fn pack_file(file: dto::IndexFile) -> ContentResult<PackFile> {
     Ok(PackFile {
         path,
         url,
-        sha1: file.hashes.sha1,
-        sha512: file.hashes.sha512,
+        sha1,
+        sha512,
         size: file.file_size,
     })
+}
+
+fn validate_pack_hash(
+    hash: Option<String>,
+    expected_len: usize,
+    algorithm: &str,
+    path: &str,
+) -> ContentResult<Option<String>> {
+    let Some(hash) = hash else {
+        return Ok(None);
+    };
+    if hash.len() != expected_len || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ContentError::Invalid(format!(
+            "modpack file has an invalid {algorithm} hash: {path}"
+        )));
+    }
+    Ok(Some(hash.to_ascii_lowercase()))
 }
 
 fn loader_from_dependencies(dependencies: &HashMap<String, String>) -> Option<PackLoader> {
@@ -768,7 +792,7 @@ mod tests {
         "files": [
             {
                 "path": "mods/sodium.jar",
-                "hashes": { "sha1": "aaa", "sha512": "bbb" },
+                "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
                 "env": { "client": "required", "server": "unsupported" },
                 "downloads": ["https://cdn.modrinth.com/sodium.jar"],
                 "fileSize": 1024
@@ -781,7 +805,7 @@ mod tests {
             },
             {
                 "path": "shaderpacks/complementary.zip",
-                "hashes": {},
+                "hashes": { "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
                 "downloads": ["https://cdn.modrinth.com/shader.zip"]
             }
         ]
@@ -822,6 +846,7 @@ mod tests {
             "dependencies": { "minecraft": "1.21.6" },
             "files": [{
                 "path": "mods/./example.jar",
+                "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
                 "downloads": ["https://cdn.modrinth.com/example.jar"]
             }]
         }"#;
@@ -832,8 +857,8 @@ mod tests {
             "formatVersion": 1,
             "dependencies": { "minecraft": "1.21.6" },
             "files": [
-                { "path": "mods/example.jar", "downloads": ["https://cdn.modrinth.com/a.jar"] },
-                { "path": "mods/./example.jar", "downloads": ["https://cdn.modrinth.com/b.jar"] }
+                { "path": "mods/example.jar", "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, "downloads": ["https://cdn.modrinth.com/a.jar"] },
+                { "path": "mods/./example.jar", "hashes": { "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }, "downloads": ["https://cdn.modrinth.com/b.jar"] }
             ]
         }"#;
         assert!(parse_pack_index(duplicate).is_err());
@@ -857,7 +882,21 @@ mod tests {
         let raw = r#"{
             "formatVersion": 1,
             "dependencies": { "minecraft": "1.21.6" },
-            "files": [{ "path": "mods/x.jar", "downloads": ["http://insecure/x.jar"] }]
+            "files": [{ "path": "mods/x.jar", "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, "downloads": ["http://insecure/x.jar"] }]
+        }"#;
+        assert!(parse_pack_index(raw).is_err());
+    }
+
+    #[test]
+    fn a_pack_file_without_a_cryptographic_hash_is_rejected() {
+        let raw = r#"{
+            "formatVersion": 1,
+            "dependencies": { "minecraft": "1.21.6" },
+            "files": [{
+                "path": "mods/x.jar",
+                "hashes": {},
+                "downloads": ["https://cdn.modrinth.com/x.jar"]
+            }]
         }"#;
         assert!(parse_pack_index(raw).is_err());
     }
@@ -1118,7 +1157,7 @@ mod tests {
             "dependencies": { "minecraft": "1.21.6" },
             "files": [{
                 "path": "mods/example.jar",
-                "hashes": {},
+                "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
                 "downloads": ["https://cdn.modrinth.com/example.jar"]
             }]
         }"#;

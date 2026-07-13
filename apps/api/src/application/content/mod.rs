@@ -29,7 +29,7 @@ use axial_content::{
 use axial_minecraft::DownloadProgress;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 pub use compat::{CompatCandidate, CompatDrop};
@@ -697,7 +697,7 @@ async fn retrofit_unmanaged(
                 continue;
             };
             if let Ok(hash) = sha512_file(&file.path) {
-                if negative_cache_matches(&known, file.kind, &file.filename, size, &hash) {
+                if negative_cache_matches(&known, file.kind, &file.disk_filename(), size, &hash) {
                     continue;
                 }
                 hashes.push((hash, file, size));
@@ -712,12 +712,9 @@ async fn retrofit_unmanaged(
         return false;
     }
 
-    let by_hash: HashMap<String, (UnmanagedFile, u64)> = hashed
-        .into_iter()
-        .map(|(hash, file, size)| (hash, (file, size)))
-        .collect();
+    let by_hash = group_unmanaged_by_hash(hashed);
     let hashes: Vec<String> = by_hash.keys().cloned().collect();
-    let Ok(mut identified) = state.content().identify(&hashes).await else {
+    let Ok(identified) = state.content().identify(&hashes).await else {
         return false;
     };
 
@@ -728,35 +725,60 @@ async fn retrofit_unmanaged(
     let titles = project_titles(state, &ids).await;
 
     let mut changed = false;
-    for (hash, (file, size)) in &by_hash {
-        match identified.remove(hash) {
-            Some(mut identity) => {
-                let id = CanonicalId::for_project(identity.provider, &identity.project_id);
-                if let Some(title) = titles.get(&id) {
-                    identity.title = Some(title.clone());
+    for (hash, files) in &by_hash {
+        let identity = identified.get(hash).cloned();
+        for (file, size) in files {
+            let cache_filename = file.disk_filename();
+            match identity.clone() {
+                Some(mut identity) => {
+                    let id = CanonicalId::for_project(identity.provider, &identity.project_id);
+                    if manifest.find(&id).is_some() {
+                        manifest.record_unidentified(UnidentifiedRecord {
+                            kind: file.kind,
+                            filename: cache_filename,
+                            size: *size,
+                            sha512: hash.clone(),
+                        });
+                        changed = true;
+                        continue;
+                    }
+                    if let Some(title) = titles.get(&id) {
+                        identity.title = Some(title.clone());
+                    }
+                    manifest.forget_unidentified(file.kind, &cache_filename);
+                    let mut entry =
+                        ManifestEntry::imported(file.kind, file.filename.clone(), identity);
+                    entry.sha512 = Some(hash.clone());
+                    entry.size = Some(*size);
+                    entry.enabled = !cache_filename.ends_with(".disabled");
+                    manifest.upsert(entry);
                 }
-                manifest.forget_unidentified(file.kind, &file.filename);
-                let mut entry = ManifestEntry::imported(file.kind, file.filename.clone(), identity);
-                entry.sha512 = Some(hash.clone());
-                entry.size = Some(*size);
-                entry.enabled = !file
-                    .path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().ends_with(".disabled"));
-                manifest.upsert(entry);
+                None => {
+                    manifest.record_unidentified(UnidentifiedRecord {
+                        kind: file.kind,
+                        filename: cache_filename,
+                        size: *size,
+                        sha512: hash.clone(),
+                    });
+                }
             }
-            None => {
-                manifest.record_unidentified(UnidentifiedRecord {
-                    kind: file.kind,
-                    filename: file.filename.clone(),
-                    size: *size,
-                    sha512: hash.clone(),
-                });
-            }
+            changed = true;
         }
-        changed = true;
     }
     changed
+}
+
+fn group_unmanaged_by_hash(
+    hashed: Vec<(String, UnmanagedFile, u64)>,
+) -> BTreeMap<String, Vec<(UnmanagedFile, u64)>> {
+    let mut grouped: BTreeMap<String, Vec<(UnmanagedFile, u64)>> = BTreeMap::new();
+    for (hash, file, size) in hashed {
+        grouped.entry(hash).or_default().push((file, size));
+    }
+    for files in grouped.values_mut() {
+        files.sort_by_key(|(file, _)| file.path.clone());
+    }
+    grouped
 }
 
 fn negative_cache_matches(
@@ -842,6 +864,24 @@ mod tests {
             42,
             "new-hash"
         ));
+    }
+
+    #[test]
+    fn identical_unmanaged_hashes_retain_every_file_deterministically() {
+        let file = |name: &str| UnmanagedFile {
+            kind: ContentKind::Mod,
+            filename: name.to_string(),
+            path: std::path::PathBuf::from("mods").join(name),
+        };
+        let grouped = group_unmanaged_by_hash(vec![
+            ("same-hash".to_string(), file("copy-b.jar"), 42),
+            ("same-hash".to_string(), file("copy-a.jar"), 42),
+        ]);
+
+        let files = grouped.get("same-hash").expect("hash group");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].0.filename, "copy-a.jar");
+        assert_eq!(files[1].0.filename, "copy-b.jar");
     }
 
     #[test]

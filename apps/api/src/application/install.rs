@@ -894,10 +894,13 @@ async fn start_content_operation(
     let worker_install_id = install_id.clone();
     let worker_instance_id = instance_id.to_string();
     let worker_action = action.clone();
-    InstallStore::spawn_tracked_worker(
+    let interrupted_state = state.clone();
+    let interrupted_instance_id = instance_id.to_string();
+    let interrupted_action_owns_instance = content_action_owns_instance(action);
+    InstallStore::spawn_tracked_worker_with_async_interrupt_handler(
         state.installs().clone(),
         install_id.clone(),
-        content_interrupted_progress(),
+        content_interrupted_progress(false),
         async move {
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
             let progress_store = worker_store.clone();
@@ -1011,6 +1014,14 @@ async fn start_content_operation(
             drop(progress_tx);
             let _ = progress_task.await;
         },
+        move |_| async move {
+            interrupted_content_progress(
+                &interrupted_state,
+                &interrupted_instance_id,
+                interrupted_action_owns_instance,
+            )
+            .await
+        },
     );
 
     Ok(InstallStartResponse {
@@ -1046,13 +1057,31 @@ fn content_progress(
     }
 }
 
-fn content_interrupted_progress() -> DownloadProgress {
+async fn interrupted_content_progress(
+    state: &AppState,
+    instance_id: &str,
+    action_owns_instance: bool,
+) -> DownloadProgress {
+    let removed =
+        action_owns_instance && remove_setup_instance_if_inactive(state, instance_id).await;
+    content_interrupted_progress(removed)
+}
+
+fn content_interrupted_progress(removed_instance: bool) -> DownloadProgress {
     content_progress(
-        "error",
+        if removed_instance {
+            CONTENT_INSTANCE_REMOVED_PHASE
+        } else {
+            "error"
+        },
         0,
         1,
         true,
-        Some("Content operation stopped before completing. Try again.".to_string()),
+        Some(if removed_instance {
+            "Content operation stopped. The incomplete setup instance was removed.".to_string()
+        } else {
+            "Content operation stopped before completing. Try again.".to_string()
+        }),
     )
 }
 
