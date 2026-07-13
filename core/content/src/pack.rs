@@ -18,7 +18,10 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
+use url::{Host, Url};
 
 const INDEX_FILE: &str = "modrinth.index.json";
 const OVERRIDES: &str = "overrides";
@@ -37,6 +40,13 @@ const MAX_OVERRIDE_TOTAL_BYTES: u64 = 512 << 20;
 #[cfg(test)]
 const MAX_OVERRIDE_TOTAL_BYTES: u64 = 2048;
 const MAX_OVERRIDE_FILES: usize = 10_000;
+const MAX_PACK_REDIRECTS: usize = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PackDownloadOrigin {
+    host: String,
+    port: u16,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackLoader {
@@ -155,7 +165,7 @@ where
 }
 
 pub async fn install_pack_files_with_finalize<F, P>(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     game_dir: &Path,
     archive: &Path,
     selected_paths: &[String],
@@ -191,6 +201,7 @@ where
     let mut installed = Vec::with_capacity(files.len());
     let staging = StagingGuard::create(game_dir, "axial-pack-stage")?;
     let mut relative_paths = Vec::with_capacity(files.len());
+    let mut download_clients: HashMap<PackDownloadOrigin, reqwest::Client> = HashMap::new();
 
     for (position, file) in files.into_iter().enumerate() {
         let destination = contained_path(staging.path(), &file.path)?;
@@ -209,7 +220,15 @@ where
             size: file.size,
             sha1: file.sha1.clone(),
         };
-        download_file_with_client_report(client, &file.url, &destination, &expected)
+        let (_, origin) = validate_pack_download_url(&file.url)?;
+        if !download_clients.contains_key(&origin) {
+            let safe_client = build_pack_download_client(&file.url).await?;
+            download_clients.insert(origin.clone(), safe_client);
+        }
+        let safe_client = download_clients
+            .get(&origin)
+            .expect("pack download client was inserted");
+        download_file_with_client_report(safe_client, &file.url, &destination, &expected)
             .await
             .map_err(|error| ContentError::Download(error.into_download_error().to_string()))?;
         verify_pack_sha512(&destination, file.sha512.as_deref())?;
@@ -264,6 +283,134 @@ where
 
     on_progress(done(total));
     Ok(report)
+}
+
+fn validate_pack_download_url(raw: &str) -> ContentResult<(Url, PackDownloadOrigin)> {
+    let url = Url::parse(raw)
+        .map_err(|_| ContentError::Invalid("modpack download URL is invalid".to_string()))?;
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return Err(ContentError::Invalid(
+            "modpack downloads require a public HTTPS URL".to_string(),
+        ));
+    }
+    let host = url
+        .host()
+        .ok_or_else(|| ContentError::Invalid("modpack download URL has no host".to_string()))?;
+    match host {
+        Host::Ipv4(address) if !is_public_ip(IpAddr::V4(address)) => {
+            return Err(ContentError::Invalid(
+                "modpack download destination is not public".to_string(),
+            ));
+        }
+        Host::Ipv6(address) if !is_public_ip(IpAddr::V6(address)) => {
+            return Err(ContentError::Invalid(
+                "modpack download destination is not public".to_string(),
+            ));
+        }
+        Host::Domain(_) | Host::Ipv4(_) | Host::Ipv6(_) => {}
+    }
+    let port = url.port_or_known_default().ok_or_else(|| {
+        ContentError::Invalid("modpack download URL has no usable port".to_string())
+    })?;
+    let host = host.to_string().to_ascii_lowercase();
+    Ok((url, PackDownloadOrigin { host, port }))
+}
+
+async fn build_pack_download_client(raw: &str) -> ContentResult<reqwest::Client> {
+    let (url, origin) = validate_pack_download_url(raw)?;
+    let addresses = resolve_public_pack_addresses(&url, origin.port).await?;
+    let redirect_origin = origin.clone();
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(120))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= MAX_PACK_REDIRECTS {
+                return attempt.error("modpack download redirected too many times");
+            }
+            if pack_redirect_allowed(&redirect_origin, attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("modpack download redirect was not safe")
+            }
+        }));
+    if matches!(url.host(), Some(Host::Domain(_))) {
+        builder = builder.resolve_to_addrs(&origin.host, &addresses);
+    }
+    builder.build().map_err(ContentError::Request)
+}
+
+async fn resolve_public_pack_addresses(url: &Url, port: u16) -> ContentResult<Vec<SocketAddr>> {
+    let addresses: Vec<SocketAddr> = match url.host() {
+        Some(Host::Ipv4(address)) => vec![SocketAddr::new(IpAddr::V4(address), port)],
+        Some(Host::Ipv6(address)) => vec![SocketAddr::new(IpAddr::V6(address), port)],
+        Some(Host::Domain(domain)) => tokio::net::lookup_host((domain, port))
+            .await
+            .map_err(|_| {
+                ContentError::Download(
+                    "modpack download destination could not be resolved".to_string(),
+                )
+            })?
+            .collect(),
+        None => Vec::new(),
+    };
+    if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        return Err(ContentError::Invalid(
+            "modpack download destination is not public".to_string(),
+        ));
+    }
+    Ok(addresses)
+}
+
+fn pack_redirect_allowed(origin: &PackDownloadOrigin, destination: &Url) -> bool {
+    validate_pack_download_url(destination.as_str())
+        .is_ok_and(|(_, destination_origin)| destination_origin == *origin)
+}
+
+fn is_public_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_ipv4(address),
+        IpAddr::V6(address) => is_public_ipv6(address),
+    }
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let [first, second, third, _] = address.octets();
+    !(first == 0
+        || first == 10
+        || first == 127
+        || first >= 224
+        || (first == 100 && (64..=127).contains(&second))
+        || (first == 169 && second == 254)
+        || (first == 172 && (16..=31).contains(&second))
+        || (first == 192 && second == 168)
+        || (first == 192 && second == 0 && matches!(third, 0 | 2))
+        || (first == 198 && matches!(second, 18 | 19))
+        || (first == 198 && second == 51 && third == 100)
+        || (first == 203 && second == 0 && third == 113))
+}
+
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return is_public_ipv4(mapped);
+    }
+    let segments = address.segments();
+    if segments[..6].iter().all(|segment| *segment == 0) {
+        let mapped = Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        );
+        return is_public_ipv4(mapped);
+    }
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xffc0) == 0xfec0
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8))
 }
 
 fn verify_pack_sha512(path: &Path, expected: Option<&str>) -> ContentResult<()> {
@@ -484,7 +631,11 @@ fn pack_file(file: dto::IndexFile) -> ContentResult<PackFile> {
     let url = file
         .downloads
         .into_iter()
-        .find(|url| url.starts_with("https://"))
+        .find_map(|raw| {
+            validate_pack_download_url(&raw)
+                .ok()
+                .map(|(url, _)| url.to_string())
+        })
         .ok_or_else(|| {
             ContentError::Invalid(format!("modpack file has no download: {}", file.path))
         })?;
@@ -730,6 +881,65 @@ mod tests {
         assert!(verify_pack_sha512(&path, Some("not-a-sha512")).is_err());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn private_and_special_pack_download_addresses_are_rejected() {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "[::1]",
+            "[fe80::1]",
+            "[fec0::1]",
+            "[fc00::1]",
+            "[::ffff:127.0.0.1]",
+        ] {
+            assert!(
+                validate_pack_download_url(&format!("https://{address}/payload.jar")).is_err(),
+                "{address} must not be a pack download destination"
+            );
+        }
+        assert!(validate_pack_download_url("https://1.1.1.1/payload.jar").is_ok());
+        assert!(validate_pack_download_url("https://[2606:4700:4700::1111]/payload.jar").is_ok());
+    }
+
+    #[test]
+    fn pack_redirects_stay_on_the_pinned_public_https_origin() {
+        let (_, origin) = validate_pack_download_url("https://downloads.example.com/payload.jar")
+            .expect("public HTTPS origin");
+
+        assert!(pack_redirect_allowed(
+            &origin,
+            &Url::parse("https://downloads.example.com/releases/payload.jar").expect("same origin")
+        ));
+        for destination in [
+            "http://downloads.example.com/payload.jar",
+            "https://downloads.example.com:444/payload.jar",
+            "https://127.0.0.1/payload.jar",
+            "https://169.254.169.254/latest/meta-data",
+            "https://cdn.example.com/payload.jar",
+        ] {
+            assert!(
+                !pack_redirect_allowed(&origin, &Url::parse(destination).expect("redirect URL")),
+                "redirect must be rejected: {destination}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_literal_pack_client_builds_without_network_access() {
+        build_pack_download_client("https://1.1.1.1/payload.jar")
+            .await
+            .expect("public address client");
+        assert!(
+            build_pack_download_client("https://localhost/payload.jar")
+                .await
+                .is_err()
+        );
     }
 
     #[test]

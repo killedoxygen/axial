@@ -356,6 +356,7 @@ export function DiscoverView(): JSX.Element {
   useEffect(() => {
     const id = ++requestId.current;
     loading.value = true;
+    loadingMore.value = false;
     searchError.value = null;
     const timer = window.setTimeout(() => {
       searchContent(searchInput())
@@ -371,7 +372,10 @@ export function DiscoverView(): JSX.Element {
           if (id === requestId.current) loading.value = false;
         });
     }, SEARCH_DEBOUNCE_MS);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      requestId.current += 1;
+    };
   }, [
     currentKind,
     currentQuery,
@@ -396,7 +400,7 @@ export function DiscoverView(): JSX.Element {
       })
       .catch(() => {})
       .finally(() => {
-        loadingMore.value = false;
+        if (id === requestId.current) loadingMore.value = false;
       });
   };
 

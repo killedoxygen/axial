@@ -311,10 +311,13 @@ pub fn entry_file_present(game_dir: &Path, entry: &ManifestEntry) -> bool {
         dir.join(format!("{}.disabled", entry.filename)),
     ]
     .into_iter()
-    .any(|path| entry_file_matches(&path, entry))
+    .any(|path| entry_path_matches(&path, entry))
 }
 
-fn entry_file_matches(path: &Path, entry: &ManifestEntry) -> bool {
+/// Whether one exact on-disk path still matches the integrity recorded for a
+/// manifest entry. Callers that are about to replace a particular variant must
+/// use this rather than accepting ownership from the filename alone.
+pub fn entry_path_matches(path: &Path, entry: &ManifestEntry) -> bool {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
     };

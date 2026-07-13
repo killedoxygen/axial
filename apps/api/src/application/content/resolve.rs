@@ -382,6 +382,7 @@ async fn resolve_pass(
                         let incompatible =
                             CanonicalId::for_project(ProviderId::Modrinth, project_id);
                         if let Some(entry) = manifest.find(&incompatible)
+                            && installed_entry_present(entry, target.game_dir.as_deref())
                             && incompatibilities
                                 .insert((canonical_id.clone(), entry.canonical_id.clone()))
                         {
@@ -393,7 +394,9 @@ async fn resolve_pass(
             }
         }
 
-        for entry in installed_entries_incompatible_with(manifest, &canonical_id) {
+        for entry in
+            installed_entries_incompatible_with(manifest, &canonical_id, target.game_dir.as_deref())
+        {
             if incompatibilities.insert((canonical_id.clone(), entry.canonical_id.clone())) {
                 conflicts.push(incompatible_conflict(&canonical_id, entry));
             }
@@ -445,11 +448,14 @@ fn resolved_install_state(
     game_dir: Option<&std::path::Path>,
     resolved_version_id: &str,
 ) -> (bool, bool) {
-    let already_installed =
-        existing.is_some_and(|entry| game_dir.is_none_or(|root| entry_file_present(root, entry)));
+    let already_installed = existing.is_some_and(|entry| installed_entry_present(entry, game_dir));
     let update =
         already_installed && existing.is_some_and(|entry| entry.version_id != resolved_version_id);
     (already_installed, update)
+}
+
+fn installed_entry_present(entry: &ManifestEntry, game_dir: Option<&std::path::Path>) -> bool {
+    game_dir.is_none_or(|root| entry_file_present(root, entry))
 }
 
 fn selected_incompatibility_conflicts(items: &[ResolvedItem]) -> Vec<PlanConflict> {
@@ -597,11 +603,13 @@ fn exact_dependency_conflict(
 fn installed_entries_incompatible_with<'a>(
     manifest: &'a ContentManifest,
     candidate: &CanonicalId,
+    game_dir: Option<&std::path::Path>,
 ) -> Vec<&'a ManifestEntry> {
     manifest
         .entries
         .iter()
         .filter(|entry| entry.canonical_id != *candidate)
+        .filter(|entry| installed_entry_present(entry, game_dir))
         .filter(|entry| {
             entry.dependencies.iter().any(|dependency| {
                 dependency.kind == DependencyKind::Incompatible
@@ -845,9 +853,56 @@ mod tests {
             ..ContentManifest::default()
         };
         assert_eq!(
-            installed_entries_incompatible_with(&manifest, &candidate).len(),
+            installed_entries_incompatible_with(&manifest, &candidate, None).len(),
             1
         );
+    }
+
+    #[test]
+    fn missing_or_replaced_manifest_entries_do_not_create_conflicts() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-resolve-stale-conflict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("mods")).expect("mods");
+        let candidate = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
+        let path = root.join("mods/installed.jar");
+        std::fs::write(&path, b"owned bytes").expect("owned file");
+        let mut entry = ManifestEntry::managed(
+            CanonicalId::for_project(ProviderId::Modrinth, "installed"),
+            ProviderId::Modrinth,
+            "installed".to_string(),
+            "v1".to_string(),
+            ContentKind::Mod,
+            &file("installed.jar", Some(b"owned bytes".len() as u64)),
+            vec![ContentDependency {
+                project_id: Some("candidate".to_string()),
+                version_id: None,
+                kind: DependencyKind::Incompatible,
+            }],
+            None,
+        );
+        entry.sha512 = Some(axial_content::sha512_file(&path).expect("owned hash"));
+        let manifest = ContentManifest {
+            entries: vec![entry.clone()],
+            ..ContentManifest::default()
+        };
+
+        assert_eq!(
+            installed_entries_incompatible_with(&manifest, &candidate, Some(&root)).len(),
+            1
+        );
+        std::fs::write(&path, b"user replacement").expect("replacement");
+        assert!(installed_entries_incompatible_with(&manifest, &candidate, Some(&root)).is_empty());
+        assert!(!installed_entry_present(&entry, Some(&root)));
+        std::fs::remove_file(&path).expect("remove replacement");
+        assert!(installed_entries_incompatible_with(&manifest, &candidate, Some(&root)).is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::error::{ContentError, ContentResult};
-use crate::manifest::{ContentManifest, ManifestEntry};
+use crate::manifest::{ContentManifest, ManifestEntry, entry_path_matches};
 use crate::model::{CanonicalId, ContentDependency, ContentKind, FileRef, ProviderId};
 use crate::transaction::{FileTransaction, StagingGuard, contained_path};
 use axial_minecraft::download::{
@@ -203,8 +203,14 @@ fn prepare_install_destinations(
             }
 
             let path = contained_path(game_dir, variant)?;
-            match fs::symlink_metadata(path) {
+            match fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.is_file() && !owners.is_empty() => {
+                    if owners.iter().any(|owner| !entry_path_matches(&path, owner)) {
+                        return Err(ContentError::Invalid(
+                            "a content destination is occupied by a file no longer owned by the manifest"
+                                .to_string(),
+                        ));
+                    }
                     if variant == &destination.relative {
                         selected_destination_exists = true;
                     }
@@ -354,6 +360,31 @@ mod tests {
             );
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn same_name_manual_replacement_is_not_treated_as_managed() {
+        let root = test_root("same-name-replacement");
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let path = root.join("mods/shared.jar");
+        fs::write(&path, b"launcher-owned bytes").expect("managed file");
+
+        let mut entry = recorded("project", "shared.jar");
+        entry.sha512 = Some(crate::manifest::sha512_file(&path).expect("managed hash"));
+        entry.size = Some(b"launcher-owned bytes".len() as u64);
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(entry);
+
+        fs::write(&path, b"manually replaced user bytes").expect("user replacement");
+        let result =
+            prepare_install_destinations(&root, &manifest, &[planned("project", "shared.jar")]);
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&path).expect("preserved user replacement"),
+            b"manually replaced user bytes"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
