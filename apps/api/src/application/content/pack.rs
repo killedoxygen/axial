@@ -6,9 +6,9 @@
 //! ask the provider what they are in one batch and record real provenance for
 //! every mod, rather than leaving a pack-shaped hole in the manifest.
 
-use super::resolve::pick_version;
+use super::resolve::{pick_version, resolve};
 use super::target::{ResolveTarget, instance_target};
-use super::{ContentApiError, content_error_response, json_error};
+use super::{ContentApiError, ContentSelection, content_error_response, json_error};
 use crate::application::{
     InstallQueueContentActionRequest, InstallQueueRequest, InstallQueueStateResponse,
     enqueue_install_with_dependency,
@@ -16,16 +16,13 @@ use crate::application::{
 use crate::state::AppState;
 use axial_content::{
     CanonicalId, ContentKind, ContentManifest, EntrySource, FileRef, ManifestEntry, PackIndex,
-    ProviderId, install_pack_files_with_finalize, read_pack_index,
+    ProviderId, VersionIdentity, install_pack_files_with_finalize, read_pack_index,
 };
 use axum::http::StatusCode;
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static PACK_ARCHIVE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct ScratchArchive {
     path: PathBuf,
@@ -119,62 +116,105 @@ pub struct ModpackFilesPlan {
     pub files: Vec<ModpackFileOption>,
 }
 
-/// Read a pack version's declared loader and Minecraft version straight from the
-/// provider metadata — no download needed, so the create step stays instant.
-pub async fn modpack_target(
+struct ResolvedModpackVersion {
+    canonical_id: CanonicalId,
+    name: String,
+    version: axial_content::ContentVersion,
+}
+
+async fn resolve_modpack_version(
     state: &AppState,
     canonical_id: &str,
     version_id: Option<&str>,
-) -> Result<ModpackTarget, ContentApiError> {
-    let id = CanonicalId(canonical_id.to_string());
+) -> Result<ResolvedModpackVersion, ContentApiError> {
+    let canonical_id = CanonicalId(canonical_id.to_string());
     let detail = state
         .content()
-        .detail(&id)
+        .detail(&canonical_id)
         .await
         .map_err(content_error_response)?;
     if detail.content.kind != ContentKind::Modpack {
         return Err(json_error(StatusCode::BAD_REQUEST, "this is not a modpack"));
     }
-
-    let version = pick_version(&detail.versions, version_id).ok_or_else(|| {
-        json_error(
-            StatusCode::NOT_FOUND,
-            "this modpack has no installable version",
-        )
-    })?;
-
-    let minecraft = version
-        .game_versions
-        .iter()
-        .find(|value| is_release_version(value))
-        .or_else(|| version.game_versions.first())
+    let version = pick_version(&detail.versions, version_id)
         .cloned()
         .ok_or_else(|| {
             json_error(
-                StatusCode::BAD_REQUEST,
-                "this modpack does not say which Minecraft version it needs",
+                StatusCode::NOT_FOUND,
+                "this modpack has no installable version",
             )
         })?;
+    Ok(ResolvedModpackVersion {
+        canonical_id,
+        name: detail.content.title,
+        version,
+    })
+}
 
-    let loader = version
-        .loaders
-        .iter()
-        .find(|value| axial_minecraft::LoaderComponentId::parse(value).is_some())
-        .and_then(|value| axial_minecraft::LoaderComponentId::parse(value));
+/// Read the pack-authored loader and Minecraft requirements and pin creation to
+/// that exact loader build. Provider summary metadata only names the loader
+/// family and cannot safely substitute for `modrinth.index.json`.
+pub async fn modpack_target(
+    state: &AppState,
+    canonical_id: &str,
+    version_id: Option<&str>,
+) -> Result<ModpackTarget, ContentApiError> {
+    let resolved = resolve_modpack_version(state, canonical_id, version_id).await?;
+    let archive_file = resolved.version.primary_file().cloned().ok_or_else(|| {
+        json_error(
+            StatusCode::NOT_FOUND,
+            "this modpack version has no downloadable file",
+        )
+    })?;
+    let archive = download_archive(state, &archive_file).await?;
+    let index = read_pack_index(archive.path()).map_err(content_error_response)?;
+
+    target_from_pack_index(
+        resolved.canonical_id,
+        resolved.version.id,
+        resolved.name,
+        &index,
+    )
+}
+
+fn target_from_pack_index(
+    canonical_id: CanonicalId,
+    version_id: String,
+    name: String,
+    index: &PackIndex,
+) -> Result<ModpackTarget, ContentApiError> {
+    let (loader, loader_label, selection_id) = match index.loader.as_ref() {
+        Some(loader) => {
+            let component =
+                axial_minecraft::LoaderComponentId::parse(&loader.key).ok_or_else(|| {
+                    json_error(
+                        StatusCode::BAD_REQUEST,
+                        "this modpack uses an unsupported loader",
+                    )
+                })?;
+            let build_id =
+                axial_minecraft::build_id_for(component, &index.minecraft, &loader.version);
+            (
+                Some(component.short_key().to_string()),
+                component.display_name().to_string(),
+                format!("loader_build|{}|{build_id}", component.as_str()),
+            )
+        }
+        None => (
+            None,
+            "Vanilla".to_string(),
+            format!("vanilla|{}", index.minecraft),
+        ),
+    };
 
     Ok(ModpackTarget {
-        canonical_id: id,
-        version_id: version.id.clone(),
-        name: detail.content.title.clone(),
-        selection_id: match loader {
-            Some(id) => format!("loader_version|{}|{}", id.short_key(), minecraft),
-            None => format!("vanilla|{minecraft}"),
-        },
-        loader_label: loader
-            .map(|id| id.display_name().to_string())
-            .unwrap_or_else(|| "Vanilla".to_string()),
-        loader: loader.map(|id| id.short_key().to_string()),
-        minecraft,
+        canonical_id,
+        version_id,
+        name,
+        minecraft: index.minecraft.clone(),
+        loader,
+        loader_label,
+        selection_id,
     })
 }
 
@@ -189,36 +229,22 @@ pub async fn modpack_files(
         .game_dir
         .clone()
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "instance not found"))?;
-    let id = CanonicalId(canonical_id.to_string());
-    let detail = state
-        .content()
-        .detail(&id)
-        .await
-        .map_err(content_error_response)?;
-    if detail.content.kind != ContentKind::Modpack {
-        return Err(json_error(StatusCode::BAD_REQUEST, "this is not a modpack"));
-    }
-    let version = pick_version(&detail.versions, version_id).ok_or_else(|| {
-        json_error(
-            StatusCode::NOT_FOUND,
-            "this modpack has no installable version",
-        )
-    })?;
-    let archive_file = version.primary_file().cloned().ok_or_else(|| {
+    let resolved = resolve_modpack_version(state, canonical_id, version_id).await?;
+    let archive_file = resolved.version.primary_file().cloned().ok_or_else(|| {
         json_error(
             StatusCode::NOT_FOUND,
             "this modpack version has no downloadable file",
         )
     })?;
-    let archive = download_archive(state, &game_dir, &archive_file).await?;
+    let archive = download_archive(state, &archive_file).await?;
     let index = read_pack_index(archive.path()).map_err(content_error_response)?;
-
-    let files = classify_modpack_files(state, &target, &game_dir, &index).await;
+    let identities = identify_modpack_files(state, &index).await;
+    let files = classify_modpack_files(state, &target, &game_dir, &index, &identities).await;
 
     Ok(ModpackFilesPlan {
-        canonical_id: id,
-        version_id: version.id.clone(),
-        name: detail.content.title,
+        canonical_id: resolved.canonical_id,
+        version_id: resolved.version.id,
+        name: resolved.name,
         minecraft: index.minecraft,
         loader: index.loader.map(|loader| loader.key),
         files,
@@ -230,17 +256,8 @@ async fn classify_modpack_files(
     target: &ResolveTarget,
     game_dir: &Path,
     index: &PackIndex,
+    identities: &HashMap<String, VersionIdentity>,
 ) -> Vec<ModpackFileOption> {
-    let hashes: Vec<String> = index
-        .files
-        .iter()
-        .filter_map(|file| file.sha512.clone())
-        .collect();
-    let identities = if hashes.is_empty() {
-        HashMap::new()
-    } else {
-        state.content().identify(&hashes).await.unwrap_or_default()
-    };
     let identity_versions: HashMap<(String, String), Option<(bool, bool, String)>> = stream::iter(
         identities
             .values()
@@ -285,6 +302,32 @@ async fn classify_modpack_files(
     .buffer_unordered(8)
     .collect()
     .await;
+
+    classify_modpack_file_options(game_dir, index, identities, &identity_versions)
+}
+
+async fn identify_modpack_files(
+    state: &AppState,
+    index: &PackIndex,
+) -> HashMap<String, VersionIdentity> {
+    let hashes: Vec<String> = index
+        .files
+        .iter()
+        .filter_map(|file| file.sha512.clone())
+        .collect();
+    if hashes.is_empty() {
+        HashMap::new()
+    } else {
+        state.content().identify(&hashes).await.unwrap_or_default()
+    }
+}
+
+fn classify_modpack_file_options(
+    game_dir: &Path,
+    index: &PackIndex,
+    identities: &HashMap<String, VersionIdentity>,
+    identity_versions: &HashMap<(String, String), Option<(bool, bool, String)>>,
+) -> Vec<ModpackFileOption> {
     let mut files = Vec::new();
     for file in &index.files {
         let Some(kind) = file.kind() else { continue };
@@ -343,11 +386,17 @@ pub(crate) async fn queue_modpack_install_after(
     remove_instance_on_failure: bool,
 ) -> Result<InstallQueueStateResponse, ContentApiError> {
     reject_cherry_pick_overrides(&request)?;
-    let target =
-        modpack_target(state, &request.canonical_id, request.version_id.as_deref()).await?;
+    let resolved =
+        resolve_modpack_version(state, &request.canonical_id, request.version_id.as_deref())
+            .await?;
     enqueue_install_with_dependency(
         state,
-        pinned_modpack_queue_request(request, target),
+        pinned_modpack_queue_request(
+            request,
+            resolved.canonical_id,
+            resolved.version.id,
+            resolved.name,
+        ),
         prerequisite_queue_id,
         remove_instance_on_failure,
     )
@@ -356,16 +405,18 @@ pub(crate) async fn queue_modpack_install_after(
 
 fn pinned_modpack_queue_request(
     request: ModpackInstallRequest,
-    target: ModpackTarget,
+    canonical_id: CanonicalId,
+    version_id: String,
+    name: String,
 ) -> InstallQueueRequest {
     let include_overrides = request.selected_paths.is_empty() && request.include_overrides;
     let label = if request.selected_paths.is_empty() {
-        format!("Setting up {}", target.name)
+        format!("Setting up {name}")
     } else {
         format!(
             "Adding {} files from {}",
             request.selected_paths.len(),
-            target.name
+            name
         )
     };
     InstallQueueRequest {
@@ -373,8 +424,8 @@ fn pinned_modpack_queue_request(
         instance_id: request.instance_id,
         label,
         content_action: Some(InstallQueueContentActionRequest::Modpack {
-            canonical_id: target.canonical_id.as_str().to_string(),
-            version_id: target.version_id,
+            canonical_id: canonical_id.as_str().to_string(),
+            version_id,
             selected_paths: request.selected_paths,
             include_overrides,
         }),
@@ -418,35 +469,32 @@ where
         .clone()
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "instance not found"))?;
 
-    let id = CanonicalId(request.canonical_id.clone());
-    let detail = state
-        .content()
-        .detail(&id)
-        .await
-        .map_err(content_error_response)?;
-    if detail.content.kind != ContentKind::Modpack {
-        return Err(json_error(StatusCode::BAD_REQUEST, "this is not a modpack"));
-    }
-    let version =
-        pick_version(&detail.versions, request.version_id.as_deref()).ok_or_else(|| {
-            json_error(
-                StatusCode::NOT_FOUND,
-                "this modpack has no installable version",
-            )
-        })?;
-    let archive_file = version.primary_file().cloned().ok_or_else(|| {
+    let resolved =
+        resolve_modpack_version(state, &request.canonical_id, request.version_id.as_deref())
+            .await?;
+    let archive_file = resolved.version.primary_file().cloned().ok_or_else(|| {
         json_error(
             StatusCode::NOT_FOUND,
             "this modpack version has no downloadable file",
         )
     })?;
 
-    let pack_title = detail.content.title.clone();
-    let archive = download_archive(state, &game_dir, &archive_file).await?;
+    let archive = download_archive(state, &archive_file).await?;
     let preview = read_pack_index(archive.path()).map_err(content_error_response)?;
     if !request.selected_paths.is_empty() {
-        let classified = classify_modpack_files(state, &target, &game_dir, &preview).await;
+        let identities = identify_modpack_files(state, &preview).await;
+        let classified =
+            classify_modpack_files(state, &target, &game_dir, &preview, &identities).await;
         validate_cherry_pick_files(&request.selected_paths, &classified)?;
+        validate_cherry_pick_dependencies(
+            state,
+            &target,
+            &game_dir,
+            &preview,
+            &request.selected_paths,
+            &identities,
+        )
+        .await?;
     }
     let preview_files: Vec<axial_content::PackFile> = preview
         .files
@@ -461,9 +509,9 @@ where
         state,
         &game_dir,
         &preview_files,
-        &id,
-        &pack_title,
-        version,
+        &resolved.canonical_id,
+        &resolved.name,
+        &resolved.version,
         request.selected_paths.is_empty(),
     )
     .await?;
@@ -536,16 +584,78 @@ fn validate_cherry_pick_files(
     Ok(())
 }
 
-/// Pull the `.mrpack` itself into a scratch file next to the instance, verified
-/// like any other download.
+async fn validate_cherry_pick_dependencies(
+    state: &AppState,
+    target: &ResolveTarget,
+    game_dir: &Path,
+    index: &PackIndex,
+    selected_paths: &[String],
+    identities: &HashMap<String, VersionIdentity>,
+) -> Result<(), ContentApiError> {
+    let files: HashMap<&str, &axial_content::PackFile> = index
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
+    let mut selections = Vec::with_capacity(selected_paths.len());
+    let mut selected_versions = HashSet::with_capacity(selected_paths.len());
+    for path in selected_paths {
+        let Some(file) = files.get(path.as_str()) else {
+            return Err(cherry_pick_conflict());
+        };
+        let Some(kind) = file.kind() else {
+            return Err(cherry_pick_conflict());
+        };
+        let Some(identity) = file.sha512.as_ref().and_then(|hash| identities.get(hash)) else {
+            return Err(cherry_pick_conflict());
+        };
+        let canonical_id = CanonicalId::for_project(identity.provider, &identity.project_id);
+        if !selected_versions.insert((canonical_id.clone(), identity.version_id.clone())) {
+            return Err(cherry_pick_conflict());
+        }
+        selections.push(ContentSelection {
+            canonical_id: canonical_id.as_str().to_string(),
+            kind,
+            version_id: Some(identity.version_id.clone()),
+        });
+    }
+
+    let manifest = ContentManifest::load(game_dir).map_err(content_error_response)?;
+    let resolution = resolve(state, target, &selections, &manifest).await?;
+    if !cherry_pick_resolution_is_complete(&resolution, &selected_versions) {
+        return Err(cherry_pick_conflict());
+    }
+    Ok(())
+}
+
+fn cherry_pick_resolution_is_complete(
+    resolution: &super::resolve::Resolution,
+    selected_versions: &HashSet<(CanonicalId, String)>,
+) -> bool {
+    resolution.conflicts.is_empty()
+        && resolution.items.iter().all(|item| {
+            (item.already_installed && !item.update)
+                || selected_versions.contains(&(item.canonical_id.clone(), item.version_id.clone()))
+        })
+}
+
+fn cherry_pick_conflict() -> ContentApiError {
+    json_error(
+        StatusCode::CONFLICT,
+        "selected modpack files require other files or conflict with installed content; review the selection and try again",
+    )
+}
+
+/// Pull the `.mrpack` into a process-unique temporary file, verified like any
+/// other download. The guard removes it on every return path.
 async fn download_archive(
     state: &AppState,
-    game_dir: &Path,
     file: &FileRef,
 ) -> Result<ScratchArchive, ContentApiError> {
-    let sequence = PACK_ARCHIVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let archive = ScratchArchive::new(game_dir.join(format!(
-        ".axial-pack-{sequence:x}-{}",
+    let archive = ScratchArchive::new(std::env::temp_dir().join(format!(
+        ".axial-pack-{}-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4(),
         sanitize(&file.filename)
     )));
     if let Some(parent) = archive.path().parent() {
@@ -689,13 +799,6 @@ fn mismatch_notice(
     ))
 }
 
-fn is_release_version(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .split('.')
-            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
-}
-
 fn sanitize(filename: &str) -> String {
     filename
         .chars()
@@ -740,7 +843,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "axial-scratch-archive-test-{}-{}",
             std::process::id(),
-            PACK_ARCHIVE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, b"scratch").expect("write scratch archive");
 
@@ -754,6 +857,33 @@ mod tests {
     }
 
     #[test]
+    fn modpack_target_pins_the_loader_version_from_the_pack_index() {
+        let target = target_from_pack_index(
+            CanonicalId("modrinth:pack".to_string()),
+            "pack-version".to_string(),
+            "Pack".to_string(),
+            &PackIndex {
+                name: "Pack".to_string(),
+                version: "1.0.0".to_string(),
+                minecraft: "1.20.1".to_string(),
+                loader: Some(axial_content::PackLoader {
+                    key: "fabric".to_string(),
+                    version: "0.14.22".to_string(),
+                }),
+                files: Vec::new(),
+            },
+        )
+        .expect("pack target");
+
+        assert_eq!(target.minecraft, "1.20.1");
+        assert_eq!(target.loader.as_deref(), Some("fabric"));
+        assert_eq!(
+            target.selection_id,
+            "loader_build|net.fabricmc.fabric-loader|fabric:1.20.1:0.14.22"
+        );
+    }
+
+    #[test]
     fn omitted_modpack_version_is_replaced_with_the_resolved_version() {
         let request = pinned_modpack_queue_request(
             ModpackInstallRequest {
@@ -763,15 +893,9 @@ mod tests {
                 selected_paths: Vec::new(),
                 include_overrides: true,
             },
-            ModpackTarget {
-                canonical_id: CanonicalId("modrinth:pack".to_string()),
-                version_id: "resolved-version".to_string(),
-                name: "Pack".to_string(),
-                minecraft: "1.21.1".to_string(),
-                loader: Some("fabric".to_string()),
-                loader_label: "Fabric".to_string(),
-                selection_id: "loader_version|fabric|1.21.1".to_string(),
-            },
+            CanonicalId("modrinth:pack".to_string()),
+            "resolved-version".to_string(),
+            "Pack".to_string(),
         );
 
         let Some(InstallQueueContentActionRequest::Modpack { version_id, .. }) =
@@ -827,5 +951,54 @@ mod tests {
                 "{rejected} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn cherry_pick_resolution_requires_the_complete_dependency_closure() {
+        let item = |project: &str, reason: super::super::resolve::PlanReason, installed: bool| {
+            super::super::resolve::ResolvedItem {
+                canonical_id: CanonicalId::for_project(ProviderId::Modrinth, project),
+                provider: ProviderId::Modrinth,
+                project_id: project.to_string(),
+                kind: ContentKind::Mod,
+                version_id: format!("{project}-version"),
+                version_number: "1.0.0".to_string(),
+                title: project.to_string(),
+                file: FileRef {
+                    url: format!("https://example.invalid/{project}.jar"),
+                    filename: format!("{project}.jar"),
+                    sha1: None,
+                    sha512: None,
+                    size: None,
+                    primary: true,
+                },
+                dependencies: Vec::new(),
+                reason,
+                already_installed: installed,
+                update: false,
+            }
+        };
+        let selected_id = CanonicalId::for_project(ProviderId::Modrinth, "selected");
+        let dependency_id = CanonicalId::for_project(ProviderId::Modrinth, "dependency");
+        let mut selected = HashSet::from([(selected_id, "selected-version".to_string())]);
+        let resolution = super::super::resolve::Resolution {
+            items: vec![
+                item(
+                    "selected",
+                    super::super::resolve::PlanReason::Selected,
+                    false,
+                ),
+                item(
+                    "dependency",
+                    super::super::resolve::PlanReason::Dependency,
+                    false,
+                ),
+            ],
+            conflicts: Vec::new(),
+        };
+
+        assert!(!cherry_pick_resolution_is_complete(&resolution, &selected));
+        selected.insert((dependency_id, "dependency-version".to_string()));
+        assert!(cherry_pick_resolution_is_complete(&resolution, &selected));
     }
 }

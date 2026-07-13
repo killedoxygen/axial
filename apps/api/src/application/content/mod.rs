@@ -674,11 +674,14 @@ async fn retrofit_unmanaged(
                     identity.title = Some(title.clone());
                 }
                 manifest.forget_unidentified(file.kind, &file.filename);
-                manifest.upsert(ManifestEntry::imported(
-                    file.kind,
-                    file.filename.clone(),
-                    identity,
-                ));
+                let mut entry = ManifestEntry::imported(file.kind, file.filename.clone(), identity);
+                entry.sha512 = Some(hash.clone());
+                entry.size = Some(*size);
+                entry.enabled = !file
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".disabled"));
+                manifest.upsert(entry);
             }
             None => {
                 manifest.record_unidentified(UnidentifiedRecord {

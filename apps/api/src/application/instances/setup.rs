@@ -205,12 +205,14 @@ pub async fn execute_modpack_instance_setup(
         loader: target.loader.clone(),
         game_version: target.minecraft.clone(),
     };
-    if !target_matches_selection(&target_ref, &selection) {
+    if !target_matches_selection(&target_ref, &selection)
+        || selection.exact_selection_id() != target.selection_id
+    {
         return Err(conflict(
-            "Modpack target does not match the selected Minecraft version and loader.",
+            "Modpack target does not match the selected Minecraft version and loader build.",
         ));
     }
-    request.create.selection_id = selection.exact_selection_id();
+    request.create.selection_id = target.selection_id;
     let mut created = handle_create_instance(state, request.create).await?;
     let instance_id = created.instance.id.clone();
     let prerequisite_queue_id = created

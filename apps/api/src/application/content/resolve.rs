@@ -868,7 +868,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(root.join("mods")).expect("mods");
-        let entry = ManifestEntry::managed(
+        let mut entry = ManifestEntry::managed(
             CanonicalId::for_project(ProviderId::Modrinth, "project"),
             ProviderId::Modrinth,
             "project".to_string(),
@@ -883,7 +883,10 @@ mod tests {
             resolved_install_state(Some(&entry), Some(&root), "v1"),
             (false, false)
         );
-        std::fs::write(root.join("mods/project.jar"), b"jar").expect("managed file");
+        let path = root.join("mods/project.jar");
+        std::fs::write(&path, b"jar").expect("managed file");
+        entry.sha512 = Some(axial_content::sha512_file(&path).expect("managed hash"));
+        entry.size = Some(3);
         assert_eq!(
             resolved_install_state(Some(&entry), Some(&root), "v1"),
             (true, false)

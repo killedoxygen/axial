@@ -24,6 +24,10 @@ const OVERRIDES: &str = "overrides";
 const CLIENT_OVERRIDES: &str = "client-overrides";
 const SUPPORTED_FORMAT_VERSION: u32 = 1;
 #[cfg(not(test))]
+const MAX_INDEX_BYTES: u64 = 8 << 20;
+#[cfg(test)]
+const MAX_INDEX_BYTES: u64 = 1024;
+#[cfg(not(test))]
 const MAX_OVERRIDE_ENTRY_BYTES: u64 = 128 << 20;
 #[cfg(test)]
 const MAX_OVERRIDE_ENTRY_BYTES: u64 = 1024;
@@ -91,8 +95,20 @@ pub fn read_pack_index(archive: &Path) -> ContentResult<PackIndex> {
     let mut entry = zip
         .by_name(INDEX_FILE)
         .map_err(|_| ContentError::Invalid("modpack has no modrinth.index.json".to_string()))?;
+    if entry.size() > MAX_INDEX_BYTES {
+        return Err(ContentError::Invalid(
+            "modpack index exceeds the size limit".to_string(),
+        ));
+    }
     let mut raw = String::new();
-    io::Read::read_to_string(&mut entry, &mut raw)?;
+    (&mut entry)
+        .take(MAX_INDEX_BYTES + 1)
+        .read_to_string(&mut raw)?;
+    if raw.len() as u64 > MAX_INDEX_BYTES {
+        return Err(ContentError::Invalid(
+            "modpack index exceeds the size limit".to_string(),
+        ));
+    }
     parse_pack_index(&raw)
 }
 
@@ -639,6 +655,19 @@ mod tests {
             "files": []
         }"#;
         assert_eq!(parse_pack_index(raw).expect("parse").loader, None);
+    }
+
+    #[test]
+    fn compressed_pack_index_is_bounded_before_parsing() {
+        let archive = override_archive(
+            "index-limit",
+            &[(INDEX_FILE, vec![b' '; MAX_INDEX_BYTES as usize + 1])],
+        );
+
+        let error = read_pack_index(&archive).expect_err("oversized index must be rejected");
+        assert!(error.to_string().contains("size limit"));
+
+        let _ = fs::remove_file(archive);
     }
 
     #[test]

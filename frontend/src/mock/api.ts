@@ -686,7 +686,7 @@ function mockModpackTarget(canonicalId: string): ModpackTarget {
     minecraft: MOCK_FABRIC_MC_VERSION,
     loader: 'fabric',
     loader_label: 'Fabric',
-    selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${MOCK_FABRIC_MC_VERSION}`,
+    selection_id: `loader_build|${FABRIC_COMPONENT_ID}|${MOCK_FABRIC_BUILD_ID}`,
   };
 }
 

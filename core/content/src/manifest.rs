@@ -4,6 +4,7 @@ use crate::model::{
 };
 use crate::transaction::promote_replacement;
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha512};
 use std::collections::HashSet;
 use std::fs;
@@ -256,6 +257,7 @@ pub fn reconcile(game_dir: &Path, manifest: &ContentManifest) -> ReconcileReport
     let recorded: HashSet<(ContentKind, String)> = manifest
         .entries
         .iter()
+        .filter(|entry| entry_file_present(game_dir, entry))
         .map(|entry| (entry.kind, entry.filename.clone()))
         .collect();
 
@@ -297,6 +299,9 @@ pub fn reconcile(game_dir: &Path, manifest: &ContentManifest) -> ReconcileReport
     report
 }
 
+/// Whether an entry still owns a regular file on disk. When provenance carries
+/// integrity metadata, presence includes matching the recorded size and
+/// strongest available hash so a same-name manual replacement is not trusted.
 pub fn entry_file_present(game_dir: &Path, entry: &ManifestEntry) -> bool {
     // A modpack entry records which pack the instance came from and owns no file
     // of its own, so it can never go missing.
@@ -309,7 +314,23 @@ pub fn entry_file_present(game_dir: &Path, entry: &ManifestEntry) -> bool {
         dir.join(format!("{}.disabled", entry.filename)),
     ]
     .into_iter()
-    .any(|path| fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()))
+    .any(|path| entry_file_matches(&path, entry))
+}
+
+fn entry_file_matches(path: &Path, entry: &ManifestEntry) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || entry.size.is_some_and(|size| size != metadata.len()) {
+        return false;
+    }
+    if let Some(expected) = entry.sha512.as_deref() {
+        return hash_file::<Sha512>(path).is_ok_and(|actual| actual.eq_ignore_ascii_case(expected));
+    }
+    if let Some(expected) = entry.sha1.as_deref() {
+        return hash_file::<Sha1>(path).is_ok_and(|actual| actual.eq_ignore_ascii_case(expected));
+    }
+    true
 }
 
 pub fn manifest_path(game_dir: &Path) -> PathBuf {
@@ -324,8 +345,15 @@ pub fn enabled_base_name(filename: &str) -> String {
 }
 
 pub fn sha512_file(path: &Path) -> ContentResult<String> {
+    hash_file::<Sha512>(path)
+}
+
+fn hash_file<D>(path: &Path) -> ContentResult<String>
+where
+    D: Digest + Default,
+{
     let mut file = fs::File::open(path)?;
-    let mut hasher = Sha512::new();
+    let mut hasher = D::default();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
@@ -367,9 +395,9 @@ mod tests {
         FileRef {
             url: format!("https://example.invalid/{filename}"),
             filename: filename.to_string(),
-            sha1: Some("a".repeat(40)),
-            sha512: Some("b".repeat(128)),
-            size: Some(1024),
+            sha1: None,
+            sha512: None,
+            size: None,
             primary: true,
         }
     }
@@ -555,6 +583,32 @@ mod tests {
         let report = reconcile(&dir, &manifest);
         assert!(report.missing.is_empty(), "disabled file still counts");
         assert!(report.unmanaged.is_empty(), "disabled file is recorded");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reconcile_treats_a_same_name_hash_mismatch_as_unmanaged() {
+        let dir = temp_game_dir("replaced-in-place");
+        let mods_dir = dir.join("mods");
+        fs::create_dir_all(&mods_dir).expect("mods dir");
+        let path = mods_dir.join("tracked.jar");
+        fs::write(&path, b"old").expect("tracked file");
+
+        let mut entry = managed_entry("AAA", "tracked.jar");
+        entry.size = Some(3);
+        entry.sha512 = Some(sha512_file(&path).expect("tracked hash"));
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(entry);
+
+        fs::write(&path, b"new").expect("replace tracked file");
+        let report = reconcile(&dir, &manifest);
+
+        assert_eq!(
+            report.missing,
+            vec![CanonicalId::for_project(ProviderId::Modrinth, "AAA")]
+        );
+        assert_eq!(report.unmanaged.len(), 1);
+        assert_eq!(report.unmanaged[0].filename, "tracked.jar");
         fs::remove_dir_all(&dir).ok();
     }
 }
