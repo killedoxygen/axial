@@ -10,6 +10,7 @@ mod copy;
 mod directive;
 mod healing;
 mod install_evidence;
+mod integrity;
 pub mod jvm_preset;
 pub mod launch_decision;
 pub mod launch_failure_memory;
@@ -91,6 +92,10 @@ pub use install_evidence::{
 pub(crate) use install_evidence::{
     GuardianInstallAssessment, GuardianInstallFailureOutcome,
     assess_install_artifact_failure_with_context, install_artifact_failure_safety_case,
+};
+pub(crate) use integrity::{
+    TIER2_INTEGRITY_COUNTER_TOKEN_COUNT, Tier2IntegrityGuardianEvidence,
+    tier2_integrity_guardian_evidence,
 };
 pub use jvm_preset::{
     GuardianJvmPresetId, GuardianJvmPresetResolution, normalize_create_jvm_preset,

@@ -25,6 +25,8 @@ use tracing::warn;
 
 pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v1";
 pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = 128;
+pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
+pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
 const OPERATION_JOURNAL_FILE: &str = "operation-journals.json";
 const OPERATION_JOURNAL_LOCK_INVARIANT: &str =
     "operation journal records lock poisoned; in-memory and persisted state may diverge";
@@ -357,6 +359,28 @@ impl OperationJournalStore {
         self.await_commit(ticket, mutation).await
     }
 
+    pub(crate) async fn record_success_with_guardian_evidence(
+        &self,
+        operation_id: &OperationId,
+        completed_step: OperationJournalStep,
+        fact_ids: Vec<String>,
+        diagnosis_ids: Vec<DiagnosisId>,
+    ) -> Result<(), OperationJournalStoreError> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
+            if operation_journal_status_is_terminal(entry.status) {
+                return Err(OperationJournalStoreError::AlreadyTerminal);
+            }
+            entry.status = OperationStatus::Succeeded;
+            entry.completed_steps.push(completed_step);
+            entry.failure_point = None;
+            entry.outcome = Some(OperationOutcome::Succeeded);
+            apply_guardian_evidence(entry, fact_ids, diagnosis_ids);
+            Ok(())
+        })?;
+        self.await_commit(ticket, mutation).await
+    }
+
     pub async fn record_failure(
         &self,
         operation_id: &OperationId,
@@ -397,6 +421,27 @@ impl OperationJournalStore {
             entry.failure_point = Some(failure_point.into());
             entry.outcome = Some(outcome);
             apply_guardian_evidence(entry, fact_ids, diagnosis_ids);
+            Ok(())
+        })?;
+        self.await_commit(ticket, mutation).await
+    }
+
+    pub(crate) async fn record_cancellation(
+        &self,
+        operation_id: &OperationId,
+        cancellation_step: OperationJournalStep,
+    ) -> Result<(), OperationJournalStoreError> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
+            if operation_journal_status_is_terminal(entry.status) {
+                return Err(OperationJournalStoreError::AlreadyTerminal);
+            }
+            entry.status = OperationStatus::Cancelled;
+            entry.completed_steps.clear();
+            entry.completed_steps.push(cancellation_step);
+            entry.failure_point = None;
+            entry.guardian_diagnosis_ids.clear();
+            entry.outcome = Some(OperationOutcome::Cancelled);
             Ok(())
         })?;
         self.await_commit(ticket, mutation).await
@@ -859,7 +904,7 @@ fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalV
     {
         return Err(OperationJournalValidationError::UnsafeFailurePoint);
     }
-    if entry.guardian_diagnosis_ids.len() > 32 {
+    if entry.guardian_diagnosis_ids.len() > MAX_OPERATION_JOURNAL_DIAGNOSES {
         return Err(OperationJournalValidationError::TooManyDiagnoses);
     }
     Ok(())
@@ -889,7 +934,7 @@ fn validate_step(step: &OperationJournalStep) -> Result<(), OperationJournalVali
     if let Some(target) = &step.changed_target {
         validate_target(target)?;
     }
-    if step.generated_facts.len() > 64 {
+    if step.generated_facts.len() > MAX_OPERATION_JOURNAL_STEP_FACTS {
         return Err(OperationJournalValidationError::TooManyFacts);
     }
     for fact in &step.generated_facts {
@@ -1309,6 +1354,93 @@ mod tests {
         assert_eq!(stored.failure_point.as_deref(), Some("download_failed"));
         assert_eq!(stored.completed_steps.len(), 1);
         assert_eq!(stored.completed_steps[0].step_id, "install_failed");
+    }
+
+    #[tokio::test]
+    async fn success_with_guardian_evidence_is_one_terminal_transition() {
+        let store = OperationJournalStore::new();
+        let operation_id = OperationId::new("integrity-sweep-atomic-success");
+        store
+            .create(planned_entry(&operation_id))
+            .await
+            .expect("create planned journal");
+        let mut step = completed_step("tier2_integrity_sweep");
+        step.generated_facts
+            .push("integrity_counter:processed_entry_count:1".to_string());
+
+        store
+            .record_success_with_guardian_evidence(
+                &operation_id,
+                step,
+                vec!["guardian_fact:artifact_hash_mismatch".to_string()],
+                vec![DiagnosisId::LauncherManagedArtifactCorrupt],
+            )
+            .await
+            .expect("record atomic terminal evidence");
+
+        let stored = store.get(&operation_id).expect("terminal journal");
+        assert_eq!(stored.status, OperationStatus::Succeeded);
+        assert_eq!(stored.outcome, Some(OperationOutcome::Succeeded));
+        assert_eq!(stored.completed_steps.len(), 1);
+        assert_eq!(
+            stored.completed_steps[0].generated_facts,
+            vec![
+                "integrity_counter:processed_entry_count:1",
+                "guardian_fact:artifact_hash_mismatch",
+            ]
+        );
+        assert_eq!(
+            stored.guardian_diagnosis_ids,
+            vec![DiagnosisId::LauncherManagedArtifactCorrupt]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_atomically_replaces_nonterminal_findings() {
+        let store = OperationJournalStore::new();
+        let operation_id = OperationId::new("integrity-sweep-atomic-cancel");
+        store
+            .create(planned_entry(&operation_id))
+            .await
+            .expect("create planned journal");
+        let mut prior = completed_step("obsolete_progress");
+        prior
+            .generated_facts
+            .push("guardian_fact:artifact_missing".to_string());
+        store
+            .record_checkpoint(&operation_id, prior)
+            .await
+            .expect("record nonterminal evidence");
+        store
+            .record_guardian_evidence(
+                &operation_id,
+                Vec::new(),
+                vec![DiagnosisId::LauncherManagedArtifactCorrupt],
+            )
+            .await
+            .expect("record nonterminal diagnosis");
+        let mut cancelled =
+            OperationJournalStep::new("tier2_integrity_sweep", OperationPhase::Validating);
+        cancelled.result = crate::state::contracts::OperationStepResult::Skipped;
+        cancelled
+            .generated_facts
+            .push("integrity_counter:processed_entry_count:0".to_string());
+
+        store
+            .record_cancellation(&operation_id, cancelled)
+            .await
+            .expect("record atomic cancellation");
+
+        let stored = store.get(&operation_id).expect("cancelled journal");
+        assert_eq!(stored.status, OperationStatus::Cancelled);
+        assert_eq!(stored.outcome, Some(OperationOutcome::Cancelled));
+        assert_eq!(stored.completed_steps.len(), 1);
+        assert_eq!(
+            stored.completed_steps[0].generated_facts,
+            vec!["integrity_counter:processed_entry_count:0"]
+        );
+        assert!(stored.guardian_diagnosis_ids.is_empty());
+        assert_eq!(stored.failure_point, None);
     }
 
     #[test]

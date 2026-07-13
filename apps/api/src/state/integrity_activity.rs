@@ -53,10 +53,18 @@ pub(crate) struct IntegrityIdleSnapshot {
 }
 
 impl IntegrityIdleSnapshot {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the R5 stable-idle scheduler slice")
+    )]
     pub(crate) const fn epoch(self) -> IntegrityIdleEpoch {
         self.epoch
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the R5 stable-idle scheduler slice")
+    )]
     pub(crate) const fn is_stably_idle(self) -> bool {
         self.running && self.foreground_count == 0 && !self.sweep_active
     }

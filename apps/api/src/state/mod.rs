@@ -10,19 +10,11 @@ mod installed_versions;
 mod installs;
 mod instance_lifecycle;
 mod instance_registry;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the R5 application wiring slice")
-)]
 mod integrity_activity;
 mod java_probe_failures;
 mod journals;
 mod known_good;
 mod known_good_rebuilds;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the R5 scheduler slice")
-)]
 mod known_good_tier2;
 pub(crate) mod launch_reports;
 mod lifecycle;
@@ -88,6 +80,7 @@ pub(crate) use java_probe_failures::{
     JavaProbeFailureOwner,
 };
 pub(crate) use journals::{
+    MAX_OPERATION_JOURNAL_DIAGNOSES, MAX_OPERATION_JOURNAL_STEP_FACTS,
     OperationJournalReconciliation, operation_journal_completed_step_is_visible,
     operation_journal_plan_is_visible, operation_journal_terminal_is_visible,
 };
@@ -854,10 +847,6 @@ impl AppState {
         self.integrity_activity.register_foreground()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the R5 scheduler slice")
-    )]
     pub(crate) fn try_reserve_idle_sweep(
         &self,
         expected_epoch: IntegrityIdleEpoch,

@@ -1462,64 +1462,13 @@ pub(crate) struct IntegrityTier2Report {
     pub(crate) suppressed_fact_count: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct IntegrityTier2Progress {
-    pub(crate) selected_entry_count: usize,
-    pub(crate) verified_entry_count: usize,
-    pub(crate) processed_entry_count: usize,
-    pub(crate) hashed_entry_count: usize,
-    pub(crate) expected_content_byte_count: u64,
-    pub(crate) content_read_byte_count: u64,
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct IntegrityTier2ProgressSink {
-    latest: Arc<Mutex<IntegrityTier2Progress>>,
-}
-
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the R5 scheduler slice")
-)]
-impl IntegrityTier2ProgressSink {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn latest(&self) -> IntegrityTier2Progress {
-        *self
-            .latest
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn publish(&self, report: &IntegrityTier2Report) {
-        *self
-            .latest
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = IntegrityTier2Progress {
-            selected_entry_count: report.selected_entry_count,
-            verified_entry_count: report.verified_entry_count,
-            processed_entry_count: report.processed_entry_count,
-            hashed_entry_count: report.hashed_entry_count,
-            expected_content_byte_count: report.expected_content_byte_count,
-            content_read_byte_count: report.content_read_byte_count,
-        };
-    }
-}
-
 #[must_use = "Tier 2 work must be run by its blocking owner"]
 pub(crate) struct IntegrityTier2OwnedWork {
     state: AppState,
     ticket: KnownGoodTier2Ticket,
     reservation: IdleSweepReservation,
-    progress: IntegrityTier2ProgressSink,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the R5 scheduler slice")
-)]
 #[derive(Debug)]
 #[must_use = "Tier 2 result records the finalized report and sweep settlement"]
 pub(crate) struct IntegrityTier2OwnedResult {
@@ -1536,22 +1485,32 @@ pub(crate) struct IntegrityTier2BlockingWorker {
 #[error("Tier 2 dedicated worker stopped before terminal settlement")]
 pub(crate) struct IntegrityTier2BlockingWorkerUnavailable;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the R5 scheduler slice")
-)]
+trait IntegrityTier2ThreadSpawner: Send + 'static {
+    fn spawn(self, name: &'static str, run: impl FnOnce() + Send + 'static) -> Result<(), ()>;
+}
+
+struct SystemIntegrityTier2ThreadSpawner;
+
+impl IntegrityTier2ThreadSpawner for SystemIntegrityTier2ThreadSpawner {
+    fn spawn(self, name: &'static str, run: impl FnOnce() + Send + 'static) -> Result<(), ()> {
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(run)
+            .map(drop)
+            .map_err(|_| ())
+    }
+}
+
 impl IntegrityTier2OwnedWork {
     pub(crate) fn new(
         state: AppState,
         ticket: KnownGoodTier2Ticket,
         reservation: IdleSweepReservation,
-        progress: IntegrityTier2ProgressSink,
     ) -> Self {
         Self {
             state,
             ticket,
             reservation,
-            progress,
         }
     }
 
@@ -1563,26 +1522,33 @@ impl IntegrityTier2OwnedWork {
     where
         Platform: LowPriorityPlatform,
     {
+        self.spawn_with_platform_and_spawner(platform, SystemIntegrityTier2ThreadSpawner)
+    }
+
+    fn spawn_with_platform_and_spawner<Platform, Spawner>(
+        self,
+        platform: Platform,
+        spawner: Spawner,
+    ) -> IntegrityTier2BlockingWorker
+    where
+        Platform: LowPriorityPlatform,
+        Spawner: IntegrityTier2ThreadSpawner,
+    {
         let work = Arc::new(Mutex::new(Some(self)));
         let thread_work = work.clone();
         let (completion_tx, completion) = tokio::sync::oneshot::channel();
-        let spawned = std::thread::Builder::new()
-            .name("axial-tier-two-integrity".to_string())
-            .spawn(move || {
-                let work = thread_work
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                    .expect("Tier 2 worker was already claimed");
-                let result = complete_integrity_tier2_owned(work, platform);
-                let _ = completion_tx.send(result);
-            });
+        let spawned = spawner.spawn("axial-tier-two-integrity", move || {
+            let work = thread_work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("Tier 2 worker was already claimed");
+            let result = complete_integrity_tier2_owned(work, platform);
+            let _ = completion_tx.send(result);
+        });
 
         match spawned {
-            Ok(thread) => {
-                drop(thread);
-                IntegrityTier2BlockingWorker { completion }
-            }
+            Ok(()) => IntegrityTier2BlockingWorker { completion },
             Err(_) => {
                 let work = work
                     .lock()
@@ -1600,10 +1566,6 @@ impl IntegrityTier2OwnedWork {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the R5 scheduler slice")
-)]
 impl IntegrityTier2BlockingWorker {
     pub(crate) async fn join(
         self,
@@ -1625,11 +1587,10 @@ where
         state,
         ticket,
         reservation,
-        progress,
     } = work;
     let cancellation = reservation.cancellation();
-    let mut report = settle_integrity_tier2_owned(&progress, platform, || {
-        sense_integrity_tier2_owned(&state, ticket, &cancellation, &progress)
+    let mut report = settle_integrity_tier2_owned(platform, || {
+        sense_integrity_tier2_owned(&state, ticket, &cancellation)
     });
     let terminal = match report.status {
         IntegrityTier2Status::Complete => IdleSweepTerminal::Complete,
@@ -1638,9 +1599,6 @@ where
     };
     let settlement = reservation.settle(terminal);
     report = finalize_integrity_tier2_report(report, settlement);
-    if report.status == IntegrityTier2Status::Cancelled {
-        progress.publish(&report);
-    }
     IntegrityTier2OwnedResult { report, settlement }
 }
 
@@ -1658,40 +1616,31 @@ fn finalize_integrity_tier2_report(
 }
 
 fn refuse_integrity_tier2_thread_spawn(work: IntegrityTier2OwnedWork) -> IntegrityTier2OwnedResult {
-    let IntegrityTier2OwnedWork {
-        reservation,
-        progress,
-        ..
-    } = work;
+    let IntegrityTier2OwnedWork { reservation, .. } = work;
     let report = IntegrityTier2Report::new(0, 0).refuse(tier2_worker_refused_fact());
-    progress.publish(&report);
     let settlement = reservation.settle(IdleSweepTerminal::Refused);
     IntegrityTier2OwnedResult { report, settlement }
 }
 
 fn settle_integrity_tier2_owned<Platform>(
-    progress: &IntegrityTier2ProgressSink,
     platform: Platform,
     run: impl FnOnce() -> IntegrityTier2Report,
 ) -> IntegrityTier2Report
 where
     Platform: LowPriorityPlatform,
 {
-    let report =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match run_at_low_priority(platform, run) {
-                LowPriorityOutcome::Complete(report) => report,
-                LowPriorityOutcome::EnterFailed => {
-                    IntegrityTier2Report::new(0, 0).refuse(tier2_priority_enter_refused_fact())
-                }
-                LowPriorityOutcome::RestoreFailed(report) => {
-                    report.refuse(tier2_priority_restore_refused_fact())
-                }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match run_at_low_priority(platform, run) {
+            LowPriorityOutcome::Complete(report) => report,
+            LowPriorityOutcome::EnterFailed => {
+                IntegrityTier2Report::new(0, 0).refuse(tier2_priority_enter_refused_fact())
             }
-        }))
-        .unwrap_or_else(|_| IntegrityTier2Report::new(0, 0).refuse(tier2_worker_refused_fact()));
-    progress.publish(&report);
-    report
+            LowPriorityOutcome::RestoreFailed(report) => {
+                report.refuse(tier2_priority_restore_refused_fact())
+            }
+        }
+    }))
+    .unwrap_or_else(|_| IntegrityTier2Report::new(0, 0).refuse(tier2_worker_refused_fact()))
 }
 
 impl IntegrityTier2Report {
@@ -1839,45 +1788,36 @@ struct IntegrityTier2RunContext<'a, Pacer> {
     runtime_cache: &'a ManagedRuntimeCache,
     cancellation: &'a IdleSweepCancellation,
     pacer: &'a Pacer,
-    progress: &'a IntegrityTier2ProgressSink,
 }
 
 fn sense_integrity_tier2_owned(
     state: &AppState,
     ticket: KnownGoodTier2Ticket,
     cancellation: &IdleSweepCancellation,
-    progress: &IntegrityTier2ProgressSink,
 ) -> IntegrityTier2Report {
     let (library_root, runtime_cache, inventory) = ticket.execution_parts();
     if cancellation.is_cancelled() {
-        let report = IntegrityTier2Report::new(inventory.entries().len(), 0).cancel();
-        progress.publish(&report);
-        return report;
+        return IntegrityTier2Report::new(inventory.entries().len(), 0).cancel();
     }
     let projection = match inventory.tier2_projection() {
         Ok(projection) => projection,
         Err(error) => {
-            let report = IntegrityTier2Report::new(error.entry_count(), 0)
+            return IntegrityTier2Report::new(error.entry_count(), 0)
                 .refuse(tier2_projection_refused_fact(error.entry_count()));
-            progress.publish(&report);
-            return report;
         }
     };
     let pacer = SystemIntegrityTier2Pacer::start();
-    let report = run_integrity_tier2_with(
+    run_integrity_tier2_with(
         projection,
         IntegrityTier2RunContext {
             library_root,
             runtime_cache,
             cancellation,
             pacer: &pacer,
-            progress,
         },
         FilesystemIntegrityReader::default,
         || state.known_good_tier2_ticket_is_current(&ticket),
-    );
-    progress.publish(&report);
-    report
+    )
 }
 
 fn run_integrity_tier2_with<Reader, ReaderFactory, Pacer, IsCurrent>(
@@ -1896,7 +1836,6 @@ where
         projection.entry_count(),
         projection.expected_content_byte_count(),
     );
-    context.progress.publish(&report);
     if context.cancellation.is_cancelled() {
         return report.cancel();
     }
@@ -1936,7 +1875,6 @@ where
                 return report.cancel();
             }
             report.processed_entry_count += 1;
-            context.progress.publish(&report);
             batch_entry_count += 1;
             if report
                 .content_read_byte_count
@@ -1953,7 +1891,6 @@ where
             return report.refuse(tier2_confinement_refused_fact());
         }
         report.verified_entry_count = report.processed_entry_count;
-        context.progress.publish(&report);
         drop(reader);
         if !is_current() {
             return report.refuse(tier2_authority_refused_fact());
@@ -1966,7 +1903,6 @@ where
         return report.refuse(tier2_authority_refused_fact());
     }
     report.status = IntegrityTier2Status::Complete;
-    context.progress.publish(&report);
     report
 }
 
@@ -2886,6 +2822,18 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RefusingTier2ThreadSpawner {
+        names: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl IntegrityTier2ThreadSpawner for RefusingTier2ThreadSpawner {
+        fn spawn(self, name: &'static str, _run: impl FnOnce() + Send + 'static) -> Result<(), ()> {
+            self.names.lock().expect("thread names").push(name);
+            Err(())
+        }
+    }
+
     impl ContentReader for BlockingContentReader {
         fn hash_file(
             &self,
@@ -3076,14 +3024,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    async fn tier2_owned_work_fixture(
-        label: &str,
-    ) -> (
-        AppState,
-        PathBuf,
-        IntegrityTier2OwnedWork,
-        IntegrityTier2ProgressSink,
-    ) {
+    async fn tier2_owned_work_fixture(label: &str) -> (AppState, PathBuf, IntegrityTier2OwnedWork) {
         let (state, root) = state_fixture(label, None);
         let managed_parent = root.join("private-library-root/libraries/owned");
         fs::create_dir_all(&managed_parent).expect("managed library parent");
@@ -3111,10 +3052,8 @@ mod tests {
             .mint_known_good_tier2_ticket(&reservation, &instance.id)
             .await
             .expect("Tier 2 ticket");
-        let progress = IntegrityTier2ProgressSink::new();
-        let work =
-            IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation, progress.clone());
-        (state, root, work, progress)
+        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation);
+        (state, root, work)
     }
 
     async fn test_integrity_foreground(state: &AppState) -> IntegrityForegroundLease {
@@ -3227,7 +3166,6 @@ mod tests {
                 runtime_cache: &runtime_cache,
                 cancellation: &cancellation,
                 pacer: &pacer,
-                progress: &IntegrityTier2ProgressSink::new(),
             },
             || reader.clone(),
             || true,
@@ -3278,7 +3216,6 @@ mod tests {
                 runtime_cache: &runtime_cache,
                 cancellation: &cancellation,
                 pacer: &pacer,
-                progress: &IntegrityTier2ProgressSink::new(),
             },
             || {
                 reader_count.fetch_add(1, AtomicOrdering::SeqCst);
@@ -3323,7 +3260,6 @@ mod tests {
                 runtime_cache: &runtime_cache,
                 cancellation: &cancellation,
                 pacer: &pacer,
-                progress: &IntegrityTier2ProgressSink::new(),
             },
             || reader.clone(),
             || true,
@@ -3371,7 +3307,6 @@ mod tests {
                 runtime_cache: &runtime_cache,
                 cancellation: &cancellation,
                 pacer: &pacer,
-                progress: &IntegrityTier2ProgressSink::new(),
             },
             || reader.clone(),
             || true,
@@ -3472,7 +3407,6 @@ mod tests {
                 runtime_cache: &runtime_cache,
                 cancellation: &cancellation,
                 pacer: &pacer,
-                progress: &IntegrityTier2ProgressSink::new(),
             },
             || {
                 reader_count.fetch_add(1, AtomicOrdering::SeqCst);
@@ -3527,7 +3461,6 @@ mod tests {
                 runtime_cache: &runtime_cache,
                 cancellation: &cancellation,
                 pacer: &pacer,
-                progress: &IntegrityTier2ProgressSink::new(),
             },
             || reader.clone(),
             || current_checks.fetch_add(1, AtomicOrdering::SeqCst) < 2,
@@ -3575,7 +3508,6 @@ mod tests {
                 runtime_cache: &runtime_cache,
                 cancellation: &cancellation,
                 pacer: &pacer,
-                progress: &IntegrityTier2ProgressSink::new(),
             },
             || reader.clone(),
             || true,
@@ -3593,8 +3525,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tier_two_move_only_work_publishes_latest_progress_from_the_owned_call() {
-        let (state, root, work, progress) = tier2_owned_work_fixture("tier2-owned-work").await;
+    async fn tier_two_move_only_work_returns_the_final_report() {
+        let (state, root, work) = tier2_owned_work_fixture("tier2-owned-work").await;
 
         let result = work.spawn().join().await.expect("dedicated worker result");
         let report = result.report;
@@ -3609,17 +3541,6 @@ mod tests {
         assert_eq!(
             report.facts[0].kind,
             ExecutionFactKind::ArtifactHashMismatch
-        );
-        assert_eq!(
-            progress.latest(),
-            IntegrityTier2Progress {
-                selected_entry_count: 1,
-                verified_entry_count: 1,
-                processed_entry_count: 1,
-                hashed_entry_count: 1,
-                expected_content_byte_count: 1,
-                content_read_byte_count: 1,
-            }
         );
         close_fixture(state, root).await;
     }
@@ -3663,12 +3584,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
             cancel_from_thread.cancel();
         });
-        let work = IntegrityTier2OwnedWork::new(
-            state.clone(),
-            ticket,
-            reservation,
-            IntegrityTier2ProgressSink::new(),
-        );
+        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation);
 
         let result = work.spawn().join().await.expect("dedicated worker result");
         canceller.join().expect("cancellation thread");
@@ -3683,10 +3599,9 @@ mod tests {
 
     #[test]
     fn tier_two_owned_boundary_settles_worker_panics_as_one_bounded_refusal() {
-        let progress = IntegrityTier2ProgressSink::new();
         let platform = ScriptedLowPriorityPlatform::successful();
 
-        let report = settle_integrity_tier2_owned(&progress, platform.clone(), || {
+        let report = settle_integrity_tier2_owned(platform.clone(), || {
             panic!("injected Tier 2 worker panic")
         });
 
@@ -3697,13 +3612,12 @@ mod tests {
             fact_field(&report.facts[0], "observation"),
             Some("tier2_worker_unavailable")
         );
-        assert_eq!(progress.latest(), IntegrityTier2Progress::default());
         assert_eq!(platform.events(), vec!["enter", "restore"]);
     }
 
     #[tokio::test]
     async fn tier_two_priority_enter_failure_refuses_without_sensing() {
-        let (state, root, work, progress) = tier2_owned_work_fixture("tier2-enter-failure").await;
+        let (state, root, work) = tier2_owned_work_fixture("tier2-enter-failure").await;
         let platform = ScriptedLowPriorityPlatform::enter_failure();
 
         let result = work
@@ -3721,14 +3635,55 @@ mod tests {
             fact_field(&result.report.facts[0], "observation"),
             Some("tier2_low_priority_enter_failed")
         );
-        assert_eq!(progress.latest(), IntegrityTier2Progress::default());
         assert_eq!(platform.events(), vec!["enter"]);
         close_fixture(state, root).await;
     }
 
     #[tokio::test]
+    async fn tier_two_thread_spawn_failure_recovers_untouched_work_and_unblocks_foreground() {
+        let (state, root, work) = tier2_owned_work_fixture("tier2-spawn-failure").await;
+        let platform = ScriptedLowPriorityPlatform::successful();
+        let spawner = RefusingTier2ThreadSpawner::default();
+
+        let result = work
+            .spawn_with_platform_and_spawner(platform.clone(), spawner.clone())
+            .join()
+            .await
+            .expect("bounded spawn refusal result");
+
+        assert_eq!(result.settlement, IdleSweepSettlement::Superseded);
+        assert_eq!(result.report.status, IntegrityTier2Status::Refused);
+        assert_eq!(result.report.selected_entry_count, 0);
+        assert_eq!(result.report.processed_entry_count, 0);
+        assert_eq!(result.report.content_read_byte_count, 0);
+        assert_eq!(result.report.facts.len(), 1);
+        assert_eq!(
+            fact_field(&result.report.facts[0], "observation"),
+            Some("tier2_worker_unavailable")
+        );
+        assert!(platform.events().is_empty());
+        assert_eq!(
+            *spawner.names.lock().expect("thread names"),
+            vec!["axial-tier-two-integrity"]
+        );
+
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                state
+                    .register_integrity_foreground()
+                    .expect("register foreground after refused spawn")
+                    .wait_for_settlement(),
+            )
+            .await
+            .expect("refused worker settles reservation before returning"),
+        );
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
     async fn tier_two_priority_restore_failure_discards_facts_but_preserves_counters() {
-        let (state, root, work, progress) = tier2_owned_work_fixture("tier2-restore-failure").await;
+        let (state, root, work) = tier2_owned_work_fixture("tier2-restore-failure").await;
         let platform = ScriptedLowPriorityPlatform::restore_failure();
 
         let result = work
@@ -3748,24 +3703,13 @@ mod tests {
             fact_field(&result.report.facts[0], "observation"),
             Some("tier2_low_priority_restore_failed")
         );
-        assert_eq!(
-            progress.latest(),
-            IntegrityTier2Progress {
-                selected_entry_count: 1,
-                verified_entry_count: 1,
-                processed_entry_count: 1,
-                hashed_entry_count: 1,
-                expected_content_byte_count: 1,
-                content_read_byte_count: 1,
-            }
-        );
         assert_eq!(platform.events(), vec!["enter", "restore", "restore"]);
         close_fixture(state, root).await;
     }
 
     #[tokio::test]
     async fn tier_two_spawned_join_stays_pending_until_the_dedicated_worker_finishes() {
-        let (state, root, work, _) = tier2_owned_work_fixture("tier2-gated-join").await;
+        let (state, root, work) = tier2_owned_work_fixture("tier2-gated-join").await;
         let (gate, entered) = BlockingContentGate::new();
         let platform = ScriptedLowPriorityPlatform::gated(gate.clone());
         let worker = work.spawn_with_platform(platform.clone());
@@ -3790,7 +3734,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_join_waiter_keeps_physical_sweep_ownership_until_thread_exit() {
-        let (state, root, work, _) = tier2_owned_work_fixture("tier2-dropped-waiter").await;
+        let (state, root, work) = tier2_owned_work_fixture("tier2-dropped-waiter").await;
         let (gate, entered) = BlockingContentGate::new();
         let worker = work.spawn_with_platform(ScriptedLowPriorityPlatform::gated(gate.clone()));
         let join = tokio::spawn(worker.join());
